@@ -27,7 +27,7 @@ RSpec.describe MCPClient do
         file = Tempfile.new('servers.json')
         configs = [
           { type: 'stdio', command: 'echo hi' },
-          { type: 'sse', url: 'https://example.com' }
+          { type: 'sse', url: 'https://example.com', ping: 10, close_after: 25 }
         ]
         file.write(configs.to_json)
         file.close
@@ -52,7 +52,8 @@ RSpec.describe MCPClient do
       url = 'https://example.com/'
       headers = { 'Authorization' => 'Bearer token' }
       cfg = MCPClient.sse_config(base_url: url, headers: headers)
-      expect(cfg).to eq(type: 'sse', base_url: url, headers: headers, read_timeout: 30, retries: 0, retry_backoff: 1)
+      expect(cfg).to eq(type: 'sse', base_url: url, headers: headers, read_timeout: 30, ping: 10, retries: 0,
+                        retry_backoff: 1)
     end
   end
 end

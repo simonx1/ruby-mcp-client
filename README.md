@@ -53,6 +53,8 @@ client = MCPClient.create_client(
       base_url: 'https://api.example.com/sse',
       headers: { 'Authorization' => 'Bearer YOUR_TOKEN' },
       read_timeout: 30, # Optional timeout in seconds (default: 30)
+      ping: 10,         # Optional ping interval in seconds of inactivity (default: 10)
+                        # Connection closes automatically after inactivity (2.5x ping interval)
       retries: 3,       # Optional number of retry attempts (default: 0)
       retry_backoff: 1  # Optional backoff delay in seconds (default: 1)
       # Native support for tool streaming via call_tool_streaming method
@@ -139,7 +141,10 @@ sse_client = MCPClient.create_client(
   mcp_server_configs: [
     MCPClient.sse_config(
       base_url: 'http://localhost:8931/sse',
-      read_timeout: 30,  # Timeout in seconds
+      read_timeout: 30,  # Timeout in seconds for request fulfillment
+      ping: 10,          # Send ping after 10 seconds of inactivity
+                         # Connection closes automatically after inactivity (2.5x ping interval)
+      retries: 2         # Number of retry attempts on transient errors
     )
   ]
 )
@@ -349,6 +354,11 @@ Special configuration options:
 The SSE client implementation provides these key features:
 
 - **Robust connection handling**: Properly manages HTTP/HTTPS connections with configurable timeouts and retries
+- **Advanced connection management**:
+  - **Inactivity tracking**: Monitors connection activity to detect idle connections
+  - **Automatic ping**: Sends ping requests after a configurable period of inactivity (default: 10 seconds)
+  - **Automatic disconnection**: Closes idle connections after inactivity (2.5× ping interval)
+  - **MCP compliant**: Any server communication resets the inactivity timer per specification
 - **Thread safety**: All operations are thread-safe using monitors and synchronized access
 - **Reliable error handling**: Comprehensive error handling for network issues, timeouts, and malformed responses
 - **JSON-RPC over SSE**: Full implementation of JSON-RPC 2.0 over SSE transport with initialize handshake

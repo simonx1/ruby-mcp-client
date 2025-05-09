@@ -11,15 +11,20 @@ module MCPClient
   # Implementation of MCP server that communicates via Server-Sent Events (SSE)
   # Useful for communicating with remote MCP servers over HTTP
   class ServerSSE < ServerBase
+    # Ratio of close_after timeout to ping interval
+    CLOSE_AFTER_PING_RATIO = 2.5
+
     attr_reader :base_url, :tools, :server_info, :capabilities
 
     # @param base_url [String] The base URL of the MCP server
     # @param headers [Hash] Additional headers to include in requests
     # @param read_timeout [Integer] Read timeout in seconds (default: 30)
+    # @param ping [Integer] Time in seconds after which to send ping if no activity (default: 10)
     # @param retries [Integer] number of retry attempts on transient errors
     # @param retry_backoff [Numeric] base delay in seconds for exponential backoff
     # @param logger [Logger, nil] optional logger
-    def initialize(base_url:, headers: {}, read_timeout: 30, retries: 0, retry_backoff: 1, logger: nil)
+    def initialize(base_url:, headers: {}, read_timeout: 30, ping: 10,
+                   retries: 0, retry_backoff: 1, logger: nil)
       super()
       @logger = logger || Logger.new($stdout, level: Logger::WARN)
       @logger.progname = self.class.name
@@ -36,6 +41,9 @@ module MCPClient
       # HTTP client is managed via Faraday
       @tools = nil
       @read_timeout = read_timeout
+      @ping_interval = ping
+      # Set close_after to a multiple of the ping interval
+      @close_after = (ping * CLOSE_AFTER_PING_RATIO).to_i
 
       # SSE-provided JSON-RPC endpoint path for POST requests
       @rpc_endpoint = nil
@@ -51,6 +59,10 @@ module MCPClient
       @auth_error = nil
       # Whether to use SSE transport; may disable if handshake fails
       @use_sse = true
+
+      # Time of last activity
+      @last_activity_time = Time.now
+      @activity_timer_thread = nil
     end
 
     # Stream tool call fallback for SSE transport (yields single result)
@@ -138,6 +150,7 @@ module MCPClient
         start_sse_thread
         effective_timeout = [@read_timeout || 30, 30].min
         wait_for_connection(timeout: effective_timeout)
+        start_activity_monitor
         true
       rescue MCPClient::Errors::ConnectionError => e
         cleanup
@@ -168,6 +181,13 @@ module MCPClient
           nil
         end
         @sse_thread = nil
+
+        begin
+          @activity_timer_thread&.kill
+        rescue StandardError
+          nil
+        end
+        @activity_timer_thread = nil
 
         if @http_client
           @http_client.finish if @http_client.started?
@@ -227,7 +247,55 @@ module MCPClient
       raise MCPClient::Errors::TransportError, "Failed to send notification: #{e.message}"
     end
 
+    # Ping the server to keep the connection alive
+    # @return [Hash] the result of the ping request
+    def ping
+      rpc_request('ping')
+    end
+
     private
+
+    # Start the activity monitor thread
+    # This thread monitors connection activity and:
+    # 1. Sends a ping if there's no activity for @ping_interval seconds
+    # 2. Closes the connection if there's no activity for @close_after seconds
+    def start_activity_monitor
+      return if @activity_timer_thread&.alive?
+
+      @mutex.synchronize { @last_activity_time = Time.now }
+
+      @activity_timer_thread = Thread.new do
+        loop do
+          sleep 1 # Check every second
+
+          last_activity = nil
+          @mutex.synchronize { last_activity = @last_activity_time }
+
+          time_since_activity = Time.now - last_activity
+
+          if @close_after && time_since_activity >= @close_after
+            @logger.info("Closing connection due to inactivity (#{time_since_activity.round(1)}s)")
+            cleanup
+            break
+          elsif @ping_interval && time_since_activity >= @ping_interval
+            begin
+              @logger.debug("Sending ping after #{time_since_activity.round(1)}s of inactivity")
+              ping
+              @mutex.synchronize { @last_activity_time = Time.now }
+            rescue StandardError => e
+              @logger.error("Error sending ping: #{e.message}")
+            end
+          end
+        end
+      rescue StandardError => e
+        @logger.error("Activity monitor error: #{e.message}")
+      end
+    end
+
+    # Record activity to reset the inactivity timer
+    def record_activity
+      @mutex.synchronize { @last_activity_time = Time.now }
+    end
 
     # Wait for SSE connection to be established with periodic checks
     # @param timeout [Integer] Maximum time to wait in seconds
@@ -367,6 +435,9 @@ module MCPClient
     # @param chunk [String] the chunk to process
     def process_sse_chunk(chunk)
       @logger.debug("Processing SSE chunk: #{chunk.inspect}")
+
+      # Only record activity for real events
+      record_activity if chunk.include?('event:')
 
       # Check for direct JSON error responses (which aren't proper SSE events)
       if chunk.start_with?('{') && chunk.include?('"error"') &&
@@ -619,6 +690,10 @@ module MCPClient
     # @return [Hash] the result of the request
     def send_jsonrpc_request(request)
       @logger.debug("Sending JSON-RPC request: #{request.to_json}")
+
+      # Record activity when sending a request
+      record_activity
+
       uri = URI.parse(@base_url)
       base = "#{uri.scheme}://#{uri.host}:#{uri.port}"
       rpc_ep = @mutex.synchronize { @rpc_endpoint }
@@ -643,6 +718,9 @@ module MCPClient
       end
       @logger.debug("Received JSON-RPC response: #{response.status} #{response.body}")
 
+      # Record activity when receiving a response
+      record_activity
+
       unless response.success?
         raise MCPClient::Errors::ServerError, "Server returned error: #{response.status} #{response.reason_phrase}"
       end
@@ -651,17 +729,32 @@ module MCPClient
         # Wait for result via SSE channel
         request_id = request[:id]
         start_time = Time.now
+        # Use the specified read_timeout for the overall operation
         timeout = @read_timeout || 10
+
+        # Check every 100ms for the result, with a total timeout from read_timeout
         loop do
           result = nil
           @mutex.synchronize do
             result = @sse_results.delete(request_id) if @sse_results.key?(request_id)
           end
-          return result if result
-          break if Time.now - start_time > timeout
 
+          if result
+            # Record activity when receiving a result
+            record_activity
+            return result
+          end
+
+          current_time = Time.now
+          time_elapsed = current_time - start_time
+
+          # If we've exceeded the timeout, raise an error
+          break if time_elapsed > timeout
+
+          # Sleep for a short time before checking again
           sleep 0.1
         end
+
         raise MCPClient::Errors::ToolCallError, "Timeout waiting for SSE result for request #{request_id}"
       else
         begin

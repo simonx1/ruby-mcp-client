@@ -21,6 +21,7 @@ module MCPClient
           base_url: config[:base_url],
           headers: config[:headers] || {},
           read_timeout: config[:read_timeout] || 30,
+          ping: config[:ping] || 10,
           retries: config[:retries] || 0,
           retry_backoff: config[:retry_backoff] || 1,
           logger: config[:logger]

@@ -33,6 +33,25 @@ RSpec.describe MCPClient::ServerSSE do
     it 'initializes auth_error to nil' do
       expect(server.instance_variable_get(:@auth_error)).to be_nil
     end
+
+    it 'sets default ping interval to 10 seconds' do
+      expect(server.instance_variable_get(:@ping_interval)).to eq(10)
+    end
+
+    it 'sets default close_after to 25 seconds' do
+      expect(server.instance_variable_get(:@close_after)).to eq(25)
+    end
+
+    it 'accepts custom ping interval' do
+      custom_server = described_class.new(base_url: base_url, ping: 30)
+      expect(custom_server.instance_variable_get(:@ping_interval)).to eq(30)
+    end
+
+    it 'calculates close_after based on ping value' do
+      custom_server = described_class.new(base_url: base_url, ping: 20)
+      expected_close_after = (20 * MCPClient::ServerSSE::CLOSE_AFTER_PING_RATIO).to_i
+      expect(custom_server.instance_variable_get(:@close_after)).to eq(expected_close_after)
+    end
   end
 
   describe '#connect' do
@@ -45,6 +64,9 @@ RSpec.describe MCPClient::ServerSSE do
         server.instance_variable_set(:@connection_established, true)
         block.call
       end
+
+      # Expect the activity monitor to be started
+      expect(server).to receive(:start_activity_monitor)
 
       expect(server.connect).to eq true
     end
@@ -59,6 +81,9 @@ RSpec.describe MCPClient::ServerSSE do
         server.instance_variable_set(:@initialized, true)
         block.call
       end
+
+      # Allow activity monitor to be started
+      allow(server).to receive(:start_activity_monitor)
 
       # Just verify that we can connect
       uri = URI.parse(server.base_url)
@@ -78,6 +103,9 @@ RSpec.describe MCPClient::ServerSSE do
         http_server.instance_variable_set(:@initialized, true)
         block.call
       end
+
+      # Allow activity monitor to be started
+      allow(http_server).to receive(:start_activity_monitor)
 
       # Just verify that we can connect
       uri = URI.parse(http_server.base_url)
@@ -341,17 +369,26 @@ RSpec.describe MCPClient::ServerSSE do
   end
 
   describe '#cleanup' do
-    it 'resets all connection state and thread' do
+    it 'resets all connection state and threads' do
       # Set up initial state
-      server.instance_variable_set(:@sse_thread, double('thread', kill: nil))
+      sse_thread = double('sse_thread', kill: nil)
+      activity_thread = double('activity_thread', kill: nil)
+
+      server.instance_variable_set(:@sse_thread, sse_thread)
+      server.instance_variable_set(:@activity_timer_thread, activity_thread)
       server.instance_variable_set(:@connection_established, true)
       server.instance_variable_set(:@sse_connected, true)
       server.instance_variable_set(:@tools, [double('tool')])
+
+      # Expect both threads to be killed
+      expect(sse_thread).to receive(:kill)
+      expect(activity_thread).to receive(:kill)
 
       # Call cleanup and verify state
       server.cleanup
 
       expect(server.instance_variable_get(:@sse_thread)).to be_nil
+      expect(server.instance_variable_get(:@activity_timer_thread)).to be_nil
       expect(server.instance_variable_get(:@connection_established)).to be false
       expect(server.instance_variable_get(:@sse_connected)).to be false
       expect(server.instance_variable_get(:@tools)).to be_nil
@@ -400,6 +437,136 @@ RSpec.describe MCPClient::ServerSSE do
     it 'delegates to rpc_request and returns the result' do
       allow(server).to receive(:rpc_request).with('ping').and_return({})
       expect(server.ping).to eq({})
+    end
+  end
+
+  describe '#start_activity_monitor' do
+    before do
+      # Mock activity monitor thread to prevent actual thread creation
+      allow(Thread).to receive(:new).and_return(double('thread', alive?: true))
+    end
+
+    it 'creates activity monitor thread' do
+      expect(Thread).to receive(:new).and_return(double('thread', alive?: true))
+      server.send(:start_activity_monitor)
+    end
+
+    it 'does not create thread if already running' do
+      # Set up an existing thread
+      server.instance_variable_set(:@activity_timer_thread, double('thread', alive?: true))
+
+      # Expect no new thread to be created
+      expect(Thread).not_to receive(:new)
+      server.send(:start_activity_monitor)
+    end
+
+    it 'initializes last_activity_time' do
+      allow(Thread).to receive(:new).and_return(double('thread', alive?: true))
+
+      # Track the current time before calling the method
+      before_time = Time.now
+
+      server.send(:start_activity_monitor)
+
+      # The last_activity_time should be set to a time >= the before_time
+      last_activity_time = server.instance_variable_get(:@last_activity_time)
+      expect(last_activity_time).to be >= before_time
+    end
+
+    it 'calculates close_after based on ping interval' do
+      # Create a server with custom ping value
+      custom_server = described_class.new(base_url: 'https://example.com', ping: 15)
+      # The close_after should be calculated as ping * CLOSE_AFTER_PING_RATIO
+      expected_close_after = (15 * MCPClient::ServerSSE::CLOSE_AFTER_PING_RATIO).to_i
+
+      expect(custom_server.instance_variable_get(:@close_after)).to eq(expected_close_after)
+    end
+  end
+
+  describe '#record_activity' do
+    it 'updates last_activity_time' do
+      # Track the current time before calling the method
+      before_time = Time.now
+
+      server.send(:record_activity)
+
+      # The last_activity_time should be set to a time >= the before_time
+      last_activity_time = server.instance_variable_get(:@last_activity_time)
+      expect(last_activity_time).to be >= before_time
+    end
+  end
+
+  describe 'activity monitoring' do
+    it 'calculates close_after as a multiple of ping interval' do
+      ping_value = 15
+      server = described_class.new(base_url: 'https://example.com', ping: ping_value)
+
+      expected_close_after = (ping_value * MCPClient::ServerSSE::CLOSE_AFTER_PING_RATIO).to_i
+      actual_close_after = server.instance_variable_get(:@close_after)
+
+      expect(actual_close_after).to eq(expected_close_after)
+    end
+
+    it 'initializes last_activity_time on startup' do
+      before_time = Time.now
+      server = described_class.new(base_url: 'https://example.com')
+
+      # The last_activity_time should be initialized during construction
+      last_activity_time = server.instance_variable_get(:@last_activity_time)
+      expect(last_activity_time).to be >= before_time
+    end
+
+    it 'tracks activity when receiving SSE chunks' do
+      server = described_class.new(base_url: 'https://example.com')
+
+      # Set last_activity_time to the past
+      old_time = Time.now - 10
+      server.instance_variable_set(:@last_activity_time, old_time)
+
+      # Process a message event
+      event_chunk = "event: message\ndata: {\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{}}\n\n"
+      server.send(:process_sse_chunk, event_chunk)
+
+      # Verify the last_activity_time was updated
+      last_activity_time = server.instance_variable_get(:@last_activity_time)
+      expect(last_activity_time).to be > old_time
+    end
+
+    it 'tracks activity when sending JSON-RPC requests' do
+      # Setup the server with mocked HTTP responses
+      server = described_class.new(base_url: 'https://example.com')
+
+      # Disable SSE for this test
+      server.instance_variable_set(:@use_sse, false)
+      server.instance_variable_set(:@rpc_endpoint, '/rpc')
+      server.instance_variable_set(:@connection_established, true)
+
+      # Create a Faraday connection stub
+      faraday_stubs = Faraday::Adapter::Test::Stubs.new
+      faraday_conn = Faraday.new do |builder|
+        builder.adapter :test, faraday_stubs
+      end
+
+      # Stub the Faraday response
+      faraday_stubs.post('/rpc') do |_env|
+        [200, { 'Content-Type' => 'application/json' }, '{"result": {}}']
+      end
+
+      # Set the stubbed connection
+      server.instance_variable_set(:@rpc_conn, faraday_conn)
+
+      # Set last_activity_time to the past
+      old_time = Time.now - 10
+      server.instance_variable_set(:@last_activity_time, old_time)
+      server.instance_variable_set(:@initialized, true)
+
+      # Send a request
+      request = { jsonrpc: '2.0', id: 1, method: 'test', params: {} }
+      server.send(:send_jsonrpc_request, request)
+
+      # Verify the last_activity_time was updated
+      last_activity_time = server.instance_variable_get(:@last_activity_time)
+      expect(last_activity_time).to be > old_time
     end
   end
 
@@ -609,6 +776,9 @@ RSpec.describe MCPClient::ServerSSE do
       # Expect parse_and_handle_sse_event to be called twice, once for each event
       expect(server).to receive(:parse_and_handle_sse_event).twice
 
+      # Expect activity to be recorded
+      expect(server).to receive(:record_activity)
+
       server.send(:process_sse_chunk, chunk)
     end
 
@@ -769,6 +939,31 @@ RSpec.describe MCPClient::ServerSSE do
 
       # Should not set auth_error
       expect(server.instance_variable_get(:@auth_error)).to be_nil
+    end
+  end
+
+  describe '#send_jsonrpc_request' do
+    it 'records activity when sending and receiving' do
+      # Set up a minimal request
+      request = { jsonrpc: '2.0', id: 1, method: 'test', params: {} }
+
+      # Mock the Faraday connection and response
+      mock_conn = instance_double(Faraday::Connection)
+      allow(mock_conn).to receive(:post).and_return(double('response', success?: true, body: '{"result": {}}',
+                                                                       status: 200))
+      allow(Faraday).to receive(:new).and_return(mock_conn)
+
+      # Set up a fake RPC endpoint
+      server.instance_variable_set(:@rpc_endpoint, '/rpc')
+      server.instance_variable_set(:@use_sse, false)
+
+      # Expect activity to be recorded twice - once for sending, once for receiving
+      expect(server).to receive(:record_activity).exactly(2).times
+
+      # Allow JSON parsing
+      allow(JSON).to receive(:parse).and_return({ 'result' => {} })
+
+      server.send(:send_jsonrpc_request, request)
     end
   end
 end
