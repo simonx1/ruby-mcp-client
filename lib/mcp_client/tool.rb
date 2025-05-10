@@ -46,5 +46,13 @@ module MCPClient
         input_schema: @schema
       }
     end
+
+    def to_google_tool
+      {
+        name: @name,
+        description: @description,
+        parameters: @schema
+      }
+    end
   end
 end

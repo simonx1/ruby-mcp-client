@@ -164,6 +164,39 @@ RSpec.describe MCPClient::Client do
     end
   end
 
+  describe '#to_google_tools' do
+    let(:other_tool) do
+      MCPClient::Tool.new(
+        name: 'other_tool',
+        description: 'Another test tool',
+        schema: { 'type' => 'object', 'properties' => {} }
+      )
+    end
+    let(:client) { described_class.new(mcp_server_configs: [{ type: 'stdio', command: 'test' }]) }
+
+    before do
+      allow(mock_server).to receive(:list_tools).and_return([mock_tool, other_tool])
+    end
+
+    it 'converts tools to Google tool specs' do
+      google_tools = client.to_google_tools
+      expect(google_tools.size).to eq(2)
+      expect(google_tools.first[:name]).to eq('test_tool')
+      expect(google_tools.first[:parameters]).to eq(mock_tool.schema)
+    end
+
+    it 'filters tools by name when tool_names are provided' do
+      google_tools = client.to_google_tools(tool_names: ['other_tool'])
+      expect(google_tools.size).to eq(1)
+      expect(google_tools.first[:name]).to eq('other_tool')
+    end
+
+    it 'returns empty array when no tools match the filter' do
+      google_tools = client.to_google_tools(tool_names: ['nonexistent_tool'])
+      expect(google_tools).to be_empty
+    end
+  end
+
   describe '#cleanup' do
     let(:client) { described_class.new(mcp_server_configs: [{ type: 'stdio', command: 'test' }]) }
 

@@ -36,6 +36,7 @@ with popular AI services with built-in conversions:
 
 - `to_openai_tools()` - Formats tools for OpenAI API
 - `to_anthropic_tools()` - Formats tools for Anthropic Claude API
+- `to_google_tools()` - Formats tools for Google API
 
 ## Usage
 

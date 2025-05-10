@@ -94,6 +94,12 @@ module MCPClient
       tools.map(&:to_anthropic_tool)
     end
 
+    def to_google_tools(tool_names: nil)
+      tools = list_tools
+      tools = tools.select { |t| tool_names.include?(t.name) } if tool_names
+      tools.map(&:to_google_tool)
+    end
+
     # Clean up all server connections
     def cleanup
       servers.each(&:cleanup)

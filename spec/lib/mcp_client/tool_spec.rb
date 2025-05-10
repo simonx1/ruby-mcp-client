@@ -65,4 +65,32 @@ RSpec.describe MCPClient::Tool do
       )
     end
   end
+
+  describe '#to_anthropic_tool' do
+    it 'converts the tool to Anthropic Claude tool format' do
+      anthropic_tool = tool.to_anthropic_tool
+      # Claude tool format
+      expect(anthropic_tool).to eq(
+        {
+          name: tool_name,
+          description: tool_description,
+          input_schema: tool_schema
+        }
+      )
+    end
+  end
+
+  describe '#to_google_tool' do
+    it 'converts the tool to Google tool format' do
+      google_tool = tool.to_google_tool
+      # Google tool format
+      expect(google_tool).to eq(
+        {
+          name: tool_name,
+          description: tool_description,
+          parameters: tool_schema
+        }
+      )
+    end
+  end
 end
