@@ -149,5 +149,65 @@ RSpec.describe MCPClient::Tool do
         expect(google_tool[:parameters]).to eq(expected_cleaned_schema)
       end
     end
+
+    context 'with $schema inside nested arrays' do
+      let(:schema_with_nested_arrays) do
+        {
+          '$schema' => 'http://json-schema.org/draft-07/schema#',
+          'type' => 'object',
+          'properties' => {
+            'matrix' => {
+              '$schema' => 'http://example.com/array',
+              'type' => 'array',
+              'items' => [
+                {
+                  'type' => 'array',
+                  '$schema' => 'http://example.com/nested',
+                  'items' => [
+                    { 'type' => 'string', '$schema' => 'http://example.com/str' }
+                  ]
+                },
+                { 'type' => 'number', '$schema' => 'http://example.com/num' }
+              ]
+            }
+          },
+          'required' => ['matrix']
+        }
+      end
+
+      let(:expected_nested_cleaned_schema) do
+        {
+          'type' => 'object',
+          'properties' => {
+            'matrix' => {
+              'type' => 'array',
+              'items' => [
+                {
+                  'type' => 'array',
+                  'items' => [
+                    { 'type' => 'string' }
+                  ]
+                },
+                { 'type' => 'number' }
+              ]
+            }
+          },
+          'required' => ['matrix']
+        }
+      end
+
+      let(:tool_with_nested_arrays) do
+        described_class.new(
+          name: tool_name,
+          description: tool_description,
+          schema: schema_with_nested_arrays
+        )
+      end
+
+      it 'removes $schema keys from nested arrays' do
+        google_tool = tool_with_nested_arrays.to_google_tool
+        expect(google_tool[:parameters]).to eq(expected_nested_cleaned_schema)
+      end
+    end
   end
 end

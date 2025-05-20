@@ -58,12 +58,10 @@ module MCPClient
         else
           @stdin, @stdout, @stderr, @wait_thread = Open3.popen3(*@command_array)
         end
+      elsif @env.any?
+        @stdin, @stdout, @stderr, @wait_thread = Open3.popen3(@env, @command)
       else
-        if @env.any?
-          @stdin, @stdout, @stderr, @wait_thread = Open3.popen3(@env, @command)
-        else
-          @stdin, @stdout, @stderr, @wait_thread = Open3.popen3(@command)
-        end
+        @stdin, @stdout, @stderr, @wait_thread = Open3.popen3(@command)
       end
       true
     rescue StandardError => e
