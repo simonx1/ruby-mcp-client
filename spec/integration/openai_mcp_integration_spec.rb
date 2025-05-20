@@ -2,6 +2,7 @@
 
 require 'spec_helper'
 require 'pathname'
+require 'rbconfig'
 
 RSpec.describe 'MCPClient integration with ruby-openai', :integration,
                vcr: { cassette_name: 'openai_mcp_integration' } do
@@ -11,7 +12,7 @@ RSpec.describe 'MCPClient integration with ruby-openai', :integration,
       mcp_server_configs: [
         # Use JSON-RPC stdio to communicate with the Node MCP filesystem server
         MCPClient.stdio_config(
-          command: ['npx', '-y', '@modelcontextprotocol/server-filesystem', local_path]
+          command: [RbConfig.ruby, File.expand_path('../support/fake_filesystem_mcp_server.rb', __dir__), local_path]
         )
       ]
     )
@@ -19,7 +20,7 @@ RSpec.describe 'MCPClient integration with ruby-openai', :integration,
 
   let(:openai) do
     OpenAI::Client.new(
-      access_token: ENV.fetch('OPENAI_API_KEY')
+      access_token: ENV.fetch('OPENAI_API_KEY', 'fake')
     )
   end
 

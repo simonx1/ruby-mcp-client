@@ -48,7 +48,7 @@ module MCPClient
       @env           = env || {}
     end
 
-    # Connect to the MCP server by launching the command process via stdout/stdin
+    # Connect to the MCP server by launching the command process via stdin/stdout
     # @return [Boolean] true if connection was successful
     # @raise [MCPClient::Errors::ConnectionError] if connection fails
     def connect
@@ -58,12 +58,10 @@ module MCPClient
         else
           @stdin, @stdout, @stderr, @wait_thread = Open3.popen3(*@command_array)
         end
+      elsif @env.any?
+        @stdin, @stdout, @stderr, @wait_thread = Open3.popen3(@env, @command)
       else
-        if @env.any?
-          @stdin, @stdout, @stderr, @wait_thread = Open3.popen3(@env, @command)
-        else
-          @stdin, @stdout, @stderr, @wait_thread = Open3.popen3(@command)
-        end
+        @stdin, @stdout, @stderr, @wait_thread = Open3.popen3(@command)
       end
       true
     rescue StandardError => e

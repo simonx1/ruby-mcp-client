@@ -16,7 +16,7 @@ require 'openai'
 VCR.configure do |config|
   config.cassette_library_dir = File.expand_path('cassettes', __dir__)
   config.hook_into :webmock
-  config.filter_sensitive_data('<OPENAI_API_KEY>') { ENV.fetch('OPENAI_API_KEY') }
+  config.filter_sensitive_data('<OPENAI_API_KEY>') { ENV.fetch('OPENAI_API_KEY', 'fake') }
   config.configure_rspec_metadata!
   config.ignore_localhost = true
   # Allow external connections when running integration tests
