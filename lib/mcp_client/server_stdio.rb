@@ -104,6 +104,52 @@ module MCPClient
       # Skip non-JSONRPC lines in the output stream
     end
 
+    # List all prompts available from the MCP server
+    # @return [Array<MCPClient::Prompt>] list of available prompts
+    # @raise [MCPClient::Errors::ServerError] if server returns an error
+    # @raise [MCPClient::Errors::PromptGetError] for other errors during prompt listing
+    def list_prompts
+      ensure_initialized
+      req_id = next_id
+      req = { 'jsonrpc' => '2.0', 'id' => req_id, 'method' => 'prompts/list', 'params' => {} }
+      send_request(req)
+      res = wait_response(req_id)
+      if (err = res['error'])
+        raise MCPClient::Errors::ServerError, err['message']
+      end
+
+      (res.dig('result', 'prompts') || []).map { |td| MCPClient::Prompt.from_json(td, server: self) }
+    rescue StandardError => e
+      raise MCPClient::Errors::PromptGetError, "Error listing prompts: #{e.message}"
+    end
+
+    # Get a prompt with the given parameters
+    # @param prompt_name [String] the name of the prompt to get
+    # @param parameters [Hash] the parameters to pass to the prompt
+    # @return [Object] the result of the prompt interpolation
+    # @raise [MCPClient::Errors::ServerError] if server returns an error
+    # @raise [MCPClient::Errors::PromptGetError] for other errors during prompt interpolation
+    def get_prompt(prompt_name, parameters)
+      ensure_initialized
+      req_id = next_id
+      # JSON-RPC method for getting a prompt
+      req = {
+        'jsonrpc' => '2.0',
+        'id' => req_id,
+        'method' => 'prompts/get',
+        'params' => { 'name' => prompt_name, 'arguments' => parameters }
+      }
+      send_request(req)
+      res = wait_response(req_id)
+      if (err = res['error'])
+        raise MCPClient::Errors::ServerError, err['message']
+      end
+
+      res['result']
+    rescue StandardError => e
+      raise MCPClient::Errors::PromptGetError, "Error calling prompt '#{prompt_name}': #{e.message}"
+    end
+
     # List all tools available from the MCP server
     # @return [Array<MCPClient::Tool>] list of available tools
     # @raise [MCPClient::Errors::ServerError] if server returns an error

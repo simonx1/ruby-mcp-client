@@ -3,6 +3,7 @@
 # Load all MCPClient components
 require_relative 'mcp_client/errors'
 require_relative 'mcp_client/tool'
+require_relative 'mcp_client/prompt'
 require_relative 'mcp_client/server_base'
 require_relative 'mcp_client/server_stdio'
 require_relative 'mcp_client/server_sse'

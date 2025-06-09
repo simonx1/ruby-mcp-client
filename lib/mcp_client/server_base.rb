@@ -19,6 +19,18 @@ module MCPClient
       raise NotImplementedError, 'Subclasses must implement connect'
     end
 
+    # List all prompts available from the MCP server
+    # @return [Array<MCPClient::Prompt>] list of available prompts
+    def list_prompts
+      raise NotImplementedError, 'Subclasses must implement list_prompts'
+    end
+
+    # Get a prompt with the given parameters
+    # @return [MCPClient::Prompt] prompt
+    def get_prompt(prompt_name, parameters)
+      raise NotImplementedError, 'Subclasses must implement get_prompt'
+    end
+
     # List all tools available from the MCP server
     # @return [Array<MCPClient::Tool>] list of available tools
     def list_tools
