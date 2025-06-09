@@ -101,6 +101,56 @@ module MCPClient
       end
     end
 
+    # List all prompts available from the MCP server
+    # @return [Array<MCPClient::Prompt>] list of available prompts
+    # @raise [MCPClient::Errors::ServerError] if server returns an error
+    # @raise [MCPClient::Errors::TransportError] if response isn't valid JSON
+    # @raise [MCPClient::Errors::PromptGetError] for other errors during prompt listing
+    def list_prompts
+      @mutex.synchronize do
+        return @prompts if @prompts
+      end
+
+      begin
+        ensure_initialized
+
+        prompts_data = request_prompts_list
+        @mutex.synchronize do
+          @prompts = prompts_data.map do |prompt_data|
+            MCPClient::Prompt.from_json(prompt_data, server: self)
+          end
+        end
+
+        @mutex.synchronize { @prompts }
+      rescue MCPClient::Errors::ConnectionError, MCPClient::Errors::TransportError, MCPClient::Errors::ServerError
+        # Re-raise these errors directly
+        raise
+      rescue StandardError => e
+        raise MCPClient::Errors::PromptGetError, "Error listing prompts: #{e.message}"
+      end
+    end
+
+    # Get a prompt with the given parameters
+    # @param prompt_name [String] the name of the prompt to get
+    # @param parameters [Hash] the parameters to pass to the prompt
+    # @return [Object] the result of the prompt interpolation
+    # @raise [MCPClient::Errors::ServerError] if server returns an error
+    # @raise [MCPClient::Errors::TransportError] if response isn't valid JSON
+    # @raise [MCPClient::Errors::PromptGetError] for other errors during tool execution
+    # @raise [MCPClient::Errors::ConnectionError] if server is disconnected
+    def get_prompt(prompt_name, parameters)
+      rpc_request('prompts/get', {
+                    name: prompt_name,
+                    arguments: parameters
+                  })
+    rescue MCPClient::Errors::ConnectionError, MCPClient::Errors::TransportError
+      # Re-raise connection/transport errors directly to match test expectations
+      raise
+    rescue StandardError => e
+      # For all other errors, wrap in ToolCallError
+      raise MCPClient::Errors::PromptGetError, "Error get prompt '#{prompt_name}': #{e.message}"
+    end
+
     # List all tools available from the MCP server
     # @return [Array<MCPClient::Tool>] list of available tools
     # @raise [MCPClient::Errors::ServerError] if server returns an error
@@ -423,6 +473,32 @@ module MCPClient
       end
 
       raise MCPClient::Errors::ConnectionError, "Authorization failed: #{error_message}"
+    end
+
+    # Request the prompts list using JSON-RPC
+    # @return [Array<Hash>] the prompts data
+    # @raise [MCPClient::Errors::PromptGetError] if prompts list retrieval fails
+    # @private
+    def request_prompts_list
+      @mutex.synchronize do
+        return @prompts_data if @prompts_data
+      end
+
+      result = rpc_request('prompts/list')
+
+      if result && result['prompts']
+        @mutex.synchronize do
+          @prompts_data = result['prompts']
+        end
+        return @mutex.synchronize { @prompts_data.dup }
+      elsif result
+        @mutex.synchronize do
+          @prompts_data = result
+        end
+        return @mutex.synchronize { @prompts_data.dup }
+      end
+
+      raise MCPClient::Errors::PromptGetError, 'Failed to get prompts list from JSON-RPC request'
     end
 
     # Request the tools list using JSON-RPC

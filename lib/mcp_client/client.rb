@@ -10,9 +10,11 @@ module MCPClient
     #   @return [Array<MCPClient::ServerBase>] list of servers
     # @!attribute [r] tool_cache
     #   @return [Hash<String, MCPClient::Tool>] cache of tools by name
+    # @!attribute [r] prompt_cache
+    #   @return [Hash<String, MCPClient::Prompt>] cache of prompts by name
     # @!attribute [r] logger
     #   @return [Logger] logger for client operations
-    attr_reader :servers, :tool_cache, :logger
+    attr_reader :servers, :tool_cache, :prompt_cache, :logger
 
     # Initialize a new MCPClient::Client
     # @param mcp_server_configs [Array<Hash>] configurations for MCP servers
@@ -26,6 +28,7 @@ module MCPClient
         MCPClient::ServerFactory.create(config, logger: @logger)
       end
       @tool_cache = {}
+      @prompt_cache = {}
       # JSON-RPC notification listeners
       @notification_listeners = []
       # Register default and user-defined notification handlers on each server
@@ -36,6 +39,91 @@ module MCPClient
           # Invoke user-defined listeners
           @notification_listeners.each { |cb| cb.call(server, method, params) }
         end
+      end
+    end
+
+    # Lists all available prompts from all connected MCP servers
+    # @param cache [Boolean] whether to use cached prompts or fetch fresh
+    # @return [Array<MCPClient::Prompt>] list of available prompts
+    # @raise [MCPClient::Errors::ConnectionError] on authorization failures
+    # @raise [MCPClient::Errors::PromptGetError] if no prompts could be retrieved from any server
+    def list_prompts(cache: true)
+      return @prompt_cache.values if cache && !@prompt_cache.empty?
+
+      prompts = []
+      connection_errors = []
+
+      servers.each do |server|
+        server.list_prompts.each do |prompt|
+          @prompt_cache[prompt.name] = prompt
+          prompts << prompt
+        end
+      rescue MCPClient::Errors::ConnectionError => e
+        # Fast-fail on authorization errors for better user experience
+        # If this is the first server or we haven't collected any prompts yet,
+        # raise the auth error directly to avoid cascading error messages
+        raise e if e.message.include?('Authorization failed') && prompts.empty?
+
+        # Store the error and try other servers
+        connection_errors << e
+        @logger.error("Server error: #{e.message}")
+      end
+
+      # If we didn't get any prompts from any server but have servers configured, report failure
+      if prompts.empty? && !servers.empty?
+        raise connection_errors.first if connection_errors.any?
+
+        raise MCPClient::Errors::PromptGetError, 'Failed to retrieve prompts from any server'
+      end
+
+      prompts
+    end
+
+    # Gets a specific prompt by name with the given parameters
+    # @param prompt_name [String] the name of the prompt to get
+    # @param parameters [Hash] the parameters to pass to the prompt
+    # @param server [String, Symbol, Integer, MCPClient::ServerBase, nil] optional server to use
+    # @return [Object] the final prompt
+    def get_prompt(prompt_name, parameters, server: nil)
+      prompts = list_prompts
+
+      if server
+        # Use the specified server
+        srv = select_server(server)
+        # Find the prompt on this specific server
+        prompt = prompts.find { |t| t.name == prompt_name && t.server == srv }
+        unless prompt
+          raise MCPClient::Errors::PromptNotFound,
+                "Prompt '#{prompt_name}' not found on server '#{srv.name || srv.class.name}'"
+        end
+      else
+        # Find the prompt across all servers
+        matching_prompts = prompts.select { |t| t.name == prompt_name }
+
+        if matching_prompts.empty?
+          raise MCPClient::Errors::PromptNotFound, "Prompt '#{prompt_name}' not found"
+        elsif matching_prompts.size > 1
+          # If multiple matches, disambiguate with server names
+          server_names = matching_prompts.map { |t| t.server&.name || 'unnamed' }
+          raise MCPClient::Errors::AmbiguousPromptName,
+                "Multiple prompts named '#{prompt_name}' found across servers (#{server_names.join(', ')}). " \
+                "Please specify a server using the 'server' parameter."
+        end
+
+        prompt = matching_prompts.first
+      end
+
+      # Use the prompt's associated server
+      server = prompt.server
+      raise MCPClient::Errors::ServerNotFound, "No server found for prompt '#{prompt_name}'" unless server
+
+      begin
+        server.get_prompt(prompt_name, parameters)
+      rescue MCPClient::Errors::ConnectionError => e
+        # Add server identity information to the error for better context
+        server_id = server.name ? "#{server.class}[#{server.name}]" : server.class.name
+        raise MCPClient::Errors::PromptGetError,
+              "Error getting prompt '#{prompt_name}': #{e.message} (Server: #{server_id})"
       end
     end
 
