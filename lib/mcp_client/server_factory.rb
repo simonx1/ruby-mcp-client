@@ -15,6 +15,8 @@ module MCPClient
         create_stdio_server(config, logger_to_use)
       when 'sse'
         create_sse_server(config, logger_to_use)
+      when 'http'
+        create_http_server(config, logger_to_use)
       else
         raise ArgumentError, "Unknown server type: #{config[:type]}"
       end
@@ -51,6 +53,25 @@ module MCPClient
         read_timeout: config[:read_timeout] || 30,
         ping: config[:ping] || 10,
         retries: config[:retries] || 0,
+        retry_backoff: config[:retry_backoff] || 1,
+        name: config[:name],
+        logger: logger
+      )
+    end
+
+    # Create an HTTP-based server
+    # @param config [Hash] server configuration
+    # @param logger [Logger, nil] logger to use
+    # @return [MCPClient::ServerHTTP] server instance
+    def self.create_http_server(config, logger)
+      # Handle both :url and :base_url (config parser uses :url)
+      base_url = config[:base_url] || config[:url]
+      MCPClient::ServerHTTP.new(
+        base_url: base_url,
+        endpoint: config[:endpoint] || '/rpc',
+        headers: config[:headers] || {},
+        read_timeout: config[:read_timeout] || 30,
+        retries: config[:retries] || 3,
         retry_backoff: config[:retry_backoff] || 1,
         name: config[:name],
         logger: logger

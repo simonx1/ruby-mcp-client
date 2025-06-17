@@ -1,6 +1,6 @@
 # frozen_string_literal: true
 
-require 'mcp_client/json_rpc_common'
+require_relative '../json_rpc_common'
 
 module MCPClient
   class ServerSSE

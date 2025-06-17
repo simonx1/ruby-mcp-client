@@ -8,7 +8,7 @@ require 'logger'
 module MCPClient
   # JSON-RPC implementation of MCP server over stdio.
   class ServerStdio < ServerBase
-    require 'mcp_client/server_stdio/json_rpc_transport'
+    require_relative 'server_stdio/json_rpc_transport'
 
     include JsonRpcTransport
 

@@ -6,6 +6,7 @@ require_relative 'mcp_client/tool'
 require_relative 'mcp_client/server_base'
 require_relative 'mcp_client/server_stdio'
 require_relative 'mcp_client/server_sse'
+require_relative 'mcp_client/server_http'
 require_relative 'mcp_client/server_factory'
 require_relative 'mcp_client/client'
 require_relative 'mcp_client/version'
@@ -45,6 +46,10 @@ module MCPClient
           # Use 'url' from parsed config as 'base_url' for SSE config
           configs << MCPClient.sse_config(base_url: cfg[:url], headers: cfg[:headers] || {}, name: cfg[:name],
                                           logger: logger)
+        when 'http'
+          # Use 'url' from parsed config as 'base_url' for HTTP config
+          configs << MCPClient.http_config(base_url: cfg[:url], endpoint: cfg[:endpoint], 
+                                          headers: cfg[:headers] || {}, name: cfg[:name], logger: logger)
         end
       end
     end
@@ -84,6 +89,31 @@ module MCPClient
       headers: headers,
       read_timeout: read_timeout,
       ping: ping,
+      retries: retries,
+      retry_backoff: retry_backoff,
+      name: name,
+      logger: logger
+    }
+  end
+
+  # Create a standard server configuration for HTTP
+  # @param base_url [String] base URL for the server
+  # @param endpoint [String] JSON-RPC endpoint path (default: '/rpc')
+  # @param headers [Hash] HTTP headers to include in requests
+  # @param read_timeout [Integer] read timeout in seconds (default: 30)
+  # @param retries [Integer] number of retry attempts (default: 3)
+  # @param retry_backoff [Integer] backoff delay in seconds (default: 1)
+  # @param name [String, nil] optional name for this server
+  # @param logger [Logger, nil] optional logger for server operations
+  # @return [Hash] server configuration
+  def self.http_config(base_url:, endpoint: '/rpc', headers: {}, read_timeout: 30, retries: 3, retry_backoff: 1,
+                       name: nil, logger: nil)
+    {
+      type: 'http',
+      base_url: base_url,
+      endpoint: endpoint,
+      headers: headers,
+      read_timeout: read_timeout,
       retries: retries,
       retry_backoff: retry_backoff,
       name: name,

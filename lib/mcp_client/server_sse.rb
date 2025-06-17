@@ -11,12 +11,12 @@ module MCPClient
   # Implementation of MCP server that communicates via Server-Sent Events (SSE)
   # Useful for communicating with remote MCP servers over HTTP
   class ServerSSE < ServerBase
-    require 'mcp_client/server_sse/sse_parser'
-    require 'mcp_client/server_sse/json_rpc_transport'
+    require_relative 'server_sse/sse_parser'
+    require_relative 'server_sse/json_rpc_transport'
 
     include SseParser
     include JsonRpcTransport
-    require 'mcp_client/server_sse/reconnect_monitor'
+    require_relative 'server_sse/reconnect_monitor'
 
     include ReconnectMonitor
     # Ratio of close_after timeout to ping interval

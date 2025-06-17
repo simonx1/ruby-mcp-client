@@ -30,6 +30,7 @@ via different transport mechanisms:
 
 - **Standard I/O**: Local processes implementing the MCP protocol
 - **Server-Sent Events (SSE)**: Remote MCP servers over HTTP with streaming support
+- **HTTP**: Remote MCP servers over HTTP request/response (without streaming)
 
 The core client resides in `MCPClient::Client` and provides helper methods for integrating
 with popular AI services with built-in conversions:
@@ -56,7 +57,7 @@ client = MCPClient.create_client(
     MCPClient.sse_config(
       base_url: 'https://api.example.com/sse',
       headers: { 'Authorization' => 'Bearer YOUR_TOKEN' },
-      name: 'api',      # Optional name for this server
+      name: 'sse_api',  # Optional name for this server
       read_timeout: 30, # Optional timeout in seconds (default: 30)
       ping: 10,         # Optional ping interval in seconds of inactivity (default: 10)
                         # Connection closes automatically after inactivity (2.5x ping interval)
@@ -64,7 +65,19 @@ client = MCPClient.create_client(
       retry_backoff: 1, # Optional backoff delay in seconds (default: 1)
       # Native support for tool streaming via call_tool_streaming method
       logger: Logger.new($stdout, level: Logger::INFO) # Optional logger for this server
-)  ],
+    ),
+    # Remote HTTP server (request/response without streaming)
+    MCPClient.http_config(
+      base_url: 'https://api.example.com',
+      endpoint: '/rpc', # Optional JSON-RPC endpoint path (default: '/rpc')
+      headers: { 'Authorization' => 'Bearer YOUR_TOKEN' },
+      name: 'http_api', # Optional name for this server
+      read_timeout: 30, # Optional timeout in seconds (default: 30)
+      retries: 3,       # Optional number of retry attempts (default: 3)
+      retry_backoff: 1, # Optional backoff delay in seconds (default: 1)
+      logger: Logger.new($stdout, level: Logger::INFO) # Optional logger for this server
+    )
+  ],
   # Optional logger for the client and all servers without explicit loggers
   logger: Logger.new($stdout, level: Logger::WARN)
 )
@@ -78,11 +91,12 @@ client = MCPClient.create_client(
 # MCP server configuration JSON format can be:
 # 1. A single server object: 
 #    { "type": "sse", "url": "http://example.com/sse" }
+#    { "type": "http", "url": "http://example.com", "endpoint": "/rpc" }
 # 2. An array of server objects: 
-#    [{ "type": "stdio", "command": "npx server" }, { "type": "sse", "url": "http://..." }]
+#    [{ "type": "stdio", "command": "npx server" }, { "type": "sse", "url": "http://..." }, { "type": "http", "url": "http://..." }]
 # 3. An object with "mcpServers" key containing named servers:
-#    { "mcpServers": { "server1": { "type": "sse", "url": "http://..." } } }
-#    Note: When using this format, server1 will be accessible by name
+#    { "mcpServers": { "server1": { "type": "sse", "url": "http://..." }, "server2": { "type": "http", "url": "http://..." } } }
+#    Note: When using this format, server1/server2 will be accessible by name
 
 # List available tools
 tools = client.list_tools
@@ -142,6 +156,71 @@ client.clear_cache
 # Clean up connections
 client.cleanup
 ```
+
+### HTTP Transport Example
+
+The HTTP transport provides simple request/response communication with MCP servers:
+
+```ruby
+require 'mcp_client'
+require 'logger'
+
+# Optional logger for debugging
+logger = Logger.new($stdout)
+logger.level = Logger::INFO
+
+# Create an MCP client that connects to an HTTP MCP server
+http_client = MCPClient.create_client(
+  mcp_server_configs: [
+    MCPClient.http_config(
+      base_url: 'https://api.example.com',
+      endpoint: '/mcp',     # JSON-RPC endpoint path
+      headers: {
+        'Authorization' => 'Bearer YOUR_API_TOKEN',
+        'X-Custom-Header' => 'custom-value'
+      },
+      read_timeout: 30,     # Timeout in seconds for HTTP requests
+      retries: 3,           # Number of retry attempts on transient errors
+      retry_backoff: 1,     # Base delay in seconds for exponential backoff
+      logger: logger        # Optional logger for debugging HTTP requests
+    )
+  ]
+)
+
+# List available tools
+tools = http_client.list_tools
+
+# Call a tool
+result = http_client.call_tool('analyze_data', { 
+  dataset: 'sales_2024',
+  metrics: ['revenue', 'conversion_rate']
+})
+
+# HTTP transport also supports streaming (though implemented as single response)
+# This provides API compatibility with SSE transport
+http_client.call_tool_streaming('process_batch', { batch_id: 123 }).each do |result|
+  puts "Processing result: #{result}"
+end
+
+# Send custom JSON-RPC requests
+custom_result = http_client.send_rpc('custom_method', params: { key: 'value' })
+
+# Send notifications (fire-and-forget)
+http_client.send_notification('status_update', params: { status: 'processing' })
+
+# Test connectivity
+ping_result = http_client.ping
+puts "Server is responsive: #{ping_result.inspect}"
+
+# Clean up
+http_client.cleanup
+```
+
+The HTTP transport is ideal for:
+- Simple request/response communication
+- Stateless server interactions
+- Standard REST-like API integrations
+- Environments where Server-Sent Events are not supported
 
 ### Server-Sent Events (SSE) Example
 
@@ -313,6 +392,15 @@ You can define MCP server configurations in JSON files for easier management:
         "Authorization": "Bearer TOKEN"
       }
     },
+    "api_server": {
+      "type": "http",
+      "url": "https://api.example.com",
+      "endpoint": "/mcp",
+      "headers": {
+        "Authorization": "Bearer API_TOKEN",
+        "X-Custom-Header": "value"
+      }
+    },
     "filesystem": {
       "type": "stdio",
       "command": "npx",
@@ -346,20 +434,21 @@ client = MCPClient.create_client(server_definition_file: 'path/to/definition.jso
 ```
 
 The JSON format supports:
-1. A single server object: `{ "type": "sse", "url": "..." }`
-2. An array of server objects: `[{ "type": "stdio", ... }, { "type": "sse", ... }]`
+1. A single server object: `{ "type": "sse", "url": "..." }` or `{ "type": "http", "url": "..." }`
+2. An array of server objects: `[{ "type": "stdio", ... }, { "type": "sse", ... }, { "type": "http", ... }]`
 3. An object with named servers under `mcpServers` key (as shown above)
 
 Special configuration options:
 - `comment` and `description` are reserved keys that are ignored during parsing and can be used for documentation
-- Server type can be inferred from the presence of either `command` (for stdio) or `url` (for SSE)
+- Server type can be inferred from the presence of either `command` (for stdio) or `url` (for SSE/HTTP)
+- For HTTP servers, `endpoint` specifies the JSON-RPC endpoint path (defaults to '/rpc' if not specified)
 - All string values in arrays (like `args`) are automatically converted to strings
 
 ## Key Features
 
 ### Client Features
 
-- **Multiple transports** - Support for both stdio and SSE transports
+- **Multiple transports** - Support for stdio, SSE, and HTTP transports
 - **Multiple servers** - Connect to multiple MCP servers simultaneously
 - **Named servers** - Associate names with servers and find/reference them by name
 - **Server lookup** - Find servers by name using `find_server`
@@ -403,6 +492,31 @@ The SSE client implementation provides these key features:
 - **Graceful fallbacks**: Automatic fallback to synchronous HTTP when SSE connection fails
 - **URL normalization**: Consistent URL handling that respects user-provided formats
 - **Server connectivity check**: Built-in `ping` method to test server connectivity and health
+
+### HTTP Transport Implementation
+
+The HTTP transport provides a simpler, stateless communication mechanism for MCP servers:
+
+- **Request/Response Model**: Standard HTTP request/response cycle for each JSON-RPC call
+- **Stateless Communication**: Each request is independent, making it suitable for load-balanced deployments
+- **HTTP Headers Support**: Full support for custom headers including authorization, API keys, and other metadata
+- **Reliable Error Handling**: Comprehensive HTTP status code handling with appropriate error mapping
+- **Configurable Retries**: Exponential backoff retry logic for transient network failures
+- **Connection Pooling**: Uses Faraday's connection pooling for efficient HTTP connections
+- **Timeout Management**: Configurable timeouts for both connection establishment and request completion
+- **JSON-RPC over HTTP**: Full JSON-RPC 2.0 implementation over HTTP POST requests
+- **MCP Protocol Compliance**: Supports all standard MCP methods (initialize, tools/list, tools/call)
+- **Custom RPC Methods**: Send any custom JSON-RPC method or notification
+- **Thread Safety**: All operations are thread-safe for concurrent usage
+- **Streaming API Compatibility**: Provides `call_tool_streaming` method for API compatibility (returns single response)
+- **Graceful Degradation**: Simple fallback behavior when complex features aren't needed
+
+The HTTP transport is ideal for:
+- Microservice architectures where services need to communicate via HTTP
+- Load-balanced MCP server deployments
+- Integration with existing HTTP-based APIs
+- Serverless and cloud-native deployments
+- Simple request/response patterns without the need for persistent connections
 
 ## Requirements
 
