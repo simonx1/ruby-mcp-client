@@ -8,11 +8,11 @@ require 'faraday'
 require 'faraday/retry'
 
 module MCPClient
-  # Implementation of MCP server that communicates via HTTP requests/responses
-  # Useful for communicating with MCP servers that support HTTP-based transport
-  # without Server-Sent Events streaming
-  class ServerHTTP < ServerBase
-    require_relative 'server_http/json_rpc_transport'
+  # Implementation of MCP server that communicates via Streamable HTTP transport
+  # This transport uses HTTP POST requests but expects Server-Sent Event formatted responses
+  # It's designed for servers that support streaming responses over HTTP
+  class ServerStreamableHTTP < ServerBase
+    require_relative 'server_streamable_http/json_rpc_transport'
 
     include JsonRpcTransport
 
@@ -76,11 +76,13 @@ module MCPClient
         @endpoint = endpoint
       end
       
-      # Set up headers for HTTP requests
+      # Set up headers for Streamable HTTP requests
       @headers = headers.merge({
         'Content-Type' => 'application/json',
-        'Accept' => 'application/json',
-        'User-Agent' => "ruby-mcp-client/#{MCPClient::VERSION}"
+        'Accept' => 'text/event-stream, application/json',
+        'Accept-Encoding' => 'gzip, deflate',
+        'User-Agent' => "ruby-mcp-client/#{MCPClient::VERSION}",
+        'Cache-Control' => 'no-cache'
       })
       
       @read_timeout = read_timeout
@@ -93,7 +95,7 @@ module MCPClient
       @http_conn = nil
     end
 
-    # Connect to the MCP server over HTTP
+    # Connect to the MCP server over Streamable HTTP
     # @return [Boolean] true if connection was successful
     # @raise [MCPClient::Errors::ConnectionError] if connection fails
     def connect
@@ -193,7 +195,7 @@ module MCPClient
         @connection_established = false
         @initialized = false
         
-        @logger.debug('Cleaning up HTTP connection')
+        @logger.debug('Cleaning up Streamable HTTP connection')
         
         # Close HTTP connection if it exists
         @http_conn = nil
@@ -243,9 +245,14 @@ module MCPClient
 
       result = rpc_request('tools/list')
 
-      if result && result['tools']
+      if result && result.is_a?(Hash) && result['tools']
         @mutex.synchronize do
           @tools_data = result['tools']
+        end
+        return @mutex.synchronize { @tools_data.dup }
+      elsif result && result.is_a?(Array)
+        @mutex.synchronize do
+          @tools_data = result
         end
         return @mutex.synchronize { @tools_data.dup }
       elsif result

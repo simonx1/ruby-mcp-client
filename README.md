@@ -31,6 +31,7 @@ via different transport mechanisms:
 - **Standard I/O**: Local processes implementing the MCP protocol
 - **Server-Sent Events (SSE)**: Remote MCP servers over HTTP with streaming support
 - **HTTP**: Remote MCP servers over HTTP request/response (without streaming)
+- **Streamable HTTP**: Remote MCP servers that use HTTP POST with Server-Sent Event formatted responses
 
 The core client resides in `MCPClient::Client` and provides helper methods for integrating
 with popular AI services with built-in conversions:
@@ -221,6 +222,61 @@ The HTTP transport is ideal for:
 - Stateless server interactions
 - Standard REST-like API integrations
 - Environments where Server-Sent Events are not supported
+
+### Streamable HTTP Transport Example
+
+The Streamable HTTP transport is designed for servers that use HTTP POST requests but return Server-Sent Event formatted responses. This is commonly used by services like Zapier's MCP implementation:
+
+```ruby
+require 'mcp_client'
+require 'logger'
+
+# Optional logger for debugging
+logger = Logger.new($stdout)
+logger.level = Logger::INFO
+
+# Create an MCP client that connects to a Streamable HTTP MCP server
+streamable_client = MCPClient.create_client(
+  mcp_server_configs: [
+    MCPClient.streamable_http_config(
+      base_url: 'https://mcp.zapier.com/api/mcp/s/YOUR_SESSION_ID/mcp',
+      headers: {
+        'Authorization' => 'Bearer YOUR_ZAPIER_TOKEN'
+      },
+      read_timeout: 60,     # Timeout in seconds for HTTP requests
+      retries: 3,           # Number of retry attempts on transient errors
+      retry_backoff: 2,     # Base delay in seconds for exponential backoff
+      logger: logger        # Optional logger for debugging requests
+    )
+  ]
+)
+
+# List available tools (server responds with SSE-formatted JSON)
+tools = streamable_client.list_tools
+puts "Found #{tools.size} tools:"
+tools.each { |tool| puts "- #{tool.name}: #{tool.description}" }
+
+# Call a tool (response will be in SSE format)
+result = streamable_client.call_tool('google_calendar_find_event', {
+  instructions: 'Find today\'s meetings',
+  calendarid: 'primary'
+})
+
+# The client automatically parses SSE responses like:
+# event: message
+# data: {"jsonrpc":"2.0","id":1,"result":{"content":[...]}}
+
+puts "Tool result: #{result.inspect}"
+
+# Clean up
+streamable_client.cleanup
+```
+
+The Streamable HTTP transport is ideal for:
+- Servers that return SSE-formatted responses to HTTP POST requests
+- Services like Zapier MCP that use this hybrid approach
+- Maintaining HTTP semantics while supporting structured streaming responses
+- APIs that need both HTTP compatibility and event-stream formatting
 
 ### Server-Sent Events (SSE) Example
 
@@ -448,7 +504,7 @@ Special configuration options:
 
 ### Client Features
 
-- **Multiple transports** - Support for stdio, SSE, and HTTP transports
+- **Multiple transports** - Support for stdio, SSE, HTTP, and Streamable HTTP transports
 - **Multiple servers** - Connect to multiple MCP servers simultaneously
 - **Named servers** - Associate names with servers and find/reference them by name
 - **Server lookup** - Find servers by name using `find_server`
@@ -518,6 +574,28 @@ The HTTP transport is ideal for:
 - Serverless and cloud-native deployments
 - Simple request/response patterns without the need for persistent connections
 
+### Streamable HTTP Transport Implementation
+
+The Streamable HTTP transport bridges HTTP and Server-Sent Events, designed for servers that use HTTP POST but return SSE-formatted responses:
+
+- **Hybrid Communication**: HTTP POST requests with Server-Sent Event formatted responses
+- **SSE Response Parsing**: Automatically parses `event:` and `data:` lines from SSE responses
+- **HTTP Semantics**: Maintains standard HTTP request/response model for client compatibility
+- **Streaming Format Support**: Handles complex SSE responses with multiple fields (event, id, retry, etc.)
+- **Error Handling**: Comprehensive error handling for both HTTP and SSE parsing failures
+- **Headers Optimization**: Includes SSE-compatible headers (`Accept: text/event-stream`, `Cache-Control: no-cache`)
+- **JSON-RPC Compliance**: Full JSON-RPC 2.0 support over the hybrid HTTP/SSE transport
+- **Retry Logic**: Exponential backoff for both connection and parsing failures
+- **Thread Safety**: All operations are thread-safe for concurrent usage
+- **Malformed Response Handling**: Graceful handling of invalid SSE format or missing data lines
+
+The Streamable HTTP transport is ideal for:
+- Services like Zapier MCP that use HTTP POST with SSE responses
+- APIs that need HTTP compatibility but want structured streaming responses
+- Integration with existing systems that expect HTTP while supporting event streams
+- Hybrid architectures that combine HTTP infrastructure with streaming capabilities
+- Maintaining compatibility with HTTP middleware while supporting real-time data
+
 ## Requirements
 
 - Ruby >= 3.2.0
@@ -527,7 +605,7 @@ The HTTP transport is ideal for:
 
 To implement a compatible MCP server you must:
 
-- Listen on your chosen transport (JSON-RPC stdio, or HTTP SSE)
+- Listen on your chosen transport (JSON-RPC stdio, HTTP SSE, HTTP, or Streamable HTTP)
 - Respond to `list_tools` requests with a JSON list of tools
 - Respond to `call_tool` requests by executing the specified tool
 - Return results (or errors) in JSON format
