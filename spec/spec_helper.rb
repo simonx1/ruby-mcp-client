@@ -28,6 +28,15 @@ RSpec.configure do |config|
     c.syntax = :expect
   end
 
+  # Reset WebMock before each test to ensure test isolation
+  config.before(:each) do
+    WebMock.reset!
+    WebMock.disable_net_connect!(allow_localhost: true)
+
+    # Clear any cached HTTP connections that might persist between tests
+    Faraday::ConnectionPool.instance_variable_set(:@connections, {}) if defined?(Faraday::ConnectionPool)
+  end
+
   # Disable WebMock for integration tests
   config.before(:each, integration: true) do
     WebMock.allow_net_connect!

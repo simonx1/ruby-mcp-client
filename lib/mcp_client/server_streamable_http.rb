@@ -54,6 +54,9 @@ module MCPClient
       @max_retries = retries
       @retry_backoff = retry_backoff
 
+      # Validate and normalize base_url
+      raise ArgumentError, "Invalid or insecure server URL: #{base_url}" unless valid_server_url?(base_url)
+
       # Normalize base_url and handle cases where full endpoint is provided in base_url
       uri = URI.parse(base_url.chomp('/'))
 
@@ -97,6 +100,7 @@ module MCPClient
       @initialized = false
       @http_conn = nil
       @session_id = nil
+      @last_event_id = nil
     end
 
     # Connect to the MCP server over Streamable HTTP
@@ -207,17 +211,27 @@ module MCPClient
             @logger.debug("Adding session header: Mcp-Session-Id: #{@session_id}")
           end
 
+          # Add Last-Event-ID header for resumability (if available)
+          if @last_event_id
+            req.headers['Last-Event-ID'] = @last_event_id
+            @logger.debug("Adding Last-Event-ID header: #{@last_event_id}")
+          end
+
           req.body = request.to_json
         end
 
         handle_http_error_response(response) unless response.success?
 
-        # Capture session ID from initialize response
+        # Capture session ID from initialize response with validation
         if request['method'] == 'initialize' && response.success?
           session_id = response.headers['mcp-session-id'] || response.headers['Mcp-Session-Id']
           if session_id
-            @session_id = session_id
-            @logger.debug("Captured session ID: #{@session_id}")
+            if valid_session_id?(session_id)
+              @session_id = session_id
+              @logger.debug("Captured session ID: #{@session_id}")
+            else
+              @logger.warn("Invalid session ID format received: #{session_id.inspect}")
+            end
           else
             @logger.warn('No session ID found in initialize response headers')
           end
@@ -235,10 +249,23 @@ module MCPClient
       end
     end
 
+    # Terminate the current session (if any)
+    # @return [Boolean] true if termination was successful or no session exists
+    def terminate_session
+      @mutex.synchronize do
+        return true unless @session_id
+
+        super
+      end
+    end
+
     # Clean up the server connection
     # Properly closes HTTP connections and clears cached state
     def cleanup
       @mutex.synchronize do
+        # Attempt to terminate session before cleanup
+        terminate_session if @session_id
+
         @connection_established = false
         @initialized = false
 

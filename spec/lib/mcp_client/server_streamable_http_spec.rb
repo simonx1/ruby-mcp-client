@@ -21,12 +21,7 @@ RSpec.describe MCPClient::ServerStreamableHTTP do
     )
   end
 
-  before do
-    WebMock.disable_net_connect!
-  end
-
   after do
-    WebMock.allow_net_connect!
     server.cleanup if defined?(server)
   end
 
@@ -570,6 +565,356 @@ RSpec.describe MCPClient::ServerStreamableHTTP do
       expect { server.connect }.to raise_error(
         MCPClient::Errors::ConnectionError
       )
+    end
+  end
+
+  describe 'session management' do
+    describe '#terminate_session' do
+      context 'when session ID is present' do
+        before do
+          server.instance_variable_set(:@session_id, 'streamable-session-123')
+        end
+
+        it 'sends HTTP DELETE request with session ID' do
+          stub_request(:delete, "#{base_url}#{endpoint}")
+            .with(headers: { 'Mcp-Session-Id' => 'streamable-session-123' })
+            .to_return(status: 200, body: '')
+
+          result = server.terminate_session
+          expect(result).to be true
+          expect(server.instance_variable_get(:@session_id)).to be_nil
+        end
+
+        it 'handles termination failure gracefully' do
+          stub_request(:delete, "#{base_url}#{endpoint}")
+            .to_return(status: 500, body: 'Internal Server Error')
+
+          result = server.terminate_session
+          expect(result).to be false
+        end
+
+        it 'clears session ID even on network errors' do
+          stub_request(:delete, "#{base_url}#{endpoint}")
+            .to_raise(Faraday::TimeoutError.new('Request timeout'))
+
+          result = server.terminate_session
+          expect(result).to be false
+          expect(server.instance_variable_get(:@session_id)).to be_nil
+        end
+      end
+
+      context 'when no session ID is present' do
+        it 'returns true without making a request' do
+          expect(server.terminate_session).to be true
+          expect(WebMock).not_to have_requested(:delete, "#{base_url}#{endpoint}")
+        end
+      end
+    end
+
+    describe 'session ID capture and validation' do
+      before do
+        server.instance_variable_set(:@connection_established, true)
+        server.instance_variable_set(:@initialized, true)
+      end
+
+      it 'captures valid session ID from initialize response' do
+        stub_request(:post, "#{base_url}#{endpoint}")
+          .with(body: hash_including(method: 'initialize'))
+          .to_return(
+            status: 200,
+            body: "event: message\ndata: {\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{}}\n\n",
+            headers: {
+              'Mcp-Session-Id' => 'valid-streamable-session-456',
+              'Content-Type' => 'text/event-stream'
+            }
+          )
+
+        server.send(:perform_initialize)
+        expect(server.instance_variable_get(:@session_id)).to eq('valid-streamable-session-456')
+      end
+
+      it 'rejects invalid session ID format' do
+        stub_request(:post, "#{base_url}#{endpoint}")
+          .with(body: hash_including(method: 'initialize'))
+          .to_return(
+            status: 200,
+            body: "event: message\ndata: {\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{}}\n\n",
+            headers: {
+              'Mcp-Session-Id' => 'invalid@session$format!',
+              'Content-Type' => 'text/event-stream'
+            }
+          )
+
+        server.send(:perform_initialize)
+        expect(server.instance_variable_get(:@session_id)).to be_nil
+      end
+
+      it 'handles missing session ID gracefully' do
+        stub_request(:post, "#{base_url}#{endpoint}")
+          .with(body: hash_including(method: 'initialize'))
+          .to_return(
+            status: 200,
+            body: "event: message\ndata: {\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{}}\n\n",
+            headers: { 'Content-Type' => 'text/event-stream' }
+          )
+
+        server.send(:perform_initialize)
+        expect(server.instance_variable_get(:@session_id)).to be_nil
+      end
+    end
+
+    describe 'session header injection' do
+      before do
+        server.instance_variable_set(:@connection_established, true)
+        server.instance_variable_set(:@initialized, true)
+        server.instance_variable_set(:@session_id, 'active-streamable-session-789')
+      end
+
+      it 'includes session header in non-initialize requests' do
+        stub_request(:post, "#{base_url}#{endpoint}")
+          .with(
+            headers: { 'Mcp-Session-Id' => 'active-streamable-session-789' },
+            body: hash_including(method: 'tools/list')
+          )
+          .to_return(
+            status: 200,
+            body: "event: message\ndata: {\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"tools\":[]}}\n\n",
+            headers: { 'Content-Type' => 'text/event-stream' }
+          )
+
+        server.send(:request_tools_list)
+        expect(WebMock).to have_requested(:post, "#{base_url}#{endpoint}")
+          .with(headers: { 'Mcp-Session-Id' => 'active-streamable-session-789' })
+      end
+
+      it 'does not include session header in initialize requests' do
+        stub_request(:post, "#{base_url}#{endpoint}")
+          .with(body: hash_including(method: 'initialize'))
+          .to_return(
+            status: 200,
+            body: "event: message\ndata: {\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{}}\n\n",
+            headers: { 'Content-Type' => 'text/event-stream' }
+          )
+
+        server.send(:perform_initialize)
+        expect(WebMock).to(have_requested(:post, "#{base_url}#{endpoint}")
+          .with { |req| !req.headers.key?('Mcp-Session-Id') })
+      end
+    end
+
+    describe 'cleanup with session termination' do
+      before do
+        server.instance_variable_set(:@session_id, 'cleanup-streamable-session-999')
+      end
+
+      it 'terminates session during cleanup' do
+        stub_request(:delete, "#{base_url}#{endpoint}")
+          .with(headers: { 'Mcp-Session-Id' => 'cleanup-streamable-session-999' })
+          .to_return(status: 200, body: '')
+
+        server.cleanup
+
+        expect(WebMock).to have_requested(:delete, "#{base_url}#{endpoint}")
+        expect(server.instance_variable_get(:@session_id)).to be_nil
+      end
+    end
+  end
+
+  describe 'resumability and event ID tracking' do
+    before do
+      server.instance_variable_set(:@connection_established, true)
+      server.instance_variable_set(:@initialized, true)
+    end
+
+    describe 'event ID extraction from SSE responses' do
+      it 'tracks event ID from SSE response' do
+        stub_request(:post, "#{base_url}#{endpoint}")
+          .to_return(
+            status: 200,
+            body: "event: message\nid: event-123\ndata: {\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"tools\":[]}}\n\n",
+            headers: { 'Content-Type' => 'text/event-stream' }
+          )
+
+        server.send(:request_tools_list)
+        expect(server.instance_variable_get(:@last_event_id)).to eq('event-123')
+      end
+
+      it 'handles SSE response without event ID' do
+        stub_request(:post, "#{base_url}#{endpoint}")
+          .to_return(
+            status: 200,
+            body: "event: message\ndata: {\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"tools\":[]}}\n\n",
+            headers: { 'Content-Type' => 'text/event-stream' }
+          )
+
+        server.send(:request_tools_list)
+        expect(server.instance_variable_get(:@last_event_id)).to be_nil
+      end
+
+      it 'updates event ID with each response' do
+        # First request
+        stub_request(:post, "#{base_url}#{endpoint}")
+          .to_return(
+            status: 200,
+            body: "event: message\nid: event-001\ndata: {\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"tools\":[]}}\n\n",
+            headers: { 'Content-Type' => 'text/event-stream' }
+          )
+
+        server.send(:request_tools_list)
+        expect(server.instance_variable_get(:@last_event_id)).to eq('event-001')
+
+        # Second request with new event ID
+        stub_request(:post, "#{base_url}#{endpoint}")
+          .to_return(
+            status: 200,
+            body: "event: message\nid: event-002\ndata: {\"jsonrpc\":\"2.0\",\"id\":2,\"result\":{\"content\":[]}}\n\n",
+            headers: { 'Content-Type' => 'text/event-stream' }
+          )
+
+        server.rpc_request('tools/call', { name: 'test', arguments: {} })
+        expect(server.instance_variable_get(:@last_event_id)).to eq('event-002')
+      end
+    end
+
+    describe 'Last-Event-ID header injection' do
+      before do
+        server.instance_variable_set(:@last_event_id, 'last-event-456')
+      end
+
+      it 'includes Last-Event-ID header when available' do
+        stub_request(:post, "#{base_url}#{endpoint}")
+          .with(
+            headers: { 'Last-Event-ID' => 'last-event-456' },
+            body: hash_including(method: 'tools/list')
+          )
+          .to_return(
+            status: 200,
+            body: "event: message\nid: event-457\ndata: {\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"tools\":[]}}\n\n",
+            headers: { 'Content-Type' => 'text/event-stream' }
+          )
+
+        server.send(:request_tools_list)
+        expect(WebMock).to have_requested(:post, "#{base_url}#{endpoint}")
+          .with(headers: { 'Last-Event-ID' => 'last-event-456' })
+      end
+
+      it 'includes both session and Last-Event-ID headers when both present' do
+        server.instance_variable_set(:@session_id, 'session-123')
+        server.instance_variable_set(:@last_event_id, 'event-789')
+
+        stub_request(:post, "#{base_url}#{endpoint}")
+          .with(
+            headers: {
+              'Mcp-Session-Id' => 'session-123',
+              'Last-Event-ID' => 'event-789'
+            },
+            body: hash_including(method: 'tools/list')
+          )
+          .to_return(
+            status: 200,
+            body: "event: message\ndata: {\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"tools\":[]}}\n\n",
+            headers: { 'Content-Type' => 'text/event-stream' }
+          )
+
+        server.send(:request_tools_list)
+        expect(WebMock).to have_requested(:post, "#{base_url}#{endpoint}")
+          .with(headers: {
+                  'Mcp-Session-Id' => 'session-123',
+                  'Last-Event-ID' => 'event-789'
+                })
+      end
+    end
+
+    describe 'complex SSE response parsing' do
+      it 'handles multiline SSE response with event ID' do
+        sse_response = <<~SSE
+          event: message
+          id: complex-event-123
+          retry: 1000
+          data: {"jsonrpc":"2.0","id":1,"result":{"tools":[]}}
+
+        SSE
+
+        stub_request(:post, "#{base_url}#{endpoint}")
+          .to_return(status: 200, body: sse_response, headers: { 'Content-Type' => 'text/event-stream' })
+
+        result = server.send(:request_tools_list)
+        expect(result).to eq([])
+        expect(server.instance_variable_get(:@last_event_id)).to eq('complex-event-123')
+      end
+
+      it 'handles SSE response with multiple data lines' do
+        sse_response = <<~SSE
+          event: message#{'  '}
+          id: multiline-event-456
+          data: {"jsonrpc":"2.0","id":1,
+          data: "result":{"tools":[]}}
+
+        SSE
+
+        stub_request(:post, "#{base_url}#{endpoint}")
+          .to_return(status: 200, body: sse_response, headers: { 'Content-Type' => 'text/event-stream' })
+
+        result = server.send(:request_tools_list)
+        expect(result).to eq([])
+        expect(server.instance_variable_get(:@last_event_id)).to eq('multiline-event-456')
+      end
+    end
+  end
+
+  describe 'security validation' do
+    # Session ID and URL validation tests are shared with HTTP transport
+    # through the HttpTransportBase module, so we just verify they work here
+
+    describe 'URL validation during initialization' do
+      it 'raises ArgumentError for invalid URL' do
+        expect do
+          described_class.new(base_url: 'ftp://invalid.com')
+        end.to raise_error(ArgumentError, /Invalid or insecure server URL/)
+      end
+
+      it 'raises ArgumentError for malicious URL' do
+        expect do
+          described_class.new(base_url: 'javascript:void(0)')
+        end.to raise_error(ArgumentError, /Invalid or insecure server URL/)
+      end
+    end
+
+    describe 'session ID validation in practice' do
+      before do
+        server.instance_variable_set(:@connection_established, true)
+        server.instance_variable_set(:@initialized, true)
+      end
+
+      it 'accepts alphanumeric session IDs with hyphens and underscores' do
+        stub_request(:post, "#{base_url}#{endpoint}")
+          .to_return(
+            status: 200,
+            body: "event: message\ndata: {\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{}}\n\n",
+            headers: {
+              'Mcp-Session-Id' => 'valid_session-123_abc',
+              'Content-Type' => 'text/event-stream'
+            }
+          )
+
+        server.send(:perform_initialize)
+        expect(server.instance_variable_get(:@session_id)).to eq('valid_session-123_abc')
+      end
+
+      it 'rejects session IDs with special characters' do
+        stub_request(:post, "#{base_url}#{endpoint}")
+          .to_return(
+            status: 200,
+            body: "event: message\ndata: {\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{}}\n\n",
+            headers: {
+              'Mcp-Session-Id' => 'invalid/session@123!',
+              'Content-Type' => 'text/event-stream'
+            }
+          )
+
+        server.send(:perform_initialize)
+        expect(server.instance_variable_get(:@session_id)).to be_nil
+      end
     end
   end
 end

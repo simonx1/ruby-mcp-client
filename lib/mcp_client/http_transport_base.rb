@@ -42,6 +42,76 @@ module MCPClient
       end
     end
 
+    # Terminate the current session with the server
+    # Sends an HTTP DELETE request with the session ID to properly close the session
+    # @return [Boolean] true if termination was successful
+    # @raise [MCPClient::Errors::ConnectionError] if termination fails
+    def terminate_session
+      return true unless @session_id
+
+      conn = http_connection
+
+      begin
+        @logger.debug("Terminating session: #{@session_id}")
+        response = conn.delete(@endpoint) do |req|
+          # Apply base headers but prioritize session termination headers
+          @headers.each { |k, v| req.headers[k] = v }
+          req.headers['Mcp-Session-Id'] = @session_id
+        end
+
+        if response.success?
+          @logger.debug("Session terminated successfully: #{@session_id}")
+          @session_id = nil
+          true
+        else
+          @logger.warn("Session termination failed with HTTP #{response.status}")
+          @session_id = nil # Clear session ID even on HTTP error
+          false
+        end
+      rescue Faraday::Error => e
+        @logger.warn("Session termination request failed: #{e.message}")
+        # Clear session ID even if termination request failed
+        @session_id = nil
+        false
+      end
+    end
+
+    # Validate session ID format for security
+    # @param session_id [String] the session ID to validate
+    # @return [Boolean] true if session ID is valid
+    def valid_session_id?(session_id)
+      return false unless session_id.is_a?(String)
+      return false if session_id.empty?
+
+      # Session ID should be alphanumeric with optional hyphens and underscores
+      # Length should be reasonable (8-128 characters)
+      session_id.match?(/\A[a-zA-Z0-9\-_]{8,128}\z/)
+    end
+
+    # Validate the server's base URL for security
+    # @param url [String] the URL to validate
+    # @return [Boolean] true if URL is considered safe
+    def valid_server_url?(url)
+      return false unless url.is_a?(String)
+
+      uri = URI.parse(url)
+
+      # Only allow HTTP and HTTPS protocols
+      return false unless %w[http https].include?(uri.scheme)
+
+      # Must have a host
+      return false if uri.host.nil? || uri.host.empty?
+
+      # Don't allow localhost binding to all interfaces in production
+      if uri.host == '0.0.0.0'
+        @logger.warn('Server URL uses 0.0.0.0 which may be insecure. Consider using 127.0.0.1 for localhost.')
+      end
+
+      true
+    rescue URI::InvalidURIError
+      false
+    end
+
     private
 
     # Generate initialization parameters for HTTP MCP protocol

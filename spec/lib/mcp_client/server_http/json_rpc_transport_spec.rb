@@ -48,14 +48,6 @@ RSpec.describe MCPClient::ServerHTTP::JsonRpcTransport do
 
   subject(:transport) { dummy_class.new }
 
-  before do
-    WebMock.disable_net_connect!
-  end
-
-  after do
-    WebMock.allow_net_connect!
-  end
-
   describe '#rpc_request' do
     let(:method_name) { 'test_method' }
     let(:params) { { key: 'value' } }

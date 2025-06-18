@@ -49,14 +49,6 @@ RSpec.describe MCPClient::ServerStreamableHTTP::JsonRpcTransport do
 
   subject(:transport) { dummy_class.new }
 
-  before do
-    WebMock.disable_net_connect!
-  end
-
-  after do
-    WebMock.allow_net_connect!
-  end
-
   describe '#rpc_request' do
     let(:method_name) { 'test_method' }
     let(:params) { { key: 'value' } }
@@ -94,9 +86,6 @@ RSpec.describe MCPClient::ServerStreamableHTTP::JsonRpcTransport do
     end
 
     it 'increments request ID for each request' do
-      # Clear any existing stubs to create fresh ones for this test
-      WebMock.reset!
-
       # Stub for the first request
       stub_request(:post, 'https://example.com/rpc')
         .with do |request|
@@ -437,7 +426,8 @@ RSpec.describe MCPClient::ServerStreamableHTTP::JsonRpcTransport do
   end
 
   describe '#parse_response' do
-    let(:mock_response) { double('response', body: response_body) }
+    let(:mock_response) { double('response', body: response_body, headers: response_headers) }
+    let(:response_headers) { { 'content-type' => 'text/event-stream' } }
 
     context 'with valid SSE JSON response' do
       let(:response_body) do

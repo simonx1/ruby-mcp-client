@@ -6,6 +6,7 @@ require_relative '../lib/mcp_client'
 require 'bundler/setup'
 require 'openai'
 require 'json'
+require 'logger'
 
 # Ensure the OPENAI_API_KEY environment variable is set
 api_key = ENV.fetch('OPENAI_API_KEY', nil)

@@ -21,14 +21,6 @@ RSpec.describe MCPClient::ServerHTTP do
     )
   end
 
-  before do
-    WebMock.disable_net_connect!
-  end
-
-  after do
-    WebMock.allow_net_connect!
-  end
-
   describe '#initialize' do
     it 'sets the base URL correctly' do
       expect(server.base_url).to eq(base_url)
@@ -543,6 +535,242 @@ RSpec.describe MCPClient::ServerHTTP do
         expect { server.rpc_request('test') }.to raise_error(
           MCPClient::Errors::ConnectionError
         )
+      end
+    end
+  end
+
+  describe 'session management' do
+    describe '#terminate_session' do
+      context 'when session ID is present' do
+        before do
+          server.instance_variable_set(:@session_id, 'test-session-123')
+        end
+
+        it 'sends HTTP DELETE request with session ID' do
+          stub_request(:delete, "#{base_url}#{endpoint}")
+            .with(headers: { 'Mcp-Session-Id' => 'test-session-123' })
+            .to_return(status: 200, body: '')
+
+          result = server.terminate_session
+          expect(result).to be true
+          expect(server.instance_variable_get(:@session_id)).to be_nil
+        end
+
+        it 'handles termination failure gracefully' do
+          stub_request(:delete, "#{base_url}#{endpoint}")
+            .to_return(status: 400, body: 'Bad Request')
+
+          result = server.terminate_session
+          expect(result).to be false
+        end
+
+        it 'clears session ID even on network errors' do
+          stub_request(:delete, "#{base_url}#{endpoint}")
+            .to_raise(Faraday::ConnectionFailed.new('Connection failed'))
+
+          result = server.terminate_session
+          expect(result).to be false
+          expect(server.instance_variable_get(:@session_id)).to be_nil
+        end
+      end
+
+      context 'when no session ID is present' do
+        it 'returns true without making a request' do
+          expect(server.terminate_session).to be true
+          expect(WebMock).not_to have_requested(:delete, "#{base_url}#{endpoint}")
+        end
+      end
+    end
+
+    describe 'session ID capture and validation' do
+      before do
+        server.instance_variable_set(:@connection_established, true)
+        server.instance_variable_set(:@initialized, true)
+      end
+
+      it 'captures valid session ID from initialize response' do
+        stub_request(:post, "#{base_url}#{endpoint}")
+          .with(body: hash_including(method: 'initialize'))
+          .to_return(
+            status: 200,
+            body: { jsonrpc: '2.0', id: 1, result: {} }.to_json,
+            headers: { 'Mcp-Session-Id' => 'valid-session-123' }
+          )
+
+        server.send(:perform_initialize)
+        expect(server.instance_variable_get(:@session_id)).to eq('valid-session-123')
+      end
+
+      it 'rejects invalid session ID format' do
+        stub_request(:post, "#{base_url}#{endpoint}")
+          .with(body: hash_including(method: 'initialize'))
+          .to_return(
+            status: 200,
+            body: { jsonrpc: '2.0', id: 1, result: {} }.to_json,
+            headers: { 'Mcp-Session-Id' => 'invalid@session!' }
+          )
+
+        server.send(:perform_initialize)
+        expect(server.instance_variable_get(:@session_id)).to be_nil
+      end
+
+      it 'handles missing session ID gracefully' do
+        stub_request(:post, "#{base_url}#{endpoint}")
+          .with(body: hash_including(method: 'initialize'))
+          .to_return(
+            status: 200,
+            body: { jsonrpc: '2.0', id: 1, result: {} }.to_json,
+            headers: {}
+          )
+
+        server.send(:perform_initialize)
+        expect(server.instance_variable_get(:@session_id)).to be_nil
+      end
+    end
+
+    describe 'session header injection' do
+      before do
+        server.instance_variable_set(:@connection_established, true)
+        server.instance_variable_set(:@initialized, true)
+        server.instance_variable_set(:@session_id, 'active-session-456')
+      end
+
+      it 'includes session header in non-initialize requests' do
+        stub_request(:post, "#{base_url}#{endpoint}")
+          .with(
+            headers: { 'Mcp-Session-Id' => 'active-session-456' },
+            body: hash_including(method: 'tools/list')
+          )
+          .to_return(
+            status: 200,
+            body: { jsonrpc: '2.0', id: 1, result: { tools: [] } }.to_json
+          )
+
+        server.send(:request_tools_list)
+        expect(WebMock).to have_requested(:post, "#{base_url}#{endpoint}")
+          .with(headers: { 'Mcp-Session-Id' => 'active-session-456' })
+      end
+
+      it 'does not include session header in initialize requests' do
+        stub_request(:post, "#{base_url}#{endpoint}")
+          .with(body: hash_including(method: 'initialize'))
+          .to_return(
+            status: 200,
+            body: { jsonrpc: '2.0', id: 1, result: {} }.to_json
+          )
+
+        server.send(:perform_initialize)
+        expect(WebMock).to(have_requested(:post, "#{base_url}#{endpoint}")
+          .with { |req| !req.headers.key?('Mcp-Session-Id') })
+      end
+    end
+
+    describe 'cleanup with session termination' do
+      before do
+        server.instance_variable_set(:@session_id, 'cleanup-session-789')
+      end
+
+      it 'terminates session during cleanup' do
+        stub_request(:delete, "#{base_url}#{endpoint}")
+          .with(headers: { 'Mcp-Session-Id' => 'cleanup-session-789' })
+          .to_return(status: 200, body: '')
+
+        server.cleanup
+
+        expect(WebMock).to have_requested(:delete, "#{base_url}#{endpoint}")
+        expect(server.instance_variable_get(:@session_id)).to be_nil
+      end
+    end
+  end
+
+  describe 'security validation' do
+    describe '#valid_session_id?' do
+      valid_session_ids = [
+        'abc123def456',
+        'session_id_123',
+        'sess-123-abc_def',
+        'a1b2c3d4e5f6g7h8',
+        '12345678' # minimum length
+      ]
+
+      invalid_session_ids = [
+        '', # empty
+        'short', # too short
+        'x' * 200,           # too long
+        'session@id',        # invalid characters
+        'session id',        # spaces
+        'session.id',        # dots
+        'session/id',        # slashes
+        'session%id'         # percent encoding
+      ]
+
+      valid_session_ids.each do |session_id|
+        it "accepts valid session ID: '#{session_id}'" do
+          expect(server.send(:valid_session_id?, session_id)).to be true
+        end
+      end
+
+      invalid_session_ids.each do |session_id|
+        it "rejects invalid session ID: '#{session_id.length > 20 ? "#{session_id[0..17]}..." : session_id}'" do
+          expect(server.send(:valid_session_id?, session_id)).to be false
+        end
+      end
+
+      it 'rejects non-string input' do
+        expect(server.send(:valid_session_id?, nil)).to be false
+        expect(server.send(:valid_session_id?, 123)).to be false
+        expect(server.send(:valid_session_id?, [])).to be false
+      end
+    end
+
+    describe '#valid_server_url?' do
+      valid_urls = [
+        'http://localhost:3000',
+        'https://api.example.com',
+        'http://127.0.0.1:8080',
+        'https://subdomain.example.com/path'
+      ]
+
+      invalid_urls = [
+        'ftp://example.com',    # invalid protocol
+        'file:///path/to/file', # file protocol
+        'javascript:alert(1)',  # javascript protocol
+        'not-a-url',           # invalid format
+        '',                    # empty
+        'http://',             # incomplete
+        'https://'             # incomplete
+      ]
+
+      valid_urls.each do |url|
+        it "accepts valid URL: '#{url}'" do
+          expect(server.send(:valid_server_url?, url)).to be true
+        end
+      end
+
+      invalid_urls.each do |url|
+        it "rejects invalid URL: '#{url}'" do
+          expect(server.send(:valid_server_url?, url)).to be false
+        end
+      end
+
+      it 'rejects non-string input' do
+        expect(server.send(:valid_server_url?, nil)).to be false
+        expect(server.send(:valid_server_url?, 123)).to be false
+        expect(server.send(:valid_server_url?, [])).to be false
+      end
+    end
+
+    describe 'URL validation during initialization' do
+      it 'raises ArgumentError for invalid URL' do
+        expect do
+          described_class.new(base_url: 'ftp://invalid.com')
+        end.to raise_error(ArgumentError, /Invalid or insecure server URL/)
+      end
+
+      it 'raises ArgumentError for malicious URL' do
+        expect do
+          described_class.new(base_url: 'javascript:alert(1)')
+        end.to raise_error(ArgumentError, /Invalid or insecure server URL/)
       end
     end
   end

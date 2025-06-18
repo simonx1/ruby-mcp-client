@@ -19,12 +19,7 @@ RSpec.describe 'Streamable HTTP Transport Integration', type: :integration do
     )
   end
 
-  before do
-    WebMock.disable_net_connect!
-  end
-
   after do
-    WebMock.allow_net_connect!
     server.cleanup if defined?(server)
   end
 

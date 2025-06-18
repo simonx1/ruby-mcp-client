@@ -492,17 +492,60 @@ Special configuration options:
 
 Both HTTP and Streamable HTTP transports now support session-based MCP servers that require session continuity:
 
+### Session Management Features
+
 - **Automatic Session Management**: Captures session IDs from `initialize` response headers
 - **Session Header Injection**: Automatically includes `Mcp-Session-Id` header in subsequent requests
+- **Session Termination**: Sends HTTP DELETE requests to properly terminate sessions during cleanup
+- **Session Validation**: Validates session ID format for security (8-128 alphanumeric characters with hyphens/underscores)
 - **Backward Compatibility**: Works with both session-based and stateless MCP servers
 - **Session Cleanup**: Properly cleans up session state during connection teardown
 
+### Resumability and Redelivery (Streamable HTTP)
+
+The Streamable HTTP transport provides additional resumability features for reliable message delivery:
+
+- **Event ID Tracking**: Automatically tracks event IDs from SSE responses
+- **Last-Event-ID Header**: Includes `Last-Event-ID` header in requests for resuming from disconnection points
+- **Message Replay**: Enables servers to replay missed messages from the last received event
+- **Connection Recovery**: Maintains message continuity even with unstable network connections
+
+### Security Features
+
+Both transports implement security best practices:
+
+- **URL Validation**: Validates server URLs to ensure only HTTP/HTTPS protocols are used
+- **Session ID Validation**: Enforces secure session ID formats to prevent malicious injection
+- **Security Warnings**: Logs warnings for potentially insecure configurations (e.g., 0.0.0.0 binding)
+- **Header Sanitization**: Properly handles and validates all session-related headers
+
+### Usage
+
 The session support is transparent to the user - no additional configuration is required. The client will automatically detect and handle session-based servers by:
 
-1. Capturing the `Mcp-Session-Id` header from the `initialize` response
-2. Including this header in all subsequent requests (except `initialize`)
-3. Logging session activity for debugging purposes
-4. Cleaning up session state when the connection is closed
+1. **Session Initialization**: Capturing the `Mcp-Session-Id` header from the `initialize` response
+2. **Session Persistence**: Including this header in all subsequent requests (except `initialize`)
+3. **Session Termination**: Sending HTTP DELETE request with session ID during cleanup
+4. **Resumability** (Streamable HTTP): Tracking event IDs and including `Last-Event-ID` for message replay
+5. **Security Validation**: Validating session IDs and server URLs for security
+6. **Logging**: Comprehensive logging of session activity for debugging purposes
+
+Example of automatic session termination:
+
+```ruby
+# Session is automatically terminated when client is cleaned up
+client = MCPClient.create_client(
+  mcp_server_configs: [
+    MCPClient.http_config(base_url: 'https://api.example.com/mcp')
+  ]
+)
+
+# Use the client...
+tools = client.list_tools
+
+# Session automatically terminated with HTTP DELETE request
+client.cleanup
+```
 
 This enables compatibility with MCP servers that maintain state between requests and require session identification.
 
@@ -562,6 +605,8 @@ The HTTP transport provides a simpler, stateless communication mechanism for MCP
 - **Request/Response Model**: Standard HTTP request/response cycle for each JSON-RPC call
 - **JSON-Only Responses**: Accepts only `application/json` responses (no SSE support)
 - **Session Support**: Automatic session header (`Mcp-Session-Id`) capture and injection for session-based MCP servers
+- **Session Termination**: Proper session cleanup with HTTP DELETE requests during connection teardown
+- **Session Validation**: Security validation of session IDs to prevent malicious injection
 - **Stateless & Stateful**: Supports both stateless servers and session-based servers that require state continuity
 - **HTTP Headers Support**: Full support for custom headers including authorization, API keys, and other metadata
 - **Reliable Error Handling**: Comprehensive HTTP status code handling with appropriate error mapping
@@ -582,6 +627,9 @@ The Streamable HTTP transport bridges HTTP and Server-Sent Events, designed for 
 - **Hybrid Communication**: HTTP POST requests with Server-Sent Event formatted responses
 - **SSE Response Parsing**: Automatically parses `event:` and `data:` lines from SSE responses
 - **Session Support**: Automatic session header (`Mcp-Session-Id`) capture and injection for session-based MCP servers
+- **Session Termination**: Proper session cleanup with HTTP DELETE requests during connection teardown
+- **Resumability**: Event ID tracking and `Last-Event-ID` header support for message replay after disconnections
+- **Session Validation**: Security validation of session IDs to prevent malicious injection
 - **HTTP Semantics**: Maintains standard HTTP request/response model for client compatibility
 - **Streaming Format Support**: Handles complex SSE responses with multiple fields (event, id, retry, etc.)
 - **Error Handling**: Comprehensive error handling for both HTTP and SSE parsing failures

@@ -7,6 +7,7 @@
 require_relative '../lib/mcp_client'
 require 'openai'
 require 'json'
+require 'logger'
 
 # Ensure the OPENAI_API_KEY environment variable is set
 api_key = ENV.fetch('OPENAI_API_KEY', nil)
@@ -14,7 +15,7 @@ abort 'Please set OPENAI_API_KEY' unless api_key
 
 # Create an MCPClient client (SSE server for demo)
 logger = Logger.new($stdout)
-logger.level = Logger::WARN
+logger.level = Logger::DEBUG
 mcp_client = MCPClient::Client.new(
   mcp_server_configs: [
     MCPClient.sse_config(

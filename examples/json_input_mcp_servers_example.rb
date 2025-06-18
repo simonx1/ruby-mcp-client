@@ -16,7 +16,7 @@ require 'logger'
 
 # Create a logger for debugging (optional)
 logger = Logger.new($stdout)
-logger.level = Logger::INFO
+logger.level = Logger::WARN # INFO
 
 # Create an MCP client that connects to multiple servers defined in a JSON file
 # Server names from the JSON file are preserved and can be used for disambiguation
