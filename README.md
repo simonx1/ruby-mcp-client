@@ -30,7 +30,7 @@ via different transport mechanisms:
 
 - **Standard I/O**: Local processes implementing the MCP protocol
 - **Server-Sent Events (SSE)**: Remote MCP servers over HTTP with streaming support
-- **HTTP**: Remote MCP servers over HTTP request/response (without streaming)
+- **HTTP**: Remote MCP servers over HTTP request/response (non-streaming Streamable HTTP)
 - **Streamable HTTP**: Remote MCP servers that use HTTP POST with Server-Sent Event formatted responses
 
 The core client resides in `MCPClient::Client` and provides helper methods for integrating
