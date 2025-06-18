@@ -217,12 +217,6 @@ puts "Server is responsive: #{ping_result.inspect}"
 http_client.cleanup
 ```
 
-The HTTP transport is ideal for:
-- Simple request/response communication
-- Stateless server interactions
-- Standard REST-like API integrations
-- Environments where Server-Sent Events are not supported
-
 ### Streamable HTTP Transport Example
 
 The Streamable HTTP transport is designed for servers that use HTTP POST requests but return Server-Sent Event formatted responses. This is commonly used by services like Zapier's MCP implementation:
@@ -494,6 +488,24 @@ Special configuration options:
 - For HTTP servers, `endpoint` specifies the JSON-RPC endpoint path (defaults to '/rpc' if not specified)
 - All string values in arrays (like `args`) are automatically converted to strings
 
+## Session-Based MCP Protocol Support
+
+Both HTTP and Streamable HTTP transports now support session-based MCP servers that require session continuity:
+
+- **Automatic Session Management**: Captures session IDs from `initialize` response headers
+- **Session Header Injection**: Automatically includes `Mcp-Session-Id` header in subsequent requests
+- **Backward Compatibility**: Works with both session-based and stateless MCP servers
+- **Session Cleanup**: Properly cleans up session state during connection teardown
+
+The session support is transparent to the user - no additional configuration is required. The client will automatically detect and handle session-based servers by:
+
+1. Capturing the `Mcp-Session-Id` header from the `initialize` response
+2. Including this header in all subsequent requests (except `initialize`)
+3. Logging session activity for debugging purposes
+4. Cleaning up session state when the connection is closed
+
+This enables compatibility with MCP servers that maintain state between requests and require session identification.
+
 ## Key Features
 
 ### Client Features
@@ -548,7 +560,9 @@ The SSE client implementation provides these key features:
 The HTTP transport provides a simpler, stateless communication mechanism for MCP servers:
 
 - **Request/Response Model**: Standard HTTP request/response cycle for each JSON-RPC call
-- **Stateless Communication**: Each request is independent, making it suitable for load-balanced deployments
+- **JSON-Only Responses**: Accepts only `application/json` responses (no SSE support)
+- **Session Support**: Automatic session header (`Mcp-Session-Id`) capture and injection for session-based MCP servers
+- **Stateless & Stateful**: Supports both stateless servers and session-based servers that require state continuity
 - **HTTP Headers Support**: Full support for custom headers including authorization, API keys, and other metadata
 - **Reliable Error Handling**: Comprehensive HTTP status code handling with appropriate error mapping
 - **Configurable Retries**: Exponential backoff retry logic for transient network failures
@@ -567,10 +581,11 @@ The Streamable HTTP transport bridges HTTP and Server-Sent Events, designed for 
 
 - **Hybrid Communication**: HTTP POST requests with Server-Sent Event formatted responses
 - **SSE Response Parsing**: Automatically parses `event:` and `data:` lines from SSE responses
+- **Session Support**: Automatic session header (`Mcp-Session-Id`) capture and injection for session-based MCP servers
 - **HTTP Semantics**: Maintains standard HTTP request/response model for client compatibility
 - **Streaming Format Support**: Handles complex SSE responses with multiple fields (event, id, retry, etc.)
 - **Error Handling**: Comprehensive error handling for both HTTP and SSE parsing failures
-- **Headers Optimization**: Includes SSE-compatible headers (`Accept: text/event-stream`, `Cache-Control: no-cache`)
+- **Headers Optimization**: Includes SSE-compatible headers (`Accept: text/event-stream, application/json`, `Cache-Control: no-cache`)
 - **JSON-RPC Compliance**: Full JSON-RPC 2.0 support over the hybrid HTTP/SSE transport
 - **Retry Logic**: Exponential backoff for both connection and parsing failures
 - **Thread Safety**: All operations are thread-safe for concurrent usage
