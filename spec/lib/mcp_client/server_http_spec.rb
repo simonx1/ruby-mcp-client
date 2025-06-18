@@ -54,6 +54,34 @@ RSpec.describe MCPClient::ServerHTTP do
       expect(server_with_path.endpoint).to eq('/mcp')
     end
 
+    it 'uses HTTP protocol version for initialization' do
+      # Mock the initialize request to verify protocol version
+      init_request_body = nil
+      stub_request(:post, "#{base_url}#{endpoint}")
+        .with do |request|
+          init_request_body = JSON.parse(request.body)
+          init_request_body['method'] == 'initialize'
+        end
+        .to_return(
+          status: 200,
+          body: JSON.generate({
+            jsonrpc: '2.0',
+            id: 1,
+            result: {
+              protocolVersion: MCPClient::HTTP_PROTOCOL_VERSION,
+              capabilities: {},
+              serverInfo: { name: 'test-server', version: '1.0.0' }
+            }
+          }),
+          headers: { 'Content-Type' => 'application/json' }
+        )
+
+      server.connect
+
+      expect(init_request_body['params']['protocolVersion']).to eq(MCPClient::HTTP_PROTOCOL_VERSION)
+      expect(init_request_body['params']['protocolVersion']).to eq('2025-03-26')
+    end
+
     it 'handles base_url with path and explicit endpoint' do
       server_explicit = described_class.new(
         base_url: 'https://example.com/api', 

@@ -87,6 +87,10 @@ module MCPClient
         parse_stdio_config(clean, config, server_name)
       when 'sse'
         return nil unless parse_sse_config(clean, config, server_name)
+      when 'streamable_http'
+        return nil unless parse_streamable_http_config(clean, config, server_name)
+      when 'http'
+        return nil unless parse_http_config(clean, config, server_name)
       else
         @logger.warn("Unrecognized type '#{type}' for server '#{server_name}'; skipping.")
         return nil
@@ -106,7 +110,9 @@ module MCPClient
       inferred_type = if config.key?('command') || config.key?('args') || config.key?('env')
                         'stdio'
                       elsif config.key?('url')
-                        'sse'
+                        # Default to streamable_http unless URL contains "sse"
+                        url = config['url'].to_s.downcase
+                        url.include?('sse') ? 'sse' : 'streamable_http'
                       end
 
       if inferred_type
@@ -178,6 +184,72 @@ module MCPClient
       # Update clean config
       clean[:url] = source
       clean[:headers] = headers
+      true
+    end
+
+    # Parse Streamable HTTP-specific configuration
+    # @param clean [Hash] clean configuration hash to update
+    # @param config [Hash] raw configuration from JSON
+    # @param server_name [String] name of the server for error reporting
+    # @return [Boolean] true if parsing succeeded, false if required elements are missing
+    def parse_streamable_http_config(clean, config, server_name)
+      # URL is required
+      source = config['url']
+      unless source
+        @logger.warn("Streamable HTTP server '#{server_name}' is missing required 'url' property; skipping.")
+        return false
+      end
+
+      unless source.is_a?(String)
+        @logger.warn("'url' for server '#{server_name}' is not a string; converting to string.")
+        source = source.to_s
+      end
+
+      # Headers are optional
+      headers = config['headers']
+      headers = headers.is_a?(Hash) ? headers.transform_keys(&:to_s) : {}
+
+      # Endpoint is optional (defaults to '/rpc' in the transport)
+      endpoint = config['endpoint']
+      endpoint = endpoint.to_s if endpoint && !endpoint.is_a?(String)
+
+      # Update clean config
+      clean[:url] = source
+      clean[:headers] = headers
+      clean[:endpoint] = endpoint if endpoint
+      true
+    end
+
+    # Parse HTTP-specific configuration
+    # @param clean [Hash] clean configuration hash to update
+    # @param config [Hash] raw configuration from JSON
+    # @param server_name [String] name of the server for error reporting
+    # @return [Boolean] true if parsing succeeded, false if required elements are missing
+    def parse_http_config(clean, config, server_name)
+      # URL is required
+      source = config['url']
+      unless source
+        @logger.warn("HTTP server '#{server_name}' is missing required 'url' property; skipping.")
+        return false
+      end
+
+      unless source.is_a?(String)
+        @logger.warn("'url' for server '#{server_name}' is not a string; converting to string.")
+        source = source.to_s
+      end
+
+      # Headers are optional
+      headers = config['headers']
+      headers = headers.is_a?(Hash) ? headers.transform_keys(&:to_s) : {}
+
+      # Endpoint is optional (defaults to '/rpc' in the transport)
+      endpoint = config['endpoint']
+      endpoint = endpoint.to_s if endpoint && !endpoint.is_a?(String)
+
+      # Update clean config
+      clean[:url] = source
+      clean[:headers] = headers
+      clean[:endpoint] = endpoint if endpoint
       true
     end
 
