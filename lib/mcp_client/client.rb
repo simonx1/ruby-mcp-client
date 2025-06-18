@@ -70,7 +70,7 @@ module MCPClient
       if tools.empty? && !servers.empty?
         raise connection_errors.first if connection_errors.any?
 
-        raise MCPClient::Errors::ToolCallError, 'Failed to retrieve tools from any server'
+        @logger.warn('No tools found from any server.')
       end
 
       tools
