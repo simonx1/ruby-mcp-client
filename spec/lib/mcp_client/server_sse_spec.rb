@@ -315,7 +315,7 @@ RSpec.describe MCPClient::ServerSSE do
   describe '#call_tool' do
     let(:tool_name) { 'test_tool' }
     let(:parameters) { { foo: 'bar' } }
-    let(:result) { { 'output' => 'success' } }
+    let(:result) { { output: 'success' } }
 
     before do
       # Stub initialization to avoid real SSE connection
@@ -367,7 +367,7 @@ RSpec.describe MCPClient::ServerSSE do
       server.instance_variable_set(:@sse_connected, true)
 
       response = server.call_tool(tool_name, parameters)
-      expect(response).to eq(result)
+      expect(response).to eq({ 'output' => 'success' })
     end
 
     it 'raises ToolCallError on non-success response' do

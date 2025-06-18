@@ -71,10 +71,10 @@ RSpec.describe MCPClient::JsonRpcCommon do
     it 'builds a proper JSON-RPC request object' do
       request = instance.build_jsonrpc_request('test_method', { param1: 'value1' }, 123)
       expect(request).to eq({
-                              jsonrpc: '2.0',
-                              id: 123,
-                              method: 'test_method',
-                              params: { param1: 'value1' }
+                              'jsonrpc' => '2.0',
+                              'id' => 123,
+                              'method' => 'test_method',
+                              'params' => { param1: 'value1' }
                             })
     end
   end
@@ -83,9 +83,9 @@ RSpec.describe MCPClient::JsonRpcCommon do
     it 'builds a proper JSON-RPC notification object (no id)' do
       notification = instance.build_jsonrpc_notification('test_notification', { param1: 'value1' })
       expect(notification).to eq({
-                                   jsonrpc: '2.0',
-                                   method: 'test_notification',
-                                   params: { param1: 'value1' }
+                                   'jsonrpc' => '2.0',
+                                   'method' => 'test_notification',
+                                   'params' => { param1: 'value1' }
                                  })
     end
   end

@@ -274,7 +274,7 @@ RSpec.describe MCPClient::ServerStreamableHTTP::JsonRpcTransport do
           double('response', body: sse_response)
         end
 
-        allow(transport).to receive(:parse_streamable_http_response).and_return(response_data[:result])
+        allow(transport).to receive(:parse_response).and_return(response_data[:result])
 
         result = transport.rpc_request(method_name, params)
         expect(result).to eq(response_data[:result])
@@ -436,7 +436,7 @@ RSpec.describe MCPClient::ServerStreamableHTTP::JsonRpcTransport do
     end
   end
 
-  describe '#parse_streamable_http_response' do
+  describe '#parse_response' do
     let(:mock_response) { double('response', body: response_body) }
 
     context 'with valid SSE JSON response' do
@@ -452,7 +452,7 @@ RSpec.describe MCPClient::ServerStreamableHTTP::JsonRpcTransport do
       end
 
       it 'parses SSE and returns result' do
-        result = transport.send(:parse_streamable_http_response, mock_response)
+        result = transport.send(:parse_response, mock_response)
         expect(result).to eq({ 'data' => 'test' })
       end
     end
@@ -470,7 +470,7 @@ RSpec.describe MCPClient::ServerStreamableHTTP::JsonRpcTransport do
       end
 
       it 'raises ServerError with error message' do
-        expect { transport.send(:parse_streamable_http_response, mock_response) }.to raise_error(
+        expect { transport.send(:parse_response, mock_response) }.to raise_error(
           MCPClient::Errors::ServerError,
           'Test error'
         )
@@ -481,7 +481,7 @@ RSpec.describe MCPClient::ServerStreamableHTTP::JsonRpcTransport do
       let(:response_body) { "event: message\ndata: invalid json\n\n" }
 
       it 'raises TransportError' do
-        expect { transport.send(:parse_streamable_http_response, mock_response) }.to raise_error(
+        expect { transport.send(:parse_response, mock_response) }.to raise_error(
           MCPClient::Errors::TransportError,
           /Invalid JSON response from server/
         )
@@ -492,7 +492,7 @@ RSpec.describe MCPClient::ServerStreamableHTTP::JsonRpcTransport do
       let(:response_body) { "event: message\nno data line\n\n" }
 
       it 'raises TransportError for missing data' do
-        expect { transport.send(:parse_streamable_http_response, mock_response) }.to raise_error(
+        expect { transport.send(:parse_response, mock_response) }.to raise_error(
           MCPClient::Errors::TransportError,
           /No data found in SSE response/
         )

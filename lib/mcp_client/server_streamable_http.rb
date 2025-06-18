@@ -26,11 +26,15 @@ module MCPClient
     #   @return [String] The JSON-RPC endpoint path
     # @!attribute [r] tools
     #   @return [Array<MCPClient::Tool>, nil] List of available tools (nil if not fetched yet)
-    # @!attribute [r] server_info
-    #   @return [Hash, nil] Server information from initialize response
-    # @!attribute [r] capabilities
-    #   @return [Hash, nil] Server capabilities from initialize response
-    attr_reader :base_url, :endpoint, :tools, :server_info, :capabilities
+    attr_reader :base_url, :endpoint, :tools
+
+    # Server information from initialize response
+    # @return [Hash, nil] Server information
+    attr_reader :server_info
+
+    # Server capabilities from initialize response
+    # @return [Hash, nil] Server capabilities
+    attr_reader :capabilities
 
     # @param base_url [String] The base URL of the MCP server
     # @param endpoint [String] The JSON-RPC endpoint path (default: '/rpc')
@@ -159,7 +163,7 @@ module MCPClient
     # Call a tool with the given parameters
     # @param tool_name [String] the name of the tool to call
     # @param parameters [Hash] the parameters to pass to the tool
-    # @return [Object] the result of the tool invocation
+    # @return [Object] the result of the tool invocation (with string keys for backward compatibility)
     # @raise [MCPClient::Errors::ServerError] if server returns an error
     # @raise [MCPClient::Errors::TransportError] if response isn't valid JSON
     # @raise [MCPClient::Errors::ToolCallError] for other errors during tool execution

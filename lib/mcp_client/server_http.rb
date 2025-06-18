@@ -26,11 +26,15 @@ module MCPClient
     #   @return [String] The JSON-RPC endpoint path
     # @!attribute [r] tools
     #   @return [Array<MCPClient::Tool>, nil] List of available tools (nil if not fetched yet)
-    # @!attribute [r] server_info
-    #   @return [Hash, nil] Server information from initialize response
-    # @!attribute [r] capabilities
-    #   @return [Hash, nil] Server capabilities from initialize response
-    attr_reader :base_url, :endpoint, :tools, :server_info, :capabilities
+    attr_reader :base_url, :endpoint, :tools
+
+    # Server information from initialize response
+    # @return [Hash, nil] Server information
+    attr_reader :server_info
+
+    # Server capabilities from initialize response
+    # @return [Hash, nil] Server capabilities
+    attr_reader :capabilities
 
     # @param base_url [String] The base URL of the MCP server
     # @param endpoint [String] The JSON-RPC endpoint path (default: '/rpc')

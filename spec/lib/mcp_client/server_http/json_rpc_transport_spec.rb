@@ -253,7 +253,7 @@ RSpec.describe MCPClient::ServerHTTP::JsonRpcTransport do
           double('response', body: response_data.to_json)
         end
 
-        allow(transport).to receive(:parse_http_response).and_return(response_data[:result])
+        allow(transport).to receive(:parse_response).and_return(response_data[:result])
 
         result = transport.rpc_request(method_name, params)
         expect(result).to eq(response_data[:result])
@@ -414,7 +414,7 @@ RSpec.describe MCPClient::ServerHTTP::JsonRpcTransport do
     end
   end
 
-  describe '#parse_http_response' do
+  describe '#parse_response' do
     let(:mock_response) { double('response', body: response_body) }
 
     context 'with valid JSON response' do
@@ -427,7 +427,7 @@ RSpec.describe MCPClient::ServerHTTP::JsonRpcTransport do
       end
 
       it 'parses JSON and returns result' do
-        result = transport.send(:parse_http_response, mock_response)
+        result = transport.send(:parse_response, mock_response)
         expect(result).to eq({ 'data' => 'test' })
       end
     end
@@ -442,7 +442,7 @@ RSpec.describe MCPClient::ServerHTTP::JsonRpcTransport do
       end
 
       it 'raises ServerError with error message' do
-        expect { transport.send(:parse_http_response, mock_response) }.to raise_error(
+        expect { transport.send(:parse_response, mock_response) }.to raise_error(
           MCPClient::Errors::ServerError,
           'Test error'
         )
@@ -453,7 +453,7 @@ RSpec.describe MCPClient::ServerHTTP::JsonRpcTransport do
       let(:response_body) { 'invalid json' }
 
       it 'raises TransportError' do
-        expect { transport.send(:parse_http_response, mock_response) }.to raise_error(
+        expect { transport.send(:parse_response, mock_response) }.to raise_error(
           MCPClient::Errors::TransportError,
           /Invalid JSON response from server/
         )

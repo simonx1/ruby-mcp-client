@@ -68,8 +68,8 @@ module MCPClient
         result = send_jsonrpc_request(json_rpc_request)
         return unless result.is_a?(Hash)
 
-        @server_info = result['serverInfo'] if result.key?('serverInfo')
-        @capabilities = result['capabilities'] if result.key?('capabilities')
+        @server_info = result['serverInfo']
+        @capabilities = result['capabilities']
       end
 
       # Send a JSON-RPC request to the server and wait for result
@@ -97,7 +97,7 @@ module MCPClient
         rescue Errno::ECONNREFUSED => e
           raise MCPClient::Errors::ConnectionError, "Server connection lost: #{e.message}"
         rescue StandardError => e
-          method_name = request[:method] || request['method']
+          method_name = request['method']
           raise MCPClient::Errors::ToolCallError, "Error executing request '#{method_name}': #{e.message}"
         end
       end
@@ -166,7 +166,7 @@ module MCPClient
       # @return [Hash] the result data
       # @raise [MCPClient::Errors::ConnectionError, MCPClient::Errors::ToolCallError] on errors
       def wait_for_sse_result(request)
-        request_id = request[:id]
+        request_id = request['id']
         start_time = Time.now
         timeout = @read_timeout || 10
 
