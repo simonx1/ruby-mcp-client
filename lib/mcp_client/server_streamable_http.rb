@@ -96,6 +96,7 @@ module MCPClient
       @connection_established = false
       @initialized = false
       @http_conn = nil
+      @session_id = nil
     end
 
     # Connect to the MCP server over Streamable HTTP
@@ -191,6 +192,49 @@ module MCPClient
       end
     end
 
+    # Override send_http_request to handle session headers for MCP protocol
+    def send_http_request(request)
+      conn = http_connection
+
+      begin
+        response = conn.post(@endpoint) do |req|
+          # Apply all headers including custom ones
+          @headers.each { |k, v| req.headers[k] = v }
+
+          # Add session header if we have one (for non-initialize requests)
+          if @session_id && request['method'] != 'initialize'
+            req.headers['Mcp-Session-Id'] = @session_id
+            @logger.debug("Adding session header: Mcp-Session-Id: #{@session_id}")
+          end
+
+          req.body = request.to_json
+        end
+
+        handle_http_error_response(response) unless response.success?
+
+        # Capture session ID from initialize response
+        if request['method'] == 'initialize' && response.success?
+          session_id = response.headers['mcp-session-id'] || response.headers['Mcp-Session-Id']
+          if session_id
+            @session_id = session_id
+            @logger.debug("Captured session ID: #{@session_id}")
+          else
+            @logger.warn('No session ID found in initialize response headers')
+          end
+        end
+
+        log_response(response)
+        response
+      rescue Faraday::UnauthorizedError, Faraday::ForbiddenError => e
+        error_status = e.response ? e.response[:status] : 'unknown'
+        raise MCPClient::Errors::ConnectionError, "Authorization failed: HTTP #{error_status}"
+      rescue Faraday::ConnectionFailed => e
+        raise MCPClient::Errors::ConnectionError, "Server connection lost: #{e.message}"
+      rescue Faraday::Error => e
+        raise MCPClient::Errors::TransportError, "HTTP request failed: #{e.message}"
+      end
+    end
+
     # Clean up the server connection
     # Properly closes HTTP connections and clears cached state
     def cleanup
@@ -202,6 +246,7 @@ module MCPClient
 
         # Close HTTP connection if it exists
         @http_conn = nil
+        @session_id = nil
 
         @tools = nil
         @tools_data = nil

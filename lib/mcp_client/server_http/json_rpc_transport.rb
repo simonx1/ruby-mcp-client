@@ -16,7 +16,8 @@ module MCPClient
       # @raise [MCPClient::Errors::TransportError] if parsing fails
       # @raise [MCPClient::Errors::ServerError] if the response contains an error
       def parse_response(response)
-        data = JSON.parse(response.body)
+        body = response.body.strip
+        data = JSON.parse(body)
         process_jsonrpc_response(data)
       rescue JSON::ParserError => e
         raise MCPClient::Errors::TransportError, "Invalid JSON response from server: #{e.message}"
