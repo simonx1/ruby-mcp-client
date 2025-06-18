@@ -13,7 +13,7 @@ RSpec.describe MCPClient::ServerHTTP::JsonRpcTransport do
 
       attr_accessor :logger, :base_url, :endpoint, :headers, :max_retries, :retry_backoff,
                     :read_timeout, :request_id, :mutex, :connection_established, :initialized,
-                    :http_conn, :server_info, :capabilities
+                    :server_info, :capabilities
 
       def initialize
         @logger = Logger.new(StringIO.new)
@@ -31,7 +31,6 @@ RSpec.describe MCPClient::ServerHTTP::JsonRpcTransport do
         @mutex = Monitor.new
         @connection_established = true
         @initialized = true
-        @http_conn = nil
         @server_info = nil
         @capabilities = nil
       end
@@ -43,23 +42,14 @@ RSpec.describe MCPClient::ServerHTTP::JsonRpcTransport do
       def cleanup
         @connection_established = false
         @initialized = false
-        @http_conn = nil
       end
     end
   end
 
   subject(:transport) { dummy_class.new }
 
-  let(:faraday_stubs) { Faraday::Adapter::Test::Stubs.new }
-  let(:faraday_conn) do
-    Faraday.new do |builder|
-      builder.adapter :test, faraday_stubs
-    end
-  end
-
   before do
     WebMock.disable_net_connect!
-    transport.http_conn = faraday_conn
   end
 
   after do
@@ -78,20 +68,22 @@ RSpec.describe MCPClient::ServerHTTP::JsonRpcTransport do
     end
 
     before do
-      faraday_stubs.post('/rpc') do |env|
-        request_body = JSON.parse(env.body)
-        expect(request_body['method']).to eq(method_name)
-        expect(request_body['params']).to eq({ 'key' => 'value' })
-        expect(request_body['jsonrpc']).to eq('2.0')
-        expect(request_body['id']).to be_a(Integer)
-
-        # Verify headers
-        expect(env.request_headers['Content-Type']).to eq('application/json')
-        expect(env.request_headers['Accept']).to eq('application/json')
-        expect(env.request_headers['Authorization']).to eq('Bearer test-token')
-
-        [200, { 'Content-Type' => 'application/json' }, response_data.to_json]
-      end
+      stub_request(:post, 'https://example.com/rpc')
+        .with do |request|
+          request_body = JSON.parse(request.body)
+          request_body['method'] == method_name &&
+            request_body['params'] == { 'key' => 'value' } &&
+            request_body['jsonrpc'] == '2.0' &&
+            request_body['id'].is_a?(Integer) &&
+            request.headers['Content-Type'] == 'application/json' &&
+            request.headers['Accept'] == 'application/json' &&
+            request.headers['Authorization'] == 'Bearer test-token'
+        end
+        .to_return(
+          status: 200,
+          body: response_data.to_json,
+          headers: { 'Content-Type' => 'application/json' }
+        )
     end
 
     it 'sends JSON-RPC request with correct format' do
@@ -100,14 +92,45 @@ RSpec.describe MCPClient::ServerHTTP::JsonRpcTransport do
     end
 
     it 'increments request ID for each request' do
+      # Clear any existing stubs to create fresh ones for this test
+      WebMock.reset!
+
+      # Stub for the first request
+      stub_request(:post, 'https://example.com/rpc')
+        .with do |request|
+          request_body = JSON.parse(request.body)
+          request_body['id'] == 1
+        end
+        .to_return(
+          status: 200,
+          body: response_data.to_json,
+          headers: { 'Content-Type' => 'application/json' }
+        )
+
+      # Stub for the second request
+      stub_request(:post, 'https://example.com/rpc')
+        .with do |request|
+          request_body = JSON.parse(request.body)
+          request_body['id'] == 2
+        end
+        .to_return(
+          status: 200,
+          body: response_data.to_json,
+          headers: { 'Content-Type' => 'application/json' }
+        )
+
       initial_id = transport.request_id
       transport.rpc_request(method_name, params)
       expect(transport.request_id).to eq(initial_id + 1)
+
+      # Make another request to verify ID increments again
+      transport.rpc_request(method_name, params)
+      expect(transport.request_id).to eq(initial_id + 2)
     end
 
     it 'includes all custom headers in request' do
       transport.rpc_request(method_name, params)
-      # Headers are verified in the faraday_stubs block above
+      # Headers are verified in the WebMock stub above
     end
 
     context 'when connection is not established' do
@@ -125,23 +148,19 @@ RSpec.describe MCPClient::ServerHTTP::JsonRpcTransport do
     end
 
     context 'when server returns JSON-RPC error' do
-      let(:error_faraday_stubs) { Faraday::Adapter::Test::Stubs.new }
-      let(:error_faraday_conn) do
-        Faraday.new do |builder|
-          builder.adapter :test, error_faraday_stubs
-        end
-      end
-      
       before do
-        transport.http_conn = error_faraday_conn
-        error_faraday_stubs.post('/rpc') do |_env|
-          error_response = {
-            'jsonrpc' => '2.0',
-            'id' => 1,
-            'error' => { 'code' => -32_601, 'message' => 'Method not found' }
-          }
-          [200, { 'Content-Type' => 'application/json' }, error_response.to_json]
-        end
+        error_response = {
+          'jsonrpc' => '2.0',
+          'id' => 1,
+          'error' => { 'code' => -32_601, 'message' => 'Method not found' }
+        }
+
+        stub_request(:post, 'https://example.com/rpc')
+          .to_return(
+            status: 200,
+            body: error_response.to_json,
+            headers: { 'Content-Type' => 'application/json' }
+          )
       end
 
       it 'raises ServerError with error message' do
@@ -153,18 +172,12 @@ RSpec.describe MCPClient::ServerHTTP::JsonRpcTransport do
     end
 
     context 'when HTTP request fails' do
-      let(:error_faraday_stubs) { Faraday::Adapter::Test::Stubs.new }
-      let(:error_faraday_conn) do
-        Faraday.new do |builder|
-          builder.adapter :test, error_faraday_stubs
-        end
-      end
-      
       before do
-        transport.http_conn = error_faraday_conn
-        error_faraday_stubs.post('/rpc') do |_env|
-          [500, {}, 'Internal Server Error']
-        end
+        stub_request(:post, 'https://example.com/rpc')
+          .to_return(
+            status: 500,
+            body: 'Internal Server Error'
+          )
       end
 
       it 'raises ServerError for server errors' do
@@ -176,18 +189,12 @@ RSpec.describe MCPClient::ServerHTTP::JsonRpcTransport do
     end
 
     context 'when authorization fails' do
-      let(:auth_faraday_stubs) { Faraday::Adapter::Test::Stubs.new }
-      let(:auth_faraday_conn) do
-        Faraday.new do |builder|
-          builder.adapter :test, auth_faraday_stubs
-        end
-      end
-      
       before do
-        transport.http_conn = auth_faraday_conn
-        auth_faraday_stubs.post('/rpc') do |_env|
-          [401, {}, 'Unauthorized']
-        end
+        stub_request(:post, 'https://example.com/rpc')
+          .to_return(
+            status: 401,
+            body: 'Unauthorized'
+          )
       end
 
       it 'raises ConnectionError for auth failures' do
@@ -199,18 +206,13 @@ RSpec.describe MCPClient::ServerHTTP::JsonRpcTransport do
     end
 
     context 'when response is invalid JSON' do
-      let(:invalid_faraday_stubs) { Faraday::Adapter::Test::Stubs.new }
-      let(:invalid_faraday_conn) do
-        Faraday.new do |builder|
-          builder.adapter :test, invalid_faraday_stubs
-        end
-      end
-      
       before do
-        transport.http_conn = invalid_faraday_conn
-        invalid_faraday_stubs.post('/rpc') do |_env|
-          [200, { 'Content-Type' => 'application/json' }, 'invalid json response']
-        end
+        stub_request(:post, 'https://example.com/rpc')
+          .to_return(
+            status: 200,
+            body: 'invalid json response',
+            headers: { 'Content-Type' => 'application/json' }
+          )
       end
 
       it 'raises TransportError' do
@@ -223,7 +225,7 @@ RSpec.describe MCPClient::ServerHTTP::JsonRpcTransport do
 
     context 'when connection fails' do
       before do
-        allow(transport).to receive(:get_http_connection).and_raise(
+        allow(transport).to receive(:http_connection).and_raise(
           Faraday::ConnectionFailed.new('Connection refused')
         )
       end
@@ -246,13 +248,11 @@ RSpec.describe MCPClient::ServerHTTP::JsonRpcTransport do
         # Stub the connection method to avoid the actual connection failure raising
         allow(transport).to receive(:send_http_request) do
           @attempt_count += 1
-          if @attempt_count < 3
-            raise MCPClient::Errors::TransportError, 'Temporary failure'
-          else
-            double('response', body: response_data.to_json)
-          end
+          raise MCPClient::Errors::TransportError, 'Temporary failure' if @attempt_count < 3
+
+          double('response', body: response_data.to_json)
         end
-        
+
         allow(transport).to receive(:parse_http_response).and_return(response_data[:result])
 
         result = transport.rpc_request(method_name, params)
@@ -267,15 +267,18 @@ RSpec.describe MCPClient::ServerHTTP::JsonRpcTransport do
     let(:params) { { event: 'test_event' } }
 
     before do
-      faraday_stubs.post('/rpc') do |env|
-        request_body = JSON.parse(env.body)
-        expect(request_body['method']).to eq(method_name)
-        expect(request_body['params']).to eq({ 'event' => 'test_event' })
-        expect(request_body['jsonrpc']).to eq('2.0')
-        expect(request_body).not_to have_key('id') # Notifications should not have id
-
-        [200, {}, '']
-      end
+      stub_request(:post, 'https://example.com/rpc')
+        .with do |request|
+          request_body = JSON.parse(request.body)
+          request_body['method'] == method_name &&
+            request_body['params'] == { 'event' => 'test_event' } &&
+            request_body['jsonrpc'] == '2.0' &&
+            !request_body.key?('id') # Notifications should not have id
+        end
+        .to_return(
+          status: 200,
+          body: ''
+        )
     end
 
     it 'sends notification without id field' do
@@ -288,18 +291,12 @@ RSpec.describe MCPClient::ServerHTTP::JsonRpcTransport do
     end
 
     context 'when notification fails' do
-      let(:notify_faraday_stubs) { Faraday::Adapter::Test::Stubs.new }
-      let(:notify_faraday_conn) do
-        Faraday.new do |builder|
-          builder.adapter :test, notify_faraday_stubs
-        end
-      end
-      
       before do
-        transport.http_conn = notify_faraday_conn
-        notify_faraday_stubs.post('/rpc') do |_env|
-          [500, {}, 'Server Error']
-        end
+        stub_request(:post, 'https://example.com/rpc')
+          .to_return(
+            status: 500,
+            body: 'Server Error'
+          )
       end
 
       it 'raises TransportError' do
@@ -325,15 +322,19 @@ RSpec.describe MCPClient::ServerHTTP::JsonRpcTransport do
     end
 
     before do
-      faraday_stubs.post('/rpc') do |env|
-        request_body = JSON.parse(env.body)
-        expect(request_body['method']).to eq('initialize')
-        expect(request_body['params']).to have_key('protocolVersion')
-        expect(request_body['params']).to have_key('capabilities')
-        expect(request_body['params']).to have_key('clientInfo')
-
-        [200, { 'Content-Type' => 'application/json' }, initialize_response.to_json]
-      end
+      stub_request(:post, 'https://example.com/rpc')
+        .with do |request|
+          request_body = JSON.parse(request.body)
+          request_body['method'] == 'initialize' &&
+            request_body['params'].key?('protocolVersion') &&
+            request_body['params'].key?('capabilities') &&
+            request_body['params'].key?('clientInfo')
+        end
+        .to_return(
+          status: 200,
+          body: initialize_response.to_json,
+          headers: { 'Content-Type' => 'application/json' }
+        )
     end
 
     it 'sends initialize request with correct parameters' do
@@ -344,12 +345,12 @@ RSpec.describe MCPClient::ServerHTTP::JsonRpcTransport do
 
     it 'includes protocol version in request' do
       transport.send(:perform_initialize)
-      # Parameters are verified in the faraday_stubs block above
+      # Parameters are verified in the WebMock stub above
     end
 
     it 'includes client info in request' do
       transport.send(:perform_initialize)
-      # Parameters are verified in the faraday_stubs block above
+      # Parameters are verified in the WebMock stub above
     end
   end
 
@@ -357,10 +358,13 @@ RSpec.describe MCPClient::ServerHTTP::JsonRpcTransport do
     let(:request_data) { { jsonrpc: '2.0', method: 'test', id: 1 } }
 
     before do
-      faraday_stubs.post('/rpc') do |env|
-        expect(env.body).to eq(request_data.to_json)
-        [200, { 'Content-Type' => 'application/json' }, 'success']
-      end
+      stub_request(:post, 'https://example.com/rpc')
+        .with(body: request_data.to_json)
+        .to_return(
+          status: 200,
+          body: 'success',
+          headers: { 'Content-Type' => 'application/json' }
+        )
     end
 
     it 'sends HTTP POST request with JSON body' do
@@ -376,9 +380,11 @@ RSpec.describe MCPClient::ServerHTTP::JsonRpcTransport do
 
     context 'when HTTP client is not set' do
       before do
-        transport.http_conn = nil
+        transport.instance_variable_set(:@http_connection, nil)
         # Mock the creation of HTTP connection
-        allow(transport).to receive(:create_http_connection).and_return(faraday_conn)
+        mock_conn = double('connection')
+        allow(transport).to receive(:create_http_connection).and_return(mock_conn)
+        allow(mock_conn).to receive(:post).and_return(double('response', status: 200, body: 'success', success?: true))
       end
 
       it 'creates HTTP connection automatically' do

@@ -35,7 +35,6 @@ module MCPClient
       parsed.each_value do |cfg|
         case cfg[:type].to_s
         when 'stdio'
-          # Build command list with args and propagate environment
           cmd_list = [cfg[:command]] + Array(cfg[:args])
           configs << MCPClient.stdio_config(
             command: cmd_list,
@@ -44,17 +43,14 @@ module MCPClient
             env: cfg[:env]
           )
         when 'sse'
-          # Use 'url' from parsed config as 'base_url' for SSE config
           configs << MCPClient.sse_config(base_url: cfg[:url], headers: cfg[:headers] || {}, name: cfg[:name],
                                           logger: logger)
         when 'http'
-          # Use 'url' from parsed config as 'base_url' for HTTP config
-          configs << MCPClient.http_config(base_url: cfg[:url], endpoint: cfg[:endpoint], 
-                                          headers: cfg[:headers] || {}, name: cfg[:name], logger: logger)
+          configs << MCPClient.http_config(base_url: cfg[:url], endpoint: cfg[:endpoint],
+                                           headers: cfg[:headers] || {}, name: cfg[:name], logger: logger)
         when 'streamable_http'
-          # Use 'url' from parsed config as 'base_url' for Streamable HTTP config
-          configs << MCPClient.streamable_http_config(base_url: cfg[:url], endpoint: cfg[:endpoint], 
-                                                     headers: cfg[:headers] || {}, name: cfg[:name], logger: logger)
+          configs << MCPClient.streamable_http_config(base_url: cfg[:url], endpoint: cfg[:endpoint],
+                                                      headers: cfg[:headers] || {}, name: cfg[:name], logger: logger)
         end
       end
     end
@@ -137,8 +133,8 @@ module MCPClient
   # @param name [String, nil] Optional name for this server
   # @param logger [Logger, nil] Optional logger for server operations
   # @return [Hash] server configuration
-  def self.streamable_http_config(base_url:, endpoint: '/rpc', headers: {}, read_timeout: 30, retries: 3, retry_backoff: 1,
-                                  name: nil, logger: nil)
+  def self.streamable_http_config(base_url:, endpoint: '/rpc', headers: {}, read_timeout: 30, retries: 3,
+                                  retry_backoff: 1, name: nil, logger: nil)
     {
       type: 'streamable_http',
       base_url: base_url,

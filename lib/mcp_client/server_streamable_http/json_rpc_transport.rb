@@ -33,9 +33,9 @@ module MCPClient
       # @return [void]
       def rpc_notify(method, params = {})
         ensure_connected
-        
+
         notif = build_jsonrpc_notification(method, params)
-        
+
         begin
           send_http_request(notif)
         rescue MCPClient::Errors::ServerError, MCPClient::Errors::ConnectionError, Faraday::ConnectionFailed => e
@@ -62,7 +62,7 @@ module MCPClient
         request_id = @mutex.synchronize { @request_id += 1 }
         json_rpc_request = build_jsonrpc_request('initialize', initialization_params, request_id)
         @logger.debug("Performing initialize RPC: #{json_rpc_request}")
-        
+
         result = send_jsonrpc_request(json_rpc_request)
         return unless result.is_a?(Hash)
 
@@ -99,8 +99,8 @@ module MCPClient
       # @return [Faraday::Response] the HTTP response
       # @raise [MCPClient::Errors::ConnectionError] if connection fails
       def send_http_request(request)
-        conn = get_http_connection
-        
+        conn = http_connection
+
         begin
           response = conn.post(@endpoint) do |req|
             # Apply all headers including custom ones for Streamable HTTP
@@ -108,9 +108,7 @@ module MCPClient
             req.body = request.to_json
           end
 
-          unless response.success?
-            handle_http_error_response(response)
-          end
+          handle_http_error_response(response) unless response.success?
 
           @logger.debug("Received Streamable HTTP response: #{response.status} #{response.body}")
           response
@@ -131,7 +129,8 @@ module MCPClient
       def handle_http_error_response(response)
         case response.status
         when 401, 403
-          raise MCPClient::Errors::ConnectionError, "Authorization failed: HTTP #{response.status} #{response.reason_phrase}"
+          raise MCPClient::Errors::ConnectionError,
+                "Authorization failed: HTTP #{response.status} #{response.reason_phrase}"
         when 400..499
           raise MCPClient::Errors::ServerError, "Client error: HTTP #{response.status} #{response.reason_phrase}"
         when 500..599
@@ -143,8 +142,8 @@ module MCPClient
 
       # Get or create HTTP connection
       # @return [Faraday::Connection] the HTTP connection
-      def get_http_connection
-        @http_conn ||= create_http_connection
+      def http_connection
+        @http_connection ||= create_http_connection
       end
 
       # Create a Faraday connection for HTTP requests
@@ -165,7 +164,7 @@ module MCPClient
       # @raise [MCPClient::Errors::ServerError] if the response contains an error
       def parse_streamable_http_response(response)
         body = response.body.strip
-        
+
         # Parse SSE-formatted response
         data = parse_sse_response(body)
         process_jsonrpc_response(data)
@@ -181,13 +180,11 @@ module MCPClient
         # Extract JSON data from SSE format
         # SSE format: event: message\ndata: {...}\n\n
         data_line = sse_body.lines.find { |line| line.start_with?('data:') }
-        
-        if data_line
-          json_data = data_line.sub(/^data:\s*/, '').strip
-          JSON.parse(json_data)
-        else
-          raise MCPClient::Errors::TransportError, "No data found in SSE response"
-        end
+
+        raise MCPClient::Errors::TransportError, 'No data found in SSE response' unless data_line
+
+        json_data = data_line.sub(/^data:\s*/, '').strip
+        JSON.parse(json_data)
       end
     end
   end

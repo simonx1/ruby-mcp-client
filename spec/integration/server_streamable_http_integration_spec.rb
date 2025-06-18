@@ -7,7 +7,7 @@ RSpec.describe 'Streamable HTTP Transport Integration', type: :integration do
   let(:base_url) { 'https://api.example.com' }
   let(:endpoint) { '/mcp' }
   let(:headers) { { 'Authorization' => 'Bearer test-token-123' } }
-  
+
   let(:server) do
     MCPClient::ServerStreamableHTTP.new(
       base_url: base_url,
@@ -96,22 +96,22 @@ RSpec.describe 'Streamable HTTP Transport Integration', type: :integration do
           body = JSON.parse(request.body)
           case body['method']
           when 'initialize'
-            { 
-              status: 200, 
-              body: "event: message\ndata: #{initialize_response.to_json}\n\n", 
-              headers: { 'Content-Type' => 'text/event-stream' } 
+            {
+              status: 200,
+              body: "event: message\ndata: #{initialize_response.to_json}\n\n",
+              headers: { 'Content-Type' => 'text/event-stream' }
             }
           when 'tools/list'
-            { 
-              status: 200, 
-              body: "event: message\ndata: #{tools_response.to_json}\n\n", 
-              headers: { 'Content-Type' => 'text/event-stream' } 
+            {
+              status: 200,
+              body: "event: message\ndata: #{tools_response.to_json}\n\n",
+              headers: { 'Content-Type' => 'text/event-stream' }
             }
           when 'tools/call'
-            { 
-              status: 200, 
-              body: "event: message\ndata: #{weather_tool_response.to_json}\n\n", 
-              headers: { 'Content-Type' => 'text/event-stream' } 
+            {
+              status: 200,
+              body: "event: message\ndata: #{weather_tool_response.to_json}\n\n",
+              headers: { 'Content-Type' => 'text/event-stream' }
             }
           else
             { status: 404, body: 'Not Found' }
@@ -128,7 +128,7 @@ RSpec.describe 'Streamable HTTP Transport Integration', type: :integration do
       # Step 2: List available tools
       tools = server.list_tools
       expect(tools.size).to eq(2)
-      
+
       weather_tool = tools.find { |t| t.name == 'weather' }
       expect(weather_tool).not_to be_nil
       expect(weather_tool.description).to eq('Get weather information')
@@ -155,10 +155,10 @@ RSpec.describe 'Streamable HTTP Transport Integration', type: :integration do
 
     it 'handles streaming tool calls' do
       server.connect
-      
+
       stream = server.call_tool_streaming('weather', { location: 'San Francisco' })
       results = stream.to_a
-      
+
       expect(results.size).to eq(1)
       expect(results.first['content'].first['text']).to include('Weather in San Francisco')
     end
@@ -218,7 +218,7 @@ RSpec.describe 'Streamable HTTP Transport Integration', type: :integration do
         stub_request(:post, "#{base_url}#{endpoint}")
           .with(body: hash_including(method: 'tools/list'))
           .to_return(
-            status: 200, 
+            status: 200,
             body: "event: message\nno data line\n\n",
             headers: { 'Content-Type' => 'text/event-stream' }
           )
@@ -258,7 +258,7 @@ RSpec.describe 'Streamable HTTP Transport Integration', type: :integration do
         stub_request(:post, "#{base_url}#{endpoint}")
           .with(body: hash_including(method: 'tools/list'))
           .to_return(
-            status: 200, 
+            status: 200,
             body: "event: message\ndata: invalid json response\n\n",
             headers: { 'Content-Type' => 'text/event-stream' }
           )
@@ -347,14 +347,14 @@ RSpec.describe 'Streamable HTTP Transport Integration', type: :integration do
 
     it 'sends notifications without expecting responses' do
       server.connect
-      
+
       expect { server.rpc_notify('notification', { event: 'test' }) }.not_to raise_error
-      
-      expect(WebMock).to have_requested(:post, "#{base_url}#{endpoint}")
-        .with { |req|
+
+      expect(WebMock).to(have_requested(:post, "#{base_url}#{endpoint}")
+        .with do |req|
           body = JSON.parse(req.body)
           body['method'] == 'notification' && !body.key?('id')
-        }
+        end)
     end
   end
 
@@ -390,12 +390,12 @@ RSpec.describe 'Streamable HTTP Transport Integration', type: :integration do
 
     it 'creates Streamable HTTP server through factory' do
       server = MCPClient::ServerFactory.create(config)
-      
+
       expect(server).to be_a(MCPClient::ServerStreamableHTTP)
       expect(server.base_url).to eq(base_url)
       expect(server.endpoint).to eq(endpoint)
       expect(server.name).to eq('factory-test-server')
-      
+
       # Test that it can connect
       expect(server.connect).to be true
     end
@@ -435,17 +435,17 @@ RSpec.describe 'Streamable HTTP Transport Integration', type: :integration do
 
     it 'handles concurrent requests correctly' do
       server.connect
-      
+
       # Make multiple concurrent requests
-      threads = 5.times.map do |i|
+      threads = 5.times.map do |_i|
         Thread.new do
           server.ping
         end
       end
-      
+
       results = threads.map(&:join).map(&:value)
       expect(results).to all(eq('pong'))
-      
+
       # Verify all requests were made
       expect(WebMock).to have_requested(:post, "#{base_url}#{endpoint}")
         .with(body: hash_including(method: 'ping'))

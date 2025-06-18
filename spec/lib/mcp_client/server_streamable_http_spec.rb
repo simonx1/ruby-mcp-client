@@ -9,7 +9,7 @@ RSpec.describe MCPClient::ServerStreamableHTTP do
   let(:base_url) { 'https://example.com' }
   let(:endpoint) { '/rpc' }
   let(:headers) { { 'Authorization' => 'Bearer test-token' } }
-  
+
   let(:server) do
     described_class.new(
       base_url: base_url,
@@ -47,7 +47,7 @@ RSpec.describe MCPClient::ServerStreamableHTTP do
     context 'with URL containing endpoint path' do
       let(:base_url) { 'https://example.com/api/mcp' }
       let(:endpoint) { '/rpc' } # default
-      
+
       it 'extracts endpoint from URL when using default endpoint' do
         expect(server.base_url).to eq('https://example.com')
         expect(server.endpoint).to eq('/api/mcp')
@@ -57,7 +57,7 @@ RSpec.describe MCPClient::ServerStreamableHTTP do
     context 'with custom endpoint' do
       let(:base_url) { 'https://example.com/api/mcp' }
       let(:endpoint) { '/custom' }
-      
+
       it 'uses provided endpoint and extracts host from base URL' do
         expect(server.base_url).to eq('https://example.com')
         expect(server.endpoint).to eq('/custom')
@@ -66,7 +66,7 @@ RSpec.describe MCPClient::ServerStreamableHTTP do
 
     context 'with non-standard ports' do
       let(:base_url) { 'https://example.com:8443' }
-      
+
       it 'preserves non-standard ports' do
         expect(server.base_url).to eq('https://example.com:8443')
       end
@@ -82,15 +82,17 @@ RSpec.describe MCPClient::ServerStreamableHTTP do
         end
         .to_return(
           status: 200,
-          body: "event: message\ndata: " + JSON.generate({
-            jsonrpc: '2.0',
-            id: 1,
-            result: {
-              protocolVersion: MCPClient::HTTP_PROTOCOL_VERSION,
-              capabilities: {},
-              serverInfo: { name: 'test-server', version: '1.0.0' }
+          body: "event: message\ndata: #{JSON.generate(
+            {
+              jsonrpc: '2.0',
+              id: 1,
+              result: {
+                protocolVersion: MCPClient::HTTP_PROTOCOL_VERSION,
+                capabilities: {},
+                serverInfo: { name: 'test-server', version: '1.0.0' }
+              }
             }
-          }) + "\n\n",
+          )}\n\n",
           headers: { 'Content-Type' => 'text/event-stream' }
         )
 
@@ -117,7 +119,7 @@ RSpec.describe MCPClient::ServerStreamableHTTP do
     let(:initialize_response) do
       "event: message\ndata: #{initialize_data.to_json}\n\n"
     end
-    
+
     let(:initialize_data) do
       {
         jsonrpc: '2.0',
@@ -188,7 +190,7 @@ RSpec.describe MCPClient::ServerStreamableHTTP do
     let(:tools_response) do
       "event: message\ndata: #{tools_data.to_json}\n\n"
     end
-    
+
     let(:tools_data) do
       {
         jsonrpc: '2.0',
@@ -310,7 +312,7 @@ RSpec.describe MCPClient::ServerStreamableHTTP do
     let(:tool_response) do
       "event: message\ndata: #{tool_data.to_json}\n\n"
     end
-    
+
     let(:tool_data) do
       {
         jsonrpc: '2.0',
@@ -376,7 +378,7 @@ RSpec.describe MCPClient::ServerStreamableHTTP do
           error: { code: -1, message: 'Tool execution failed' }
         }
       end
-      
+
       let(:error_response) do
         "event: message\ndata: #{tool_data.to_json}\n\n"
       end
@@ -419,13 +421,13 @@ RSpec.describe MCPClient::ServerStreamableHTTP do
   describe '#call_tool_streaming' do
     before do
       allow(server).to receive(:call_tool).with('streaming_tool', { param: 'value' })
-                                         .and_return({ result: 'streamed' })
+                                          .and_return({ result: 'streamed' })
     end
 
     it 'returns enumerator with single result' do
       stream = server.call_tool_streaming('streaming_tool', { param: 'value' })
       results = stream.to_a
-      
+
       expect(results.size).to eq(1)
       expect(results.first).to eq({ result: 'streamed' })
     end
@@ -433,13 +435,17 @@ RSpec.describe MCPClient::ServerStreamableHTTP do
 
   describe '#cleanup' do
     it 'resets connection state' do
-      server.connect rescue nil
+      begin
+        server.connect
+      rescue StandardError
+        nil
+      end
       server.cleanup
-      
+
       connection_established = server.instance_variable_get(:@connection_established)
       initialized = server.instance_variable_get(:@initialized)
       tools = server.instance_variable_get(:@tools)
-      
+
       expect(connection_established).to be false
       expect(initialized).to be false
       expect(tools).to be_nil
@@ -545,7 +551,7 @@ RSpec.describe MCPClient::ServerStreamableHTTP do
       conn = server.send(:create_http_connection)
       expect(conn.builder.handlers).to include(Faraday::Retry::Middleware)
     end
-    
+
     it 'sets retry parameters correctly' do
       conn = server.send(:create_http_connection)
       # Retry middleware is configured but testing actual retry behavior

@@ -272,12 +272,6 @@ puts "Tool result: #{result.inspect}"
 streamable_client.cleanup
 ```
 
-The Streamable HTTP transport is ideal for:
-- Servers that return SSE-formatted responses to HTTP POST requests
-- Services like Zapier MCP that use this hybrid approach
-- Maintaining HTTP semantics while supporting structured streaming responses
-- APIs that need both HTTP compatibility and event-stream formatting
-
 ### Server-Sent Events (SSE) Example
 
 The SSE transport provides robust connection handling for remote MCP servers:
@@ -567,13 +561,6 @@ The HTTP transport provides a simpler, stateless communication mechanism for MCP
 - **Streaming API Compatibility**: Provides `call_tool_streaming` method for API compatibility (returns single response)
 - **Graceful Degradation**: Simple fallback behavior when complex features aren't needed
 
-The HTTP transport is ideal for:
-- Microservice architectures where services need to communicate via HTTP
-- Load-balanced MCP server deployments
-- Integration with existing HTTP-based APIs
-- Serverless and cloud-native deployments
-- Simple request/response patterns without the need for persistent connections
-
 ### Streamable HTTP Transport Implementation
 
 The Streamable HTTP transport bridges HTTP and Server-Sent Events, designed for servers that use HTTP POST but return SSE-formatted responses:
@@ -588,13 +575,6 @@ The Streamable HTTP transport bridges HTTP and Server-Sent Events, designed for 
 - **Retry Logic**: Exponential backoff for both connection and parsing failures
 - **Thread Safety**: All operations are thread-safe for concurrent usage
 - **Malformed Response Handling**: Graceful handling of invalid SSE format or missing data lines
-
-The Streamable HTTP transport is ideal for:
-- Services like Zapier MCP that use HTTP POST with SSE responses
-- APIs that need HTTP compatibility but want structured streaming responses
-- Integration with existing systems that expect HTTP while supporting event streams
-- Hybrid architectures that combine HTTP infrastructure with streaming capabilities
-- Maintaining compatibility with HTTP middleware while supporting real-time data
 
 ## Requirements
 

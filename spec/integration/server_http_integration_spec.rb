@@ -7,7 +7,7 @@ RSpec.describe 'HTTP Transport Integration', type: :integration do
   let(:base_url) { 'https://api.example.com' }
   let(:endpoint) { '/mcp' }
   let(:headers) { { 'Authorization' => 'Bearer test-token-123' } }
-  
+
   let(:server) do
     MCPClient::ServerHTTP.new(
       base_url: base_url,
@@ -116,7 +116,7 @@ RSpec.describe 'HTTP Transport Integration', type: :integration do
       # Step 2: List available tools
       tools = server.list_tools
       expect(tools.size).to eq(2)
-      
+
       weather_tool = tools.find { |t| t.name == 'weather' }
       expect(weather_tool).not_to be_nil
       expect(weather_tool.description).to eq('Get weather information')
@@ -143,10 +143,10 @@ RSpec.describe 'HTTP Transport Integration', type: :integration do
 
     it 'handles streaming tool calls' do
       server.connect
-      
+
       stream = server.call_tool_streaming('weather', { location: 'San Francisco' })
       results = stream.to_a
-      
+
       expect(results.size).to eq(1)
       expect(results.first['content'].first['text']).to include('Weather in San Francisco')
     end
@@ -282,14 +282,14 @@ RSpec.describe 'HTTP Transport Integration', type: :integration do
 
     it 'sends notifications without expecting responses' do
       server.connect
-      
+
       expect { server.rpc_notify('notification', { event: 'test' }) }.not_to raise_error
-      
-      expect(WebMock).to have_requested(:post, "#{base_url}#{endpoint}")
-        .with { |req|
+
+      expect(WebMock).to(have_requested(:post, "#{base_url}#{endpoint}")
+        .with do |req|
           body = JSON.parse(req.body)
           body['method'] == 'notification' && !body.key?('id')
-        }
+        end)
     end
   end
 
@@ -320,12 +320,12 @@ RSpec.describe 'HTTP Transport Integration', type: :integration do
 
     it 'creates HTTP server through factory' do
       server = MCPClient::ServerFactory.create(config)
-      
+
       expect(server).to be_a(MCPClient::ServerHTTP)
       expect(server.base_url).to eq(base_url)
       expect(server.endpoint).to eq(endpoint)
       expect(server.name).to eq('factory-test-server')
-      
+
       # Test that it can connect
       expect(server.connect).to be true
     end
@@ -355,17 +355,17 @@ RSpec.describe 'HTTP Transport Integration', type: :integration do
 
     it 'handles concurrent requests correctly' do
       server.connect
-      
+
       # Make multiple concurrent requests
-      threads = 5.times.map do |i|
+      threads = 5.times.map do |_i|
         Thread.new do
           server.ping
         end
       end
-      
+
       results = threads.map(&:join).map(&:value)
       expect(results).to all(eq('pong'))
-      
+
       # Verify all requests were made
       expect(WebMock).to have_requested(:post, "#{base_url}#{endpoint}")
         .with(body: hash_including(method: 'ping'))

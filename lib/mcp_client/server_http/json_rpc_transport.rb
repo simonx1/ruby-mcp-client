@@ -32,9 +32,9 @@ module MCPClient
       # @return [void]
       def rpc_notify(method, params = {})
         ensure_connected
-        
+
         notif = build_jsonrpc_notification(method, params)
-        
+
         begin
           send_http_request(notif)
         rescue MCPClient::Errors::ServerError, MCPClient::Errors::ConnectionError, Faraday::ConnectionFailed => e
@@ -61,7 +61,7 @@ module MCPClient
         request_id = @mutex.synchronize { @request_id += 1 }
         json_rpc_request = build_jsonrpc_request('initialize', initialization_params, request_id)
         @logger.debug("Performing initialize RPC: #{json_rpc_request}")
-        
+
         result = send_jsonrpc_request(json_rpc_request)
         return unless result.is_a?(Hash)
 
@@ -98,8 +98,8 @@ module MCPClient
       # @return [Faraday::Response] the HTTP response
       # @raise [MCPClient::Errors::ConnectionError] if connection fails
       def send_http_request(request)
-        conn = get_http_connection
-        
+        conn = http_connection
+
         begin
           response = conn.post(@endpoint) do |req|
             # Apply all headers including custom ones
@@ -107,9 +107,7 @@ module MCPClient
             req.body = request.to_json
           end
 
-          unless response.success?
-            handle_http_error_response(response)
-          end
+          handle_http_error_response(response) unless response.success?
 
           @logger.debug("Received HTTP response: #{response.status} #{response.body}")
           response
@@ -131,7 +129,7 @@ module MCPClient
         reason = response.respond_to?(:reason_phrase) ? response.reason_phrase : ''
         reason = reason.to_s.strip
         reason_text = reason.empty? ? '' : " #{reason}"
-        
+
         case response.status
         when 401, 403
           raise MCPClient::Errors::ConnectionError, "Authorization failed: HTTP #{response.status}"
@@ -146,8 +144,8 @@ module MCPClient
 
       # Get or create HTTP connection
       # @return [Faraday::Connection] the HTTP connection
-      def get_http_connection
-        @http_conn ||= create_http_connection
+      def http_connection
+        @http_connection ||= create_http_connection
       end
 
       # Create a Faraday connection for HTTP requests

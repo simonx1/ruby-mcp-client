@@ -6,7 +6,7 @@ module MCPClient
 
   # JSON-RPC handshake protocol version (date-based)
   PROTOCOL_VERSION = '2024-11-05'
-  
+
   # Protocol version for HTTP and Streamable HTTP transports
   HTTP_PROTOCOL_VERSION = '2025-03-26'
 end

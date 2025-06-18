@@ -49,40 +49,39 @@ module MCPClient
 
       @max_retries = retries
       @retry_backoff = retry_backoff
-      
+
       # Normalize base_url and handle cases where full endpoint is provided in base_url
       uri = URI.parse(base_url.chomp('/'))
-      
+
       # Helper to build base URL without default ports
       build_base_url = lambda do |parsed_uri|
-        port_part = if parsed_uri.port && 
-                       !((parsed_uri.scheme == 'http' && parsed_uri.port == 80) || 
+        port_part = if parsed_uri.port &&
+                       !((parsed_uri.scheme == 'http' && parsed_uri.port == 80) ||
                          (parsed_uri.scheme == 'https' && parsed_uri.port == 443))
                       ":#{parsed_uri.port}"
                     else
-                      ""
+                      ''
                     end
         "#{parsed_uri.scheme}://#{parsed_uri.host}#{port_part}"
       end
-      
-      if uri.path && !uri.path.empty? && uri.path != '/' && endpoint == '/rpc'
-        # If base_url contains a path and we're using default endpoint,
-        # treat the path as the endpoint and use the base URL without path
-        @base_url = build_base_url.call(uri)
-        @endpoint = uri.path
-      else
-        # Standard case: base_url is just scheme://host:port, endpoint is separate
-        @base_url = build_base_url.call(uri)
-        @endpoint = endpoint
-      end
-      
+
+      @base_url = build_base_url.call(uri)
+      @endpoint = if uri.path && !uri.path.empty? && uri.path != '/' && endpoint == '/rpc'
+                    # If base_url contains a path and we're using default endpoint,
+                    # treat the path as the endpoint and use the base URL without path
+                    uri.path
+                  else
+                    # Standard case: base_url is just scheme://host:port, endpoint is separate
+                    endpoint
+                  end
+
       # Set up headers for HTTP requests
       @headers = headers.merge({
-        'Content-Type' => 'application/json',
-        'Accept' => 'application/json',
-        'User-Agent' => "ruby-mcp-client/#{MCPClient::VERSION}"
-      })
-      
+                                 'Content-Type' => 'application/json',
+                                 'Accept' => 'application/json',
+                                 'User-Agent' => "ruby-mcp-client/#{MCPClient::VERSION}"
+                               })
+
       @read_timeout = read_timeout
       @tools = nil
       @tools_data = nil
@@ -107,15 +106,15 @@ module MCPClient
 
         # Test connectivity with a simple HTTP request
         test_connection
-        
+
         # Perform MCP initialization handshake
         perform_initialize
-        
+
         @mutex.synchronize do
           @connection_established = true
           @initialized = true
         end
-        
+
         true
       rescue MCPClient::Errors::ConnectionError => e
         cleanup
@@ -192,12 +191,12 @@ module MCPClient
       @mutex.synchronize do
         @connection_established = false
         @initialized = false
-        
+
         @logger.debug('Cleaning up HTTP connection')
-        
+
         # Close HTTP connection if it exists
         @http_conn = nil
-        
+
         @tools = nil
         @tools_data = nil
       end
@@ -209,8 +208,8 @@ module MCPClient
     # @return [void]
     # @raise [MCPClient::Errors::ConnectionError] if connection test fails
     def test_connection
-      conn = create_http_connection
-      
+      create_http_connection
+
       # Simple connectivity test - we'll use the actual initialize call
       # since there's no standard HTTP health check endpoint
     rescue Faraday::ConnectionFailed => e

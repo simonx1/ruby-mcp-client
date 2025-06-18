@@ -65,14 +65,14 @@ RSpec.describe MCPClient::ServerHTTP do
         .to_return(
           status: 200,
           body: JSON.generate({
-            jsonrpc: '2.0',
-            id: 1,
-            result: {
-              protocolVersion: MCPClient::HTTP_PROTOCOL_VERSION,
-              capabilities: {},
-              serverInfo: { name: 'test-server', version: '1.0.0' }
-            }
-          }),
+                                jsonrpc: '2.0',
+                                id: 1,
+                                result: {
+                                  protocolVersion: MCPClient::HTTP_PROTOCOL_VERSION,
+                                  capabilities: {},
+                                  serverInfo: { name: 'test-server', version: '1.0.0' }
+                                }
+                              }),
           headers: { 'Content-Type' => 'application/json' }
         )
 
@@ -84,7 +84,7 @@ RSpec.describe MCPClient::ServerHTTP do
 
     it 'handles base_url with path and explicit endpoint' do
       server_explicit = described_class.new(
-        base_url: 'https://example.com/api', 
+        base_url: 'https://example.com/api',
         endpoint: '/custom'
       )
       expect(server_explicit.base_url).to eq('https://example.com')
@@ -335,21 +335,21 @@ RSpec.describe MCPClient::ServerHTTP do
     it 'calls tool with correct parameters' do
       result = server.call_tool(tool_name, parameters)
       expect(result).to eq({
-        'content' => [
-          { 'type' => 'text', 'text' => 'Tool executed successfully' }
-        ]
-      })
+                             'content' => [
+                               { 'type' => 'text', 'text' => 'Tool executed successfully' }
+                             ]
+                           })
     end
 
     it 'sends correct JSON-RPC request' do
       server.call_tool(tool_name, parameters)
-      expect(WebMock).to have_requested(:post, "#{base_url}#{endpoint}")
-        .with { |req|
+      expect(WebMock).to(have_requested(:post, "#{base_url}#{endpoint}")
+        .with do |req|
           body = JSON.parse(req.body)
           body['method'] == 'tools/call' &&
             body['params']['name'] == tool_name &&
             body['params']['arguments'] == { 'param' => 'value' }
-        }
+        end)
     end
 
     context 'when connection is lost' do
@@ -462,11 +462,11 @@ RSpec.describe MCPClient::ServerHTTP do
 
     it 'sends request without id field' do
       server.rpc_notify(method_name, params)
-      expect(WebMock).to have_requested(:post, "#{base_url}#{endpoint}")
-        .with { |req|
+      expect(WebMock).to(have_requested(:post, "#{base_url}#{endpoint}")
+        .with do |req|
           body = JSON.parse(req.body)
           !body.key?('id') && body['method'] == method_name
-        }
+        end)
     end
   end
 
