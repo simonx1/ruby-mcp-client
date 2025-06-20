@@ -12,6 +12,8 @@ require_relative 'mcp_client/server_factory'
 require_relative 'mcp_client/client'
 require_relative 'mcp_client/version'
 require_relative 'mcp_client/config_parser'
+require_relative 'mcp_client/auth'
+require_relative 'mcp_client/oauth_client'
 
 # Model Context Protocol (MCP) Client module
 # Provides a standardized way for agents to communicate with external tools and services

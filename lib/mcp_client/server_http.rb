@@ -37,22 +37,24 @@ module MCPClient
     attr_reader :capabilities
 
     # @param base_url [String] The base URL of the MCP server
-    # @param endpoint [String] The JSON-RPC endpoint path (default: '/rpc')
-    # @param headers [Hash] Additional headers to include in requests
-    # @param read_timeout [Integer] Read timeout in seconds (default: 30)
-    # @param retries [Integer] number of retry attempts on transient errors (default: 3)
-    # @param retry_backoff [Numeric] base delay in seconds for exponential backoff (default: 1)
-    # @param name [String, nil] optional name for this server
-    # @param logger [Logger, nil] optional logger
-    def initialize(base_url:, endpoint: '/rpc', headers: {}, read_timeout: DEFAULT_READ_TIMEOUT,
-                   retries: DEFAULT_MAX_RETRIES, retry_backoff: 1, name: nil, logger: nil)
-      super(name: name)
-      @logger = logger || Logger.new($stdout, level: Logger::WARN)
+    # @param options [Hash] Server configuration options
+    # @option options [String] :endpoint JSON-RPC endpoint path (default: '/rpc')
+    # @option options [Hash] :headers Additional headers to include in requests
+    # @option options [Integer] :read_timeout Read timeout in seconds (default: 30)
+    # @option options [Integer] :retries Retry attempts on transient errors (default: 3)
+    # @option options [Numeric] :retry_backoff Base delay for exponential backoff (default: 1)
+    # @option options [String, nil] :name Optional name for this server
+    # @option options [Logger, nil] :logger Optional logger
+    # @option options [MCPClient::Auth::OAuthProvider, nil] :oauth_provider Optional OAuth provider
+    def initialize(base_url:, **options)
+      opts = default_options.merge(options)
+      super(name: opts[:name])
+      @logger = opts[:logger] || Logger.new($stdout, level: Logger::WARN)
       @logger.progname = self.class.name
       @logger.formatter = proc { |severity, _datetime, progname, msg| "#{severity} [#{progname}] #{msg}\n" }
 
-      @max_retries = retries
-      @retry_backoff = retry_backoff
+      @max_retries = opts[:retries]
+      @retry_backoff = opts[:retry_backoff]
 
       # Validate and normalize base_url
       raise ArgumentError, "Invalid or insecure server URL: #{base_url}" unless valid_server_url?(base_url)
@@ -73,23 +75,23 @@ module MCPClient
       end
 
       @base_url = build_base_url.call(uri)
-      @endpoint = if uri.path && !uri.path.empty? && uri.path != '/' && endpoint == '/rpc'
+      @endpoint = if uri.path && !uri.path.empty? && uri.path != '/' && opts[:endpoint] == '/rpc'
                     # If base_url contains a path and we're using default endpoint,
                     # treat the path as the endpoint and use the base URL without path
                     uri.path
                   else
                     # Standard case: base_url is just scheme://host:port, endpoint is separate
-                    endpoint
+                    opts[:endpoint]
                   end
 
       # Set up headers for HTTP requests
-      @headers = headers.merge({
-                                 'Content-Type' => 'application/json',
-                                 'Accept' => 'application/json',
-                                 'User-Agent' => "ruby-mcp-client/#{MCPClient::VERSION}"
-                               })
+      @headers = opts[:headers].merge({
+                                        'Content-Type' => 'application/json',
+                                        'Accept' => 'application/json',
+                                        'User-Agent' => "ruby-mcp-client/#{MCPClient::VERSION}"
+                                      })
 
-      @read_timeout = read_timeout
+      @read_timeout = opts[:read_timeout]
       @tools = nil
       @tools_data = nil
       @request_id = 0
@@ -98,6 +100,7 @@ module MCPClient
       @initialized = false
       @http_conn = nil
       @session_id = nil
+      @oauth_provider = opts[:oauth_provider]
     end
 
     # Connect to the MCP server over HTTP
@@ -272,6 +275,21 @@ module MCPClient
     end
 
     private
+
+    # Default options for server initialization
+    # @return [Hash] Default options
+    def default_options
+      {
+        endpoint: '/rpc',
+        headers: {},
+        read_timeout: DEFAULT_READ_TIMEOUT,
+        retries: DEFAULT_MAX_RETRIES,
+        retry_backoff: 1,
+        name: nil,
+        logger: nil,
+        oauth_provider: nil
+      }
+    end
 
     # Test basic connectivity to the HTTP endpoint
     # @return [void]

@@ -1,6 +1,7 @@
 # frozen_string_literal: true
 
 require_relative 'json_rpc_common'
+require_relative 'auth/oauth_provider'
 
 module MCPClient
   # Base module for HTTP-based JSON-RPC transports
@@ -174,6 +175,10 @@ module MCPClient
         response = conn.post(@endpoint) do |req|
           # Apply all headers including custom ones
           @headers.each { |k, v| req.headers[k] = v }
+
+          # Apply OAuth authorization if available
+          @oauth_provider&.apply_authorization(req)
+
           req.body = request.to_json
         end
 
@@ -182,6 +187,16 @@ module MCPClient
         log_response(response)
         response
       rescue Faraday::UnauthorizedError, Faraday::ForbiddenError => e
+        # Handle OAuth authorization challenges
+        if e.response && @oauth_provider
+          resource_metadata = @oauth_provider.handle_unauthorized_response(e.response)
+          if resource_metadata
+            @logger.debug('Received OAuth challenge, discovered resource metadata')
+            # Re-raise the error to trigger OAuth flow in calling code
+            raise MCPClient::Errors::ConnectionError, "OAuth authorization required: HTTP #{e.response[:status]}"
+          end
+        end
+
         error_status = e.response ? e.response[:status] : 'unknown'
         raise MCPClient::Errors::ConnectionError, "Authorization failed: HTTP #{error_status}"
       rescue Faraday::ConnectionFailed => e
