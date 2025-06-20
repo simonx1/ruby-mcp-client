@@ -173,37 +173,59 @@ module MCPClient
 
       begin
         response = conn.post(@endpoint) do |req|
-          # Apply all headers including custom ones
-          @headers.each { |k, v| req.headers[k] = v }
-
-          # Apply OAuth authorization if available
-          @oauth_provider&.apply_authorization(req)
-
+          apply_request_headers(req, request)
           req.body = request.to_json
         end
 
         handle_http_error_response(response) unless response.success?
+        handle_successful_response(response, request)
 
         log_response(response)
         response
       rescue Faraday::UnauthorizedError, Faraday::ForbiddenError => e
-        # Handle OAuth authorization challenges
-        if e.response && @oauth_provider
-          resource_metadata = @oauth_provider.handle_unauthorized_response(e.response)
-          if resource_metadata
-            @logger.debug('Received OAuth challenge, discovered resource metadata')
-            # Re-raise the error to trigger OAuth flow in calling code
-            raise MCPClient::Errors::ConnectionError, "OAuth authorization required: HTTP #{e.response[:status]}"
-          end
-        end
-
-        error_status = e.response ? e.response[:status] : 'unknown'
-        raise MCPClient::Errors::ConnectionError, "Authorization failed: HTTP #{error_status}"
+        handle_auth_error(e)
       rescue Faraday::ConnectionFailed => e
         raise MCPClient::Errors::ConnectionError, "Server connection lost: #{e.message}"
       rescue Faraday::Error => e
         raise MCPClient::Errors::TransportError, "HTTP request failed: #{e.message}"
       end
+    end
+
+    # Apply headers to the HTTP request (can be overridden by subclasses)
+    # @param req [Faraday::Request] HTTP request
+    # @param _request [Hash] JSON-RPC request
+    def apply_request_headers(req, _request)
+      # Apply all headers including custom ones
+      @headers.each { |k, v| req.headers[k] = v }
+
+      # Apply OAuth authorization if available
+      @logger.debug("OAuth provider present: #{@oauth_provider ? 'yes' : 'no'}")
+      @oauth_provider&.apply_authorization(req)
+    end
+
+    # Handle successful HTTP response (can be overridden by subclasses)
+    # @param response [Faraday::Response] HTTP response
+    # @param _request [Hash] JSON-RPC request
+    def handle_successful_response(response, _request)
+      # Default: no additional handling
+    end
+
+    # Handle authentication errors
+    # @param error [Faraday::UnauthorizedError, Faraday::ForbiddenError] Auth error
+    # @raise [MCPClient::Errors::ConnectionError] Connection error
+    def handle_auth_error(error)
+      # Handle OAuth authorization challenges
+      if error.response && @oauth_provider
+        resource_metadata = @oauth_provider.handle_unauthorized_response(error.response)
+        if resource_metadata
+          @logger.debug('Received OAuth challenge, discovered resource metadata')
+          # Re-raise the error to trigger OAuth flow in calling code
+          raise MCPClient::Errors::ConnectionError, "OAuth authorization required: HTTP #{error.response[:status]}"
+        end
+      end
+
+      error_status = error.response ? error.response[:status] : 'unknown'
+      raise MCPClient::Errors::ConnectionError, "Authorization failed: HTTP #{error_status}"
     end
 
     # Handle HTTP error responses

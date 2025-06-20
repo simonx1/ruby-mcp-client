@@ -11,13 +11,18 @@ module MCPClient
     # Handles the complete OAuth flow including server discovery, client registration,
     # authorization, token exchange, and refresh
     class OAuthProvider
-      # @!attribute [r] server_url
-      #   @return [String] The MCP server URL
-      # @!attribute [r] redirect_uri
+      # @!attribute [rw] redirect_uri
       #   @return [String] OAuth redirect URI
-      # @!attribute [r] scope
+      # @!attribute [rw] scope
       #   @return [String, nil] OAuth scope
-      attr_reader :server_url, :redirect_uri, :scope
+      # @!attribute [rw] logger
+      #   @return [Logger] Logger instance
+      # @!attribute [rw] storage
+      #   @return [Object] Storage backend for tokens and client info
+      # @!attribute [r] server_url
+      #   @return [String] The MCP server URL (normalized)
+      attr_accessor :redirect_uri, :scope, :logger, :storage
+      attr_reader :server_url
 
       # Initialize OAuth provider
       # @param server_url [String] The MCP server URL (used as OAuth resource parameter)
@@ -26,18 +31,25 @@ module MCPClient
       # @param logger [Logger, nil] Optional logger
       # @param storage [Object, nil] Storage backend for tokens and client info
       def initialize(server_url:, redirect_uri: 'http://localhost:8080/callback', scope: nil, logger: nil, storage: nil)
-        @server_url = normalize_server_url(server_url)
-        @redirect_uri = redirect_uri
-        @scope = scope
-        @logger = logger || Logger.new($stdout, level: Logger::WARN)
-        @storage = storage || MemoryStorage.new
+        self.server_url = server_url
+        self.redirect_uri = redirect_uri
+        self.scope = scope
+        self.logger = logger || Logger.new($stdout, level: Logger::WARN)
+        self.storage = storage || MemoryStorage.new
         @http_client = create_http_client
+      end
+
+      # Custom setter for server_url to normalize it
+      # @param url [String] Server URL to normalize
+      def server_url=(url)
+        @server_url = normalize_server_url(url)
       end
 
       # Get current access token (refresh if needed)
       # @return [Token, nil] Current valid access token or nil
       def access_token
-        token = @storage.get_token(@server_url)
+        token = storage.get_token(server_url)
+        logger.debug("OAuth access_token: retrieved token=#{token ? 'present' : 'nil'} for #{server_url}")
         return nil unless token
 
         # Return token if still valid
@@ -59,11 +71,11 @@ module MCPClient
 
         # Generate PKCE parameters
         pkce = PKCE.new
-        @storage.set_pkce(@server_url, pkce)
+        storage.set_pkce(server_url, pkce)
 
         # Generate state parameter
         state = SecureRandom.urlsafe_base64(32)
-        @storage.set_state(@server_url, state)
+        storage.set_state(server_url, state)
 
         # Build authorization URL
         build_authorization_url(server_metadata, client_info, pkce, state)
@@ -77,12 +89,12 @@ module MCPClient
       # @raise [ArgumentError] if state parameter doesn't match
       def complete_authorization_flow(code, state)
         # Verify state parameter
-        stored_state = @storage.get_state(@server_url)
+        stored_state = storage.get_state(server_url)
         raise ArgumentError, 'Invalid state parameter' unless stored_state == state
 
         # Get stored PKCE and client info
-        pkce = @storage.get_pkce(@server_url)
-        client_info = @storage.get_client_info(@server_url)
+        pkce = storage.get_pkce(server_url)
+        client_info = storage.get_client_info(server_url)
         server_metadata = discover_authorization_server
 
         raise MCPClient::Errors::ConnectionError, 'Missing PKCE or client info' unless pkce && client_info
@@ -91,11 +103,11 @@ module MCPClient
         token = exchange_authorization_code(server_metadata, client_info, code, pkce)
 
         # Store token
-        @storage.set_token(@server_url, token)
+        storage.set_token(server_url, token)
 
         # Clean up temporary data
-        @storage.delete_pkce(@server_url)
-        @storage.delete_state(@server_url)
+        storage.delete_pkce(server_url)
+        storage.delete_state(server_url)
 
         token
       end
@@ -105,8 +117,10 @@ module MCPClient
       # @return [void]
       def apply_authorization(request)
         token = access_token
+        logger.debug("OAuth apply_authorization: token=#{token ? 'present' : 'nil'}")
         return unless token
 
+        logger.debug("OAuth applying authorization header: #{token.to_header[0..20]}...")
         request.headers['Authorization'] = token.to_header
       end
 
@@ -190,12 +204,12 @@ module MCPClient
       # @raise [MCPClient::Errors::ConnectionError] if discovery fails
       def discover_authorization_server
         # Try to get from storage first
-        if (cached = @storage.get_server_metadata(@server_url))
+        if (cached = storage.get_server_metadata(server_url))
           return cached
         end
 
         # Build discovery URL using the origin (scheme + host + port) only
-        discovery_url = build_discovery_url(@server_url)
+        discovery_url = build_discovery_url(server_url)
 
         # Fetch resource metadata to find authorization server
         resource_metadata = fetch_resource_metadata(discovery_url)
@@ -208,7 +222,7 @@ module MCPClient
         server_metadata = fetch_server_metadata("#{auth_server_url}/.well-known/oauth-authorization-server")
 
         # Cache the metadata
-        @storage.set_server_metadata(@server_url, server_metadata)
+        storage.set_server_metadata(server_url, server_metadata)
 
         server_metadata
       end
@@ -218,7 +232,7 @@ module MCPClient
       # @return [ResourceMetadata] Resource metadata
       # @raise [MCPClient::Errors::ConnectionError] if fetch fails
       def fetch_resource_metadata(url)
-        @logger.debug("Fetching resource metadata from: #{url}")
+        logger.debug("Fetching resource metadata from: #{url}")
 
         response = @http_client.get(url) do |req|
           req.headers['Accept'] = 'application/json'
@@ -241,7 +255,7 @@ module MCPClient
       # @return [ServerMetadata] Server metadata
       # @raise [MCPClient::Errors::ConnectionError] if fetch fails
       def fetch_server_metadata(url)
-        @logger.debug("Fetching server metadata from: #{url}")
+        logger.debug("Fetching server metadata from: #{url}")
 
         response = @http_client.get(url) do |req|
           req.headers['Accept'] = 'application/json'
@@ -265,7 +279,7 @@ module MCPClient
       # @raise [MCPClient::Errors::ConnectionError] if registration fails
       def get_or_register_client(server_metadata)
         # Try to get existing client info from storage
-        if (client_info = @storage.get_client_info(@server_url)) && !client_info.client_secret_expired?
+        if (client_info = storage.get_client_info(server_url)) && !client_info.client_secret_expired?
           return client_info
         end
 
@@ -283,14 +297,14 @@ module MCPClient
       # @return [ClientInfo] Registered client information
       # @raise [MCPClient::Errors::ConnectionError] if registration fails
       def register_client(server_metadata)
-        @logger.debug("Registering OAuth client at: #{server_metadata.registration_endpoint}")
+        logger.debug("Registering OAuth client at: #{server_metadata.registration_endpoint}")
 
         metadata = ClientMetadata.new(
-          redirect_uris: [@redirect_uri],
+          redirect_uris: [redirect_uri],
           token_endpoint_auth_method: 'none', # Public client
           grant_types: %w[authorization_code refresh_token],
           response_types: ['code'],
-          scope: @scope
+          scope: scope
         )
 
         response = @http_client.post(server_metadata.registration_endpoint) do |req|
@@ -313,7 +327,7 @@ module MCPClient
         )
 
         # Store client info
-        @storage.set_client_info(@server_url, client_info)
+        storage.set_client_info(server_url, client_info)
 
         client_info
       rescue JSON::ParserError => e
@@ -332,12 +346,12 @@ module MCPClient
         params = {
           response_type: 'code',
           client_id: client_info.client_id,
-          redirect_uri: @redirect_uri,
-          scope: @scope,
+          redirect_uri: redirect_uri,
+          scope: scope,
           state: state,
           code_challenge: pkce.code_challenge,
           code_challenge_method: pkce.code_challenge_method,
-          resource: @server_url
+          resource: server_url
         }.compact
 
         uri = URI.parse(server_metadata.authorization_endpoint)
@@ -353,15 +367,15 @@ module MCPClient
       # @return [Token] Access token
       # @raise [MCPClient::Errors::ConnectionError] if token exchange fails
       def exchange_authorization_code(server_metadata, client_info, code, pkce)
-        @logger.debug("Exchanging authorization code for token at: #{server_metadata.token_endpoint}")
+        logger.debug("Exchanging authorization code for token at: #{server_metadata.token_endpoint}")
 
         params = {
           grant_type: 'authorization_code',
           code: code,
-          redirect_uri: @redirect_uri,
+          redirect_uri: redirect_uri,
           client_id: client_info.client_id,
           code_verifier: pkce.code_verifier,
-          resource: @server_url
+          resource: server_url
         }
 
         response = @http_client.post(server_metadata.token_endpoint) do |req|
@@ -394,10 +408,10 @@ module MCPClient
       def refresh_token(token)
         return nil unless token.refresh_token
 
-        @logger.debug('Refreshing access token')
+        logger.debug('Refreshing access token')
 
         server_metadata = discover_authorization_server
-        client_info = @storage.get_client_info(@server_url)
+        client_info = storage.get_client_info(server_url)
 
         return nil unless server_metadata && client_info
 
@@ -405,7 +419,7 @@ module MCPClient
           grant_type: 'refresh_token',
           refresh_token: token.refresh_token,
           client_id: client_info.client_id,
-          resource: @server_url
+          resource: server_url
         }
 
         response = @http_client.post(server_metadata.token_endpoint) do |req|
@@ -415,7 +429,7 @@ module MCPClient
         end
 
         unless response.success?
-          @logger.warn("Token refresh failed: HTTP #{response.status}")
+          logger.warn("Token refresh failed: HTTP #{response.status}")
           return nil
         end
 
@@ -428,13 +442,13 @@ module MCPClient
           refresh_token: data['refresh_token'] || token.refresh_token
         )
 
-        @storage.set_token(@server_url, new_token)
+        storage.set_token(server_url, new_token)
         new_token
       rescue JSON::ParserError => e
-        @logger.warn("Invalid token refresh response: #{e.message}")
+        logger.warn("Invalid token refresh response: #{e.message}")
         nil
       rescue Faraday::Error => e
-        @logger.warn("Network error during token refresh: #{e.message}")
+        logger.warn("Network error during token refresh: #{e.message}")
         nil
       end
 

@@ -40,6 +40,14 @@ with popular AI services with built-in conversions:
 - `to_anthropic_tools()` - Formats tools for Anthropic Claude API
 - `to_google_tools()` - Formats tools for Google Vertex AI API (automatically removes "$schema" keys not accepted by Vertex AI)
 
+## MCP 2025-03-26 Protocol Features
+
+This Ruby MCP Client implements key features from the latest MCP specification (Protocol Revision: 2025-03-26):
+
+### Implemented Features
+- **OAuth 2.1 Authorization Framework** - Complete authentication with PKCE, dynamic client registration, server discovery, and runtime configuration
+- **Streamable HTTP Transport** - Enhanced transport with Server-Sent Event formatted responses and session management
+
 ## Usage
 
 ### Basic Client Usage
@@ -548,6 +556,69 @@ client.cleanup
 ```
 
 This enables compatibility with MCP servers that maintain state between requests and require session identification.
+
+## OAuth 2.1 Authentication
+
+The Ruby MCP Client includes comprehensive OAuth 2.1 support for secure authentication with MCP servers:
+
+```ruby
+require 'mcp_client'
+
+# Create an OAuth-enabled HTTP server
+server = MCPClient::OAuthClient.create_http_server(
+  server_url: 'https://api.example.com/mcp',
+  redirect_uri: 'http://localhost:8080/callback',
+  scope: 'mcp:read mcp:write'
+)
+
+# Check if authorization is needed
+unless MCPClient::OAuthClient.valid_token?(server)
+  # Start OAuth flow
+  auth_url = MCPClient::OAuthClient.start_oauth_flow(server)
+  puts "Please visit: #{auth_url}"
+
+  # After user authorization, complete the flow
+  # token = MCPClient::OAuthClient.complete_oauth_flow(server, code, state)
+end
+
+# Use the server normally
+server.connect
+tools = server.list_tools
+```
+
+### Manual OAuth Provider
+
+For more control over the OAuth flow:
+
+```ruby
+# Create OAuth provider directly
+oauth_provider = MCPClient::Auth::OAuthProvider.new(
+  server_url: 'https://api.example.com/mcp',
+  redirect_uri: 'http://localhost:8080/callback',
+  scope: 'mcp:read mcp:write'
+)
+
+# Update configuration at runtime
+oauth_provider.scope = 'mcp:read mcp:write admin'
+oauth_provider.redirect_uri = 'http://localhost:9000/callback'
+
+# Start authorization flow
+auth_url = oauth_provider.start_authorization_flow
+
+# Complete flow after user authorization
+token = oauth_provider.complete_authorization_flow(code, state)
+```
+
+### OAuth Features
+
+- **OAuth 2.1 compliance** with PKCE for security
+- **Automatic server discovery** via `.well-known` endpoints
+- **Dynamic client registration** when supported by servers
+- **Token refresh** and automatic token management
+- **Pluggable storage** for tokens and client credentials
+- **Runtime configuration** via getter/setter methods
+
+For complete OAuth documentation, see [OAUTH.md](OAUTH.md).
 
 ## Key Features
 

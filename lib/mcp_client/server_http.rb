@@ -186,50 +186,34 @@ module MCPClient
       raise MCPClient::Errors::ToolCallError, "Error calling tool '#{tool_name}': #{e.message}"
     end
 
-    # Override send_http_request to handle session headers for MCP protocol
-    def send_http_request(request)
-      conn = http_connection
+    # Override apply_request_headers to add session headers for MCP protocol
+    def apply_request_headers(req, request)
+      super
 
-      begin
-        response = conn.post(@endpoint) do |req|
-          # Apply all headers including custom ones
-          @headers.each { |k, v| req.headers[k] = v }
+      # Add session header if we have one (for non-initialize requests)
+      return unless @session_id && request['method'] != 'initialize'
 
-          # Add session header if we have one (for non-initialize requests)
-          if @session_id && request['method'] != 'initialize'
-            req.headers['Mcp-Session-Id'] = @session_id
-            @logger.debug("Adding session header: Mcp-Session-Id: #{@session_id}")
-          end
+      req.headers['Mcp-Session-Id'] = @session_id
+      @logger.debug("Adding session header: Mcp-Session-Id: #{@session_id}")
+    end
 
-          req.body = request.to_json
+    # Override handle_successful_response to capture session ID
+    def handle_successful_response(response, request)
+      super
+
+      # Capture session ID from initialize response with validation
+      return unless request['method'] == 'initialize' && response.success?
+
+      session_id = response.headers['mcp-session-id'] || response.headers['Mcp-Session-Id']
+      if session_id
+        if valid_session_id?(session_id)
+          @session_id = session_id
+          @logger.debug("Captured session ID: #{@session_id}")
+        else
+          @logger.warn("Invalid session ID format received: #{session_id.inspect}")
         end
-
-        handle_http_error_response(response) unless response.success?
-
-        # Capture session ID from initialize response with validation
-        if request['method'] == 'initialize' && response.success?
-          session_id = response.headers['mcp-session-id'] || response.headers['Mcp-Session-Id']
-          if session_id
-            if valid_session_id?(session_id)
-              @session_id = session_id
-              @logger.debug("Captured session ID: #{@session_id}")
-            else
-              @logger.warn("Invalid session ID format received: #{session_id.inspect}")
-            end
-          else
-            @logger.warn('No session ID found in initialize response headers')
-          end
-        end
-
-        log_response(response)
-        response
-      rescue Faraday::UnauthorizedError, Faraday::ForbiddenError => e
-        error_status = e.response ? e.response[:status] : 'unknown'
-        raise MCPClient::Errors::ConnectionError, "Authorization failed: HTTP #{error_status}"
-      rescue Faraday::ConnectionFailed => e
-        raise MCPClient::Errors::ConnectionError, "Server connection lost: #{e.message}"
-      rescue Faraday::Error => e
-        raise MCPClient::Errors::TransportError, "HTTP request failed: #{e.message}"
+      else
+        @logger.warn('No session ID found in initialize response headers')
       end
     end
 

@@ -31,7 +31,7 @@ unless MCPClient::OAuthClient.valid_token?(server)
   # Start OAuth flow
   auth_url = MCPClient::OAuthClient.start_oauth_flow(server)
   puts "Please visit: #{auth_url}"
-  
+
   # After user authorization, complete the flow
   # token = MCPClient::OAuthClient.complete_oauth_flow(server, code, state)
 end
