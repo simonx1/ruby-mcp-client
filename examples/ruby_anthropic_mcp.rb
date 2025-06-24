@@ -37,7 +37,7 @@ stdio_server = mcp_client.servers.first
 puts "STDIO server env EXAMPLE_ENV_VAR: #{stdio_server.env['EXAMPLE_ENV_VAR']}"
 
 # Initialize the Anthropic client
-client = Anthropic::Client.new(access_token: api_key)
+client = Anthropic::Client.new(api_key: api_key)
 
 # Get MCPClient tools
 mcp_client.list_tools

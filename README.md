@@ -411,7 +411,7 @@ mcp_client = MCPClient.create_client(
 claude_tools = mcp_client.to_anthropic_tools
 
 # Use with Anthropic client
-client = Anthropic::Client.new(access_token: ENV['ANTHROPIC_API_KEY'])
+client = Anthropic::Client.new(api_key: ENV['ANTHROPIC_API_KEY'])
 # See examples directory for complete implementation
 ```
 
