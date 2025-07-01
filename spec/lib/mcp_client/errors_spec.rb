@@ -11,5 +11,8 @@ RSpec.describe MCPClient::Errors do
     expect(MCPClient::Errors::ConnectionError).to be < MCPClient::Errors::MCPError
     expect(MCPClient::Errors::ServerError).to be < MCPClient::Errors::MCPError
     expect(MCPClient::Errors::TransportError).to be < MCPClient::Errors::MCPError
+    expect(MCPClient::Errors::PromptGetError).to be < MCPClient::Errors::MCPError
+    expect(MCPClient::Errors::PromptGetError).to be < MCPClient::Errors::MCPError
+    expect(MCPClient::Errors::AmbiguousPromptName).to be < MCPClient::Errors::MCPError
   end
 end
