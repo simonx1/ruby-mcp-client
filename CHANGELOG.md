@@ -1,5 +1,35 @@
 # Changelog
 
+## 0.7.1 (2025-06-20)
+
+### OAuth 2.1 Authentication Framework
+- Added comprehensive OAuth 2.1 support with PKCE for secure authentication
+- Implemented automatic authorization server discovery via `.well-known` endpoints
+- Added dynamic client registration when supported by servers
+- Implemented token refresh and automatic token management
+- Added pluggable storage backends for tokens and client credentials
+- Created `MCPClient::OAuthClient` utility class for easy OAuth-enabled server creation
+- Added runtime configuration support via getter/setter methods in `OAuthProvider`
+- Included complete OAuth examples and documentation
+
+### HTTP Transport Improvements
+- Refactored HTTP transport layer using template method pattern for better code organization
+- Eliminated code duplication across HTTP and Streamable HTTP transports
+- Improved OAuth integration across all HTTP-based transports
+- Enhanced error handling and authentication workflows
+- Added proper session management and validation
+
+### MCP 2025-03-26 Protocol Support
+- Updated protocol version support to 2025-03-26
+- Enhanced Streamable HTTP transport with improved SSE handling
+- Added session ID capture and management for stateful servers
+
+### Documentation and Examples
+- Added comprehensive OAuth documentation (OAUTH.md)
+- Updated README with OAuth usage examples and 2025 protocol features
+- Enhanced oauth_example.rb with practical implementation patterns
+- Improved code documentation and API clarity
+
 ## 0.6.2 (2025-05-20)
 
 - Fixed reconnect attempts not being reset after successful ping

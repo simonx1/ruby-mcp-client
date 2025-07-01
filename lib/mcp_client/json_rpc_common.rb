@@ -40,10 +40,10 @@ module MCPClient
     # @return [Hash] the JSON-RPC request object
     def build_jsonrpc_request(method, params, id)
       {
-        jsonrpc: '2.0',
-        id: id,
-        method: method,
-        params: params
+        'jsonrpc' => '2.0',
+        'id' => id,
+        'method' => method,
+        'params' => params
       }
     end
 
@@ -53,9 +53,9 @@ module MCPClient
     # @return [Hash] the JSON-RPC notification object
     def build_jsonrpc_notification(method, params)
       {
-        jsonrpc: '2.0',
-        method: method,
-        params: params
+        'jsonrpc' => '2.0',
+        'method' => method,
+        'params' => params
       }
     end
 
@@ -74,9 +74,7 @@ module MCPClient
     # @return [Object] the result field from the response
     # @raise [MCPClient::Errors::ServerError] if the response contains an error
     def process_jsonrpc_response(response)
-      if (err = response['error'])
-        raise MCPClient::Errors::ServerError, err['message']
-      end
+      raise MCPClient::Errors::ServerError, response['error']['message'] if response['error']
 
       response['result']
     end

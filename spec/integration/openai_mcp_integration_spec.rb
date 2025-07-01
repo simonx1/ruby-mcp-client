@@ -89,6 +89,7 @@ RSpec.describe 'MCPClient integration with ruby-openai', :integration,
     expect(response_content).to include('README.md')
 
     expect(mcp_client.to_openai_tools).to all(be_a(Hash))
-    expect(mcp_client.to_openai_tools.first).to include(:type, :function)
+    expect(mcp_client.to_openai_tools.first).to have_key(:type)
+    expect(mcp_client.to_openai_tools.first).to have_key(:function)
   end
 end

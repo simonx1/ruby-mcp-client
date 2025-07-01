@@ -11,12 +11,12 @@ module MCPClient
   # Implementation of MCP server that communicates via Server-Sent Events (SSE)
   # Useful for communicating with remote MCP servers over HTTP
   class ServerSSE < ServerBase
-    require 'mcp_client/server_sse/sse_parser'
-    require 'mcp_client/server_sse/json_rpc_transport'
+    require_relative 'server_sse/sse_parser'
+    require_relative 'server_sse/json_rpc_transport'
 
     include SseParser
     include JsonRpcTransport
-    require 'mcp_client/server_sse/reconnect_monitor'
+    require_relative 'server_sse/reconnect_monitor'
 
     include ReconnectMonitor
     # Ratio of close_after timeout to ping interval
@@ -37,11 +37,15 @@ module MCPClient
     #   @return [Array<MCPClient::Tool>, nil] List of available tools (nil if not fetched yet)
     # @!attribute [r] prompts
     #   @return [Array<MCPClient::Prompt>, nil] List of available prompts (nil if not fetched yet)
-    # @!attribute [r] server_info
-    #   @return [Hash, nil] Server information from initialize response
-    # @!attribute [r] capabilities
-    #   @return [Hash, nil] Server capabilities from initialize response
-    attr_reader :base_url, :tools, :prompts, :server_info, :capabilities
+    attr_reader :base_url, :tools, :prompts
+
+    # Server information from initialize response
+    # @return [Hash, nil] Server information
+    attr_reader :server_info
+
+    # Server capabilities from initialize response
+    # @return [Hash, nil] Server capabilities
+    attr_reader :capabilities
 
     # @param base_url [String] The base URL of the MCP server
     # @param headers [Hash] Additional headers to include in requests
@@ -192,6 +196,10 @@ module MCPClient
     # @raise [MCPClient::Errors::TransportError] if response isn't valid JSON
     # @raise [MCPClient::Errors::ToolCallError] for other errors during tool execution
     # @raise [MCPClient::Errors::ConnectionError] if server is disconnected
+    # Call a tool with the given parameters
+    # @param tool_name [String] the name of the tool to call
+    # @param parameters [Hash] the parameters to pass to the tool
+    # @return [Object] the result of the tool invocation (with string keys for backward compatibility)
     def call_tool(tool_name, parameters)
       rpc_request('tools/call', {
                     name: tool_name,

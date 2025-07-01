@@ -84,13 +84,24 @@ RSpec.describe MCPClient::ConfigParser do
         end
       end
 
-      it 'infers sse type from url presence' do
+      it 'infers streamable_http type from url presence by default' do
         with_temp_file('{"url":"http://example.com"}') do |path|
           parser = described_class.new(path, logger: logger)
           result = parser.parse
 
-          expect(result['0'][:type]).to eq('sse')
+          expect(result['0'][:type]).to eq('streamable_http')
           expect(result['0'][:url]).to eq('http://example.com')
+          expect(logger).to have_received(:warn).with(/inferring as 'streamable_http'/)
+        end
+      end
+
+      it 'infers sse type when url contains "sse"' do
+        with_temp_file('{"url":"http://example.com/sse"}') do |path|
+          parser = described_class.new(path, logger: logger)
+          result = parser.parse
+
+          expect(result['0'][:type]).to eq('sse')
+          expect(result['0'][:url]).to eq('http://example.com/sse')
           expect(logger).to have_received(:warn).with(/inferring as 'sse'/)
         end
       end

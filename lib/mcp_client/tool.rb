@@ -31,10 +31,11 @@ module MCPClient
     # @return [MCPClient::Tool] tool instance
     def self.from_json(data, server: nil)
       # Some servers (Playwright MCP CLI) use 'inputSchema' instead of 'schema'
-      schema = data['inputSchema'] || data['schema']
+      # Handle both string and symbol keys
+      schema = data['inputSchema'] || data[:inputSchema] || data['schema'] || data[:schema]
       new(
-        name: data['name'],
-        description: data['description'],
+        name: data['name'] || data[:name],
+        description: data['description'] || data[:description],
         schema: schema,
         server: server
       )

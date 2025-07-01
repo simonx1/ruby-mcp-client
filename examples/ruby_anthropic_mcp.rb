@@ -5,6 +5,7 @@
 require_relative '../lib/mcp_client'
 require 'anthropic'
 require 'json'
+require 'logger'
 
 # Ensure the ANTHROPIC_API_KEY environment variable is set
 api_key = ENV.fetch('ANTHROPIC_API_KEY', nil)

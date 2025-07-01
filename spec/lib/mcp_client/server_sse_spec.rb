@@ -371,26 +371,18 @@ RSpec.describe MCPClient::ServerSSE do
       # Prevent RPC request from triggering SSE reconnect logic
       server.instance_variable_set(:@sse_connected, true)
 
-      # Create a Faraday connection stub to avoid real HTTP requests
-      faraday_stubs = Faraday::Adapter::Test::Stubs.new
-      faraday_conn = Faraday.new do |builder|
-        builder.adapter :test, faraday_stubs
-      end
-
       server.instance_variable_set(:@rpc_endpoint, '/rpc')
 
-      # Stub the Faraday response for tools/list
-      faraday_stubs.post('/rpc') do |env|
-        request_body = JSON.parse(env.body)
-        if request_body['method'] == 'tools/list'
-          [200, { 'Content-Type' => 'application/json' }, { result: { tools: [tool_data] } }.to_json]
-        else
-          [404, {}, 'Not Found']
-        end
-      end
-
-      # Set the stubbed connection
-      server.instance_variable_set(:@rpc_conn, faraday_conn)
+      # Stub the HTTP response for tools/list
+      # The URL is constructed by parsing base_url and extracting scheme://host:port
+      uri = URI.parse(base_url)
+      rpc_url = "#{uri.scheme}://#{uri.host}:#{uri.port}/rpc"
+      stub_request(:post, rpc_url)
+        .to_return(
+          status: 200,
+          body: { result: { tools: [tool_data] } }.to_json,
+          headers: { 'Content-Type' => 'application/json' }
+        )
     end
 
     it 'connects if not already connected' do
@@ -427,17 +419,14 @@ RSpec.describe MCPClient::ServerSSE do
     end
 
     it 'raises ServerError on non-success response' do
-      # Create error response stub
-      faraday_stubs = Faraday::Adapter::Test::Stubs.new
-      faraday_conn = Faraday.new do |builder|
-        builder.adapter :test, faraday_stubs
-      end
-
-      faraday_stubs.post('/rpc') do |_env|
-        [500, {}, 'Server Error']
-      end
-
-      server.instance_variable_set(:@rpc_conn, faraday_conn)
+      # Stub error response
+      uri = URI.parse(base_url)
+      rpc_url = "#{uri.scheme}://#{uri.host}:#{uri.port}/rpc"
+      stub_request(:post, rpc_url)
+        .to_return(
+          status: 500,
+          body: 'Server Error'
+        )
 
       expect { server.list_tools }.to raise_error(MCPClient::Errors::ServerError, /Server returned error/)
     end
@@ -460,7 +449,7 @@ RSpec.describe MCPClient::ServerSSE do
   describe '#call_tool' do
     let(:tool_name) { 'test_tool' }
     let(:parameters) { { foo: 'bar' } }
-    let(:result) { { 'output' => 'success' } }
+    let(:result) { { output: 'success' } }
 
     before do
       # Stub initialization to avoid real SSE connection
@@ -474,26 +463,18 @@ RSpec.describe MCPClient::ServerSSE do
       # Disable SSE transport for testing synchronous HTTP fallback
       server.instance_variable_set(:@use_sse, false)
 
-      # Create a Faraday connection stub to avoid real HTTP requests
-      faraday_stubs = Faraday::Adapter::Test::Stubs.new
-      faraday_conn = Faraday.new do |builder|
-        builder.adapter :test, faraday_stubs
-      end
-
       server.instance_variable_set(:@rpc_endpoint, '/rpc')
 
-      # Stub the Faraday response for tools/call
-      faraday_stubs.post('/rpc') do |env|
-        request_body = JSON.parse(env.body)
-        if request_body['method'] == 'tools/call' && request_body['params']['name'] == tool_name
-          [200, { 'Content-Type' => 'application/json' }, { result: result }.to_json]
-        else
-          [404, {}, 'Not Found']
-        end
-      end
-
-      # Set the stubbed connection
-      server.instance_variable_set(:@rpc_conn, faraday_conn)
+      # Stub the HTTP response for tools/call
+      # The URL is constructed by parsing base_url and extracting scheme://host:port
+      uri = URI.parse(base_url)
+      rpc_url = "#{uri.scheme}://#{uri.host}:#{uri.port}/rpc"
+      stub_request(:post, rpc_url)
+        .to_return(
+          status: 200,
+          body: { result: result }.to_json,
+          headers: { 'Content-Type' => 'application/json' }
+        )
     end
 
     it 'connects if not already connected' do
@@ -520,21 +501,18 @@ RSpec.describe MCPClient::ServerSSE do
       server.instance_variable_set(:@sse_connected, true)
 
       response = server.call_tool(tool_name, parameters)
-      expect(response).to eq(result)
+      expect(response).to eq({ 'output' => 'success' })
     end
 
     it 'raises ToolCallError on non-success response' do
-      # Create error response stub
-      faraday_stubs = Faraday::Adapter::Test::Stubs.new
-      faraday_conn = Faraday.new do |builder|
-        builder.adapter :test, faraday_stubs
-      end
-
-      faraday_stubs.post('/messages') do |_env|
-        [500, {}, 'Server Error']
-      end
-
-      server.instance_variable_set(:@rpc_conn, faraday_conn)
+      # Stub error response
+      uri = URI.parse(base_url)
+      rpc_url = "#{uri.scheme}://#{uri.host}:#{uri.port}/rpc"
+      stub_request(:post, rpc_url)
+        .to_return(
+          status: 500,
+          body: 'Server Error'
+        )
 
       # Setup to properly handle ServerError by wrapping it in ToolCallError
       allow(server).to receive(:post_json_rpc_request).and_raise(
@@ -951,19 +929,13 @@ RSpec.describe MCPClient::ServerSSE do
       server.instance_variable_set(:@rpc_endpoint, '/rpc')
       server.instance_variable_set(:@connection_established, true)
 
-      # Create a Faraday connection stub
-      faraday_stubs = Faraday::Adapter::Test::Stubs.new
-      faraday_conn = Faraday.new do |builder|
-        builder.adapter :test, faraday_stubs
-      end
-
-      # Stub the Faraday response
-      faraday_stubs.post('/rpc') do |_env|
-        [200, { 'Content-Type' => 'application/json' }, '{"result": {}}']
-      end
-
-      # Set the stubbed connection
-      server.instance_variable_set(:@rpc_conn, faraday_conn)
+      # Stub the HTTP response
+      stub_request(:post, 'https://example.com/rpc')
+        .to_return(
+          status: 200,
+          body: '{"result": {}}',
+          headers: { 'Content-Type' => 'application/json' }
+        )
 
       # Set last_activity_time to the past
       old_time = Time.now - 10
@@ -991,23 +963,18 @@ RSpec.describe MCPClient::ServerSSE do
       allow(server).to receive(:cleanup)
       server.instance_variable_set(:@use_sse, false)
 
-      # Create a Faraday connection stub to avoid real HTTP requests
-      @faraday_stubs = Faraday::Adapter::Test::Stubs.new
-      faraday_conn = Faraday.new do |builder|
-        builder.adapter :test, @faraday_stubs
-      end
-
       server.instance_variable_set(:@rpc_endpoint, '/rpc')
-      @faraday_stubs.post('/rpc') do |env|
-        request_body = JSON.parse(env.body)
-        if request_body['method'] == 'test_method'
-          [200, { 'Content-Type' => 'application/json' }, { result: { test: 'result' } }.to_json]
-        else
-          [404, {}, 'Not Found']
-        end
-      end
 
-      server.instance_variable_set(:@rpc_conn, faraday_conn)
+      # Stub the HTTP response for test_method
+      # The URL is constructed by parsing base_url and extracting scheme://host:port
+      uri = URI.parse(base_url)
+      rpc_url = "#{uri.scheme}://#{uri.host}:#{uri.port}/rpc"
+      stub_request(:post, rpc_url)
+        .to_return(
+          status: 200,
+          body: { result: { test: 'result' } }.to_json,
+          headers: { 'Content-Type' => 'application/json' }
+        )
     end
 
     it 'sends a JSON-RPC request with the given method and parameters' do
@@ -1346,21 +1313,23 @@ RSpec.describe MCPClient::ServerSSE do
       # Set up a minimal request
       request = { jsonrpc: '2.0', id: 1, method: 'test', params: {} }
 
-      # Mock the Faraday connection and response
-      mock_conn = instance_double(Faraday::Connection)
-      allow(mock_conn).to receive(:post).and_return(double('response', success?: true, body: '{"result": {}}',
-                                                                       status: 200))
-      allow(Faraday).to receive(:new).and_return(mock_conn)
-
       # Set up a fake RPC endpoint
       server.instance_variable_set(:@rpc_endpoint, '/rpc')
       server.instance_variable_set(:@use_sse, false)
 
+      # Stub the HTTP response
+      # The URL is constructed by parsing base_url and extracting scheme://host:port
+      uri = URI.parse(base_url)
+      rpc_url = "#{uri.scheme}://#{uri.host}:#{uri.port}/rpc"
+      stub_request(:post, rpc_url)
+        .to_return(
+          status: 200,
+          body: '{"result": {}}',
+          headers: { 'Content-Type' => 'application/json' }
+        )
+
       # Expect activity to be recorded twice - once for sending, once for receiving
       expect(server).to receive(:record_activity).exactly(2).times
-
-      # Allow JSON parsing
-      allow(JSON).to receive(:parse).and_return({ 'result' => {} })
 
       server.send(:send_jsonrpc_request, request)
     end

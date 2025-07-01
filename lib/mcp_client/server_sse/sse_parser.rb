@@ -31,9 +31,9 @@ module MCPClient
           data = JSON.parse(event[:data])
 
           return if process_error_in_message(data)
-          return if process_notification(data)
+          return if process_notification?(data)
 
-          process_response(data)
+          process_response?(data)
         rescue MCPClient::Errors::ConnectionError
           raise
         rescue JSON::ParserError => e
@@ -61,7 +61,7 @@ module MCPClient
       # Process a JSON-RPC notification (no id => notification)
       # @param data [Hash] the parsed JSON payload
       # @return [Boolean] true if we saw & handled a notification
-      def process_notification(data)
+      def process_notification?(data)
         return false unless data['method'] && !data.key?('id')
 
         @notification_callback&.call(data['method'], data['params'])
@@ -71,7 +71,7 @@ module MCPClient
       # Process a JSON-RPC response (id => response)
       # @param data [Hash] the parsed JSON payload
       # @return [Boolean] true if we saw & handled a response
-      def process_response(data)
+      def process_response?(data)
         return false unless data['id']
 
         @mutex.synchronize do

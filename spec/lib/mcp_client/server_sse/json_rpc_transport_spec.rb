@@ -72,7 +72,7 @@ RSpec.describe MCPClient::ServerSSE::JsonRpcTransport do
   describe '#parse_direct_response' do
     it 'parses JSON and returns result key' do
       resp = double('resp', body: '{"result":{"ok":true}}')
-      expect(transport.send(:parse_direct_response, resp)).to eq('ok' => true)
+      expect(transport.send(:parse_direct_response, resp)).to eq({ 'ok' => true })
     end
 
     it 'raises TransportError for invalid JSON' do
