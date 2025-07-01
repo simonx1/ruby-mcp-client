@@ -69,13 +69,6 @@ module MCPClient
         @logger.error("Server error: #{e.message}")
       end
 
-      # If we didn't get any prompts from any server but have servers configured, report failure
-      if prompts.empty? && !servers.empty?
-        raise connection_errors.first if connection_errors.any?
-
-        raise MCPClient::Errors::PromptGetError, 'Failed to retrieve prompts from any server'
-      end
-
       prompts
     end
 
@@ -140,7 +133,7 @@ module MCPClient
 
       servers.each do |server|
         server.list_tools.each do |tool|
-          @tool_cache[tool.name] = tool
+          @tool_cache[{ tool_name: tool.name, server_name: server.name }] = tool
           tools << tool
         end
       rescue MCPClient::Errors::ConnectionError => e
@@ -152,13 +145,6 @@ module MCPClient
         # Store the error and try other servers
         connection_errors << e
         @logger.error("Server error: #{e.message}")
-      end
-
-      # If we didn't get any tools from any server but have servers configured, report failure
-      if tools.empty? && !servers.empty?
-        raise connection_errors.first if connection_errors.any?
-
-        raise MCPClient::Errors::ToolCallError, 'Failed to retrieve tools from any server'
       end
 
       tools
@@ -250,6 +236,7 @@ module MCPClient
     # @return [void]
     def clear_cache
       @tool_cache.clear
+      @prompt_cache.clear
     end
 
     # Register a callback for JSON-RPC notifications from servers

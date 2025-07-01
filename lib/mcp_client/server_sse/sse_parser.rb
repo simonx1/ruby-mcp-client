@@ -75,6 +75,7 @@ module MCPClient
         return false unless data['id']
 
         @mutex.synchronize do
+          @prompts_data = data['result']['prompts'] if data['result'] && data['result']['prompts']
           @tools_data = data['result']['tools'] if data['result'] && data['result']['tools']
 
           @sse_results[data['id']] =

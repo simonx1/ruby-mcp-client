@@ -12,6 +12,13 @@ RSpec.describe MCPClient::Client do
       server: mock_server
     )
   end
+  let(:mock_prompt) do
+    MCPClient::Prompt.new(
+      name: 'test_prompt',
+      description: 'A test prompt',
+      server: mock_server
+    )
+  end
 
   before do
     allow(MCPClient::ServerFactory).to receive(:create).and_return(mock_server)
@@ -29,6 +36,11 @@ RSpec.describe MCPClient::Client do
       expect(client.tool_cache).to be_empty
     end
 
+    it 'initializes an empty prompt cache' do
+      client = described_class.new
+      expect(client.prompt_cache).to be_empty
+    end
+
     it 'passes logger to ServerFactory' do
       custom_logger = Logger.new(StringIO.new)
       expect(MCPClient::ServerFactory).to receive(:create).with(
@@ -40,6 +52,113 @@ RSpec.describe MCPClient::Client do
         mcp_server_configs: [{ type: 'stdio', command: 'test' }],
         logger: custom_logger
       )
+    end
+  end
+
+  describe '#list_prompts' do
+    let(:client) { described_class.new(mcp_server_configs: [{ type: 'stdio', command: 'test' }]) }
+
+    before do
+      allow(mock_server).to receive(:list_prompts).and_return([mock_prompt])
+    end
+
+    it 'returns prompts from all servers' do
+      prompts = client.list_prompts
+      expect(prompts).to contain_exactly(mock_prompt)
+    end
+
+    it 'caches prompts after first call' do
+      client.list_prompts
+      expect(mock_server).to have_received(:list_prompts).once
+      client.list_prompts
+      expect(mock_server).to have_received(:list_prompts).once
+    end
+
+    it 'refreshes prompts when cache is disabled' do
+      client.list_prompts
+      client.list_prompts(cache: false)
+      expect(mock_server).to have_received(:list_prompts).twice
+    end
+  end
+
+  describe '#get_prompt' do
+    let(:client) { described_class.new(mcp_server_configs: [{ type: 'stdio', command: 'test' }]) }
+    let(:prompt_params) { { message: 'John' } }
+    let(:prompt_result) { { 'result' => 'success' } }
+
+    before do
+      allow(mock_server).to receive_messages(list_prompts: [mock_prompt], get_prompt: prompt_result)
+    end
+
+    it 'get the prompt with parameters' do
+      result = client.get_prompt('test_prompt', prompt_params)
+      expect(mock_server).to have_received(:get_prompt).with('test_prompt', prompt_params)
+      expect(result).to eq(prompt_result)
+    end
+
+    it "raises PromptNotFound if prompt doesn't exist" do
+      expect { client.get_prompt('nonexistent_prompt', {}) }.to raise_error(MCPClient::Errors::PromptNotFound)
+    end
+
+    it 'handles disconnected server errors' do
+      # Prepare a prompt and server
+      test_prompt = mock_prompt
+      test_server = mock_server
+      client.instance_variable_set(:@prompt_cache, { test_prompt.name => test_prompt })
+
+      # Simulate connection error when calling tool
+      connection_error = MCPClient::Errors::ConnectionError.new('Server connection lost: Connection refused')
+      allow(test_server).to receive(:get_prompt).and_raise(connection_error)
+
+      # Should wrap ConnectionError in a ToolCallError with context
+      expect do
+        client.get_prompt(test_prompt.name, {})
+      end.to raise_error(
+        MCPClient::Errors::PromptGetError,
+        /Error getting prompt .* Server connection lost: Connection refused \(Server: .*\)/
+      )
+    end
+
+    context 'with server disambiguation' do
+      let(:mock_server2) { instance_double(MCPClient::ServerBase, name: 'server2') }
+      let(:duplicate_prompt) do
+        MCPClient::Prompt.new(
+          name: 'test_prompt',
+          description: 'Same-named prompt on server2',
+          server: mock_server2
+        )
+      end
+      let(:server2_result) { { 'result' => 'from_server2' } }
+      let(:multi_client) do
+        client = described_class.new(mcp_server_configs: [
+                                       { type: 'stdio', command: 'test1' },
+                                       { type: 'stdio', command: 'test2' }
+                                     ])
+        client.instance_variable_set(:@servers, [mock_server, mock_server2])
+        client
+      end
+
+      before do
+        allow(mock_server2).to receive_messages(list_prompts: [duplicate_prompt], get_prompt: server2_result,
+                                                on_notification: nil)
+        allow(multi_client).to receive(:list_prompts).and_return([mock_prompt, duplicate_prompt])
+      end
+
+      it 'raises AmbiguousPromptName when duplicate prompts exist' do
+        expect { multi_client.get_prompt('test_prompt', {}) }.to raise_error(MCPClient::Errors::AmbiguousPromptName)
+      end
+
+      it 'calls the prompt on the specified server by name' do
+        result = multi_client.get_prompt('test_prompt', {}, server: 'server2')
+        expect(mock_server2).to have_received(:get_prompt).with('test_prompt', {})
+        expect(result).to eq(server2_result)
+      end
+
+      it 'calls the prompt on the specified server instance' do
+        result = multi_client.get_prompt('test_prompt', {}, server: mock_server2)
+        expect(mock_server2).to have_received(:get_prompt).with('test_prompt', {})
+        expect(result).to eq(server2_result)
+      end
     end
   end
 
@@ -290,6 +409,7 @@ RSpec.describe MCPClient::Client do
     let(:client) { described_class.new(mcp_server_configs: [{ type: 'stdio', command: 'test' }]) }
     before do
       allow(mock_server).to receive(:list_tools).and_return([mock_tool])
+      allow(mock_server).to receive(:list_prompts).and_return([mock_prompt])
     end
 
     it 'clears the cache and refetches tools on next call' do
@@ -297,6 +417,13 @@ RSpec.describe MCPClient::Client do
       client.clear_cache
       client.list_tools
       expect(mock_server).to have_received(:list_tools).twice
+    end
+
+    it 'clears the cache and refetches prompts on next call' do
+      client.list_prompts
+      client.clear_cache
+      client.list_prompts
+      expect(mock_server).to have_received(:list_prompts).twice
     end
   end
 

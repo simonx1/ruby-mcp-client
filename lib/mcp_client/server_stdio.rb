@@ -16,7 +16,9 @@ module MCPClient
     #   @return [String, Array] the command used to launch the server
     # @!attribute [r] env
     #   @return [Hash] environment variables for the subprocess
-    attr_reader :command, :env
+    # @!attribute [r] capabilities
+    #   @return [Hash, nil] Server capabilities from initialize response
+    attr_reader :command, :env, :capabilities
 
     # Timeout in seconds for responses
     READ_TIMEOUT = 15
@@ -110,6 +112,8 @@ module MCPClient
     # @raise [MCPClient::Errors::PromptGetError] for other errors during prompt listing
     def list_prompts
       ensure_initialized
+      return [] if capabilities.nil? || !capabilities['prompts']
+
       req_id = next_id
       req = { 'jsonrpc' => '2.0', 'id' => req_id, 'method' => 'prompts/list', 'params' => {} }
       send_request(req)
@@ -131,6 +135,8 @@ module MCPClient
     # @raise [MCPClient::Errors::PromptGetError] for other errors during prompt interpolation
     def get_prompt(prompt_name, parameters)
       ensure_initialized
+      return if capabilities.nil? || !capabilities['prompts']
+
       req_id = next_id
       # JSON-RPC method for getting a prompt
       req = {
@@ -156,6 +162,8 @@ module MCPClient
     # @raise [MCPClient::Errors::ToolCallError] for other errors during tool listing
     def list_tools
       ensure_initialized
+      return [] if capabilities.nil? || !capabilities['tools']
+
       req_id = next_id
       # JSON-RPC method for listing tools
       req = { 'jsonrpc' => '2.0', 'id' => req_id, 'method' => 'tools/list', 'params' => {} }
@@ -178,6 +186,8 @@ module MCPClient
     # @raise [MCPClient::Errors::ToolCallError] for other errors during tool execution
     def call_tool(tool_name, parameters)
       ensure_initialized
+      return if capabilities.nil? || !capabilities['tools']
+
       req_id = next_id
       # JSON-RPC method for calling a tool
       req = {

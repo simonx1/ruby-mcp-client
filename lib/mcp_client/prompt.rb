@@ -7,17 +7,20 @@ module MCPClient
     #   @return [String] the name of the prompt
     # @!attribute [r] description
     #   @return [String] the description of the prompt
+    # @!attribute [r] arguments
+    #   @return [Hash] the JSON arguments for the prompt
     # @!attribute [r] server
     #   @return [MCPClient::ServerBase, nil] the server this prompt belongs to
-    attr_reader :name, :description, :server
+    attr_reader :name, :description, :arguments, :server
 
     # Initialize a new prompt
     # @param name [String] the name of the prompt
     # @param description [String] the description of the prompt
     # @param server [MCPClient::ServerBase, nil] the server this prompt belongs to
-    def initialize(name:, description:, server: nil)
+    def initialize(name:, description:, arguments: {}, server: nil)
       @name = name
       @description = description
+      @arguments = arguments
       @server = server
     end
 
@@ -29,6 +32,7 @@ module MCPClient
       new(
         name: data['name'],
         description: data['description'],
+        arguments: data['arguments'] || {},
         server: server
       )
     end

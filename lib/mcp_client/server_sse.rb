@@ -35,11 +35,13 @@ module MCPClient
     #   @return [String] The base URL of the MCP server
     # @!attribute [r] tools
     #   @return [Array<MCPClient::Tool>, nil] List of available tools (nil if not fetched yet)
+    # @!attribute [r] prompts
+    #   @return [Array<MCPClient::Prompt>, nil] List of available prompts (nil if not fetched yet)
     # @!attribute [r] server_info
     #   @return [Hash, nil] Server information from initialize response
     # @!attribute [r] capabilities
     #   @return [Hash, nil] Server capabilities from initialize response
-    attr_reader :base_url, :tools, :server_info, :capabilities
+    attr_reader :base_url, :tools, :prompts, :server_info, :capabilities
 
     # @param base_url [String] The base URL of the MCP server
     # @param headers [Hash] Additional headers to include in requests
@@ -113,6 +115,7 @@ module MCPClient
 
       begin
         ensure_initialized
+        return [] unless capabilities && capabilities['prompts']
 
         prompts_data = request_prompts_list
         @mutex.synchronize do
@@ -163,6 +166,7 @@ module MCPClient
 
       begin
         ensure_initialized
+        return [] unless capabilities && capabilities['tools']
 
         tools_data = request_tools_list
         @mutex.synchronize do

@@ -33,6 +33,8 @@ module MCPClient
           raise MCPClient::Errors::ConnectionError, "Initialize failed: #{err['message']}"
         end
 
+        @capabilities = res.dig('result', 'capabilities') || {}
+
         # Send initialized notification
         notif = build_jsonrpc_notification('notifications/initialized', {})
         @stdin.puts(notif.to_json)

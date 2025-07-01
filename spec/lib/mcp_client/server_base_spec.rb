@@ -28,6 +28,18 @@ RSpec.describe MCPClient::ServerBase do
     end
   end
 
+  describe '#list_prompts' do
+    it 'raises NotImplementedError' do
+      expect { base_server.list_prompts }.to raise_error(NotImplementedError)
+    end
+  end
+
+  describe '#get_prompt' do
+    it 'raises NotImplementedError' do
+      expect { base_server.get_prompt('prompt', {}) }.to raise_error(NotImplementedError)
+    end
+  end
+
   describe '#list_tools' do
     it 'raises NotImplementedError' do
       expect { base_server.list_tools }.to raise_error(NotImplementedError)
