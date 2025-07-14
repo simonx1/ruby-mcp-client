@@ -24,6 +24,11 @@ RSpec.describe 'MCPClient integration with ruby-openai', :integration,
     )
   end
 
+  before do
+    allow_any_instance_of(MCPClient::ServerStdio).to receive(:capabilities)
+      .and_return('tools' => { 'listChanged' => true }, 'prompts' => { 'listChanged' => true })
+  end
+
   after do
     mcp_client.cleanup
   end

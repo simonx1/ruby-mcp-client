@@ -36,6 +36,165 @@ RSpec.describe MCPClient::ServerStdio do
     end
   end
 
+  describe '#list_prompts' do
+    let(:prompt_data) do
+      {
+        'name' => 'test_prompt',
+        'description' => 'A test prompt'
+      }
+    end
+    let(:response) do
+      {
+        'jsonrpc' => '2.0',
+        'id' => 1,
+        'result' => {
+          'prompts' => [prompt_data]
+        }
+      }
+    end
+
+    before do
+      # Setup mocks for the server connection
+      @stdin = StringIO.new
+      @stdout = StringIO.new
+      @stderr = StringIO.new
+      @wait_thread = double('wait_thread', pid: 12_345, alive?: true)
+
+      allow(Open3).to receive(:popen3).and_return([@stdin, @stdout, @wait_thread, @stderr])
+      allow(Process).to receive(:kill)
+
+      # Mock the response handling
+      allow(server).to receive(:ensure_initialized).and_call_original
+      allow(server).to receive(:connect)
+      allow(server).to receive(:start_reader)
+      allow(server).to receive(:perform_initialize)
+      allow(server).to receive(:wait_response).and_return(response)
+      allow(server).to receive(:capabilities).and_return('prompts' => { 'listChanged' => true })
+    end
+
+    before do
+      # Properly initialize the server to avoid nil errors
+      server.instance_variable_set(:@initialized, true)
+      server.instance_variable_set(:@stdin, StringIO.new)
+    end
+
+    it 'ensures the server is initialized' do
+      expect(server).to receive(:ensure_initialized)
+      server.list_prompts
+    end
+
+    it 'sends a JSONRPC request' do
+      expect(server).to receive(:send_request) do |req|
+        expect(req['method']).to eq('prompts/list')
+        expect(req['params']).to eq({})
+      end
+      server.list_prompts
+    end
+
+    it 'returns an array of Prompt objects' do
+      prompts = server.list_prompts
+      expect(prompts).to be_an(Array)
+      expect(prompts.length).to eq(1)
+      expect(prompts.first).to be_a(MCPClient::Prompt)
+      expect(prompts.first.name).to eq('test_prompt')
+    end
+
+    it 'raises PromptGetError when server returns an error' do
+      error_response = {
+        'jsonrpc' => '2.0',
+        'id' => 1,
+        'error' => {
+          'code' => -32_000,
+          'message' => 'Server error'
+        }
+      }
+      allow(server).to receive(:wait_response).and_return(error_response)
+      expect { server.list_prompts }.to raise_error(MCPClient::Errors::PromptGetError, /Error listing prompts/)
+    end
+
+    it 'raises PromptGetError on other errors' do
+      allow(server).to receive(:send_request).and_raise(StandardError.new('Communication error'))
+      expect { server.list_prompts }.to raise_error(MCPClient::Errors::PromptGetError, /Error listing prompts/)
+    end
+  end
+
+  describe '#get_prompt' do
+    let(:prompt_name) { 'test_prompt' }
+    let(:parameters) { { 'message' => 'John' } }
+    let(:result) { { 'output' => 'hello John' } }
+    let(:response) do
+      {
+        'jsonrpc' => '2.0',
+        'id' => 1,
+        'result' => result
+      }
+    end
+
+    before do
+      # Setup mocks for the server connection
+      @stdin = StringIO.new
+      @stdout = StringIO.new
+      @stderr = StringIO.new
+      @wait_thread = double('wait_thread', pid: 12_345, alive?: true)
+
+      allow(Open3).to receive(:popen3).and_return([@stdin, @stdout, @wait_thread, @stderr])
+      allow(Process).to receive(:kill)
+
+      # Mock the response handling
+      allow(server).to receive(:ensure_initialized).and_call_original
+      allow(server).to receive(:connect)
+      allow(server).to receive(:start_reader)
+      allow(server).to receive(:perform_initialize)
+      allow(server).to receive(:wait_response).and_return(response)
+      allow(server).to receive(:capabilities).and_return('prompts' => { 'listChanged' => true })
+
+      # Properly initialize the server to avoid nil errors
+      server.instance_variable_set(:@initialized, true)
+      server.instance_variable_set(:@stdin, StringIO.new)
+    end
+
+    it 'ensures the server is initialized' do
+      expect(server).to receive(:ensure_initialized)
+      server.get_prompt(prompt_name, parameters)
+    end
+
+    it 'sends a JSONRPC request with the prompt name and parameters' do
+      expect(server).to receive(:send_request) do |req|
+        expect(req['method']).to eq('prompts/get')
+        expect(req['params']['name']).to eq(prompt_name)
+        expect(req['params']['arguments']).to eq(parameters)
+      end
+      server.get_prompt(prompt_name, parameters)
+    end
+
+    it 'returns the result from the response' do
+      response = server.get_prompt(prompt_name, parameters)
+      expect(response).to eq(result)
+    end
+
+    it 'raises PromptGetError when server returns an error' do
+      error_response = {
+        'jsonrpc' => '2.0',
+        'id' => 1,
+        'error' => {
+          'code' => -32_000,
+          'message' => 'Server error'
+        }
+      }
+      allow(server).to receive(:wait_response).and_return(error_response)
+      expect do
+        server.get_prompt(prompt_name, parameters)
+      end.to raise_error(MCPClient::Errors::PromptGetError, /Error calling prompt/)
+    end
+
+    it 'raises PromptGetError on other errors' do
+      allow(server).to receive(:send_request).and_raise(StandardError.new('Communication error'))
+      expect do
+        server.get_prompt(prompt_name, parameters)
+      end.to raise_error(MCPClient::Errors::PromptGetError, /Error calling prompt/)
+    end
+  end
+
   describe '#list_tools' do
     let(:tool_data) do
       {
@@ -77,6 +236,7 @@ RSpec.describe MCPClient::ServerStdio do
       allow(server).to receive(:start_reader)
       allow(server).to receive(:perform_initialize)
       allow(server).to receive(:wait_response).and_return(response)
+      allow(server).to receive(:capabilities).and_return('tools' => { 'listChanged' => true })
     end
 
     before do
@@ -153,6 +313,7 @@ RSpec.describe MCPClient::ServerStdio do
       allow(server).to receive(:start_reader)
       allow(server).to receive(:perform_initialize)
       allow(server).to receive(:wait_response).and_return(response)
+      allow(server).to receive(:capabilities).and_return('tools' => { 'listChanged' => true })
 
       # Properly initialize the server to avoid nil errors
       server.instance_variable_set(:@initialized, true)
