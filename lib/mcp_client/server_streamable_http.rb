@@ -95,6 +95,9 @@ module MCPClient
       @session_id = nil
       @last_event_id = nil
       @oauth_provider = opts[:oauth_provider]
+      @events_connection = nil
+      @events_thread = nil
+      @buffer = ''
     end
 
     # Connect to the MCP server over Streamable HTTP
@@ -114,6 +117,9 @@ module MCPClient
 
         # Perform MCP initialization handshake
         perform_initialize
+
+        # Start long-lived GET connection for server events
+        start_events_connection
 
         @mutex.synchronize do
           @connection_established = true
@@ -170,7 +176,8 @@ module MCPClient
     def call_tool(tool_name, parameters)
       rpc_request('tools/call', {
                     name: tool_name,
-                    arguments: parameters
+                    arguments: parameters.except(:_meta),
+                    **parameters.slice(:_meta)
                   })
     rescue MCPClient::Errors::ConnectionError, MCPClient::Errors::TransportError
       # Re-raise connection/transport errors directly to match test expectations
@@ -249,16 +256,34 @@ module MCPClient
 
         @logger.debug('Cleaning up Streamable HTTP connection')
 
+        # Stop events thread and close connections
+        events_thread = @events_thread
+        @events_thread = nil
+        events_thread&.kill
+
         # Close HTTP connection if it exists
         @http_conn = nil
+        @events_connection = nil
         @session_id = nil
 
         @tools = nil
         @tools_data = nil
+        @buffer = ''
       end
     end
 
     private
+
+    def perform_initialize
+      super
+      # Send initialized notification to acknowledge completion of initialization
+      notification = build_jsonrpc_notification('notifications/initialized', {})
+      begin
+        send_http_request(notification)
+      rescue MCPClient::Errors::ServerError, MCPClient::Errors::ConnectionError, Faraday::ConnectionFailed => e
+        raise MCPClient::Errors::TransportError, "Failed to send initialized notification: #{e.message}"
+      end
+    end
 
     # Default options for server initialization
     # @return [Hash] Default options
@@ -326,6 +351,113 @@ module MCPClient
       end
 
       raise MCPClient::Errors::ToolCallError, 'Failed to get tools list from JSON-RPC request'
+    end
+
+    # Start the long-lived GET connection for server events
+    # @return [void]
+    def start_events_connection
+      return if @events_thread&.alive?
+
+      @logger.debug('Starting events connection thread')
+      @events_thread = Thread.new do
+        handle_events_connection
+      end
+    end
+
+    # Handle the events connection in a separate thread
+    # @return [void]
+    def handle_events_connection
+      @events_connection = create_http_connection
+      @events_connection.get(@endpoint) do |req|
+        apply_events_headers(req)
+
+        req.options.on_data = proc do |chunk, _bytes|
+          process_event_chunk(chunk) if chunk && !chunk.empty?
+        end
+      end
+    rescue Faraday::ConnectionFailed => e
+      raise MCPClient::Errors::ConnectionError, "Cannot connect to server at #{@base_url}: #{e.message}"
+    rescue Faraday::UnauthorizedError, Faraday::ForbiddenError => e
+      error_status = e.response ? e.response[:status] : 'unknown'
+      raise MCPClient::Errors::ConnectionError, "Authorization failed: HTTP #{error_status}"
+    rescue Faraday::Error => e
+      raise MCPClient::Errors::ConnectionError, "HTTP connection error: #{e.message}"
+    end
+
+    # Apply headers for events connection
+    # @param req [Faraday::Request] HTTP request
+    def apply_events_headers(req)
+      @headers.each { |k, v| req.headers[k] = v }
+      req.headers['Mcp-Session-Id'] = @session_id if @session_id
+    end
+
+    # Process event chunks from the server
+    # @param chunk [String] the chunk to process
+    def process_event_chunk(chunk)
+      @logger.debug("Processing event chunk: #{chunk.inspect}")
+
+      @mutex.synchronize do
+        @buffer += chunk
+
+        # Extract complete events (SSE format)
+        while (event_end = @buffer.index("\n\n") || @buffer.index("\r\n\r\n"))
+          event_data = extract_event(event_end)
+          parse_and_handle_event(event_data)
+        end
+      end
+    end
+
+    # Extract a single event from the buffer
+    # @param event_end [Integer] the position where the event ends
+    # @return [String] the extracted event data
+    def extract_event(event_end)
+      # Determine the line ending style and extract accordingly
+      crlf_index = @buffer.index("\r\n\r\n")
+      lf_index = @buffer.index("\n\n")
+      if crlf_index && (lf_index.nil? || crlf_index < lf_index)
+        @buffer.slice!(0, event_end + 4) # \r\n\r\n is 4 chars
+      else
+        @buffer.slice!(0, event_end + 2) # \n\n is 2 chars
+      end
+    end
+
+    # Parse and handle an SSE event
+    # @param event_data [String] the raw event data
+    def parse_and_handle_event(event_data)
+      event = { event: 'message', data: '', id: nil }
+      data_lines = []
+
+      event_data.each_line do |line|
+        line = line.chomp
+        next if line.empty? || line.start_with?(':')
+
+        if line.start_with?('event:')
+          event[:event] = line[6..].strip
+        elsif line.start_with?('data:')
+          data_lines << line[5..].strip
+        end
+      end
+
+      event[:data] = data_lines.join("\n")
+
+      handle_server_message(event[:data])
+    end
+
+    # Handle server messages (notifications)
+    # @param data [String] the JSON data
+    def handle_server_message(data)
+      return if data.empty?
+
+      begin
+        message = JSON.parse(data)
+
+        # Handle notifications (messages without id)
+        if message['method'] && !message.key?('id')
+          @notification_callback&.call(message['method'], message['params'])
+        end
+      rescue JSON::ParserError => e
+        raise MCPClient::Errors::TransportError, "Invalid JSON response from server: #{e.message}"
+      end
     end
   end
 end
