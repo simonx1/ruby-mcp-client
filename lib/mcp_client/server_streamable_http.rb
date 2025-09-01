@@ -9,9 +9,15 @@ require 'faraday/retry'
 require 'faraday/follow_redirects'
 
 module MCPClient
-  # Implementation of MCP server that communicates via Streamable HTTP transport
-  # This transport uses HTTP POST requests but expects Server-Sent Event formatted responses
-  # It's designed for servers that support streaming responses over HTTP
+  # Implementation of MCP server that communicates via Streamable HTTP transport (MCP 2025-03-26)
+  # This transport uses HTTP POST for RPC calls with optional SSE responses, and GET for event streams
+  # Compliant with MCP specification version 2025-03-26
+  #
+  # Key features:
+  # - Supports server-sent events (SSE) for real-time notifications
+  # - Handles ping/pong keepalive mechanism
+  # - Thread-safe connection management
+  # - Automatic reconnection with exponential backoff
   class ServerStreamableHTTP < ServerBase
     require_relative 'server_streamable_http/json_rpc_transport'
 
@@ -20,6 +26,12 @@ module MCPClient
     # Default values for connection settings
     DEFAULT_READ_TIMEOUT = 30
     DEFAULT_MAX_RETRIES = 3
+
+    # SSE connection settings
+    SSE_CONNECTION_TIMEOUT = 300 # 5 minutes
+    SSE_RECONNECT_DELAY = 1        # Initial reconnect delay in seconds
+    SSE_MAX_RECONNECT_DELAY = 30   # Maximum reconnect delay in seconds
+    THREAD_JOIN_TIMEOUT = 5 # Timeout for thread cleanup
 
     # @!attribute [r] base_url
     #   @return [String] The base URL of the MCP server
@@ -95,9 +107,11 @@ module MCPClient
       @session_id = nil
       @last_event_id = nil
       @oauth_provider = opts[:oauth_provider]
+
+      # SSE events connection state
       @events_connection = nil
       @events_thread = nil
-      @buffer = ''
+      @buffer = '' # Buffer for partial SSE event data
     end
 
     # Connect to the MCP server over Streamable HTTP
@@ -245,30 +259,44 @@ module MCPClient
     end
 
     # Clean up the server connection
-    # Properly closes HTTP connections and clears cached state
+    # Properly closes HTTP connections, stops threads, and clears cached state
     def cleanup
       @mutex.synchronize do
-        # Attempt to terminate session before cleanup
-        terminate_session if @session_id
+        return unless @connection_established || @initialized
 
+        @logger.info('Cleaning up Streamable HTTP connection')
+
+        # Mark connection as closed to stop reconnection attempts
         @connection_established = false
         @initialized = false
 
-        @logger.debug('Cleaning up Streamable HTTP connection')
+        # Attempt to terminate session before cleanup
+        begin
+          terminate_session if @session_id
+        rescue StandardError => e
+          @logger.warn("Failed to terminate session: #{e.message}")
+        end
 
-        # Stop events thread and close connections
-        events_thread = @events_thread
+        # Stop events thread gracefully
+        if @events_thread&.alive?
+          @logger.debug('Stopping events thread...')
+          @events_thread.kill
+          @events_thread.join(THREAD_JOIN_TIMEOUT)
+        end
         @events_thread = nil
-        events_thread&.kill
 
-        # Close HTTP connection if it exists
+        # Clear connections and state
         @http_conn = nil
         @events_connection = nil
         @session_id = nil
+        @last_event_id = nil
 
+        # Clear cached data
         @tools = nil
         @tools_data = nil
         @buffer = ''
+
+        @logger.info('Cleanup completed')
       end
     end
 
@@ -354,34 +382,90 @@ module MCPClient
     end
 
     # Start the long-lived GET connection for server events
+    # Creates a separate thread to maintain SSE connection for server notifications
     # @return [void]
     def start_events_connection
       return if @events_thread&.alive?
 
-      @logger.debug('Starting events connection thread')
+      @logger.info('Starting SSE events connection thread')
       @events_thread = Thread.new do
-        handle_events_connection
+        Thread.current.name = 'MCP-SSE-Events'
+        Thread.current.report_on_exception = false # We handle exceptions internally
+
+        begin
+          handle_events_connection
+        rescue StandardError => e
+          @logger.error("Events thread crashed: #{e.message}")
+          @logger.debug(e.backtrace.join("\n")) if @logger.level <= Logger::DEBUG
+        end
       end
     end
 
     # Handle the events connection in a separate thread
+    # Maintains a persistent SSE connection for server notifications and ping/pong
     # @return [void]
     def handle_events_connection
-      @events_connection = create_http_connection
-      @events_connection.get(@endpoint) do |req|
-        apply_events_headers(req)
+      reconnect_delay = SSE_RECONNECT_DELAY
 
-        req.options.on_data = proc do |chunk, _bytes|
-          process_event_chunk(chunk) if chunk && !chunk.empty?
+      loop do
+        # Create a Faraday connection specifically for SSE streaming
+        # Using net_http adapter for better streaming support
+        conn = Faraday.new(url: @base_url) do |f|
+          f.request :retry, max: 0 # No automatic retries for SSE stream
+          f.options.open_timeout = 10
+          f.options.timeout = SSE_CONNECTION_TIMEOUT
+          f.adapter :net_http do |http|
+            http.read_timeout = SSE_CONNECTION_TIMEOUT
+            http.open_timeout = 10
+          end
         end
+
+        @logger.debug("Establishing SSE events connection to #{@endpoint}") if @logger.level <= Logger::DEBUG
+
+        response = conn.get(@endpoint) do |req|
+          apply_events_headers(req)
+
+          # Handle streaming response with on_data callback
+          req.options.on_data = proc do |chunk, _total_bytes|
+            if chunk && !chunk.empty?
+              @logger.debug("Received event chunk (#{chunk.bytesize} bytes)") if @logger.level <= Logger::DEBUG
+              process_event_chunk(chunk)
+            end
+          end
+        end
+
+        @logger.debug("Events connection completed with status: #{response.status}") if @logger.level <= Logger::DEBUG
+
+        # Connection closed normally, check if we should reconnect
+        break unless @mutex.synchronize { @connection_established }
+
+        @logger.info('Events connection closed, reconnecting...')
+        sleep reconnect_delay
+        reconnect_delay = [reconnect_delay * 2, SSE_MAX_RECONNECT_DELAY].min
+
+      # Intentional shutdown
+      rescue Net::ReadTimeout, Faraday::TimeoutError
+        # Timeout after inactivity - this is expected for long-lived connections
+        break unless @mutex.synchronize { @connection_established }
+
+        @logger.debug('Events connection timed out after inactivity, reconnecting...')
+        sleep reconnect_delay
+      rescue Faraday::ConnectionFailed => e
+        break unless @mutex.synchronize { @connection_established }
+
+        @logger.warn("Events connection failed: #{e.message}, retrying in #{reconnect_delay}s...")
+        sleep reconnect_delay
+        reconnect_delay = [reconnect_delay * 2, SSE_MAX_RECONNECT_DELAY].min
+      rescue StandardError => e
+        break unless @mutex.synchronize { @connection_established }
+
+        @logger.error("Unexpected error in events connection: #{e.class} - #{e.message}")
+        @logger.debug(e.backtrace.join("\n")) if @logger.level <= Logger::DEBUG
+        sleep reconnect_delay
+        reconnect_delay = [reconnect_delay * 2, SSE_MAX_RECONNECT_DELAY].min
       end
-    rescue Faraday::ConnectionFailed => e
-      raise MCPClient::Errors::ConnectionError, "Cannot connect to server at #{@base_url}: #{e.message}"
-    rescue Faraday::UnauthorizedError, Faraday::ForbiddenError => e
-      error_status = e.response ? e.response[:status] : 'unknown'
-      raise MCPClient::Errors::ConnectionError, "Authorization failed: HTTP #{error_status}"
-    rescue Faraday::Error => e
-      raise MCPClient::Errors::ConnectionError, "HTTP connection error: #{e.message}"
+    ensure
+      @logger.info('Events connection thread terminated')
     end
 
     # Apply headers for events connection
@@ -392,19 +476,23 @@ module MCPClient
     end
 
     # Process event chunks from the server
+    # Buffers partial chunks and processes complete SSE events
     # @param chunk [String] the chunk to process
     def process_event_chunk(chunk)
-      @logger.debug("Processing event chunk: #{chunk.inspect}")
+      @logger.debug("Processing event chunk: #{chunk.inspect}") if @logger.level <= Logger::DEBUG
 
       @mutex.synchronize do
         @buffer += chunk
 
-        # Extract complete events (SSE format)
+        # Extract complete events (SSE format: events end with double newline)
         while (event_end = @buffer.index("\n\n") || @buffer.index("\r\n\r\n"))
           event_data = extract_event(event_end)
           parse_and_handle_event(event_data)
         end
       end
+    rescue StandardError => e
+      @logger.error("Error processing event chunk: #{e.message}")
+      @logger.debug(e.backtrace.join("\n")) if @logger.level <= Logger::DEBUG
     end
 
     # Extract a single event from the buffer
@@ -422,6 +510,7 @@ module MCPClient
     end
 
     # Parse and handle an SSE event
+    # Parses SSE format according to the W3C specification
     # @param event_data [String] the raw event data
     def parse_and_handle_event(event_data)
       event = { event: 'message', data: '', id: nil }
@@ -429,34 +518,81 @@ module MCPClient
 
       event_data.each_line do |line|
         line = line.chomp
-        next if line.empty? || line.start_with?(':')
+        next if line.empty? || line.start_with?(':') # Skip empty lines and comments
 
         if line.start_with?('event:')
           event[:event] = line[6..].strip
         elsif line.start_with?('data:')
+          # SSE allows multiple data lines that should be joined with newlines
           data_lines << line[5..].strip
+        elsif line.start_with?('id:')
+          # Track event ID for resumability (MCP future enhancement)
+          event[:id] = line[3..].strip
+          @last_event_id = event[:id]
+        elsif line.start_with?('retry:')
+          # Server can suggest reconnection delay (in milliseconds)
+          retry_ms = line[6..].strip.to_i
+          @logger.debug("Server suggested retry delay: #{retry_ms}ms") if @logger.level <= Logger::DEBUG
         end
       end
 
       event[:data] = data_lines.join("\n")
 
-      handle_server_message(event[:data])
+      # Only process non-empty data
+      handle_server_message(event[:data]) unless event[:data].empty?
     end
 
-    # Handle server messages (notifications)
-    # @param data [String] the JSON data
+    # Handle server messages (notifications and requests)
+    # Processes ping/pong keepalive and server notifications
+    # @param data [String] the JSON data from SSE event
     def handle_server_message(data)
       return if data.empty?
 
       begin
         message = JSON.parse(data)
 
-        # Handle notifications (messages without id)
-        if message['method'] && !message.key?('id')
+        # Handle ping requests from server (keepalive mechanism)
+        if message['method'] == 'ping' && message.key?('id')
+          handle_ping_request(message['id'])
+        elsif message['method'] && !message.key?('id')
+          # Handle server notifications (messages without id)
           @notification_callback&.call(message['method'], message['params'])
+        elsif message.key?('id')
+          # This might be a server-to-client request (future MCP versions)
+          @logger.warn("Received unhandled server request: #{message['method']}")
         end
       rescue JSON::ParserError => e
-        raise MCPClient::Errors::TransportError, "Invalid JSON response from server: #{e.message}"
+        @logger.error("Invalid JSON in server message: #{e.message}")
+        @logger.debug("Raw data: #{data.inspect}") if @logger.level <= Logger::DEBUG
+      end
+    end
+
+    # Handle ping request from server
+    # Sends pong response to maintain session keepalive
+    # @param ping_id [Integer, String] the ping request ID
+    def handle_ping_request(ping_id)
+      pong_response = {
+        jsonrpc: '2.0',
+        id: ping_id,
+        result: {}
+      }
+
+      # Send pong response in a separate thread to avoid blocking event processing
+      Thread.new do
+        conn = http_connection
+        response = conn.post(@endpoint) do |req|
+          @headers.each { |k, v| req.headers[k] = v }
+          req.headers['Mcp-Session-Id'] = @session_id if @session_id
+          req.body = pong_response.to_json
+        end
+
+        if response.success?
+          @logger.debug("Sent pong response for ping ID: #{ping_id}") if @logger.level <= Logger::DEBUG
+        else
+          @logger.warn("Failed to send pong response: HTTP #{response.status}")
+        end
+      rescue StandardError => e
+        @logger.error("Failed to send pong response: #{e.message}")
       end
     end
   end

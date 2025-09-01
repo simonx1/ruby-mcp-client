@@ -288,12 +288,12 @@ require 'logger'
 logger = Logger.new($stdout)
 logger.level = Logger::INFO
 
-# Create an MCP client that connects to a Playwright MCP server via SSE
+# Create an MCP client that connects to a Playwright MCP server via Streamable HTTP
 # First run: npx @playwright/mcp@latest --port 8931
-sse_client = MCPClient.create_client(
+mcp_client = MCPClient.create_client(
   mcp_server_configs: [
-    MCPClient.sse_config(
-      base_url: 'http://localhost:8931/sse',
+    MCPClient.streamable_http_config(
+      base_url: 'http://localhost:8931/mcp',
       read_timeout: 30,  # Timeout in seconds for request fulfillment
       ping: 10,          # Send ping after 10 seconds of inactivity
                          # Connection closes automatically after inactivity (2.5x ping interval)
@@ -304,33 +304,33 @@ sse_client = MCPClient.create_client(
 )
 
 # List available tools
-tools = sse_client.list_tools
+tools = mcp_client.list_tools
 
 # Launch a browser
-result = sse_client.call_tool('browser_install', {})
-result = sse_client.call_tool('browser_navigate', { url: 'about:blank' })
+result = mcp_client.call_tool('browser_install', {})
+result = mcp_client.call_tool('browser_navigate', { url: 'about:blank' })
 # No browser ID needed with these tool names
 
 # Create a new page
-page_result = sse_client.call_tool('browser_tab_new', {})
+page_result = mcp_client.call_tool('browser_tab', {action: 'create'})
 # No page ID needed with these tool names
 
 # Navigate to a website
-sse_client.call_tool('browser_navigate', { url: 'https://example.com' })
+mcp_client.call_tool('browser_navigate', { url: 'https://example.com' })
 
 # Get page title
-title_result = sse_client.call_tool('browser_snapshot', {})
+title_result = mcp_client.call_tool('browser_snapshot', {})
 puts "Page snapshot: #{title_result}"
 
 # Take a screenshot
-screenshot_result = sse_client.call_tool('browser_take_screenshot', {})
+screenshot_result = mcp_client.call_tool('browser_take_screenshot', {})
 
 # Ping the server to verify connectivity
-ping_result = sse_client.ping
+ping_result = mcp_client.ping
 puts "Ping successful: #{ping_result.inspect}"
 
 # Clean up
-sse_client.cleanup
+mcp_client.cleanup
 ```
 
 See `examples/mcp_sse_server_example.rb` for the full Playwright SSE example.
@@ -485,7 +485,7 @@ You can define MCP server configurations in JSON files for easier management:
   "mcpServers": {
     "playwright": {
       "type": "sse",
-      "url": "http://localhost:8931/sse",
+      "url": "http://localhost:8931/mcp",
       "headers": {
         "Authorization": "Bearer TOKEN"
       }
@@ -517,7 +517,7 @@ A simpler example used in the Playwright demo (found in `examples/sample_server_
 {
   "mcpServers": {
     "playwright": {
-      "url": "http://localhost:8931/sse",
+      "url": "http://localhost:8931/mcp",
       "headers": {},
       "comment": "Local Playwright MCP Server running on port 8931"
     }

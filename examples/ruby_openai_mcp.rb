@@ -9,18 +9,19 @@ require_relative '../lib/mcp_client'
 require 'openai'
 require 'json'
 require 'logger'
+require 'byebug'
 
 # Ensure the OPENAI_API_KEY environment variable is set
 api_key = ENV.fetch('OPENAI_API_KEY', nil)
 abort 'Please set OPENAI_API_KEY' unless api_key
 
-# Create an MCPClient client (SSE server for demo)
+# Create an MCPClient client
 logger = Logger.new($stdout)
-logger.level = Logger::WARN # DEBUG
+logger.level = Logger::DEBUG
 mcp_client = MCPClient::Client.new(
   mcp_server_configs: [
-    MCPClient.sse_config(
-      base_url: 'http://localhost:8931/sse',
+    MCPClient.streamable_http_config(
+      base_url: 'http://localhost:8931/mcp',
       read_timeout: 30, # Optional timeout in seconds
       retries: 3,       # Optional number of retry attempts
       retry_backoff: 1  # Optional backoff delay in seconds
@@ -47,11 +48,13 @@ messages = [
 # 1) Send chat with function definitions
 response = client.chat(
   parameters: {
-    model: 'gpt-4.1-mini',
+    model: 'gpt-5',
     messages: messages,
     tools: tools
   }
 )
+
+# byebug
 
 # Extract the function call from the response
 tool_call = response.dig('choices', 0, 'message', 'tool_calls', 0)
@@ -69,7 +72,7 @@ messages << { role: 'tool', tool_call_id: tool_call['id'], name: name, content: 
 # 4) Get the first response from the model
 response = client.chat(
   parameters: {
-    model: 'gpt-4.1-mini',
+    model: 'gpt-5',
     messages: messages,
     tools: tools
   }
@@ -91,7 +94,7 @@ messages << { role: 'tool', tool_call_id: tool_call['id'], name: name, content: 
 # 7) Get final response from the model
 final = client.chat(
   parameters: {
-    model: 'gpt-4.1-mini',
+    model: 'gpt-5',
     messages: messages,
     tools: tools
   }

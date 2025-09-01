@@ -84,7 +84,7 @@ RSpec.describe 'Streamable HTTP Progress Notifications Integration', type: :inte
     end
 
     # Progress notification messages (as they would come from the server)
-    let(:progress_notification_1) do
+    let(:progress_notification_one) do
       {
         method: 'notifications/progress',
         params: {
@@ -96,7 +96,7 @@ RSpec.describe 'Streamable HTTP Progress Notifications Integration', type: :inte
       }
     end
 
-    let(:progress_notification_2) do
+    let(:progress_notification_two) do
       {
         method: 'notifications/progress',
         params: {
@@ -108,7 +108,7 @@ RSpec.describe 'Streamable HTTP Progress Notifications Integration', type: :inte
       }
     end
 
-    let(:progress_notification_3) do
+    let(:progress_notification_three) do
       {
         method: 'notifications/progress',
         params: {
@@ -186,11 +186,11 @@ RSpec.describe 'Streamable HTTP Progress Notifications Integration', type: :inte
       # In a real scenario, these would come from the server during tool execution
       Thread.new do
         sleep(0.05) # Small delay to simulate async notifications
-        server.send(:handle_server_message, progress_notification_1.to_json)
+        server.send(:handle_server_message, progress_notification_one.to_json)
         sleep(0.05)
-        server.send(:handle_server_message, progress_notification_2.to_json)
+        server.send(:handle_server_message, progress_notification_two.to_json)
         sleep(0.05)
-        server.send(:handle_server_message, progress_notification_3.to_json)
+        server.send(:handle_server_message, progress_notification_three.to_json)
       end
 
       # Call the tool with progress token in _meta
@@ -256,11 +256,11 @@ RSpec.describe 'Streamable HTTP Progress Notifications Integration', type: :inte
       # Simulate progress notifications
       Thread.new do
         sleep(0.05)
-        server_instance.send(:handle_server_message, progress_notification_1.to_json)
+        server_instance.send(:handle_server_message, progress_notification_one.to_json)
         sleep(0.05)
-        server_instance.send(:handle_server_message, progress_notification_2.to_json)
+        server_instance.send(:handle_server_message, progress_notification_two.to_json)
         sleep(0.05)
-        server_instance.send(:handle_server_message, progress_notification_3.to_json)
+        server_instance.send(:handle_server_message, progress_notification_three.to_json)
       end
 
       result = client.call_tool('longRunningOperation', {
@@ -297,13 +297,13 @@ RSpec.describe 'Streamable HTTP Progress Notifications Integration', type: :inte
     it 'processes multiple concurrent tool calls with different progress tokens' do
       second_progress_token = '5edd6f648b48_longRunningOperation_74b5c284-gcd3-5c56-c23b-bd5829d2ed81'
 
-      second_progress_notification_1 = {
+      second_progress_notification_one = {
         method: 'notifications/progress',
         params: { progress: 1, total: 2, progressToken: second_progress_token },
         jsonrpc: '2.0'
       }
 
-      second_progress_notification_2 = {
+      second_progress_notification_two = {
         method: 'notifications/progress',
         params: { progress: 2, total: 2, progressToken: second_progress_token },
         jsonrpc: '2.0'
@@ -319,13 +319,13 @@ RSpec.describe 'Streamable HTTP Progress Notifications Integration', type: :inte
       # Simulate notifications for different progress tokens
       Thread.new do
         sleep(0.05)
-        server.send(:handle_server_message, progress_notification_1.to_json)
-        server.send(:handle_server_message, second_progress_notification_1.to_json)
+        server.send(:handle_server_message, progress_notification_one.to_json)
+        server.send(:handle_server_message, second_progress_notification_one.to_json)
         sleep(0.05)
-        server.send(:handle_server_message, progress_notification_2.to_json)
-        server.send(:handle_server_message, second_progress_notification_2.to_json)
+        server.send(:handle_server_message, progress_notification_two.to_json)
+        server.send(:handle_server_message, second_progress_notification_two.to_json)
         sleep(0.05)
-        server.send(:handle_server_message, progress_notification_3.to_json)
+        server.send(:handle_server_message, progress_notification_three.to_json)
       end
 
       # Make concurrent calls with different progress tokens

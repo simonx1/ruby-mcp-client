@@ -85,7 +85,7 @@ RSpec.describe 'Streamable HTTP Transport Integration', type: :integration do
     end
 
     before do
-      # Use a general stub that responds to all requests to the endpoint with SSE format
+      # Use a general stub that responds to all POST requests to the endpoint with SSE format
       stub_request(:post, "#{base_url}#{endpoint}")
         .to_return do |request|
           body = JSON.parse(request.body)
@@ -94,6 +94,12 @@ RSpec.describe 'Streamable HTTP Transport Integration', type: :integration do
             {
               status: 200,
               body: "event: message\ndata: #{initialize_response.to_json}\n\n",
+              headers: { 'Content-Type' => 'text/event-stream' }
+            }
+          when 'notifications/initialized'
+            {
+              status: 200,
+              body: '',
               headers: { 'Content-Type' => 'text/event-stream' }
             }
           when 'tools/list'
@@ -112,6 +118,14 @@ RSpec.describe 'Streamable HTTP Transport Integration', type: :integration do
             { status: 404, body: 'Not Found' }
           end
         end
+
+      # Stub the GET request for server events
+      stub_request(:get, "#{base_url}#{endpoint}")
+        .to_return(
+          status: 200,
+          body: '',
+          headers: { 'Content-Type' => 'text/event-stream' }
+        )
     end
 
     it 'successfully completes full MCP workflow' do
@@ -134,8 +148,8 @@ RSpec.describe 'Streamable HTTP Transport Integration', type: :integration do
       expect(result['content'].size).to eq(1)
       expect(result['content'].first['text']).to include('Weather in San Francisco')
 
-      # Verify all expected requests were made
-      expect(WebMock).to have_requested(:post, "#{base_url}#{endpoint}").times(3)
+      # Verify all expected requests were made (initialize, notifications/initialized, tools/list, tools/call)
+      expect(WebMock).to have_requested(:post, "#{base_url}#{endpoint}").times(4)
     end
 
     it 'sends correct headers in all requests' do
@@ -145,7 +159,8 @@ RSpec.describe 'Streamable HTTP Transport Integration', type: :integration do
 
       # Verify all requests were made to the correct endpoint
       # Headers verification is covered in unit tests
-      expect(WebMock).to have_requested(:post, "#{base_url}#{endpoint}").times(3)
+      # (connect + list_tools + call_tool = 4 requests including notifications/initialized)
+      expect(WebMock).to have_requested(:post, "#{base_url}#{endpoint}").times(4)
     end
 
     it 'handles streaming tool calls' do
@@ -211,6 +226,21 @@ RSpec.describe 'Streamable HTTP Transport Integration', type: :integration do
           )
 
         stub_request(:post, "#{base_url}#{endpoint}")
+          .with(body: hash_including(method: 'notifications/initialized'))
+          .to_return(
+            status: 200,
+            body: '',
+            headers: { 'Content-Type' => 'text/event-stream' }
+          )
+
+        stub_request(:get, "#{base_url}#{endpoint}")
+          .to_return(
+            status: 200,
+            body: '',
+            headers: { 'Content-Type' => 'text/event-stream' }
+          )
+
+        stub_request(:post, "#{base_url}#{endpoint}")
           .with(body: hash_including(method: 'tools/list'))
           .to_return(
             status: 200,
@@ -247,6 +277,21 @@ RSpec.describe 'Streamable HTTP Transport Integration', type: :integration do
           .to_return(
             status: 200,
             body: "event: message\ndata: #{init_response.to_json}\n\n",
+            headers: { 'Content-Type' => 'text/event-stream' }
+          )
+
+        stub_request(:post, "#{base_url}#{endpoint}")
+          .with(body: hash_including(method: 'notifications/initialized'))
+          .to_return(
+            status: 200,
+            body: '',
+            headers: { 'Content-Type' => 'text/event-stream' }
+          )
+
+        stub_request(:get, "#{base_url}#{endpoint}")
+          .to_return(
+            status: 200,
+            body: '',
             headers: { 'Content-Type' => 'text/event-stream' }
           )
 
@@ -291,6 +336,21 @@ RSpec.describe 'Streamable HTTP Transport Integration', type: :integration do
           )
 
         stub_request(:post, "#{base_url}#{endpoint}")
+          .with(body: hash_including(method: 'notifications/initialized'))
+          .to_return(
+            status: 200,
+            body: '',
+            headers: { 'Content-Type' => 'text/event-stream' }
+          )
+
+        stub_request(:get, "#{base_url}#{endpoint}")
+          .to_return(
+            status: 200,
+            body: '',
+            headers: { 'Content-Type' => 'text/event-stream' }
+          )
+
+        stub_request(:post, "#{base_url}#{endpoint}")
           .with(body: hash_including(method: 'tools/call'))
           .to_return(
             status: 200,
@@ -324,6 +384,21 @@ RSpec.describe 'Streamable HTTP Transport Integration', type: :integration do
         .to_return(
           status: 200,
           body: "event: message\ndata: #{init_response.to_json}\n\n",
+          headers: { 'Content-Type' => 'text/event-stream' }
+        )
+
+      stub_request(:post, "#{base_url}#{endpoint}")
+        .with(body: hash_including(method: 'notifications/initialized'))
+        .to_return(
+          status: 200,
+          body: '',
+          headers: { 'Content-Type' => 'text/event-stream' }
+        )
+
+      stub_request(:get, "#{base_url}#{endpoint}")
+        .to_return(
+          status: 200,
+          body: '',
           headers: { 'Content-Type' => 'text/event-stream' }
         )
 
@@ -373,6 +448,13 @@ RSpec.describe 'Streamable HTTP Transport Integration', type: :integration do
           body: "event: message\ndata: #{init_response.to_json}\n\n",
           headers: { 'Content-Type' => 'text/event-stream' }
         )
+
+      stub_request(:get, "#{base_url}#{endpoint}")
+        .to_return(
+          status: 200,
+          body: '',
+          headers: { 'Content-Type' => 'text/event-stream' }
+        )
     end
 
     let(:init_response) do
@@ -403,6 +485,21 @@ RSpec.describe 'Streamable HTTP Transport Integration', type: :integration do
         .to_return(
           status: 200,
           body: "event: message\ndata: #{init_response.to_json}\n\n",
+          headers: { 'Content-Type' => 'text/event-stream' }
+        )
+
+      stub_request(:post, "#{base_url}#{endpoint}")
+        .with(body: hash_including(method: 'notifications/initialized'))
+        .to_return(
+          status: 200,
+          body: '',
+          headers: { 'Content-Type' => 'text/event-stream' }
+        )
+
+      stub_request(:get, "#{base_url}#{endpoint}")
+        .to_return(
+          status: 200,
+          body: '',
           headers: { 'Content-Type' => 'text/event-stream' }
         )
 

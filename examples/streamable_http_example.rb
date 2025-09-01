@@ -21,7 +21,7 @@ puts
 # Example configuration for a Streamable HTTP server
 # Replace with your actual server URL and credentials
 server_config = MCPClient.streamable_http_config(
-  base_url: 'https://mcp.zapier.com/api/mcp/s/<base64 encoded api key>/mcp',
+  base_url: 'https://mcp.zapier.com/api/mcp/s/ZGZkMmM4OTgtMGE0OC00OTZmLWJjMWItNWNjMTA4MmYwODkzOjU3MmU3NDY2LWZkZWQtNDhiNy1iOGZmLWZhMjZlOWU5NDY2MQ==/mcp',
   read_timeout: 60,
   retries: 3,
   retry_backoff: 2,

@@ -203,6 +203,23 @@ RSpec.describe 'Session Management Integration', type: :integration do
             }
           )
 
+        # Step 1b: notifications/initialized stub
+        stub_request(:post, "#{base_url}#{endpoint}")
+          .with(body: hash_including(method: 'notifications/initialized'))
+          .to_return(
+            status: 200,
+            body: '',
+            headers: { 'Content-Type' => 'text/event-stream' }
+          )
+
+        # Step 1c: GET request for events
+        stub_request(:get, "#{base_url}#{endpoint}")
+          .to_return(
+            status: 200,
+            body: '',
+            headers: { 'Content-Type' => 'text/event-stream' }
+          )
+
         # Step 2: Tools list with session and Last-Event-ID headers
         stub_request(:post, "#{base_url}#{endpoint}")
           .with(
@@ -257,7 +274,8 @@ RSpec.describe 'Session Management Integration', type: :integration do
         expect(streamable_server.instance_variable_get(:@session_id)).to be_nil
 
         # Verify all expected requests were made with correct headers
-        expect(WebMock).to have_requested(:post, "#{base_url}#{endpoint}").times(3)
+        # (initialize, notifications/initialized, tools/list, tools/call)
+        expect(WebMock).to have_requested(:post, "#{base_url}#{endpoint}").times(4)
         expect(WebMock).to have_requested(:delete, "#{base_url}#{endpoint}").once
       end
 

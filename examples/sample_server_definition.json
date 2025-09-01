@@ -1,7 +1,7 @@
 {
   "mcpServers": {
     "playwright": {
-      "url": "http://localhost:8931/sse",
+      "url": "http://localhost:8931/mcp",
       "comment": "Local Playwright MCP Server running on port 8931"
     },
     "filesystem": {

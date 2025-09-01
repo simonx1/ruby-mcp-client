@@ -91,6 +91,15 @@ RSpec.describe MCPClient::ServerStreamableHTTP do
           headers: { 'Content-Type' => 'text/event-stream' }
         )
 
+      # Mock the notifications/initialized request
+      stub_request(:post, "#{base_url}#{endpoint}")
+        .with(body: hash_including('method' => 'notifications/initialized'))
+        .to_return(
+          status: 200,
+          body: '',
+          headers: { 'Content-Type' => 'text/event-stream' }
+        )
+
       server.connect
 
       expect(init_request_body['params']['protocolVersion']).to eq(MCPClient::PROTOCOL_VERSION)
@@ -128,11 +137,21 @@ RSpec.describe MCPClient::ServerStreamableHTTP do
     end
 
     before do
+      # Stub the initialize request
       stub_request(:post, "#{base_url}#{endpoint}")
         .with(body: hash_including('method' => 'initialize'))
         .to_return(
           status: 200,
           body: initialize_response,
+          headers: { 'Content-Type' => 'text/event-stream' }
+        )
+
+      # Stub the notifications/initialized request
+      stub_request(:post, "#{base_url}#{endpoint}")
+        .with(body: hash_including('method' => 'notifications/initialized'))
+        .to_return(
+          status: 200,
+          body: '',
           headers: { 'Content-Type' => 'text/event-stream' }
         )
     end
@@ -213,6 +232,23 @@ RSpec.describe MCPClient::ServerStreamableHTTP do
         .to_return(
           status: 200,
           body: "event: message\ndata: #{initialize_data.to_json}\n\n",
+          headers: { 'Content-Type' => 'text/event-stream' }
+        )
+
+      # Stub notifications/initialized
+      stub_request(:post, "#{base_url}#{endpoint}")
+        .with(body: hash_including('method' => 'notifications/initialized'))
+        .to_return(
+          status: 200,
+          body: '',
+          headers: { 'Content-Type' => 'text/event-stream' }
+        )
+
+      # Stub GET for events
+      stub_request(:get, "#{base_url}#{endpoint}")
+        .to_return(
+          status: 200,
+          body: '',
           headers: { 'Content-Type' => 'text/event-stream' }
         )
 
@@ -327,6 +363,23 @@ RSpec.describe MCPClient::ServerStreamableHTTP do
         .to_return(
           status: 200,
           body: "event: message\ndata: #{initialize_data.to_json}\n\n",
+          headers: { 'Content-Type' => 'text/event-stream' }
+        )
+
+      # Stub notifications/initialized
+      stub_request(:post, "#{base_url}#{endpoint}")
+        .with(body: hash_including('method' => 'notifications/initialized'))
+        .to_return(
+          status: 200,
+          body: '',
+          headers: { 'Content-Type' => 'text/event-stream' }
+        )
+
+      # Stub GET for events
+      stub_request(:get, "#{base_url}#{endpoint}")
+        .to_return(
+          status: 200,
+          body: '',
           headers: { 'Content-Type' => 'text/event-stream' }
         )
 
@@ -629,6 +682,14 @@ RSpec.describe MCPClient::ServerStreamableHTTP do
             }
           )
 
+        stub_request(:post, "#{base_url}#{endpoint}")
+          .with(body: hash_including(method: 'notifications/initialized'))
+          .to_return(
+            status: 200,
+            body: '',
+            headers: { 'Content-Type' => 'text/event-stream' }
+          )
+
         server.send(:perform_initialize)
         expect(server.instance_variable_get(:@session_id)).to eq('valid-streamable-session-456')
       end
@@ -645,6 +706,14 @@ RSpec.describe MCPClient::ServerStreamableHTTP do
             }
           )
 
+        stub_request(:post, "#{base_url}#{endpoint}")
+          .with(body: hash_including(method: 'notifications/initialized'))
+          .to_return(
+            status: 200,
+            body: '',
+            headers: { 'Content-Type' => 'text/event-stream' }
+          )
+
         server.send(:perform_initialize)
         expect(server.instance_variable_get(:@session_id)).to be_nil
       end
@@ -655,6 +724,14 @@ RSpec.describe MCPClient::ServerStreamableHTTP do
           .to_return(
             status: 200,
             body: "event: message\ndata: {\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{}}\n\n",
+            headers: { 'Content-Type' => 'text/event-stream' }
+          )
+
+        stub_request(:post, "#{base_url}#{endpoint}")
+          .with(body: hash_including(method: 'notifications/initialized'))
+          .to_return(
+            status: 200,
+            body: '',
             headers: { 'Content-Type' => 'text/event-stream' }
           )
 
@@ -696,6 +773,14 @@ RSpec.describe MCPClient::ServerStreamableHTTP do
             headers: { 'Content-Type' => 'text/event-stream' }
           )
 
+        stub_request(:post, "#{base_url}#{endpoint}")
+          .with(body: hash_including(method: 'notifications/initialized'))
+          .to_return(
+            status: 200,
+            body: '',
+            headers: { 'Content-Type' => 'text/event-stream' }
+          )
+
         server.send(:perform_initialize)
         expect(WebMock).to(have_requested(:post, "#{base_url}#{endpoint}")
           .with { |req| !req.headers.key?('Mcp-Session-Id') })
@@ -705,6 +790,8 @@ RSpec.describe MCPClient::ServerStreamableHTTP do
     describe 'cleanup with session termination' do
       before do
         server.instance_variable_set(:@session_id, 'cleanup-streamable-session-999')
+        server.instance_variable_set(:@connection_established, true)
+        server.instance_variable_set(:@initialized, true)
       end
 
       it 'terminates session during cleanup' do
