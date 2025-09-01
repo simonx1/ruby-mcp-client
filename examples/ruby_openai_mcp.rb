@@ -17,7 +17,7 @@ abort 'Please set OPENAI_API_KEY' unless api_key
 
 # Create an MCPClient client
 logger = Logger.new($stdout)
-logger.level = Logger::DEBUG
+logger.level = Logger::WARN # DEBUG
 mcp_client = MCPClient::Client.new(
   mcp_server_configs: [
     MCPClient.streamable_http_config(

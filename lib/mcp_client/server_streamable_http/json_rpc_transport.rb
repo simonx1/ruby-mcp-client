@@ -45,30 +45,44 @@ module MCPClient
       # @return [Hash] the parsed JSON data
       # @raise [MCPClient::Errors::TransportError] if no data found in SSE response
       def parse_sse_response(sse_body)
-        # Extract JSON data and event ID from SSE format
+        # Extract JSON data from SSE format, processing events separately
         # SSE format: event: message\nid: 123\ndata: {...}\n\n
-        data_lines = []
-        event_id = nil
+        events = []
+        current_event = { type: nil, data_lines: [], id: nil }
 
         sse_body.lines.each do |line|
           line = line.strip
-          if line.start_with?('data:')
-            data_lines << line.sub(/^data:\s*/, '').strip
+
+          if line.empty?
+            # Empty line marks end of an event
+            events << current_event.dup if current_event[:type] && !current_event[:data_lines].empty?
+            current_event = { type: nil, data_lines: [], id: nil }
+          elsif line.start_with?('event:')
+            current_event[:type] = line.sub(/^event:\s*/, '').strip
+          elsif line.start_with?('data:')
+            current_event[:data_lines] << line.sub(/^data:\s*/, '').strip
           elsif line.start_with?('id:')
-            event_id = line.sub(/^id:\s*/, '').strip
+            current_event[:id] = line.sub(/^id:\s*/, '').strip
           end
         end
 
-        raise MCPClient::Errors::TransportError, 'No data found in SSE response' if data_lines.empty?
+        # Handle last event if no trailing empty line
+        events << current_event if current_event[:type] && !current_event[:data_lines].empty?
 
-        # Track the last event ID for resumability
-        if event_id && !event_id.empty?
-          @last_event_id = event_id
-          @logger.debug("Tracking event ID for resumability: #{event_id}")
+        # Find the first 'message' event which contains the JSON-RPC response
+        message_event = events.find { |e| e[:type] == 'message' }
+
+        raise MCPClient::Errors::TransportError, 'No data found in SSE response' unless message_event
+        raise MCPClient::Errors::TransportError, 'No data found in message event' if message_event[:data_lines].empty?
+
+        # Track the event ID for resumability
+        if message_event[:id] && !message_event[:id].empty?
+          @last_event_id = message_event[:id]
+          @logger.debug("Tracking event ID for resumability: #{message_event[:id]}")
         end
 
         # Join multiline data fields according to SSE spec
-        json_data = data_lines.join("\n")
+        json_data = message_event[:data_lines].join("\n")
         JSON.parse(json_data)
       end
     end
