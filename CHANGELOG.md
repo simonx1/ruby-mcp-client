@@ -1,5 +1,22 @@
 # Changelog
 
+## 0.7.3 (2025-09-01)
+
+### Bug Fixes
+- **Streaming JSON Parsing**: Fixed streaming JSON parsing improvements for better handling of partial data chunks
+- **SSE Connection**: Enhanced server-sent events connection reliability for real-time notifications
+
+### Dependencies
+- Updated faraday from 2.13.1 to 2.13.4
+- Updated ruby-openai from 8.1.0 to 8.3.0 (dev dependency)
+- Updated openai gem to latest version (dev dependency)
+- Updated rdoc from 6.14.1 to 6.14.2 (dev dependency)
+
+### Developer Experience
+- Improved CI configuration and permissions
+- Enhanced examples with better cleanup and error handling
+- Fixed Rubocop style violations
+
 ## 0.7.2 (2025-07-14)
 
 ### Bug Fixes
