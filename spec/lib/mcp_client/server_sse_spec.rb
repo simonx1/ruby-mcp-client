@@ -44,7 +44,28 @@ RSpec.describe MCPClient::ServerSSE do
         server.call_tool('TestTool', {})
       end.to raise_error(MCPClient::Errors::ConnectionError, /Server connection lost/)
     end
+
+    it 'propagates connection errors from get_prompt' do
+      # Setup - ensure the server appears initialized and connected
+      server.instance_variable_set(:@initialized, true)
+      server.instance_variable_set(:@connection_established, true)
+      server.instance_variable_set(:@sse_connected, true)
+
+      # Also disable reconnect attempts
+      allow(server).to receive(:connect).and_return(true)
+
+      # Simulate connection error in the send_jsonrpc_request method
+      allow(server).to receive(:send_jsonrpc_request).and_raise(
+        MCPClient::Errors::ConnectionError.new('Server connection lost: Connection refused')
+      )
+
+      # Should preserve the ConnectionError
+      expect do
+        server.get_prompt('TestPrompt', {})
+      end.to raise_error(MCPClient::Errors::ConnectionError, /Server connection lost/)
+    end
   end
+
   let(:tool_data) do
     {
       'name' => 'test_tool',
@@ -55,6 +76,16 @@ RSpec.describe MCPClient::ServerSSE do
         'properties' => {
           'foo' => { 'type' => 'string' }
         }
+      }
+    }
+  end
+
+  let(:prompt_data) do
+    {
+      'name' => 'test_prompt',
+      'description' => 'A test prompt',
+      'parameters' => {
+        'message' => 'John'
       }
     }
   end
@@ -222,6 +253,108 @@ RSpec.describe MCPClient::ServerSSE do
     end
   end
 
+  describe '#list_prompts' do
+    before do
+      # Stub initialization to avoid real SSE connection
+      allow(server).to receive(:connect) do
+        server.instance_variable_set(:@connection_established, true)
+      end
+      allow(server).to receive(:perform_initialize) do
+        server.instance_variable_set(:@initialized, true)
+      end
+      allow(server).to receive(:cleanup)
+      allow(server).to receive(:capabilities).and_return('prompts' => { 'listChanged' => true })
+      # Disable SSE transport for testing synchronous HTTP fallback
+      server.instance_variable_set(:@use_sse, false)
+      # Prevent RPC request from triggering SSE reconnect logic
+      server.instance_variable_set(:@sse_connected, true)
+
+      # Create a Faraday connection stub to avoid real HTTP requests
+      faraday_stubs = Faraday::Adapter::Test::Stubs.new
+      faraday_conn = Faraday.new do |builder|
+        builder.adapter :test, faraday_stubs
+      end
+
+      server.instance_variable_set(:@rpc_endpoint, '/rpc')
+
+      # Stub the Faraday response for prompts/list
+      faraday_stubs.post('/rpc') do |env|
+        request_body = JSON.parse(env.body)
+        if request_body['method'] == 'prompts/list'
+          [200, { 'Content-Type' => 'application/json' }, { result: { prompts: [prompt_data] } }.to_json]
+        else
+          [404, {}, 'Not Found']
+        end
+      end
+
+      # Set the stubbed connection
+      server.instance_variable_set(:@rpc_conn, faraday_conn)
+    end
+
+    it 'connects if not already connected' do
+      # Reset initialized state
+      server.instance_variable_set(:@initialized, false)
+      server.instance_variable_set(:@connection_established, false)
+
+      # Mock the connection
+      expect(server).to receive(:connect) do
+        server.instance_variable_set(:@connection_established, true)
+      end
+
+      expect(server).to receive(:perform_initialize) do
+        server.instance_variable_set(:@initialized, true)
+      end
+
+      # Makes sure prompts are cached
+      expect(server).to receive(:request_prompts_list).and_return([prompt_data])
+
+      server.list_prompts
+    end
+
+    it 'returns a list of Prompt objects' do
+      prompts = server.list_prompts
+      expect(prompts.length).to eq(1)
+      expect(prompts.first).to be_a(MCPClient::Prompt)
+      expect(prompts.first.name).to eq('test_prompt')
+    end
+
+    it 'caches the prompts' do
+      server.list_prompts
+      expect(server.prompts).to be_an(Array)
+      expect(server.prompts.first).to be_a(MCPClient::Prompt)
+    end
+
+    it 'raises ServerError on non-success response' do
+      # Create error response stub
+      faraday_stubs = Faraday::Adapter::Test::Stubs.new
+      faraday_conn = Faraday.new do |builder|
+        builder.adapter :test, faraday_stubs
+      end
+
+      faraday_stubs.post('/rpc') do |_env|
+        [500, {}, 'Server Error']
+      end
+
+      server.instance_variable_set(:@rpc_conn, faraday_conn)
+
+      expect { server.list_prompts }.to raise_error(MCPClient::Errors::ServerError, /Server returned error/)
+    end
+
+    it 'raises TransportError on invalid JSON' do
+      allow(server).to receive(:request_prompts_list).and_raise(
+        MCPClient::Errors::TransportError.new('Invalid JSON response from server: unexpected token')
+      )
+
+      expect { server.list_prompts }.to raise_error(MCPClient::Errors::TransportError, /Invalid JSON response/)
+    end
+
+    it 'raises PromptGetError on other errors' do
+      # Create standard error stub
+      allow(server).to receive(:request_prompts_list).and_raise(StandardError.new('Network failure'))
+      expect { server.list_prompts }.to raise_error(MCPClient::Errors::PromptGetError, /Error listing prompts/)
+    end
+  end
+
   describe '#list_tools' do
     before do
       # Stub initialization to avoid real SSE connection
@@ -232,6 +365,7 @@ RSpec.describe MCPClient::ServerSSE do
         server.instance_variable_set(:@initialized, true)
       end
       allow(server).to receive(:cleanup)
+      allow(server).to receive(:capabilities).and_return('tools' => { 'listChanged' => true })
       # Disable SSE transport for testing synchronous HTTP fallback
       server.instance_variable_set(:@use_sse, false)
       # Prevent RPC request from triggering SSE reconnect logic

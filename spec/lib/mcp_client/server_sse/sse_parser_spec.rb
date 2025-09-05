@@ -22,6 +22,7 @@ RSpec.describe MCPClient::ServerSSE::SseParser do
         }
         @sse_results = {}
         @tools_data = nil
+        @prompts_data = nil
       end
 
       def record_activity; end

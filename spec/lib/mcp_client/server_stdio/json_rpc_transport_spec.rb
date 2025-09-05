@@ -28,6 +28,7 @@ RSpec.describe MCPClient::ServerStdio::JsonRpcTransport do
       def start_reader; end
       def perform_initialize; end
       def call_tool(name, params); end
+      def get_prompt(name, params); end
     end
   end
 
