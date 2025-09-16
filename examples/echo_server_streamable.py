@@ -25,6 +25,7 @@ import json
 import time
 import threading
 import uuid
+import base64
 from datetime import datetime
 from flask import Flask, request, Response, jsonify
 from queue import Queue
@@ -132,6 +133,8 @@ def handle_rpc():
                     "protocolVersion": "2025-03-26",
                     "capabilities": {
                         "tools": {},
+                        "prompts": {},
+                        "resources": {},
                         "notifications": {
                             "server": ["notification/server_status", "notification/progress"]
                         }
@@ -212,6 +215,355 @@ def handle_rpc():
                     ]
                 }
             }
+            return Response(
+                format_sse_event("message", response_data),
+                content_type='text/event-stream',
+                headers={'Cache-Control': 'no-cache'}
+            )
+
+        elif method == 'prompts/list':
+            response_data = {
+                "jsonrpc": "2.0",
+                "id": request_id,
+                "result": {
+                    "prompts": [
+                        {
+                            "name": "greeting",
+                            "description": "Generate a personalized greeting message",
+                            "arguments": [
+                                {
+                                    "name": "name",
+                                    "description": "The name to greet",
+                                    "required": True
+                                }
+                            ]
+                        },
+                        {
+                            "name": "code_review",
+                            "description": "Generate code review comments",
+                            "arguments": [
+                                {
+                                    "name": "code",
+                                    "description": "The code to review",
+                                    "required": True
+                                },
+                                {
+                                    "name": "language",
+                                    "description": "Programming language of the code",
+                                    "required": False
+                                }
+                            ]
+                        },
+                        {
+                            "name": "documentation",
+                            "description": "Generate documentation for a topic",
+                            "arguments": [
+                                {
+                                    "name": "topic",
+                                    "description": "The topic to document",
+                                    "required": True
+                                },
+                                {
+                                    "name": "audience",
+                                    "description": "Target audience for the documentation",
+                                    "required": False
+                                }
+                            ]
+                        }
+                    ]
+                }
+            }
+            return Response(
+                format_sse_event("message", response_data),
+                content_type='text/event-stream',
+                headers={'Cache-Control': 'no-cache'}
+            )
+
+        elif method == 'prompts/get':
+            prompt_name = params.get('name')
+            prompt_args = params.get('arguments', {})
+
+            if prompt_name == 'greeting':
+                name = prompt_args.get('name', 'there')
+                response_data = {
+                    "jsonrpc": "2.0",
+                    "id": request_id,
+                    "result": {
+                        "description": "A personalized greeting message",
+                        "messages": [
+                            {
+                                "role": "user",
+                                "content": {
+                                    "type": "text",
+                                    "text": f"Hello {name}! Welcome to the Enhanced MCP Echo Server with Streamable HTTP Transport. This server demonstrates the full capabilities of the MCP protocol including tools, prompts, and resources. How can I assist you today?"
+                                }
+                            }
+                        ]
+                    }
+                }
+
+            elif prompt_name == 'code_review':
+                code = prompt_args.get('code', '')
+                language = prompt_args.get('language', 'unknown')
+                response_data = {
+                    "jsonrpc": "2.0",
+                    "id": request_id,
+                    "result": {
+                        "description": "Code review comments and suggestions",
+                        "messages": [
+                            {
+                                "role": "user",
+                                "content": {
+                                    "type": "text",
+                                    "text": f"Code Review for {language.title()} Code:\n\n```{language}\n{code}\n```\n\nAnalysis:\n- The code appears to be written in {language}\n- Consider adding error handling for edge cases\n- Documentation could be improved\n- Consider performance optimizations if this is performance-critical\n- Ensure proper input validation\n\nNote: This is a demonstration review from the MCP Echo Server."
+                                }
+                            }
+                        ]
+                    }
+                }
+
+            elif prompt_name == 'documentation':
+                topic = prompt_args.get('topic', 'Unknown Topic')
+                audience = prompt_args.get('audience', 'general audience')
+                response_data = {
+                    "jsonrpc": "2.0",
+                    "id": request_id,
+                    "result": {
+                        "description": "Generated documentation",
+                        "messages": [
+                            {
+                                "role": "user",
+                                "content": {
+                                    "type": "text",
+                                    "text": f"# {topic}\n\n## Overview\n\nThis documentation is generated for {audience} and covers the topic: {topic}.\n\n## Introduction\n\n{topic} is an important concept that requires proper understanding and implementation.\n\n## Key Points\n\n- Understanding the fundamentals is crucial\n- Best practices should be followed\n- Regular updates and maintenance are important\n- Documentation should be kept current\n\n## Conclusion\n\nThis documentation provides a basic overview of {topic} tailored for {audience}. For more detailed information, please consult additional resources or contact support.\n\n---\n*Generated by MCP Echo Server with Streamable HTTP Transport*"
+                                }
+                            }
+                        ]
+                    }
+                }
+
+            else:
+                response_data = {
+                    "jsonrpc": "2.0",
+                    "id": request_id,
+                    "error": {
+                        "code": -32602,
+                        "message": f"Unknown prompt: {prompt_name}"
+                    }
+                }
+            return Response(
+                format_sse_event("message", response_data),
+                content_type='text/event-stream',
+                headers={'Cache-Control': 'no-cache'}
+            )
+
+        elif method == 'resources/list':
+            response_data = {
+                "jsonrpc": "2.0",
+                "id": request_id,
+                "result": {
+                    "resources": [
+                        {
+                            "uri": "file:///sample/README.md",
+                            "name": "Sample README",
+                            "description": "A sample README file demonstrating markdown content",
+                            "mimeType": "text/markdown"
+                        },
+                        {
+                            "uri": "file:///sample/config.json",
+                            "name": "Sample Configuration",
+                            "description": "A sample JSON configuration file",
+                            "mimeType": "application/json"
+                        },
+                        {
+                            "uri": "file:///sample/data.txt",
+                            "name": "Sample Data",
+                            "description": "Plain text data with annotations",
+                            "mimeType": "text/plain",
+                            "annotations": {
+                                "category": "demo",
+                                "importance": "low",
+                                "created": datetime.now().isoformat()
+                            }
+                        },
+                        {
+                            "uri": "file:///sample/image.png",
+                            "name": "Sample Image",
+                            "description": "A sample binary image resource",
+                            "mimeType": "image/png"
+                        }
+                    ]
+                }
+            }
+            return Response(
+                format_sse_event("message", response_data),
+                content_type='text/event-stream',
+                headers={'Cache-Control': 'no-cache'}
+            )
+
+        elif method == 'resources/read':
+            resource_uri = params.get('uri')
+
+            if resource_uri == 'file:///sample/README.md':
+                content = """# Sample Project README
+
+This is a sample README file from the Enhanced MCP Echo Server.
+
+## Features
+
+- **Tools**: Echo, reverse, uppercase, count_words, long_task, trigger_notification
+- **Prompts**: Greeting, code_review, documentation
+- **Resources**: README.md, config.json, data.txt, image.png
+- **Streaming**: Server-Sent Events with session management
+- **Notifications**: Progress updates and server status
+
+## Usage
+
+This server demonstrates the complete MCP 2025-03-26 protocol capabilities.
+
+## Getting Started
+
+1. Start the server: `python echo_server_streamable.py`
+2. Connect with a compatible MCP client
+3. Explore tools, prompts, and resources
+
+## Protocol Support
+
+- JSON-RPC 2.0 over HTTP
+- Server-Sent Events for streaming
+- Session management with keepalive
+- Progress notifications
+- Server-to-client notifications
+
+Generated by MCP Echo Server with Streamable HTTP Transport
+"""
+                response_data = {
+                    "jsonrpc": "2.0",
+                    "id": request_id,
+                    "result": {
+                        "contents": [
+                            {
+                                "uri": resource_uri,
+                                "mimeType": "text/markdown",
+                                "text": content
+                            }
+                        ]
+                    }
+                }
+
+            elif resource_uri == 'file:///sample/config.json':
+                config_data = {
+                    "server": {
+                        "name": "Enhanced MCP Echo Server",
+                        "version": "2.0.0",
+                        "protocol": "2025-03-26",
+                        "transport": "streamable-http"
+                    },
+                    "features": {
+                        "tools": True,
+                        "prompts": True,
+                        "resources": True,
+                        "streaming": True,
+                        "sessions": True,
+                        "notifications": True
+                    },
+                    "endpoints": {
+                        "rpc": "/mcp",
+                        "events": "/mcp",
+                        "session_management": "/mcp"
+                    },
+                    "timeouts": {
+                        "ping_interval": 10,
+                        "notification_interval": 30,
+                        "session_cleanup": 300
+                    }
+                }
+                response_data = {
+                    "jsonrpc": "2.0",
+                    "id": request_id,
+                    "result": {
+                        "contents": [
+                            {
+                                "uri": resource_uri,
+                                "mimeType": "application/json",
+                                "text": json.dumps(config_data, indent=2)
+                            }
+                        ]
+                    }
+                }
+
+            elif resource_uri == 'file:///sample/data.txt':
+                content = """This is sample text data from the MCP Echo Server.
+
+Line 1: Hello from the Enhanced MCP Server!
+Line 2: This server supports tools, prompts, and resources.
+Line 3: Streaming is enabled via Server-Sent Events.
+Line 4: Session management keeps connections alive.
+Line 5: Progress notifications provide real-time updates.
+
+Metadata:
+- Created: {}
+- Server: Enhanced MCP Echo Server v2.0.0
+- Protocol: MCP 2025-03-26
+- Transport: Streamable HTTP
+
+End of sample data.""".format(datetime.now().isoformat())
+
+                response_data = {
+                    "jsonrpc": "2.0",
+                    "id": request_id,
+                    "result": {
+                        "contents": [
+                            {
+                                "uri": resource_uri,
+                                "mimeType": "text/plain",
+                                "text": content,
+                                "annotations": {
+                                    "category": "demo",
+                                    "importance": "low",
+                                    "created": datetime.now().isoformat(),
+                                    "lines": len(content.split('\n')),
+                                    "characters": len(content)
+                                }
+                            }
+                        ]
+                    }
+                }
+
+            elif resource_uri == 'file:///sample/image.png':
+                # Create a simple base64 encoded "image" (just sample binary data)
+                sample_binary = b"\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR\x00\x00\x00\x01\x00\x00\x00\x01\x08\x02\x00\x00\x00\x90wS\xde\x00\x00\x00\tpHYs\x00\x00\x0b\x13\x00\x00\x0b\x13\x01\x00\x9a\x9c\x18\x00\x00\x00\nIDATx\x9cc```\x00\x00\x00\x02\x00\x01H\xaf\xa4q\x00\x00\x00\x00IEND\xaeB`\x82"
+                encoded_data = base64.b64encode(sample_binary).decode('utf-8')
+
+                response_data = {
+                    "jsonrpc": "2.0",
+                    "id": request_id,
+                    "result": {
+                        "contents": [
+                            {
+                                "uri": resource_uri,
+                                "mimeType": "image/png",
+                                "blob": encoded_data
+                            }
+                        ]
+                    }
+                }
+
+            else:
+                response_data = {
+                    "jsonrpc": "2.0",
+                    "id": request_id,
+                    "error": {
+                        "code": -32602,
+                        "message": f"Resource not found: {resource_uri}"
+                    }
+                }
+
+            return Response(
+                format_sse_event("message", response_data),
+                content_type='text/event-stream',
+                headers={'Cache-Control': 'no-cache'}
+            )
             return Response(
                 format_sse_event("message", response_data),
                 content_type='text/event-stream',
@@ -432,10 +784,22 @@ if __name__ == "__main__":
     print("✅ Server notifications (every 30 seconds)")
     print("✅ Progress notifications")
     print("✅ Session management")
+    print("✅ Tools support")
+    print("✅ Prompts support")
+    print("✅ Resources support")
     print("\nAvailable tools:")
     print("  - echo: Echo back a message")
     print("  - long_task: Simulate long-running task with progress")
     print("  - trigger_notification: Trigger a server notification")
+    print("\nAvailable prompts:")
+    print("  - greeting: Generate personalized greetings")
+    print("  - code_review: Generate code review comments")
+    print("  - documentation: Generate documentation")
+    print("\nAvailable resources:")
+    print("  - file:///sample/README.md: Sample README file")
+    print("  - file:///sample/config.json: Configuration data")
+    print("  - file:///sample/data.txt: Sample text data")
+    print("  - file:///sample/image.png: Sample binary image")
     print("\nPress Ctrl+C to stop the server")
     print("-" * 60)
     
