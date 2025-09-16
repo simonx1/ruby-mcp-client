@@ -1,5 +1,27 @@
 # Changelog
 
+## 0.8.0 (2025-09-16)
+
+### New Features
+- **MCP Prompts and Resources Support**: Added full support for MCP prompts and resources (#31)
+  - Implemented `list_prompts` and `get_prompt` methods for prompt management
+  - Implemented `list_resources` and `read_resource` methods for resource access
+  - Added support for both text and blob resource types
+
+### Bug Fixes
+- **Tool Caching**: Fixed issue with caching tools that have the same name from different servers (#342ff55)
+  - Tools are now properly disambiguated by server when cached
+  - Improved tool resolution to prevent conflicts between servers
+
+### Dependencies
+- Updated openai from `9e5d91e` to `003ab1d` (dev dependency) (#30)
+- Updated rubocop from 1.77.0 to 1.80.2 (dev dependency) (#28)
+- Updated gemini-ai from 4.2.0 to 4.3.0 (dev dependency) (#25)
+
+### Developer Experience
+- Updated examples with improved error handling
+- Enhanced CI workflow configuration
+
 ## 0.7.3 (2025-09-01)
 
 ### Bug Fixes
