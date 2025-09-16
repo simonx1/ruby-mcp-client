@@ -20,6 +20,21 @@ require_relative '../lib/mcp_client'
 require 'logger'
 require 'json'
 
+# Helper method to display content from resources
+def display_content(content)
+  if content['text']
+    # Text content
+    preview = content['text'].length > 200 ? "#{content['text'][0...200]}..." : content['text']
+    puts "   Content (#{content['mimeType'] || 'text'}): #{preview.gsub("\n", "\n            ")}"
+  elsif content['blob']
+    # Binary content
+    puts "   Binary data: #{content['blob'].length} characters (base64)"
+  end
+
+  # Show annotations if present
+  puts "   Annotations: #{content['annotations']}" if content['annotations']
+end
+
 # Create a logger for debugging (optional)
 logger = Logger.new($stdout)
 logger.level = Logger::INFO
@@ -241,18 +256,4 @@ ensure
   puts "\n🧹 Cleaning up..."
   client&.cleanup
   puts '👋 Done!'
-end
-
-def display_content(content)
-  if content['text']
-    # Text content
-    preview = content['text'].length > 200 ? "#{content['text'][0...200]}..." : content['text']
-    puts "   Content (#{content['mimeType'] || 'text'}): #{preview.gsub("\n", "\n            ")}"
-  elsif content['blob']
-    # Binary content
-    puts "   Binary data: #{content['blob'].length} characters (base64)"
-  end
-
-  # Show annotations if present
-  puts "   Annotations: #{content['annotations']}" if content['annotations']
 end
