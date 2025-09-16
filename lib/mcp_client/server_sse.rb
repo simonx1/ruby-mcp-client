@@ -17,9 +17,11 @@ module MCPClient
 
     include SseParser
     include JsonRpcTransport
+
     require_relative 'server_sse/reconnect_monitor'
 
     include ReconnectMonitor
+
     # Ratio of close_after timeout to ping interval
     CLOSE_AFTER_PING_RATIO = 2.5
 

@@ -7,6 +7,7 @@ module MCPClient
     # JSON-RPC request/notification plumbing for SSE transport
     module JsonRpcTransport
       include JsonRpcCommon
+
       # Generic JSON-RPC request: send method with params and return result
       # @param method [String] JSON-RPC method name
       # @param params [Hash] parameters for the request
