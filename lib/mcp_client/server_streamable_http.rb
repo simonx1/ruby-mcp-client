@@ -99,6 +99,10 @@ module MCPClient
       @read_timeout = opts[:read_timeout]
       @tools = nil
       @tools_data = nil
+      @prompts = nil
+      @prompts_data = nil
+      @resources = nil
+      @resources_data = nil
       @request_id = 0
       @mutex = Monitor.new
       @connection_established = false
@@ -211,6 +215,93 @@ module MCPClient
       end
     end
 
+    # List all prompts available from the MCP server
+    # @return [Array<MCPClient::Prompt>] list of available prompts
+    # @raise [MCPClient::Errors::PromptGetError] if prompts list retrieval fails
+    def list_prompts
+      @mutex.synchronize do
+        return @prompts if @prompts
+      end
+
+      begin
+        ensure_connected
+
+        prompts_data = request_prompts_list
+        @mutex.synchronize do
+          @prompts = prompts_data.map do |prompt_data|
+            MCPClient::Prompt.from_json(prompt_data, server: self)
+          end
+        end
+
+        @mutex.synchronize { @prompts }
+      rescue MCPClient::Errors::ConnectionError, MCPClient::Errors::TransportError, MCPClient::Errors::ServerError
+        # Re-raise these errors directly
+        raise
+      rescue StandardError => e
+        raise MCPClient::Errors::PromptGetError, "Error listing prompts: #{e.message}"
+      end
+    end
+
+    # Get a prompt with the given parameters
+    # @param prompt_name [String] the name of the prompt to get
+    # @param parameters [Hash] the parameters to pass to the prompt
+    # @return [Object] the result of the prompt (with string keys for backward compatibility)
+    # @raise [MCPClient::Errors::PromptGetError] if prompt retrieval fails
+    def get_prompt(prompt_name, parameters)
+      rpc_request('prompts/get', {
+                    name: prompt_name,
+                    arguments: parameters.except(:_meta),
+                    **parameters.slice(:_meta)
+                  })
+    rescue MCPClient::Errors::ConnectionError, MCPClient::Errors::TransportError
+      # Re-raise connection/transport errors directly
+      raise
+    rescue StandardError => e
+      # For all other errors, wrap in PromptGetError
+      raise MCPClient::Errors::PromptGetError, "Error getting prompt '#{prompt_name}': #{e.message}"
+    end
+
+    # List all resources available from the MCP server
+    # @return [Array<MCPClient::Resource>] list of available resources
+    # @raise [MCPClient::Errors::ResourceReadError] if resources list retrieval fails
+    def list_resources
+      @mutex.synchronize do
+        return @resources if @resources
+      end
+
+      begin
+        ensure_connected
+
+        resources_data = request_resources_list
+        @mutex.synchronize do
+          @resources = resources_data.map do |resource_data|
+            MCPClient::Resource.from_json(resource_data, server: self)
+          end
+        end
+
+        @mutex.synchronize { @resources }
+      rescue MCPClient::Errors::ConnectionError, MCPClient::Errors::TransportError, MCPClient::Errors::ServerError
+        # Re-raise these errors directly
+        raise
+      rescue StandardError => e
+        raise MCPClient::Errors::ResourceReadError, "Error listing resources: #{e.message}"
+      end
+    end
+
+    # Read a resource by its URI
+    # @param uri [String] the URI of the resource to read
+    # @return [Object] the resource contents
+    # @raise [MCPClient::Errors::ResourceReadError] if resource reading fails
+    def read_resource(uri)
+      rpc_request('resources/read', { uri: uri })
+    rescue MCPClient::Errors::ConnectionError, MCPClient::Errors::TransportError
+      # Re-raise connection/transport errors directly
+      raise
+    rescue StandardError => e
+      # For all other errors, wrap in ResourceReadError
+      raise MCPClient::Errors::ResourceReadError, "Error reading resource '#{uri}': #{e.message}"
+    end
+
     # Override apply_request_headers to add session and SSE headers for MCP protocol
     def apply_request_headers(req, request)
       super
@@ -294,6 +385,10 @@ module MCPClient
         # Clear cached data
         @tools = nil
         @tools_data = nil
+        @prompts = nil
+        @prompts_data = nil
+        @resources = nil
+        @resources_data = nil
         @buffer = ''
 
         @logger.info('Cleanup completed')
@@ -379,6 +474,56 @@ module MCPClient
       end
 
       raise MCPClient::Errors::ToolCallError, 'Failed to get tools list from JSON-RPC request'
+    end
+
+    # Request the prompts list using JSON-RPC
+    # @return [Array<Hash>] the prompts data
+    # @raise [MCPClient::Errors::PromptGetError] if prompts list retrieval fails
+    def request_prompts_list
+      @mutex.synchronize do
+        return @prompts_data if @prompts_data
+      end
+
+      result = rpc_request('prompts/list')
+
+      if result.is_a?(Hash) && result['prompts']
+        @mutex.synchronize do
+          @prompts_data = result['prompts']
+        end
+        return @mutex.synchronize { @prompts_data.dup }
+      elsif result.is_a?(Array) || result
+        @mutex.synchronize do
+          @prompts_data = result
+        end
+        return @mutex.synchronize { @prompts_data.dup }
+      end
+
+      raise MCPClient::Errors::PromptGetError, 'Failed to get prompts list from JSON-RPC request'
+    end
+
+    # Request the resources list using JSON-RPC
+    # @return [Array<Hash>] the resources data
+    # @raise [MCPClient::Errors::ResourceReadError] if resources list retrieval fails
+    def request_resources_list
+      @mutex.synchronize do
+        return @resources_data if @resources_data
+      end
+
+      result = rpc_request('resources/list')
+
+      if result.is_a?(Hash) && result['resources']
+        @mutex.synchronize do
+          @resources_data = result['resources']
+        end
+        return @mutex.synchronize { @resources_data.dup }
+      elsif result.is_a?(Array) || result
+        @mutex.synchronize do
+          @resources_data = result
+        end
+        return @mutex.synchronize { @resources_data.dup }
+      end
+
+      raise MCPClient::Errors::ResourceReadError, 'Failed to get resources list from JSON-RPC request'
     end
 
     # Start the long-lived GET connection for server events

@@ -49,6 +49,8 @@ This Ruby MCP Client implements key features from the latest MCP specification (
 - **Streamable HTTP Transport** - Enhanced transport with Server-Sent Event formatted responses and session management
 - **HTTP Redirect Support** - Automatic redirect handling for both SSE and HTTP transports with configurable limits
 - **FastMCP Compatibility** - Full compatibility with FastMCP servers including proper line ending handling
+- **Prompts Support** - Full implementation of MCP prompts for dynamic content generation
+- **Resources Support** - Complete resources implementation for accessing files and data with URI-based identification
 
 ## Usage
 
@@ -87,6 +89,17 @@ client = MCPClient.create_client(
       retries: 3,       # Optional number of retry attempts (default: 3)
       retry_backoff: 1, # Optional backoff delay in seconds (default: 1)
       logger: Logger.new($stdout, level: Logger::INFO) # Optional logger for this server
+    ),
+    # Streamable HTTP server (HTTP POST with SSE responses and session management)
+    MCPClient.streamable_http_config(
+      base_url: 'https://api.example.com/mcp',
+      endpoint: '/rpc', # Optional JSON-RPC endpoint path (default: '/rpc')
+      headers: { 'Authorization' => 'Bearer YOUR_TOKEN' },
+      name: 'streamable_api', # Optional name for this server
+      read_timeout: 60, # Optional timeout in seconds (default: 30)
+      retries: 3,       # Optional number of retry attempts (default: 3)
+      retry_backoff: 1, # Optional backoff delay in seconds (default: 1)
+      logger: Logger.new($stdout, level: Logger::INFO) # Optional logger for this server
     )
   ],
   # Optional logger for the client and all servers without explicit loggers
@@ -100,13 +113,14 @@ client = MCPClient.create_client(
 )
 
 # MCP server configuration JSON format can be:
-# 1. A single server object: 
+# 1. A single server object:
 #    { "type": "sse", "url": "http://example.com/sse" }
 #    { "type": "http", "url": "http://example.com", "endpoint": "/rpc" }
-# 2. An array of server objects: 
-#    [{ "type": "stdio", "command": "npx server" }, { "type": "sse", "url": "http://..." }, { "type": "http", "url": "http://..." }]
+#    { "type": "streamable_http", "url": "http://example.com/mcp", "endpoint": "/rpc" }
+# 2. An array of server objects:
+#    [{ "type": "stdio", "command": "npx server" }, { "type": "sse", "url": "http://..." }, { "type": "streamable_http", "url": "http://..." }]
 # 3. An object with "mcpServers" key containing named servers:
-#    { "mcpServers": { "server1": { "type": "sse", "url": "http://..." }, "server2": { "type": "http", "url": "http://..." } } }
+#    { "mcpServers": { "server1": { "type": "sse", "url": "http://..." }, "server2": { "type": "streamable_http", "url": "http://..." } } }
 #    Note: When using this format, server1/server2 will be accessible by name
 
 # List available tools
@@ -139,6 +153,26 @@ client.call_tool_streaming('streaming_tool', { param: 'value' }, server: 'api').
   # Process each chunk as it arrives
   puts chunk
 end
+
+# === Working with Prompts ===
+# List available prompts from all servers
+prompts = client.list_prompts
+
+# Get a specific prompt with parameters
+result = client.get_prompt('greeting', { name: 'Ruby Developer' })
+
+# Get a prompt from a specific server
+result = client.get_prompt('greeting', { name: 'Ruby Developer' }, server: 'filesystem')
+
+# === Working with Resources ===
+# List available resources from all servers
+resources = client.list_resources
+
+# Read a specific resource by URI
+contents = client.read_resource('file:///example.txt')
+
+# Read a resource from a specific server
+contents = client.read_resource('file:///example.txt', server: 'filesystem')
 
 # Format tools for specific AI services
 openai_tools = client.to_openai_tools
@@ -333,15 +367,21 @@ puts "Ping successful: #{ping_result.inspect}"
 mcp_client.cleanup
 ```
 
-See `examples/mcp_sse_server_example.rb` for the full Playwright SSE example.
+See `examples/streamable_http_example.rb` for the full Playwright SSE example.
 
 ### FastMCP Example
 
-The repository includes a complete FastMCP server example that demonstrates the Ruby MCP client working with a Python FastMCP server:
+The repository includes complete FastMCP server examples that demonstrate the Ruby MCP client working with Python FastMCP servers, including full MCP protocol support with tools, prompts, and resources:
+
+#### Basic FastMCP Example
+
+**For FastMCP server with SSE transport (includes tools, prompts, and resources):**
+```bash
+# From the ruby-mcp-client directory
+python examples/echo_server.py
+```
 
 ```ruby
-# Start the FastMCP server
-# python examples/echo_server.py
 
 # Run the Ruby client
 # bundle exec ruby examples/echo_server_client.rb
@@ -352,16 +392,71 @@ require 'mcp_client'
 client = MCPClient.create_client(
   mcp_server_configs: [
     MCPClient.sse_config(
-      base_url: 'http://127.0.0.1:8000/sse/',
+      base_url: 'http://127.0.0.1:8000/sse',
       read_timeout: 30
     )
   ]
 )
 
-# List available tools
+# List and use tools
 tools = client.list_tools
 puts "Found #{tools.length} tools:"
 tools.each { |tool| puts "- #{tool.name}: #{tool.description}" }
+
+result = client.call_tool('echo', { message: 'Hello FastMCP!' })
+
+# List and use prompts
+prompts = client.list_prompts
+puts "Found #{prompts.length} prompts:"
+prompts.each { |prompt| puts "- #{prompt.name}: #{prompt.description}" }
+
+greeting = client.get_prompt('greeting', { name: 'Ruby Developer' })
+
+# List and read resources
+resources = client.list_resources
+puts "Found #{resources.length} resources:"
+resources.each { |resource| puts "- #{resource.name} (#{resource.uri})" }
+
+readme_content = client.read_resource('file:///sample/README.md')
+```
+
+#### Streamable HTTP Example
+
+**For FastMCP server with Streamable HTTP transport (includes tools, prompts, and resources):**
+```bash
+# From the ruby-mcp-client directory
+python examples/echo_server_streamable.py
+```
+
+```ruby
+
+# Run the streamable HTTP client
+# bundle exec ruby examples/echo_server_streamable_client.rb
+
+require 'mcp_client'
+
+# Connect to streamable HTTP server with full MCP protocol support
+client = MCPClient.create_client(
+  mcp_server_configs: [
+    MCPClient.streamable_http_config(
+      base_url: 'http://localhost:8931/mcp',
+      read_timeout: 60
+    )
+  ]
+)
+
+# Full protocol support including real-time notifications
+client.on_notification do |method, params|
+  puts "Server notification: #{method} - #{params}"
+end
+
+# Use all MCP features: tools, prompts, resources
+tools = client.list_tools
+prompts = client.list_prompts
+resources = client.list_resources
+
+# Real-time progress notifications for long-running tasks
+result = client.call_tool('long_task', { duration: 5, steps: 5 })
 
 # Use the tools
 result = client.call_tool('echo', { message: 'Hello from Ruby!' })
@@ -371,8 +466,10 @@ client.cleanup
 ```
 
 The FastMCP example includes:
-- **`echo_server.py`** - A Python FastMCP server with 4 interactive tools
-- **`echo_server_client.rb`** - Ruby client demonstrating all features
+- **`echo_server.py`** - A Python FastMCP server with tools, prompts, and resources
+- **`echo_server_client.rb`** - Ruby client demonstrating all features including prompts and resources
+- **`echo_server_streamable.py`** - Enhanced streamable HTTP server with tools, prompts, and resources
+- **`echo_server_streamable_client.rb`** - Ruby client demonstrating streamable HTTP transport
 - **`README_ECHO_SERVER.md`** - Complete setup and usage instructions
 
 This example showcases redirect support, proper line ending handling, and seamless integration between Ruby and Python MCP implementations.
@@ -464,8 +561,9 @@ Complete examples can be found in the `examples/` directory:
 - `openai_ruby_mcp.rb` - Integration with official openai/openai-ruby gem
 - `ruby_anthropic_mcp.rb` - Integration with alexrudall/ruby-anthropic gem
 - `gemini_ai_mcp.rb` - Integration with Google Vertex AI and Gemini models
-- `mcp_sse_server_example.rb` - SSE transport with Playwright MCP
+- `streamable_http_example.rb` - Streamable HTTP transport with Playwright MCP
 - `echo_server.py` & `echo_server_client.rb` - FastMCP server example with full setup
+- `echo_server_streamable.py` & `echo_server_streamable_client.rb` - Enhanced streamable HTTP server example
 
 ## MCP Server Compatibility
 
@@ -679,6 +777,8 @@ For complete OAuth documentation, see [OAUTH.md](OAUTH.md).
 - **Server disambiguation** - Specify which server to use when tools with same name exist in multiple servers
 - **Atomic tool calls** - Simple API for invoking tools with parameters
 - **Batch support** - Call multiple tools in a single operation
+- **Prompts support** - List and get prompts with parameters from MCP servers
+- **Resources support** - List and read resources by URI from MCP servers
 - **API conversions** - Built-in format conversion for OpenAI, Anthropic, and Google Vertex AI APIs
 - **Thread safety** - Synchronized access for thread-safe operation
 - **Server notifications** - Support for JSON-RPC notifications

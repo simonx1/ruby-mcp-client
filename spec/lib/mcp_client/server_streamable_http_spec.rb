@@ -481,6 +481,320 @@ RSpec.describe MCPClient::ServerStreamableHTTP do
     end
   end
 
+  describe '#list_prompts' do
+    let(:prompts_response) do
+      "event: message\ndata: #{prompts_data.to_json}\n\n"
+    end
+
+    let(:prompts_data) do
+      {
+        'jsonrpc' => '2.0',
+        'id' => 1,
+        'result' => {
+          'prompts' => [
+            {
+              'name' => 'test_prompt',
+              'description' => 'A test prompt',
+              'arguments' => [
+                {
+                  'name' => 'name',
+                  'description' => 'The name parameter',
+                  'required' => true
+                }
+              ]
+            }
+          ]
+        }
+      }
+    end
+
+    let(:initialize_response) do
+      "event: message\ndata: #{initialize_data.to_json}\n\n"
+    end
+
+    let(:initialize_data) do
+      {
+        jsonrpc: '2.0',
+        id: 1,
+        result: {
+          protocolVersion: '2024-11-05',
+          capabilities: { tools: {} },
+          serverInfo: { name: 'test-server', version: '1.0.0' }
+        }
+      }
+    end
+
+    before do
+      stub_request(:post, "#{base_url}#{endpoint}")
+        .with(body: hash_including('method' => 'initialize'))
+        .to_return(
+          status: 200,
+          body: initialize_response,
+          headers: { 'Content-Type' => 'text/event-stream', 'Mcp-Session-Id' => 'test-session-123' }
+        )
+
+      stub_request(:post, "#{base_url}#{endpoint}")
+        .with(body: hash_including('method' => 'notifications/initialized'))
+        .to_return(status: 202, headers: { 'Mcp-Session-Id' => 'test-session-123' })
+
+      stub_request(:get, "#{base_url}#{endpoint}")
+        .with(headers: { 'Mcp-Session-Id' => 'test-session-123' })
+        .to_return(status: 200, body: '', headers: { 'Content-Type' => 'text/event-stream' })
+
+      stub_request(:post, "#{base_url}#{endpoint}")
+        .with(
+          body: hash_including('method' => 'prompts/list'),
+          headers: { 'Mcp-Session-Id' => 'test-session-123' }
+        )
+        .to_return(status: 200, body: prompts_response, headers: { 'Content-Type' => 'text/event-stream' })
+
+      server.connect
+    end
+
+    it 'returns list of prompt objects' do
+      prompts = server.list_prompts
+      expect(prompts.size).to eq(1)
+      expect(prompts.first.name).to eq('test_prompt')
+      expect(prompts.first.description).to eq('A test prompt')
+      expect(prompts.first.arguments).to be_an(Array)
+      expect(prompts.first.arguments.first['name']).to eq('name')
+    end
+
+    it 'caches prompts after first call' do
+      server.list_prompts
+      prompts = server.list_prompts
+      expect(prompts.size).to eq(1)
+      # Should not make another HTTP request
+    end
+  end
+
+  describe '#get_prompt' do
+    let(:prompt_response) do
+      "event: message\ndata: #{prompt_data.to_json}\n\n"
+    end
+
+    let(:prompt_data) do
+      {
+        'jsonrpc' => '2.0',
+        'id' => 1,
+        'result' => {
+          'description' => 'Generated greeting',
+          'messages' => [
+            {
+              'role' => 'user',
+              'content' => {
+                'type' => 'text',
+                'text' => 'Hello Ruby Developer!'
+              }
+            }
+          ]
+        }
+      }
+    end
+
+    let(:initialize_response) do
+      "event: message\ndata: #{initialize_data.to_json}\n\n"
+    end
+
+    let(:initialize_data) do
+      {
+        jsonrpc: '2.0',
+        id: 1,
+        result: {
+          protocolVersion: '2024-11-05',
+          capabilities: { tools: {} },
+          serverInfo: { name: 'test-server', version: '1.0.0' }
+        }
+      }
+    end
+
+    before do
+      stub_request(:post, "#{base_url}#{endpoint}")
+        .with(body: hash_including('method' => 'initialize'))
+        .to_return(
+          status: 200,
+          body: initialize_response,
+          headers: { 'Content-Type' => 'text/event-stream', 'Mcp-Session-Id' => 'test-session-123' }
+        )
+
+      stub_request(:post, "#{base_url}#{endpoint}")
+        .with(body: hash_including('method' => 'notifications/initialized'))
+        .to_return(status: 202, headers: { 'Mcp-Session-Id' => 'test-session-123' })
+
+      stub_request(:get, "#{base_url}#{endpoint}")
+        .with(headers: { 'Mcp-Session-Id' => 'test-session-123' })
+        .to_return(status: 200, body: '', headers: { 'Content-Type' => 'text/event-stream' })
+
+      stub_request(:post, "#{base_url}#{endpoint}")
+        .with(
+          body: hash_including('method' => 'prompts/get', 'params' => hash_including('name' => 'greeting')),
+          headers: { 'Mcp-Session-Id' => 'test-session-123' }
+        )
+        .to_return(status: 200, body: prompt_response, headers: { 'Content-Type' => 'text/event-stream' })
+
+      server.connect
+    end
+
+    it 'returns prompt result' do
+      result = server.get_prompt('greeting', { name: 'Ruby Developer' })
+      expect(result['messages'].first['content']['text']).to eq('Hello Ruby Developer!')
+    end
+  end
+
+  describe '#list_resources' do
+    let(:resources_response) do
+      "event: message\ndata: #{resources_data.to_json}\n\n"
+    end
+
+    let(:resources_data) do
+      {
+        'jsonrpc' => '2.0',
+        'id' => 1,
+        'result' => {
+          'resources' => [
+            {
+              'uri' => 'file:///sample/README.md',
+              'name' => 'Sample README',
+              'description' => 'A sample README file',
+              'mimeType' => 'text/markdown'
+            }
+          ]
+        }
+      }
+    end
+
+    let(:initialize_response) do
+      "event: message\ndata: #{initialize_data.to_json}\n\n"
+    end
+
+    let(:initialize_data) do
+      {
+        jsonrpc: '2.0',
+        id: 1,
+        result: {
+          protocolVersion: '2024-11-05',
+          capabilities: { tools: {} },
+          serverInfo: { name: 'test-server', version: '1.0.0' }
+        }
+      }
+    end
+
+    before do
+      stub_request(:post, "#{base_url}#{endpoint}")
+        .with(body: hash_including('method' => 'initialize'))
+        .to_return(
+          status: 200,
+          body: initialize_response,
+          headers: { 'Content-Type' => 'text/event-stream', 'Mcp-Session-Id' => 'test-session-123' }
+        )
+
+      stub_request(:post, "#{base_url}#{endpoint}")
+        .with(body: hash_including('method' => 'notifications/initialized'))
+        .to_return(status: 202, headers: { 'Mcp-Session-Id' => 'test-session-123' })
+
+      stub_request(:get, "#{base_url}#{endpoint}")
+        .with(headers: { 'Mcp-Session-Id' => 'test-session-123' })
+        .to_return(status: 200, body: '', headers: { 'Content-Type' => 'text/event-stream' })
+
+      stub_request(:post, "#{base_url}#{endpoint}")
+        .with(
+          body: hash_including('method' => 'resources/list'),
+          headers: { 'Mcp-Session-Id' => 'test-session-123' }
+        )
+        .to_return(status: 200, body: resources_response, headers: { 'Content-Type' => 'text/event-stream' })
+
+      server.connect
+    end
+
+    it 'returns list of resource objects' do
+      resources = server.list_resources
+      expect(resources.size).to eq(1)
+      expect(resources.first.uri).to eq('file:///sample/README.md')
+      expect(resources.first.name).to eq('Sample README')
+      expect(resources.first.description).to eq('A sample README file')
+      expect(resources.first.mime_type).to eq('text/markdown')
+    end
+
+    it 'caches resources after first call' do
+      server.list_resources
+      resources = server.list_resources
+      expect(resources.size).to eq(1)
+      # Should not make another HTTP request
+    end
+  end
+
+  describe '#read_resource' do
+    let(:resource_response) do
+      "event: message\ndata: #{resource_data.to_json}\n\n"
+    end
+
+    let(:resource_data) do
+      {
+        'jsonrpc' => '2.0',
+        'id' => 1,
+        'result' => {
+          'contents' => [
+            {
+              'uri' => 'file:///sample/README.md',
+              'mimeType' => 'text/markdown',
+              'text' => '# Sample README\n\nThis is a sample file.'
+            }
+          ]
+        }
+      }
+    end
+
+    let(:initialize_response) do
+      "event: message\ndata: #{initialize_data.to_json}\n\n"
+    end
+
+    let(:initialize_data) do
+      {
+        jsonrpc: '2.0',
+        id: 1,
+        result: {
+          protocolVersion: '2024-11-05',
+          capabilities: { tools: {} },
+          serverInfo: { name: 'test-server', version: '1.0.0' }
+        }
+      }
+    end
+
+    before do
+      stub_request(:post, "#{base_url}#{endpoint}")
+        .with(body: hash_including('method' => 'initialize'))
+        .to_return(
+          status: 200,
+          body: initialize_response,
+          headers: { 'Content-Type' => 'text/event-stream', 'Mcp-Session-Id' => 'test-session-123' }
+        )
+
+      stub_request(:post, "#{base_url}#{endpoint}")
+        .with(body: hash_including('method' => 'notifications/initialized'))
+        .to_return(status: 202, headers: { 'Mcp-Session-Id' => 'test-session-123' })
+
+      stub_request(:get, "#{base_url}#{endpoint}")
+        .with(headers: { 'Mcp-Session-Id' => 'test-session-123' })
+        .to_return(status: 200, body: '', headers: { 'Content-Type' => 'text/event-stream' })
+
+      stub_request(:post, "#{base_url}#{endpoint}")
+        .with(
+          body: hash_including('method' => 'resources/read',
+                               'params' => hash_including('uri' => 'file:///sample/README.md')),
+          headers: { 'Mcp-Session-Id' => 'test-session-123' }
+        )
+        .to_return(status: 200, body: resource_response, headers: { 'Content-Type' => 'text/event-stream' })
+
+      server.connect
+    end
+
+    it 'returns resource contents' do
+      result = server.read_resource('file:///sample/README.md')
+      expect(result['contents'].first['text']).to eq('# Sample README\n\nThis is a sample file.')
+      expect(result['contents'].first['mimeType']).to eq('text/markdown')
+    end
+  end
+
   describe '#cleanup' do
     it 'resets connection state' do
       begin
@@ -493,10 +807,14 @@ RSpec.describe MCPClient::ServerStreamableHTTP do
       connection_established = server.instance_variable_get(:@connection_established)
       initialized = server.instance_variable_get(:@initialized)
       tools = server.instance_variable_get(:@tools)
+      prompts = server.instance_variable_get(:@prompts)
+      resources = server.instance_variable_get(:@resources)
 
       expect(connection_established).to be false
       expect(initialized).to be false
       expect(tools).to be_nil
+      expect(prompts).to be_nil
+      expect(resources).to be_nil
     end
   end
 

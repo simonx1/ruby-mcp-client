@@ -33,6 +33,33 @@ module MCPClient
       raise NotImplementedError, 'Subclasses must implement call_tool'
     end
 
+    # List all prompts available from the MCP server
+    # @return [Array<MCPClient::Prompt>] list of available prompts
+    def list_prompts
+      raise NotImplementedError, 'Subclasses must implement list_prompts'
+    end
+
+    # Get a prompt with the given parameters
+    # @param prompt_name [String] the name of the prompt to get
+    # @param parameters [Hash] the parameters to pass to the prompt
+    # @return [Object] the result of the prompt interpolation
+    def get_prompt(prompt_name, parameters)
+      raise NotImplementedError, 'Subclasses must implement get_prompt'
+    end
+
+    # List all resources available from the MCP server
+    # @return [Array<MCPClient::Resource>] list of available resources
+    def list_resources
+      raise NotImplementedError, 'Subclasses must implement list_resources'
+    end
+
+    # Read a resource by its URI
+    # @param uri [String] the URI of the resource to read
+    # @return [Object] the resource contents
+    def read_resource(uri)
+      raise NotImplementedError, 'Subclasses must implement read_resource'
+    end
+
     # Clean up the server connection
     def cleanup
       raise NotImplementedError, 'Subclasses must implement cleanup'

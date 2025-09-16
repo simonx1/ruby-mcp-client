@@ -7,6 +7,7 @@ module MCPClient
     # JSON-RPC request/notification plumbing for stdio transport
     module JsonRpcTransport
       include JsonRpcCommon
+
       # Ensure the server process is started and initialized (handshake)
       # @return [void]
       # @raise [MCPClient::Errors::ConnectionError] if initialization fails
