@@ -9,11 +9,11 @@ module MCPClient
     # @!attribute [r] servers
     #   @return [Array<MCPClient::ServerBase>] list of servers
     # @!attribute [r] tool_cache
-    #   @return [Hash<String, MCPClient::Tool>] cache of tools by name
+    #   @return [Hash<String, MCPClient::Tool>] cache of tools by composite key (server_id:name)
     # @!attribute [r] prompt_cache
-    #   @return [Hash<String, MCPClient::Prompt>] cache of prompts by name
+    #   @return [Hash<String, MCPClient::Prompt>] cache of prompts by composite key (server_id:name)
     # @!attribute [r] resource_cache
-    #   @return [Hash<String, MCPClient::Resource>] cache of resources by URI
+    #   @return [Hash<String, MCPClient::Resource>] cache of resources by composite key (server_id:uri)
     # @!attribute [r] logger
     #   @return [Logger] logger for client operations
     attr_reader :servers, :tool_cache, :prompt_cache, :resource_cache, :logger
@@ -58,7 +58,8 @@ module MCPClient
 
       servers.each do |server|
         server.list_prompts.each do |prompt|
-          @prompt_cache[prompt.name] = prompt
+          cache_key = cache_key_for(server, prompt.name)
+          @prompt_cache[cache_key] = prompt
           prompts << prompt
         end
       rescue MCPClient::Errors::ConnectionError => e
@@ -136,7 +137,8 @@ module MCPClient
 
       servers.each do |server|
         server.list_resources.each do |resource|
-          @resource_cache[resource.uri] = resource
+          cache_key = cache_key_for(server, resource.uri)
+          @resource_cache[cache_key] = resource
           resources << resource
         end
       rescue MCPClient::Errors::ConnectionError => e
@@ -213,7 +215,8 @@ module MCPClient
 
       servers.each do |server|
         server.list_tools.each do |tool|
-          @tool_cache[tool.name] = tool
+          cache_key = cache_key_for(server, tool.name)
+          @tool_cache[cache_key] = tool
           tools << tool
         end
       rescue MCPClient::Errors::ConnectionError => e
@@ -543,6 +546,15 @@ module MCPClient
       servers.find do |server|
         server.list_tools.any? { |t| t.name == tool.name }
       end
+    end
+
+    # Generate a cache key for server-specific items
+    # @param server [MCPClient::ServerBase] the server
+    # @param item_id [String] the item identifier (name or URI)
+    # @return [String] composite cache key
+    def cache_key_for(server, item_id)
+      server_id = server.object_id.to_s
+      "#{server_id}:#{item_id}"
     end
   end
 end
