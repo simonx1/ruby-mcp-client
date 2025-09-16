@@ -374,9 +374,14 @@ See `examples/streamable_http_example.rb` for the full Playwright SSE example.
 The repository includes complete FastMCP server examples that demonstrate the Ruby MCP client working with Python FastMCP servers, including full MCP protocol support with tools, prompts, and resources:
 
 #### Basic FastMCP Example
+
+**For FastMCP server with SSE transport (includes tools, prompts, and resources):**
+```bash
+# From the ruby-mcp-client directory
+python examples/echo_server.py
+```
+
 ```ruby
-# Start the enhanced FastMCP server with tools, prompts, and resources
-# python examples/echo_server.py
 
 # Run the Ruby client
 # bundle exec ruby examples/echo_server_client.rb
@@ -416,9 +421,14 @@ readme_content = client.read_resource('file:///sample/README.md')
 ```
 
 #### Streamable HTTP Example
+
+**For FastMCP server with Streamable HTTP transport (includes tools, prompts, and resources):**
+```bash
+# From the ruby-mcp-client directory
+python examples/echo_server_streamable.py
+```
+
 ```ruby
-# Start the enhanced streamable HTTP server
-# python examples/echo_server_streamable.py
 
 # Run the streamable HTTP client
 # bundle exec ruby examples/echo_server_streamable_client.rb
@@ -460,7 +470,6 @@ The FastMCP example includes:
 - **`echo_server_client.rb`** - Ruby client demonstrating all features including prompts and resources
 - **`echo_server_streamable.py`** - Enhanced streamable HTTP server with tools, prompts, and resources
 - **`echo_server_streamable_client.rb`** - Ruby client demonstrating streamable HTTP transport
-- **`prompts_and_resources_example.rb`** - General example showing prompts and resources usage
 - **`README_ECHO_SERVER.md`** - Complete setup and usage instructions
 
 This example showcases redirect support, proper line ending handling, and seamless integration between Ruby and Python MCP implementations.
@@ -555,7 +564,6 @@ Complete examples can be found in the `examples/` directory:
 - `streamable_http_example.rb` - Streamable HTTP transport with Playwright MCP
 - `echo_server.py` & `echo_server_client.rb` - FastMCP server example with full setup
 - `echo_server_streamable.py` & `echo_server_streamable_client.rb` - Enhanced streamable HTTP server example
-- `prompts_and_resources_example.rb` - General prompts and resources demonstration
 
 ## MCP Server Compatibility
 
