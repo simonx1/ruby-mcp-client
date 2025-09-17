@@ -63,8 +63,8 @@ RSpec.describe MCPClient::Client, 'caching' do
       client.instance_variable_set(:@servers, [server1, server2])
       allow(server1).to receive(:list_tools).and_return([tool1_from_server1, unique_tool_from_server1])
       allow(server2).to receive(:list_tools).and_return([tool2_from_server2])
-      allow(server1).to receive(:object_id).and_return(123456)
-      allow(server2).to receive(:object_id).and_return(789012)
+      allow(server1).to receive(:object_id).and_return(123_456)
+      allow(server2).to receive(:object_id).and_return(789_012)
     end
 
     it 'caches both tools with same name from different servers' do
@@ -72,9 +72,9 @@ RSpec.describe MCPClient::Client, 'caching' do
 
       # Both tools should be in the cache with different keys
       expect(client.tool_cache.size).to eq(3)
-      expect(client.tool_cache["123456:duplicate_tool"]).to eq(tool1_from_server1)
-      expect(client.tool_cache["789012:duplicate_tool"]).to eq(tool2_from_server2)
-      expect(client.tool_cache["123456:unique_tool"]).to eq(unique_tool_from_server1)
+      expect(client.tool_cache['123456:duplicate_tool']).to eq(tool1_from_server1)
+      expect(client.tool_cache['789012:duplicate_tool']).to eq(tool2_from_server2)
+      expect(client.tool_cache['123456:unique_tool']).to eq(unique_tool_from_server1)
     end
 
     it 'returns all tools including duplicates' do
@@ -137,16 +137,16 @@ RSpec.describe MCPClient::Client, 'caching' do
       client.instance_variable_set(:@servers, [server1, server2])
       allow(server1).to receive(:list_prompts).and_return([prompt1_from_server1])
       allow(server2).to receive(:list_prompts).and_return([prompt2_from_server2])
-      allow(server1).to receive(:object_id).and_return(123456)
-      allow(server2).to receive(:object_id).and_return(789012)
+      allow(server1).to receive(:object_id).and_return(123_456)
+      allow(server2).to receive(:object_id).and_return(789_012)
     end
 
     it 'caches both prompts with same name from different servers' do
       client.list_prompts
 
       expect(client.prompt_cache.size).to eq(2)
-      expect(client.prompt_cache["123456:duplicate_prompt"]).to eq(prompt1_from_server1)
-      expect(client.prompt_cache["789012:duplicate_prompt"]).to eq(prompt2_from_server2)
+      expect(client.prompt_cache['123456:duplicate_prompt']).to eq(prompt1_from_server1)
+      expect(client.prompt_cache['789012:duplicate_prompt']).to eq(prompt2_from_server2)
     end
 
     it 'returns all prompts including duplicates' do
@@ -184,16 +184,16 @@ RSpec.describe MCPClient::Client, 'caching' do
       client.instance_variable_set(:@servers, [server1, server2])
       allow(server1).to receive(:list_resources).and_return([resource1_from_server1])
       allow(server2).to receive(:list_resources).and_return([resource2_from_server2])
-      allow(server1).to receive(:object_id).and_return(123456)
-      allow(server2).to receive(:object_id).and_return(789012)
+      allow(server1).to receive(:object_id).and_return(123_456)
+      allow(server2).to receive(:object_id).and_return(789_012)
     end
 
     it 'caches both resources with same URI from different servers' do
       client.list_resources
 
       expect(client.resource_cache.size).to eq(2)
-      expect(client.resource_cache["123456:file://shared.txt"]).to eq(resource1_from_server1)
-      expect(client.resource_cache["789012:file://shared.txt"]).to eq(resource2_from_server2)
+      expect(client.resource_cache['123456:file://shared.txt']).to eq(resource1_from_server1)
+      expect(client.resource_cache['789012:file://shared.txt']).to eq(resource2_from_server2)
     end
 
     it 'returns all resources including those with duplicate URIs' do
@@ -239,7 +239,7 @@ RSpec.describe MCPClient::Client, 'caching' do
       allow(server1).to receive(:list_tools).and_return([tool])
       allow(server1).to receive(:list_prompts).and_return([prompt])
       allow(server1).to receive(:list_resources).and_return([resource])
-      allow(server1).to receive(:object_id).and_return(123456)
+      allow(server1).to receive(:object_id).and_return(123_456)
     end
 
     it 'clears all caches when clear_cache is called' do
@@ -287,8 +287,8 @@ RSpec.describe MCPClient::Client, 'caching' do
       client.instance_variable_set(:@servers, [server1, server2])
       allow(server1).to receive(:list_tools).and_return([tool1])
       allow(server2).to receive(:list_tools).and_return([tool2])
-      allow(server1).to receive(:object_id).and_return(123456)
-      allow(server2).to receive(:object_id).and_return(789012)
+      allow(server1).to receive(:object_id).and_return(123_456)
+      allow(server2).to receive(:object_id).and_return(789_012)
       allow(server1).to receive(:call_tool).with('shared_tool', {}).and_return('result1')
       allow(server2).to receive(:call_tool).with('shared_tool', {}).and_return('result2')
     end
@@ -296,9 +296,9 @@ RSpec.describe MCPClient::Client, 'caching' do
     it 'raises AmbiguousToolName error when tool name is ambiguous without server specification' do
       client.list_tools # Populate cache
 
-      expect {
+      expect do
         client.call_tool('shared_tool', {})
-      }.to raise_error(MCPClient::Errors::AmbiguousToolName, /Multiple tools named 'shared_tool' found/)
+      end.to raise_error(MCPClient::Errors::AmbiguousToolName, /Multiple tools named 'shared_tool' found/)
     end
 
     it 'calls correct tool when server is specified by name' do
