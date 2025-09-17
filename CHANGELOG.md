@@ -1,5 +1,31 @@
 # Changelog
 
+## 0.8.1 (2025-09-17)
+
+### Breaking Changes
+- **Resources API**: Updated resources implementation to fully comply with MCP specification
+  - `list_resources` now returns `{ 'resources' => [...], 'nextCursor' => ... }` hash format on both client and server levels
+  - `read_resource` now returns array of `ResourceContent` objects instead of hash with 'contents' key
+
+### New Features
+- **Full MCP Resources Specification Compliance**:
+  - Added `ResourceContent` class for structured content handling with `text?` and `binary?` methods
+  - Added `ResourceTemplate` class for URI templates following RFC 6570
+  - Implemented cursor-based pagination for `list_resources` and `list_resource_templates`
+  - Added `subscribe_resource` and `unsubscribe_resource` methods for real-time updates
+  - Added support for resource annotations (audience, priority, lastModified)
+  - Binary content properly handled with base64 encoding/decoding
+  - All transport types (stdio, SSE, HTTP, streamable_http) now have consistent resource support
+
+### Improvements
+- **Code Quality**: Refactored `Client#read_resource` to reduce cyclomatic complexity
+  - Extracted helper methods: `find_resource_on_server`, `find_resource_across_servers`, `execute_resource_read`
+  - Improved code maintainability and readability
+- **ServerHTTP**: Added complete resource methods that were previously missing
+- **ServerHTTP**: Added prompts support (`list_prompts` and `get_prompt`)
+- **Examples**: Updated echo_server_client.rb to use new ResourceContent API
+- **Examples**: Enhanced echo_server_streamable.py with full resource features
+
 ## 0.8.0 (2025-09-16)
 
 ### New Features

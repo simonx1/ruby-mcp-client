@@ -9,7 +9,7 @@ GIT
 PATH
   remote: .
   specs:
-    ruby-mcp-client (0.8.0)
+    ruby-mcp-client (0.8.1)
       faraday (~> 2.0)
       faraday-follow_redirects (~> 0.3)
       faraday-retry (~> 2.0)
