@@ -165,16 +165,18 @@ result = client.get_prompt('greeting', { name: 'Ruby Developer' })
 result = client.get_prompt('greeting', { name: 'Ruby Developer' }, server: 'filesystem')
 
 # === Working with Resources ===
-# List available resources from all servers (returns array)
-resources = client.list_resources
+# List available resources from all servers (returns hash with 'resources' array and optional 'nextCursor')
+result = client.list_resources
+resources = result['resources']  # Array of Resource objects from all servers
+next_cursor = result['nextCursor']  # nil when aggregating multiple servers
 
-# Get resources from a specific server (returns hash with 'resources' array and optional 'nextCursor')
+# Get resources from a specific server with pagination support
 result = client.servers.first.list_resources
 resources = result['resources']  # Array of Resource objects
 next_cursor = result['nextCursor']  # For pagination
 
-# List resources with pagination
-result = client.servers.first.list_resources(cursor: next_cursor)
+# List resources with pagination (only works with single server or client.list_resources with cursor)
+result = client.list_resources(cursor: next_cursor)  # Uses first server when cursor provided
 
 # Read a specific resource by URI (returns array of ResourceContent objects)
 contents = client.read_resource('file:///example.txt')
@@ -430,7 +432,8 @@ prompts.each { |prompt| puts "- #{prompt.name}: #{prompt.description}" }
 greeting = client.get_prompt('greeting', { name: 'Ruby Developer' })
 
 # List and read resources
-resources = client.list_resources
+result = client.list_resources
+resources = result['resources']
 puts "Found #{resources.length} resources:"
 resources.each { |resource| puts "- #{resource.name} (#{resource.uri})" }
 

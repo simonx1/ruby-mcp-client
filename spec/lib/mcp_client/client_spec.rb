@@ -207,12 +207,13 @@ RSpec.describe MCPClient::Client do
     let(:client) { described_class.new(mcp_server_configs: [{ type: 'stdio', command: 'test' }]) }
 
     before do
-      allow(mock_server).to receive(:list_resources).and_return([mock_resource])
+      allow(mock_server).to receive(:list_resources).and_return({ 'resources' => [mock_resource], 'nextCursor' => nil })
     end
 
-    it 'returns resources from all servers' do
-      resources = client.list_resources
-      expect(resources).to contain_exactly(mock_resource)
+    it 'returns resources from all servers in hash format' do
+      result = client.list_resources
+      expect(result['resources']).to contain_exactly(mock_resource)
+      expect(result['nextCursor']).to be_nil
     end
 
     it 'caches resources after first call' do
@@ -235,7 +236,10 @@ RSpec.describe MCPClient::Client do
     let(:resource_result) { { 'contents' => [{ 'uri' => resource_uri, 'text' => 'Hello World!' }] } }
 
     before do
-      allow(mock_server).to receive_messages(list_resources: [mock_resource], read_resource: resource_result)
+      allow(mock_server).to receive_messages(
+        list_resources: { 'resources' => [mock_resource], 'nextCursor' => nil },
+        read_resource: resource_result
+      )
     end
 
     it 'reads the resource by URI' do
@@ -288,9 +292,9 @@ RSpec.describe MCPClient::Client do
       end
 
       before do
-        allow(mock_server2).to receive_messages(list_resources: [duplicate_resource], read_resource: server2_result,
+        allow(mock_server2).to receive_messages(list_resources: { 'resources' => [duplicate_resource], 'nextCursor' => nil }, read_resource: server2_result,
                                                 on_notification: nil)
-        allow(multi_client).to receive(:list_resources).and_return([mock_resource, duplicate_resource])
+        allow(multi_client).to receive(:list_resources).and_return({ 'resources' => [mock_resource, duplicate_resource], 'nextCursor' => nil })
       end
 
       it 'raises AmbiguousResourceURI when duplicate resources exist' do
@@ -533,7 +537,7 @@ RSpec.describe MCPClient::Client do
     before do
       allow(mock_server).to receive(:list_tools).and_return([mock_tool])
       allow(mock_server).to receive(:list_prompts).and_return([mock_prompt])
-      allow(mock_server).to receive(:list_resources).and_return([mock_resource])
+      allow(mock_server).to receive(:list_resources).and_return({ 'resources' => [mock_resource], 'nextCursor' => nil })
     end
 
     it 'clears the cache and refetches tools on next call' do

@@ -182,8 +182,8 @@ RSpec.describe MCPClient::Client, 'caching' do
 
     before do
       client.instance_variable_set(:@servers, [server1, server2])
-      allow(server1).to receive(:list_resources).and_return([resource1_from_server1])
-      allow(server2).to receive(:list_resources).and_return([resource2_from_server2])
+      allow(server1).to receive(:list_resources).and_return({ 'resources' => [resource1_from_server1], 'nextCursor' => nil })
+      allow(server2).to receive(:list_resources).and_return({ 'resources' => [resource2_from_server2], 'nextCursor' => nil })
       allow(server1).to receive(:object_id).and_return(123_456)
       allow(server2).to receive(:object_id).and_return(789_012)
     end
@@ -197,7 +197,8 @@ RSpec.describe MCPClient::Client, 'caching' do
     end
 
     it 'returns all resources including those with duplicate URIs' do
-      resources = client.list_resources
+      result = client.list_resources
+      resources = result['resources']
 
       expect(resources.size).to eq(2)
       expect(resources).to include(resource1_from_server1)
@@ -238,7 +239,7 @@ RSpec.describe MCPClient::Client, 'caching' do
       client.instance_variable_set(:@servers, [server1])
       allow(server1).to receive(:list_tools).and_return([tool])
       allow(server1).to receive(:list_prompts).and_return([prompt])
-      allow(server1).to receive(:list_resources).and_return([resource])
+      allow(server1).to receive(:list_resources).and_return({ 'resources' => [resource], 'nextCursor' => nil })
       allow(server1).to receive(:object_id).and_return(123_456)
     end
 

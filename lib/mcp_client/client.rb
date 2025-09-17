@@ -126,23 +126,32 @@ module MCPClient
 
     # Lists all available resources from all connected MCP servers
     # @param cache [Boolean] whether to use cached resources or fetch fresh
-    # @return [Array<MCPClient::Resource>] list of available resources
+    # @param cursor [String, nil] optional cursor for pagination (only works with single server)
+    # @return [Hash] result containing 'resources' array and optional 'nextCursor'
     # @raise [MCPClient::Errors::ConnectionError] on authorization failures
     # @raise [MCPClient::Errors::ResourceReadError] if no resources could be retrieved from any server
-    def list_resources(cache: true)
-      return @resource_cache.values if cache && !@resource_cache.empty?
+    def list_resources(cache: true, cursor: nil)
+      # If cursor is provided, we can only query one server (the one that provided the cursor)
+      # This is a limitation of aggregating multiple servers
+      if cursor
+        # For now, just use the first server when cursor is provided
+        # In a real implementation, you'd need to track which server the cursor came from
+        return servers.first.list_resources(cursor: cursor) if servers.any?
+        return { 'resources' => [], 'nextCursor' => nil }
+      end
+
+      # Use cache if available and no cursor
+      if cache && !@resource_cache.empty?
+        return { 'resources' => @resource_cache.values, 'nextCursor' => nil }
+      end
 
       resources = []
       connection_errors = []
 
       servers.each do |server|
         result = server.list_resources
-        # Handle both old array format and new hash format for backwards compatibility
-        resource_list = if result.is_a?(Hash)
-                          result['resources'] || []
-                        else
-                          result
-                        end
+        resource_list = result['resources'] || []
+
         resource_list.each do |resource|
           cache_key = cache_key_for(server, resource.uri)
           @resource_cache[cache_key] = resource
@@ -159,7 +168,8 @@ module MCPClient
         @logger.error("Server error: #{e.message}")
       end
 
-      resources
+      # Return hash format consistent with server methods
+      { 'resources' => resources, 'nextCursor' => nil }
     end
 
     # Reads a specific resource by URI
@@ -167,7 +177,8 @@ module MCPClient
     # @param server [String, Symbol, Integer, MCPClient::ServerBase, nil] optional server to use
     # @return [Object] the resource contents
     def read_resource(uri, server: nil)
-      resources = list_resources
+      result = list_resources
+      resources = result['resources'] || []
 
       if server
         # Use the specified server
