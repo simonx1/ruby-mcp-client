@@ -216,6 +216,148 @@ module MCPClient
       end
     end
 
+    # List all prompts available from the MCP server
+    # @return [Array<MCPClient::Prompt>] list of available prompts
+    # @raise [MCPClient::Errors::ServerError] if server returns an error
+    # @raise [MCPClient::Errors::TransportError] if response isn't valid JSON
+    # @raise [MCPClient::Errors::PromptGetError] for other errors during prompt listing
+    def list_prompts
+      @mutex.synchronize do
+        return @prompts if @prompts
+      end
+
+      begin
+        ensure_connected
+
+        prompts_data = rpc_request('prompts/list')
+        prompts = prompts_data['prompts'] || []
+
+        @mutex.synchronize do
+          @prompts = prompts.map do |prompt_data|
+            MCPClient::Prompt.from_json(prompt_data, server: self)
+          end
+        end
+
+        @mutex.synchronize { @prompts }
+      rescue MCPClient::Errors::ConnectionError, MCPClient::Errors::TransportError, MCPClient::Errors::ServerError
+        raise
+      rescue StandardError => e
+        raise MCPClient::Errors::PromptGetError, "Error listing prompts: #{e.message}"
+      end
+    end
+
+    # Get a prompt with the given parameters
+    # @param prompt_name [String] the name of the prompt to get
+    # @param parameters [Hash] the parameters to pass to the prompt
+    # @return [Object] the result of the prompt interpolation
+    # @raise [MCPClient::Errors::ServerError] if server returns an error
+    # @raise [MCPClient::Errors::TransportError] if response isn't valid JSON
+    # @raise [MCPClient::Errors::PromptGetError] for other errors during prompt interpolation
+    def get_prompt(prompt_name, parameters)
+      rpc_request('prompts/get', {
+                    name: prompt_name,
+                    arguments: parameters
+                  })
+    rescue MCPClient::Errors::ConnectionError, MCPClient::Errors::TransportError
+      raise
+    rescue StandardError => e
+      raise MCPClient::Errors::PromptGetError, "Error getting prompt '#{prompt_name}': #{e.message}"
+    end
+
+    # List all resources available from the MCP server
+    # @param cursor [String, nil] optional cursor for pagination
+    # @return [Hash] result containing resources array and optional nextCursor
+    # @raise [MCPClient::Errors::ResourceReadError] if resources list retrieval fails
+    def list_resources(cursor: nil)
+      @mutex.synchronize do
+        return @resources_result if @resources_result && !cursor
+      end
+
+      begin
+        ensure_connected
+
+        params = {}
+        params['cursor'] = cursor if cursor
+        result = rpc_request('resources/list', params)
+
+        resources = (result['resources'] || []).map do |resource_data|
+          MCPClient::Resource.from_json(resource_data, server: self)
+        end
+
+        resources_result = { 'resources' => resources, 'nextCursor' => result['nextCursor'] }
+
+        @mutex.synchronize do
+          @resources_result = resources_result unless cursor
+        end
+
+        resources_result
+      rescue MCPClient::Errors::ConnectionError, MCPClient::Errors::TransportError, MCPClient::Errors::ServerError
+        raise
+      rescue StandardError => e
+        raise MCPClient::Errors::ResourceReadError, "Error listing resources: #{e.message}"
+      end
+    end
+
+    # Read a resource by its URI
+    # @param uri [String] the URI of the resource to read
+    # @return [Array<MCPClient::ResourceContent>] array of resource contents
+    # @raise [MCPClient::Errors::ResourceReadError] if resource reading fails
+    def read_resource(uri)
+      result = rpc_request('resources/read', { uri: uri })
+      contents = result['contents'] || []
+      contents.map { |content| MCPClient::ResourceContent.from_json(content) }
+    rescue MCPClient::Errors::ConnectionError, MCPClient::Errors::TransportError
+      raise
+    rescue StandardError => e
+      raise MCPClient::Errors::ResourceReadError, "Error reading resource '#{uri}': #{e.message}"
+    end
+
+    # List all resource templates available from the MCP server
+    # @param cursor [String, nil] optional cursor for pagination
+    # @return [Hash] result containing resourceTemplates array and optional nextCursor
+    # @raise [MCPClient::Errors::ResourceReadError] for other errors during resource template listing
+    def list_resource_templates(cursor: nil)
+      params = {}
+      params['cursor'] = cursor if cursor
+      result = rpc_request('resources/templates/list', params)
+
+      templates = (result['resourceTemplates'] || []).map do |template_data|
+        MCPClient::ResourceTemplate.from_json(template_data, server: self)
+      end
+
+      { 'resourceTemplates' => templates, 'nextCursor' => result['nextCursor'] }
+    rescue MCPClient::Errors::ConnectionError, MCPClient::Errors::TransportError, MCPClient::Errors::ServerError
+      raise
+    rescue StandardError => e
+      raise MCPClient::Errors::ResourceReadError, "Error listing resource templates: #{e.message}"
+    end
+
+    # Subscribe to resource updates
+    # @param uri [String] the URI of the resource to subscribe to
+    # @return [Boolean] true if subscription successful
+    # @raise [MCPClient::Errors::ResourceReadError] for other errors during subscription
+    def subscribe_resource(uri)
+      rpc_request('resources/subscribe', { uri: uri })
+      true
+    rescue MCPClient::Errors::ConnectionError, MCPClient::Errors::TransportError, MCPClient::Errors::ServerError
+      raise
+    rescue StandardError => e
+      raise MCPClient::Errors::ResourceReadError, "Error subscribing to resource '#{uri}': #{e.message}"
+    end
+
+    # Unsubscribe from resource updates
+    # @param uri [String] the URI of the resource to unsubscribe from
+    # @return [Boolean] true if unsubscription successful
+    # @raise [MCPClient::Errors::ResourceReadError] for other errors during unsubscription
+    def unsubscribe_resource(uri)
+      rpc_request('resources/unsubscribe', { uri: uri })
+      true
+    rescue MCPClient::Errors::ConnectionError, MCPClient::Errors::TransportError, MCPClient::Errors::ServerError
+      raise
+    rescue StandardError => e
+      raise MCPClient::Errors::ResourceReadError, "Error unsubscribing from resource '#{uri}': #{e.message}"
+    end
+
     # Stream tool call (default implementation returns single-value stream)
     # @param tool_name [String] the name of the tool to call
     # @param parameters [Hash] the parameters to pass to the tool
