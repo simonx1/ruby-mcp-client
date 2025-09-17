@@ -50,7 +50,7 @@ This Ruby MCP Client implements key features from the latest MCP specification (
 - **HTTP Redirect Support** - Automatic redirect handling for both SSE and HTTP transports with configurable limits
 - **FastMCP Compatibility** - Full compatibility with FastMCP servers including proper line ending handling
 - **Prompts Support** - Full implementation of MCP prompts for dynamic content generation
-- **Resources Support** - Complete resources implementation for accessing files and data with URI-based identification
+- **Resources Support** - Full MCP resources specification compliance including templates, subscriptions, pagination, and annotations
 
 ## Usage
 
@@ -165,11 +165,28 @@ result = client.get_prompt('greeting', { name: 'Ruby Developer' })
 result = client.get_prompt('greeting', { name: 'Ruby Developer' }, server: 'filesystem')
 
 # === Working with Resources ===
-# List available resources from all servers
+# List available resources from all servers (returns array)
 resources = client.list_resources
 
-# Read a specific resource by URI
+# Get resources from a specific server (returns hash with 'resources' array and optional 'nextCursor')
+result = client.servers.first.list_resources
+resources = result['resources']  # Array of Resource objects
+next_cursor = result['nextCursor']  # For pagination
+
+# List resources with pagination
+result = client.servers.first.list_resources(cursor: next_cursor)
+
+# Read a specific resource by URI (returns array of ResourceContent objects)
 contents = client.read_resource('file:///example.txt')
+contents.each do |content|
+  if content.text?
+    puts content.text  # Text content
+  elsif content.binary?
+    data = Base64.decode64(content.blob)  # Binary content
+  end
+  puts content.mime_type if content.mime_type
+  puts content.annotations if content.annotations  # Optional metadata
+end
 
 # Read a resource from a specific server
 contents = client.read_resource('file:///example.txt', server: 'filesystem')
@@ -417,7 +434,11 @@ resources = client.list_resources
 puts "Found #{resources.length} resources:"
 resources.each { |resource| puts "- #{resource.name} (#{resource.uri})" }
 
-readme_content = client.read_resource('file:///sample/README.md')
+# Read resource (returns array of ResourceContent objects)
+contents = client.read_resource('file:///sample/README.md')
+contents.each do |content|
+  puts content.text if content.text?
+end
 ```
 
 #### Streamable HTTP Example
@@ -763,6 +784,126 @@ token = oauth_provider.complete_authorization_flow(code, state)
 - **Runtime configuration** via getter/setter methods
 
 For complete OAuth documentation, see [OAUTH.md](OAUTH.md).
+
+## Resources
+
+The Ruby MCP Client provides full support for the MCP resources specification, enabling access to files, data, and other content with URI-based identification.
+
+### Resource Features
+
+- **Resource listing** with cursor-based pagination
+- **Resource templates** with URI patterns (RFC 6570)
+- **Resource subscriptions** for real-time updates
+- **Binary content support** with base64 encoding
+- **Resource annotations** for metadata (audience, priority, lastModified)
+- **ResourceContent objects** for structured content access
+
+### Resource API
+
+```ruby
+# Get a server instance
+server = client.servers.first  # or client.find_server('name')
+
+# List resources with pagination
+result = server.list_resources
+resources = result['resources']  # Array of Resource objects
+next_cursor = result['nextCursor']  # String cursor for next page (if any)
+
+# Get next page of resources
+if next_cursor
+  next_result = server.list_resources(cursor: next_cursor)
+end
+
+# Access Resource properties
+resource = resources.first
+resource.uri         # "file:///example.txt"
+resource.name        # "example.txt"
+resource.title       # Optional human-readable title
+resource.description # Optional description
+resource.mime_type   # "text/plain"
+resource.size        # Optional file size in bytes
+resource.annotations # Optional metadata hash
+
+# Read resource contents (returns array of ResourceContent objects)
+contents = server.read_resource(resource.uri)
+
+contents.each do |content|
+  # Check content type
+  if content.text?
+    # Text content
+    text = content.text
+    mime = content.mime_type  # e.g., "text/plain"
+  elsif content.binary?
+    # Binary content (base64 encoded)
+    blob = content.blob  # Base64 string
+    data = Base64.decode64(blob)  # Decoded binary data
+  end
+
+  # Access optional annotations
+  if content.annotations
+    audience = content.annotations['audience']  # e.g., ["user", "assistant"]
+    priority = content.annotations['priority']  # e.g., 0.5
+    modified = content.annotations['lastModified']  # ISO 8601 timestamp
+  end
+end
+
+# List resource templates
+templates_result = server.list_resource_templates
+templates = templates_result['resourceTemplates']  # Array of ResourceTemplate objects
+
+template = templates.first
+template.uri_template  # "file:///{path}" (RFC 6570 URI template)
+template.name         # Template name
+template.title        # Optional title
+template.description  # Optional description
+template.mime_type    # Optional MIME type hint
+
+# Subscribe to resource updates
+server.subscribe_resource('file:///watched.txt')  # Returns true on success
+
+# Unsubscribe from resource updates
+server.unsubscribe_resource('file:///watched.txt')  # Returns true on success
+
+# Check server capabilities for resources
+capabilities = server.capabilities
+if capabilities['resources']
+  can_subscribe = capabilities['resources']['subscribe']  # true/false
+  list_changed = capabilities['resources']['listChanged']  # true/false
+end
+```
+
+### Working with ResourceContent
+
+The `ResourceContent` class provides a structured way to handle both text and binary content:
+
+```ruby
+# ResourceContent for text
+content = MCPClient::ResourceContent.new(
+  uri: 'file:///example.txt',
+  name: 'example.txt',
+  mime_type: 'text/plain',
+  text: 'File contents here',
+  annotations: {
+    'audience' => ['user'],
+    'priority' => 1.0
+  }
+)
+
+# ResourceContent for binary data
+binary_content = MCPClient::ResourceContent.new(
+  uri: 'file:///image.png',
+  name: 'image.png',
+  mime_type: 'image/png',
+  blob: Base64.strict_encode64(binary_data)
+)
+
+# Access content
+if content.text?
+  puts content.text
+elsif content.binary?
+  data = Base64.decode64(content.blob)
+end
+```
 
 ## Key Features
 

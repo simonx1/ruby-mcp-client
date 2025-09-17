@@ -707,18 +707,20 @@ RSpec.describe MCPClient::ServerStreamableHTTP do
     end
 
     it 'returns list of resource objects' do
-      resources = server.list_resources
-      expect(resources.size).to eq(1)
-      expect(resources.first.uri).to eq('file:///sample/README.md')
-      expect(resources.first.name).to eq('Sample README')
-      expect(resources.first.description).to eq('A sample README file')
-      expect(resources.first.mime_type).to eq('text/markdown')
+      result = server.list_resources
+      expect(result).to be_a(Hash)
+      expect(result['resources']).to be_an(Array)
+      expect(result['resources'].size).to eq(1)
+      expect(result['resources'].first.uri).to eq('file:///sample/README.md')
+      expect(result['resources'].first.name).to eq('Sample README')
+      expect(result['resources'].first.description).to eq('A sample README file')
+      expect(result['resources'].first.mime_type).to eq('text/markdown')
     end
 
     it 'caches resources after first call' do
       server.list_resources
-      resources = server.list_resources
-      expect(resources.size).to eq(1)
+      result = server.list_resources
+      expect(result['resources'].size).to eq(1)
       # Should not make another HTTP request
     end
   end
@@ -790,8 +792,11 @@ RSpec.describe MCPClient::ServerStreamableHTTP do
 
     it 'returns resource contents' do
       result = server.read_resource('file:///sample/README.md')
-      expect(result['contents'].first['text']).to eq('# Sample README\n\nThis is a sample file.')
-      expect(result['contents'].first['mimeType']).to eq('text/markdown')
+      expect(result).to be_an(Array)
+      expect(result.size).to eq(1)
+      expect(result.first).to be_a(MCPClient::ResourceContent)
+      expect(result.first.text).to eq('# Sample README\n\nThis is a sample file.')
+      expect(result.first.mime_type).to eq('text/markdown')
     end
   end
 

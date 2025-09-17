@@ -53,6 +53,7 @@ class Session:
         self.ping_thread = None
         self.notification_thread = None
         self.active = True
+        self.resource_subscriptions = set()
 
 def generate_session_id():
     """Generate a cryptographically secure session ID"""
@@ -134,9 +135,12 @@ def handle_rpc():
                     "capabilities": {
                         "tools": {},
                         "prompts": {},
-                        "resources": {},
+                        "resources": {
+                            "subscribe": True,
+                            "listChanged": True
+                        },
                         "notifications": {
-                            "server": ["notification/server_status", "notification/progress"]
+                            "server": ["notification/server_status", "notification/progress", "notifications/resources/updated", "notifications/resources/list_changed"]
                         }
                     },
                     "serverInfo": {
@@ -358,41 +362,78 @@ def handle_rpc():
             )
 
         elif method == 'resources/list':
+            # Handle pagination
+            cursor = params.get('cursor')
+
+            resources = [
+                {
+                    "uri": "file:///sample/README.md",
+                    "name": "README.md",
+                    "title": "Project Documentation",
+                    "description": "A sample README file demonstrating markdown content",
+                    "mimeType": "text/markdown",
+                    "size": 2048,
+                    "annotations": {
+                        "audience": ["user", "assistant"],
+                        "priority": 1.0,
+                        "lastModified": "2025-01-12T15:00:00Z"
+                    }
+                },
+                {
+                    "uri": "file:///sample/config.json",
+                    "name": "config.json",
+                    "title": "Configuration",
+                    "description": "A sample JSON configuration file",
+                    "mimeType": "application/json",
+                    "size": 1024,
+                    "annotations": {
+                        "audience": ["assistant"],
+                        "priority": 0.8,
+                        "lastModified": "2025-01-12T14:00:00Z"
+                    }
+                },
+                {
+                    "uri": "file:///sample/data.txt",
+                    "name": "data.txt",
+                    "title": "Sample Data",
+                    "description": "Plain text data with annotations",
+                    "mimeType": "text/plain",
+                    "size": 512,
+                    "annotations": {
+                        "audience": ["user"],
+                        "priority": 0.5,
+                        "lastModified": "2025-01-12T13:00:00Z"
+                    }
+                },
+                {
+                    "uri": "file:///sample/image.png",
+                    "name": "image.png",
+                    "title": "Sample Image",
+                    "description": "A sample binary image resource",
+                    "mimeType": "image/png",
+                    "size": 256
+                }
+            ]
+
+            # Simple pagination implementation
+            limit = 2  # Small limit for demonstration
+            start = 0
+            if cursor:
+                try:
+                    start = int(cursor)
+                except:
+                    start = 0
+
+            end = start + limit
+            page_resources = resources[start:end]
+            next_cursor = str(end) if end < len(resources) else None
+
             response_data = {
                 "jsonrpc": "2.0",
                 "id": request_id,
                 "result": {
-                    "resources": [
-                        {
-                            "uri": "file:///sample/README.md",
-                            "name": "Sample README",
-                            "description": "A sample README file demonstrating markdown content",
-                            "mimeType": "text/markdown"
-                        },
-                        {
-                            "uri": "file:///sample/config.json",
-                            "name": "Sample Configuration",
-                            "description": "A sample JSON configuration file",
-                            "mimeType": "application/json"
-                        },
-                        {
-                            "uri": "file:///sample/data.txt",
-                            "name": "Sample Data",
-                            "description": "Plain text data with annotations",
-                            "mimeType": "text/plain",
-                            "annotations": {
-                                "category": "demo",
-                                "importance": "low",
-                                "created": datetime.now().isoformat()
-                            }
-                        },
-                        {
-                            "uri": "file:///sample/image.png",
-                            "name": "Sample Image",
-                            "description": "A sample binary image resource",
-                            "mimeType": "image/png"
-                        }
-                    ]
+                    "resources": page_resources,
+                    "nextCursor": next_cursor
                 }
             }
             return Response(
@@ -564,12 +605,112 @@ End of sample data.""".format(datetime.now().isoformat())
                 content_type='text/event-stream',
                 headers={'Cache-Control': 'no-cache'}
             )
+
+        elif method == 'resources/templates/list':
+            # Resource templates support
+            cursor = params.get('cursor')
+            templates = [
+                {
+                    "uriTemplate": "file:///{path}",
+                    "name": "Project Files",
+                    "title": "📁 Project Files",
+                    "description": "Access files in the project directory",
+                    "mimeType": "application/octet-stream",
+                    "annotations": {
+                        "audience": ["user", "assistant"],
+                        "priority": 0.7
+                    }
+                },
+                {
+                    "uriTemplate": "config:///{section}/{key}",
+                    "name": "Configuration Values",
+                    "title": "⚙️ Configuration",
+                    "description": "Access configuration values by section and key",
+                    "mimeType": "text/plain"
+                }
+            ]
+
+            # Pagination
+            limit = 2
+            start = int(cursor) if cursor else 0
+            end = start + limit
+            page_templates = templates[start:end]
+            next_cursor = str(end) if end < len(templates) else None
+
+            response_data = {
+                "jsonrpc": "2.0",
+                "id": request_id,
+                "result": {
+                    "resourceTemplates": page_templates,
+                    "nextCursor": next_cursor
+                }
+            }
             return Response(
                 format_sse_event("message", response_data),
                 content_type='text/event-stream',
                 headers={'Cache-Control': 'no-cache'}
             )
-            
+
+        elif method == 'resources/subscribe':
+            # Subscribe to resource updates
+            resource_uri = params.get('uri')
+
+            if session_id in sessions:
+                session = sessions[session_id]
+                session.resource_subscriptions.add(resource_uri)
+                logger.info(f"Session {session_id} subscribed to {resource_uri}")
+
+                response_data = {
+                    "jsonrpc": "2.0",
+                    "id": request_id,
+                    "result": {}
+                }
+            else:
+                response_data = {
+                    "jsonrpc": "2.0",
+                    "id": request_id,
+                    "error": {
+                        "code": -32603,
+                        "message": "Session not found"
+                    }
+                }
+
+            return Response(
+                format_sse_event("message", response_data),
+                content_type='text/event-stream',
+                headers={'Cache-Control': 'no-cache'}
+            )
+
+        elif method == 'resources/unsubscribe':
+            # Unsubscribe from resource updates
+            resource_uri = params.get('uri')
+
+            if session_id in sessions:
+                session = sessions[session_id]
+                session.resource_subscriptions.discard(resource_uri)
+                logger.info(f"Session {session_id} unsubscribed from {resource_uri}")
+
+                response_data = {
+                    "jsonrpc": "2.0",
+                    "id": request_id,
+                    "result": {}
+                }
+            else:
+                response_data = {
+                    "jsonrpc": "2.0",
+                    "id": request_id,
+                    "error": {
+                        "code": -32603,
+                        "message": "Session not found"
+                    }
+                }
+
+            return Response(
+                format_sse_event("message", response_data),
+                content_type='text/event-stream',
+                headers={'Cache-Control': 'no-cache'}
+            )
+
         elif method == 'tools/call':
             tool_name = params.get('name')
             tool_args = params.get('arguments', {})
@@ -786,7 +927,10 @@ if __name__ == "__main__":
     print("✅ Session management")
     print("✅ Tools support")
     print("✅ Prompts support")
-    print("✅ Resources support")
+    print("✅ Resources support with annotations")
+    print("✅ Resource templates")
+    print("✅ Resource subscriptions")
+    print("✅ Pagination support")
     print("\nAvailable tools:")
     print("  - echo: Echo back a message")
     print("  - long_task: Simulate long-running task with progress")

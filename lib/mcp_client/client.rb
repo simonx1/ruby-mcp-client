@@ -136,7 +136,14 @@ module MCPClient
       connection_errors = []
 
       servers.each do |server|
-        server.list_resources.each do |resource|
+        result = server.list_resources
+        # Handle both old array format and new hash format for backwards compatibility
+        resource_list = if result.is_a?(Hash)
+                          result['resources'] || []
+                        else
+                          result
+                        end
+        resource_list.each do |resource|
           cache_key = cache_key_for(server, resource.uri)
           @resource_cache[cache_key] = resource
           resources << resource
@@ -478,7 +485,7 @@ module MCPClient
       case method
       when 'notifications/tools/list_changed'
         logger.warn("[#{server_id}] Tool list has changed, clearing tool cache")
-        clear_cache
+        @tool_cache.clear
       when 'notifications/resources/updated'
         logger.warn("[#{server_id}] Resource #{params['uri']} updated")
       when 'notifications/prompts/list_changed'

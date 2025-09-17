@@ -236,50 +236,122 @@ begin
     puts "❌ Prompt Error: #{e.message}"
   end
 
-  # Test 8: Resources functionality
+  # Test 8: Enhanced Resources functionality with new features
   puts '=' * 40
-  puts 'Test 8: Resources Support'
+  puts 'Test 8: Enhanced Resources Support'
   puts '-' * 40
-  puts 'Testing resources functionality...'
+  puts 'Testing resources with templates, subscriptions, and pagination...'
   puts
 
-  # List available resources
-  puts '📋 Fetching available resources...'
+  # Test 8a: List resources with pagination
+  puts '📋 Testing resource pagination...'
   begin
-    resources = client.list_resources
-    puts "Found #{resources.length} resources:"
-    resources.each_with_index do |resource, index|
+    # First page
+    result = client.servers.first.list_resources
+    puts 'First page of resources:'
+    result['resources'].each_with_index do |resource, index|
       puts "  #{index + 1}. #{resource.name} (#{resource.uri})"
-      puts "     MIME Type: #{resource.mime_type}" if resource.mime_type
-      puts "     Description: #{resource.description}" if resource.description
+      puts "     Title: #{resource.title}" if resource.title
+      puts "     Size: #{resource.size} bytes" if resource.size
+      next unless resource.annotations
+
+      puts "     Audience: #{resource.annotations['audience'].join(', ')}" if resource.annotations['audience']
+      puts "     Priority: #{resource.annotations['priority']}" if resource.annotations['priority']
+      puts "     Last Modified: #{resource.annotations['lastModified']}" if resource.annotations['lastModified']
+    end
+
+    # Check for next page
+    if result['nextCursor']
+      puts "\n📋 Fetching next page (cursor: #{result['nextCursor']})..."
+      next_result = client.servers.first.list_resources(cursor: result['nextCursor'])
+      puts 'Next page of resources:'
+      next_result['resources'].each_with_index do |resource, index|
+        puts "  #{index + 1}. #{resource.name} (#{resource.uri})"
+      end
     end
     puts
 
-    # Test reading each resource
-    puts '📖 Reading resources:'
+    # Test 8b: Resource Templates
+    puts '🗂️ Testing resource templates...'
+    begin
+      templates_result = client.servers.first.list_resource_templates
+      puts "Found #{templates_result['resourceTemplates'].length} resource templates:"
+      templates_result['resourceTemplates'].each_with_index do |template, index|
+        puts "  #{index + 1}. #{template.name}"
+        puts "     URI Template: #{template.uri_template}"
+        puts "     Title: #{template.title}" if template.title
+        puts "     Description: #{template.description}" if template.description
+        puts "     MIME Type: #{template.mime_type}" if template.mime_type
+        puts "     Annotations: #{template.annotations}" if template.annotations
+      end
+      puts
+    rescue StandardError => e
+      puts "❌ Resource templates not supported or error: #{e.message}"
+      puts
+    end
+
+    # Test 8c: Resource Subscriptions
+    puts '🔔 Testing resource subscriptions...'
+    begin
+      test_uri = 'file:///sample/data.txt'
+
+      # Subscribe to a resource
+      puts "Subscribing to #{test_uri}..."
+      subscription_result = client.servers.first.subscribe_resource(test_uri)
+      puts '✅ Subscribed successfully' if subscription_result
+
+      # Wait for potential updates
+      puts 'Waiting for resource update notifications...'
+      sleep(2)
+
+      # Unsubscribe
+      puts "Unsubscribing from #{test_uri}..."
+      unsubscribe_result = client.servers.first.unsubscribe_resource(test_uri)
+      puts '✅ Unsubscribed successfully' if unsubscribe_result
+      puts
+    rescue StandardError => e
+      puts "❌ Resource subscriptions not supported or error: #{e.message}"
+      puts
+    end
+
+    # Test 8d: Read resources with enhanced content structure
+    puts '📖 Reading resources with enhanced content structure:'
     puts
 
-    resources.each_with_index do |resource, index|
+    # Get all resources (without pagination for reading)
+    all_resources = []
+    cursor = nil
+    loop do
+      result = client.servers.first.list_resources(cursor: cursor)
+      all_resources.concat(result['resources'])
+      cursor = result['nextCursor']
+      break unless cursor
+    end
+
+    all_resources.first(2).each_with_index do |resource, index|
       puts "#{index + 1}. Reading #{resource.name}:"
       begin
-        result = client.read_resource(resource.uri)
+        contents = client.servers.first.read_resource(resource.uri)
 
-        result['contents']&.each do |content|
-          if content['text']
-            # Text content
-            preview = if content['text'].length > 150
-                        "#{content['text'][0...150]}..."
-                      else
-                        content['text']
-                      end
-            puts "   Content (#{content['mimeType'] || 'text'}): #{preview.gsub("\n", "\n   ")}"
+        contents.each do |content|
+          if content.respond_to?(:text?) && content.text?
+            # Using ResourceContent object
+            preview = content.text.length > 150 ? "#{content.text[0...150]}..." : content.text
+            puts "   Content (#{content.mime_type || 'text'}): #{preview.gsub("\n", "\n   ")}"
+            if content.annotations
+              puts "   Audience: #{content.annotations['audience'].join(', ')}" if content.annotations['audience']
+              puts "   Priority: #{content.annotations['priority']}" if content.annotations['priority']
+              puts "   Last Modified: #{content.annotations['lastModified']}" if content.annotations['lastModified']
+            end
+          elsif content.respond_to?(:binary?) && content.binary?
+            puts "   Binary data: #{content.blob.length} characters (base64)"
+          elsif content['text']
+            # Fallback for raw hash format
+            preview = content['text'].length > 150 ? "#{content['text'][0...150]}..." : content['text']
+            puts "   Content: #{preview.gsub("\n", "\n   ")}"
           elsif content['blob']
-            # Binary content
             puts "   Binary data: #{content['blob'].length} characters (base64)"
           end
-
-          # Show annotations if present
-          puts "   Annotations: #{content['annotations']}" if content['annotations']
         end
         puts
       rescue MCPClient::Errors::ResourceReadError => e
@@ -289,6 +361,8 @@ begin
     end
   rescue MCPClient::Errors::ResourceReadError => e
     puts "❌ Resource Error: #{e.message}"
+  rescue StandardError => e
+    puts "❌ Unexpected Error: #{e.class}: #{e.message}"
   end
 
   # Final summary
@@ -305,6 +379,10 @@ begin
   puts '  ✅ Session persistence verified'
   puts '  ✅ Prompts functionality tested'
   puts '  ✅ Resources functionality tested'
+  puts '  ✅ Resource pagination verified'
+  puts '  ✅ Resource templates tested'
+  puts '  ✅ Resource subscriptions tested'
+  puts '  ✅ Resource annotations validated'
 rescue MCPClient::Errors::ConnectionError => e
   puts "❌ Connection Error: #{e.message}"
   puts "\n💡 Make sure the enhanced echo server is running:"

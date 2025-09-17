@@ -39,12 +39,22 @@ module MCPClient
       @next_id = 1
       @pending = {}
       @initialized = false
+      @server_info = nil
+      @capabilities = nil
       initialize_logger(logger)
       @max_retries   = retries
       @retry_backoff = retry_backoff
       @read_timeout  = read_timeout
       @env           = env || {}
     end
+
+    # Server info from the initialize response
+    # @return [Hash, nil] Server information
+    attr_reader :server_info
+
+    # Server capabilities from the initialize response
+    # @return [Hash, nil] Server capabilities
+    attr_reader :capabilities
 
     # Connect to the MCP server by launching the command process via stdin/stdout
     # @return [Boolean] true if connection was successful
@@ -149,27 +159,32 @@ module MCPClient
     end
 
     # List all resources available from the MCP server
-    # @return [Array<MCPClient::Resource>] list of available resources
+    # @param cursor [String, nil] optional cursor for pagination
+    # @return [Hash] result containing resources array and optional nextCursor
     # @raise [MCPClient::Errors::ServerError] if server returns an error
     # @raise [MCPClient::Errors::ResourceReadError] for other errors during resource listing
-    def list_resources
+    def list_resources(cursor: nil)
       ensure_initialized
       req_id = next_id
-      req = { 'jsonrpc' => '2.0', 'id' => req_id, 'method' => 'resources/list', 'params' => {} }
+      params = {}
+      params['cursor'] = cursor if cursor
+      req = { 'jsonrpc' => '2.0', 'id' => req_id, 'method' => 'resources/list', 'params' => params }
       send_request(req)
       res = wait_response(req_id)
       if (err = res['error'])
         raise MCPClient::Errors::ServerError, err['message']
       end
 
-      (res.dig('result', 'resources') || []).map { |td| MCPClient::Resource.from_json(td, server: self) }
+      result = res['result'] || {}
+      resources = (result['resources'] || []).map { |td| MCPClient::Resource.from_json(td, server: self) }
+      { 'resources' => resources, 'nextCursor' => result['nextCursor'] }
     rescue StandardError => e
       raise MCPClient::Errors::ResourceReadError, "Error listing resources: #{e.message}"
     end
 
     # Read a resource by its URI
     # @param uri [String] the URI of the resource to read
-    # @return [Object] the resource contents
+    # @return [Array<MCPClient::ResourceContent>] array of resource contents
     # @raise [MCPClient::Errors::ServerError] if server returns an error
     # @raise [MCPClient::Errors::ResourceReadError] for other errors during resource reading
     def read_resource(uri)
@@ -188,9 +203,85 @@ module MCPClient
         raise MCPClient::Errors::ServerError, err['message']
       end
 
-      res['result']
+      result = res['result'] || {}
+      contents = result['contents'] || []
+      contents.map { |content| MCPClient::ResourceContent.from_json(content) }
     rescue StandardError => e
       raise MCPClient::Errors::ResourceReadError, "Error reading resource '#{uri}': #{e.message}"
+    end
+
+    # List all resource templates available from the MCP server
+    # @param cursor [String, nil] optional cursor for pagination
+    # @return [Hash] result containing resourceTemplates array and optional nextCursor
+    # @raise [MCPClient::Errors::ServerError] if server returns an error
+    # @raise [MCPClient::Errors::ResourceReadError] for other errors during resource template listing
+    def list_resource_templates(cursor: nil)
+      ensure_initialized
+      req_id = next_id
+      params = {}
+      params['cursor'] = cursor if cursor
+      req = { 'jsonrpc' => '2.0', 'id' => req_id, 'method' => 'resources/templates/list', 'params' => params }
+      send_request(req)
+      res = wait_response(req_id)
+      if (err = res['error'])
+        raise MCPClient::Errors::ServerError, err['message']
+      end
+
+      result = res['result'] || {}
+      templates = (result['resourceTemplates'] || []).map { |td| MCPClient::ResourceTemplate.from_json(td, server: self) }
+      { 'resourceTemplates' => templates, 'nextCursor' => result['nextCursor'] }
+    rescue StandardError => e
+      raise MCPClient::Errors::ResourceReadError, "Error listing resource templates: #{e.message}"
+    end
+
+    # Subscribe to resource updates
+    # @param uri [String] the URI of the resource to subscribe to
+    # @return [Boolean] true if subscription successful
+    # @raise [MCPClient::Errors::ServerError] if server returns an error
+    # @raise [MCPClient::Errors::ResourceReadError] for other errors during subscription
+    def subscribe_resource(uri)
+      ensure_initialized
+      req_id = next_id
+      req = {
+        'jsonrpc' => '2.0',
+        'id' => req_id,
+        'method' => 'resources/subscribe',
+        'params' => { 'uri' => uri }
+      }
+      send_request(req)
+      res = wait_response(req_id)
+      if (err = res['error'])
+        raise MCPClient::Errors::ServerError, err['message']
+      end
+
+      true
+    rescue StandardError => e
+      raise MCPClient::Errors::ResourceReadError, "Error subscribing to resource '#{uri}': #{e.message}"
+    end
+
+    # Unsubscribe from resource updates
+    # @param uri [String] the URI of the resource to unsubscribe from
+    # @return [Boolean] true if unsubscription successful
+    # @raise [MCPClient::Errors::ServerError] if server returns an error
+    # @raise [MCPClient::Errors::ResourceReadError] for other errors during unsubscription
+    def unsubscribe_resource(uri)
+      ensure_initialized
+      req_id = next_id
+      req = {
+        'jsonrpc' => '2.0',
+        'id' => req_id,
+        'method' => 'resources/unsubscribe',
+        'params' => { 'uri' => uri }
+      }
+      send_request(req)
+      res = wait_response(req_id)
+      if (err = res['error'])
+        raise MCPClient::Errors::ServerError, err['message']
+      end
+
+      true
+    rescue StandardError => e
+      raise MCPClient::Errors::ResourceReadError, "Error unsubscribing from resource '#{uri}': #{e.message}"
     end
 
     # List all tools available from the MCP server

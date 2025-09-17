@@ -48,16 +48,44 @@ module MCPClient
     end
 
     # List all resources available from the MCP server
-    # @return [Array<MCPClient::Resource>] list of available resources
-    def list_resources
+    # @param cursor [String, nil] optional cursor for pagination
+    # @return [Hash] result containing resources array and optional nextCursor
+    def list_resources(cursor: nil)
       raise NotImplementedError, 'Subclasses must implement list_resources'
     end
 
     # Read a resource by its URI
     # @param uri [String] the URI of the resource to read
-    # @return [Object] the resource contents
+    # @return [Array<MCPClient::ResourceContent>] array of resource contents
     def read_resource(uri)
       raise NotImplementedError, 'Subclasses must implement read_resource'
+    end
+
+    # List all resource templates available from the MCP server
+    # @param cursor [String, nil] optional cursor for pagination
+    # @return [Hash] result containing resourceTemplates array and optional nextCursor
+    def list_resource_templates(cursor: nil)
+      raise NotImplementedError, 'Subclasses must implement list_resource_templates'
+    end
+
+    # Subscribe to resource updates
+    # @param uri [String] the URI of the resource to subscribe to
+    # @return [Boolean] true if subscription successful
+    def subscribe_resource(uri)
+      raise NotImplementedError, 'Subclasses must implement subscribe_resource'
+    end
+
+    # Unsubscribe from resource updates
+    # @param uri [String] the URI of the resource to unsubscribe from
+    # @return [Boolean] true if unsubscription successful
+    def unsubscribe_resource(uri)
+      raise NotImplementedError, 'Subclasses must implement unsubscribe_resource'
+    end
+
+    # Get server capabilities
+    # @return [Hash, nil] server capabilities
+    def capabilities
+      raise NotImplementedError, 'Subclasses must implement capabilities'
     end
 
     # Clean up the server connection
