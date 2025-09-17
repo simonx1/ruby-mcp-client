@@ -22,17 +22,15 @@ require 'json'
 
 # Helper method to display content from resources
 def display_content(content)
-  if content['text']
-    # Text content
-    preview = content['text'].length > 200 ? "#{content['text'][0...200]}..." : content['text']
-    puts "   Content (#{content['mimeType'] || 'text'}): #{preview.gsub("\n", "\n            ")}"
-  elsif content['blob']
-    # Binary content
-    puts "   Binary data: #{content['blob'].length} characters (base64)"
+  if content.text?
+    preview = content.text.length > 200 ? "#{content.text[0...200]}..." : content.text
+    puts "   Content (#{content.mime_type || 'text'}): #{preview.gsub("\n", "\n            ")}"
+  elsif content.binary?
+    puts "   Binary data: #{content.blob.length} characters (base64)"
   end
 
   # Show annotations if present
-  puts "   Annotations: #{content['annotations']}" if content['annotations']
+  puts "   Annotations: #{content.annotations}" if content.annotations
 end
 
 # Create a logger for debugging (optional)
@@ -192,9 +190,10 @@ begin
   # List available resources
   puts "\n📋 Fetching available resources..."
   begin
-    resources = client.list_resources
+    result = client.servers.first.list_resources
+    resources = result['resources']
 
-    if resources.empty?
+    if resources.nil? || resources.empty?
       puts '   ℹ️  No resources available from this server'
     else
       puts "Found #{resources.length} resources:"
@@ -214,13 +213,8 @@ begin
         puts "   URI: #{resource.uri}"
 
         begin
-          result = client.read_resource(resource.uri)
-
-          if result['contents']
-            result['contents'].each { |content| display_content(content) }
-          else
-            puts "   Raw result: #{JSON.pretty_generate(result)}"
-          end
+          contents = client.servers.first.read_resource(resource.uri)
+          contents.each { |content| display_content(content) }
         rescue MCPClient::Errors::ResourceReadError => e
           puts "   ❌ Error reading resource: #{e.message}"
         end
