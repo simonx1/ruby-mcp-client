@@ -292,9 +292,16 @@ RSpec.describe MCPClient::Client do
       end
 
       before do
-        allow(mock_server2).to receive_messages(list_resources: { 'resources' => [duplicate_resource], 'nextCursor' => nil }, read_resource: server2_result,
-                                                on_notification: nil)
-        allow(multi_client).to receive(:list_resources).and_return({ 'resources' => [mock_resource, duplicate_resource], 'nextCursor' => nil })
+        allow(mock_server2).to receive_messages(
+          list_resources: { 'resources' => [duplicate_resource], 'nextCursor' => nil },
+          read_resource: server2_result,
+          on_notification: nil
+        )
+        allow(multi_client).to receive(:list_resources).and_return({
+                                                                     'resources' => [mock_resource,
+                                                                                     duplicate_resource],
+                                                                     'nextCursor' => nil
+                                                                   })
       end
 
       it 'raises AmbiguousResourceURI when duplicate resources exist' do

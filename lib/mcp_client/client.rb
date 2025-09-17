@@ -137,13 +137,12 @@ module MCPClient
         # For now, just use the first server when cursor is provided
         # In a real implementation, you'd need to track which server the cursor came from
         return servers.first.list_resources(cursor: cursor) if servers.any?
+
         return { 'resources' => [], 'nextCursor' => nil }
       end
 
       # Use cache if available and no cursor
-      if cache && !@resource_cache.empty?
-        return { 'resources' => @resource_cache.values, 'nextCursor' => nil }
-      end
+      return { 'resources' => @resource_cache.values, 'nextCursor' => nil } if cache && !@resource_cache.empty?
 
       resources = []
       connection_errors = []
@@ -180,44 +179,13 @@ module MCPClient
       result = list_resources
       resources = result['resources'] || []
 
-      if server
-        # Use the specified server
-        srv = select_server(server)
-        # Find the resource on this specific server
-        resource = resources.find { |r| r.uri == uri && r.server == srv }
-        unless resource
-          raise MCPClient::Errors::ResourceNotFound,
-                "Resource '#{uri}' not found on server '#{srv.name || srv.class.name}'"
-        end
-      else
-        # Find the resource across all servers
-        matching_resources = resources.select { |r| r.uri == uri }
+      resource = if server
+                   find_resource_on_server(uri, resources, server)
+                 else
+                   find_resource_across_servers(uri, resources)
+                 end
 
-        if matching_resources.empty?
-          raise MCPClient::Errors::ResourceNotFound, "Resource '#{uri}' not found"
-        elsif matching_resources.size > 1
-          # If multiple matches, disambiguate with server names
-          server_names = matching_resources.map { |r| r.server&.name || 'unnamed' }
-          raise MCPClient::Errors::AmbiguousResourceURI,
-                "Multiple resources with URI '#{uri}' found across servers (#{server_names.join(', ')}). " \
-                "Please specify a server using the 'server' parameter."
-        end
-
-        resource = matching_resources.first
-      end
-
-      # Use the resource's associated server
-      server = resource.server
-      raise MCPClient::Errors::ServerNotFound, "No server found for resource '#{uri}'" unless server
-
-      begin
-        server.read_resource(uri)
-      rescue MCPClient::Errors::ConnectionError => e
-        # Add server identity information to the error for better context
-        server_id = server.name ? "#{server.class}[#{server.name}]" : server.class.name
-        raise MCPClient::Errors::ResourceReadError,
-              "Error reading resource '#{uri}': #{e.message} (Server: #{server_id})"
-      end
+      execute_resource_read(resource, uri)
     end
 
     # Lists all available tools from all connected MCP servers
@@ -573,6 +541,62 @@ module MCPClient
     def cache_key_for(server, item_id)
       server_id = server.object_id.to_s
       "#{server_id}:#{item_id}"
+    end
+
+    # Find a resource on a specific server
+    # @param uri [String] the URI of the resource
+    # @param resources [Array<Resource>] available resources
+    # @param server [String, Symbol, Integer, MCPClient::ServerBase] server selector
+    # @return [Resource] the found resource
+    # @raise [MCPClient::Errors::ResourceNotFound] if resource not found
+    def find_resource_on_server(uri, resources, server)
+      srv = select_server(server)
+      resource = resources.find { |r| r.uri == uri && r.server == srv }
+      unless resource
+        raise MCPClient::Errors::ResourceNotFound,
+              "Resource '#{uri}' not found on server '#{srv.name || srv.class.name}'"
+      end
+      resource
+    end
+
+    # Find a resource across all servers
+    # @param uri [String] the URI of the resource
+    # @param resources [Array<Resource>] available resources
+    # @return [Resource] the found resource
+    # @raise [MCPClient::Errors::ResourceNotFound] if resource not found
+    # @raise [MCPClient::Errors::AmbiguousResourceURI] if multiple resources found
+    def find_resource_across_servers(uri, resources)
+      matching_resources = resources.select { |r| r.uri == uri }
+
+      if matching_resources.empty?
+        raise MCPClient::Errors::ResourceNotFound, "Resource '#{uri}' not found"
+      elsif matching_resources.size > 1
+        server_names = matching_resources.map { |r| r.server&.name || 'unnamed' }
+        raise MCPClient::Errors::AmbiguousResourceURI,
+              "Multiple resources with URI '#{uri}' found across servers (#{server_names.join(', ')}). " \
+              "Please specify a server using the 'server' parameter."
+      end
+
+      matching_resources.first
+    end
+
+    # Execute the resource read operation
+    # @param resource [Resource] the resource to read
+    # @param uri [String] the URI of the resource
+    # @return [Object] the resource contents
+    # @raise [MCPClient::Errors::ServerNotFound] if no server found
+    # @raise [MCPClient::Errors::ResourceReadError] on read errors
+    def execute_resource_read(resource, uri)
+      server = resource.server
+      raise MCPClient::Errors::ServerNotFound, "No server found for resource '#{uri}'" unless server
+
+      begin
+        server.read_resource(uri)
+      rescue MCPClient::Errors::ConnectionError => e
+        server_id = server.name ? "#{server.class}[#{server.name}]" : server.class.name
+        raise MCPClient::Errors::ResourceReadError,
+              "Error reading resource '#{uri}': #{e.message} (Server: #{server_id})"
+      end
     end
   end
 end
