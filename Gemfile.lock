@@ -1,9 +1,9 @@
 GIT
   remote: https://github.com/openai/openai-ruby.git
-  revision: 003ab1d01a76a4bba8a8864943d4a44cf9a1685d
+  revision: 84e837d4314103342f5f0b0d565346cf82f23dd5
   branch: main
   specs:
-    openai (0.23.3)
+    openai (0.25.0)
       connection_pool
 
 PATH
