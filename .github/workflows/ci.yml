@@ -30,7 +30,7 @@ jobs:
 
   code-review:
     runs-on: ubuntu-latest
-    if: github.event_name == 'pull_request'
+    if: github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository
     permissions:
       contents: read
       pull-requests: write
@@ -38,14 +38,13 @@ jobs:
     steps:
     - uses: actions/checkout@v4
     - uses: anthropics/claude-code-action@v1
-      env:
-        ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
       with:
         prompt: |
           REPO: ${{ github.repository }}
           PR NUMBER: ${{ github.event.pull_request.number }}
 
           Review the PR changes. Focus on code quality, potential bugs, performance and security issues.
+        anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
         claude_args: |
           --model claude-sonnet-4-5-20250929
           --allowedTools Edit,Read,Write
