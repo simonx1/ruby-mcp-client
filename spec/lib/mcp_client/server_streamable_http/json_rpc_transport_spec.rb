@@ -490,6 +490,35 @@ RSpec.describe MCPClient::ServerStreamableHTTP::JsonRpcTransport do
     end
   end
 
+  describe '#parse_response_gzip' do
+    let(:mock_response) { double('response', body: response_body, headers: response_headers) }
+    let(:response_headers) { { 'content-type' => 'text/event-stream', 'content-encoding' => 'gzip' } }
+
+    context 'with valid SSE JSON response' do
+      let(:response_body) do
+        message = "event: message\ndata: #{response_data.to_json}\n\n"
+        string_io_buffer = StringIO.new
+        Zlib::GzipWriter.wrap(string_io_buffer) do |gz|
+          gz.write message
+          gz.close
+        end
+        string_io_buffer.string
+      end
+      let(:response_data) do
+        {
+          jsonrpc: '2.0',
+          id: 1,
+          result: { data: 'test' }
+        }
+      end
+
+      it 'parses SSE and returns result' do
+        result = transport.send(:parse_response, mock_response)
+        expect(result).to eq({ 'data' => 'test' })
+      end
+    end
+  end
+
   describe '#parse_sse_response' do
     context 'with standard SSE format' do
       let(:sse_body) { "event: message\ndata: #{data.to_json}\n\n" }

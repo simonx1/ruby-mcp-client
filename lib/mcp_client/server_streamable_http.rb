@@ -91,7 +91,7 @@ module MCPClient
       @headers = opts[:headers].merge({
                                         'Content-Type' => 'application/json',
                                         'Accept' => 'text/event-stream, application/json',
-                                        'Accept-Encoding' => 'gzip, deflate',
+                                        'Accept-Encoding' => 'gzip',
                                         'User-Agent' => "ruby-mcp-client/#{MCPClient::VERSION}",
                                         'Cache-Control' => 'no-cache'
                                       })
