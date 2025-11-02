@@ -26,17 +26,17 @@ module MCPClient
       # @raise [MCPClient::Errors::TransportError] if parsing fails
       # @raise [MCPClient::Errors::ServerError] if the response contains an error
       def parse_response(response)
-        body = response.body.strip
+        body = response.body
         content_type = response.headers['content-type'] || response.headers['Content-Type'] || ''
         content_encoding = response.headers['content-encoding'] || response.headers['Content-Encoding'] || ''
+
+        body = Zlib::GzipReader.new(StringIO.new(body)).read if content_encoding.include?('gzip')
+        body = body&.strip
 
         # Determine response format based on Content-Type header per MCP 2025 spec
         data = if content_type.include?('text/event-stream')
                  # Parse SSE-formatted response for streaming
                  parse_sse_response(body)
-               elsif content_encoding.include?('gzip')
-                 body = Zlib::GzipReader.new(StringIO.new(body)).read
-                 JSON.parse(body)
                else
                  # Parse regular JSON response (default for Streamable HTTP)
                  JSON.parse(body)
