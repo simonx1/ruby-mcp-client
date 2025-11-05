@@ -179,15 +179,18 @@ module MCPClient
       # Build OAuth discovery URL from server URL
       # Uses only the origin (scheme + host + port) for discovery
       # @param server_url [String] Full MCP server URL
+      # @param discovery_type [Symbol] Type of discovery endpoint (:authorization_server or :protected_resource)
       # @return [String] Discovery URL
-      def build_discovery_url(server_url)
+      def build_discovery_url(server_url, discovery_type = :authorization_server)
         uri = URI.parse(server_url)
 
         # Build origin URL (scheme + host + port)
         origin = "#{uri.scheme}://#{uri.host}"
         origin += ":#{uri.port}" if uri.port && !default_port?(uri)
 
-        "#{origin}/.well-known/oauth-protected-resource"
+        # Select discovery endpoint based on type
+        endpoint = discovery_type == :authorization_server ? 'oauth-authorization-server' : 'oauth-protected-resource'
+        "#{origin}/.well-known/#{endpoint}"
       end
 
       # Check if URI uses default port for its scheme
@@ -199,6 +202,9 @@ module MCPClient
       end
 
       # Discover authorization server metadata
+      # Tries multiple discovery patterns:
+      # 1. oauth-authorization-server (MCP spec pattern - server is its own auth server)
+      # 2. oauth-protected-resource (delegation pattern - points to external auth server)
       # @return [ServerMetadata] Authorization server metadata
       # @raise [MCPClient::Errors::ConnectionError] if discovery fails
       def discover_authorization_server
@@ -207,18 +213,40 @@ module MCPClient
           return cached
         end
 
-        # Build discovery URL using the origin (scheme + host + port) only
-        discovery_url = build_discovery_url(server_url)
+        server_metadata = nil
 
-        # Fetch resource metadata to find authorization server
-        resource_metadata = fetch_resource_metadata(discovery_url)
+        # Primary discovery: oauth-authorization-server (MCP spec pattern)
+        # Used by servers that are both resource and authorization server (e.g., Sentry)
+        begin
+          discovery_url = build_discovery_url(server_url, :authorization_server)
+          logger.debug("Attempting OAuth discovery: #{discovery_url}")
+          server_metadata = fetch_server_metadata(discovery_url)
+        rescue MCPClient::Errors::ConnectionError => e
+          logger.debug("oauth-authorization-server discovery failed: #{e.message}")
+        end
 
-        # Get first authorization server
-        auth_server_url = resource_metadata.authorization_servers.first
-        raise MCPClient::Errors::ConnectionError, 'No authorization servers found' unless auth_server_url
+        # Fallback discovery: oauth-protected-resource (delegation pattern)
+        # Used by resource servers that delegate to external authorization servers
+        unless server_metadata
+          begin
+            discovery_url = build_discovery_url(server_url, :protected_resource)
+            logger.debug("Attempting OAuth discovery: #{discovery_url}")
 
-        # Fetch authorization server metadata
-        server_metadata = fetch_server_metadata("#{auth_server_url}/.well-known/oauth-authorization-server")
+            resource_metadata = fetch_resource_metadata(discovery_url)
+            auth_server_url = resource_metadata.authorization_servers.first
+
+            if auth_server_url
+              server_metadata = fetch_server_metadata("#{auth_server_url}/.well-known/oauth-authorization-server")
+            end
+          rescue MCPClient::Errors::ConnectionError => e
+            logger.debug("oauth-protected-resource discovery failed: #{e.message}")
+          end
+        end
+
+        unless server_metadata
+          raise MCPClient::Errors::ConnectionError,
+                'OAuth discovery failed: no valid endpoints found'
+        end
 
         # Cache the metadata
         storage.set_server_metadata(server_url, server_metadata)

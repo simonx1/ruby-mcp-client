@@ -36,13 +36,22 @@ RSpec.describe MCPClient::Auth::OAuthProvider do
   end
 
   describe 'OAuth discovery URL generation' do
-    it 'generates correct discovery URL for full server URL with path and query' do
+    it 'generates correct authorization-server discovery URL (default)' do
       provider = described_class.new(
         server_url: 'https://mcp.zapier.com/api/mcp/a/123/mcp?serverId=abc-123'
       )
 
-      # Access private method for testing
+      # Access private method for testing - defaults to :authorization_server
       discovery_url = provider.send(:build_discovery_url, provider.server_url)
+      expect(discovery_url).to eq('https://mcp.zapier.com/.well-known/oauth-authorization-server')
+    end
+
+    it 'generates correct protected-resource discovery URL when specified' do
+      provider = described_class.new(
+        server_url: 'https://mcp.zapier.com/api/mcp/a/123/mcp?serverId=abc-123'
+      )
+
+      discovery_url = provider.send(:build_discovery_url, provider.server_url, :protected_resource)
       expect(discovery_url).to eq('https://mcp.zapier.com/.well-known/oauth-protected-resource')
     end
 
@@ -50,14 +59,14 @@ RSpec.describe MCPClient::Auth::OAuthProvider do
       provider = described_class.new(server_url: 'https://api.example.com')
 
       discovery_url = provider.send(:build_discovery_url, provider.server_url)
-      expect(discovery_url).to eq('https://api.example.com/.well-known/oauth-protected-resource')
+      expect(discovery_url).to eq('https://api.example.com/.well-known/oauth-authorization-server')
     end
 
     it 'handles non-default ports correctly' do
       provider = described_class.new(server_url: 'https://api.example.com:8443/mcp')
 
       discovery_url = provider.send(:build_discovery_url, provider.server_url)
-      expect(discovery_url).to eq('https://api.example.com:8443/.well-known/oauth-protected-resource')
+      expect(discovery_url).to eq('https://api.example.com:8443/.well-known/oauth-authorization-server')
     end
   end
 

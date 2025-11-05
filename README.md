@@ -804,9 +804,9 @@ token = browser_oauth.authenticate(
   auto_open_browser: true    # Optional: Auto-open browser (default: true)
 )
 
-# Create authenticated client
+# Create authenticated client (use streamable_http for modern MCP servers)
 server_config = {
-  type: 'http',
+  type: 'streamable_http',  # or 'http' for simple HTTP-only servers
   base_url: 'https://api.example.com/mcp',
   oauth_provider: oauth_provider
 }
@@ -846,7 +846,9 @@ end
 
 **Server Requirements:**
 - OAuth 2.1 Protocol with PKCE
-- Authorization Server Discovery via `/.well-known/oauth-protected-resource`
+- Authorization Server Discovery via:
+  - `/.well-known/oauth-authorization-server` (primary, for self-contained servers)
+  - `/.well-known/oauth-protected-resource` (fallback, for delegated auth)
 - Dynamic Client Registration (recommended)
 - Authorization Code Grant Flow
 

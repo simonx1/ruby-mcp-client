@@ -84,9 +84,10 @@ begin
   # Step 4: Create an authenticated MCP client
   puts 'Step 4: Creating authenticated MCP client...'
 
-  # Create an OAuth-enabled HTTP server config
+  # Create an OAuth-enabled Streamable HTTP server config
+  # Note: Sentry MCP and other modern MCP servers use Streamable HTTP with SSE support
   server_config = {
-    type: 'http',
+    type: 'streamable_http',
     base_url: SERVER_URL,
     headers: {},
     oauth_provider: oauth_provider
