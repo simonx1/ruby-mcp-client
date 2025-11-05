@@ -216,7 +216,7 @@ module MCPClient
         server_metadata = nil
 
         # Primary discovery: oauth-authorization-server (MCP spec pattern)
-        # Used by servers that are both resource and authorization server (e.g., Sentry)
+        # Used by servers that are both resource and authorization server
         begin
           discovery_url = build_discovery_url(server_url, :authorization_server)
           logger.debug("Attempting OAuth discovery: #{discovery_url}")

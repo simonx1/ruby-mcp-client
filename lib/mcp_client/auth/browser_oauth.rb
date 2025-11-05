@@ -68,13 +68,13 @@ module MCPClient
           # Open browser to authorization URL
           if auto_open_browser
             open_browser(auth_url)
-            puts "\nOpening browser for authorization..."
-            puts "If browser doesn't open automatically, visit this URL:"
+            @logger.info("\nOpening browser for authorization...")
+            @logger.info("If browser doesn't open automatically, visit this URL:")
           else
-            puts "\nPlease visit this URL to authorize:"
+            @logger.info("\nPlease visit this URL to authorize:")
           end
-          puts auth_url
-          puts "\nWaiting for authorization..."
+          @logger.info(auth_url)
+          @logger.info("\nWaiting for authorization...")
 
           # Wait for callback with timeout
           mutex.synchronize do
@@ -91,7 +91,7 @@ module MCPClient
           @logger.debug('Completing OAuth authorization flow')
           token = @oauth_provider.complete_authorization_flow(result[:code], result[:state])
 
-          puts "\nAuthentication successful!"
+          @logger.info("\nAuthentication successful!")
           token
         ensure
           # Always shutdown the server
