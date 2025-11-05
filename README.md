@@ -42,13 +42,13 @@ with popular AI services with built-in conversions:
 
 ## MCP Protocol Support
 
-This Ruby MCP Client implements features from the latest MCP specifications:
+This Ruby MCP Client implements the **MCP 2025-06-18** specification with full backward compatibility.
 
-### MCP 2025-06-18 Features
+### Key Features
+
+**MCP 2025-06-18 (Latest):**
 - **Structured Tool Outputs** - Tools can declare output schemas and return type-safe, validated structured data
 - **Elicitation (Server-initiated User Interactions)** - Servers can request user input during tool execution via bidirectional JSON-RPC (stdio, SSE, and Streamable HTTP transports)
-
-### MCP 2025-03-26 Features
 - **Tool Annotations** - Support for tool behavior annotations (readOnly, destructive, requiresConfirmation) for safer tool execution
 - **OAuth 2.1 Authorization Framework** - Complete authentication with PKCE, dynamic client registration, server discovery, and runtime configuration
 - **Streamable HTTP Transport** - Enhanced transport with Server-Sent Event formatted responses and session management
@@ -1001,7 +1001,7 @@ end
 
 ## Tool Annotations
 
-MCP 2025-03-26 introduces tool annotations that describe tool behavior, enabling safer and more informed tool execution. The Ruby MCP Client provides full support for reading and interpreting these annotations.
+MCP 2025-06-18 supports tool annotations that describe tool behavior, enabling safer and more informed tool execution. The Ruby MCP Client provides full support for reading and interpreting these annotations.
 
 ### Annotation Types
 

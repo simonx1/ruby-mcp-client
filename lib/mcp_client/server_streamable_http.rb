@@ -9,9 +9,9 @@ require 'faraday/retry'
 require 'faraday/follow_redirects'
 
 module MCPClient
-  # Implementation of MCP server that communicates via Streamable HTTP transport (MCP 2025-03-26)
+  # Implementation of MCP server that communicates via Streamable HTTP transport (MCP 2025-06-18)
   # This transport uses HTTP POST for RPC calls with optional SSE responses, and GET for event streams
-  # Compliant with MCP specification version 2025-03-26
+  # Compliant with MCP specification version 2025-06-18
   #
   # Key features:
   # - Supports server-sent events (SSE) for real-time notifications

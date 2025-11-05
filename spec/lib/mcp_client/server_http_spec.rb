@@ -71,7 +71,7 @@ RSpec.describe MCPClient::ServerHTTP do
       server.connect
 
       expect(init_request_body['params']['protocolVersion']).to eq(MCPClient::PROTOCOL_VERSION)
-      expect(init_request_body['params']['protocolVersion']).to eq('2025-03-26')
+      expect(init_request_body['params']['protocolVersion']).to eq('2025-06-18')
     end
 
     it 'handles base_url with path and explicit endpoint' do
