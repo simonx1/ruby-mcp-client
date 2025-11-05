@@ -45,6 +45,7 @@ with popular AI services with built-in conversions:
 This Ruby MCP Client implements key features from the latest MCP specification (Protocol Revision: 2025-03-26):
 
 ### Implemented Features
+- **Tool Annotations** - Support for tool behavior annotations (readOnly, destructive, requiresConfirmation) for safer tool execution
 - **OAuth 2.1 Authorization Framework** - Complete authentication with PKCE, dynamic client registration, server discovery, and runtime configuration
 - **Streamable HTTP Transport** - Enhanced transport with Server-Sent Event formatted responses and session management
 - **HTTP Redirect Support** - Automatic redirect handling for both SSE and HTTP transports with configurable limits
@@ -588,6 +589,7 @@ Complete examples can be found in the `examples/` directory:
 - `streamable_http_example.rb` - Streamable HTTP transport with Playwright MCP
 - `echo_server.py` & `echo_server_client.rb` - FastMCP server example with full setup
 - `echo_server_streamable.py` & `echo_server_streamable_client.rb` - Enhanced streamable HTTP server example
+- `echo_server_with_annotations.py` & `test_tool_annotations.rb` - Tool annotations demonstration
 
 ## MCP Server Compatibility
 
@@ -986,6 +988,80 @@ elsif content.binary?
 end
 ```
 
+## Tool Annotations
+
+MCP 2025-03-26 introduces tool annotations that describe tool behavior, enabling safer and more informed tool execution. The Ruby MCP Client provides full support for reading and interpreting these annotations.
+
+### Annotation Types
+
+Tools can include the following annotations:
+
+- **`readOnly`** - Indicates the tool only reads data and doesn't modify state
+- **`destructive`** - Indicates the tool performs potentially dangerous operations (e.g., deleting data)
+- **`requiresConfirmation`** - Indicates the tool should require explicit user confirmation before execution
+
+### Using Tool Annotations
+
+```ruby
+# List tools and check their annotations
+tools = client.list_tools
+
+tools.each do |tool|
+  puts "Tool: #{tool.name}"
+
+  # Check annotations using helper methods
+  if tool.read_only?
+    puts "  → Safe to execute (read-only)"
+  end
+
+  if tool.destructive?
+    puts "  ⚠️  Warning: This tool is destructive"
+  end
+
+  if tool.requires_confirmation?
+    puts "  🛡️  Requires user confirmation before execution"
+  end
+
+  # Access raw annotations hash
+  if tool.annotations
+    puts "  Annotations: #{tool.annotations.inspect}"
+  end
+end
+
+# Make informed decisions based on annotations
+tool = client.find_tool('delete_user')
+if tool.destructive? && tool.requires_confirmation?
+  # Prompt user for confirmation before executing
+  puts "This will delete user data. Are you sure? (y/n)"
+  response = gets.chomp
+  if response.downcase == 'y'
+    result = client.call_tool('delete_user', { user_id: 123 })
+  else
+    puts "Operation cancelled"
+  end
+else
+  # Safe to execute without confirmation
+  result = client.call_tool('get_user', { user_id: 123 })
+end
+```
+
+### Tool Annotation Helper Methods
+
+The `Tool` class provides convenient helper methods:
+
+- `tool.read_only?` - Returns true if the tool is marked as read-only
+- `tool.destructive?` - Returns true if the tool is marked as destructive
+- `tool.requires_confirmation?` - Returns true if the tool requires confirmation
+- `tool.annotations` - Returns the raw annotations hash
+
+### Example
+
+See `examples/test_tool_annotations.rb` for a complete working example demonstrating:
+- Listing tools with their annotations
+- Using annotation helper methods
+- Making annotation-aware decisions about tool execution
+- Handling destructive operations safely
+
 ## Key Features
 
 ### Client Features
@@ -996,6 +1072,7 @@ end
 - **Server lookup** - Find servers by name using `find_server`
 - **Tool association** - Each tool knows which server it belongs to
 - **Tool discovery** - Find tools by name or pattern
+- **Tool annotations** - Support for readOnly, destructive, and requiresConfirmation annotations with helper methods
 - **Server disambiguation** - Specify which server to use when tools with same name exist in multiple servers
 - **Atomic tool calls** - Simple API for invoking tools with parameters
 - **Batch support** - Call multiple tools in a single operation

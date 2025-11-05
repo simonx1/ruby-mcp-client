@@ -9,19 +9,23 @@ module MCPClient
     #   @return [String] the description of the tool
     # @!attribute [r] schema
     #   @return [Hash] the JSON schema for the tool
+    # @!attribute [r] annotations
+    #   @return [Hash, nil] optional annotations describing tool behavior (e.g., readOnly, destructive)
     # @!attribute [r] server
     #   @return [MCPClient::ServerBase, nil] the server this tool belongs to
-    attr_reader :name, :description, :schema, :server
+    attr_reader :name, :description, :schema, :annotations, :server
 
     # Initialize a new Tool
     # @param name [String] the name of the tool
     # @param description [String] the description of the tool
     # @param schema [Hash] the JSON schema for the tool
+    # @param annotations [Hash, nil] optional annotations describing tool behavior
     # @param server [MCPClient::ServerBase, nil] the server this tool belongs to
-    def initialize(name:, description:, schema:, server: nil)
+    def initialize(name:, description:, schema:, annotations: nil, server: nil)
       @name = name
       @description = description
       @schema = schema
+      @annotations = annotations
       @server = server
     end
 
@@ -33,10 +37,12 @@ module MCPClient
       # Some servers (Playwright MCP CLI) use 'inputSchema' instead of 'schema'
       # Handle both string and symbol keys
       schema = data['inputSchema'] || data[:inputSchema] || data['schema'] || data[:schema]
+      annotations = data['annotations'] || data[:annotations]
       new(
         name: data['name'] || data[:name],
         description: data['description'] || data[:description],
         schema: schema,
+        annotations: annotations,
         server: server
       )
     end
@@ -72,6 +78,24 @@ module MCPClient
         description: @description,
         parameters: cleaned_schema(@schema)
       }
+    end
+
+    # Check if the tool is marked as read-only
+    # @return [Boolean] true if the tool is read-only
+    def read_only?
+      @annotations && @annotations['readOnly'] == true
+    end
+
+    # Check if the tool is marked as destructive
+    # @return [Boolean] true if the tool is destructive
+    def destructive?
+      @annotations && @annotations['destructive'] == true
+    end
+
+    # Check if the tool requires confirmation before execution
+    # @return [Boolean] true if the tool requires confirmation
+    def requires_confirmation?
+      @annotations && @annotations['requiresConfirmation'] == true
     end
 
     private
