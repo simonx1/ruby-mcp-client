@@ -134,7 +134,8 @@ begin
   puts
 
   result2 = client.call_tool('send_notification',
-                             { message: 'System maintenance scheduled for tonight at 10 PM' }, server: 'elicitation-demo')
+                             { message: 'System maintenance scheduled for tonight at 10 PM' },
+                             server: 'elicitation-demo')
   puts "\nResult:"
   puts result2['content'].first['text']
   puts

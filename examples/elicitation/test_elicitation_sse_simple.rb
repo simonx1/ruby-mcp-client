@@ -3,15 +3,17 @@
 
 # Simple MCP Elicitation Example - SSE Transport
 #
-# Note: SSE and Streamable HTTP transports are similar in this implementation.
-# This example shows a minimal SSE configuration using the streamable HTTP server.
+# This example demonstrates SSE (Server-Sent Events) transport for MCP elicitation.
+# SSE transport uses:
+#   - Server-to-client: SSE stream for pushing requests
+#   - Client-to-server: HTTP POST for sending responses
 #
 # Usage:
 #   # Start the server:
-#   python examples/elicitation_streamable_server.py
+#   python examples/elicitation/elicitation_streamable_server.py
 #
 #   # Run this client:
-#   ruby examples/test_elicitation_sse_simple.rb
+#   ruby examples/elicitation/test_elicitation_sse_simple.rb
 
 require 'bundler/setup'
 require 'mcp_client'
@@ -22,7 +24,7 @@ puts '=' * 60
 puts
 
 # Simple elicitation handler
-elicitation_handler = lambda do |message, schema|
+elicitation_handler = lambda do |message, _schema|
   puts "\n📡 Server request: #{message}"
 
   # Auto-accept with sample data
@@ -31,25 +33,26 @@ elicitation_handler = lambda do |message, schema|
     puts "✓ Providing: title='Quick Doc', author='Demo User'"
     { 'action' => 'accept', 'content' => { 'title' => 'Quick Doc', 'author' => 'Demo User' } }
   when /content/
-    puts "✓ Providing content"
+    puts '✓ Providing content'
     { 'action' => 'accept', 'content' => { 'content' => 'This is demo content from SSE transport.' } }
   else
-    puts "✓ Accepting request"
+    puts '✓ Accepting request'
     { 'action' => 'accept' }
   end
 end
 
 # Create client with SSE transport
-# Note: For simplicity, using streamable_http type which works the same way
+# SSE transport uses separate endpoints:
+#   - GET /sse - Opens SSE stream for server-to-client events
+#   - POST /sse - Sends JSON-RPC requests from client to server
 client = MCPClient::Client.new(
   mcp_server_configs: [
-    {
-      type: 'streamable_http',
-      base_url: 'http://localhost:8000',
-      endpoint: '/mcp',
+    MCPClient.sse_config(
+      base_url: 'http://localhost:8000/sse',
       name: 'sse-demo',
-      read_timeout: 60
-    }
+      read_timeout: 60,
+      ping: 10 # Send ping every 10 seconds of inactivity
+    )
   ],
   elicitation_handler: elicitation_handler
 )
@@ -65,7 +68,7 @@ begin
 rescue MCPClient::Errors::ConnectionError => e
   puts "\n❌ Connection Error: #{e.message}"
   puts "\nMake sure the server is running:"
-  puts "  python examples/elicitation_streamable_server.py"
+  puts '  python examples/elicitation/elicitation_streamable_server.py'
 rescue StandardError => e
   puts "\n❌ Error: #{e.message}"
 ensure

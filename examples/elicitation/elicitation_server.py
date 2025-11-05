@@ -65,7 +65,8 @@ async def create_document(
     )
 
     if content_result.action == "decline":
-        return f"User declined to provide content. Document '{title}' not created."
+        return f"User declined to provide content. Document '{
+            title}' not created."
     elif content_result.action == "cancel":
         return "User cancelled the operation."
 
@@ -75,7 +76,8 @@ async def create_document(
     if format == "markdown":
         document = f"# {title}\n\n{content}"
     elif format == "html":
-        document = f"<html><head><title>{title}</title></head><body><h1>{title}</h1><p>{content}</p></body></html>"
+        document = f"<html><head><title>{
+            title}</title></head><body><h1>{title}</h1><p>{content}</p></body></html>"
     else:
         document = f"{title}\n\n{content}"
 

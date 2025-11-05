@@ -828,11 +828,12 @@ module MCPClient
     end
 
     # Handle elicitation/create request from server (MCP 2025-06-18)
-    # @param request_id [String, Integer] the JSON-RPC request ID
+    # @param request_id [String, Integer] the JSON-RPC request ID (used as elicitationId)
     # @param params [Hash] the elicitation parameters
     # @return [void]
     def handle_elicitation_create(request_id, params)
-      elicitation_id = params['elicitationId']
+      # The request_id is the elicitationId per MCP spec
+      elicitation_id = request_id
 
       # If no callback is registered, decline the request
       unless @elicitation_request_callback
@@ -855,14 +856,18 @@ module MCPClient
     # @param result [Hash] the elicitation result (action and optional content)
     # @return [void]
     def send_elicitation_response(elicitation_id, result)
+      params = {
+        'elicitationId' => elicitation_id,
+        'action' => result['action']
+      }
+
+      # Only include content if present (typically for 'accept' action)
+      params['content'] = result['content'] if result['content']
+
       request = {
         'jsonrpc' => '2.0',
         'method' => 'elicitation/response',
-        'params' => {
-          'elicitationId' => elicitation_id,
-          'action' => result['action'],
-          'content' => result['content'] || {}
-        }
+        'params' => params
       }
 
       # Send as a JSON-RPC request via HTTP POST

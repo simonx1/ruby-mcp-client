@@ -661,8 +661,6 @@ module MCPClient
       end
     end
 
-    private
-
     # Ensure the action value conforms to MCP spec (accept, decline, cancel)
     # Falls back to accept for unknown action values.
     def normalised_action_response(result)

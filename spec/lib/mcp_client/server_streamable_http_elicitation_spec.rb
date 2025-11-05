@@ -156,14 +156,19 @@ RSpec.describe MCPClient::ServerStreamableHTTP, 'Elicitation (MCP 2025-06-18)' d
     let(:request_id) { 123 }
     let(:result) { { 'action' => 'accept', 'content' => { 'name' => 'John' } } }
 
-    it 'sends JSON-RPC response via HTTP POST' do
-      expected_response = {
+    it 'sends JSON-RPC request via HTTP POST' do
+      # Elicitation responses are sent as JSON-RPC requests, not responses
+      expected_request = {
         'jsonrpc' => '2.0',
-        'id' => request_id,
-        'result' => result
+        'method' => 'elicitation/response',
+        'params' => {
+          'elicitationId' => request_id,
+          'action' => result['action'],
+          'content' => result['content']
+        }
       }
 
-      expect(server).to receive(:post_jsonrpc_response).with(expected_response)
+      expect(server).to receive(:post_jsonrpc_response).with(expected_request)
       server.send(:send_elicitation_response, request_id, result)
     end
   end
@@ -389,7 +394,7 @@ RSpec.describe MCPClient::ServerStreamableHTTP, 'Elicitation (MCP 2025-06-18)' d
         user_response
       end
 
-      # Stub HTTP POST for response
+      # Stub HTTP POST for response (sent as JSON-RPC request, not response)
       response_stub = stub_request(:post, "#{base_url}#{endpoint}")
                       .with(
                         headers: {
@@ -398,8 +403,12 @@ RSpec.describe MCPClient::ServerStreamableHTTP, 'Elicitation (MCP 2025-06-18)' d
                         },
                         body: {
                           'jsonrpc' => '2.0',
-                          'id' => 456,
-                          'result' => user_response
+                          'method' => 'elicitation/response',
+                          'params' => {
+                            'elicitationId' => 456,
+                            'action' => user_response['action'],
+                            'content' => user_response['content']
+                          }
                         }.to_json
                       )
                       .to_return(status: 200, body: '')
@@ -433,10 +442,14 @@ RSpec.describe MCPClient::ServerStreamableHTTP, 'Elicitation (MCP 2025-06-18)' d
       # No callback registered, should auto-decline
       response_stub = stub_request(:post, "#{base_url}#{endpoint}")
                       .with(
-                        body: hash_including(
-                          'id' => 789,
-                          'result' => { 'action' => 'decline' }
-                        )
+                        body: {
+                          'jsonrpc' => '2.0',
+                          'method' => 'elicitation/response',
+                          'params' => {
+                            'elicitationId' => 789,
+                            'action' => 'decline'
+                          }
+                        }.to_json
                       )
                       .to_return(status: 200, body: '')
 

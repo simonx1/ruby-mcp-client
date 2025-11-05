@@ -65,12 +65,14 @@ ruby examples/elicitation/test_elicitation.rb
 #### Server: `elicitation_streamable_server.py`
 ```bash
 # Install dependencies
-pip install mcp starlette uvicorn sse-starlette
+pip install flask
 
-# Run server
+# Run server (supports both SSE and Streamable HTTP transports)
 python examples/elicitation/elicitation_streamable_server.py
 
-# Server runs on http://localhost:8000
+# Server runs on:
+#   http://localhost:8000/sse (SSE transport)
+#   http://localhost:8000/mcp (Streamable HTTP transport)
 ```
 
 #### Client: `test_elicitation_streamable.rb`
@@ -100,22 +102,26 @@ ruby examples/elicitation/test_elicitation_streamable.rb
 
 ### 3. SSE Transport Example (Simple)
 
-**Quick Demo**: Minimal example with auto-response
+**Quick Demo**: Minimal example with auto-response using traditional SSE
+
+#### Server: Same `elicitation_streamable_server.py`
+The streamable server supports both transports - SSE and Streamable HTTP.
 
 #### Client: `test_elicitation_sse_simple.rb`
 ```bash
 # Make sure server is running first:
 python examples/elicitation/elicitation_streamable_server.py
 
-# Run simple SSE example:
+# Run simple SSE example (uses /sse endpoint):
 ruby examples/elicitation/test_elicitation_sse_simple.rb
 ```
 
 **Features:**
+- ✅ Traditional SSE transport with separate GET/POST endpoints
 - ✅ Automatic elicitation responses (no user input required)
 - ✅ Clean, minimal code (~75 lines)
 - ✅ Perfect for testing and CI/CD
-- ✅ Uses `streamable_http` type (SSE-compatible)
+- ✅ Uses `sse_config` helper for proper SSE transport
 
 **Use Case:** Quick testing, automation, demos
 
