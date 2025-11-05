@@ -777,6 +777,81 @@ auth_url = oauth_provider.start_authorization_flow
 token = oauth_provider.complete_authorization_flow(code, state)
 ```
 
+### Browser-Based OAuth Authentication
+
+For the easiest authentication experience, use the browser-based OAuth flow that automatically handles the entire process:
+
+```ruby
+require 'mcp_client/auth/browser_oauth'
+
+# Create OAuth provider
+oauth_provider = MCPClient::Auth::OAuthProvider.new(
+  server_url: 'https://api.example.com/mcp',
+  redirect_uri: 'http://localhost:8080/callback',
+  scope: 'read:tools write:tools'  # Optional
+)
+
+# Create browser OAuth helper
+browser_oauth = MCPClient::Auth::BrowserOAuth.new(
+  oauth_provider,
+  callback_port: 8080,        # Optional: Port for local server (default: 8080)
+  callback_path: '/callback'  # Optional: Callback path (default: '/callback')
+)
+
+# Authenticate (opens browser automatically and handles callback)
+token = browser_oauth.authenticate(
+  timeout: 300,              # Optional: 5 minutes (default: 300)
+  auto_open_browser: true    # Optional: Auto-open browser (default: true)
+)
+
+# Create authenticated client
+server_config = {
+  type: 'http',
+  base_url: 'https://api.example.com/mcp',
+  oauth_provider: oauth_provider
+}
+
+client = MCPClient::Client.new(mcp_server_configs: [server_config])
+```
+
+**How it works:**
+1. **Automatically starts a local HTTP server** (using pure Ruby `TCPServer`) to handle the OAuth callback
+2. **Opens your default browser** to the authorization page (macOS: `open`, Linux: `xdg-open`, Windows: `start`)
+3. **Captures the authorization code** automatically from the callback
+4. **Completes the OAuth flow** and stores the access token
+5. **Handles token refresh** automatically when tokens expire
+
+**Features:**
+- **Zero external dependencies** - Uses pure Ruby stdlib (`TCPServer`)
+- **User-friendly HTML pages** - Shows success/error pages in the browser
+- **Automatic token management** - Handles token refresh transparently
+- **Configurable timeout** - Raises `Timeout::Error` if user doesn't authorize in time
+- **Token storage** - Supports custom storage backends for persistent tokens
+- **Port conflict detection** - Clear error messages if port is already in use
+- **Security hardened** - PKCE, CSRF protection, request validation, header limits
+
+**Error Handling:**
+```ruby
+begin
+  token = browser_oauth.authenticate
+rescue Timeout::Error
+  puts "User took too long to authorize"
+rescue MCPClient::Errors::ConnectionError => e
+  puts "OAuth flow failed: #{e.message}"
+  # Port already in use, server doesn't support OAuth, etc.
+rescue ArgumentError => e
+  puts "Invalid state parameter (CSRF protection)"
+end
+```
+
+**Server Requirements:**
+- OAuth 2.1 Protocol with PKCE
+- Authorization Server Discovery via `/.well-known/oauth-protected-resource`
+- Dynamic Client Registration (recommended)
+- Authorization Code Grant Flow
+
+For a complete working example, see [`examples/oauth_browser_auth.rb`](examples/oauth_browser_auth.rb).
+
 ### OAuth Features
 
 - **OAuth 2.1 compliance** with PKCE for security
@@ -785,6 +860,7 @@ token = oauth_provider.complete_authorization_flow(code, state)
 - **Token refresh** and automatic token management
 - **Pluggable storage** for tokens and client credentials
 - **Runtime configuration** via getter/setter methods
+- **Browser-based authentication** with automatic callback handling
 
 For complete OAuth documentation, see [OAUTH.md](OAUTH.md).
 

@@ -76,7 +76,8 @@ module MCPClient
         retries: config[:retries] || 3,
         retry_backoff: config[:retry_backoff] || 1,
         name: config[:name],
-        logger: logger
+        logger: logger,
+        oauth_provider: config[:oauth_provider]
       )
     end
 
@@ -95,7 +96,8 @@ module MCPClient
         retries: config[:retries] || 3,
         retry_backoff: config[:retry_backoff] || 1,
         name: config[:name],
-        logger: logger
+        logger: logger,
+        oauth_provider: config[:oauth_provider]
       )
     end
 
