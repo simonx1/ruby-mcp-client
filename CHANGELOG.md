@@ -1,5 +1,84 @@
 # Changelog
 
+## 0.9.0 (2025-11-05)
+
+### MCP Protocol Update
+- **Updated to MCP 2025-06-18**: Latest protocol specification
+  - Protocol version constant updated from `2025-03-26` to `2025-06-18`
+  - All documentation and code comments updated to reference 2025-06-18
+  - Maintains full backward compatibility with previous versions
+
+### New Features
+
+#### Elicitation (Server-initiated User Interactions)
+- **Full Elicitation Support**: Servers can now request structured user input during tool execution
+  - Implemented across all transports: stdio, SSE, and Streamable HTTP
+  - Bidirectional JSON-RPC communication for interactive workflows
+  - Support for all three response actions: `accept`, `decline`, `cancel`
+  - Callback-based API with `elicitation_handler` parameter
+  - Automatic decline when no handler registered
+  - Thread-safe response delivery for HTTP-based transports
+  - Proper handling of `elicitation/create` requests
+  - Responses sent as JSON-RPC requests (method: `elicitation/response`)
+  - Content field only included when present (not empty hash for decline/cancel)
+
+#### Elicitation Examples
+- **stdio Transport Example** (`examples/elicitation/`)
+  - `elicitation_server.py` - Python MCP server with elicitation tools
+  - `test_elicitation.rb` - Interactive Ruby client with user input
+  - Tools: `create_document`, `send_notification`
+
+- **Streamable HTTP Transport Example** (`examples/elicitation/`)
+  - `elicitation_streamable_server.py` - Python server supporting both SSE and Streamable HTTP
+  - `test_elicitation_streamable.rb` - Full-featured client with multi-step workflows
+  - Tools: `create_document`, `delete_files`, `deploy_application`
+
+- **SSE Transport Example** (`examples/elicitation/`)
+  - `test_elicitation_sse_simple.rb` - Minimal SSE example with auto-response
+  - Uses traditional SSE transport (GET /sse for stream, POST /sse for RPC)
+  - Perfect for testing and CI/CD
+
+#### Browser-based OAuth flow
+- Added support for browser-based OAuth authentication flow (#50)
+
+#### Streamable HTTP Gzip Support
+- Added gzip compression support for streamable HTTP transport (by @purposemc) (#46)
+
+### Implementation Details
+
+#### Core Changes
+- `lib/mcp_client/version.rb` - Updated PROTOCOL_VERSION to '2025-06-18'
+- `lib/mcp_client/client.rb` - Added elicitation handler registration and propagation
+- `lib/mcp_client/server_streamable_http.rb` - Added elicitation support for Streamable HTTP
+  - `on_elicitation_request` - Register callback
+  - `handle_elicitation_create` - Process elicitation requests
+  - `send_elicitation_response` - Send responses via HTTP POST
+  - `post_jsonrpc_response` - Thread-safe response delivery
+- `lib/mcp_client/server_sse.rb` - Added elicitation support for SSE
+  - Queue-based response delivery
+  - Proper handling of JSON-RPC requests vs responses
+- `lib/mcp_client/server_stdio.rb` - Added elicitation support for stdio
+  - Bidirectional JSON-RPC over stdin/stdout
+- `lib/mcp_client/json_rpc_common.rb` - Enhanced message type detection
+- `lib/mcp_client/server_http.rb` - Base class updates
+
+#### Bug Fixes
+- Fixed elicitation ID extraction to correctly use JSON-RPC request ID
+- Fixed elicitation response format to only include content when present
+- Fixed response delivery mechanism for HTTP-based transports
+
+### Documentation
+- Updated main README with MCP 2025-06-18 as primary version
+- Consolidated feature list under "MCP 2025-06-18 (Latest)"
+
+### Dependencies
+- Updated faraday from 2.13.4 to 2.14.0
+- Updated faraday-follow_redirects from 0.3.0 to 0.4.0
+- Various dev dependency updates
+
+### Developer Experience
+- Enhanced CI configuration and workflows
+
 ## 0.8.1 (2025-09-17)
 
 ### Breaking Changes
