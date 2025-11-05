@@ -262,7 +262,9 @@ RSpec.describe MCPClient::Auth::OAuthProvider do
       expect(requests.length).to eq(2)
       expect(requests.first).to include('redirect_uri=http%3A%2F%2Flocalhost%3A8080%2Fcallback')
       expect(requests.last).to include('redirect_uri=https%3A%2F%2F3d4834530bf2.ngrok.app')
-      expect(logger).to have_received(:warn).with("Token exchange failed: redirect_uri mismatch. Retrying with server's expected value: https://3d4834530bf2.ngrok.app")
+      expected_message = "Token exchange failed: redirect_uri mismatch. Retrying with server's expected value: " \
+                         'https://3d4834530bf2.ngrok.app'
+      expect(logger).to have_received(:warn).with(expected_message)
     end
   end
 end

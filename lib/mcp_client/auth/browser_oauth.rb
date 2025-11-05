@@ -33,11 +33,11 @@ module MCPClient
 
         # Ensure OAuth provider's redirect_uri matches our callback server
         expected_redirect_uri = "http://localhost:#{callback_port}#{callback_path}"
-        if oauth_provider.redirect_uri != expected_redirect_uri
-          @logger.warn("OAuth provider redirect_uri (#{oauth_provider.redirect_uri}) doesn't match " \
-                       "callback server (#{expected_redirect_uri}). Updating redirect_uri.")
-          oauth_provider.redirect_uri = expected_redirect_uri
-        end
+        return unless oauth_provider.redirect_uri != expected_redirect_uri
+
+        @logger.warn("OAuth provider redirect_uri (#{oauth_provider.redirect_uri}) doesn't match " \
+                     "callback server (#{expected_redirect_uri}). Updating redirect_uri.")
+        oauth_provider.redirect_uri = expected_redirect_uri
       end
 
       # Perform complete browser-based OAuth authentication flow
@@ -82,14 +82,10 @@ module MCPClient
           end
 
           # Check if we got a response
-          unless result[:completed]
-            raise Timeout::Error, "OAuth authorization timed out after #{timeout} seconds"
-          end
+          raise Timeout::Error, "OAuth authorization timed out after #{timeout} seconds" unless result[:completed]
 
           # Check for errors
-          if result[:error]
-            raise MCPClient::Errors::ConnectionError, "OAuth authorization failed: #{result[:error]}"
-          end
+          raise MCPClient::Errors::ConnectionError, "OAuth authorization failed: #{result[:error]}" if result[:error]
 
           # Complete OAuth flow
           @logger.debug('Completing OAuth authorization flow')
@@ -117,7 +113,7 @@ module MCPClient
         rescue Errno::EADDRINUSE
           raise MCPClient::Errors::ConnectionError,
                 "Cannot start OAuth callback server: port #{@callback_port} is already in use. " \
-                "Please close the application using this port or choose a different callback_port."
+                'Please close the application using this port or choose a different callback_port.'
         rescue StandardError => e
           raise MCPClient::Errors::ConnectionError,
                 "Failed to start OAuth callback server on port #{@callback_port}: #{e.message}"
@@ -129,9 +125,8 @@ module MCPClient
         thread = Thread.new do
           while running
             begin
-              # Use select with timeout to allow checking the running flag
-              readable, = IO.select([server], nil, nil, 0.5)
-              next unless readable
+              # Use wait_readable with timeout to allow checking the running flag
+              next unless server.wait_readable(0.5)
 
               client = server.accept
               handle_http_request(client, result, mutex, condition)
@@ -202,15 +197,13 @@ module MCPClient
         mutex.synchronize do
           if error
             result[:error] = error_description || error
-            result[:completed] = true
           elsif code && state
             result[:code] = code
             result[:state] = state
-            result[:completed] = true
           else
             result[:error] = 'Invalid callback: missing code or state parameter'
-            result[:completed] = true
           end
+          result[:completed] = true
 
           condition.signal
         end
@@ -276,7 +269,7 @@ module MCPClient
         when /mswin|mingw|cygwin/
           system('start', url)
         else
-          @logger.warn("Unknown operating system, cannot open browser automatically")
+          @logger.warn('Unknown operating system, cannot open browser automatically')
           false
         end
       rescue StandardError => e

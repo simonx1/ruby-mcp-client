@@ -139,8 +139,8 @@ RSpec.describe MCPClient::Auth::BrowserOAuth do
         allow(TCPServer).to receive(:new).and_return(tcp_server)
         allow(tcp_server).to receive(:close)
 
-        # Mock IO.select to never return readable (simulating timeout)
-        allow(IO).to receive(:select).and_return(nil)
+        # Mock wait_readable to never return truthy (simulating timeout)
+        allow(tcp_server).to receive(:wait_readable).and_return(nil)
 
         expect do
           browser_oauth.authenticate(timeout: 0.1, auto_open_browser: false)
@@ -154,7 +154,7 @@ RSpec.describe MCPClient::Auth::BrowserOAuth do
         client_socket = instance_double('TCPSocket')
 
         allow(TCPServer).to receive(:new).and_return(tcp_server)
-        allow(IO).to receive(:select).and_return([[tcp_server]])
+        allow(tcp_server).to receive(:wait_readable).and_return(tcp_server)
         allow(tcp_server).to receive(:accept).and_return(client_socket)
         allow(tcp_server).to receive(:close)
 
@@ -183,7 +183,7 @@ RSpec.describe MCPClient::Auth::BrowserOAuth do
         client_socket = instance_double('TCPSocket')
 
         allow(TCPServer).to receive(:new).and_return(tcp_server)
-        allow(IO).to receive(:select).and_return([[tcp_server]])
+        allow(tcp_server).to receive(:wait_readable).and_return(tcp_server)
         allow(tcp_server).to receive(:accept).and_return(client_socket)
         allow(tcp_server).to receive(:close)
 
@@ -302,8 +302,8 @@ RSpec.describe MCPClient::Auth::BrowserOAuth do
 
       browser_oauth.send(:send_http_response, client, 200, 'text/html', 'Success')
 
-      expect(response).to match(/HTTP\/1\.1 200 OK/)
-      expect(response).to match(/Content-Type: text\/html/)
+      expect(response).to match(%r{HTTP/1\.1 200 OK})
+      expect(response).to match(%r{Content-Type: text/html})
       expect(response).to match(/Success/)
     end
 
@@ -315,7 +315,7 @@ RSpec.describe MCPClient::Auth::BrowserOAuth do
 
       browser_oauth.send(:send_http_response, client, 400, 'text/plain', 'Error')
 
-      expect(response).to match(/HTTP\/1\.1 400 Bad Request/)
+      expect(response).to match(%r{HTTP/1\.1 400 Bad Request})
       expect(response).to match(/Error/)
     end
 
@@ -327,7 +327,7 @@ RSpec.describe MCPClient::Auth::BrowserOAuth do
 
       browser_oauth.send(:send_http_response, client, 404, 'text/plain', 'Not Found')
 
-      expect(response).to match(/HTTP\/1\.1 404 Not Found/)
+      expect(response).to match(%r{HTTP/1\.1 404 Not Found})
       expect(response).to match(/Not Found/)
     end
 

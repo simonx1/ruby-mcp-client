@@ -284,7 +284,7 @@ module MCPClient
         end
 
         # Register new client if server supports it
-        logger.debug("No cached client found, registering new OAuth client...")
+        logger.debug('No cached client found, registering new OAuth client...')
         if server_metadata.supports_registration?
           register_client(server_metadata)
         else
@@ -334,7 +334,7 @@ module MCPClient
         requested_uri = redirect_uri
         registered_uri = registered_metadata.redirect_uris.first
         if registered_uri != requested_uri
-          logger.warn("OAuth server changed redirect_uri:")
+          logger.warn('OAuth server changed redirect_uri:')
           logger.warn("  Requested:  #{requested_uri}")
           logger.warn("  Registered: #{registered_uri}")
           logger.warn("Using server's registered redirect_uri for token exchange.")
@@ -392,7 +392,7 @@ module MCPClient
       # @return [Token] Access token
       # @raise [MCPClient::Errors::ConnectionError] if token exchange fails
       def exchange_authorization_code(server_metadata, client_info, code, pkce)
-        logger.debug("Exchanging authorization code for access token")
+        logger.debug('Exchanging authorization code for access token')
 
         # Use the redirect_uri that was actually registered, not our requested one
         registered_redirect_uri = client_info.metadata.redirect_uris.first
@@ -427,7 +427,10 @@ module MCPClient
           redirect_hint = extract_redirect_mismatch(response.body)
 
           if redirect_hint && redirect_hint[:expected] && redirect_hint[:expected] != registered_redirect_uri
-            logger.warn("Token exchange failed: redirect_uri mismatch. Retrying with server's expected value: #{redirect_hint[:expected]}")
+            expected_uri = redirect_hint[:expected]
+            logger.warn(
+              "Token exchange failed: redirect_uri mismatch. Retrying with server's expected value: #{expected_uri}"
+            )
 
             params[:redirect_uri] = redirect_hint[:expected]
             retry_body = URI.encode_www_form(params)
@@ -520,7 +523,7 @@ module MCPClient
         description = data['error_description'] || data[:error_description]
         return nil unless description.is_a?(String)
 
-        match = description.match(/You sent\s+(https?:\/\/\S+)[,\.]?\s+and we expected\s+(https?:\/\/\S+)/i)
+        match = description.match(%r{You sent\s+(https?://\S+)[,.]?\s+and we expected\s+(https?://\S+)}i)
         return nil unless match
 
         {

@@ -19,16 +19,16 @@ require 'logger'
 
 # Configuration
 SERVER_URL = ENV['MCP_SERVER_URL'] || 'http://localhost:3000/mcp'
-OAUTH_SCOPE = ENV['OAUTH_SCOPE'] # Optional OAuth scope
+OAUTH_SCOPE = ENV.fetch('OAUTH_SCOPE', nil) # Optional OAuth scope
 CALLBACK_PORT = (ENV['CALLBACK_PORT'] || 8080).to_i
 
 # Create logger
 logger = Logger.new($stdout)
 logger.level = Logger::INFO
 
-puts "=" * 80
-puts "MCP Client - Browser-Based OAuth Authentication Example"
-puts "=" * 80
+puts '=' * 80
+puts 'MCP Client - Browser-Based OAuth Authentication Example'
+puts '=' * 80
 puts
 puts "Server URL: #{SERVER_URL}"
 puts "OAuth Scope: #{OAUTH_SCOPE || '(default)'}"
@@ -36,7 +36,7 @@ puts "Callback Port: #{CALLBACK_PORT}"
 puts
 
 # Step 1: Create OAuth provider
-puts "Step 1: Setting up OAuth provider..."
+puts 'Step 1: Setting up OAuth provider...'
 
 # Create a fresh storage instance (clears any cached credentials)
 storage = MCPClient::Auth::OAuthProvider::MemoryStorage.new
@@ -50,7 +50,7 @@ oauth_provider = MCPClient::Auth::OAuthProvider.new(
 )
 
 # Step 2: Create browser OAuth helper
-puts "Step 2: Creating browser OAuth helper..."
+puts 'Step 2: Creating browser OAuth helper...'
 browser_oauth = MCPClient::Auth::BrowserOAuth.new(
   oauth_provider,
   callback_port: CALLBACK_PORT,
@@ -59,7 +59,7 @@ browser_oauth = MCPClient::Auth::BrowserOAuth.new(
 )
 
 # Step 3: Perform authentication
-puts "Step 3: Starting browser-based authentication..."
+puts 'Step 3: Starting browser-based authentication...'
 puts
 
 begin
@@ -70,9 +70,9 @@ begin
   )
 
   puts
-  puts "=" * 80
-  puts "Authentication Successful!"
-  puts "=" * 80
+  puts '=' * 80
+  puts 'Authentication Successful!'
+  puts '=' * 80
   puts
   puts "Access Token: #{token.access_token[0..20]}..."
   puts "Token Type: #{token.token_type}"
@@ -82,7 +82,7 @@ begin
   puts
 
   # Step 4: Create an authenticated MCP client
-  puts "Step 4: Creating authenticated MCP client..."
+  puts 'Step 4: Creating authenticated MCP client...'
 
   # Create an OAuth-enabled HTTP server config
   server_config = {
@@ -96,20 +96,20 @@ begin
   client = MCPClient::Client.new(mcp_server_configs: [server_config], logger: logger)
 
   # Test the connection
-  puts "Testing connection to MCP server..."
+  puts 'Testing connection to MCP server...'
   client.ping
 
-  puts "Successfully connected to MCP server!"
+  puts 'Successfully connected to MCP server!'
   puts
 
   # Step 5: List available tools
-  puts "Step 5: Listing available tools..."
+  puts 'Step 5: Listing available tools...'
   tools = client.list_tools
 
   if tools.empty?
-    puts "No tools available"
+    puts 'No tools available'
   else
-    puts "Available tools:"
+    puts 'Available tools:'
     tools.each do |tool|
       puts "  - #{tool.name}: #{tool.description}"
     end
@@ -118,29 +118,28 @@ begin
 
   # Step 6: Demonstrate token refresh (if applicable)
   if token.expires_in && token.refresh_token
-    puts "Step 6: Token refresh is available"
-    puts "The access token will be automatically refreshed when it expires."
+    puts 'Step 6: Token refresh is available'
+    puts 'The access token will be automatically refreshed when it expires.'
     puts "Token expires at: #{token.expires_at}"
   end
   puts
 
-  puts "=" * 80
-  puts "Example completed successfully!"
-  puts "=" * 80
-
+  puts '=' * 80
+  puts 'Example completed successfully!'
+  puts '=' * 80
 rescue Timeout::Error => e
   puts
   puts "ERROR: #{e.message}"
-  puts "You took too long to authorize. Please try again."
+  puts 'You took too long to authorize. Please try again.'
   exit 1
 rescue MCPClient::Errors::ConnectionError => e
   puts
   puts "ERROR: Connection failed - #{e.message}"
   puts
-  puts "Make sure:"
+  puts 'Make sure:'
   puts "1. The MCP server is running at #{SERVER_URL}"
-  puts "2. The server supports OAuth 2.1 authentication"
-  puts "3. The server has dynamic client registration enabled"
+  puts '2. The server supports OAuth 2.1 authentication'
+  puts '3. The server has dynamic client registration enabled'
   exit 1
 rescue StandardError => e
   puts
