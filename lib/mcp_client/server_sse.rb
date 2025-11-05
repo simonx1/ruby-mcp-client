@@ -11,6 +11,12 @@ require 'faraday/follow_redirects'
 module MCPClient
   # Implementation of MCP server that communicates via Server-Sent Events (SSE)
   # Useful for communicating with remote MCP servers over HTTP
+  #
+  # @note Elicitation Support (MCP 2025-06-18)
+  #   This transport FULLY supports server-initiated elicitation requests via bidirectional
+  #   JSON-RPC. The server sends elicitation/create requests via the SSE stream, and the
+  #   client responds via HTTP POST to the RPC endpoint. This provides full elicitation
+  #   capability for remote servers.
   class ServerSSE < ServerBase
     require_relative 'server_sse/sse_parser'
     require_relative 'server_sse/json_rpc_transport'
@@ -98,6 +104,7 @@ module MCPClient
       # Time of last activity
       @last_activity_time = Time.now
       @activity_timer_thread = nil
+      @elicitation_request_callback = nil # MCP 2025-06-18
     end
 
     # Stream tool call fallback for SSE transport (yields single result)
@@ -407,6 +414,125 @@ module MCPClient
         # Don't clear auth error as we need it for reporting the correct error
         # Don't reset @consecutive_ping_failures or @reconnect_attempts as they're tracked across reconnections
       end
+    end
+
+    # Register a callback for elicitation requests (MCP 2025-06-18)
+    # @param block [Proc] callback that receives (request_id, params) and returns response hash
+    # @return [void]
+    def on_elicitation_request(&block)
+      @elicitation_request_callback = block
+    end
+
+    # Handle incoming JSON-RPC request from server (MCP 2025-06-18)
+    # @param msg [Hash] the JSON-RPC request message
+    # @return [void]
+    def handle_server_request(msg)
+      request_id = msg['id']
+      method = msg['method']
+      params = msg['params'] || {}
+
+      @logger.debug("Received server request: #{method} (id: #{request_id})")
+
+      case method
+      when 'elicitation/create'
+        handle_elicitation_create(request_id, params)
+      else
+        # Unknown request method, send error response
+        send_error_response(request_id, -32_601, "Method not found: #{method}")
+      end
+    rescue StandardError => e
+      @logger.error("Error handling server request: #{e.message}")
+      send_error_response(request_id, -32_603, "Internal error: #{e.message}")
+    end
+
+    # Handle elicitation/create request from server (MCP 2025-06-18)
+    # @param request_id [String, Integer] the JSON-RPC request ID
+    # @param params [Hash] the elicitation parameters
+    # @return [void]
+    def handle_elicitation_create(request_id, params)
+      # If no callback is registered, decline the request
+      unless @elicitation_request_callback
+        @logger.warn('Received elicitation request but no callback registered, declining')
+        send_elicitation_response(request_id, { 'action' => 'decline' })
+        return
+      end
+
+      # Call the registered callback
+      result = @elicitation_request_callback.call(request_id, params)
+
+      # Send the response back to the server
+      send_elicitation_response(request_id, result)
+    end
+
+    # Send elicitation response back to server via HTTP POST (MCP 2025-06-18)
+    # @param request_id [String, Integer] the JSON-RPC request ID
+    # @param result [Hash] the elicitation result (action and optional content)
+    # @return [void]
+    def send_elicitation_response(request_id, result)
+      ensure_initialized
+
+      response = {
+        'jsonrpc' => '2.0',
+        'id' => request_id,
+        'result' => result
+      }
+
+      # Send response via HTTP POST to the RPC endpoint
+      post_jsonrpc_response(response)
+    rescue StandardError => e
+      @logger.error("Error sending elicitation response: #{e.message}")
+    end
+
+    # Send error response back to server via HTTP POST (MCP 2025-06-18)
+    # @param request_id [String, Integer] the JSON-RPC request ID
+    # @param code [Integer] the error code
+    # @param message [String] the error message
+    # @return [void]
+    def send_error_response(request_id, code, message)
+      ensure_initialized
+
+      response = {
+        'jsonrpc' => '2.0',
+        'id' => request_id,
+        'error' => {
+          'code' => code,
+          'message' => message
+        }
+      }
+
+      # Send response via HTTP POST to the RPC endpoint
+      post_jsonrpc_response(response)
+    rescue StandardError => e
+      @logger.error("Error sending error response: #{e.message}")
+    end
+
+    # Post a JSON-RPC response message to the server via HTTP
+    # @param response [Hash] the JSON-RPC response
+    # @return [void]
+    # @private
+    def post_jsonrpc_response(response)
+      unless @rpc_endpoint
+        @logger.error('Cannot send response: RPC endpoint not available')
+        return
+      end
+
+      # Use the same connection pattern as post_json_rpc_request
+      uri = URI.parse(@base_url)
+      base = "#{uri.scheme}://#{uri.host}:#{uri.port}"
+      @rpc_conn ||= create_json_rpc_connection(base)
+
+      json_body = JSON.generate(response)
+
+      @rpc_conn.post do |req|
+        req.url @rpc_endpoint
+        req.headers['Content-Type'] = 'application/json'
+        @headers.each { |k, v| req.headers[k] = v }
+        req.body = json_body
+      end
+
+      @logger.debug("Sent response via HTTP POST: #{json_body}")
+    rescue StandardError => e
+      @logger.error("Failed to send response via HTTP POST: #{e.message}")
     end
 
     private

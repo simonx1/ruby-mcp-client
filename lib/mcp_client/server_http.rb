@@ -12,6 +12,14 @@ module MCPClient
   # Implementation of MCP server that communicates via HTTP requests/responses
   # Useful for communicating with MCP servers that support HTTP-based transport
   # without Server-Sent Events streaming
+  #
+  # @note Elicitation Support (MCP 2025-06-18)
+  #   This transport does NOT support server-initiated elicitation requests.
+  #   The HTTP transport uses a pure request-response architecture where only the client
+  #   can initiate requests. For elicitation support, use one of these transports instead:
+  #   - ServerStdio: Full bidirectional JSON-RPC over stdin/stdout
+  #   - ServerSSE: Server requests via SSE stream, client responses via HTTP POST
+  #   - ServerStreamableHTTP: Server requests via SSE-formatted responses, client responses via HTTP POST
   class ServerHTTP < ServerBase
     require_relative 'server_http/json_rpc_transport'
 

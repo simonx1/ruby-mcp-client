@@ -21,7 +21,8 @@ module MCPClient
     # Initialize a new MCPClient::Client
     # @param mcp_server_configs [Array<Hash>] configurations for MCP servers
     # @param logger [Logger, nil] optional logger, defaults to STDOUT
-    def initialize(mcp_server_configs: [], logger: nil)
+    # @param elicitation_handler [Proc, nil] optional handler for elicitation requests (MCP 2025-06-18)
+    def initialize(mcp_server_configs: [], logger: nil, elicitation_handler: nil)
       @logger = logger || Logger.new($stdout, level: Logger::WARN)
       @logger.progname = self.class.name
       @logger.formatter = proc { |severity, _datetime, progname, msg| "#{severity} [#{progname}] #{msg}\n" }
@@ -34,6 +35,8 @@ module MCPClient
       @resource_cache = {}
       # JSON-RPC notification listeners
       @notification_listeners = []
+      # Elicitation handler (MCP 2025-06-18)
+      @elicitation_handler = elicitation_handler
       # Register default and user-defined notification handlers on each server
       @servers.each do |server|
         server.on_notification do |method, params|
@@ -41,6 +44,10 @@ module MCPClient
           process_notification(server, method, params)
           # Invoke user-defined listeners
           @notification_listeners.each { |cb| cb.call(server, method, params) }
+        end
+        # Register elicitation handler on each server
+        if server.respond_to?(:on_elicitation_request)
+          server.on_elicitation_request(&method(:handle_elicitation_request))
         end
       end
     end
@@ -597,6 +604,71 @@ module MCPClient
         raise MCPClient::Errors::ResourceReadError,
               "Error reading resource '#{uri}': #{e.message} (Server: #{server_id})"
       end
+    end
+
+    # Handle elicitation request from server (MCP 2025-06-18)
+    # @param request_id [String, Integer] the JSON-RPC request ID
+    # @param params [Hash] the elicitation parameters
+    # @return [Hash] the elicitation response
+    def handle_elicitation_request(_request_id, params)
+      # If no handler is configured, decline the request
+      unless @elicitation_handler
+        @logger.warn('Received elicitation request but no handler configured, declining')
+        return { 'action' => 'decline' }
+      end
+
+      message = params['message']
+      schema = params['schema'] || params['requestedSchema']
+      metadata = params['metadata']
+
+      begin
+        # Call the user-defined handler
+        result = case @elicitation_handler.arity
+                 when 0
+                   @elicitation_handler.call
+                 when 1
+                   @elicitation_handler.call(message)
+                 when 2, -1
+                   @elicitation_handler.call(message, schema)
+                 else
+                   @elicitation_handler.call(message, schema, metadata)
+                 end
+
+        # Validate and format response
+        case result
+        when Hash
+          if result['action']
+            normalised_action_response(result)
+          elsif result[:action]
+            # Convert symbol keys to strings
+            {
+              'action' => result[:action].to_s,
+              'content' => result[:content]
+            }.compact.then { |payload| normalised_action_response(payload) }
+          else
+            # Assume it's content for an accept action
+            { 'action' => 'accept', 'content' => result }
+          end
+        when nil
+          { 'action' => 'cancel' }
+        else
+          { 'action' => 'accept', 'content' => result }
+        end
+      rescue StandardError => e
+        @logger.error("Elicitation handler error: #{e.message}")
+        @logger.debug(e.backtrace.join("\n"))
+        { 'action' => 'decline' }
+      end
+    end
+
+    # Ensure the action value conforms to MCP spec (accept, decline, cancel)
+    # Falls back to accept for unknown action values.
+    def normalised_action_response(result)
+      action = result['action']
+      return result if %w[accept decline cancel].include?(action)
+
+      @logger.warn("Unknown elicitation action '#{action}', defaulting to accept")
+      result.merge('action' => 'accept')
     end
   end
 end

@@ -31,6 +31,7 @@ module MCPClient
           data = JSON.parse(event[:data])
 
           return if process_error_in_message(data)
+          return if process_server_request?(data)
           return if process_notification?(data)
 
           process_response?(data)
@@ -55,6 +56,16 @@ module MCPClient
         handle_sse_auth_error_message(error_message) if authorization_error?(error_message, error_code)
 
         @logger.error("Server error: #{error_message}")
+        true
+      end
+
+      # Process a JSON-RPC request from server (has both id AND method)
+      # @param data [Hash] the parsed JSON payload
+      # @return [Boolean] true if we saw & handled a server request
+      def process_server_request?(data)
+        return false unless data['method'] && data.key?('id')
+
+        handle_server_request(data)
         true
       end
 
