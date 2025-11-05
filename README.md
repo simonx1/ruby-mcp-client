@@ -46,6 +46,7 @@ This Ruby MCP Client implements features from the latest MCP specifications:
 
 ### MCP 2025-06-18 Features
 - **Structured Tool Outputs** - Tools can declare output schemas and return type-safe, validated structured data
+- **Elicitation (Server-initiated User Interactions)** - Servers can request user input during tool execution via bidirectional JSON-RPC (stdio transport only)
 
 ### MCP 2025-03-26 Features
 - **Tool Annotations** - Support for tool behavior annotations (readOnly, destructive, requiresConfirmation) for safer tool execution
@@ -1134,6 +1135,117 @@ The example includes a Python MCP server (`examples/structured_output_server.py`
 - `analyze_text` - Text analysis with word count, character count, statistics
 - `calculate_stats` - Statistical calculations (mean, median, min, max, etc.)
 
+## Elicitation (Server-initiated User Interactions) - MCP 2025-06-18
+
+Elicitation enables MCP servers to request user input during tool execution via bidirectional JSON-RPC.
+This allows servers to gather additional information, confirm sensitive operations, or interact with users
+dynamically during the execution of tools.
+
+### Transport Support
+
+**Fully Supported:**
+- ✅ **stdio** - Full bidirectional JSON-RPC over stdin/stdout
+- ✅ **SSE** - Server sends requests via SSE stream, client responds via HTTP POST
+- ✅ **Streamable HTTP** - Server sends requests via SSE-formatted responses, client responds via HTTP POST
+
+**Not Supported:**
+- ❌ **HTTP** - Pure request-response architecture prevents server-initiated requests
+
+### Using Elicitation
+
+To use elicitation, register a handler when creating the client:
+
+```ruby
+# Define an elicitation handler
+elicitation_handler = lambda do |message, requested_schema|
+  puts "Server requests: #{message}"
+
+  # Show expected input format from schema
+  if requested_schema && requested_schema['properties']
+    requested_schema['properties'].each do |field, schema|
+      puts "  #{field}: #{schema['type']}"
+    end
+  end
+
+  # Prompt user and return one of three response types:
+
+  # 1. Accept and provide data
+  {
+    'action' => 'accept',
+    'content' => {
+      'field_name' => 'user_input_value'
+    }
+  }
+
+  # 2. Decline to provide input
+  # { 'action' => 'decline' }
+
+  # 3. Cancel the operation
+  # { 'action' => 'cancel' }
+end
+
+# Create client with elicitation handler
+# Works with stdio, SSE, and Streamable HTTP transports
+client = MCPClient::Client.new(
+  mcp_server_configs: [
+    # Stdio transport
+    MCPClient.stdio_config(
+      command: 'python my_server.py',
+      name: 'my-server'
+    ),
+    # Or SSE transport
+    MCPClient.sse_config(
+      base_url: 'https://api.example.com/sse',
+      name: 'remote-server'
+    ),
+    # Or Streamable HTTP transport
+    MCPClient.streamable_http_config(
+      base_url: 'https://api.example.com/mcp',
+      name: 'streamable-server'
+    )
+  ],
+  elicitation_handler: elicitation_handler
+)
+
+# When calling tools, the server may send elicitation requests
+result = client.call_tool('create_document', { format: 'markdown' })
+# Server may request title and content via elicitation during execution
+```
+
+### Response Actions
+
+The elicitation handler should return a hash with an `action` field:
+
+1. **Accept** - Provide the requested input:
+   ```ruby
+   {
+     'action' => 'accept',
+     'content' => { 'field' => 'value' }  # Must match requested schema
+   }
+   ```
+
+2. **Decline** - Refuse to provide input (server should handle gracefully):
+   ```ruby
+   { 'action' => 'decline' }
+   ```
+
+3. **Cancel** - Cancel the entire operation:
+   ```ruby
+   { 'action' => 'cancel' }
+   ```
+
+### Example
+
+See `examples/test_elicitation.rb` for a complete working example demonstrating:
+- Registering an elicitation handler
+- Handling different message types and schemas
+- Responding with accept/decline/cancel actions
+- Interactive user prompts during tool execution
+
+The example includes a Python MCP server (`examples/elicitation_server.py`) that provides tools using elicitation:
+- `create_document` - Requests title and content via elicitation
+- `sensitive_operation` - Requires user confirmation before executing
+
 ## Key Features
 
 ### Client Features
@@ -1146,6 +1258,7 @@ The example includes a Python MCP server (`examples/structured_output_server.py`
 - **Tool discovery** - Find tools by name or pattern
 - **Structured outputs** - Support for MCP 2025-06-18 structured tool outputs with output schemas and type-safe responses
 - **Tool annotations** - Support for readOnly, destructive, and requiresConfirmation annotations with helper methods
+- **Elicitation support** - Server-initiated user interactions during tool execution (stdio, SSE, and Streamable HTTP transports)
 - **Server disambiguation** - Specify which server to use when tools with same name exist in multiple servers
 - **Atomic tool calls** - Simple API for invoking tools with parameters
 - **Batch support** - Call multiple tools in a single operation

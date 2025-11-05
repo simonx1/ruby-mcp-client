@@ -46,6 +46,7 @@ module MCPClient
       @retry_backoff = retry_backoff
       @read_timeout  = read_timeout
       @env           = env || {}
+      @elicitation_request_callback = nil # MCP 2025-06-18
     end
 
     # Server info from the initialize response
@@ -95,12 +96,20 @@ module MCPClient
     def handle_line(line)
       msg = JSON.parse(line)
       @logger.debug("Received line: #{line.chomp}")
+
+      # Dispatch JSON-RPC requests from server (has id AND method) - MCP 2025-06-18
+      if msg['method'] && msg.key?('id')
+        handle_server_request(msg)
+        return
+      end
+
       # Dispatch JSON-RPC notifications (no id, has method)
       if msg['method'] && !msg.key?('id')
         @notification_callback&.call(msg['method'], msg['params'])
         return
       end
-      # Handle standard JSON-RPC responses
+
+      # Handle standard JSON-RPC responses (has id, no method)
       id = msg['id']
       return unless id
 
@@ -329,6 +338,96 @@ module MCPClient
       res['result']
     rescue StandardError => e
       raise MCPClient::Errors::ToolCallError, "Error calling tool '#{tool_name}': #{e.message}"
+    end
+
+    # Register a callback for elicitation requests (MCP 2025-06-18)
+    # @param block [Proc] callback that receives (request_id, params) and returns response hash
+    # @return [void]
+    def on_elicitation_request(&block)
+      @elicitation_request_callback = block
+    end
+
+    # Handle incoming JSON-RPC request from server (MCP 2025-06-18)
+    # @param msg [Hash] the JSON-RPC request message
+    # @return [void]
+    def handle_server_request(msg)
+      request_id = msg['id']
+      method = msg['method']
+      params = msg['params'] || {}
+
+      @logger.debug("Received server request: #{method} (id: #{request_id})")
+
+      case method
+      when 'elicitation/create'
+        handle_elicitation_create(request_id, params)
+      else
+        # Unknown request method, send error response
+        send_error_response(request_id, -32_601, "Method not found: #{method}")
+      end
+    rescue StandardError => e
+      @logger.error("Error handling server request: #{e.message}")
+      send_error_response(request_id, -32_603, "Internal error: #{e.message}")
+    end
+
+    # Handle elicitation/create request from server (MCP 2025-06-18)
+    # @param request_id [String, Integer] the JSON-RPC request ID
+    # @param params [Hash] the elicitation parameters
+    # @return [void]
+    def handle_elicitation_create(request_id, params)
+      # If no callback is registered, decline the request
+      unless @elicitation_request_callback
+        @logger.warn('Received elicitation request but no callback registered, declining')
+        send_elicitation_response(request_id, { 'action' => 'decline' })
+        return
+      end
+
+      # Call the registered callback
+      result = @elicitation_request_callback.call(request_id, params)
+
+      # Send the response back to the server
+      send_elicitation_response(request_id, result)
+    end
+
+    # Send elicitation response back to server (MCP 2025-06-18)
+    # @param request_id [String, Integer] the JSON-RPC request ID
+    # @param result [Hash] the elicitation result (action and optional content)
+    # @return [void]
+    def send_elicitation_response(request_id, result)
+      response = {
+        'jsonrpc' => '2.0',
+        'id' => request_id,
+        'result' => result
+      }
+      send_message(response)
+    end
+
+    # Send error response back to server (MCP 2025-06-18)
+    # @param request_id [String, Integer] the JSON-RPC request ID
+    # @param code [Integer] the error code
+    # @param message [String] the error message
+    # @return [void]
+    def send_error_response(request_id, code, message)
+      response = {
+        'jsonrpc' => '2.0',
+        'id' => request_id,
+        'error' => {
+          'code' => code,
+          'message' => message
+        }
+      }
+      send_message(response)
+    end
+
+    # Send a JSON-RPC message to the server
+    # @param message [Hash] the message to send
+    # @return [void]
+    def send_message(message)
+      json = JSON.generate(message)
+      @stdin.puts(json)
+      @stdin.flush
+      @logger.debug("Sent message: #{json}")
+    rescue StandardError => e
+      @logger.error("Error sending message: #{e.message}")
     end
 
     # Clean up the server connection

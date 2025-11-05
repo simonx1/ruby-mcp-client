@@ -116,6 +116,7 @@ module MCPClient
       @events_connection = nil
       @events_thread = nil
       @buffer = '' # Buffer for partial SSE event data
+      @elicitation_request_callback = nil # MCP 2025-06-18
     end
 
     # Connect to the MCP server over Streamable HTTP
@@ -755,12 +756,12 @@ module MCPClient
         # Handle ping requests from server (keepalive mechanism)
         if message['method'] == 'ping' && message.key?('id')
           handle_ping_request(message['id'])
+        elsif message['method'] && message.key?('id')
+          # Handle server-to-client requests (MCP 2025-06-18)
+          handle_server_request(message)
         elsif message['method'] && !message.key?('id')
           # Handle server notifications (messages without id)
           @notification_callback&.call(message['method'], message['params'])
-        elsif message.key?('id')
-          # This might be a server-to-client request (future MCP versions)
-          @logger.warn("Received unhandled server request: #{message['method']}")
         end
       rescue JSON::ParserError => e
         @logger.error("Invalid JSON in server message: #{e.message}")
@@ -794,6 +795,118 @@ module MCPClient
         end
       rescue StandardError => e
         @logger.error("Failed to send pong response: #{e.message}")
+      end
+    end
+
+    # Register a callback for elicitation requests (MCP 2025-06-18)
+    # @param block [Proc] callback that receives (request_id, params) and returns response hash
+    # @return [void]
+    def on_elicitation_request(&block)
+      @elicitation_request_callback = block
+    end
+
+    # Handle incoming JSON-RPC request from server (MCP 2025-06-18)
+    # @param msg [Hash] the JSON-RPC request message
+    # @return [void]
+    def handle_server_request(msg)
+      request_id = msg['id']
+      method = msg['method']
+      params = msg['params'] || {}
+
+      @logger.debug("Received server request: #{method} (id: #{request_id})")
+
+      case method
+      when 'elicitation/create'
+        handle_elicitation_create(request_id, params)
+      else
+        # Unknown request method, send error response
+        send_error_response(request_id, -32_601, "Method not found: #{method}")
+      end
+    rescue StandardError => e
+      @logger.error("Error handling server request: #{e.message}")
+      send_error_response(request_id, -32_603, "Internal error: #{e.message}")
+    end
+
+    # Handle elicitation/create request from server (MCP 2025-06-18)
+    # @param request_id [String, Integer] the JSON-RPC request ID
+    # @param params [Hash] the elicitation parameters
+    # @return [void]
+    def handle_elicitation_create(request_id, params)
+      # If no callback is registered, decline the request
+      unless @elicitation_request_callback
+        @logger.warn('Received elicitation request but no callback registered, declining')
+        send_elicitation_response(request_id, { 'action' => 'decline' })
+        return
+      end
+
+      # Call the registered callback
+      result = @elicitation_request_callback.call(request_id, params)
+
+      # Send the response back to the server
+      send_elicitation_response(request_id, result)
+    end
+
+    # Send elicitation response back to server via HTTP POST (MCP 2025-06-18)
+    # @param request_id [String, Integer] the JSON-RPC request ID
+    # @param result [Hash] the elicitation result (action and optional content)
+    # @return [void]
+    def send_elicitation_response(request_id, result)
+      response = {
+        'jsonrpc' => '2.0',
+        'id' => request_id,
+        'result' => result
+      }
+
+      # Send response via HTTP POST to the endpoint (same as pong)
+      post_jsonrpc_response(response)
+    rescue StandardError => e
+      @logger.error("Error sending elicitation response: #{e.message}")
+    end
+
+    # Send error response back to server via HTTP POST (MCP 2025-06-18)
+    # @param request_id [String, Integer] the JSON-RPC request ID
+    # @param code [Integer] the error code
+    # @param message [String] the error message
+    # @return [void]
+    def send_error_response(request_id, code, message)
+      response = {
+        'jsonrpc' => '2.0',
+        'id' => request_id,
+        'error' => {
+          'code' => code,
+          'message' => message
+        }
+      }
+
+      # Send response via HTTP POST to the endpoint
+      post_jsonrpc_response(response)
+    rescue StandardError => e
+      @logger.error("Error sending error response: #{e.message}")
+    end
+
+    # Post a JSON-RPC response message to the server via HTTP
+    # @param response [Hash] the JSON-RPC response
+    # @return [void]
+    # @private
+    def post_jsonrpc_response(response)
+      # Send response in a separate thread to avoid blocking event processing
+      Thread.new do
+        conn = http_connection
+        json_body = JSON.generate(response)
+
+        resp = conn.post(@endpoint) do |req|
+          @headers.each { |k, v| req.headers[k] = v }
+          req.headers['Mcp-Session-Id'] = @session_id if @session_id
+          req.body = json_body
+        end
+
+        if resp.success?
+          @logger.debug("Sent JSON-RPC response: #{json_body}")
+        else
+          @logger.warn("Failed to send JSON-RPC response: HTTP #{resp.status}")
+        end
+      rescue StandardError => e
+        @logger.error("Failed to send JSON-RPC response: #{e.message}")
       end
     end
   end

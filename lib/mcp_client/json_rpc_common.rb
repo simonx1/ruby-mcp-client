@@ -64,7 +64,9 @@ module MCPClient
     def initialization_params
       {
         'protocolVersion' => MCPClient::PROTOCOL_VERSION,
-        'capabilities' => {},
+        'capabilities' => {
+          'elicitation' => {} # MCP 2025-06-18: Support for server-initiated user interactions
+        },
         'clientInfo' => { 'name' => 'ruby-mcp-client', 'version' => MCPClient::VERSION }
       }
     end
