@@ -179,15 +179,18 @@ module MCPClient
       # Build OAuth discovery URL from server URL
       # Uses only the origin (scheme + host + port) for discovery
       # @param server_url [String] Full MCP server URL
+      # @param discovery_type [Symbol] Type of discovery endpoint (:authorization_server or :protected_resource)
       # @return [String] Discovery URL
-      def build_discovery_url(server_url)
+      def build_discovery_url(server_url, discovery_type = :authorization_server)
         uri = URI.parse(server_url)
 
         # Build origin URL (scheme + host + port)
         origin = "#{uri.scheme}://#{uri.host}"
         origin += ":#{uri.port}" if uri.port && !default_port?(uri)
 
-        "#{origin}/.well-known/oauth-protected-resource"
+        # Select discovery endpoint based on type
+        endpoint = discovery_type == :authorization_server ? 'oauth-authorization-server' : 'oauth-protected-resource'
+        "#{origin}/.well-known/#{endpoint}"
       end
 
       # Check if URI uses default port for its scheme
@@ -199,6 +202,9 @@ module MCPClient
       end
 
       # Discover authorization server metadata
+      # Tries multiple discovery patterns:
+      # 1. oauth-authorization-server (MCP spec pattern - server is its own auth server)
+      # 2. oauth-protected-resource (delegation pattern - points to external auth server)
       # @return [ServerMetadata] Authorization server metadata
       # @raise [MCPClient::Errors::ConnectionError] if discovery fails
       def discover_authorization_server
@@ -207,18 +213,40 @@ module MCPClient
           return cached
         end
 
-        # Build discovery URL using the origin (scheme + host + port) only
-        discovery_url = build_discovery_url(server_url)
+        server_metadata = nil
 
-        # Fetch resource metadata to find authorization server
-        resource_metadata = fetch_resource_metadata(discovery_url)
+        # Primary discovery: oauth-authorization-server (MCP spec pattern)
+        # Used by servers that are both resource and authorization server
+        begin
+          discovery_url = build_discovery_url(server_url, :authorization_server)
+          logger.debug("Attempting OAuth discovery: #{discovery_url}")
+          server_metadata = fetch_server_metadata(discovery_url)
+        rescue MCPClient::Errors::ConnectionError => e
+          logger.debug("oauth-authorization-server discovery failed: #{e.message}")
+        end
 
-        # Get first authorization server
-        auth_server_url = resource_metadata.authorization_servers.first
-        raise MCPClient::Errors::ConnectionError, 'No authorization servers found' unless auth_server_url
+        # Fallback discovery: oauth-protected-resource (delegation pattern)
+        # Used by resource servers that delegate to external authorization servers
+        unless server_metadata
+          begin
+            discovery_url = build_discovery_url(server_url, :protected_resource)
+            logger.debug("Attempting OAuth discovery: #{discovery_url}")
 
-        # Fetch authorization server metadata
-        server_metadata = fetch_server_metadata("#{auth_server_url}/.well-known/oauth-authorization-server")
+            resource_metadata = fetch_resource_metadata(discovery_url)
+            auth_server_url = resource_metadata.authorization_servers.first
+
+            if auth_server_url
+              server_metadata = fetch_server_metadata("#{auth_server_url}/.well-known/oauth-authorization-server")
+            end
+          rescue MCPClient::Errors::ConnectionError => e
+            logger.debug("oauth-protected-resource discovery failed: #{e.message}")
+          end
+        end
+
+        unless server_metadata
+          raise MCPClient::Errors::ConnectionError,
+                'OAuth discovery failed: no valid endpoints found'
+        end
 
         # Cache the metadata
         storage.set_server_metadata(server_url, server_metadata)
@@ -279,10 +307,12 @@ module MCPClient
       def get_or_register_client(server_metadata)
         # Try to get existing client info from storage
         if (client_info = storage.get_client_info(server_url)) && !client_info.client_secret_expired?
+          logger.debug("Using cached OAuth client for #{server_url}")
           return client_info
         end
 
         # Register new client if server supports it
+        logger.debug('No cached client found, registering new OAuth client...')
         if server_metadata.supports_registration?
           register_client(server_metadata)
         else
@@ -317,12 +347,33 @@ module MCPClient
         end
 
         data = JSON.parse(response.body)
+        logger.debug("OAuth client registered successfully: #{data['client_id']}")
+
+        # Parse registered metadata from server response (may differ from our request)
+        registered_metadata = ClientMetadata.new(
+          redirect_uris: data['redirect_uris'] || [redirect_uri],
+          token_endpoint_auth_method: data['token_endpoint_auth_method'] || 'none',
+          grant_types: data['grant_types'] || %w[authorization_code refresh_token],
+          response_types: data['response_types'] || ['code'],
+          scope: data['scope']
+        )
+
+        # Warn if server changed redirect_uri
+        requested_uri = redirect_uri
+        registered_uri = registered_metadata.redirect_uris.first
+        if registered_uri != requested_uri
+          logger.warn('OAuth server changed redirect_uri:')
+          logger.warn("  Requested:  #{requested_uri}")
+          logger.warn("  Registered: #{registered_uri}")
+          logger.warn("Using server's registered redirect_uri for token exchange.")
+        end
+
         client_info = ClientInfo.new(
           client_id: data['client_id'],
           client_secret: data['client_secret'],
           client_id_issued_at: data['client_id_issued_at'],
           client_secret_expires_at: data['client_secret_expires_at'],
-          metadata: metadata
+          metadata: registered_metadata
         )
 
         # Store client info
@@ -342,10 +393,13 @@ module MCPClient
       # @param state [String] State parameter
       # @return [String] Authorization URL
       def build_authorization_url(server_metadata, client_info, pkce, state)
+        # Use the redirect_uri that was actually registered
+        registered_redirect_uri = client_info.metadata.redirect_uris.first
+
         params = {
           response_type: 'code',
           client_id: client_info.client_id,
-          redirect_uri: redirect_uri,
+          redirect_uri: registered_redirect_uri,
           scope: scope,
           state: state,
           code_challenge: pkce.code_challenge,
@@ -366,21 +420,51 @@ module MCPClient
       # @return [Token] Access token
       # @raise [MCPClient::Errors::ConnectionError] if token exchange fails
       def exchange_authorization_code(server_metadata, client_info, code, pkce)
-        logger.debug("Exchanging authorization code for token at: #{server_metadata.token_endpoint}")
+        logger.debug('Exchanging authorization code for access token')
+
+        # Use the redirect_uri that was actually registered, not our requested one
+        registered_redirect_uri = client_info.metadata.redirect_uris.first
 
         params = {
           grant_type: 'authorization_code',
           code: code,
-          redirect_uri: redirect_uri,
+          redirect_uri: registered_redirect_uri,
           client_id: client_info.client_id,
           code_verifier: pkce.code_verifier,
           resource: server_url
         }
 
-        response = @http_client.post(server_metadata.token_endpoint) do |req|
-          req.headers['Content-Type'] = 'application/x-www-form-urlencoded'
-          req.headers['Accept'] = 'application/json'
-          req.body = URI.encode_www_form(params)
+        # Add client_secret if required by token_endpoint_auth_method
+        if client_info.client_secret && client_info.metadata.token_endpoint_auth_method == 'client_secret_post'
+          params[:client_secret] = client_info.client_secret
+        end
+
+        request_body = URI.encode_www_form(params)
+
+        send_token_request = lambda do |body|
+          @http_client.post(server_metadata.token_endpoint) do |req|
+            req.headers['Content-Type'] = 'application/x-www-form-urlencoded'
+            req.headers['Accept'] = 'application/json'
+            req.body = body
+          end
+        end
+
+        response = send_token_request.call(request_body)
+
+        unless response.success?
+          redirect_hint = extract_redirect_mismatch(response.body)
+
+          if redirect_hint && redirect_hint[:expected] && redirect_hint[:expected] != registered_redirect_uri
+            expected_uri = redirect_hint[:expected]
+            logger.warn(
+              "Token exchange failed: redirect_uri mismatch. Retrying with server's expected value: #{expected_uri}"
+            )
+
+            params[:redirect_uri] = redirect_hint[:expected]
+            retry_body = URI.encode_www_form(params)
+
+            response = send_token_request.call(retry_body)
+          end
         end
 
         unless response.success?
@@ -421,6 +505,11 @@ module MCPClient
           resource: server_url
         }
 
+        # Add client_secret if required by token_endpoint_auth_method
+        if client_info.client_secret && client_info.metadata.token_endpoint_auth_method == 'client_secret_post'
+          params[:client_secret] = client_info.client_secret
+        end
+
         response = @http_client.post(server_metadata.token_endpoint) do |req|
           req.headers['Content-Type'] = 'application/x-www-form-urlencoded'
           req.headers['Accept'] = 'application/json'
@@ -448,6 +537,29 @@ module MCPClient
         nil
       rescue Faraday::Error => e
         logger.warn("Network error during token refresh: #{e.message}")
+        nil
+      end
+
+      # Extract redirect_uri mismatch details from an OAuth error response
+      # @param body [String] Raw HTTP response body
+      # @return [Hash, nil] Hash with :sent and :expected URIs if mismatch detected
+      def extract_redirect_mismatch(body)
+        data = JSON.parse(body)
+        error = data['error'] || data[:error]
+        return nil unless error == 'unauthorized_client'
+
+        description = data['error_description'] || data[:error_description]
+        return nil unless description.is_a?(String)
+
+        match = description.match(%r{You sent\s+(https?://\S+)[,.]?\s+and we expected\s+(https?://\S+)}i)
+        return nil unless match
+
+        {
+          sent: match[1],
+          expected: match[2],
+          description: description
+        }
+      rescue JSON::ParserError
         nil
       end
 

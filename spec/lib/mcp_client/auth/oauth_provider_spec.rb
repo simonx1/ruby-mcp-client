@@ -36,13 +36,22 @@ RSpec.describe MCPClient::Auth::OAuthProvider do
   end
 
   describe 'OAuth discovery URL generation' do
-    it 'generates correct discovery URL for full server URL with path and query' do
+    it 'generates correct authorization-server discovery URL (default)' do
       provider = described_class.new(
         server_url: 'https://mcp.zapier.com/api/mcp/a/123/mcp?serverId=abc-123'
       )
 
-      # Access private method for testing
+      # Access private method for testing - defaults to :authorization_server
       discovery_url = provider.send(:build_discovery_url, provider.server_url)
+      expect(discovery_url).to eq('https://mcp.zapier.com/.well-known/oauth-authorization-server')
+    end
+
+    it 'generates correct protected-resource discovery URL when specified' do
+      provider = described_class.new(
+        server_url: 'https://mcp.zapier.com/api/mcp/a/123/mcp?serverId=abc-123'
+      )
+
+      discovery_url = provider.send(:build_discovery_url, provider.server_url, :protected_resource)
       expect(discovery_url).to eq('https://mcp.zapier.com/.well-known/oauth-protected-resource')
     end
 
@@ -50,14 +59,14 @@ RSpec.describe MCPClient::Auth::OAuthProvider do
       provider = described_class.new(server_url: 'https://api.example.com')
 
       discovery_url = provider.send(:build_discovery_url, provider.server_url)
-      expect(discovery_url).to eq('https://api.example.com/.well-known/oauth-protected-resource')
+      expect(discovery_url).to eq('https://api.example.com/.well-known/oauth-authorization-server')
     end
 
     it 'handles non-default ports correctly' do
       provider = described_class.new(server_url: 'https://api.example.com:8443/mcp')
 
       discovery_url = provider.send(:build_discovery_url, provider.server_url)
-      expect(discovery_url).to eq('https://api.example.com:8443/.well-known/oauth-protected-resource')
+      expect(discovery_url).to eq('https://api.example.com:8443/.well-known/oauth-authorization-server')
     end
   end
 
@@ -178,6 +187,93 @@ RSpec.describe MCPClient::Auth::OAuthProvider do
         result = oauth_provider.handle_unauthorized_response(response)
         expect(result).to be_nil
       end
+    end
+  end
+
+  describe '#exchange_authorization_code' do
+    let(:storage_instance) { MCPClient::Auth::OAuthProvider::MemoryStorage.new }
+    let(:logger) { instance_double('Logger') }
+    let(:provider) do
+      described_class.new(
+        server_url: 'https://3d4834530bf2.ngrok.app/mcp',
+        redirect_uri: redirect_uri,
+        logger: logger,
+        storage: storage_instance
+      )
+    end
+    let(:http_client) { double('Faraday::Connection') }
+    let(:server_metadata) do
+      instance_double(
+        'MCPClient::Auth::ServerMetadata',
+        token_endpoint: 'https://tropic-dev.us.auth0.com/oauth/token'
+      )
+    end
+    let(:client_metadata) do
+      MCPClient::Auth::ClientMetadata.new(
+        redirect_uris: [redirect_uri],
+        token_endpoint_auth_method: 'client_secret_post'
+      )
+    end
+    let(:client_info) do
+      MCPClient::Auth::ClientInfo.new(
+        client_id: 'client123',
+        client_secret: 'secret456',
+        metadata: client_metadata
+      )
+    end
+    let(:pkce) { instance_double('MCPClient::Auth::PKCE', code_verifier: 'verifier123') }
+    let(:requests) { [] }
+    let(:error_body) do
+      {
+        error: 'unauthorized_client',
+        error_description: 'The redirect URI is wrong. You sent http://localhost:8080, and we expected https://3d4834530bf2.ngrok.app'
+      }.to_json
+    end
+    let(:success_body) do
+      {
+        access_token: 'access-token',
+        token_type: 'Bearer'
+      }.to_json
+    end
+    let(:error_response) do
+      instance_double('Faraday::Response', success?: false, status: 403, body: error_body)
+    end
+    let(:success_response) do
+      instance_double('Faraday::Response', success?: true, status: 200, body: success_body)
+    end
+
+    before do
+      allow(logger).to receive(:info)
+      allow(logger).to receive(:warn)
+      allow(logger).to receive(:debug)
+
+      provider.instance_variable_set(:@http_client, http_client)
+      queue = [error_response, success_response]
+
+      allow(http_client).to receive(:post) do |url, &block|
+        expect(url).to eq(server_metadata.token_endpoint)
+
+        request = Struct.new(:headers, :body).new({}, nil)
+        block.call(request)
+        requests << request.body
+
+        response = queue.shift
+        raise 'No response stubbed for token request' unless response
+
+        response
+      end
+    end
+
+    it 'retries token exchange with server-provided redirect URI when mismatch occurs' do
+      token = provider.send(:exchange_authorization_code, server_metadata, client_info, 'auth-code', pkce)
+
+      expect(token.access_token).to eq('access-token')
+      expect(requests.length).to eq(2)
+      expect(requests.first).to include('redirect_uri=http%3A%2F%2Flocalhost%3A8080%2Fcallback')
+      expect(requests.last).to include('redirect_uri=https%3A%2F%2F3d4834530bf2.ngrok.app')
+      expected_message = "Token exchange failed: redirect_uri mismatch. Retrying with server's expected value: " \
+                         'https://3d4834530bf2.ngrok.app'
+      expect(logger).to have_received(:warn).with(expected_message)
     end
   end
 end

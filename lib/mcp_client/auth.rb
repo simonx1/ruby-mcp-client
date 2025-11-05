@@ -47,7 +47,7 @@ module MCPClient
       # Convert token to authorization header value
       # @return [String] Authorization header value
       def to_header
-        "#{@token_type} #{@access_token}"
+        "#{@token_type.capitalize} #{@access_token}"
       end
 
       # Convert to hash for serialization
