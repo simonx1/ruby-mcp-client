@@ -40,11 +40,14 @@ with popular AI services with built-in conversions:
 - `to_anthropic_tools()` - Formats tools for Anthropic Claude API
 - `to_google_tools()` - Formats tools for Google Vertex AI API (automatically removes "$schema" keys not accepted by Vertex AI)
 
-## MCP 2025-03-26 Protocol Features
+## MCP Protocol Support
 
-This Ruby MCP Client implements key features from the latest MCP specification (Protocol Revision: 2025-03-26):
+This Ruby MCP Client implements features from the latest MCP specifications:
 
-### Implemented Features
+### MCP 2025-06-18 Features
+- **Structured Tool Outputs** - Tools can declare output schemas and return type-safe, validated structured data
+
+### MCP 2025-03-26 Features
 - **Tool Annotations** - Support for tool behavior annotations (readOnly, destructive, requiresConfirmation) for safer tool execution
 - **OAuth 2.1 Authorization Framework** - Complete authentication with PKCE, dynamic client registration, server discovery, and runtime configuration
 - **Streamable HTTP Transport** - Enhanced transport with Server-Sent Event formatted responses and session management
@@ -582,14 +585,21 @@ client = Anthropic::Client.new(access_token: ENV['ANTHROPIC_API_KEY'])
 ```
 
 Complete examples can be found in the `examples/` directory:
+
+**AI Integration Examples:**
 - `ruby_openai_mcp.rb` - Integration with alexrudall/ruby-openai gem
 - `openai_ruby_mcp.rb` - Integration with official openai/openai-ruby gem
 - `ruby_anthropic_mcp.rb` - Integration with alexrudall/ruby-anthropic gem
 - `gemini_ai_mcp.rb` - Integration with Google Vertex AI and Gemini models
+
+**Transport Examples:**
 - `streamable_http_example.rb` - Streamable HTTP transport with Playwright MCP
 - `echo_server.py` & `echo_server_client.rb` - FastMCP server example with full setup
 - `echo_server_streamable.py` & `echo_server_streamable_client.rb` - Enhanced streamable HTTP server example
-- `echo_server_with_annotations.py` & `test_tool_annotations.rb` - Tool annotations demonstration
+
+**MCP 2025 Protocol Features:**
+- `structured_output_server.py` & `test_structured_outputs.rb` - Structured tool outputs (MCP 2025-06-18)
+- `echo_server_with_annotations.py` & `test_tool_annotations.rb` - Tool annotations (MCP 2025-03-26)
 
 ## MCP Server Compatibility
 
@@ -1062,6 +1072,68 @@ See `examples/test_tool_annotations.rb` for a complete working example demonstra
 - Making annotation-aware decisions about tool execution
 - Handling destructive operations safely
 
+## Structured Tool Outputs
+
+MCP 2025-06-18 introduces structured tool outputs, allowing tools to declare output schemas and return type-safe, validated data structures instead of just text.
+
+### Overview
+
+Tools can now specify an `outputSchema` (JSON Schema) that defines the expected structure of their results. When called, they return data in a `structuredContent` field that validates against this schema, providing:
+
+- **Type safety** - Predictable, validated data structures
+- **Better IDE support** - Code completion and type checking
+- **Easier parsing** - No need to parse text or guess formats
+- **Backward compatibility** - Text content is still provided alongside structured data
+
+### Using Structured Outputs
+
+```ruby
+# List tools and check for structured output support
+tools = client.list_tools
+
+tools.each do |tool|
+  if tool.structured_output?
+    puts "#{tool.name} supports structured output"
+    puts "Output schema: #{tool.output_schema}"
+  end
+end
+
+# Call a tool that returns structured output
+result = client.call_tool('get_weather', { location: 'San Francisco' })
+
+# Access structured data (type-safe, validated)
+if result['structuredContent']
+  data = result['structuredContent']
+  puts "Temperature: #{data['temperature']}°C"
+  puts "Conditions: #{data['conditions']}"
+  puts "Humidity: #{data['humidity']}%"
+end
+
+# Backward compatibility: text content is still available
+text_content = result['content']&.first&.dig('text')
+parsed = JSON.parse(text_content) if text_content
+```
+
+### Helper Methods
+
+The `Tool` class provides a convenient helper method:
+
+- `tool.structured_output?` - Returns true if the tool has an output schema defined
+- `tool.output_schema` - Returns the JSON Schema for the tool's output
+
+### Example
+
+See `examples/test_structured_outputs.rb` for a complete working example demonstrating:
+- Detecting tools with structured output support
+- Accessing output schemas
+- Calling tools and receiving structured data
+- Backward compatibility with text content
+
+The example includes a Python MCP server (`examples/structured_output_server.py`) that provides three tools with structured outputs:
+- `get_weather` - Weather data with temperature, conditions, humidity
+- `analyze_text` - Text analysis with word count, character count, statistics
+- `calculate_stats` - Statistical calculations (mean, median, min, max, etc.)
+
 ## Key Features
 
 ### Client Features
@@ -1072,6 +1144,7 @@ See `examples/test_tool_annotations.rb` for a complete working example demonstra
 - **Server lookup** - Find servers by name using `find_server`
 - **Tool association** - Each tool knows which server it belongs to
 - **Tool discovery** - Find tools by name or pattern
+- **Structured outputs** - Support for MCP 2025-06-18 structured tool outputs with output schemas and type-safe responses
 - **Tool annotations** - Support for readOnly, destructive, and requiresConfirmation annotations with helper methods
 - **Server disambiguation** - Specify which server to use when tools with same name exist in multiple servers
 - **Atomic tool calls** - Simple API for invoking tools with parameters
