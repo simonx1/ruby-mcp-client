@@ -617,21 +617,34 @@ module MCPClient
         return { 'action' => 'decline' }
       end
 
+      message = params['message']
+      schema = params['schema'] || params['requestedSchema']
+      metadata = params['metadata']
+
       begin
         # Call the user-defined handler
-        result = @elicitation_handler.call(params['message'], params['requestedSchema'])
+        result = case @elicitation_handler.arity
+                 when 0
+                   @elicitation_handler.call
+                 when 1
+                   @elicitation_handler.call(message)
+                 when 2, -1
+                   @elicitation_handler.call(message, schema)
+                 else
+                   @elicitation_handler.call(message, schema, metadata)
+                 end
 
         # Validate and format response
         case result
         when Hash
           if result['action']
-            result # Already formatted
+            normalised_action_response(result)
           elsif result[:action]
             # Convert symbol keys to strings
             {
               'action' => result[:action].to_s,
               'content' => result[:content]
-            }.compact
+            }.compact.then { |payload| normalised_action_response(payload) }
           else
             # Assume it's content for an accept action
             { 'action' => 'accept', 'content' => result }
@@ -646,6 +659,18 @@ module MCPClient
         @logger.debug(e.backtrace.join("\n"))
         { 'action' => 'decline' }
       end
+    end
+
+    private
+
+    # Ensure the action value conforms to MCP spec (accept, decline, cancel)
+    # Falls back to accept for unknown action values.
+    def normalised_action_response(result)
+      action = result['action']
+      return result if %w[accept decline cancel].include?(action)
+
+      @logger.warn("Unknown elicitation action '#{action}', defaulting to accept")
+      result.merge('action' => 'accept')
     end
   end
 end

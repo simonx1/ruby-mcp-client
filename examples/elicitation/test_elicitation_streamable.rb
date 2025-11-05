@@ -134,7 +134,7 @@ puts
 client = MCPClient::Client.new(
   mcp_server_configs: [
     {
-      server_type: 'streamable_http',
+      type: 'streamable_http',
       base_url: server_url,
       endpoint: server_endpoint,
       name: 'elicitation-demo',
@@ -142,7 +142,7 @@ client = MCPClient::Client.new(
         # Add any required authentication headers here
         # 'Authorization' => 'Bearer YOUR_TOKEN'
       },
-      read_timeout: 60, # Longer timeout for user interaction
+      read_timeout: 120, # Longer timeout for user interaction with elicitation
       retries: 3,
       retry_backoff: 1
     }
@@ -152,15 +152,9 @@ client = MCPClient::Client.new(
 )
 
 begin
-  # Connect to the server
-  puts 'Connecting to server...'
-  client.connect_to_all_servers
-  puts '✓ Connected!'
-  puts
-
   # List available tools
   puts 'Available tools:'
-  tools = client.list_all_tools
+  tools = client.list_tools
   tools.each do |tool|
     puts "  • #{tool.name}"
     puts "    #{tool.description}"
@@ -180,7 +174,7 @@ begin
   puts
 
   begin
-    result1 = client.call_tool('elicitation-demo', 'create_document', { format: 'markdown' })
+    result1 = client.call_tool('create_document', { format: 'markdown' }, server: 'elicitation-demo')
     puts "\n📄 Result:"
     puts result1['content'].first['text']
   rescue StandardError => e
@@ -199,7 +193,7 @@ begin
   puts
 
   begin
-    result2 = client.call_tool('elicitation-demo', 'delete_files', { file_pattern: '*.tmp' })
+    result2 = client.call_tool('delete_files', { file_pattern: '*.tmp' }, server: 'elicitation-demo')
     puts "\n🗑️  Result:"
     puts result2['content'].first['text']
   rescue StandardError => e
@@ -227,9 +221,9 @@ begin
 
   begin
     result3 = client.call_tool(
-      'elicitation-demo',
       'deploy_application',
-      { environment: environment, version: version }
+      { environment: environment, version: version },
+      server: 'elicitation-demo'
     )
     puts "\n🚀 Result:"
     puts result3['content'].first['text']

@@ -16,8 +16,14 @@ Elicitation enables MCP servers to request structured information from users dur
 |-----------|---------|-------|
 | **stdio** | ✅ Full | `elicitation_server.py`, `test_elicitation.rb` |
 | **Streamable HTTP** | ✅ Full | `elicitation_streamable_server.py`, `test_elicitation_streamable.rb` |
-| **SSE** | ✅ Full | (Works with any SSE server supporting elicitation) |
+| **SSE** | ✅ Full | `test_elicitation_sse_simple.rb` (uses streamable server) |
 | **HTTP** | ❌ Not supported | (Unidirectional request-response only) |
+
+**Note:** SSE and Streamable HTTP transports are very similar in this implementation. Both use:
+- Server-to-client: SSE (Server-Sent Events) for streaming requests
+- Client-to-server: HTTP POST for sending responses
+
+The `streamable_http` type works for both traditional SSE and unified streamable HTTP servers.
 
 ## Examples
 
@@ -31,13 +37,13 @@ Elicitation enables MCP servers to request structured information from users dur
 pip install mcp
 
 # Run server
-python examples/elicitation_server.py
+python examples/elicitation/elicitation_server.py
 ```
 
 #### Client: `test_elicitation.rb`
 ```bash
 # Run client (launches server automatically)
-ruby examples/test_elicitation.rb
+ruby examples/elicitation/test_elicitation.rb
 ```
 
 **Features:**
@@ -48,7 +54,7 @@ ruby examples/test_elicitation.rb
 
 **Tools Provided:**
 1. `create_document` - Asks for title and content via elicitation
-2. `sensitive_operation` - Requires user confirmation
+2. `send_notification` - Confirms before sending a notification
 
 ---
 
@@ -62,7 +68,7 @@ ruby examples/test_elicitation.rb
 pip install mcp starlette uvicorn sse-starlette
 
 # Run server
-python examples/elicitation_streamable_server.py
+python examples/elicitation/elicitation_streamable_server.py
 
 # Server runs on http://localhost:8000
 ```
@@ -70,12 +76,12 @@ python examples/elicitation_streamable_server.py
 #### Client: `test_elicitation_streamable.rb`
 ```bash
 # Make sure server is running first, then:
-ruby examples/test_elicitation_streamable.rb
+ruby examples/elicitation/test_elicitation_streamable.rb
 
 # Or specify custom server URL:
 export MCP_SERVER_URL='http://localhost:8000'
 export MCP_SERVER_ENDPOINT='/mcp'
-ruby examples/test_elicitation_streamable.rb
+ruby examples/elicitation/test_elicitation_streamable.rb
 ```
 
 **Features:**
@@ -89,6 +95,29 @@ ruby examples/test_elicitation_streamable.rb
 1. `create_document` - Multi-step: asks for title/author, then content
 2. `delete_files` - Confirmation with optional decline reason
 3. `deploy_application` - Multi-step: initial confirmation + production check
+
+---
+
+### 3. SSE Transport Example (Simple)
+
+**Quick Demo**: Minimal example with auto-response
+
+#### Client: `test_elicitation_sse_simple.rb`
+```bash
+# Make sure server is running first:
+python examples/elicitation/elicitation_streamable_server.py
+
+# Run simple SSE example:
+ruby examples/elicitation/test_elicitation_sse_simple.rb
+```
+
+**Features:**
+- ✅ Automatic elicitation responses (no user input required)
+- ✅ Clean, minimal code (~75 lines)
+- ✅ Perfect for testing and CI/CD
+- ✅ Uses `streamable_http` type (SSE-compatible)
+
+**Use Case:** Quick testing, automation, demos
 
 ---
 
@@ -180,14 +209,14 @@ client = MCPClient::Client.new(
   mcp_server_configs: [
     # stdio transport
     MCPClient.stdio_config(
-      command: 'python elicitation_server.py',
+      command: ['python', 'elicitation_server.py'],
       name: 'my-server'
     ),
 
     # OR Streamable HTTP transport
     MCPClient.streamable_http_config(
       base_url: 'http://localhost:8000',
-      endpoint: '/mcp',
+      endpoint: '/mcp/',  # Note: trailing slash required for FastMCP
       name: 'remote-server'
     ),
 
@@ -200,9 +229,8 @@ client = MCPClient::Client.new(
   elicitation_handler: elicitation_handler
 )
 
-# Connect and use
-client.connect_to_all_servers
-result = client.call_tool('my-server', 'create_document', { format: 'markdown' })
+# Call tools - connection happens automatically
+result = client.call_tool('create_document', { format: 'markdown' }, server: 'my-server')
 ```
 
 ---
@@ -300,7 +328,7 @@ python --version
 pip install mcp
 
 # Test server directly
-python examples/elicitation_server.py
+python examples/elicitation/elicitation_server.py
 # Should wait for JSON-RPC input on stdin
 ```
 
@@ -325,7 +353,7 @@ curl http://localhost:8000/mcp
 # Should return MCP response
 
 # Check server logs
-python examples/elicitation_streamable_server.py
+python examples/elicitation/elicitation_streamable_server.py
 ```
 
 **Problem**: Elicitation requests not received
@@ -355,14 +383,14 @@ Run the examples to verify elicitation works:
 
 ```bash
 # Test stdio transport
-ruby examples/test_elicitation.rb
+ruby examples/elicitation/test_elicitation.rb
 
 # Test Streamable HTTP transport
 # Terminal 1: Start server
-python examples/elicitation_streamable_server.py
+python examples/elicitation/elicitation_streamable_server.py
 
 # Terminal 2: Run client
-ruby examples/test_elicitation_streamable.rb
+ruby examples/elicitation/test_elicitation_streamable.rb
 ```
 
 ---

@@ -452,6 +452,13 @@ module MCPClient
       end
     end
 
+    # Register a callback for elicitation requests (MCP 2025-06-18)
+    # @param block [Proc] callback that receives (request_id, params) and returns response hash
+    # @return [void]
+    def on_elicitation_request(&block)
+      @elicitation_request_callback = block
+    end
+
     private
 
     def perform_initialize
@@ -798,13 +805,6 @@ module MCPClient
       end
     end
 
-    # Register a callback for elicitation requests (MCP 2025-06-18)
-    # @param block [Proc] callback that receives (request_id, params) and returns response hash
-    # @return [void]
-    def on_elicitation_request(&block)
-      @elicitation_request_callback = block
-    end
-
     # Handle incoming JSON-RPC request from server (MCP 2025-06-18)
     # @param msg [Hash] the JSON-RPC request message
     # @return [void]
@@ -832,10 +832,12 @@ module MCPClient
     # @param params [Hash] the elicitation parameters
     # @return [void]
     def handle_elicitation_create(request_id, params)
+      elicitation_id = params['elicitationId']
+
       # If no callback is registered, decline the request
       unless @elicitation_request_callback
         @logger.warn('Received elicitation request but no callback registered, declining')
-        send_elicitation_response(request_id, { 'action' => 'decline' })
+        send_elicitation_response(elicitation_id, { 'action' => 'decline' })
         return
       end
 
@@ -843,22 +845,28 @@ module MCPClient
       result = @elicitation_request_callback.call(request_id, params)
 
       # Send the response back to the server
-      send_elicitation_response(request_id, result)
+      send_elicitation_response(elicitation_id, result)
     end
 
     # Send elicitation response back to server via HTTP POST (MCP 2025-06-18)
-    # @param request_id [String, Integer] the JSON-RPC request ID
+    # For streamable HTTP, this is sent as a JSON-RPC request (not response)
+    # because HTTP is unidirectional.
+    # @param elicitation_id [String] the elicitation ID from the server
     # @param result [Hash] the elicitation result (action and optional content)
     # @return [void]
-    def send_elicitation_response(request_id, result)
-      response = {
+    def send_elicitation_response(elicitation_id, result)
+      request = {
         'jsonrpc' => '2.0',
-        'id' => request_id,
-        'result' => result
+        'method' => 'elicitation/response',
+        'params' => {
+          'elicitationId' => elicitation_id,
+          'action' => result['action'],
+          'content' => result['content'] || {}
+        }
       }
 
-      # Send response via HTTP POST to the endpoint (same as pong)
-      post_jsonrpc_response(response)
+      # Send as a JSON-RPC request via HTTP POST
+      post_jsonrpc_response(request)
     rescue StandardError => e
       @logger.error("Error sending elicitation response: #{e.message}")
     end

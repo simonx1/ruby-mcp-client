@@ -46,7 +46,7 @@ This Ruby MCP Client implements features from the latest MCP specifications:
 
 ### MCP 2025-06-18 Features
 - **Structured Tool Outputs** - Tools can declare output schemas and return type-safe, validated structured data
-- **Elicitation (Server-initiated User Interactions)** - Servers can request user input during tool execution via bidirectional JSON-RPC (stdio transport only)
+- **Elicitation (Server-initiated User Interactions)** - Servers can request user input during tool execution via bidirectional JSON-RPC (stdio, SSE, and Streamable HTTP transports)
 
 ### MCP 2025-03-26 Features
 - **Tool Annotations** - Support for tool behavior annotations (readOnly, destructive, requiresConfirmation) for safer tool execution
@@ -1169,7 +1169,7 @@ elicitation_handler = lambda do |message, requested_schema|
 
   # Prompt user and return one of three response types:
 
-  # 1. Accept and provide data
+  # 1. Accept and provide data to the server
   {
     'action' => 'accept',
     'content' => {
@@ -1200,16 +1200,17 @@ client = MCPClient::Client.new(
     ),
     # Or Streamable HTTP transport
     MCPClient.streamable_http_config(
-      base_url: 'https://api.example.com/mcp',
+      base_url: 'https://api.example.com',
+      endpoint: '/mcp',
       name: 'streamable-server'
     )
   ],
   elicitation_handler: elicitation_handler
 )
 
-# When calling tools, the server may send elicitation requests
-result = client.call_tool('create_document', { format: 'markdown' })
-# Server may request title and content via elicitation during execution
+# Call tools - connection happens automatically
+# Server may send elicitation requests during tool execution
+result = client.call_tool('create_document', { format: 'markdown' }, server: 'my-server')
 ```
 
 ### Response Actions
@@ -1236,15 +1237,15 @@ The elicitation handler should return a hash with an `action` field:
 
 ### Example
 
-See `examples/test_elicitation.rb` for a complete working example demonstrating:
+See `examples/elicitation/test_elicitation.rb` for a complete working example demonstrating:
 - Registering an elicitation handler
 - Handling different message types and schemas
 - Responding with accept/decline/cancel actions
 - Interactive user prompts during tool execution
 
-The example includes a Python MCP server (`examples/elicitation_server.py`) that provides tools using elicitation:
+The example includes a Python MCP server (`examples/elicitation/elicitation_server.py`) that provides tools using elicitation:
 - `create_document` - Requests title and content via elicitation
-- `sensitive_operation` - Requires user confirmation before executing
+- `send_notification` - Confirms before sending a notification
 
 ## Key Features
 

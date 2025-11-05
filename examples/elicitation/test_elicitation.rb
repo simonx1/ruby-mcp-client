@@ -97,9 +97,10 @@ end
 client = MCPClient::Client.new(
   mcp_server_configs: [
     {
-      server_type: 'stdio',
+      type: 'stdio',
       command: ['python', File.join(__dir__, 'elicitation_server.py')],
-      name: 'elicitation-demo'
+      name: 'elicitation-demo',
+      read_timeout: 60 # Longer timeout for user interaction with elicitation
     }
   ],
   logger: logger,
@@ -107,15 +108,9 @@ client = MCPClient::Client.new(
 )
 
 begin
-  # Connect to the server
-  puts 'Connecting to MCP server with elicitation support...'
-  client.connect_to_all_servers
-  puts '✓ Connected!'
-  puts
-
   # List available tools
   puts 'Available tools:'
-  tools = client.list_all_tools
+  tools = client.list_tools
   tools.each do |tool|
     puts "  • #{tool.name}: #{tool.description}"
   end
@@ -127,19 +122,19 @@ begin
   puts '=' * 80
   puts
 
-  result1 = client.call_tool('elicitation-demo', 'create_document', { format: 'markdown' })
+  result1 = client.call_tool('create_document', { format: 'markdown' }, server: 'elicitation-demo')
   puts "\nResult:"
   puts result1['content'].first['text']
   puts
 
-  # Example 2: Sensitive operation with confirmation
+  # Example 2: Send notification with confirmation
   puts '=' * 80
-  puts 'Example 2: Sensitive operation (requires confirmation via elicitation)'
+  puts 'Example 2: Sending a notification (requires confirmation via elicitation)'
   puts '=' * 80
   puts
 
-  result2 = client.call_tool('elicitation-demo', 'sensitive_operation',
-                             { operation: 'delete all temporary files' })
+  result2 = client.call_tool('send_notification',
+                             { message: 'System maintenance scheduled for tonight at 10 PM' }, server: 'elicitation-demo')
   puts "\nResult:"
   puts result2['content'].first['text']
   puts
