@@ -162,7 +162,6 @@ begin
   result = client.call_tool('read_data', { key: 'user_1' })
   output = result['content']&.first&.dig('text')
   puts "   user_1 data: #{output}"
-
 rescue MCPClient::Errors::ConnectionError => e
   puts "❌ Connection Error: #{e.message}"
   puts "\n💡 Make sure the annotated echo server is running:"
