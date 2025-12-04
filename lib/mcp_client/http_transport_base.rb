@@ -256,14 +256,20 @@ module MCPClient
     end
 
     # Create a Faraday connection for HTTP requests
+    # Applies default configuration first, then allows user customization via @faraday_config block
     # @return [Faraday::Connection] the configured connection
     def create_http_connection
-      Faraday.new(url: @base_url) do |f|
+      conn = Faraday.new(url: @base_url) do |f|
         f.request :retry, max: @max_retries, interval: @retry_backoff, backoff_factor: 2
         f.options.open_timeout = @read_timeout
         f.options.timeout = @read_timeout
         f.adapter Faraday.default_adapter
       end
+
+      # Apply user's Faraday customizations after defaults
+      @faraday_config&.call(conn)
+
+      conn
     end
 
     # Log HTTP response (to be overridden by specific transports)

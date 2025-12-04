@@ -77,7 +77,8 @@ module MCPClient
         retry_backoff: config[:retry_backoff] || 1,
         name: config[:name],
         logger: logger,
-        oauth_provider: config[:oauth_provider]
+        oauth_provider: config[:oauth_provider],
+        faraday_config: config[:faraday_config]
       )
     end
 
@@ -97,7 +98,8 @@ module MCPClient
         retry_backoff: config[:retry_backoff] || 1,
         name: config[:name],
         logger: logger,
-        oauth_provider: config[:oauth_provider]
+        oauth_provider: config[:oauth_provider],
+        faraday_config: config[:faraday_config]
       )
     end
 
