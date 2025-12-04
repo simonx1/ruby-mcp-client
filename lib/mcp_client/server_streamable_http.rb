@@ -97,6 +97,7 @@ module MCPClient
                                       })
 
       @read_timeout = opts[:read_timeout]
+      @faraday_config = opts[:faraday_config]
       @tools = nil
       @tools_data = nil
       @prompts = nil
@@ -483,7 +484,8 @@ module MCPClient
         retry_backoff: 1,
         name: nil,
         logger: nil,
-        oauth_provider: nil
+        oauth_provider: nil,
+        faraday_config: nil
       }
     end
 
@@ -628,6 +630,9 @@ module MCPClient
             http.open_timeout = 10
           end
         end
+
+        # Apply user's Faraday customizations after defaults
+        @faraday_config&.call(conn)
 
         @logger.debug("Establishing SSE events connection to #{@endpoint}") if @logger.level <= Logger::DEBUG
 

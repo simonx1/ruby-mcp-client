@@ -285,6 +285,40 @@ puts "Server is responsive: #{ping_result.inspect}"
 http_client.cleanup
 ```
 
+### Faraday Connection Customization
+
+Both HTTP and Streamable HTTP transports support custom Faraday connection configuration via an optional block. This is useful for connecting to servers using internal Certificate Authorities, adding custom middleware, or configuring specific TLS settings:
+
+```ruby
+require 'mcp_client'
+require 'openssl'
+
+# Create a custom certificate store with your internal CA
+cert_store = OpenSSL::X509::Store.new
+cert_store.set_default_paths  # Include system CA certificates
+cert_store.add_file('/path/to/internal-ca.pem')  # Add your internal CA
+
+# Use with HTTP transport - customize Faraday via block
+http_client = MCPClient.create_client(
+  mcp_server_configs: [
+    MCPClient.http_config(base_url: 'https://internal-mcp-server.company.com') do |faraday|
+      faraday.ssl.cert_store = cert_store
+      faraday.ssl.verify = true
+    end
+  ]
+)
+
+# Use with Streamable HTTP transport - customize Faraday via block
+streamable_client = MCPClient.create_client(
+  mcp_server_configs: [
+    MCPClient.streamable_http_config(base_url: 'https://internal-mcp-server.company.com/mcp') do |faraday|
+      faraday.ssl.cert_store = cert_store
+      faraday.ssl.verify = true
+    end
+  ]
+)
+```
+
 ### Streamable HTTP Transport Example
 
 The Streamable HTTP transport is designed for servers that use HTTP POST requests but return Server-Sent Event formatted responses. This is commonly used by services like Zapier's MCP implementation:
