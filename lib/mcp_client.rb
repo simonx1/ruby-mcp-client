@@ -112,9 +112,10 @@ module MCPClient
   # @param retry_backoff [Integer] backoff delay in seconds (default: 1)
   # @param name [String, nil] optional name for this server
   # @param logger [Logger, nil] optional logger for server operations
+  # @yield [Faraday::Connection] optional block to customize the Faraday connection
   # @return [Hash] server configuration
   def self.http_config(base_url:, endpoint: '/rpc', headers: {}, read_timeout: 30, retries: 3, retry_backoff: 1,
-                       name: nil, logger: nil)
+                       name: nil, logger: nil, &faraday_config)
     {
       type: 'http',
       base_url: base_url,
@@ -124,7 +125,8 @@ module MCPClient
       retries: retries,
       retry_backoff: retry_backoff,
       name: name,
-      logger: logger
+      logger: logger,
+      faraday_config: faraday_config
     }
   end
 
@@ -138,9 +140,10 @@ module MCPClient
   # @param retry_backoff [Integer] Backoff delay in seconds (default: 1)
   # @param name [String, nil] Optional name for this server
   # @param logger [Logger, nil] Optional logger for server operations
+  # @yield [Faraday::Connection] optional block to customize the Faraday connection
   # @return [Hash] server configuration
   def self.streamable_http_config(base_url:, endpoint: '/rpc', headers: {}, read_timeout: 30, retries: 3,
-                                  retry_backoff: 1, name: nil, logger: nil)
+                                  retry_backoff: 1, name: nil, logger: nil, &faraday_config)
     {
       type: 'streamable_http',
       base_url: base_url,
@@ -150,7 +153,8 @@ module MCPClient
       retries: retries,
       retry_backoff: retry_backoff,
       name: name,
-      logger: logger
+      logger: logger,
+      faraday_config: faraday_config
     }
   end
 end
