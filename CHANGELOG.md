@@ -1,5 +1,45 @@
 # Changelog
 
+## 0.9.1 (2025-12-10)
+
+### New Features
+
+#### Simplified API - `MCPClient.connect(url)`
+- **New single entry point** that auto-detects transport based on URL patterns (#62)
+  - `MCPClient.connect('http://localhost:8000/sse')` → SSE transport
+  - `MCPClient.connect('http://localhost:8931/mcp')` → Streamable HTTP transport
+  - `MCPClient.connect('npx -y @modelcontextprotocol/server-filesystem /home')` → stdio transport
+  - Supports options: `headers`, `read_timeout`, `sampling_handler`, etc.
+  - Multiple servers: `MCPClient.connect(['http://server1/mcp', 'http://server2/sse'])`
+
+#### MCP 2025-06-18 Protocol Compliance (#62)
+- **Roots Support**: Define filesystem scope boundaries
+  - `client.set_roots([{ uri: 'file:///path', name: 'Root' }])`
+  - Sends `notifications/roots/list_changed` to servers
+  - Handles `roots/list` requests from servers
+
+- **Sampling Support**: Server-initiated LLM completions
+  - `sampling_handler:` parameter for `MCPClient.connect()` and `Client.new`
+  - Handles `sampling/createMessage` requests from servers
+  - Supports variable arity handlers (1-4 args)
+
+- **Completion Support**: Autocomplete suggestions
+  - `client.complete(ref:, argument:)` method
+  - Works with prompts (`ref/prompt`) and resources (`ref/resource`)
+  - Returns completion values with pagination info
+
+- **Logging Support**: Server log messages
+  - `client.set_log_level(level)` method
+  - Handles `notifications/message` from servers
+  - Maps MCP levels to Ruby Logger levels
+
+#### Faraday Connection Customization (by @conr) (#58)
+- Added ability to customize Faraday HTTP connections
+- Pass custom middleware, adapters, or configuration blocks
+
+### Documentation
+- Updated YARD documentation
+
 ## 0.9.0 (2025-11-05)
 
 ### MCP Protocol Update
