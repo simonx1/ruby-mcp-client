@@ -309,15 +309,11 @@ module MCPClient
     # Call a tool with the given parameters
     # @param tool_name [String] the name of the tool to call
     # @param parameters [Hash] the parameters to pass to the tool
-    # @return [Object] the result of the tool invocation
+    # @return [Object] the result of the tool invocation (with string keys for backward compatibility)
     # @raise [MCPClient::Errors::ServerError] if server returns an error
     # @raise [MCPClient::Errors::TransportError] if response isn't valid JSON
     # @raise [MCPClient::Errors::ToolCallError] for other errors during tool execution
     # @raise [MCPClient::Errors::ConnectionError] if server is disconnected
-    # Call a tool with the given parameters
-    # @param tool_name [String] the name of the tool to call
-    # @param parameters [Hash] the parameters to pass to the tool
-    # @return [Object] the result of the tool invocation (with string keys for backward compatibility)
     def call_tool(tool_name, parameters)
       rpc_request('tools/call', {
                     name: tool_name,
@@ -346,10 +342,11 @@ module MCPClient
     end
 
     # Set the logging level on the server (MCP 2025-06-18)
-    # @param level [String] the log level ('debug', 'info', 'notice', 'warning', 'error', 'critical', 'alert', 'emergency')
+    # @param level [String] the log level ('debug', 'info', 'notice', 'warning', 'error',
+    #   'critical', 'alert', 'emergency')
     # @return [Hash] empty result on success
     # @raise [MCPClient::Errors::ServerError] if server returns an error
-    def set_log_level(level)
+    def log_level=(level)
       rpc_request('logging/setLevel', { level: level })
     rescue MCPClient::Errors::ConnectionError, MCPClient::Errors::TransportError
       raise

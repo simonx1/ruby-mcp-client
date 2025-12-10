@@ -140,10 +140,10 @@ data = result['structuredContent']  # Type-safe structured data
 
 ```ruby
 # Set filesystem scope boundaries
-client.set_roots([
+client.roots = [
   { uri: 'file:///home/user/project', name: 'Project' },
   { uri: 'file:///var/log', name: 'Logs' }
-])
+]
 
 # Access current roots
 client.roots
@@ -180,7 +180,7 @@ result = client.complete(
 
 ```ruby
 # Set log level
-client.set_log_level('debug')  # debug/info/notice/warning/error/critical
+client.log_level = 'debug'  # debug/info/notice/warning/error/critical
 
 # Handle log notifications
 client.on_notification do |server, method, params|

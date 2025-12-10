@@ -368,10 +368,11 @@ module MCPClient
     end
 
     # Set the logging level on the server (MCP 2025-06-18)
-    # @param level [String] the log level ('debug', 'info', 'notice', 'warning', 'error', 'critical', 'alert', 'emergency')
+    # @param level [String] the log level ('debug', 'info', 'notice', 'warning', 'error',
+    #   'critical', 'alert', 'emergency')
     # @return [Hash] empty result on success
     # @raise [MCPClient::Errors::ServerError] if server returns an error
-    def set_log_level(level)
+    def log_level=(level)
       ensure_initialized
       req_id = next_id
       req = {

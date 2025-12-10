@@ -47,7 +47,7 @@ begin
   # Create MCP client using the simplified connect API
   # The /mcp suffix auto-detects Streamable HTTP transport
   client = MCPClient.connect(server_url,
-                             read_timeout: 60,  # Longer timeout for long-running tasks
+                             read_timeout: 60, # Longer timeout for long-running tasks
                              retries: 3,
                              logger: logger)
 

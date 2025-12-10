@@ -431,14 +431,18 @@ RSpec.describe 'MCPClient.connect' do
           allow(server).to receive(:connect).and_raise(MCPClient::Errors::ConnectionError, "#{type} failed")
         end
 
-        expect do
+        error = nil
+        begin
           MCPClient.connect('http://example.com/api')
-        end.to raise_error(MCPClient::Errors::ConnectionError) do |error|
-          expect(error.message).to include('Tried all transports')
-          expect(error.message).to include('Streamable HTTP: streamable_http failed')
-          expect(error.message).to include('SSE: sse failed')
-          expect(error.message).to include('HTTP: http failed')
+        rescue MCPClient::Errors::ConnectionError => e
+          error = e
         end
+
+        expect(error).not_to be_nil
+        expect(error.message).to include('Tried all transports')
+        expect(error.message).to include('Streamable HTTP: streamable_http failed')
+        expect(error.message).to include('SSE: sse failed')
+        expect(error.message).to include('HTTP: http failed')
       end
     end
   end

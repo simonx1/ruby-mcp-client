@@ -32,17 +32,18 @@ module MCPClient
   #   - stdio://command or Array commands -> stdio transport
   #   - Commands starting with npx, node, python, ruby, etc. -> stdio transport
   #   - Other HTTP URLs -> Try Streamable HTTP, fallback to SSE, then HTTP
-  # @param options [Hash] Connection options
-  # @option options [Hash] :headers HTTP headers for remote transports
-  # @option options [Integer] :read_timeout Request timeout in seconds (default: 30)
-  # @option options [Integer] :retries Retry attempts
-  # @option options [Numeric] :retry_backoff Backoff delay (default: 1)
-  # @option options [String] :name Optional server name
-  # @option options [Logger] :logger Optional logger
-  # @option options [Hash] :env Environment variables for stdio
-  # @option options [Integer] :ping Ping interval for SSE (default: 10)
-  # @option options [String] :endpoint JSON-RPC endpoint path (default: '/rpc')
-  # @option options [Symbol] :transport Force transport type (:stdio, :sse, :http, :streamable_http)
+  # Accepts keyword arguments for connection options:
+  # - headers [Hash] HTTP headers for remote transports
+  # - read_timeout [Integer] Request timeout in seconds (default: 30)
+  # - retries [Integer] Retry attempts
+  # - retry_backoff [Numeric] Backoff delay (default: 1)
+  # - name [String] Optional server name
+  # - logger [Logger] Optional logger
+  # - env [Hash] Environment variables for stdio
+  # - ping [Integer] Ping interval for SSE (default: 10)
+  # - endpoint [String] JSON-RPC endpoint path (default: '/rpc')
+  # - transport [Symbol] Force transport type (:stdio, :sse, :http, :streamable_http)
+  # - sampling_handler [Proc] Handler for sampling requests
   # @yield [Faraday::Connection] Optional block for Faraday customization
   # @return [MCPClient::Client] Connected client ready to use
   # @raise [MCPClient::Errors::ConnectionError] if connection fails
@@ -75,18 +76,18 @@ module MCPClient
   #   client = MCPClient.connect('https://internal.server.com/mcp') do |faraday|
   #     faraday.ssl.cert_store = custom_cert_store
   #   end
-  def self.connect(target, **options, &faraday_config)
+  def self.connect(target, **, &)
     # Handle array targets: either a single stdio command or multiple server URLs
     if target.is_a?(Array)
       # Check if it's a stdio command array (elements are command parts, not URLs)
       if stdio_command_array?(target)
-        connect_single(target, **options, &faraday_config)
+        connect_single(target, **, &)
       else
         # It's an array of server URLs/commands
-        connect_multiple(target, **options, &faraday_config)
+        connect_multiple(target, **, &)
       end
     else
-      connect_single(target, **options, &faraday_config)
+      connect_single(target, **, &)
     end
   end
 
@@ -94,7 +95,7 @@ module MCPClient
     private
 
     # Connect to a single server
-    def connect_single(target, **options, &faraday_config)
+    def connect_single(target, **options, &)
       transport = options[:transport]&.to_sym || detect_transport(target)
 
       case transport
@@ -103,11 +104,11 @@ module MCPClient
       when :sse
         connect_sse(target, **options)
       when :http
-        connect_http(target, **options, &faraday_config)
+        connect_http(target, **options, &)
       when :streamable_http
-        connect_streamable_http(target, **options, &faraday_config)
+        connect_streamable_http(target, **options, &)
       when :auto
-        connect_with_fallback(target, **options, &faraday_config)
+        connect_with_fallback(target, **options, &)
       else
         raise Errors::TransportDetectionError, "Unknown transport: #{transport}"
       end
@@ -145,14 +146,14 @@ module MCPClient
     end
 
     # Connect via HTTP transport
-    def connect_http(url, **options, &faraday_config)
-      config = http_config(base_url: url.to_s, **extract_http_options(options), &faraday_config)
+    def connect_http(url, **options, &)
+      config = http_config(base_url: url.to_s, **extract_http_options(options), &)
       create_and_connect_client(config, options)
     end
 
     # Connect via Streamable HTTP transport
-    def connect_streamable_http(url, **options, &faraday_config)
-      config = streamable_http_config(base_url: url.to_s, **extract_http_options(options), &faraday_config)
+    def connect_streamable_http(url, **options, &)
+      config = streamable_http_config(base_url: url.to_s, **extract_http_options(options), &)
       create_and_connect_client(config, options)
     end
 
@@ -168,7 +169,7 @@ module MCPClient
     end
 
     # Try transports in order until one succeeds
-    def connect_with_fallback(url, **options, &faraday_config)
+    def connect_with_fallback(url, **options, &)
       require 'logger'
       logger = options[:logger] || Logger.new($stderr, level: Logger::WARN)
       errors = []
@@ -176,7 +177,7 @@ module MCPClient
       # Try Streamable HTTP first (most modern)
       begin
         logger.debug("MCPClient.connect: Attempting Streamable HTTP connection to #{url}")
-        return connect_streamable_http(url, **options, &faraday_config)
+        return connect_streamable_http(url, **options, &)
       rescue Errors::ConnectionError, Errors::TransportError => e
         errors << "Streamable HTTP: #{e.message}"
         logger.debug("MCPClient.connect: Streamable HTTP failed: #{e.message}")
@@ -194,7 +195,7 @@ module MCPClient
       # Try plain HTTP last
       begin
         logger.debug("MCPClient.connect: Attempting HTTP connection to #{url}")
-        return connect_http(url, **options, &faraday_config)
+        return connect_http(url, **options, &)
       rescue Errors::ConnectionError, Errors::TransportError => e
         errors << "HTTP: #{e.message}"
         logger.debug("MCPClient.connect: HTTP failed: #{e.message}")
@@ -218,7 +219,7 @@ module MCPClient
       unless http_url?(uri)
         raise Errors::TransportDetectionError,
               "Cannot detect transport for non-HTTP URL: #{target}. " \
-              "Use transport: option to specify explicitly."
+              'Use transport: option to specify explicitly.'
       end
 
       path = uri.path.to_s.downcase
@@ -309,7 +310,7 @@ module MCPClient
     end
 
     # Build config hash for a target
-    def build_config_for_target(target, **options, &faraday_config)
+    def build_config_for_target(target, **options, &)
       transport = options[:transport]&.to_sym || detect_transport(target)
 
       case transport
@@ -319,10 +320,10 @@ module MCPClient
       when :sse
         sse_config(base_url: target.to_s, **extract_sse_options(options))
       when :http
-        http_config(base_url: target.to_s, **extract_http_options(options), &faraday_config)
+        http_config(base_url: target.to_s, **extract_http_options(options), &)
       when :streamable_http, :auto
         # For multi-server, default to streamable_http without fallback
-        streamable_http_config(base_url: target.to_s, **extract_http_options(options), &faraday_config)
+        streamable_http_config(base_url: target.to_s, **extract_http_options(options), &)
       else
         raise Errors::TransportDetectionError, "Unknown transport: #{transport}"
       end

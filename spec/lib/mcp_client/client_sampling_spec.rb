@@ -196,7 +196,7 @@ RSpec.describe MCPClient::Client, 'Sampling (MCP 2025-06-18)' do
 
     context 'when handler returns nil' do
       it 'returns error response' do
-        handler = ->(_messages) { nil }
+        handler = ->(_messages) {}
 
         client = described_class.new(sampling_handler: handler)
         result = client.send(:handle_sampling_request, request_id, params)
@@ -238,7 +238,10 @@ RSpec.describe MCPClient::Client, 'Sampling (MCP 2025-06-18)' do
 
       # Simulate server calling the registered callback
       result = registered_callback.call(456, {
-                                          'messages' => [{ 'role' => 'user', 'content' => { 'type' => 'text', 'text' => 'Hi' } }]
+                                          'messages' => [{
+                                            'role' => 'user',
+                                            'content' => { 'type' => 'text', 'text' => 'Hi' }
+                                          }]
                                         })
 
       expect(result['role']).to eq('assistant')

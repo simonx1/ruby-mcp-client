@@ -17,34 +17,24 @@ RSpec.describe 'Logging (MCP 2025-06-18)' do
   end
 
   describe MCPClient::Client do
-    describe '#set_log_level' do
+    describe '#log_level=' do
       let(:client) do
         described_class.new(mcp_server_configs: [{ type: 'stdio', command: 'test' }])
       end
 
-      it 'delegates to the specified server' do
-        allow(mock_server).to receive(:set_log_level).and_return({})
+      it 'sets log level on all servers' do
+        allow(mock_server).to receive(:log_level=).and_return({})
 
-        client.set_log_level('debug', server: 0)
+        client.log_level = 'warning'
 
-        expect(mock_server).to have_received(:set_log_level).with('debug')
-      end
-
-      it 'sets log level on all servers when no server specified' do
-        allow(mock_server).to receive(:set_log_level).and_return({})
-
-        result = client.set_log_level('warning')
-
-        expect(mock_server).to have_received(:set_log_level).with('warning')
-        expect(result).to be_an(Array)
+        expect(mock_server).to have_received(:log_level=).with('warning')
       end
 
       context 'when no server is available' do
         let(:empty_client) { described_class.new(mcp_server_configs: []) }
 
-        it 'returns empty array' do
-          result = empty_client.set_log_level('error')
-          expect(result).to eq([])
+        it 'does not raise error' do
+          expect { empty_client.log_level = 'error' }.not_to raise_error
         end
       end
     end
@@ -159,7 +149,7 @@ RSpec.describe 'Logging (MCP 2025-06-18)' do
   end
 
   describe MCPClient::ServerStdio do
-    describe '#set_log_level' do
+    describe '#log_level=' do
       let(:server) do
         described_class.new(command: 'test-command', logger: Logger.new(nil))
       end
@@ -172,12 +162,11 @@ RSpec.describe 'Logging (MCP 2025-06-18)' do
       end
 
       it 'sends logging/setLevel request' do
-        result = server.set_log_level('debug')
+        server.log_level = 'debug'
 
         expect(server).to have_received(:send_request).with(
           hash_including('method' => 'logging/setLevel', 'params' => { 'level' => 'debug' })
         )
-        expect(result).to eq({})
       end
 
       it 'raises ServerError on error response' do
@@ -187,14 +176,14 @@ RSpec.describe 'Logging (MCP 2025-06-18)' do
                                                             })
 
         expect do
-          server.set_log_level('invalid')
+          server.log_level = 'invalid'
         end.to raise_error(MCPClient::Errors::ServerError)
       end
     end
   end
 
   describe MCPClient::ServerSSE do
-    describe '#set_log_level' do
+    describe '#log_level=' do
       let(:server) do
         described_class.new(base_url: 'http://example.com/sse', logger: Logger.new(nil))
       end
@@ -204,16 +193,15 @@ RSpec.describe 'Logging (MCP 2025-06-18)' do
       end
 
       it 'calls rpc_request with correct parameters' do
-        result = server.set_log_level('warning')
+        server.log_level = 'warning'
 
         expect(server).to have_received(:rpc_request).with('logging/setLevel', { level: 'warning' })
-        expect(result).to eq({})
       end
     end
   end
 
   describe MCPClient::ServerStreamableHTTP do
-    describe '#set_log_level' do
+    describe '#log_level=' do
       let(:server) do
         described_class.new(base_url: 'http://example.com/mcp', logger: Logger.new(nil))
       end
@@ -223,10 +211,9 @@ RSpec.describe 'Logging (MCP 2025-06-18)' do
       end
 
       it 'calls rpc_request with correct parameters' do
-        result = server.set_log_level('error')
+        server.log_level = 'error'
 
         expect(server).to have_received(:rpc_request).with('logging/setLevel', { level: 'error' })
-        expect(result).to eq({})
       end
     end
   end

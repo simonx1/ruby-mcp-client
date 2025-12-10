@@ -128,7 +128,8 @@ RSpec.describe 'Completion (MCP 2025-06-18)' do
       before do
         allow(server).to receive(:rpc_request).and_return({
                                                             'completion' => {
-                                                              'values' => ['/home/user/documents', '/home/user/downloads'],
+                                                              'values' => ['/home/user/documents',
+                                                                           '/home/user/downloads'],
                                                               'hasMore' => true
                                                             }
                                                           })

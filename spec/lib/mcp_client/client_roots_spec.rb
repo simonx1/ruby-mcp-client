@@ -65,7 +65,7 @@ RSpec.describe MCPClient::Client, 'Roots (MCP 2025-06-18)' do
     end
   end
 
-  describe '#set_roots' do
+  describe '#roots=' do
     let(:client) do
       described_class.new(
         mcp_server_configs: [{ type: 'stdio', command: 'test' }]
@@ -74,13 +74,13 @@ RSpec.describe MCPClient::Client, 'Roots (MCP 2025-06-18)' do
 
     it 'updates the roots' do
       new_roots = [MCPClient::Root.new(uri: 'file:///new/path', name: 'New Root')]
-      client.set_roots(new_roots)
+      client.roots = new_roots
 
       expect(client.roots).to eq(new_roots)
     end
 
     it 'converts Hash roots to Root objects' do
-      client.set_roots([{ uri: 'file:///path', name: 'Test' }])
+      client.roots = [{ uri: 'file:///path', name: 'Test' }]
 
       expect(client.roots.first).to be_a(MCPClient::Root)
       expect(client.roots.first.uri).to eq('file:///path')
@@ -89,7 +89,7 @@ RSpec.describe MCPClient::Client, 'Roots (MCP 2025-06-18)' do
     it 'sends roots/list_changed notification to servers' do
       expect(mock_server).to receive(:rpc_notify).with('notifications/roots/list_changed', {})
 
-      client.set_roots([{ uri: 'file:///path' }])
+      client.roots = [{ uri: 'file:///path' }]
     end
   end
 

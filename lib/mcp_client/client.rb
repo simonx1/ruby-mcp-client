@@ -58,13 +58,9 @@ module MCPClient
           server.on_elicitation_request(&method(:handle_elicitation_request))
         end
         # Register roots list handler on each server (MCP 2025-06-18)
-        if server.respond_to?(:on_roots_list_request)
-          server.on_roots_list_request(&method(:handle_roots_list_request))
-        end
+        server.on_roots_list_request(&method(:handle_roots_list_request)) if server.respond_to?(:on_roots_list_request)
         # Register sampling handler on each server (MCP 2025-06-18)
-        if server.respond_to?(:on_sampling_request)
-          server.on_sampling_request(&method(:handle_sampling_request))
-        end
+        server.on_sampling_request(&method(:handle_sampling_request)) if server.respond_to?(:on_sampling_request)
       end
     end
 
@@ -350,7 +346,7 @@ module MCPClient
     # When roots are changed, a notification is sent to all connected servers
     # @param new_roots [Array<MCPClient::Root, Hash>] the new roots to set
     # @return [void]
-    def set_roots(new_roots)
+    def roots=(new_roots)
       @roots = normalize_roots(new_roots)
       # Notify servers that roots have changed
       notify_roots_changed
@@ -379,8 +375,10 @@ module MCPClient
     end
 
     # Call multiple tools in batch
-    # @param calls [Array<Hash>] array of calls in the form:
-    #   { name: tool_name, parameters: {...}, server: optional_server_name }
+    # @param calls [Array<Hash>] array of call hashes with keys:
+    #   - name: tool name (required)
+    #   - parameters: tool parameters (optional, default empty hash)
+    #   - server: server name for routing (optional)
     # @return [Array<Object>] array of results for each tool invocation
     def call_tools(calls)
       calls.map do |call|
@@ -497,20 +495,14 @@ module MCPClient
       srv.complete(ref: ref, argument: argument)
     end
 
-    # Set the logging level on a server (MCP 2025-06-18)
-    # @param level [String] the log level ('debug', 'info', 'notice', 'warning', 'error', 'critical', 'alert', 'emergency')
-    # @param server [Integer, String, Symbol, MCPClient::ServerBase, nil] server selector, nil for all servers
-    # @return [Hash, Array<Hash>] result from server(s)
-    # @raise [MCPClient::Errors::ServerNotFound] if no server is available
+    # Set the logging level on all connected servers (MCP 2025-06-18)
+    # To set on a specific server, use: client.find_server('name').log_level = 'debug'
+    # @param level [String] the log level ('debug', 'info', 'notice', 'warning', 'error',
+    #   'critical', 'alert', 'emergency')
+    # @return [Array<Hash>] results from servers
     # @raise [MCPClient::Errors::ServerError] if server returns an error
-    def set_log_level(level, server: nil)
-      if server
-        srv = select_server(server)
-        srv.set_log_level(level)
-      else
-        # Set log level on all servers
-        @servers.map { |srv| srv.set_log_level(level) }
-      end
+    def log_level=(level)
+      @servers.map { |srv| srv.log_level = level }
     end
 
     private
@@ -692,7 +684,7 @@ module MCPClient
     end
 
     # Handle elicitation request from server (MCP 2025-06-18)
-    # @param request_id [String, Integer] the JSON-RPC request ID
+    # @param _request_id [String, Integer] the JSON-RPC request ID (unused at client layer)
     # @param params [Hash] the elicitation parameters
     # @return [Hash] the elicitation response
     def handle_elicitation_request(_request_id, params)
@@ -858,9 +850,7 @@ module MCPClient
       result['stopReason'] ||= 'endTurn'
 
       # Normalize content if it's a string
-      if result['content'].is_a?(String)
-        result['content'] = { 'type' => 'text', 'text' => result['content'] }
-      end
+      result['content'] = { 'type' => 'text', 'text' => result['content'] } if result['content'].is_a?(String)
 
       result
     end
