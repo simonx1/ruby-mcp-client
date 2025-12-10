@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Enhanced MCP Echo Server with Streamable HTTP Transport (MCP 2025-03-26)
+Enhanced MCP Echo Server with Streamable HTTP Transport (MCP 2025-06-18)
 
 This server demonstrates the full capabilities of the Streamable HTTP transport:
 - SSE event streaming for notifications
@@ -8,6 +8,9 @@ This server demonstrates the full capabilities of the Streamable HTTP transport:
 - Server-to-client notifications
 - Progress notifications during tool execution
 - Session management with MCP-Session-Id headers
+- Logging support (logging/setLevel, notifications/message)
+- Completion support (completion/complete for autocomplete)
+- Sampling support (sampling/createMessage for LLM requests)
 
 To run this server:
 1. Install dependencies: pip install flask flask-sse-no-deps
@@ -19,6 +22,7 @@ The server provides:
 - Long-running task simulation
 - Periodic server notifications
 - Ping/pong keepalive every 10 seconds
+- ask_llm tool demonstrating sampling (server→client LLM requests)
 """
 
 import json
@@ -54,6 +58,9 @@ class Session:
         self.notification_thread = None
         self.active = True
         self.resource_subscriptions = set()
+        self.log_level = 'info'  # Default log level
+        self.sampling_requests = {}  # Track pending sampling requests
+        self.sampling_responses = {}  # Store sampling responses
 
 def generate_session_id():
     """Generate a cryptographically secure session ID"""
@@ -68,6 +75,35 @@ def format_sse_event(event_type, data, event_id=None):
     lines.append(f"data: {json.dumps(data)}")
     lines.append("")  # Empty line to end the event
     return "\n".join(lines) + "\n"
+
+# Log level hierarchy for filtering
+LOG_LEVELS = ['debug', 'info', 'notice', 'warning', 'error', 'critical', 'alert', 'emergency']
+
+def should_log(session_level, message_level):
+    """Check if a message at message_level should be logged given session's log_level"""
+    try:
+        session_idx = LOG_LEVELS.index(session_level.lower())
+        message_idx = LOG_LEVELS.index(message_level.lower())
+        return message_idx >= session_idx
+    except ValueError:
+        return True  # Default to logging if level not recognized
+
+def send_log_notification(session, level, logger_name, data):
+    """Send a log notification to the client via SSE"""
+    if not should_log(session.log_level, level):
+        return  # Skip logging if below session's log level
+
+    notification = {
+        "jsonrpc": "2.0",
+        "method": "notifications/message",
+        "params": {
+            "level": level,
+            "logger": logger_name,
+            "data": data
+        }
+    }
+    session.event_queue.put(format_sse_event("message", notification))
+    logger.debug(f"Sent log notification [{level}] to session {session.session_id}: {data}")
 
 def send_ping(session):
     """Send periodic ping requests to keep connection alive"""
@@ -131,7 +167,7 @@ def handle_rpc():
                 "jsonrpc": "2.0",
                 "id": request_id,
                 "result": {
-                    "protocolVersion": "2025-03-26",
+                    "protocolVersion": "2025-06-18",
                     "capabilities": {
                         "tools": {},
                         "prompts": {},
@@ -139,13 +175,19 @@ def handle_rpc():
                             "subscribe": True,
                             "listChanged": True
                         },
+                        "logging": {},
+                        "sampling": {},
+                        "completions": {},
+                        "roots": {
+                            "listChanged": True
+                        },
                         "notifications": {
-                            "server": ["notification/server_status", "notification/progress", "notifications/resources/updated", "notifications/resources/list_changed"]
+                            "server": ["notification/server_status", "notification/progress", "notifications/resources/updated", "notifications/resources/list_changed", "notifications/message"]
                         }
                     },
                     "serverInfo": {
                         "name": "Enhanced Echo Server",
-                        "version": "2.0.0"
+                        "version": "3.0.0"
                     }
                 }
             }
@@ -214,6 +256,18 @@ def handle_rpc():
                                 "properties": {
                                     "message": {"type": "string", "description": "Notification message"}
                                 }
+                            }
+                        },
+                        {
+                            "name": "ask_llm",
+                            "description": "Ask the connected LLM a question (demonstrates sampling/createMessage)",
+                            "inputSchema": {
+                                "type": "object",
+                                "properties": {
+                                    "prompt": {"type": "string", "description": "The question to ask the LLM"},
+                                    "max_tokens": {"type": "number", "description": "Maximum tokens in response", "default": 100}
+                                },
+                                "required": ["prompt"]
                             }
                         }
                     ]
@@ -769,7 +823,7 @@ End of sample data.""".format(datetime.now().isoformat())
                 
             elif tool_name == 'trigger_notification':
                 message = tool_args.get('message', 'Manual notification triggered')
-                
+
                 # Send notification immediately
                 if session_id in sessions:
                     session = sessions[session_id]
@@ -782,7 +836,7 @@ End of sample data.""".format(datetime.now().isoformat())
                         }
                     }
                     session.event_queue.put(format_sse_event("message", notification))
-                
+
                 response_data = {
                     "jsonrpc": "2.0",
                     "id": request_id,
@@ -795,7 +849,136 @@ End of sample data.""".format(datetime.now().isoformat())
                         ]
                     }
                 }
-                
+
+            elif tool_name == 'ask_llm':
+                prompt = tool_args.get('prompt', '')
+                max_tokens = tool_args.get('max_tokens', 100)
+
+                if session_id in sessions:
+                    session = sessions[session_id]
+
+                    # Send log notification about the sampling request
+                    send_log_notification(session, 'info', 'echo-server', f"Sending sampling request to client: {prompt[:50]}...")
+
+                    # Generate a unique ID for this sampling request
+                    sampling_id = str(uuid.uuid4())
+
+                    # Send sampling/createMessage request to client via SSE
+                    sampling_request = {
+                        "jsonrpc": "2.0",
+                        "method": "sampling/createMessage",
+                        "id": sampling_id,
+                        "params": {
+                            "messages": [
+                                {
+                                    "role": "user",
+                                    "content": {
+                                        "type": "text",
+                                        "text": prompt
+                                    }
+                                }
+                            ],
+                            "maxTokens": max_tokens,
+                            "systemPrompt": "You are a helpful assistant. Respond concisely.",
+                            "includeContext": "thisServer"
+                        }
+                    }
+
+                    # Store the request ID so we can match the response
+                    session.sampling_requests[sampling_id] = {
+                        "prompt": prompt,
+                        "tool_request_id": request_id,
+                        "timestamp": datetime.now()
+                    }
+
+                    # Send the sampling request to the client
+                    session.event_queue.put(format_sse_event("message", sampling_request))
+                    logger.info(f"Sent sampling request {sampling_id} to session {session_id}")
+
+                    # Wait for the sampling response (with timeout)
+                    timeout = 30  # seconds
+                    start_time = time.time()
+                    while time.time() - start_time < timeout:
+                        if sampling_id in session.sampling_responses:
+                            sampling_response = session.sampling_responses.pop(sampling_id)
+                            del session.sampling_requests[sampling_id]
+
+                            # Extract the response content
+                            if 'result' in sampling_response:
+                                result = sampling_response['result']
+                                response_text = result.get('content', {}).get('text', 'No response text')
+                                model = result.get('model', 'unknown')
+                                stop_reason = result.get('stopReason', 'unknown')
+
+                                send_log_notification(session, 'info', 'echo-server', f"Received sampling response from model: {model}")
+
+                                response_data = {
+                                    "jsonrpc": "2.0",
+                                    "id": request_id,
+                                    "result": {
+                                        "content": [
+                                            {
+                                                "type": "text",
+                                                "text": f"LLM Response (model: {model}, stop: {stop_reason}):\n\n{response_text}"
+                                            }
+                                        ]
+                                    }
+                                }
+                            elif 'error' in sampling_response:
+                                error = sampling_response['error']
+                                response_data = {
+                                    "jsonrpc": "2.0",
+                                    "id": request_id,
+                                    "result": {
+                                        "content": [
+                                            {
+                                                "type": "text",
+                                                "text": f"LLM Error: {error.get('message', 'Unknown error')}"
+                                            }
+                                        ]
+                                    }
+                                }
+                            else:
+                                response_data = {
+                                    "jsonrpc": "2.0",
+                                    "id": request_id,
+                                    "result": {
+                                        "content": [
+                                            {
+                                                "type": "text",
+                                                "text": f"Unexpected sampling response format"
+                                            }
+                                        ]
+                                    }
+                                }
+                            break
+                        time.sleep(0.1)
+                    else:
+                        # Timeout - clean up and return error
+                        session.sampling_requests.pop(sampling_id, None)
+                        send_log_notification(session, 'warning', 'echo-server', f"Sampling request timed out after {timeout}s")
+                        response_data = {
+                            "jsonrpc": "2.0",
+                            "id": request_id,
+                            "result": {
+                                "content": [
+                                    {
+                                        "type": "text",
+                                        "text": f"Sampling request timed out after {timeout} seconds. The client may not support sampling or didn't respond in time."
+                                    }
+                                ]
+                            }
+                        }
+                else:
+                    response_data = {
+                        "jsonrpc": "2.0",
+                        "id": request_id,
+                        "error": {
+                            "code": -32603,
+                            "message": "Session not found"
+                        }
+                    }
+
             else:
                 response_data = {
                     "jsonrpc": "2.0",
@@ -811,8 +994,126 @@ End of sample data.""".format(datetime.now().isoformat())
                 content_type='text/event-stream',
                 headers={'Cache-Control': 'no-cache'}
             )
-            
-        # Handle pong responses
+
+        elif method == 'notifications/roots/list_changed':
+            # Client is notifying us that their roots have changed
+            # In a real server, we'd request the new roots list
+            if session_id in sessions:
+                session = sessions[session_id]
+                send_log_notification(session, 'info', 'echo-server', 'Received roots/list_changed notification from client')
+            return Response("", status=202)
+
+        elif method == 'logging/setLevel':
+            # Handle log level setting
+            level = params.get('level', 'info').lower()
+            if level not in LOG_LEVELS:
+                response_data = {
+                    "jsonrpc": "2.0",
+                    "id": request_id,
+                    "error": {
+                        "code": -32602,
+                        "message": f"Invalid log level: {level}. Valid levels: {', '.join(LOG_LEVELS)}"
+                    }
+                }
+            else:
+                if session_id in sessions:
+                    session = sessions[session_id]
+                    old_level = session.log_level
+                    session.log_level = level
+                    logger.info(f"Session {session_id} log level changed from {old_level} to {level}")
+
+                    # Send a log notification about the level change
+                    send_log_notification(session, 'info', 'echo-server', f"Log level changed to {level}")
+
+                response_data = {
+                    "jsonrpc": "2.0",
+                    "id": request_id,
+                    "result": {}
+                }
+
+            return Response(
+                format_sse_event("message", response_data),
+                content_type='text/event-stream',
+                headers={'Cache-Control': 'no-cache'}
+            )
+
+        elif method == 'completion/complete':
+            # Handle autocomplete requests
+            ref = params.get('ref', {})
+            argument = params.get('argument', {})
+
+            ref_type = ref.get('type', '')
+            ref_name = ref.get('name', '')
+            arg_name = argument.get('name', '')
+            arg_value = argument.get('value', '')
+
+            completions = []
+
+            # Provide completions based on the reference type
+            if ref_type == 'ref/prompt':
+                if ref_name == 'greeting' and arg_name == 'name':
+                    # Suggest common names that start with the given value
+                    all_names = ['Alice', 'Bob', 'Charlie', 'David', 'Eve', 'Frank', 'Grace', 'Henry', 'Ivy', 'Jack']
+                    completions = [n for n in all_names if n.lower().startswith(arg_value.lower())]
+                elif ref_name == 'code_review' and arg_name == 'language':
+                    all_langs = ['python', 'ruby', 'javascript', 'typescript', 'go', 'rust', 'java', 'c++', 'c#']
+                    completions = [l for l in all_langs if l.lower().startswith(arg_value.lower())]
+                elif ref_name == 'documentation' and arg_name == 'audience':
+                    all_audiences = ['developers', 'beginners', 'experts', 'managers', 'end users', 'students']
+                    completions = [a for a in all_audiences if a.lower().startswith(arg_value.lower())]
+            elif ref_type == 'ref/resource':
+                # Suggest resource URIs
+                all_uris = ['file:///sample/README.md', 'file:///sample/config.json', 'file:///sample/data.txt', 'file:///sample/image.png']
+                completions = [u for u in all_uris if arg_value.lower() in u.lower()]
+
+            # Log the completion request
+            if session_id in sessions:
+                session = sessions[session_id]
+                send_log_notification(session, 'debug', 'echo-server', f"Completion request for {ref_type}/{ref_name}.{arg_name}='{arg_value}' -> {len(completions)} results")
+
+            response_data = {
+                "jsonrpc": "2.0",
+                "id": request_id,
+                "result": {
+                    "completion": {
+                        "values": completions[:10],  # Limit to 10 results
+                        "total": len(completions),
+                        "hasMore": len(completions) > 10
+                    }
+                }
+            }
+
+            return Response(
+                format_sse_event("message", response_data),
+                content_type='text/event-stream',
+                headers={'Cache-Control': 'no-cache'}
+            )
+
+        # Handle sampling responses from client
+        elif 'result' in request_data and request_data.get('id'):
+            response_id = request_data.get('id')
+
+            # Check if this is a sampling response
+            if session_id in sessions:
+                session = sessions[session_id]
+                if response_id in session.sampling_requests:
+                    # This is a sampling response
+                    session.sampling_responses[response_id] = request_data
+                    logger.info(f"Received sampling response {response_id} for session {session_id}")
+                    return Response("", status=200)
+
+            # If it's a pong response (empty result)
+            if request_data.get('result') == {}:
+                logger.debug(f"Received pong response for ping {response_id} from session {session_id}")
+                if session_id in sessions:
+                    sessions[session_id].last_activity = datetime.now()
+                return Response("", status=200)
+
+            # Unknown response type
+            logger.warning(f"Received unexpected response with id {response_id}")
+            return Response("", status=200)
+
+        # Handle pong responses (legacy check)
         elif 'result' in request_data and request_data.get('result') == {}:
             # This is a pong response
             logger.debug(f"Received pong response for ping {request_data.get('id')} from session {session_id}")
@@ -916,10 +1217,10 @@ def cleanup_inactive_sessions():
             logger.info(f"Cleaned up inactive session: {session_id}")
 
 if __name__ == "__main__":
-    print("🚀 Enhanced MCP Echo Server with Streamable HTTP Transport")
-    print("=" * 60)
+    print("🚀 Enhanced MCP Echo Server with Streamable HTTP Transport (MCP 2025-06-18)")
+    print("=" * 70)
     print("Server starting on: http://localhost:8931/mcp")
-    print("\nFeatures:")
+    print("\nCore Features:")
     print("✅ SSE event streaming")
     print("✅ Ping/pong keepalive (every 10 seconds)")
     print("✅ Server notifications (every 30 seconds)")
@@ -931,10 +1232,15 @@ if __name__ == "__main__":
     print("✅ Resource templates")
     print("✅ Resource subscriptions")
     print("✅ Pagination support")
+    print("\nMCP 2025-06-18 Features:")
+    print("✅ Logging (logging/setLevel, notifications/message)")
+    print("✅ Completion (completion/complete for autocomplete)")
+    print("✅ Sampling (sampling/createMessage - server→client LLM requests)")
     print("\nAvailable tools:")
     print("  - echo: Echo back a message")
     print("  - long_task: Simulate long-running task with progress")
     print("  - trigger_notification: Trigger a server notification")
+    print("  - ask_llm: Ask the connected LLM a question (sampling demo)")
     print("\nAvailable prompts:")
     print("  - greeting: Generate personalized greetings")
     print("  - code_review: Generate code review comments")
@@ -945,7 +1251,7 @@ if __name__ == "__main__":
     print("  - file:///sample/data.txt: Sample text data")
     print("  - file:///sample/image.png: Sample binary image")
     print("\nPress Ctrl+C to stop the server")
-    print("-" * 60)
+    print("-" * 70)
     
     # Start cleanup thread
     cleanup_thread = threading.Thread(target=cleanup_inactive_sessions)

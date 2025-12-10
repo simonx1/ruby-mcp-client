@@ -40,25 +40,17 @@ logger.level = Logger::INFO
 puts '🚀 Enhanced Ruby MCP Client - Tools, Prompts & Resources'
 puts '=' * 60
 
-# Server configuration
-server_config = {
-  type: 'sse',
-  base_url: 'http://127.0.0.1:8000/sse',
-  headers: {},
-  read_timeout: 30,
-  ping: 10,
-  retries: 3,
-  retry_backoff: 1,
-  logger: logger
-}
+# Server URL
+server_url = 'http://127.0.0.1:8000/sse'
 
-puts "📡 Connecting to FastMCP Echo Server at #{server_config[:base_url]}"
+puts "📡 Connecting to FastMCP Echo Server at #{server_url}"
 
 begin
-  # Create MCP client
-  client = MCPClient.create_client(
-    mcp_server_configs: [server_config]
-  )
+  # Create MCP client using the simplified connect API
+  # The /sse suffix auto-detects SSE transport
+  client = MCPClient.connect(server_url,
+                             retries: 3,
+                             logger: logger)
 
   puts '✅ Connected successfully!'
 

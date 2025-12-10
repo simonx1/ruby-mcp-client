@@ -16,13 +16,17 @@ module MCPClient
     #   @return [Hash<String, MCPClient::Resource>] cache of resources by composite key (server_id:uri)
     # @!attribute [r] logger
     #   @return [Logger] logger for client operations
-    attr_reader :servers, :tool_cache, :prompt_cache, :resource_cache, :logger
+    # @!attribute [r] roots
+    #   @return [Array<MCPClient::Root>] list of MCP roots (MCP 2025-06-18)
+    attr_reader :servers, :tool_cache, :prompt_cache, :resource_cache, :logger, :roots
 
     # Initialize a new MCPClient::Client
     # @param mcp_server_configs [Array<Hash>] configurations for MCP servers
     # @param logger [Logger, nil] optional logger, defaults to STDOUT
     # @param elicitation_handler [Proc, nil] optional handler for elicitation requests (MCP 2025-06-18)
-    def initialize(mcp_server_configs: [], logger: nil, elicitation_handler: nil)
+    # @param roots [Array<MCPClient::Root, Hash>, nil] optional list of roots (MCP 2025-06-18)
+    # @param sampling_handler [Proc, nil] optional handler for sampling requests (MCP 2025-06-18)
+    def initialize(mcp_server_configs: [], logger: nil, elicitation_handler: nil, roots: nil, sampling_handler: nil)
       @logger = logger || Logger.new($stdout, level: Logger::WARN)
       @logger.progname = self.class.name
       @logger.formatter = proc { |severity, _datetime, progname, msg| "#{severity} [#{progname}] #{msg}\n" }
@@ -37,6 +41,10 @@ module MCPClient
       @notification_listeners = []
       # Elicitation handler (MCP 2025-06-18)
       @elicitation_handler = elicitation_handler
+      # Sampling handler (MCP 2025-06-18)
+      @sampling_handler = sampling_handler
+      # Roots (MCP 2025-06-18)
+      @roots = normalize_roots(roots)
       # Register default and user-defined notification handlers on each server
       @servers.each do |server|
         server.on_notification do |method, params|
@@ -48,6 +56,14 @@ module MCPClient
         # Register elicitation handler on each server
         if server.respond_to?(:on_elicitation_request)
           server.on_elicitation_request(&method(:handle_elicitation_request))
+        end
+        # Register roots list handler on each server (MCP 2025-06-18)
+        if server.respond_to?(:on_roots_list_request)
+          server.on_roots_list_request(&method(:handle_roots_list_request))
+        end
+        # Register sampling handler on each server (MCP 2025-06-18)
+        if server.respond_to?(:on_sampling_request)
+          server.on_sampling_request(&method(:handle_sampling_request))
         end
       end
     end
@@ -330,6 +346,16 @@ module MCPClient
       @notification_listeners << block
     end
 
+    # Set the roots for this client (MCP 2025-06-18)
+    # When roots are changed, a notification is sent to all connected servers
+    # @param new_roots [Array<MCPClient::Root, Hash>] the new roots to set
+    # @return [void]
+    def set_roots(new_roots)
+      @roots = normalize_roots(new_roots)
+      # Notify servers that roots have changed
+      notify_roots_changed
+    end
+
     # Find a server by name
     # @param name [String] the name of the server to find
     # @return [MCPClient::ServerBase, nil] the server with the given name, or nil if not found
@@ -459,6 +485,34 @@ module MCPClient
       srv.rpc_notify(method, params)
     end
 
+    # Request completion suggestions from a server (MCP 2025-06-18)
+    # @param ref [Hash] reference object (e.g., { 'type' => 'ref/prompt', 'name' => 'prompt_name' })
+    # @param argument [Hash] the argument being completed (e.g., { 'name' => 'arg_name', 'value' => 'partial' })
+    # @param server [Integer, String, Symbol, MCPClient::ServerBase, nil] server selector
+    # @return [Hash] completion result with 'values', optional 'total', and 'hasMore' fields
+    # @raise [MCPClient::Errors::ServerNotFound] if no server is available
+    # @raise [MCPClient::Errors::ServerError] if server returns an error
+    def complete(ref:, argument:, server: nil)
+      srv = select_server(server)
+      srv.complete(ref: ref, argument: argument)
+    end
+
+    # Set the logging level on a server (MCP 2025-06-18)
+    # @param level [String] the log level ('debug', 'info', 'notice', 'warning', 'error', 'critical', 'alert', 'emergency')
+    # @param server [Integer, String, Symbol, MCPClient::ServerBase, nil] server selector, nil for all servers
+    # @return [Hash, Array<Hash>] result from server(s)
+    # @raise [MCPClient::Errors::ServerNotFound] if no server is available
+    # @raise [MCPClient::Errors::ServerError] if server returns an error
+    def set_log_level(level, server: nil)
+      if server
+        srv = select_server(server)
+        srv.set_log_level(level)
+      else
+        # Set log level on all servers
+        @servers.map { |srv| srv.set_log_level(level) }
+      end
+    end
+
     private
 
     # Process incoming JSON-RPC notifications with default handlers
@@ -480,9 +534,40 @@ module MCPClient
       when 'notifications/resources/list_changed'
         logger.warn("[#{server_id}] Resource list has changed, clearing resource cache")
         @resource_cache.clear
+      when 'notifications/message'
+        # MCP 2025-06-18: Handle logging messages from server
+        handle_log_message(server_id, params)
       else
         # Log unknown notification types for debugging purposes
         logger.debug("[#{server_id}] Received unknown notification: #{method} - #{params}")
+      end
+    end
+
+    # Handle logging message notification from server (MCP 2025-06-18)
+    # @param server_id [String] server identifier for log prefix
+    # @param params [Hash] log message params (level, logger, data)
+    # @return [void]
+    def handle_log_message(server_id, params)
+      level = params['level'] || 'info'
+      logger_name = params['logger']
+      data = params['data']
+
+      # Format the message
+      prefix = logger_name ? "[#{server_id}:#{logger_name}]" : "[#{server_id}]"
+      message = data.is_a?(String) ? data : data.inspect
+
+      # Map MCP log levels to Ruby Logger levels
+      case level.to_s.downcase
+      when 'debug'
+        logger.debug("#{prefix} #{message}")
+      when 'info', 'notice'
+        logger.info("#{prefix} #{message}")
+      when 'warning'
+        logger.warn("#{prefix} #{message}")
+      when 'error', 'critical', 'alert', 'emergency'
+        logger.error("#{prefix} #{message}")
+      else
+        logger.info("#{prefix} [#{level}] #{message}")
       end
     end
 
@@ -669,6 +754,115 @@ module MCPClient
 
       @logger.warn("Unknown elicitation action '#{action}', defaulting to accept")
       result.merge('action' => 'accept')
+    end
+
+    # Normalize roots array - convert Hashes to Root objects (MCP 2025-06-18)
+    # @param roots [Array<MCPClient::Root, Hash>, nil] the roots to normalize
+    # @return [Array<MCPClient::Root>] normalized roots array
+    def normalize_roots(roots)
+      return [] if roots.nil?
+
+      roots.map do |root|
+        case root
+        when MCPClient::Root
+          root
+        when Hash
+          MCPClient::Root.from_json(root)
+        else
+          raise ArgumentError, "Invalid root type: #{root.class}. Expected MCPClient::Root or Hash."
+        end
+      end
+    end
+
+    # Handle roots/list request from server (MCP 2025-06-18)
+    # @param _request_id [String, Integer] the JSON-RPC request ID (unused, kept for callback signature)
+    # @param _params [Hash] the request parameters (unused)
+    # @return [Hash] the roots list response
+    def handle_roots_list_request(_request_id, _params)
+      { 'roots' => @roots.map(&:to_h) }
+    end
+
+    # Send notification to all servers that roots have changed (MCP 2025-06-18)
+    # @return [void]
+    def notify_roots_changed
+      @servers.each do |server|
+        server.rpc_notify('notifications/roots/list_changed', {})
+      rescue StandardError => e
+        server_id = server.name ? "#{server.class}[#{server.name}]" : server.class
+        @logger.warn("[#{server_id}] Failed to send roots/list_changed notification: #{e.message}")
+      end
+    end
+
+    # Handle sampling/createMessage request from server (MCP 2025-06-18)
+    # @param _request_id [String, Integer] the JSON-RPC request ID (unused, kept for callback signature)
+    # @param params [Hash] the sampling parameters (messages, modelPreferences, systemPrompt, maxTokens)
+    # @return [Hash] the sampling response (role, content, model, stopReason)
+    def handle_sampling_request(_request_id, params)
+      # If no handler is configured, return an error
+      unless @sampling_handler
+        @logger.warn('Received sampling request but no handler configured')
+        return { 'error' => { 'code' => -1, 'message' => 'Sampling not supported' } }
+      end
+
+      messages = params['messages'] || []
+      model_preferences = params['modelPreferences']
+      system_prompt = params['systemPrompt']
+      max_tokens = params['maxTokens']
+
+      begin
+        # Call the user-defined handler
+        result = case @sampling_handler.arity
+                 when 0
+                   @sampling_handler.call
+                 when 1
+                   @sampling_handler.call(messages)
+                 when 2
+                   @sampling_handler.call(messages, model_preferences)
+                 when 3
+                   @sampling_handler.call(messages, model_preferences, system_prompt)
+                 else
+                   @sampling_handler.call(messages, model_preferences, system_prompt, max_tokens)
+                 end
+
+        # Validate and format response
+        validate_sampling_response(result)
+      rescue StandardError => e
+        @logger.error("Sampling handler error: #{e.message}")
+        @logger.debug(e.backtrace.join("\n"))
+        { 'error' => { 'code' => -1, 'message' => "Sampling error: #{e.message}" } }
+      end
+    end
+
+    # Validate sampling response from handler (MCP 2025-06-18)
+    # @param result [Hash] the result from the sampling handler
+    # @return [Hash] validated sampling response
+    def validate_sampling_response(result)
+      return { 'error' => { 'code' => -1, 'message' => 'Sampling rejected' } } if result.nil?
+
+      # Convert symbol keys to string keys
+      result = result.transform_keys(&:to_s) if result.is_a?(Hash) && result.keys.first.is_a?(Symbol)
+
+      # Ensure required fields are present
+      unless result.is_a?(Hash) && result['content']
+        return {
+          'role' => 'assistant',
+          'content' => { 'type' => 'text', 'text' => result.to_s },
+          'model' => 'unknown',
+          'stopReason' => 'endTurn'
+        }
+      end
+
+      # Set defaults for missing fields
+      result['role'] ||= 'assistant'
+      result['model'] ||= 'unknown'
+      result['stopReason'] ||= 'endTurn'
+
+      # Normalize content if it's a string
+      if result['content'].is_a?(String)
+        result['content'] = { 'type' => 'text', 'text' => result['content'] }
+      end
+
+      result
     end
   end
 end

@@ -27,20 +27,14 @@ logger.level = Logger::INFO
 puts '🚀 Ruby MCP Client - Tool Annotations Demo'
 puts '=' * 60
 
-# Server configuration for stdio transport
-server_config = {
-  type: 'stdio',
-  command: 'python',
-  args: ['examples/echo_server_with_annotations.py'],
-  logger: logger
-}
-
 puts '📡 Connecting to MCP Echo Server with Tool Annotations'
 
 begin
-  # Create MCP client
-  client = MCPClient.create_client(
-    mcp_server_configs: [server_config]
+  # Create MCP client using the simplified connect API
+  # Passing an array of command arguments auto-detects stdio transport
+  client = MCPClient.connect(
+    ['python', 'examples/echo_server_with_annotations.py'],
+    logger: logger
   )
 
   puts '✅ Connected successfully!'

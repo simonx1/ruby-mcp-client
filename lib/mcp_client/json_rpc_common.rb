@@ -62,11 +62,15 @@ module MCPClient
     # Generate initialization parameters for MCP protocol
     # @return [Hash] the initialization parameters
     def initialization_params
+      capabilities = {
+        'elicitation' => {}, # MCP 2025-06-18: Support for server-initiated user interactions
+        'roots' => { 'listChanged' => true }, # MCP 2025-06-18: Support for roots
+        'sampling' => {} # MCP 2025-06-18: Support for server-initiated LLM sampling
+      }
+
       {
         'protocolVersion' => MCPClient::PROTOCOL_VERSION,
-        'capabilities' => {
-          'elicitation' => {} # MCP 2025-06-18: Support for server-initiated user interactions
-        },
+        'capabilities' => capabilities,
         'clientInfo' => { 'name' => 'ruby-mcp-client', 'version' => MCPClient::VERSION }
       }
     end

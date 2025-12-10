@@ -12,15 +12,13 @@ require 'logger'
 api_key = ENV.fetch('OPENAI_API_KEY', nil)
 abort 'Please set OPENAI_API_KEY' unless api_key
 
-# Create an MCPClient client (stdio stub for demo)
+# Create an MCPClient client using the simplified connect API
 logger = Logger.new($stdout)
 logger.level = Logger::WARN
-mcp_client = MCPClient::Client.new(
-  mcp_server_configs: [
-    MCPClient.stdio_config(
-      command: %W[npx -y @modelcontextprotocol/server-filesystem #{Dir.pwd}]
-    )
-  ],
+
+# Connect using stdio - passing an array of command arguments auto-detects stdio transport
+mcp_client = MCPClient.connect(
+  %W[npx -y @modelcontextprotocol/server-filesystem #{Dir.pwd}],
   logger: logger
 )
 

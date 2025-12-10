@@ -59,7 +59,61 @@ This Ruby MCP Client implements the **MCP 2025-06-18** specification with full b
 
 ## Usage
 
-### Basic Client Usage
+### Quick Connect API (Recommended)
+
+The simplest way to connect to an MCP server is using `MCPClient.connect`, which auto-detects the appropriate transport based on the URL:
+
+```ruby
+require 'mcp_client'
+
+# Connect to SSE server (URL ending in /sse)
+client = MCPClient.connect('http://localhost:8000/sse')
+
+# Connect to Streamable HTTP server (URL ending in /mcp)
+client = MCPClient.connect('http://localhost:8931/mcp')
+
+# Connect to stdio server (pass command array)
+client = MCPClient.connect(['npx', '-y', '@modelcontextprotocol/server-filesystem', '/home'])
+# Or as a string command
+client = MCPClient.connect('npx -y @modelcontextprotocol/server-filesystem /home')
+
+# Connect with options
+client = MCPClient.connect('http://api.example.com/mcp',
+  headers: { 'Authorization' => 'Bearer YOUR_TOKEN' },
+  read_timeout: 60,
+  retries: 3,
+  logger: Logger.new($stdout)
+)
+
+# Connect to multiple servers at once
+client = MCPClient.connect([
+  'http://server1.com/mcp',
+  'http://server2.com/sse'
+])
+
+# Force a specific transport type
+client = MCPClient.connect('http://custom-server.com/api', transport: :streamable_http)
+
+# Use the client
+tools = client.list_tools
+result = client.call_tool('example_tool', { param: 'value' })
+
+# Clean up when done
+client.cleanup
+```
+
+**Transport Detection Rules:**
+| URL Pattern | Transport |
+|-------------|-----------|
+| Ends with `/sse` | SSE |
+| Ends with `/mcp` | Streamable HTTP |
+| `stdio://command` or Array | stdio |
+| Commands starting with `npx`, `node`, `python`, etc. | stdio |
+| Other HTTP URLs | Auto-detect (tries Streamable HTTP → SSE → HTTP) |
+
+### Advanced Client Configuration
+
+For more control over server configuration, use `MCPClient.create_client`:
 
 ```ruby
 require 'mcp_client'

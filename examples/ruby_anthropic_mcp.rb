@@ -12,26 +12,22 @@ require 'logger'
 api_key = ENV.fetch('ANTHROPIC_API_KEY', nil)
 abort 'Please set ANTHROPIC_API_KEY' unless api_key
 
-# Create an MCPClient client (stdio stub for demo)
+# Create an MCPClient client using the simplified connect API
 logger = Logger.new($stdout)
 logger.level = Logger::WARN
-mcp_client = MCPClient::Client.new(
-  mcp_server_configs: [
-    # Example with stdio configuration (pass custom environment variables)
-    MCPClient.stdio_config(
-      command: %W[npx -y @modelcontextprotocol/server-filesystem #{Dir.pwd}],
-      env: { 'EXAMPLE_ENV_VAR' => 'example_value' }
-    )
-    # Example with SSE configuration (commented out - uncomment to use)
-    # MCPClient.sse_config(
-    #   base_url: 'http://localhost:8931/sse',
-    #   read_timeout: 30, # Optional timeout in seconds (default: 30)
-    #   retries: 3,       # Optional number of retry attempts (default: 0)
-    #   retry_backoff: 1  # Optional backoff delay in seconds (default: 1)
-    # )
-  ],
+
+# Connect using stdio - passing an array of command arguments auto-detects stdio transport
+mcp_client = MCPClient.connect(
+  %W[npx -y @modelcontextprotocol/server-filesystem #{Dir.pwd}],
+  env: { 'EXAMPLE_ENV_VAR' => 'example_value' },
   logger: logger
 )
+
+# Alternative: Connect using SSE (uncomment to use)
+# mcp_client = MCPClient.connect('http://localhost:8931/sse',
+#                                 read_timeout: 30,
+#                                 retries: 3,
+#                                 logger: logger)
 
 # Verify that the EXAMPLE_ENV_VAR was forwarded to the stdio server
 stdio_server = mcp_client.servers.first
