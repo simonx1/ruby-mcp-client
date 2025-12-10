@@ -15,20 +15,15 @@ require 'byebug'
 api_key = ENV.fetch('OPENAI_API_KEY', nil)
 abort 'Please set OPENAI_API_KEY' unless api_key
 
-# Create an MCPClient client
+# Create an MCPClient client using the simplified connect API
 logger = Logger.new($stdout)
 logger.level = Logger::WARN # DEBUG
-mcp_client = MCPClient::Client.new(
-  mcp_server_configs: [
-    MCPClient.streamable_http_config(
-      base_url: 'http://localhost:8931/mcp',
-      read_timeout: 30, # Optional timeout in seconds
-      retries: 3,       # Optional number of retry attempts
-      retry_backoff: 1  # Optional backoff delay in seconds
-    )
-  ],
-  logger: logger
-)
+
+# Connect using Streamable HTTP - the /mcp suffix auto-detects the transport
+mcp_client = MCPClient.connect('http://localhost:8931/mcp',
+                               read_timeout: 30,
+                               retries: 3,
+                               logger: logger)
 
 # Initialize the Ruby-OpenAI client
 client = OpenAI::Client.new(access_token: api_key)

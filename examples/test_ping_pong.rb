@@ -28,18 +28,12 @@ puts 'This test verifies the ping/pong keepalive mechanism'
 puts 'Run with DEBUG=1 to see detailed messages'
 puts
 
-# Server configuration
-server_config = {
-  type: 'streamable_http',
-  base_url: 'http://localhost:8931/mcp',
-  logger: logger
-}
-
 begin
   puts 'Connecting to server...'
-  client = MCPClient::Client.new(
-    mcp_server_configs: [server_config]
-  )
+  # Create MCP client using the simplified connect API
+  # The /mcp suffix auto-detects Streamable HTTP transport
+  client = MCPClient.connect('http://localhost:8931/mcp',
+                             logger: logger)
 
   puts "✅ Connected! Session established.\n\n"
 

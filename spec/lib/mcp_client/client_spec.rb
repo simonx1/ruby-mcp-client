@@ -717,11 +717,15 @@ RSpec.describe MCPClient::Client do
         })
         allow(mock_server).to receive(:respond_to?).with(:call_tool_streaming).and_return(true)
         allow(mock_server).to receive(:respond_to?).with(:on_elicitation_request).and_return(false)
+        allow(mock_server).to receive(:respond_to?).with(:on_roots_list_request).and_return(false)
+        allow(mock_server).to receive(:respond_to?).with(:on_sampling_request).and_return(false)
 
         # Setup mock_server2
         allow(mock_server2).to receive(:call_tool_streaming).and_return(server2_stream)
         allow(mock_server2).to receive(:respond_to?).with(:call_tool_streaming).and_return(true)
         allow(mock_server2).to receive(:respond_to?).with(:on_elicitation_request).and_return(false)
+        allow(mock_server2).to receive(:respond_to?).with(:on_roots_list_request).and_return(false)
+        allow(mock_server2).to receive(:respond_to?).with(:on_sampling_request).and_return(false)
         allow(mock_server2).to receive_messages(list_tools: [duplicate_tool], on_notification: nil)
 
         # Setup multi_client

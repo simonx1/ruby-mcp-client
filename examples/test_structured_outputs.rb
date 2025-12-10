@@ -38,20 +38,14 @@ logger.level = Logger::INFO
 puts '🚀 Ruby MCP Client - Structured Tool Outputs Demo (MCP 2025-06-18)'
 puts '=' * 70
 
-# Server configuration for stdio transport
-server_config = {
-  type: 'stdio',
-  command: 'python',
-  args: ['examples/structured_output_server.py'],
-  logger: logger
-}
-
 puts '📡 Connecting to MCP Server with Structured Output Support'
 
 begin
-  # Create MCP client
-  client = MCPClient.create_client(
-    mcp_server_configs: [server_config]
+  # Create MCP client using the simplified connect API
+  # Passing an array of command arguments auto-detects stdio transport
+  client = MCPClient.connect(
+    ['python', 'examples/structured_output_server.py'],
+    logger: logger
   )
 
   puts '✅ Connected successfully!'

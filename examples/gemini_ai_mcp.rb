@@ -46,17 +46,14 @@ unless File.exist?(vertex_creds_file)
   MSG
 end
 
-# Create an MCPClient instance.  For a quick demo we rely on the filesystem
-# server via stdio (no network services needed).
+# Create an MCPClient instance using the simplified connect API.
+# For a quick demo we rely on the filesystem server via stdio (no network services needed).
 logger = Logger.new($stdout)
 logger.level = Logger::WARN
 
-mcp_client = MCPClient::Client.new(
-  mcp_server_configs: [
-    MCPClient.stdio_config(
-      command: %W[npx -y @modelcontextprotocol/server-filesystem #{Dir.pwd}]
-    )
-  ],
+# Connect using stdio - passing an array of command arguments auto-detects stdio transport
+mcp_client = MCPClient.connect(
+  %W[npx -y @modelcontextprotocol/server-filesystem #{Dir.pwd}],
   logger: logger
 )
 

@@ -29,8 +29,12 @@ RSpec.describe MCPClient::Client, 'Elicitation (MCP 2025-06-18)' do
       it 'registers elicitation handler on servers that support it' do
         handler = ->(_message, _schema) { { 'action' => 'accept' } }
 
-        # Server supports elicitation
+        # Server supports elicitation, roots, and sampling
         allow(mock_stdio_server).to receive(:respond_to?).with(:on_elicitation_request).and_return(true)
+        allow(mock_stdio_server).to receive(:respond_to?).with(:on_roots_list_request).and_return(true)
+        allow(mock_stdio_server).to receive(:respond_to?).with(:on_sampling_request).and_return(true)
+        allow(mock_stdio_server).to receive(:on_roots_list_request)
+        allow(mock_stdio_server).to receive(:on_sampling_request)
         expect(mock_stdio_server).to receive(:on_elicitation_request)
 
         described_class.new(
@@ -45,8 +49,10 @@ RSpec.describe MCPClient::Client, 'Elicitation (MCP 2025-06-18)' do
         # Use a generic double instead of instance_double to avoid method checking
         non_elicitation_server = double('non-elicitation-server', name: 'http-server')
 
-        # Server does not support elicitation (e.g., HTTP)
+        # Server does not support elicitation, roots, or sampling (e.g., HTTP)
         allow(non_elicitation_server).to receive(:respond_to?).with(:on_elicitation_request).and_return(false)
+        allow(non_elicitation_server).to receive(:respond_to?).with(:on_roots_list_request).and_return(false)
+        allow(non_elicitation_server).to receive(:respond_to?).with(:on_sampling_request).and_return(false)
         allow(non_elicitation_server).to receive(:on_notification)
         allow(MCPClient::ServerFactory).to receive(:create).and_return(non_elicitation_server)
 
@@ -71,9 +77,13 @@ RSpec.describe MCPClient::Client, 'Elicitation (MCP 2025-06-18)' do
           server
         end
 
-        # Both servers support elicitation
+        # Both servers support elicitation, roots, and sampling
         [mock_stdio_server, mock_sse_server].each do |server|
           allow(server).to receive(:respond_to?).with(:on_elicitation_request).and_return(true)
+          allow(server).to receive(:respond_to?).with(:on_roots_list_request).and_return(true)
+          allow(server).to receive(:respond_to?).with(:on_sampling_request).and_return(true)
+          allow(server).to receive(:on_roots_list_request)
+          allow(server).to receive(:on_sampling_request)
           expect(server).to receive(:on_elicitation_request)
         end
 
@@ -91,6 +101,10 @@ RSpec.describe MCPClient::Client, 'Elicitation (MCP 2025-06-18)' do
       it 'still registers handler on servers (for decline behavior)' do
         # Even without handler, we register the method so we can auto-decline
         allow(mock_stdio_server).to receive(:respond_to?).with(:on_elicitation_request).and_return(true)
+        allow(mock_stdio_server).to receive(:respond_to?).with(:on_roots_list_request).and_return(true)
+        allow(mock_stdio_server).to receive(:respond_to?).with(:on_sampling_request).and_return(true)
+        allow(mock_stdio_server).to receive(:on_roots_list_request)
+        allow(mock_stdio_server).to receive(:on_sampling_request)
         expect(mock_stdio_server).to receive(:on_elicitation_request)
 
         described_class.new(
@@ -269,6 +283,10 @@ RSpec.describe MCPClient::Client, 'Elicitation (MCP 2025-06-18)' do
       handler = ->(_message, _schema) { { 'action' => 'accept' } }
 
       allow(mock_stdio_server).to receive(:respond_to?).with(:on_elicitation_request).and_return(true)
+      allow(mock_stdio_server).to receive(:respond_to?).with(:on_roots_list_request).and_return(true)
+      allow(mock_stdio_server).to receive(:respond_to?).with(:on_sampling_request).and_return(true)
+      allow(mock_stdio_server).to receive(:on_roots_list_request)
+      allow(mock_stdio_server).to receive(:on_sampling_request)
 
       registered_callback = nil
       allow(mock_stdio_server).to receive(:on_elicitation_request) do |&block|

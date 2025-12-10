@@ -118,6 +118,8 @@ module MCPClient
       @events_thread = nil
       @buffer = '' # Buffer for partial SSE event data
       @elicitation_request_callback = nil # MCP 2025-06-18
+      @roots_list_request_callback = nil # MCP 2025-06-18
+      @sampling_request_callback = nil # MCP 2025-06-18
     end
 
     # Connect to the MCP server over Streamable HTTP
@@ -215,6 +217,33 @@ module MCPClient
       Enumerator.new do |yielder|
         yielder << call_tool(tool_name, parameters)
       end
+    end
+
+    # Request completion suggestions from the server (MCP 2025-06-18)
+    # @param ref [Hash] reference object (e.g., { 'type' => 'ref/prompt', 'name' => 'prompt_name' })
+    # @param argument [Hash] the argument being completed (e.g., { 'name' => 'arg_name', 'value' => 'partial' })
+    # @return [Hash] completion result with 'values', optional 'total', and 'hasMore' fields
+    # @raise [MCPClient::Errors::ServerError] if server returns an error
+    def complete(ref:, argument:)
+      result = rpc_request('completion/complete', { ref: ref, argument: argument })
+      result['completion'] || { 'values' => [] }
+    rescue MCPClient::Errors::ConnectionError, MCPClient::Errors::TransportError
+      raise
+    rescue StandardError => e
+      raise MCPClient::Errors::ServerError, "Error requesting completion: #{e.message}"
+    end
+
+    # Set the logging level on the server (MCP 2025-06-18)
+    # @param level [String] the log level ('debug', 'info', 'notice', 'warning', 'error',
+    #   'critical', 'alert', 'emergency')
+    # @return [Hash] empty result on success
+    # @raise [MCPClient::Errors::ServerError] if server returns an error
+    def log_level=(level)
+      rpc_request('logging/setLevel', { level: level })
+    rescue MCPClient::Errors::ConnectionError, MCPClient::Errors::TransportError
+      raise
+    rescue StandardError => e
+      raise MCPClient::Errors::ServerError, "Error setting log level: #{e.message}"
     end
 
     # List all prompts available from the MCP server
@@ -458,6 +487,20 @@ module MCPClient
     # @return [void]
     def on_elicitation_request(&block)
       @elicitation_request_callback = block
+    end
+
+    # Register a callback for roots/list requests (MCP 2025-06-18)
+    # @param block [Proc] callback that receives (request_id, params) and returns response hash
+    # @return [void]
+    def on_roots_list_request(&block)
+      @roots_list_request_callback = block
+    end
+
+    # Register a callback for sampling requests (MCP 2025-06-18)
+    # @param block [Proc] callback that receives (request_id, params) and returns response hash
+    # @return [void]
+    def on_sampling_request(&block)
+      @sampling_request_callback = block
     end
 
     private
@@ -823,6 +866,10 @@ module MCPClient
       case method
       when 'elicitation/create'
         handle_elicitation_create(request_id, params)
+      when 'roots/list'
+        handle_roots_list(request_id, params)
+      when 'sampling/createMessage'
+        handle_sampling_create_message(request_id, params)
       else
         # Unknown request method, send error response
         send_error_response(request_id, -32_601, "Method not found: #{method}")
@@ -852,6 +899,84 @@ module MCPClient
 
       # Send the response back to the server
       send_elicitation_response(elicitation_id, result)
+    end
+
+    # Handle roots/list request from server (MCP 2025-06-18)
+    # @param request_id [String, Integer] the JSON-RPC request ID
+    # @param params [Hash] the request parameters
+    # @return [void]
+    def handle_roots_list(request_id, params)
+      # If no callback is registered, return empty roots list
+      unless @roots_list_request_callback
+        @logger.debug('Received roots/list request but no callback registered, returning empty list')
+        send_roots_list_response(request_id, { 'roots' => [] })
+        return
+      end
+
+      # Call the registered callback
+      result = @roots_list_request_callback.call(request_id, params)
+
+      # Send the response back to the server
+      send_roots_list_response(request_id, result)
+    end
+
+    # Handle sampling/createMessage request from server (MCP 2025-06-18)
+    # @param request_id [String, Integer] the JSON-RPC request ID
+    # @param params [Hash] the sampling parameters
+    # @return [void]
+    def handle_sampling_create_message(request_id, params)
+      # If no callback is registered, return error
+      unless @sampling_request_callback
+        @logger.warn('Received sampling request but no callback registered, returning error')
+        send_error_response(request_id, -1, 'Sampling not supported')
+        return
+      end
+
+      # Call the registered callback
+      result = @sampling_request_callback.call(request_id, params)
+
+      # Send the response back to the server
+      send_sampling_response(request_id, result)
+    end
+
+    # Send roots/list response back to server via HTTP POST (MCP 2025-06-18)
+    # @param request_id [String, Integer] the JSON-RPC request ID
+    # @param result [Hash] the roots list result
+    # @return [void]
+    def send_roots_list_response(request_id, result)
+      response = {
+        'jsonrpc' => '2.0',
+        'id' => request_id,
+        'result' => result
+      }
+
+      # Send response via HTTP POST
+      post_jsonrpc_response(response)
+    rescue StandardError => e
+      @logger.error("Error sending roots/list response: #{e.message}")
+    end
+
+    # Send sampling response back to server via HTTP POST (MCP 2025-06-18)
+    # @param request_id [String, Integer] the JSON-RPC request ID
+    # @param result [Hash] the sampling result (role, content, model, stopReason)
+    # @return [void]
+    def send_sampling_response(request_id, result)
+      # Check if result contains an error
+      if result.is_a?(Hash) && result['error']
+        send_error_response(request_id, result['error']['code'] || -1, result['error']['message'] || 'Sampling error')
+        return
+      end
+
+      response = {
+        'jsonrpc' => '2.0',
+        'id' => request_id,
+        'result' => result
+      }
+
+      # Send response via HTTP POST
+      post_jsonrpc_response(response)
+    rescue StandardError => e
+      @logger.error("Error sending sampling response: #{e.message}")
     end
 
     # Send elicitation response back to server via HTTP POST (MCP 2025-06-18)

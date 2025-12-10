@@ -322,6 +322,33 @@ module MCPClient
       raise MCPClient::Errors::ResourceReadError, "Error reading resource '#{uri}': #{e.message}"
     end
 
+    # Request completion suggestions from the server (MCP 2025-06-18)
+    # @param ref [Hash] reference to complete (prompt or resource)
+    # @param argument [Hash] the argument being completed (e.g., { 'name' => 'arg_name', 'value' => 'partial' })
+    # @return [Hash] completion result with 'values', optional 'total', and 'hasMore' fields
+    # @raise [MCPClient::Errors::ServerError] if server returns an error
+    def complete(ref:, argument:)
+      result = rpc_request('completion/complete', { ref: ref, argument: argument })
+      result['completion'] || { 'values' => [] }
+    rescue MCPClient::Errors::ConnectionError, MCPClient::Errors::TransportError
+      raise
+    rescue StandardError => e
+      raise MCPClient::Errors::ServerError, "Error requesting completion: #{e.message}"
+    end
+
+    # Set the logging level on the server (MCP 2025-06-18)
+    # @param level [String] the log level ('debug', 'info', 'notice', 'warning', 'error',
+    #   'critical', 'alert', 'emergency')
+    # @return [Hash] empty result on success
+    # @raise [MCPClient::Errors::ServerError] if server returns an error
+    def log_level=(level)
+      rpc_request('logging/setLevel', { level: level })
+    rescue MCPClient::Errors::ConnectionError, MCPClient::Errors::TransportError
+      raise
+    rescue StandardError => e
+      raise MCPClient::Errors::ServerError, "Error setting log level: #{e.message}"
+    end
+
     # List all resource templates available from the MCP server
     # @param cursor [String, nil] optional cursor for pagination
     # @return [Hash] result containing resourceTemplates array and optional nextCursor

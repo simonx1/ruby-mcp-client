@@ -18,22 +18,19 @@ puts 'This example connects to a Streamable HTTP MCP server'
 puts 'The server expects HTTP POST but responds with SSE format'
 puts
 
-# Example configuration for a Streamable HTTP server
-# Replace with your actual server URL and credentials
-server_config = MCPClient.streamable_http_config(
-  base_url: 'https://mcp.zapier.com/api/mcp/s/<base64 encoded api key>/mcp',
-  read_timeout: 60,
-  retries: 3,
-  retry_backoff: 2,
-  name: 'example-streamable-server',
-  logger: logger
-)
+# Server URL - Replace with your actual server URL and credentials
+# The /mcp suffix auto-detects Streamable HTTP transport
+server_url = 'https://mcp.zapier.com/api/mcp/s/<base64 encoded api key>/mcp'
 
 begin
-  # Create client with Streamable HTTP transport
-  client = MCPClient.create_client(
-    mcp_server_configs: [server_config]
-  )
+  # Create client using the simplified connect API
+  # The /mcp suffix auto-detects Streamable HTTP transport
+  client = MCPClient.connect(server_url,
+                             read_timeout: 60,
+                             retries: 3,
+                             retry_backoff: 2,
+                             name: 'example-streamable-server',
+                             logger: logger)
 
   puts '✓ Client created successfully'
 

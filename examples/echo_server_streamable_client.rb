@@ -32,18 +32,10 @@ end
 puts '🚀 Ruby MCP Client - Streamable HTTP Transport Test'
 puts '=' * 60
 
-# Server configuration for streamable HTTP
-server_config = {
-  type: 'streamable_http',
-  base_url: 'http://localhost:8931/mcp',
-  headers: {},
-  read_timeout: 60, # Longer timeout for long-running tasks
-  retries: 3,
-  retry_backoff: 1,
-  logger: logger
-}
+# Server URL - the /mcp suffix auto-detects Streamable HTTP transport
+server_url = 'http://localhost:8931/mcp'
 
-puts "📡 Connecting to Enhanced Echo Server at #{server_config[:base_url]}"
+puts "📡 Connecting to Enhanced Echo Server at #{server_url}"
 puts 'Transport: Streamable HTTP (MCP 2025-03-26)'
 puts
 
@@ -52,10 +44,12 @@ notifications_received = []
 notification_mutex = Mutex.new
 
 begin
-  # Create MCP client with notification callback
-  client = MCPClient::Client.new(
-    mcp_server_configs: [server_config]
-  )
+  # Create MCP client using the simplified connect API
+  # The /mcp suffix auto-detects Streamable HTTP transport
+  client = MCPClient.connect(server_url,
+                             read_timeout: 60, # Longer timeout for long-running tasks
+                             retries: 3,
+                             logger: logger)
 
   # Set up notification handler
   client.on_notification do |method, params|

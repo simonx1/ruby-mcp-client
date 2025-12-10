@@ -47,5 +47,8 @@ module MCPClient
 
     # Raised when multiple resources with the same URI exist across different servers
     class AmbiguousResourceURI < MCPError; end
+
+    # Raised when transport type cannot be determined from target URL/command
+    class TransportDetectionError < MCPError; end
   end
 end
