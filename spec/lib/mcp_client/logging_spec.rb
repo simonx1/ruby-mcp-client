@@ -217,4 +217,22 @@ RSpec.describe 'Logging (MCP 2025-06-18)' do
       end
     end
   end
+
+  describe MCPClient::ServerHTTP do
+    describe '#log_level=' do
+      let(:server) do
+        described_class.new(base_url: 'http://example.com/rpc', logger: Logger.new(nil))
+      end
+
+      before do
+        allow(server).to receive(:rpc_request).and_return({})
+      end
+
+      it 'calls rpc_request with correct parameters' do
+        server.log_level = 'critical'
+
+        expect(server).to have_received(:rpc_request).with('logging/setLevel', { level: 'critical' })
+      end
+    end
+  end
 end

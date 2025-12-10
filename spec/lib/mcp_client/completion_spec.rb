@@ -194,4 +194,43 @@ RSpec.describe 'Completion (MCP 2025-06-18)' do
       end
     end
   end
+
+  describe MCPClient::ServerHTTP do
+    describe '#complete' do
+      let(:server) do
+        described_class.new(base_url: 'http://example.com/rpc', logger: Logger.new(nil))
+      end
+
+      let(:ref) { { 'type' => 'ref/prompt', 'name' => 'greeting' } }
+      let(:argument) { { 'name' => 'language', 'value' => 'en' } }
+
+      before do
+        allow(server).to receive(:rpc_request).and_return({
+                                                            'completion' => {
+                                                              'values' => %w[english esperanto],
+                                                              'total' => 2
+                                                            }
+                                                          })
+      end
+
+      it 'calls rpc_request with correct parameters' do
+        result = server.complete(ref: ref, argument: argument)
+
+        expect(server).to have_received(:rpc_request).with(
+          'completion/complete',
+          { ref: ref, argument: argument }
+        )
+        expect(result['values']).to eq(%w[english esperanto])
+        expect(result['total']).to eq(2)
+      end
+
+      it 'returns empty values when completion is nil' do
+        allow(server).to receive(:rpc_request).and_return({})
+
+        result = server.complete(ref: ref, argument: argument)
+
+        expect(result['values']).to eq([])
+      end
+    end
+  end
 end
