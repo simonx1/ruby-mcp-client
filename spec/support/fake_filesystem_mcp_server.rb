@@ -24,7 +24,7 @@ TOOLS = JSON.parse(<<~'JSON')
           "path"
         ],
         "additionalProperties": false,
-        "\$schema": "http://json-schema.org/draft-07/schema#"
+        "$schema": "http://json-schema.org/draft-07/schema#"
       }
     },
     {
@@ -44,7 +44,7 @@ TOOLS = JSON.parse(<<~'JSON')
           "paths"
         ],
         "additionalProperties": false,
-        "\$schema": "http://json-schema.org/draft-07/schema#"
+        "$schema": "http://json-schema.org/draft-07/schema#"
       }
     },
     {
@@ -65,7 +65,7 @@ TOOLS = JSON.parse(<<~'JSON')
           "content"
         ],
         "additionalProperties": false,
-        "\$schema": "http://json-schema.org/draft-07/schema#"
+        "$schema": "http://json-schema.org/draft-07/schema#"
       }
     },
     {
@@ -109,7 +109,7 @@ TOOLS = JSON.parse(<<~'JSON')
           "edits"
         ],
         "additionalProperties": false,
-        "\$schema": "http://json-schema.org/draft-07/schema#"
+        "$schema": "http://json-schema.org/draft-07/schema#"
       }
     },
     {
@@ -126,7 +126,7 @@ TOOLS = JSON.parse(<<~'JSON')
           "path"
         ],
         "additionalProperties": false,
-        "\$schema": "http://json-schema.org/draft-07/schema#"
+        "$schema": "http://json-schema.org/draft-07/schema#"
       }
     },
     {
@@ -143,7 +143,7 @@ TOOLS = JSON.parse(<<~'JSON')
           "path"
         ],
         "additionalProperties": false,
-        "\$schema": "http://json-schema.org/draft-07/schema#"
+        "$schema": "http://json-schema.org/draft-07/schema#"
       }
     },
     {
@@ -160,7 +160,7 @@ TOOLS = JSON.parse(<<~'JSON')
           "path"
         ],
         "additionalProperties": false,
-        "\$schema": "http://json-schema.org/draft-07/schema#"
+        "$schema": "http://json-schema.org/draft-07/schema#"
       }
     },
     {
@@ -181,7 +181,7 @@ TOOLS = JSON.parse(<<~'JSON')
           "destination"
         ],
         "additionalProperties": false,
-        "\$schema": "http://json-schema.org/draft-07/schema#"
+        "$schema": "http://json-schema.org/draft-07/schema#"
       }
     },
     {
@@ -209,7 +209,7 @@ TOOLS = JSON.parse(<<~'JSON')
           "pattern"
         ],
         "additionalProperties": false,
-        "\$schema": "http://json-schema.org/draft-07/schema#"
+        "$schema": "http://json-schema.org/draft-07/schema#"
       }
     },
     {
@@ -226,7 +226,7 @@ TOOLS = JSON.parse(<<~'JSON')
           "path"
         ],
         "additionalProperties": false,
-        "\$schema": "http://json-schema.org/draft-07/schema#"
+        "$schema": "http://json-schema.org/draft-07/schema#"
       }
     },
     {
