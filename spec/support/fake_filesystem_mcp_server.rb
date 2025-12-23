@@ -8,7 +8,7 @@ require 'pathname'
 ROOT_DIR = Pathname.new(ARGV[0] || '.').expand_path
 $stdout.sync = true
 
-TOOLS = JSON.parse(<<~'JSON')
+TOOLS = JSON.parse(<<~JSON)
   [
     {
       "name": "read_file",
