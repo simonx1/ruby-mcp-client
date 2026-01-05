@@ -27,9 +27,21 @@ RSpec.describe MCPClient::Tool do
   describe '#initialize' do
     it 'sets the attributes correctly' do
       expect(tool.name).to eq(tool_name)
+      expect(tool.title).to be_nil
       expect(tool.description).to eq(tool_description)
       expect(tool.schema).to eq(tool_schema)
       expect(tool.server).to be_nil
+    end
+
+    it 'sets title when provided' do
+      tool_title = 'Test Tool Display Name'
+      tool_with_title = described_class.new(
+        name: tool_name,
+        description: tool_description,
+        schema: tool_schema,
+        title: tool_title
+      )
+      expect(tool_with_title.title).to eq(tool_title)
     end
 
     it 'sets server when provided' do
@@ -56,9 +68,27 @@ RSpec.describe MCPClient::Tool do
     it 'creates a tool from JSON data' do
       tool = described_class.from_json(json_data)
       expect(tool.name).to eq(tool_name)
+      expect(tool.title).to be_nil
       expect(tool.description).to eq(tool_description)
       expect(tool.schema).to eq(tool_schema)
       expect(tool.server).to be_nil
+    end
+
+    it 'parses title from JSON data with string keys' do
+      json_data_with_title = json_data.merge('title' => 'Test Tool Display Name')
+      tool = described_class.from_json(json_data_with_title)
+      expect(tool.title).to eq('Test Tool Display Name')
+    end
+
+    it 'parses title from JSON data with symbol keys' do
+      json_data_with_title = {
+        name: tool_name,
+        description: tool_description,
+        schema: tool_schema,
+        title: 'Test Tool Display Name'
+      }
+      tool = described_class.from_json(json_data_with_title)
+      expect(tool.title).to eq('Test Tool Display Name')
     end
 
     it 'associates tool with server when provided' do
