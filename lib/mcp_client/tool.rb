@@ -5,6 +5,8 @@ module MCPClient
   class Tool
     # @!attribute [r] name
     #   @return [String] the name of the tool
+    # @!attribute [r] title
+    #   @return [String, nil] optional human-readable name of the tool for display purposes
     # @!attribute [r] description
     #   @return [String] the description of the tool
     # @!attribute [r] schema
@@ -15,17 +17,19 @@ module MCPClient
     #   @return [Hash, nil] optional annotations describing tool behavior (e.g., readOnly, destructive)
     # @!attribute [r] server
     #   @return [MCPClient::ServerBase, nil] the server this tool belongs to
-    attr_reader :name, :description, :schema, :output_schema, :annotations, :server
+    attr_reader :name, :title, :description, :schema, :output_schema, :annotations, :server
 
     # Initialize a new Tool
     # @param name [String] the name of the tool
     # @param description [String] the description of the tool
     # @param schema [Hash] the JSON schema for the tool inputs
+    # @param title [String, nil] optional human-readable name of the tool for display purposes
     # @param output_schema [Hash, nil] optional JSON schema for structured tool outputs (MCP 2025-06-18)
     # @param annotations [Hash, nil] optional annotations describing tool behavior
     # @param server [MCPClient::ServerBase, nil] the server this tool belongs to
-    def initialize(name:, description:, schema:, output_schema: nil, annotations: nil, server: nil)
+    def initialize(name:, description:, schema:, title: nil, output_schema: nil, annotations: nil, server: nil)
       @name = name
+      @title = title
       @description = description
       @schema = schema
       @output_schema = output_schema
@@ -43,10 +47,12 @@ module MCPClient
       schema = data['inputSchema'] || data[:inputSchema] || data['schema'] || data[:schema]
       output_schema = data['outputSchema'] || data[:outputSchema]
       annotations = data['annotations'] || data[:annotations]
+      title = data['title'] || data[:title]
       new(
         name: data['name'] || data[:name],
         description: data['description'] || data[:description],
         schema: schema,
+        title: title,
         output_schema: output_schema,
         annotations: annotations,
         server: server
