@@ -165,8 +165,8 @@ DEPENDENCIES
   gemini-ai
   openai!
   rdoc (~> 7.0)
-  rspec
-  rubocop
+  rspec (~> 3.12)
+  rubocop (~> 1.62)
   ruby-anthropic
   ruby-mcp-client!
   ruby-openai
