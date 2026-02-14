@@ -7,7 +7,7 @@ require_relative 'mcp_client/prompt'
 require_relative 'mcp_client/resource'
 require_relative 'mcp_client/resource_template'
 require_relative 'mcp_client/resource_content'
-require_relative 'mcp_client/audio_content'
+require_relative 'mcp_client/resource_link'
 require_relative 'mcp_client/root'
 require_relative 'mcp_client/elicitation_validator'
 require_relative 'mcp_client/server_base'
@@ -467,5 +467,28 @@ module MCPClient
       logger: logger,
       faraday_config: faraday_config
     }
+  end
+
+  # Parse a single content item from a tool result into a typed object
+  # Recognizes 'resource_link' type and returns an MCPClient::ResourceLink.
+  # Unrecognized types are returned as-is (the original Hash).
+  # @param item [Hash] a content item with a 'type' field
+  # @return [MCPClient::ResourceLink, Hash] typed object or raw hash
+  def self.parse_content_item(item)
+    case item['type']
+    when 'resource_link'
+      ResourceLink.from_json(item)
+    else
+      item
+    end
+  end
+
+  # Parse the content array from a tool result into typed objects
+  # Each item with type 'resource_link' is converted to an MCPClient::ResourceLink.
+  # Other items are returned as-is.
+  # @param content [Array<Hash>] content array from a tool result
+  # @return [Array<MCPClient::ResourceLink, Hash>] array of typed objects or raw hashes
+  def self.parse_tool_content(content)
+    Array(content).map { |item| parse_content_item(item) }
   end
 end
