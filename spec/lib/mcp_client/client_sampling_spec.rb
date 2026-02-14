@@ -390,9 +390,9 @@ RSpec.describe MCPClient::Client, 'Sampling (MCP 2025-11-25)' do
 
         client = described_class.new(sampling_handler: handler)
         client.send(:handle_sampling_request, request_id, {
-                       'messages' => [{ 'role' => 'user', 'content' => { 'type' => 'text', 'text' => 'Hi' } }],
-                       'includeContext' => 'allServers'
-                     })
+                      'messages' => [{ 'role' => 'user', 'content' => { 'type' => 'text', 'text' => 'Hi' } }],
+                      'includeContext' => 'allServers'
+                    })
 
         expect(received_extra['includeContext']).to eq('allServers')
       end
@@ -408,9 +408,9 @@ RSpec.describe MCPClient::Client, 'Sampling (MCP 2025-11-25)' do
 
         client = described_class.new(sampling_handler: handler)
         client.send(:handle_sampling_request, request_id, {
-                       'messages' => [{ 'role' => 'user', 'content' => { 'type' => 'text', 'text' => 'Hi' } }],
-                       'temperature' => 0.9
-                     })
+                      'messages' => [{ 'role' => 'user', 'content' => { 'type' => 'text', 'text' => 'Hi' } }],
+                      'temperature' => 0.9
+                    })
 
         expect(received_extra['temperature']).to eq(0.9)
       end
@@ -426,9 +426,9 @@ RSpec.describe MCPClient::Client, 'Sampling (MCP 2025-11-25)' do
 
         client = described_class.new(sampling_handler: handler)
         client.send(:handle_sampling_request, request_id, {
-                       'messages' => [{ 'role' => 'user', 'content' => { 'type' => 'text', 'text' => 'Hi' } }],
-                       'stopSequences' => %w[STOP END]
-                     })
+                      'messages' => [{ 'role' => 'user', 'content' => { 'type' => 'text', 'text' => 'Hi' } }],
+                      'stopSequences' => %w[STOP END]
+                    })
 
         expect(received_extra['stopSequences']).to eq(%w[STOP END])
       end
@@ -444,9 +444,9 @@ RSpec.describe MCPClient::Client, 'Sampling (MCP 2025-11-25)' do
 
         client = described_class.new(sampling_handler: handler)
         client.send(:handle_sampling_request, request_id, {
-                       'messages' => [{ 'role' => 'user', 'content' => { 'type' => 'text', 'text' => 'Hi' } }],
-                       'metadata' => { 'source' => 'test', 'priority' => 'high' }
-                     })
+                      'messages' => [{ 'role' => 'user', 'content' => { 'type' => 'text', 'text' => 'Hi' } }],
+                      'metadata' => { 'source' => 'test', 'priority' => 'high' }
+                    })
 
         expect(received_extra['metadata']).to eq({ 'source' => 'test', 'priority' => 'high' })
       end
@@ -462,8 +462,8 @@ RSpec.describe MCPClient::Client, 'Sampling (MCP 2025-11-25)' do
 
         client = described_class.new(sampling_handler: handler)
         client.send(:handle_sampling_request, request_id, {
-                       'messages' => [{ 'role' => 'user', 'content' => { 'type' => 'text', 'text' => 'Hi' } }]
-                     })
+                      'messages' => [{ 'role' => 'user', 'content' => { 'type' => 'text', 'text' => 'Hi' } }]
+                    })
 
         expect(received_extra['includeContext']).to be_nil
         expect(received_extra['temperature']).to be_nil
@@ -485,9 +485,9 @@ RSpec.describe MCPClient::Client, 'Sampling (MCP 2025-11-25)' do
 
       client = described_class.new(sampling_handler: handler)
       client.send(:handle_sampling_request, request_id, {
-                     'messages' => [{ 'role' => 'user', 'content' => { 'type' => 'text', 'text' => 'Hi' } }],
-                     'systemPrompt' => 'Be concise and accurate.'
-                   })
+                    'messages' => [{ 'role' => 'user', 'content' => { 'type' => 'text', 'text' => 'Hi' } }],
+                    'systemPrompt' => 'Be concise and accurate.'
+                  })
 
       expect(received_prompt).to eq('Be concise and accurate.')
     end
@@ -501,8 +501,8 @@ RSpec.describe MCPClient::Client, 'Sampling (MCP 2025-11-25)' do
 
       client = described_class.new(sampling_handler: handler)
       client.send(:handle_sampling_request, request_id, {
-                     'messages' => [{ 'role' => 'user', 'content' => { 'type' => 'text', 'text' => 'Hi' } }]
-                   })
+                    'messages' => [{ 'role' => 'user', 'content' => { 'type' => 'text', 'text' => 'Hi' } }]
+                  })
 
       expect(received_prompt).to be_nil
     end
@@ -555,7 +555,8 @@ RSpec.describe MCPClient::Client, 'Sampling (MCP 2025-11-25)' do
       )
 
       registered_callback.call(789, {
-                                 'messages' => [{ 'role' => 'user', 'content' => { 'type' => 'text', 'text' => 'Hi' } }],
+                                 'messages' => [{ 'role' => 'user',
+                                                  'content' => { 'type' => 'text', 'text' => 'Hi' } }],
                                  'modelPreferences' => {
                                    'hints' => [{ 'name' => 'claude-3-opus' }],
                                    'costPriority' => 0.1,
