@@ -903,7 +903,10 @@ module MCPClient
     # @return [Hash] the handler result
     def call_sampling_handler(messages, model_preferences, system_prompt, max_tokens,
                               include_context, temperature, stop_sequences, metadata)
-      case @sampling_handler.arity
+      arity = @sampling_handler.arity
+      # Normalize negative arity (optional params) to minimum required args
+      arity = -(arity + 1) if arity.negative?
+      case arity
       when 0
         @sampling_handler.call
       when 1
