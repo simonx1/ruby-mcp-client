@@ -150,6 +150,44 @@ module MCPClient
       fetch_annotation_hint('openWorldHint', :openWorldHint, true)
     end
 
+    # Check the readOnlyHint annotation (MCP 2025-11-25)
+    # When true, the tool does not modify its environment.
+    # @return [Boolean] defaults to true when not specified
+    def read_only_hint?
+      return true unless @annotations
+
+      fetch_annotation_hint('readOnlyHint', :readOnlyHint, true)
+    end
+
+    # Check the destructiveHint annotation (MCP 2025-11-25)
+    # When true, the tool may perform destructive updates.
+    # Only meaningful when readOnlyHint is false.
+    # @return [Boolean] defaults to false when not specified
+    def destructive_hint?
+      return false unless @annotations
+
+      fetch_annotation_hint('destructiveHint', :destructiveHint, false)
+    end
+
+    # Check the idempotentHint annotation (MCP 2025-11-25)
+    # When true, calling the tool repeatedly with the same arguments has no additional effect.
+    # Only meaningful when readOnlyHint is false.
+    # @return [Boolean] defaults to false when not specified
+    def idempotent_hint?
+      return false unless @annotations
+
+      fetch_annotation_hint('idempotentHint', :idempotentHint, false)
+    end
+
+    # Check the openWorldHint annotation (MCP 2025-11-25)
+    # When true, the tool may interact with the "open world" (external entities).
+    # @return [Boolean] defaults to true when not specified
+    def open_world_hint?
+      return true unless @annotations
+
+      fetch_annotation_hint('openWorldHint', :openWorldHint, true)
+    end
+
     # Check if the tool supports structured outputs (MCP 2025-06-18)
     # @return [Boolean] true if the tool has an output schema defined
     def structured_output?
