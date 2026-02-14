@@ -63,7 +63,7 @@ module MCPClient
     # @return [Hash] the initialization parameters
     def initialization_params
       capabilities = {
-        'elicitation' => {}, # MCP 2025-06-18: Support for server-initiated user interactions
+        'elicitation' => { 'form' => {}, 'url' => {} }, # MCP 2025-11-25: form and URL mode elicitation
         'roots' => { 'listChanged' => true }, # MCP 2025-06-18: Support for roots
         'sampling' => {} # MCP 2025-06-18: Support for server-initiated LLM sampling
       }

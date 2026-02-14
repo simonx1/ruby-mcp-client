@@ -683,7 +683,8 @@ module MCPClient
       end
     end
 
-    # Handle elicitation request from server (MCP 2025-06-18)
+    # Handle elicitation request from server (MCP 2025-11-25)
+    # Supports both form mode (structured data) and URL mode (out-of-band interaction).
     # @param _request_id [String, Integer] the JSON-RPC request ID (unused at client layer)
     # @param params [Hash] the elicitation parameters
     # @return [Hash] the elicitation response
@@ -694,48 +695,121 @@ module MCPClient
         return { 'action' => 'decline' }
       end
 
+      mode = params['mode'] || 'form'
       message = params['message']
-      schema = params['schema'] || params['requestedSchema']
-      metadata = params['metadata']
 
       begin
-        # Call the user-defined handler
-        result = case @elicitation_handler.arity
-                 when 0
-                   @elicitation_handler.call
-                 when 1
-                   @elicitation_handler.call(message)
-                 when 2, -1
-                   @elicitation_handler.call(message, schema)
+        result = if mode == 'url'
+                   handle_url_elicitation(params, message)
                  else
-                   @elicitation_handler.call(message, schema, metadata)
+                   handle_form_elicitation(params, message)
                  end
 
-        # Validate and format response
-        case result
-        when Hash
-          if result['action']
-            normalised_action_response(result)
-          elsif result[:action]
-            # Convert symbol keys to strings
-            {
-              'action' => result[:action].to_s,
-              'content' => result[:content]
-            }.compact.then { |payload| normalised_action_response(payload) }
-          else
-            # Assume it's content for an accept action
-            { 'action' => 'accept', 'content' => result }
-          end
-        when nil
-          { 'action' => 'cancel' }
-        else
-          { 'action' => 'accept', 'content' => result }
-        end
+        format_elicitation_response(result, params)
       rescue StandardError => e
         @logger.error("Elicitation handler error: #{e.message}")
         @logger.debug(e.backtrace.join("\n"))
         { 'action' => 'decline' }
       end
+    end
+
+    # Handle form mode elicitation (MCP 2025-11-25)
+    # @param params [Hash] the elicitation parameters
+    # @param message [String] the human-readable message
+    # @return [Object] handler result
+    def handle_form_elicitation(params, message)
+      schema = params['requestedSchema'] || params['schema']
+      metadata = params['metadata']
+
+      # Validate schema if present
+      if schema
+        schema_errors = ElicitationValidator.validate_schema(schema)
+        unless schema_errors.empty?
+          @logger.warn("Elicitation schema validation warnings: #{schema_errors.join('; ')}")
+        end
+      end
+
+      # Call the user-defined handler
+      case @elicitation_handler.arity
+      when 0
+        @elicitation_handler.call
+      when 1
+        @elicitation_handler.call(message)
+      when 2, -1
+        @elicitation_handler.call(message, schema)
+      else
+        @elicitation_handler.call(message, schema, metadata)
+      end
+    end
+
+    # Handle URL mode elicitation (MCP 2025-11-25)
+    # @param params [Hash] the elicitation parameters
+    # @param message [String] the human-readable message
+    # @return [Object] handler result
+    def handle_url_elicitation(params, message)
+      url = params['url']
+      elicitation_id = params['elicitationId']
+
+      # Call handler with URL-mode specific params
+      case @elicitation_handler.arity
+      when 0
+        @elicitation_handler.call
+      when 1
+        @elicitation_handler.call(message)
+      when 2, -1
+        @elicitation_handler.call(message, { 'mode' => 'url', 'url' => url, 'elicitationId' => elicitation_id })
+      else
+        @elicitation_handler.call(message, { 'mode' => 'url', 'url' => url, 'elicitationId' => elicitation_id },
+                                  params['metadata'])
+      end
+    end
+
+    # Format and validate the elicitation response
+    # @param result [Object] handler result
+    # @param params [Hash] original request params (for schema validation)
+    # @return [Hash] formatted response
+    def format_elicitation_response(result, params)
+      response = case result
+                 when Hash
+                   if result['action']
+                     normalised_action_response(result)
+                   elsif result[:action]
+                     {
+                       'action' => result[:action].to_s,
+                       'content' => result[:content]
+                     }.compact.then { |payload| normalised_action_response(payload) }
+                   else
+                     { 'action' => 'accept', 'content' => result }
+                   end
+                 when nil
+                   { 'action' => 'cancel' }
+                 else
+                   { 'action' => 'accept', 'content' => result }
+                 end
+
+      # Validate content against schema for form mode accept responses
+      validate_elicitation_content(response, params)
+
+      response
+    end
+
+    # Validate elicitation response content against the requestedSchema
+    # @param response [Hash] the formatted response
+    # @param params [Hash] original request params
+    # @return [void]
+    def validate_elicitation_content(response, params)
+      return unless response['action'] == 'accept' && response['content'].is_a?(Hash)
+
+      mode = params['mode'] || 'form'
+      return unless mode == 'form'
+
+      schema = params['requestedSchema'] || params['schema']
+      return unless schema.is_a?(Hash)
+
+      errors = ElicitationValidator.validate_content(response['content'], schema)
+      return if errors.empty?
+
+      @logger.warn("Elicitation content validation warnings: #{errors.join('; ')}")
     end
 
     # Ensure the action value conforms to MCP spec (accept, decline, cancel)
