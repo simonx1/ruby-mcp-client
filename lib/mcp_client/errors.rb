@@ -50,5 +50,11 @@ module MCPClient
 
     # Raised when transport type cannot be determined from target URL/command
     class TransportDetectionError < MCPError; end
+
+    # Raised when a task is not found
+    class TaskNotFound < MCPError; end
+
+    # Raised when there's an error creating or managing a task
+    class TaskError < MCPError; end
   end
 end
