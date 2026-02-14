@@ -96,20 +96,20 @@ module MCPClient
     # @return [Boolean] true if the tool is read-only
     # @see #read_only_hint? for MCP 2025-11-25 annotation
     def read_only?
-      @annotations && @annotations['readOnly'] == true
+      !!(@annotations && @annotations['readOnly'] == true)
     end
 
     # Check if the tool is marked as destructive (legacy annotation field)
     # @return [Boolean] true if the tool is destructive
     # @see #destructive_hint? for MCP 2025-11-25 annotation
     def destructive?
-      @annotations && @annotations['destructive'] == true
+      !!(@annotations && @annotations['destructive'] == true)
     end
 
     # Check if the tool requires confirmation before execution
     # @return [Boolean] true if the tool requires confirmation
     def requires_confirmation?
-      @annotations && @annotations['requiresConfirmation'] == true
+      !!(@annotations && @annotations['requiresConfirmation'] == true)
     end
 
     # Check the readOnlyHint annotation (MCP 2025-11-25)
