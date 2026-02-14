@@ -37,6 +37,8 @@ jobs:
       id-token: write
     steps:
     - uses: actions/checkout@v4
+      with:
+        fetch-depth: 0
     - uses: anthropics/claude-code-action@v1
       with:
         prompt: |
@@ -46,5 +48,5 @@ jobs:
           Review the PR changes. Focus on code quality, potential bugs, performance and security issues.
         anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
         claude_args: |
-          --model claude-sonnet-4-5-20250929
+          --model claude-opus-4-6-20250715
           --allowedTools Edit,Read,Write
