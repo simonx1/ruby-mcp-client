@@ -44,7 +44,9 @@ module MCPClient
     # Return the lastModified annotation value (ISO 8601 timestamp string)
     # @return [String, nil] the lastModified timestamp, or nil if not set
     def last_modified
-      @annotations && @annotations['lastModified']
+      return nil unless @annotations.is_a?(Hash)
+
+      @annotations['lastModified'] || @annotations[:lastModified]
     end
 
     # Create a Resource instance from JSON data
