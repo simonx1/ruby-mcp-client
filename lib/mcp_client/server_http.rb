@@ -325,10 +325,13 @@ module MCPClient
     # Request completion suggestions from the server (MCP 2025-06-18)
     # @param ref [Hash] reference to complete (prompt or resource)
     # @param argument [Hash] the argument being completed (e.g., { 'name' => 'arg_name', 'value' => 'partial' })
+    # @param context [Hash, nil] optional context for the completion (MCP 2025-11-25)
     # @return [Hash] completion result with 'values', optional 'total', and 'hasMore' fields
     # @raise [MCPClient::Errors::ServerError] if server returns an error
-    def complete(ref:, argument:)
-      result = rpc_request('completion/complete', { ref: ref, argument: argument })
+    def complete(ref:, argument:, context: nil)
+      params = { ref: ref, argument: argument }
+      params[:context] = context if context
+      result = rpc_request('completion/complete', params)
       result['completion'] || { 'values' => [] }
     rescue MCPClient::Errors::ConnectionError, MCPClient::Errors::TransportError
       raise
