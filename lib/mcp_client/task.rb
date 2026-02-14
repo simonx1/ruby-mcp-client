@@ -45,7 +45,7 @@ module MCPClient
         progress: json['progress'] || json[:progress],
         total: json['total'] || json[:total],
         message: json['message'] || json[:message],
-        result: json['result'] || json[:result],
+        result: json.key?('result') ? json['result'] : json[:result],
         server: server
       )
     end
@@ -58,7 +58,7 @@ module MCPClient
       result['progress'] = @progress if @progress
       result['total'] = @total if @total
       result['message'] = @message if @message
-      result['result'] = @result if @result
+      result['result'] = @result unless @result.nil?
       result
     end
 
