@@ -9,7 +9,7 @@ RSpec.describe MCPClient::Resource do
   let(:resource_description) { 'A test file for testing' }
   let(:resource_mime_type) { 'text/plain' }
   let(:resource_size) { 1024 }
-  let(:resource_annotations) { { 'audience' => ['user'], 'priority' => 0.8 } }
+  let(:resource_annotations) { { 'audience' => ['user'], 'priority' => 0.8, 'lastModified' => '2025-07-15T10:30:00Z' } }
 
   let(:resource) do
     described_class.new(
@@ -101,6 +101,65 @@ RSpec.describe MCPClient::Resource do
       expect(resource.mime_type).to be_nil
       expect(resource.size).to be_nil
       expect(resource.annotations).to be_nil
+    end
+  end
+
+  describe 'annotations' do
+    context 'with valid annotations' do
+      it 'accepts audience array' do
+        resource = described_class.new(
+          uri: resource_uri,
+          name: resource_name,
+          annotations: { 'audience' => %w[user assistant] }
+        )
+        expect(resource.annotations['audience']).to eq(%w[user assistant])
+      end
+
+      it 'accepts priority number' do
+        resource = described_class.new(
+          uri: resource_uri,
+          name: resource_name,
+          annotations: { 'priority' => 0.8 }
+        )
+        expect(resource.annotations['priority']).to eq(0.8)
+      end
+
+      it 'accepts lastModified timestamp' do
+        resource = described_class.new(
+          uri: resource_uri,
+          name: resource_name,
+          annotations: { 'lastModified' => '2025-07-15T10:30:00Z' }
+        )
+        expect(resource.annotations['lastModified']).to eq('2025-07-15T10:30:00Z')
+      end
+    end
+  end
+
+  describe '#last_modified' do
+    it 'returns the lastModified annotation value' do
+      resource = described_class.new(
+        uri: resource_uri,
+        name: resource_name,
+        annotations: { 'lastModified' => '2025-07-15T10:30:00Z' }
+      )
+      expect(resource.last_modified).to eq('2025-07-15T10:30:00Z')
+    end
+
+    it 'returns nil when annotations are nil' do
+      resource = described_class.new(
+        uri: resource_uri,
+        name: resource_name
+      )
+      expect(resource.last_modified).to be_nil
+    end
+
+    it 'returns nil when lastModified is not set' do
+      resource = described_class.new(
+        uri: resource_uri,
+        name: resource_name,
+        annotations: { 'audience' => ['user'] }
+      )
+      expect(resource.last_modified).to be_nil
     end
   end
 end
