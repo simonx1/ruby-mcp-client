@@ -2,7 +2,7 @@
 
 require 'spec_helper'
 
-RSpec.describe 'Completion (MCP 2025-06-18)' do
+RSpec.describe 'Completion (MCP 2025-06-18 / 2025-11-25 context)' do
   let(:mock_server) { instance_double(MCPClient::ServerStdio, name: 'stdio-server') }
 
   before do
@@ -37,7 +37,7 @@ RSpec.describe 'Completion (MCP 2025-06-18)' do
 
         result = client.complete(ref: ref, argument: argument)
 
-        expect(mock_server).to have_received(:complete).with(ref: ref, argument: argument)
+        expect(mock_server).to have_received(:complete).with(ref: ref, argument: argument, context: nil)
         expect(result['values']).to eq(%w[python pytho])
       end
 
@@ -47,6 +47,15 @@ RSpec.describe 'Completion (MCP 2025-06-18)' do
         client.complete(ref: ref, argument: argument, server: 0)
 
         expect(mock_server).to have_received(:complete)
+      end
+
+      it 'passes context to the server when provided' do
+        context = { 'arguments' => { 'language' => 'python' } }
+        allow(mock_server).to receive(:complete).and_return(completion_result)
+
+        client.complete(ref: ref, argument: argument, context: context)
+
+        expect(mock_server).to have_received(:complete).with(ref: ref, argument: argument, context: context)
       end
 
       context 'when no server is available' do
@@ -113,6 +122,28 @@ RSpec.describe 'Completion (MCP 2025-06-18)' do
           server.complete(ref: ref, argument: argument)
         end.to raise_error(MCPClient::Errors::ServerError)
       end
+
+      it 'includes context in params when provided' do
+        context = { 'arguments' => { 'language' => 'python' } }
+        server.complete(ref: ref, argument: argument, context: context)
+
+        expect(server).to have_received(:send_request).with(
+          hash_including(
+            'method' => 'completion/complete',
+            'params' => { 'ref' => ref, 'argument' => argument, 'context' => context }
+          )
+        )
+      end
+
+      it 'omits context from params when not provided' do
+        server.complete(ref: ref, argument: argument)
+
+        expect(server).to have_received(:send_request).with(
+          hash_including(
+            'params' => { 'ref' => ref, 'argument' => argument }
+          )
+        )
+      end
     end
   end
 
@@ -153,6 +184,25 @@ RSpec.describe 'Completion (MCP 2025-06-18)' do
 
         expect(result['values']).to eq([])
       end
+
+      it 'includes context in rpc_request when provided' do
+        context = { 'arguments' => { 'path' => '/home' } }
+        server.complete(ref: ref, argument: argument, context: context)
+
+        expect(server).to have_received(:rpc_request).with(
+          'completion/complete',
+          { ref: ref, argument: argument, context: context }
+        )
+      end
+
+      it 'omits context from rpc_request when not provided' do
+        server.complete(ref: ref, argument: argument)
+
+        expect(server).to have_received(:rpc_request).with(
+          'completion/complete',
+          { ref: ref, argument: argument }
+        )
+      end
     end
   end
 
@@ -192,6 +242,25 @@ RSpec.describe 'Completion (MCP 2025-06-18)' do
 
         expect(result['values']).to eq([])
       end
+
+      it 'includes context in rpc_request when provided' do
+        context = { 'arguments' => { 'style' => 'casual' } }
+        server.complete(ref: ref, argument: argument, context: context)
+
+        expect(server).to have_received(:rpc_request).with(
+          'completion/complete',
+          { ref: ref, argument: argument, context: context }
+        )
+      end
+
+      it 'omits context from rpc_request when not provided' do
+        server.complete(ref: ref, argument: argument)
+
+        expect(server).to have_received(:rpc_request).with(
+          'completion/complete',
+          { ref: ref, argument: argument }
+        )
+      end
     end
   end
 
@@ -230,6 +299,25 @@ RSpec.describe 'Completion (MCP 2025-06-18)' do
         result = server.complete(ref: ref, argument: argument)
 
         expect(result['values']).to eq([])
+      end
+
+      it 'includes context in rpc_request when provided' do
+        context = { 'arguments' => { 'language' => 'english' } }
+        server.complete(ref: ref, argument: argument, context: context)
+
+        expect(server).to have_received(:rpc_request).with(
+          'completion/complete',
+          { ref: ref, argument: argument, context: context }
+        )
+      end
+
+      it 'omits context from rpc_request when not provided' do
+        server.complete(ref: ref, argument: argument)
+
+        expect(server).to have_received(:rpc_request).with(
+          'completion/complete',
+          { ref: ref, argument: argument }
+        )
       end
     end
   end
