@@ -134,9 +134,9 @@ RSpec.describe MCPClient::JsonRpcCommon do
       expect(params).to include(
         'protocolVersion' => MCPClient::PROTOCOL_VERSION,
         'capabilities' => {
-          'elicitation' => {}, # MCP 2025-06-18
-          'roots' => { 'listChanged' => true }, # MCP 2025-06-18
-          'sampling' => {} # MCP 2025-06-18
+          'elicitation' => {}, # MCP 2025-11-25
+          'roots' => { 'listChanged' => true }, # MCP 2025-11-25
+          'sampling' => {} # MCP 2025-11-25
         },
         'clientInfo' => {
           'name' => 'ruby-mcp-client',
