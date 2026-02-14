@@ -15,7 +15,11 @@ module MCPClient
     #   @return [String, nil] optional MIME type of the resource
     # @!attribute [r] annotations
     #   @return [Hash, nil] optional annotations that provide hints to clients
-    attr_reader :uri, :name, :description, :mime_type, :annotations
+    # @!attribute [r] title
+    #   @return [String, nil] optional display title for the resource
+    # @!attribute [r] size
+    #   @return [Integer, nil] optional size of the resource in bytes
+    attr_reader :uri, :name, :description, :mime_type, :annotations, :title, :size
 
     # Initialize a resource link
     # @param uri [String] URI of the linked resource
@@ -23,12 +27,16 @@ module MCPClient
     # @param description [String, nil] optional human-readable description
     # @param mime_type [String, nil] optional MIME type of the resource
     # @param annotations [Hash, nil] optional annotations that provide hints to clients
-    def initialize(uri:, name:, description: nil, mime_type: nil, annotations: nil)
+    # @param title [String, nil] optional display title for the resource
+    # @param size [Integer, nil] optional size of the resource in bytes
+    def initialize(uri:, name:, description: nil, mime_type: nil, annotations: nil, title: nil, size: nil)
       @uri = uri
       @name = name
       @description = description
       @mime_type = mime_type
       @annotations = annotations
+      @title = title
+      @size = size
     end
 
     # Create a ResourceLink instance from JSON data
@@ -40,7 +48,9 @@ module MCPClient
         name: data['name'],
         description: data['description'],
         mime_type: data['mimeType'],
-        annotations: data['annotations']
+        annotations: data['annotations'],
+        title: data['title'],
+        size: data['size']
       )
     end
 
