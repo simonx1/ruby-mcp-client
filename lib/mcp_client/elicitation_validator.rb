@@ -71,7 +71,9 @@ module MCPClient
         if prop['format'] && !STRING_FORMATS.include?(prop['format'])
           errors << "Property '#{name}' has unsupported format '#{prop['format']}'"
         end
-        errors << "Property '#{name}' enum must be an array" if prop['enum'] && !prop['enum'].is_a?(Array)
+        if prop['enum'] && !prop['enum'].is_a?(Array)
+          errors << "Property '#{name}' enum must be an array"
+        end
       when 'number', 'integer'
         if prop.key?('minimum') && !prop['minimum'].is_a?(Numeric)
           errors << "Property '#{name}' minimum must be numeric"
@@ -100,7 +102,9 @@ module MCPClient
       has_enum = items['enum'].is_a?(Array)
       has_any_of = items['anyOf'].is_a?(Array)
 
-      errors << "Property '#{name}' array items must have 'enum' or 'anyOf'" unless has_enum || has_any_of
+      unless has_enum || has_any_of
+        errors << "Property '#{name}' array items must have 'enum' or 'anyOf'"
+      end
 
       errors
     end
@@ -115,12 +119,14 @@ module MCPClient
       return errors unless content.is_a?(Hash) && schema.is_a?(Hash)
 
       properties = schema['properties'] || {}
-      required = Array(schema['required'])
+      required = schema['required'] || []
 
       # Check required fields
       required.each do |field|
         field_s = field.to_s
-        errors << "Missing required field '#{field_s}'" unless content.key?(field_s) || content.key?(field_s.to_sym)
+        unless content.key?(field_s) || content.key?(field_s.to_sym)
+          errors << "Missing required field '#{field_s}'"
+        end
       end
 
       # Validate each provided field
@@ -176,7 +182,9 @@ module MCPClient
 
       if prop['oneOf'].is_a?(Array)
         allowed = prop['oneOf'].map { |o| o['const'] }
-        errors << "Field '#{field}' must be one of: #{allowed.join(', ')}" unless allowed.include?(value)
+        unless allowed.include?(value)
+          errors << "Field '#{field}' must be one of: #{allowed.join(', ')}"
+        end
       end
 
       if prop['pattern']
@@ -213,11 +221,17 @@ module MCPClient
         return errors
       end
 
-      errors << "Field '#{field}' must be an integer" if prop['type'] == 'integer' && !value.is_a?(Integer)
+      if prop['type'] == 'integer' && !value.is_a?(Integer)
+        errors << "Field '#{field}' must be an integer"
+      end
 
-      errors << "Field '#{field}' must be >= #{prop['minimum']}" if prop['minimum'] && value < prop['minimum']
+      if prop['minimum'] && value < prop['minimum']
+        errors << "Field '#{field}' must be >= #{prop['minimum']}"
+      end
 
-      errors << "Field '#{field}' must be <= #{prop['maximum']}" if prop['maximum'] && value > prop['maximum']
+      if prop['maximum'] && value > prop['maximum']
+        errors << "Field '#{field}' must be <= #{prop['maximum']}"
+      end
 
       errors
     end
@@ -244,7 +258,9 @@ module MCPClient
 
       if allowed
         value.each do |v|
-          errors << "Field '#{field}' contains invalid value '#{v}'" unless allowed.include?(v)
+          unless allowed.include?(v)
+            errors << "Field '#{field}' contains invalid value '#{v}'"
+          end
         end
       end
 

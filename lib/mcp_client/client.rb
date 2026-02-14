@@ -724,7 +724,9 @@ module MCPClient
       # Validate schema if present
       if schema
         schema_errors = ElicitationValidator.validate_schema(schema)
-        @logger.warn("Elicitation schema validation warnings: #{schema_errors.join('; ')}") unless schema_errors.empty?
+        unless schema_errors.empty?
+          @logger.warn("Elicitation schema validation warnings: #{schema_errors.join('; ')}")
+        end
       end
 
       # Call the user-defined handler
