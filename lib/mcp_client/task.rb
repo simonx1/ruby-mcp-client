@@ -83,7 +83,7 @@ module MCPClient
     # Calculate progress percentage
     # @return [Float, nil] percentage (0.0-100.0) or nil if progress info unavailable
     def progress_percentage
-      return nil unless @progress && @total && @total.positive?
+      return nil unless @progress && @total&.positive?
 
       (@progress.to_f / @total * 100).round(2)
     end
