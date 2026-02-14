@@ -103,7 +103,7 @@ RSpec.describe MCPClient::ServerStreamableHTTP do
       server.connect
 
       expect(init_request_body['params']['protocolVersion']).to eq(MCPClient::PROTOCOL_VERSION)
-      expect(init_request_body['params']['protocolVersion']).to eq('2025-06-18')
+      expect(init_request_body['params']['protocolVersion']).to eq('2025-11-25')
     end
 
     context 'with standard ports' do

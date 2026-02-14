@@ -5,5 +5,5 @@ module MCPClient
   VERSION = '0.9.1'
 
   # MCP protocol version (date-based) - unified across all transports
-  PROTOCOL_VERSION = '2025-06-18'
+  PROTOCOL_VERSION = '2025-11-25'
 end
