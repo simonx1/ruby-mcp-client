@@ -240,4 +240,299 @@ RSpec.describe MCPClient::Tool do
       end
     end
   end
+
+  describe 'legacy annotation helpers' do
+    describe '#read_only?' do
+      it 'returns false when no annotations' do
+        expect(tool.read_only?).to be false
+      end
+
+      it 'returns true when readOnly annotation is true' do
+        t = described_class.new(name: 't', description: 'd', schema: {}, annotations: { 'readOnly' => true })
+        expect(t.read_only?).to be true
+      end
+
+      it 'returns false when readOnly annotation is false' do
+        t = described_class.new(name: 't', description: 'd', schema: {}, annotations: { 'readOnly' => false })
+        expect(t.read_only?).to be false
+      end
+    end
+
+    describe '#destructive?' do
+      it 'returns false when no annotations' do
+        expect(tool.destructive?).to be false
+      end
+
+      it 'returns true when destructive annotation is true' do
+        t = described_class.new(name: 't', description: 'd', schema: {}, annotations: { 'destructive' => true })
+        expect(t.destructive?).to be true
+      end
+    end
+
+    describe '#requires_confirmation?' do
+      it 'returns false when no annotations' do
+        expect(tool.requires_confirmation?).to be false
+      end
+
+      it 'returns true when requiresConfirmation annotation is true' do
+        t = described_class.new(name: 't', description: 'd', schema: {},
+                                annotations: { 'requiresConfirmation' => true })
+        expect(t.requires_confirmation?).to be true
+      end
+    end
+  end
+
+  describe 'MCP 2025-11-25 annotation hints' do
+    describe '#read_only_hint?' do
+      it 'defaults to true when no annotations' do
+        expect(tool.read_only_hint?).to be true
+      end
+
+      it 'defaults to true when annotations exist but readOnlyHint is not set' do
+        t = described_class.new(name: 't', description: 'd', schema: {}, annotations: {})
+        expect(t.read_only_hint?).to be true
+      end
+
+      it 'returns true when readOnlyHint is true (string key)' do
+        t = described_class.new(name: 't', description: 'd', schema: {},
+                                annotations: { 'readOnlyHint' => true })
+        expect(t.read_only_hint?).to be true
+      end
+
+      it 'returns false when readOnlyHint is false' do
+        t = described_class.new(name: 't', description: 'd', schema: {},
+                                annotations: { 'readOnlyHint' => false })
+        expect(t.read_only_hint?).to be false
+      end
+
+      it 'returns true when readOnlyHint is true (symbol key)' do
+        t = described_class.new(name: 't', description: 'd', schema: {},
+                                annotations: { readOnlyHint: true })
+        expect(t.read_only_hint?).to be true
+      end
+    end
+
+    describe '#destructive_hint?' do
+      it 'defaults to false when no annotations' do
+        expect(tool.destructive_hint?).to be false
+      end
+
+      it 'defaults to false when annotations exist but destructiveHint is not set' do
+        t = described_class.new(name: 't', description: 'd', schema: {}, annotations: {})
+        expect(t.destructive_hint?).to be false
+      end
+
+      it 'returns false when destructiveHint is false (string key)' do
+        t = described_class.new(name: 't', description: 'd', schema: {},
+                                annotations: { 'destructiveHint' => false })
+        expect(t.destructive_hint?).to be false
+      end
+
+      it 'returns true when destructiveHint is true' do
+        t = described_class.new(name: 't', description: 'd', schema: {},
+                                annotations: { 'destructiveHint' => true })
+        expect(t.destructive_hint?).to be true
+      end
+
+      it 'returns false when destructiveHint is false (symbol key)' do
+        t = described_class.new(name: 't', description: 'd', schema: {},
+                                annotations: { destructiveHint: false })
+        expect(t.destructive_hint?).to be false
+      end
+    end
+
+    describe '#idempotent_hint?' do
+      it 'defaults to false when no annotations' do
+        expect(tool.idempotent_hint?).to be false
+      end
+
+      it 'defaults to false when annotations exist but idempotentHint is not set' do
+        t = described_class.new(name: 't', description: 'd', schema: {}, annotations: {})
+        expect(t.idempotent_hint?).to be false
+      end
+
+      it 'returns true when idempotentHint is true (string key)' do
+        t = described_class.new(name: 't', description: 'd', schema: {},
+                                annotations: { 'idempotentHint' => true })
+        expect(t.idempotent_hint?).to be true
+      end
+
+      it 'returns false when idempotentHint is false' do
+        t = described_class.new(name: 't', description: 'd', schema: {},
+                                annotations: { 'idempotentHint' => false })
+        expect(t.idempotent_hint?).to be false
+      end
+
+      it 'returns true when idempotentHint is true (symbol key)' do
+        t = described_class.new(name: 't', description: 'd', schema: {},
+                                annotations: { idempotentHint: true })
+        expect(t.idempotent_hint?).to be true
+      end
+    end
+
+    describe '#open_world_hint?' do
+      it 'defaults to true when no annotations' do
+        expect(tool.open_world_hint?).to be true
+      end
+
+      it 'defaults to true when annotations exist but openWorldHint is not set' do
+        t = described_class.new(name: 't', description: 'd', schema: {}, annotations: {})
+        expect(t.open_world_hint?).to be true
+      end
+
+      it 'returns false when openWorldHint is false (string key)' do
+        t = described_class.new(name: 't', description: 'd', schema: {},
+                                annotations: { 'openWorldHint' => false })
+        expect(t.open_world_hint?).to be false
+      end
+
+      it 'returns true when openWorldHint is true' do
+        t = described_class.new(name: 't', description: 'd', schema: {},
+                                annotations: { 'openWorldHint' => true })
+        expect(t.open_world_hint?).to be true
+      end
+
+      it 'returns false when openWorldHint is false (symbol key)' do
+        t = described_class.new(name: 't', description: 'd', schema: {},
+                                annotations: { openWorldHint: false })
+        expect(t.open_world_hint?).to be false
+      end
+    end
+
+    context 'with all hints set' do
+      let(:fully_annotated_tool) do
+        described_class.new(
+          name: 'annotated_tool',
+          description: 'A fully annotated tool',
+          schema: tool_schema,
+          annotations: {
+            'readOnlyHint' => true,
+            'destructiveHint' => false,
+            'idempotentHint' => true,
+            'openWorldHint' => false
+          }
+        )
+      end
+
+      it 'returns correct values for all hints' do
+        expect(fully_annotated_tool.read_only_hint?).to be true
+        expect(fully_annotated_tool.destructive_hint?).to be false
+        expect(fully_annotated_tool.idempotent_hint?).to be true
+        expect(fully_annotated_tool.open_world_hint?).to be false
+      end
+    end
+  end
+
+  describe '.from_json with annotations' do
+    it 'parses MCP 2025-11-25 annotation hints from JSON with string keys' do
+      data = {
+        'name' => 'annotated',
+        'description' => 'desc',
+        'inputSchema' => tool_schema,
+        'annotations' => {
+          'readOnlyHint' => true,
+          'destructiveHint' => false,
+          'idempotentHint' => true,
+          'openWorldHint' => false
+        }
+      }
+      t = described_class.from_json(data)
+      expect(t.read_only_hint?).to be true
+      expect(t.destructive_hint?).to be false
+      expect(t.idempotent_hint?).to be true
+      expect(t.open_world_hint?).to be false
+    end
+
+    it 'parses annotations from JSON with symbol keys' do
+      data = {
+        name: 'annotated',
+        description: 'desc',
+        inputSchema: tool_schema,
+        annotations: {
+          readOnlyHint: true,
+          destructiveHint: false
+        }
+      }
+      t = described_class.from_json(data)
+      expect(t.read_only_hint?).to be true
+      expect(t.destructive_hint?).to be false
+    end
+  end
+
+  describe 'outputSchema support' do
+    let(:output_schema) do
+      {
+        'type' => 'object',
+        'properties' => {
+          'result' => { 'type' => 'string' },
+          'count' => { 'type' => 'integer' }
+        },
+        'required' => ['result']
+      }
+    end
+
+    describe '#structured_output?' do
+      it 'returns false when no output_schema' do
+        expect(tool.structured_output?).to be false
+      end
+
+      it 'returns false when output_schema is empty' do
+        t = described_class.new(name: 't', description: 'd', schema: {}, output_schema: {})
+        expect(t.structured_output?).to be false
+      end
+
+      it 'returns true when output_schema is present' do
+        t = described_class.new(name: 't', description: 'd', schema: {}, output_schema: output_schema)
+        expect(t.structured_output?).to be true
+      end
+    end
+
+    describe '#output_schema' do
+      it 'is nil by default' do
+        expect(tool.output_schema).to be_nil
+      end
+
+      it 'stores the output schema' do
+        t = described_class.new(name: 't', description: 'd', schema: {}, output_schema: output_schema)
+        expect(t.output_schema).to eq(output_schema)
+      end
+    end
+
+    describe '.from_json with outputSchema' do
+      it 'parses outputSchema from JSON with string keys' do
+        data = {
+          'name' => 'tool_with_output',
+          'description' => 'desc',
+          'inputSchema' => tool_schema,
+          'outputSchema' => output_schema
+        }
+        t = described_class.from_json(data)
+        expect(t.output_schema).to eq(output_schema)
+        expect(t.structured_output?).to be true
+      end
+
+      it 'parses outputSchema from JSON with symbol keys' do
+        data = {
+          name: 'tool_with_output',
+          description: 'desc',
+          inputSchema: tool_schema,
+          outputSchema: output_schema
+        }
+        t = described_class.from_json(data)
+        expect(t.output_schema).to eq(output_schema)
+        expect(t.structured_output?).to be true
+      end
+
+      it 'handles missing outputSchema' do
+        data = {
+          'name' => 'tool_without_output',
+          'description' => 'desc',
+          'inputSchema' => tool_schema
+        }
+        t = described_class.from_json(data)
+        expect(t.output_schema).to be_nil
+        expect(t.structured_output?).to be false
+      end
+    end
+  end
 end

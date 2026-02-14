@@ -92,14 +92,16 @@ module MCPClient
       }
     end
 
-    # Check if the tool is marked as read-only
+    # Check if the tool is marked as read-only (legacy annotation field)
     # @return [Boolean] true if the tool is read-only
+    # @see #read_only_hint? for MCP 2025-11-25 annotation
     def read_only?
       @annotations && @annotations['readOnly'] == true
     end
 
-    # Check if the tool is marked as destructive
+    # Check if the tool is marked as destructive (legacy annotation field)
     # @return [Boolean] true if the tool is destructive
+    # @see #destructive_hint? for MCP 2025-11-25 annotation
     def destructive?
       @annotations && @annotations['destructive'] == true
     end
@@ -110,6 +112,44 @@ module MCPClient
       @annotations && @annotations['requiresConfirmation'] == true
     end
 
+    # Check the readOnlyHint annotation (MCP 2025-11-25)
+    # When true, the tool does not modify its environment.
+    # @return [Boolean] defaults to true when not specified
+    def read_only_hint?
+      return true unless @annotations
+
+      fetch_annotation_hint('readOnlyHint', :readOnlyHint, true)
+    end
+
+    # Check the destructiveHint annotation (MCP 2025-11-25)
+    # When true, the tool may perform destructive updates.
+    # Only meaningful when readOnlyHint is false.
+    # @return [Boolean] defaults to false when not specified
+    def destructive_hint?
+      return false unless @annotations
+
+      fetch_annotation_hint('destructiveHint', :destructiveHint, false)
+    end
+
+    # Check the idempotentHint annotation (MCP 2025-11-25)
+    # When true, calling the tool repeatedly with the same arguments has no additional effect.
+    # Only meaningful when readOnlyHint is false.
+    # @return [Boolean] defaults to false when not specified
+    def idempotent_hint?
+      return false unless @annotations
+
+      fetch_annotation_hint('idempotentHint', :idempotentHint, false)
+    end
+
+    # Check the openWorldHint annotation (MCP 2025-11-25)
+    # When true, the tool may interact with the "open world" (external entities).
+    # @return [Boolean] defaults to true when not specified
+    def open_world_hint?
+      return true unless @annotations
+
+      fetch_annotation_hint('openWorldHint', :openWorldHint, true)
+    end
+
     # Check if the tool supports structured outputs (MCP 2025-06-18)
     # @return [Boolean] true if the tool has an output schema defined
     def structured_output?
@@ -117,6 +157,22 @@ module MCPClient
     end
 
     private
+
+    # Fetch a boolean annotation hint, checking both string and symbol keys.
+    # Uses Hash#key? to correctly handle false values.
+    # @param str_key [String] the string key to check
+    # @param sym_key [Symbol] the symbol key to check
+    # @param default [Boolean] the default value when the key is not present
+    # @return [Boolean] the annotation value, or the default
+    def fetch_annotation_hint(str_key, sym_key, default)
+      if @annotations.key?(str_key)
+        @annotations[str_key]
+      elsif @annotations.is_a?(Hash) && @annotations.key?(sym_key)
+        @annotations[sym_key]
+      else
+        default
+      end
+    end
 
     # Recursively remove "$schema" keys that are not accepted by Vertex AI
     # @param obj [Object] schema element (Hash/Array/other)
