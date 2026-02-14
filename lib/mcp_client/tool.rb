@@ -165,9 +165,11 @@ module MCPClient
     # @param default [Boolean] the default value when the key is not present
     # @return [Boolean] the annotation value, or the default
     def fetch_annotation_hint(str_key, sym_key, default)
+      return default unless @annotations.is_a?(Hash)
+
       if @annotations.key?(str_key)
         @annotations[str_key]
-      elsif @annotations.is_a?(Hash) && @annotations.key?(sym_key)
+      elsif @annotations.key?(sym_key)
         @annotations[sym_key]
       else
         default
