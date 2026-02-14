@@ -41,6 +41,12 @@ module MCPClient
       @server = server
     end
 
+    # Return the lastModified annotation value (ISO 8601 timestamp string)
+    # @return [String, nil] the lastModified timestamp, or nil if not set
+    def last_modified
+      @annotations && @annotations['lastModified']
+    end
+
     # Create a Resource instance from JSON data
     # @param data [Hash] JSON data from MCP server
     # @param server [MCPClient::ServerBase, nil] the server this resource belongs to
