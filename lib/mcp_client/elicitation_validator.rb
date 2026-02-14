@@ -115,7 +115,7 @@ module MCPClient
       return errors unless content.is_a?(Hash) && schema.is_a?(Hash)
 
       properties = schema['properties'] || {}
-      required = schema['required'] || []
+      required = Array(schema['required'])
 
       # Check required fields
       required.each do |field|
