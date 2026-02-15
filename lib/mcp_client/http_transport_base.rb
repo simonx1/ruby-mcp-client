@@ -58,6 +58,7 @@ module MCPClient
           # Apply base headers but prioritize session termination headers
           @headers.each { |k, v| req.headers[k] = v }
           req.headers['Mcp-Session-Id'] = @session_id
+          req.headers['Mcp-Protocol-Version'] = @protocol_version if @protocol_version
         end
 
         if response.success?
@@ -138,6 +139,7 @@ module MCPClient
 
       @server_info = result['serverInfo']
       @capabilities = result['capabilities']
+      @protocol_version = result['protocolVersion']
     end
 
     # Send a JSON-RPC request to the server and wait for result

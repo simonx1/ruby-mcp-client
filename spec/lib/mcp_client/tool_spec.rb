@@ -127,6 +127,36 @@ RSpec.describe MCPClient::Tool do
         }
       )
     end
+
+    context 'with $schema in the schema' do
+      let(:tool_with_dollar_schema) do
+        described_class.new(
+          name: tool_name,
+          description: tool_description,
+          schema: {
+            '$schema' => 'https://json-schema.org/draft/2020-12/schema',
+            'type' => 'object',
+            'properties' => {
+              'path' => { 'type' => 'string' }
+            },
+            'required' => ['path']
+          }
+        )
+      end
+
+      it 'removes $schema keys from the schema' do
+        anthropic_tool = tool_with_dollar_schema.to_anthropic_tool
+        expect(anthropic_tool[:input_schema]).to eq(
+          {
+            'type' => 'object',
+            'properties' => {
+              'path' => { 'type' => 'string' }
+            },
+            'required' => ['path']
+          }
+        )
+      end
+    end
   end
 
   describe '#to_google_tool' do

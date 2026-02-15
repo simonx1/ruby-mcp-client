@@ -73,12 +73,12 @@ module MCPClient
     end
 
     # Convert tool to Anthropic Claude tool specification format
-    # @return [Hash] Anthropic Claude tool specification
+    # @return [Hash] Anthropic Claude tool specification with cleaned schema
     def to_anthropic_tool
       {
         name: @name,
         description: @description,
-        input_schema: @schema
+        input_schema: cleaned_schema(@schema)
       }
     end
 

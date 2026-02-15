@@ -51,7 +51,7 @@ messages = [
 puts 'Sending request with tools...'
 response = client.messages(
   parameters: {
-    model: 'claude-3-7-sonnet-20250219',
+    model: 'claude-sonnet-4-5-20250929',
     messages: messages,
     system: 'You can call filesystem tools.',
     tools: claude_tools,
@@ -109,7 +109,7 @@ messages << {
 puts 'Getting final response...'
 final = client.messages(
   parameters: {
-    model: 'claude-3-7-sonnet-20250219',
+    model: 'claude-sonnet-4-5-20250929',
     messages: messages,
     system: 'You can call filesystem tools.',
     tools: claude_tools,

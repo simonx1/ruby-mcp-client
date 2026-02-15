@@ -396,10 +396,17 @@ module MCPClient
     def apply_request_headers(req, request)
       super
 
-      # Add session header if we have one (for non-initialize requests)
-      if @session_id && request['method'] != 'initialize'
-        req.headers['Mcp-Session-Id'] = @session_id
-        @logger.debug("Adding session header: Mcp-Session-Id: #{@session_id}")
+      # Add session and protocol version headers for non-initialize requests
+      if request['method'] != 'initialize'
+        if @session_id
+          req.headers['Mcp-Session-Id'] = @session_id
+          @logger.debug("Adding session header: Mcp-Session-Id: #{@session_id}")
+        end
+
+        if @protocol_version
+          req.headers['Mcp-Protocol-Version'] = @protocol_version
+          @logger.debug("Adding protocol version header: Mcp-Protocol-Version: #{@protocol_version}")
+        end
       end
 
       # Add Last-Event-ID header for resumability (if available)
@@ -733,6 +740,7 @@ module MCPClient
     def apply_events_headers(req)
       @headers.each { |k, v| req.headers[k] = v }
       req.headers['Mcp-Session-Id'] = @session_id if @session_id
+      req.headers['Mcp-Protocol-Version'] = @protocol_version if @protocol_version
     end
 
     # Process event chunks from the server
@@ -843,6 +851,7 @@ module MCPClient
         response = conn.post(@endpoint) do |req|
           @headers.each { |k, v| req.headers[k] = v }
           req.headers['Mcp-Session-Id'] = @session_id if @session_id
+          req.headers['Mcp-Protocol-Version'] = @protocol_version if @protocol_version
           req.body = pong_response.to_json
         end
 
@@ -1043,6 +1052,7 @@ module MCPClient
         resp = conn.post(@endpoint) do |req|
           @headers.each { |k, v| req.headers[k] = v }
           req.headers['Mcp-Session-Id'] = @session_id if @session_id
+          req.headers['Mcp-Protocol-Version'] = @protocol_version if @protocol_version
           req.body = json_body
         end
 

@@ -18,14 +18,22 @@ puts 'This example connects to a Streamable HTTP MCP server'
 puts 'The server expects HTTP POST but responds with SSE format'
 puts
 
-# Server URL - Replace with your actual server URL and credentials
-# The /mcp suffix auto-detects Streamable HTTP transport
-server_url = 'https://mcp.zapier.com/api/mcp/s/<base64 encoded api key>/mcp'
+# Server URL and Bearer token - set via environment variables
+# Example:
+#   MCP_SERVER_URL='https://mcp.zapier.com/api/v1/connect' \
+#   MCP_BEARER_TOKEN='your_token' ./examples/streamable_http_example.rb
+server_url = ENV.fetch('MCP_SERVER_URL', 'https://mcp.zapier.com/api/v1/connect')
+bearer_token = ENV.fetch('MCP_BEARER_TOKEN', nil)
+abort 'Please set MCP_SERVER_URL (and optionally MCP_BEARER_TOKEN for authenticated servers)' unless server_url
+
+# Build headers with optional Bearer token authentication
+headers = {}
+headers['Authorization'] = "Bearer #{bearer_token}" if bearer_token
 
 begin
   # Create client using the simplified connect API
-  # The /mcp suffix auto-detects Streamable HTTP transport
   client = MCPClient.connect(server_url,
+                             headers: headers,
                              read_timeout: 60,
                              retries: 3,
                              retry_backoff: 2,

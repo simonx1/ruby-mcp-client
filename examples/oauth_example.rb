@@ -16,7 +16,7 @@ logger.level = Logger::DEBUG
 puts 'Creating OAuth-enabled HTTP server...'
 
 server = MCPClient::OAuthClient.create_streamable_http_server(
-  server_url: 'https://mcp.zapier.com/api/mcp/a/<id>/mcp?serverId=<serverId>',
+  server_url: 'https://mcp.zapier.com/api/v1/connect?token=<ZAPIER_MCP_TOKEN>',
   logger:
 )
 

@@ -1017,6 +1017,28 @@ RSpec.describe MCPClient::ServerStreamableHTTP do
         expect(server.instance_variable_get(:@session_id)).to eq('valid-streamable-session-456')
       end
 
+      it 'captures negotiated protocol version from initialize response' do
+        stub_request(:post, "#{base_url}#{endpoint}")
+          .with(body: hash_including(method: 'initialize'))
+          .to_return(
+            status: 200,
+            body: "event: message\ndata: {\"jsonrpc\":\"2.0\",\"id\":1," \
+                  "\"result\":{\"protocolVersion\":\"2025-11-25\"}}\n\n",
+            headers: { 'Content-Type' => 'text/event-stream' }
+          )
+
+        stub_request(:post, "#{base_url}#{endpoint}")
+          .with(body: hash_including(method: 'notifications/initialized'))
+          .to_return(
+            status: 200,
+            body: '',
+            headers: { 'Content-Type' => 'text/event-stream' }
+          )
+
+        server.send(:perform_initialize)
+        expect(server.instance_variable_get(:@protocol_version)).to eq('2025-11-25')
+      end
+
       it 'rejects invalid session ID format' do
         stub_request(:post, "#{base_url}#{endpoint}")
           .with(body: hash_including(method: 'initialize'))
@@ -1085,6 +1107,25 @@ RSpec.describe MCPClient::ServerStreamableHTTP do
         server.send(:request_tools_list)
         expect(WebMock).to have_requested(:post, "#{base_url}#{endpoint}")
           .with(headers: { 'Mcp-Session-Id' => 'active-streamable-session-789' })
+      end
+
+      it 'includes protocol version header in non-initialize requests' do
+        server.instance_variable_set(:@protocol_version, '2025-11-25')
+
+        stub_request(:post, "#{base_url}#{endpoint}")
+          .with(
+            headers: { 'Mcp-Protocol-Version' => '2025-11-25' },
+            body: hash_including(method: 'tools/list')
+          )
+          .to_return(
+            status: 200,
+            body: "event: message\ndata: {\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"tools\":[]}}\n\n",
+            headers: { 'Content-Type' => 'text/event-stream' }
+          )
+
+        server.send(:request_tools_list)
+        expect(WebMock).to have_requested(:post, "#{base_url}#{endpoint}")
+          .with(headers: { 'Mcp-Protocol-Version' => '2025-11-25' })
       end
 
       it 'does not include session header in initialize requests' do

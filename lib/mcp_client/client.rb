@@ -678,7 +678,17 @@ module MCPClient
       required = schema['required'] || schema[:required]
       return unless required.is_a?(Array)
 
+      properties = schema['properties'] || schema[:properties] || {}
+
       missing = required.map(&:to_s) - parameters.keys.map(&:to_s)
+
+      # Exclude required params that have a default value in the schema,
+      # since the server will apply the default.
+      missing = missing.reject do |param|
+        prop = properties[param] || properties[param.to_sym]
+        prop.is_a?(Hash) && (prop.key?('default') || prop.key?(:default))
+      end
+
       return unless missing.any?
 
       raise MCPClient::Errors::ValidationError, "Missing required parameters: #{missing.join(', ')}"

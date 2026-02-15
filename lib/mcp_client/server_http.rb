@@ -195,15 +195,22 @@ module MCPClient
       raise MCPClient::Errors::ToolCallError, "Error calling tool '#{tool_name}': #{e.message}"
     end
 
-    # Override apply_request_headers to add session headers for MCP protocol
+    # Override apply_request_headers to add session and protocol version headers
     def apply_request_headers(req, request)
       super
 
-      # Add session header if we have one (for non-initialize requests)
-      return unless @session_id && request['method'] != 'initialize'
+      # Add session and protocol version headers for non-initialize requests
+      return unless request['method'] != 'initialize'
 
-      req.headers['Mcp-Session-Id'] = @session_id
-      @logger.debug("Adding session header: Mcp-Session-Id: #{@session_id}")
+      if @session_id
+        req.headers['Mcp-Session-Id'] = @session_id
+        @logger.debug("Adding session header: Mcp-Session-Id: #{@session_id}")
+      end
+
+      return unless @protocol_version
+
+      req.headers['Mcp-Protocol-Version'] = @protocol_version
+      @logger.debug("Adding protocol version header: Mcp-Protocol-Version: #{@protocol_version}")
     end
 
     # Override handle_successful_response to capture session ID

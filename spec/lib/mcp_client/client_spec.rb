@@ -640,6 +640,28 @@ RSpec.describe MCPClient::Client do
       client.call_tool('schema_tool', params)
       expect(mock_server).to have_received(:call_tool).with('schema_tool', params)
     end
+
+    it 'skips validation for required parameters that have a default value' do
+      tool_with_default = MCPClient::Tool.new(
+        name: 'default_tool',
+        description: 'Tool with required param having default',
+        schema: {
+          'type' => 'object',
+          'properties' => {
+            'format' => { 'type' => 'string', 'enum' => %w[png jpeg], 'default' => 'png' },
+            'url' => { 'type' => 'string' }
+          },
+          'required' => %w[format url]
+        },
+        server: mock_server
+      )
+      allow(mock_server).to receive(:list_tools).and_return([tool_with_default])
+
+      # Only 'url' provided, 'format' has a default so should not raise
+      params = { 'url' => 'https://example.com' }
+      client.call_tool('default_tool', params)
+      expect(mock_server).to have_received(:call_tool).with('default_tool', params)
+    end
   end
 
   describe '#call_tool_streaming' do
