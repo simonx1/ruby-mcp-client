@@ -486,13 +486,15 @@ module MCPClient
     # Request completion suggestions from a server (MCP 2025-06-18)
     # @param ref [Hash] reference object (e.g., { 'type' => 'ref/prompt', 'name' => 'prompt_name' })
     # @param argument [Hash] the argument being completed (e.g., { 'name' => 'arg_name', 'value' => 'partial' })
+    # @param context [Hash, nil] optional context for the completion (MCP 2025-11-25),
+    #   e.g., { 'arguments' => { 'arg1' => 'value1' } } for previously-resolved arguments
     # @param server [Integer, String, Symbol, MCPClient::ServerBase, nil] server selector
     # @return [Hash] completion result with 'values', optional 'total', and 'hasMore' fields
     # @raise [MCPClient::Errors::ServerNotFound] if no server is available
     # @raise [MCPClient::Errors::ServerError] if server returns an error
-    def complete(ref:, argument:, server: nil)
+    def complete(ref:, argument:, context: nil, server: nil)
       srv = select_server(server)
-      srv.complete(ref: ref, argument: argument)
+      srv.complete(ref: ref, argument: argument, context: context)
     end
 
     # Set the logging level on all connected servers (MCP 2025-06-18)

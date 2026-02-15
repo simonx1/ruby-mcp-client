@@ -345,16 +345,19 @@ module MCPClient
     # Request completion suggestions from the server (MCP 2025-06-18)
     # @param ref [Hash] reference object (e.g., { 'type' => 'ref/prompt', 'name' => 'prompt_name' })
     # @param argument [Hash] the argument being completed (e.g., { 'name' => 'arg_name', 'value' => 'partial' })
+    # @param context [Hash, nil] optional context for the completion (MCP 2025-11-25)
     # @return [Hash] completion result with 'values', optional 'total', and 'hasMore' fields
     # @raise [MCPClient::Errors::ServerError] if server returns an error
-    def complete(ref:, argument:)
+    def complete(ref:, argument:, context: nil)
       ensure_initialized
       req_id = next_id
+      params = { 'ref' => ref, 'argument' => argument }
+      params['context'] = context if context
       req = {
         'jsonrpc' => '2.0',
         'id' => req_id,
         'method' => 'completion/complete',
-        'params' => { 'ref' => ref, 'argument' => argument }
+        'params' => params
       }
       send_request(req)
       res = wait_response(req_id)
