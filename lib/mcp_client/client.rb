@@ -25,7 +25,7 @@ module MCPClient
     # @param logger [Logger, nil] optional logger, defaults to STDOUT
     # @param elicitation_handler [Proc, nil] optional handler for elicitation requests (MCP 2025-06-18)
     # @param roots [Array<MCPClient::Root, Hash>, nil] optional list of roots (MCP 2025-06-18)
-    # @param sampling_handler [Proc, nil] optional handler for sampling requests (MCP 2025-06-18)
+    # @param sampling_handler [Proc, nil] optional handler for sampling requests (MCP 2025-11-25)
     def initialize(mcp_server_configs: [], logger: nil, elicitation_handler: nil, roots: nil, sampling_handler: nil)
       @logger = logger || Logger.new($stdout, level: Logger::WARN)
       @logger.progname = self.class.name
@@ -41,7 +41,7 @@ module MCPClient
       @notification_listeners = []
       # Elicitation handler (MCP 2025-06-18)
       @elicitation_handler = elicitation_handler
-      # Sampling handler (MCP 2025-06-18)
+      # Sampling handler (MCP 2025-11-25)
       @sampling_handler = sampling_handler
       # Roots (MCP 2025-06-18)
       @roots = normalize_roots(roots)
@@ -59,7 +59,7 @@ module MCPClient
         end
         # Register roots list handler on each server (MCP 2025-06-18)
         server.on_roots_list_request(&method(:handle_roots_list_request)) if server.respond_to?(:on_roots_list_request)
-        # Register sampling handler on each server (MCP 2025-06-18)
+        # Register sampling handler on each server (MCP 2025-11-25)
         server.on_sampling_request(&method(:handle_sampling_request)) if server.respond_to?(:on_sampling_request)
       end
     end
@@ -857,9 +857,9 @@ module MCPClient
       end
     end
 
-    # Handle sampling/createMessage request from server (MCP 2025-06-18)
+    # Handle sampling/createMessage request from server (MCP 2025-11-25)
     # @param _request_id [String, Integer] the JSON-RPC request ID (unused, kept for callback signature)
-    # @param params [Hash] the sampling parameters (messages, modelPreferences, systemPrompt, maxTokens)
+    # @param params [Hash] the sampling parameters
     # @return [Hash] the sampling response (role, content, model, stopReason)
     def handle_sampling_request(_request_id, params)
       # If no handler is configured, return an error
@@ -869,24 +869,18 @@ module MCPClient
       end
 
       messages = params['messages'] || []
-      model_preferences = params['modelPreferences']
+      model_preferences = normalize_model_preferences(params['modelPreferences'])
       system_prompt = params['systemPrompt']
       max_tokens = params['maxTokens']
+      include_context = params['includeContext']
+      temperature = params['temperature']
+      stop_sequences = params['stopSequences']
+      metadata = params['metadata']
 
       begin
-        # Call the user-defined handler
-        result = case @sampling_handler.arity
-                 when 0
-                   @sampling_handler.call
-                 when 1
-                   @sampling_handler.call(messages)
-                 when 2
-                   @sampling_handler.call(messages, model_preferences)
-                 when 3
-                   @sampling_handler.call(messages, model_preferences, system_prompt)
-                 else
-                   @sampling_handler.call(messages, model_preferences, system_prompt, max_tokens)
-                 end
+        # Call the user-defined handler with parameters based on arity
+        result = call_sampling_handler(messages, model_preferences, system_prompt, max_tokens,
+                                       include_context, temperature, stop_sequences, metadata)
 
         # Validate and format response
         validate_sampling_response(result)
@@ -897,7 +891,70 @@ module MCPClient
       end
     end
 
-    # Validate sampling response from handler (MCP 2025-06-18)
+    # Call sampling handler with appropriate arity
+    # @param messages [Array] the messages
+    # @param model_preferences [Hash, nil] normalized model preferences
+    # @param system_prompt [String, nil] system prompt
+    # @param max_tokens [Integer, nil] max tokens
+    # @param include_context [String, nil] context inclusion setting
+    # @param temperature [Float, nil] temperature
+    # @param stop_sequences [Array, nil] stop sequences
+    # @param metadata [Hash, nil] metadata
+    # @return [Hash] the handler result
+    def call_sampling_handler(messages, model_preferences, system_prompt, max_tokens,
+                              include_context, temperature, stop_sequences, metadata)
+      arity = @sampling_handler.arity
+      # Normalize negative arity (optional params) to minimum required args
+      arity = -(arity + 1) if arity.negative?
+      case arity
+      when 0
+        @sampling_handler.call
+      when 1
+        @sampling_handler.call(messages)
+      when 2
+        @sampling_handler.call(messages, model_preferences)
+      when 3
+        @sampling_handler.call(messages, model_preferences, system_prompt)
+      when 4
+        @sampling_handler.call(messages, model_preferences, system_prompt, max_tokens)
+      else
+        @sampling_handler.call(messages, model_preferences, system_prompt, max_tokens,
+                               { 'includeContext' => include_context, 'temperature' => temperature,
+                                 'stopSequences' => stop_sequences, 'metadata' => metadata })
+      end
+    end
+
+    # Normalize and validate modelPreferences from sampling request (MCP 2025-11-25)
+    # Ensures hints is an array of hashes with 'name', and priority values are clamped to 0.0..1.0
+    # @param prefs [Hash, nil] raw modelPreferences from request
+    # @return [Hash, nil] normalized modelPreferences or nil
+    def normalize_model_preferences(prefs)
+      return nil if prefs.nil?
+      return nil unless prefs.is_a?(Hash)
+
+      normalized = {}
+
+      # Normalize hints: array of { 'name' => String }
+      if prefs['hints']
+        normalized['hints'] = Array(prefs['hints']).filter_map do |hint|
+          next nil unless hint.is_a?(Hash) && hint['name']
+
+          { 'name' => hint['name'].to_s }
+        end
+      end
+
+      # Normalize priority values (0.0 to 1.0)
+      %w[costPriority speedPriority intelligencePriority].each do |key|
+        next unless prefs.key?(key)
+
+        value = prefs[key]
+        normalized[key] = value.is_a?(Numeric) ? value.to_f.clamp(0.0, 1.0) : nil
+      end
+
+      normalized
+    end
+
+    # Validate sampling response from handler (MCP 2025-11-25)
     # @param result [Hash] the result from the sampling handler
     # @return [Hash] validated sampling response
     def validate_sampling_response(result)

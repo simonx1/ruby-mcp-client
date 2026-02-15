@@ -48,7 +48,7 @@ module MCPClient
       @env           = env || {}
       @elicitation_request_callback = nil # MCP 2025-06-18
       @roots_list_request_callback = nil # MCP 2025-06-18
-      @sampling_request_callback = nil # MCP 2025-06-18
+      @sampling_request_callback = nil # MCP 2025-11-25
     end
 
     # Server info from the initialize response
@@ -406,7 +406,7 @@ module MCPClient
       @roots_list_request_callback = block
     end
 
-    # Register a callback for sampling requests (MCP 2025-06-18)
+    # Register a callback for sampling requests (MCP 2025-11-25)
     # @param block [Proc] callback that receives (request_id, params) and returns response hash
     # @return [void]
     def on_sampling_request(&block)
@@ -477,7 +477,7 @@ module MCPClient
       send_roots_list_response(request_id, result)
     end
 
-    # Handle sampling/createMessage request from server (MCP 2025-06-18)
+    # Handle sampling/createMessage request from server (MCP 2025-11-25)
     # @param request_id [String, Integer] the JSON-RPC request ID
     # @param params [Hash] the sampling parameters
     # @return [void]
@@ -509,7 +509,7 @@ module MCPClient
       send_message(response)
     end
 
-    # Send sampling response back to server (MCP 2025-06-18)
+    # Send sampling response back to server (MCP 2025-11-25)
     # @param request_id [String, Integer] the JSON-RPC request ID
     # @param result [Hash] the sampling result (role, content, model, stopReason)
     # @return [void]
