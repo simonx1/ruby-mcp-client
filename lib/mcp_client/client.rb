@@ -514,7 +514,7 @@ module MCPClient
       begin
         result = srv.rpc_request('tasks/create', rpc_params)
         MCPClient::Task.from_json(result, server: srv)
-      rescue MCPClient::Errors::ServerError, MCPClient::Errors::TransportError => e
+      rescue MCPClient::Errors::ServerError, MCPClient::Errors::TransportError, MCPClient::Errors::ConnectionError => e
         raise MCPClient::Errors::TaskError, "Error creating task: #{e.message}"
       end
     end
@@ -538,7 +538,7 @@ module MCPClient
         end
 
         raise MCPClient::Errors::TaskError, "Error getting task '#{task_id}': #{e.message}"
-      rescue MCPClient::Errors::TransportError => e
+      rescue MCPClient::Errors::TransportError, MCPClient::Errors::ConnectionError => e
         raise MCPClient::Errors::TaskError, "Error getting task '#{task_id}': #{e.message}"
       end
     end
@@ -562,7 +562,7 @@ module MCPClient
         end
 
         raise MCPClient::Errors::TaskError, "Error cancelling task '#{task_id}': #{e.message}"
-      rescue MCPClient::Errors::TransportError => e
+      rescue MCPClient::Errors::TransportError, MCPClient::Errors::ConnectionError => e
         raise MCPClient::Errors::TaskError, "Error cancelling task '#{task_id}': #{e.message}"
       end
     end
