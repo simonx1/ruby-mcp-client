@@ -276,8 +276,8 @@ RSpec.describe MCPClient::ServerStreamableHTTP, 'Elicitation (MCP 2025-06-18)' d
                            'Authorization' => 'Bearer test-token'
                          }
                        ) do |request|
-                         # Explicitly check session ID header is NOT present
-                         !request.headers.key?('Mcp-Session-Id')
+          # Explicitly check session ID header is NOT present
+          !request.headers.key?('Mcp-Session-Id')
         end
           .to_return(status: 200, body: '')
 

@@ -2,7 +2,7 @@
 
 module MCPClient
   # Current version of the MCP client gem
-  VERSION = '0.9.1'
+  VERSION = '1.0.0'
 
   # MCP protocol version (date-based) - unified across all transports
   PROTOCOL_VERSION = '2025-11-25'

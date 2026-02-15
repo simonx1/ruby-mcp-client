@@ -28,16 +28,18 @@ Built-in API conversions: `to_openai_tools()`, `to_anthropic_tools()`, `to_googl
 
 ## MCP Protocol Support
 
-Implements **MCP 2025-06-18** specification:
+Implements **MCP 2025-11-25** specification:
 
-- **Tools**: list, call, streaming, annotations, structured outputs
+- **Tools**: list, call, streaming, annotations (hint-style), structured outputs, title
 - **Prompts**: list, get with parameters
-- **Resources**: list, read, templates, subscriptions, pagination
+- **Resources**: list, read, templates, subscriptions, pagination, ResourceLink content
 - **Elicitation**: Server-initiated user interactions (stdio, SSE, Streamable HTTP)
 - **Roots**: Filesystem scope boundaries with change notifications
-- **Sampling**: Server-requested LLM completions
-- **Completion**: Autocomplete for prompts/resources
+- **Sampling**: Server-requested LLM completions with modelPreferences
+- **Completion**: Autocomplete for prompts/resources with context
 - **Logging**: Server log messages with level filtering
+- **Tasks**: Structured task management with progress tracking
+- **Audio**: Audio content type support
 - **OAuth 2.1**: PKCE, server discovery, dynamic registration
 
 ## Quick Connect API (Recommended)
@@ -114,12 +116,20 @@ contents.each do |content|
 end
 ```
 
-## MCP 2025-06-18 Features
+## MCP 2025-11-25 Features
 
 ### Tool Annotations
 
 ```ruby
 tool = client.find_tool('delete_user')
+
+# Hint-style annotations (MCP 2025-11-25)
+tool.read_only_hint?      # Defaults to true; tool does not modify environment
+tool.destructive_hint?    # Defaults to false; tool may perform destructive updates
+tool.idempotent_hint?     # Defaults to false; repeated calls have no additional effect
+tool.open_world_hint?     # Defaults to true; tool may interact with external entities
+
+# Legacy annotations
 tool.read_only?              # Safe to execute?
 tool.destructive?            # Warning: destructive operation
 tool.requires_confirmation?  # Needs user confirmation

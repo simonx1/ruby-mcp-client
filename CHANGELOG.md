@@ -1,5 +1,33 @@
 # Changelog
 
+## 1.0.0 (2026-02-15)
+
+### MCP 2025-11-25 Protocol Support
+
+Full implementation of the **MCP 2025-11-25** specification, upgrading from 2025-06-18.
+
+#### New Protocol Features
+- **Audio Content**: Support for audio content type in tool results and messages (#82)
+- **Resource Annotations**: Added `lastModified` field to resource annotations (#83)
+- **Enhanced Tool Annotations**: Hint-style annotation API (`readOnlyHint`, `destructiveHint`, `idempotentHint`, `openWorldHint`) alongside legacy annotations (#84)
+- **Enhanced Elicitation**: Improved server-initiated user interaction support for MCP 2025-11-25 (#85)
+- **Enhanced Sampling**: Added `modelPreferences` support for server-requested LLM completions (#86)
+- **Completion Context**: Completion requests now support context parameter for MCP 2025-11-25 (#87)
+- **Structured Task Management**: Server-driven task tracking with `tasks/list`, `tasks/get`, progress notifications, and cancellation (#88)
+- **ResourceLink Content Type**: New content type for linking to MCP resources from tool results (#89)
+- **Tool Title**: Optional human-readable `title` field for tools, separate from the programmatic `name` (by @conr) (#72)
+
+#### Protocol Compliance
+- **`Mcp-Protocol-Version` Header**: All HTTP transports now send the negotiated protocol version header on post-initialization requests, as required by the MCP spec
+- Protocol version captured from server `initialize` response and used in all subsequent requests
+
+### Bug Fixes
+- **Parameter Validation**: `validate_params!` now skips required parameters that have a `default` value in the schema, fixing compatibility with Playwright MCP and other Zod-based servers
+- **Anthropic Tool Schema Cleaning**: `to_anthropic_tool` now strips `$schema` keys from tool schemas, preventing 400 errors from the Anthropic Messages API
+- **Streamable HTTP Example**: Updated to use environment variables for server URL and Bearer token authentication instead of hardcoded credentials
+- **Anthropic Example**: Fixed model name to use current `claude-sonnet-4-5-20250929`
+- Fixed JSON parsing edge cases
+
 ## 0.9.1 (2025-12-10)
 
 ### New Features
