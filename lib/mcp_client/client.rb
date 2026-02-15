@@ -497,6 +497,76 @@ module MCPClient
       srv.complete(ref: ref, argument: argument, context: context)
     end
 
+    # Create a new task on a server (MCP 2025-11-25)
+    # Tasks represent long-running operations that can report progress
+    # @param method [String] the method to execute as a task
+    # @param params [Hash] parameters for the task method
+    # @param progress_token [String, nil] optional token for receiving progress notifications
+    # @param server [Integer, String, Symbol, MCPClient::ServerBase, nil] server selector
+    # @return [MCPClient::Task] the created task
+    # @raise [MCPClient::Errors::ServerNotFound] if no server is available
+    # @raise [MCPClient::Errors::TaskError] if task creation fails
+    def create_task(method, params: {}, progress_token: nil, server: nil)
+      srv = select_server(server)
+      rpc_params = { method: method, params: params }
+      rpc_params[:progressToken] = progress_token if progress_token
+
+      begin
+        result = srv.rpc_request('tasks/create', rpc_params)
+        MCPClient::Task.from_json(result, server: srv)
+      rescue MCPClient::Errors::ServerError, MCPClient::Errors::TransportError => e
+        raise MCPClient::Errors::TaskError, "Error creating task: #{e.message}"
+      end
+    end
+
+    # Get the current state of a task (MCP 2025-11-25)
+    # @param task_id [String] the ID of the task to query
+    # @param server [Integer, String, Symbol, MCPClient::ServerBase, nil] server selector
+    # @return [MCPClient::Task] the task with current state
+    # @raise [MCPClient::Errors::ServerNotFound] if no server is available
+    # @raise [MCPClient::Errors::TaskNotFound] if the task does not exist
+    # @raise [MCPClient::Errors::TaskError] if retrieving the task fails
+    def get_task(task_id, server: nil)
+      srv = select_server(server)
+
+      begin
+        result = srv.rpc_request('tasks/get', { id: task_id })
+        MCPClient::Task.from_json(result, server: srv)
+      rescue MCPClient::Errors::ServerError => e
+        if e.message.include?('not found') || e.message.include?('unknown task')
+          raise MCPClient::Errors::TaskNotFound, "Task '#{task_id}' not found"
+        end
+
+        raise MCPClient::Errors::TaskError, "Error getting task '#{task_id}': #{e.message}"
+      rescue MCPClient::Errors::TransportError => e
+        raise MCPClient::Errors::TaskError, "Error getting task '#{task_id}': #{e.message}"
+      end
+    end
+
+    # Cancel a running task (MCP 2025-11-25)
+    # @param task_id [String] the ID of the task to cancel
+    # @param server [Integer, String, Symbol, MCPClient::ServerBase, nil] server selector
+    # @return [MCPClient::Task] the task with updated (cancelled) state
+    # @raise [MCPClient::Errors::ServerNotFound] if no server is available
+    # @raise [MCPClient::Errors::TaskNotFound] if the task does not exist
+    # @raise [MCPClient::Errors::TaskError] if cancellation fails
+    def cancel_task(task_id, server: nil)
+      srv = select_server(server)
+
+      begin
+        result = srv.rpc_request('tasks/cancel', { id: task_id })
+        MCPClient::Task.from_json(result, server: srv)
+      rescue MCPClient::Errors::ServerError => e
+        if e.message.include?('not found') || e.message.include?('unknown task')
+          raise MCPClient::Errors::TaskNotFound, "Task '#{task_id}' not found"
+        end
+
+        raise MCPClient::Errors::TaskError, "Error cancelling task '#{task_id}': #{e.message}"
+      rescue MCPClient::Errors::TransportError => e
+        raise MCPClient::Errors::TaskError, "Error cancelling task '#{task_id}': #{e.message}"
+      end
+    end
+
     # Set the logging level on all connected servers (MCP 2025-06-18)
     # To set on a specific server, use: client.find_server('name').log_level = 'debug'
     # @param level [String] the log level ('debug', 'info', 'notice', 'warning', 'error',

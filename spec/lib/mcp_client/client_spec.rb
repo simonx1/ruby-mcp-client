@@ -912,6 +912,225 @@ RSpec.describe MCPClient::Client do
     end
   end
 
+  describe '#create_task' do
+    let(:client) { described_class.new(mcp_server_configs: [{ type: 'stdio', command: 'test' }]) }
+    let(:task_result) do
+      { 'id' => 'task-123', 'state' => 'pending', 'progressToken' => 'pt-abc' }
+    end
+
+    before do
+      allow(mock_server).to receive(:rpc_request)
+        .with('tasks/create', { method: 'longRunningOp', params: { input: 'data' }, progressToken: 'pt-abc' })
+        .and_return(task_result)
+    end
+
+    it 'creates a task and returns a Task object' do
+      task = client.create_task('longRunningOp', params: { input: 'data' }, progress_token: 'pt-abc')
+      expect(task).to be_a(MCPClient::Task)
+      expect(task.id).to eq('task-123')
+      expect(task.state).to eq('pending')
+      expect(task.progress_token).to eq('pt-abc')
+      expect(task.server).to eq(mock_server)
+    end
+
+    it 'creates a task without progress token' do
+      allow(mock_server).to receive(:rpc_request)
+        .with('tasks/create', { method: 'simpleOp', params: {} })
+        .and_return({ 'id' => 'task-456', 'state' => 'pending' })
+
+      task = client.create_task('simpleOp')
+      expect(task.id).to eq('task-456')
+      expect(task.progress_token).to be_nil
+    end
+
+    it 'raises TaskError on server error' do
+      allow(mock_server).to receive(:rpc_request)
+        .with('tasks/create', { method: 'failOp', params: {} })
+        .and_raise(MCPClient::Errors::ServerError.new('Internal error'))
+
+      expect do
+        client.create_task('failOp')
+      end.to raise_error(MCPClient::Errors::TaskError, /Error creating task/)
+    end
+
+    it 'raises TaskError on transport error' do
+      allow(mock_server).to receive(:rpc_request)
+        .with('tasks/create', { method: 'failOp', params: {} })
+        .and_raise(MCPClient::Errors::TransportError.new('Connection lost'))
+
+      expect do
+        client.create_task('failOp')
+      end.to raise_error(MCPClient::Errors::TaskError, /Error creating task/)
+    end
+
+    context 'with server selection' do
+      let(:mock_server2) { instance_double(MCPClient::ServerBase, name: 'server2') }
+      let(:multi_client) do
+        client = described_class.new(mcp_server_configs: [
+                                       { type: 'stdio', command: 'test1' },
+                                       { type: 'stdio', command: 'test2' }
+                                     ])
+        client.instance_variable_set(:@servers, [mock_server, mock_server2])
+        client
+      end
+
+      before do
+        allow(mock_server2).to receive(:on_notification)
+        allow(mock_server2).to receive(:rpc_request)
+          .with('tasks/create', { method: 'op', params: {} })
+          .and_return({ 'id' => 'task-s2', 'state' => 'pending' })
+      end
+
+      it 'creates a task on a specific server by name' do
+        task = multi_client.create_task('op', server: 'server2')
+        expect(task.id).to eq('task-s2')
+        expect(task.server).to eq(mock_server2)
+      end
+    end
+  end
+
+  describe '#get_task' do
+    let(:client) { described_class.new(mcp_server_configs: [{ type: 'stdio', command: 'test' }]) }
+    let(:task_result) do
+      { 'id' => 'task-123', 'state' => 'running', 'progress' => 50, 'total' => 100, 'message' => 'Halfway' }
+    end
+
+    before do
+      allow(mock_server).to receive(:rpc_request)
+        .with('tasks/get', { id: 'task-123' })
+        .and_return(task_result)
+    end
+
+    it 'gets a task and returns a Task object' do
+      task = client.get_task('task-123')
+      expect(task).to be_a(MCPClient::Task)
+      expect(task.id).to eq('task-123')
+      expect(task.state).to eq('running')
+      expect(task.progress).to eq(50)
+      expect(task.total).to eq(100)
+      expect(task.message).to eq('Halfway')
+      expect(task.server).to eq(mock_server)
+    end
+
+    it 'raises TaskNotFound when task does not exist' do
+      allow(mock_server).to receive(:rpc_request)
+        .with('tasks/get', { id: 'nonexistent' })
+        .and_raise(MCPClient::Errors::ServerError.new('Task not found'))
+
+      expect do
+        client.get_task('nonexistent')
+      end.to raise_error(MCPClient::Errors::TaskNotFound, "Task 'nonexistent' not found")
+    end
+
+    it 'raises TaskNotFound for unknown task error' do
+      allow(mock_server).to receive(:rpc_request)
+        .with('tasks/get', { id: 'bad-id' })
+        .and_raise(MCPClient::Errors::ServerError.new('unknown task'))
+
+      expect do
+        client.get_task('bad-id')
+      end.to raise_error(MCPClient::Errors::TaskNotFound)
+    end
+
+    it 'raises TaskError on other server errors' do
+      allow(mock_server).to receive(:rpc_request)
+        .with('tasks/get', { id: 'task-err' })
+        .and_raise(MCPClient::Errors::ServerError.new('Internal error'))
+
+      expect do
+        client.get_task('task-err')
+      end.to raise_error(MCPClient::Errors::TaskError, /Error getting task/)
+    end
+
+    it 'raises TaskError on transport error' do
+      allow(mock_server).to receive(:rpc_request)
+        .with('tasks/get', { id: 'task-err' })
+        .and_raise(MCPClient::Errors::TransportError.new('Connection lost'))
+
+      expect do
+        client.get_task('task-err')
+      end.to raise_error(MCPClient::Errors::TaskError, /Error getting task/)
+    end
+  end
+
+  describe '#cancel_task' do
+    let(:client) { described_class.new(mcp_server_configs: [{ type: 'stdio', command: 'test' }]) }
+    let(:cancel_result) do
+      { 'id' => 'task-123', 'state' => 'cancelled', 'message' => 'Cancelled by user' }
+    end
+
+    before do
+      allow(mock_server).to receive(:rpc_request)
+        .with('tasks/cancel', { id: 'task-123' })
+        .and_return(cancel_result)
+    end
+
+    it 'cancels a task and returns updated Task object' do
+      task = client.cancel_task('task-123')
+      expect(task).to be_a(MCPClient::Task)
+      expect(task.id).to eq('task-123')
+      expect(task.state).to eq('cancelled')
+      expect(task.message).to eq('Cancelled by user')
+      expect(task.server).to eq(mock_server)
+    end
+
+    it 'raises TaskNotFound when task does not exist' do
+      allow(mock_server).to receive(:rpc_request)
+        .with('tasks/cancel', { id: 'nonexistent' })
+        .and_raise(MCPClient::Errors::ServerError.new('Task not found'))
+
+      expect do
+        client.cancel_task('nonexistent')
+      end.to raise_error(MCPClient::Errors::TaskNotFound, "Task 'nonexistent' not found")
+    end
+
+    it 'raises TaskError on other server errors' do
+      allow(mock_server).to receive(:rpc_request)
+        .with('tasks/cancel', { id: 'task-err' })
+        .and_raise(MCPClient::Errors::ServerError.new('Cannot cancel completed task'))
+
+      expect do
+        client.cancel_task('task-err')
+      end.to raise_error(MCPClient::Errors::TaskError, /Error cancelling task/)
+    end
+
+    it 'raises TaskError on transport error' do
+      allow(mock_server).to receive(:rpc_request)
+        .with('tasks/cancel', { id: 'task-err' })
+        .and_raise(MCPClient::Errors::TransportError.new('Connection lost'))
+
+      expect do
+        client.cancel_task('task-err')
+      end.to raise_error(MCPClient::Errors::TaskError, /Error cancelling task/)
+    end
+
+    context 'with server selection' do
+      let(:mock_server2) { instance_double(MCPClient::ServerBase, name: 'server2') }
+      let(:multi_client) do
+        client = described_class.new(mcp_server_configs: [
+                                       { type: 'stdio', command: 'test1' },
+                                       { type: 'stdio', command: 'test2' }
+                                     ])
+        client.instance_variable_set(:@servers, [mock_server, mock_server2])
+        client
+      end
+
+      before do
+        allow(mock_server2).to receive(:on_notification)
+        allow(mock_server2).to receive(:rpc_request)
+          .with('tasks/cancel', { id: 'task-s2' })
+          .and_return({ 'id' => 'task-s2', 'state' => 'cancelled' })
+      end
+
+      it 'cancels a task on a specific server by name' do
+        task = multi_client.cancel_task('task-s2', server: 'server2')
+        expect(task.id).to eq('task-s2')
+        expect(task.state).to eq('cancelled')
+        expect(task.server).to eq(mock_server2)
+      end
+    end
+  end
+
   describe 'notification handling' do
     let(:client) { described_class.new(mcp_server_configs: [{ type: 'stdio', command: 'test' }]) }
     let(:notification_callback) { double('callback') }
