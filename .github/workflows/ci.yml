@@ -47,4 +47,5 @@ jobs:
 
           Review the PR changes. Focus on code quality, potential bugs, performance and security issues.
         anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
-        claude_args: "--model claude-opus-4-6-20250715"
+        claude_args: "--model opus"
+        show_full_output: true
