@@ -288,10 +288,38 @@ module MCPClient
       attr_reader :code_verifier, :code_challenge, :code_challenge_method
 
       # Generate PKCE parameters
-      def initialize
-        @code_verifier = generate_code_verifier
-        @code_challenge = generate_code_challenge(@code_verifier)
-        @code_challenge_method = 'S256'
+      # @param code_verifier [String, nil] Existing code verifier (for deserialization)
+      # @param code_challenge [String, nil] Existing code challenge (for deserialization)
+      # @param code_challenge_method [String] Challenge method (default: 'S256')
+      def initialize(code_verifier: nil, code_challenge: nil, code_challenge_method: nil)
+        @code_verifier = code_verifier || generate_code_verifier
+        @code_challenge = code_challenge || generate_code_challenge(@code_verifier)
+        @code_challenge_method = code_challenge_method || 'S256'
+      end
+
+      # Convert to hash for serialization
+      # @return [Hash] Hash representation
+      def to_h
+        {
+          code_verifier: @code_verifier,
+          code_challenge: @code_challenge,
+          code_challenge_method: @code_challenge_method
+        }
+      end
+
+      # Create PKCE instance from hash
+      # @param data [Hash] Hash with PKCE parameters
+      # @return [PKCE] New PKCE instance
+      # @raise [ArgumentError] If required parameters are missing
+      def self.from_h(data)
+        verifier = data[:code_verifier] || data['code_verifier']
+        challenge = data[:code_challenge] || data['code_challenge']
+        method = data[:code_challenge_method] || data['code_challenge_method']
+
+        raise ArgumentError, 'Missing code_verifier' unless verifier
+        raise ArgumentError, 'Missing code_challenge' unless challenge
+
+        new(code_verifier: verifier, code_challenge: challenge, code_challenge_method: method)
       end
 
       private
