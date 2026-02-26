@@ -138,9 +138,18 @@ RSpec.describe MCPClient::Auth do
     end
 
     describe '#to_h and .from_h' do
-      it 'round-trips data with symbol and string keys' do
+      it 'round-trips data with symbol keys' do
         original = described_class.new
         restored = described_class.from_h(original.to_h)
+        expect(restored.code_verifier).to eq(original.code_verifier)
+        expect(restored.code_challenge).to eq(original.code_challenge)
+        expect(restored.code_challenge_method).to eq('S256')
+      end
+
+      it 'round-trips data with string keys' do
+        original = described_class.new
+        string_hash = original.to_h.transform_keys(&:to_s)
+        restored = described_class.from_h(string_hash)
         expect(restored.code_verifier).to eq(original.code_verifier)
         expect(restored.code_challenge).to eq(original.code_challenge)
         expect(restored.code_challenge_method).to eq('S256')

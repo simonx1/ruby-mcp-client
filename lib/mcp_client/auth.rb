@@ -308,9 +308,12 @@ module MCPClient
       end
 
       # Create PKCE instance from hash
-      # @param data [Hash] Hash with PKCE parameters
+      # @param data [Hash] Hash with PKCE parameters (symbol or string keys)
       # @return [PKCE] New PKCE instance
       # @raise [ArgumentError] If required parameters are missing
+      # @note code_challenge_method is optional and defaults to 'S256'.
+      #   The code_challenge is not re-validated against code_verifier;
+      #   callers are expected to provide values from a prior to_h round-trip.
       def self.from_h(data)
         verifier = data[:code_verifier] || data['code_verifier']
         challenge = data[:code_challenge] || data['code_challenge']
