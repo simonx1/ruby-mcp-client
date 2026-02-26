@@ -124,6 +124,31 @@ RSpec.describe MCPClient::Auth do
         expect(pkce1.code_verifier).not_to eq(pkce2.code_verifier)
         expect(pkce1.code_challenge).not_to eq(pkce2.code_challenge)
       end
+
+      it 'accepts existing values' do
+        pkce = described_class.new(
+          code_verifier: 'test_verifier',
+          code_challenge: 'test_challenge',
+          code_challenge_method: 'S256'
+        )
+        expect(pkce.code_verifier).to eq('test_verifier')
+        expect(pkce.code_challenge).to eq('test_challenge')
+        expect(pkce.code_challenge_method).to eq('S256')
+      end
+    end
+
+    describe '#to_h and .from_h' do
+      it 'round-trips data with symbol and string keys' do
+        original = described_class.new
+        restored = described_class.from_h(original.to_h)
+        expect(restored.code_verifier).to eq(original.code_verifier)
+        expect(restored.code_challenge).to eq(original.code_challenge)
+        expect(restored.code_challenge_method).to eq('S256')
+      end
+
+      it 'raises error when required fields are missing' do
+        expect { described_class.from_h({}) }.to raise_error(ArgumentError)
+      end
     end
   end
 end
