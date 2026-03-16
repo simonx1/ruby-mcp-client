@@ -1,9 +1,9 @@
 GIT
   remote: https://github.com/openai/openai-ruby.git
-  revision: b13dc28ce33798a2c1269f4e6af933e89c596bb5
+  revision: eea3f9a1c177d720c3db9ed5b4ebb31c17cbb934
   branch: main
   specs:
-    openai (0.53.0)
+    openai (0.55.0)
       base64
       cgi
       connection_pool
