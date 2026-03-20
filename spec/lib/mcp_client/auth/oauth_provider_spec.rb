@@ -190,6 +190,102 @@ RSpec.describe MCPClient::Auth::OAuthProvider do
     end
   end
 
+  describe '#supported_scopes' do
+    let(:server_metadata) do
+      MCPClient::Auth::ServerMetadata.new(
+        issuer: 'https://mcp.example.com',
+        authorization_endpoint: 'https://mcp.example.com/authorize',
+        token_endpoint: 'https://mcp.example.com/token',
+        scopes_supported: %w[read write admin]
+      )
+    end
+
+    before do
+      allow(oauth_provider).to receive(:discover_authorization_server).and_return(server_metadata)
+    end
+
+    it 'returns the scopes from server metadata' do
+      expect(oauth_provider.supported_scopes).to eq(%w[read write admin])
+    end
+
+    it 'memoizes the result' do
+      oauth_provider.supported_scopes
+      oauth_provider.supported_scopes
+      expect(oauth_provider).to have_received(:discover_authorization_server).once
+    end
+
+    context 'when scopes_supported is nil' do
+      let(:server_metadata) do
+        MCPClient::Auth::ServerMetadata.new(
+          issuer: 'https://mcp.example.com',
+          authorization_endpoint: 'https://mcp.example.com/authorize',
+          token_endpoint: 'https://mcp.example.com/token',
+          scopes_supported: nil
+        )
+      end
+
+      it 'returns an empty array' do
+        expect(oauth_provider.supported_scopes).to eq([])
+      end
+    end
+  end
+
+  describe 'scope: :all' do
+    let(:server_metadata) do
+      MCPClient::Auth::ServerMetadata.new(
+        issuer: 'https://mcp.example.com',
+        authorization_endpoint: 'https://mcp.example.com/authorize',
+        token_endpoint: 'https://mcp.example.com/token',
+        registration_endpoint: 'https://mcp.example.com/register',
+        scopes_supported: %w[read write admin]
+      )
+    end
+
+    let(:client_metadata) do
+      MCPClient::Auth::ClientMetadata.new(
+        redirect_uris: [redirect_uri],
+        token_endpoint_auth_method: 'none'
+      )
+    end
+
+    let(:client_info) do
+      MCPClient::Auth::ClientInfo.new(
+        client_id: 'client123',
+        metadata: client_metadata
+      )
+    end
+
+    let(:provider) do
+      described_class.new(
+        server_url: server_url,
+        redirect_uri: redirect_uri,
+        scope: :all,
+        logger: logger,
+        storage: storage
+      )
+    end
+
+    before do
+      allow(storage).to receive(:get_server_metadata).and_return(server_metadata)
+      allow(storage).to receive(:set_server_metadata)
+      allow(storage).to receive(:get_client_info).and_return(client_info)
+      allow(storage).to receive(:set_pkce)
+      allow(storage).to receive(:set_state)
+    end
+
+    it 'resolves :all to all supported scopes in the authorization URL' do
+      auth_url = provider.start_authorization_flow
+      uri = URI.parse(auth_url)
+      params = URI.decode_www_form(uri.query).to_h
+      expect(params['scope']).to eq('read write admin')
+    end
+
+    it 'does not mutate @scope' do
+      provider.start_authorization_flow
+      expect(provider.scope).to eq(:all)
+    end
+  end
+
   describe '#exchange_authorization_code' do
     let(:storage_instance) { MCPClient::Auth::OAuthProvider::MemoryStorage.new }
     let(:logger) { instance_double('Logger') }

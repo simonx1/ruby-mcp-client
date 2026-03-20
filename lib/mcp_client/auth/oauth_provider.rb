@@ -14,7 +14,7 @@ module MCPClient
       # @!attribute [rw] redirect_uri
       #   @return [String] OAuth redirect URI
       # @!attribute [rw] scope
-      #   @return [String, nil] OAuth scope
+      #   @return [String, Symbol, nil] OAuth scope (use :all for all server-supported scopes)
       # @!attribute [rw] logger
       #   @return [Logger] Logger instance
       # @!attribute [rw] storage
@@ -27,7 +27,7 @@ module MCPClient
       # Initialize OAuth provider
       # @param server_url [String] The MCP server URL (used as OAuth resource parameter)
       # @param redirect_uri [String] OAuth redirect URI (default: http://localhost:8080/callback)
-      # @param scope [String, nil] OAuth scope
+      # @param scope [String, Symbol, nil] OAuth scope (use :all for all server-supported scopes)
       # @param logger [Logger, nil] Optional logger
       # @param storage [Object, nil] Storage backend for tokens and client info
       def initialize(server_url:, redirect_uri: 'http://localhost:8080/callback', scope: nil, logger: nil, storage: nil)
@@ -56,6 +56,14 @@ module MCPClient
 
         # Try to refresh if we have a refresh token
         refresh_token(token) if token.refresh_token
+      end
+
+      # Return the scopes supported by the authorization server
+      # Discovers server metadata and returns the scopes_supported list.
+      # @return [Array<String>] supported scopes, or empty array if not advertised
+      # @raise [MCPClient::Errors::ConnectionError] if server discovery fails
+      def supported_scopes
+        @supported_scopes ||= (discover_authorization_server.scopes_supported || [])
       end
 
       # Start OAuth authorization flow
@@ -328,12 +336,14 @@ module MCPClient
       def register_client(server_metadata)
         logger.debug("Registering OAuth client at: #{server_metadata.registration_endpoint}")
 
+        resolved_scope = scope == :all ? supported_scopes.join(' ') : scope
+
         metadata = ClientMetadata.new(
           redirect_uris: [redirect_uri],
           token_endpoint_auth_method: 'none', # Public client
           grant_types: %w[authorization_code refresh_token],
           response_types: ['code'],
-          scope: scope
+          scope: resolved_scope
         )
 
         response = @http_client.post(server_metadata.registration_endpoint) do |req|
@@ -396,11 +406,13 @@ module MCPClient
         # Use the redirect_uri that was actually registered
         registered_redirect_uri = client_info.metadata.redirect_uris.first
 
+        resolved_scope = scope == :all ? supported_scopes.join(' ') : scope
+
         params = {
           response_type: 'code',
           client_id: client_info.client_id,
           redirect_uri: registered_redirect_uri,
-          scope: scope,
+          scope: resolved_scope,
           state: state,
           code_challenge: pkce.code_challenge,
           code_challenge_method: pkce.code_challenge_method,
