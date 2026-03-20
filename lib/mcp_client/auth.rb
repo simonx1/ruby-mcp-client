@@ -100,11 +100,13 @@ module MCPClient
       # @param tos_uri [String, nil] URL of the client terms of service
       # @param policy_uri [String, nil] URL of the client privacy policy
       # @param contacts [Array<String>, nil] List of contact emails for the client
+      # rubocop:disable Metrics/ParameterLists
       def initialize(redirect_uris:, token_endpoint_auth_method: 'none',
                      grant_types: %w[authorization_code refresh_token],
                      response_types: ['code'], scope: nil,
                      client_name: nil, client_uri: nil, logo_uri: nil,
                      tos_uri: nil, policy_uri: nil, contacts: nil)
+        # rubocop:enable Metrics/ParameterLists
         @redirect_uris = redirect_uris
         @token_endpoint_auth_method = token_endpoint_auth_method
         @grant_types = grant_types
