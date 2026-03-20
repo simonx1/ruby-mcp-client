@@ -86,21 +86,36 @@ module MCPClient
 
     # OAuth client metadata for registration and authorization
     class ClientMetadata
-      attr_reader :redirect_uris, :token_endpoint_auth_method, :grant_types, :response_types, :scope
+      attr_reader :redirect_uris, :token_endpoint_auth_method, :grant_types, :response_types, :scope,
+                  :client_name, :client_uri, :logo_uri, :tos_uri, :policy_uri, :contacts
 
       # @param redirect_uris [Array<String>] List of valid redirect URIs
       # @param token_endpoint_auth_method [String] Authentication method for token endpoint
       # @param grant_types [Array<String>] Supported grant types
       # @param response_types [Array<String>] Supported response types
       # @param scope [String, nil] Requested scope
+      # @param client_name [String, nil] Human-readable client name
+      # @param client_uri [String, nil] URL of the client home page
+      # @param logo_uri [String, nil] URL of the client logo
+      # @param tos_uri [String, nil] URL of the client terms of service
+      # @param policy_uri [String, nil] URL of the client privacy policy
+      # @param contacts [Array<String>, nil] List of contact emails for the client
       def initialize(redirect_uris:, token_endpoint_auth_method: 'none',
                      grant_types: %w[authorization_code refresh_token],
-                     response_types: ['code'], scope: nil)
+                     response_types: ['code'], scope: nil,
+                     client_name: nil, client_uri: nil, logo_uri: nil,
+                     tos_uri: nil, policy_uri: nil, contacts: nil)
         @redirect_uris = redirect_uris
         @token_endpoint_auth_method = token_endpoint_auth_method
         @grant_types = grant_types
         @response_types = response_types
         @scope = scope
+        @client_name = client_name
+        @client_uri = client_uri
+        @logo_uri = logo_uri
+        @tos_uri = tos_uri
+        @policy_uri = policy_uri
+        @contacts = contacts
       end
 
       # Convert to hash for HTTP requests
@@ -111,7 +126,13 @@ module MCPClient
           token_endpoint_auth_method: @token_endpoint_auth_method,
           grant_types: @grant_types,
           response_types: @response_types,
-          scope: @scope
+          scope: @scope,
+          client_name: @client_name,
+          client_uri: @client_uri,
+          logo_uri: @logo_uri,
+          tos_uri: @tos_uri,
+          policy_uri: @policy_uri,
+          contacts: @contacts
         }.compact
       end
     end
@@ -180,7 +201,13 @@ module MCPClient
           grant_types: metadata_data[:grant_types] || metadata_data['grant_types'] ||
                        %w[authorization_code refresh_token],
           response_types: metadata_data[:response_types] || metadata_data['response_types'] || ['code'],
-          scope: metadata_data[:scope] || metadata_data['scope']
+          scope: metadata_data[:scope] || metadata_data['scope'],
+          client_name: metadata_data[:client_name] || metadata_data['client_name'],
+          client_uri: metadata_data[:client_uri] || metadata_data['client_uri'],
+          logo_uri: metadata_data[:logo_uri] || metadata_data['logo_uri'],
+          tos_uri: metadata_data[:tos_uri] || metadata_data['tos_uri'],
+          policy_uri: metadata_data[:policy_uri] || metadata_data['policy_uri'],
+          contacts: metadata_data[:contacts] || metadata_data['contacts']
         )
       end
 

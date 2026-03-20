@@ -105,6 +105,62 @@ RSpec.describe MCPClient::Auth do
           scope: 'read write'
         )
         expect(hash).not_to have_key(:client_id)
+        expect(hash).not_to have_key(:client_name)
+        expect(hash).not_to have_key(:logo_uri)
+      end
+
+      it 'includes extra OIDC fields when provided' do
+        metadata = described_class.new(
+          redirect_uris: ['http://localhost:8080/callback'],
+          client_name: 'My App',
+          client_uri: 'https://myapp.example.com',
+          logo_uri: 'https://myapp.example.com/logo.png',
+          tos_uri: 'https://myapp.example.com/tos',
+          policy_uri: 'https://myapp.example.com/privacy',
+          contacts: ['admin@myapp.example.com']
+        )
+        hash = metadata.to_h
+        expect(hash[:client_name]).to eq('My App')
+        expect(hash[:client_uri]).to eq('https://myapp.example.com')
+        expect(hash[:logo_uri]).to eq('https://myapp.example.com/logo.png')
+        expect(hash[:tos_uri]).to eq('https://myapp.example.com/tos')
+        expect(hash[:policy_uri]).to eq('https://myapp.example.com/privacy')
+        expect(hash[:contacts]).to eq(['admin@myapp.example.com'])
+      end
+    end
+
+    describe '.from_h (via ClientInfo.build_metadata_from_hash)' do
+      it 'round-trips extra fields through ClientInfo serialization' do
+        metadata = described_class.new(
+          redirect_uris: ['http://localhost:8080/callback'],
+          client_name: 'Test Client',
+          client_uri: 'https://test.example.com',
+          logo_uri: 'https://test.example.com/logo.png',
+          tos_uri: 'https://test.example.com/tos',
+          policy_uri: 'https://test.example.com/policy',
+          contacts: ['dev@test.example.com']
+        )
+        client_info = MCPClient::Auth::ClientInfo.new(client_id: 'cid', metadata: metadata)
+        restored = MCPClient::Auth::ClientInfo.from_h(client_info.to_h)
+
+        expect(restored.metadata.client_name).to eq('Test Client')
+        expect(restored.metadata.client_uri).to eq('https://test.example.com')
+        expect(restored.metadata.logo_uri).to eq('https://test.example.com/logo.png')
+        expect(restored.metadata.tos_uri).to eq('https://test.example.com/tos')
+        expect(restored.metadata.policy_uri).to eq('https://test.example.com/policy')
+        expect(restored.metadata.contacts).to eq(['dev@test.example.com'])
+      end
+
+      it 'round-trips extra fields with string keys' do
+        hash = {
+          'redirect_uris' => ['http://localhost/cb'],
+          'client_name' => 'String Key Client',
+          'contacts' => ['a@b.com']
+        }
+        restored = MCPClient::Auth::ClientInfo.build_metadata_from_hash(hash)
+
+        expect(restored.client_name).to eq('String Key Client')
+        expect(restored.contacts).to eq(['a@b.com'])
       end
     end
   end
