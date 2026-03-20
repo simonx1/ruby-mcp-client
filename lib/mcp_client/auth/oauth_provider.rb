@@ -63,7 +63,7 @@ module MCPClient
       # @return [Array<String>] supported scopes, or empty array if not advertised
       # @raise [MCPClient::Errors::ConnectionError] if server discovery fails
       def supported_scopes
-        @supported_scopes ||= (discover_authorization_server.scopes_supported || [])
+        @supported_scopes ||= discover_authorization_server.scopes_supported || []
       end
 
       # Start OAuth authorization flow
