@@ -1,5 +1,17 @@
 # Changelog
 
+## 1.0.1 (2026-03-22)
+
+### New Features
+
+#### OAuth 2.1 Enhancements
+- **Supported Scopes Discovery**: New `supported_scopes` method on `OAuthProvider` and `scope: :all` shorthand to request all server-advertised scopes (#109)
+- **Extra Client Metadata in DCR**: Dynamic client registration now supports optional OIDC metadata fields (`client_name`, `client_uri`, `logo_uri`, `tos_uri`, `policy_uri`, `contacts`) (#110)
+- **PKCE Serialization**: `PKCE#to_h` and `PKCE.from_h` methods for persisting and restoring PKCE state (#100)
+
+#### RubyLLM Integration Example
+- **New `examples/ruby_llm_mcp.rb`**: Demonstrates bridging MCP tools to RubyLLM using a minimal `Class.new(RubyLLM::Tool)` wrapper, with OpenAI as the LLM provider and Playwright MCP for browser automation. RubyLLM handles the tool call loop automatically.
+
 ## 1.0.0 (2026-02-15)
 
 ### MCP 2025-11-25 Protocol Support
