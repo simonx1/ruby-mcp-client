@@ -41,7 +41,7 @@ RSpec.shared_examples 'resource server methods' do
         expect(result).to be_a(Hash)
         expect(result['resources']).to be_an(Array)
         expect(result['resources'].size).to eq(2)
-        expect(result['resources'].all? { |r| r.is_a?(MCPClient::Resource) }).to be true
+        expect(result['resources'].all?(MCPClient::Resource)).to be true
         expect(result['nextCursor']).to be_nil
       end
     end
