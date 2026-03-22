@@ -30,12 +30,16 @@ module MCPClient
       # @param scope [String, nil] OAuth scope
       # @param logger [Logger, nil] Optional logger
       # @param storage [Object, nil] Storage backend for tokens and client info
-      def initialize(server_url:, redirect_uri: 'http://localhost:8080/callback', scope: nil, logger: nil, storage: nil)
+      # @param client_metadata [Hash] Extra OIDC client metadata fields for DCR registration.
+      #   Supported keys: :client_name, :client_uri, :logo_uri, :tos_uri, :policy_uri, :contacts
+      def initialize(server_url:, redirect_uri: 'http://localhost:8080/callback', scope: nil, logger: nil, storage: nil,
+                     client_metadata: {})
         self.server_url = server_url
         self.redirect_uri = redirect_uri
         self.scope = scope
         self.logger = logger || Logger.new($stdout, level: Logger::WARN)
         self.storage = storage || MemoryStorage.new
+        @extra_client_metadata = client_metadata
         @http_client = create_http_client
       end
 
@@ -333,7 +337,8 @@ module MCPClient
           token_endpoint_auth_method: 'none', # Public client
           grant_types: %w[authorization_code refresh_token],
           response_types: ['code'],
-          scope: scope
+          scope: scope,
+          **@extra_client_metadata
         )
 
         response = @http_client.post(server_metadata.registration_endpoint) do |req|
@@ -355,7 +360,13 @@ module MCPClient
           token_endpoint_auth_method: data['token_endpoint_auth_method'] || 'none',
           grant_types: data['grant_types'] || %w[authorization_code refresh_token],
           response_types: data['response_types'] || ['code'],
-          scope: data['scope']
+          scope: data['scope'],
+          client_name: data['client_name'],
+          client_uri: data['client_uri'],
+          logo_uri: data['logo_uri'],
+          tos_uri: data['tos_uri'],
+          policy_uri: data['policy_uri'],
+          contacts: data['contacts']
         )
 
         # Warn if server changed redirect_uri
