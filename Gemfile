@@ -8,8 +8,8 @@ group :development, :test do
   # Integration testing dependencies
   gem 'gemini-ai'
   gem 'ruby-anthropic'
-  gem 'ruby-openai'
   gem 'ruby_llm'
+  gem 'ruby-openai'
   gem 'vcr'
   gem 'webmock'
   # gem "openai", github: "openai/openai-ruby", branch: "main"
