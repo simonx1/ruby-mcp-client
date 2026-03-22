@@ -303,10 +303,36 @@ client = Anthropic::Client.new(access_token: ENV['ANTHROPIC_API_KEY'])
 # Use tools with Claude API
 ```
 
+### RubyLLM
+
+```ruby
+require 'mcp_client'
+require 'ruby_llm'
+
+RubyLLM.configure { |c| c.openai_api_key = ENV['OPENAI_API_KEY'] }
+mcp = MCPClient.connect('http://localhost:8931/mcp')  # Playwright MCP
+
+# Wrap each MCP tool as a RubyLLM tool
+tools = mcp.list_tools.map do |t|
+  tool_name = t.name
+  Class.new(RubyLLM::Tool) do
+    description t.description
+    params t.schema
+    define_method(:name) { tool_name }
+    define_method(:execute) { |**args| mcp.call_tool(tool_name, args) }
+  end.new
+end
+
+chat = RubyLLM.chat(model: 'gpt-4o-mini')
+tools.each { |tool| chat.with_tool(tool) }
+response = chat.ask('Navigate to google.com and tell me the page title')
+```
+
 See `examples/` for complete implementations:
 - `ruby_openai_mcp.rb`, `openai_ruby_mcp.rb` - OpenAI integration
 - `ruby_anthropic_mcp.rb` - Anthropic integration
 - `gemini_ai_mcp.rb` - Google Vertex AI integration
+- `ruby_llm_mcp.rb` - RubyLLM integration (OpenAI provider)
 
 ## OAuth 2.1 Authentication
 

@@ -9,6 +9,7 @@ group :development, :test do
   gem 'gemini-ai'
   gem 'ruby-anthropic'
   gem 'ruby-openai'
+  gem 'ruby_llm'
   gem 'vcr'
   gem 'webmock'
   # gem "openai", github: "openai/openai-ruby", branch: "main"

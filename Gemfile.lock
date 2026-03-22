@@ -83,6 +83,7 @@ GEM
     language_server-protocol (3.17.0.5)
     lint_roller (1.1.0)
     logger (1.7.0)
+    marcel (1.1.0)
     mcp (0.8.0)
       json-schema (>= 4.1)
     multi_json (1.17.0)
@@ -146,6 +147,17 @@ GEM
       faraday (>= 1)
       faraday-multipart (>= 1)
     ruby-progressbar (1.13.0)
+    ruby_llm (1.14.0)
+      base64
+      event_stream_parser (~> 1)
+      faraday (>= 1.10.0)
+      faraday-multipart (>= 1)
+      faraday-net_http (>= 1)
+      faraday-retry (>= 1)
+      marcel (~> 1)
+      ruby_llm-schema (~> 0)
+      zeitwerk (~> 2)
+    ruby_llm-schema (0.3.0)
     signet (0.21.0)
       addressable (~> 2.8)
       faraday (>= 0.17.5, < 3.a)
@@ -165,6 +177,7 @@ GEM
       crack (>= 0.3.2)
       hashdiff (>= 0.4.0, < 2.0.0)
     yard (0.9.38)
+    zeitwerk (2.7.5)
 
 PLATFORMS
   arm64-darwin-24
@@ -180,6 +193,7 @@ DEPENDENCIES
   ruby-anthropic
   ruby-mcp-client!
   ruby-openai
+  ruby_llm
   vcr
   webmock
   yard (~> 0.9.34)
