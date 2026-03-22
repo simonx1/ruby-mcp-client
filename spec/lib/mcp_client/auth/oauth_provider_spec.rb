@@ -33,6 +33,21 @@ RSpec.describe MCPClient::Auth::OAuthProvider do
       provider = described_class.new(server_url: server_url)
       expect(provider.redirect_uri).to eq('http://localhost:8080/callback')
     end
+
+    it 'accepts extra client_metadata' do
+      provider = described_class.new(
+        server_url: server_url,
+        client_metadata: { client_name: 'My App', contacts: ['dev@example.com'] }
+      )
+      extra = provider.instance_variable_get(:@extra_client_metadata)
+      expect(extra).to eq(client_name: 'My App', contacts: ['dev@example.com'])
+    end
+
+    it 'defaults extra client_metadata to empty hash' do
+      provider = described_class.new(server_url: server_url)
+      extra = provider.instance_variable_get(:@extra_client_metadata)
+      expect(extra).to eq({})
+    end
   end
 
   describe 'OAuth discovery URL generation' do
@@ -370,6 +385,105 @@ RSpec.describe MCPClient::Auth::OAuthProvider do
       expected_message = "Token exchange failed: redirect_uri mismatch. Retrying with server's expected value: " \
                          'https://3d4834530bf2.ngrok.app'
       expect(logger).to have_received(:warn).with(expected_message)
+    end
+  end
+
+  describe '#register_client with extra client_metadata' do
+    let(:storage_instance) { MCPClient::Auth::OAuthProvider::MemoryStorage.new }
+    let(:logger) { instance_double('Logger') }
+    let(:extra_metadata) do
+      {
+        client_name: 'My MCP App',
+        client_uri: 'https://myapp.example.com',
+        logo_uri: 'https://myapp.example.com/logo.png',
+        tos_uri: 'https://myapp.example.com/tos',
+        policy_uri: 'https://myapp.example.com/privacy',
+        contacts: ['admin@myapp.example.com']
+      }
+    end
+    let(:provider) do
+      described_class.new(
+        server_url: 'https://mcp.example.com',
+        redirect_uri: redirect_uri,
+        scope: 'read',
+        logger: logger,
+        storage: storage_instance,
+        client_metadata: extra_metadata
+      )
+    end
+    let(:http_client) { double('Faraday::Connection') }
+    let(:server_metadata) do
+      instance_double(
+        'MCPClient::Auth::ServerMetadata',
+        registration_endpoint: 'https://auth.example.com/register'
+      )
+    end
+    let(:registration_response_body) do
+      {
+        'client_id' => 'new-client-id',
+        'client_name' => 'My MCP App',
+        'client_uri' => 'https://myapp.example.com',
+        'logo_uri' => 'https://myapp.example.com/logo.png',
+        'tos_uri' => 'https://myapp.example.com/tos',
+        'policy_uri' => 'https://myapp.example.com/privacy',
+        'contacts' => ['admin@myapp.example.com'],
+        'redirect_uris' => [redirect_uri]
+      }.to_json
+    end
+    let(:sent_bodies) { [] }
+
+    before do
+      allow(logger).to receive(:debug)
+      allow(logger).to receive(:warn)
+
+      provider.instance_variable_set(:@http_client, http_client)
+      response = instance_double('Faraday::Response', success?: true, status: 200, body: registration_response_body)
+
+      allow(http_client).to receive(:post) do |_url, &block|
+        request = Struct.new(:headers, :body).new({}, nil)
+        block.call(request)
+        sent_bodies << JSON.parse(request.body)
+        response
+      end
+    end
+
+    it 'sends extra metadata fields in DCR request' do
+      provider.send(:register_client, server_metadata)
+
+      body = sent_bodies.first
+      expect(body['client_name']).to eq('My MCP App')
+      expect(body['client_uri']).to eq('https://myapp.example.com')
+      expect(body['logo_uri']).to eq('https://myapp.example.com/logo.png')
+      expect(body['tos_uri']).to eq('https://myapp.example.com/tos')
+      expect(body['policy_uri']).to eq('https://myapp.example.com/privacy')
+      expect(body['contacts']).to eq(['admin@myapp.example.com'])
+    end
+
+    it 'parses extra metadata fields from server response' do
+      client_info = provider.send(:register_client, server_metadata)
+
+      expect(client_info.metadata.client_name).to eq('My MCP App')
+      expect(client_info.metadata.client_uri).to eq('https://myapp.example.com')
+      expect(client_info.metadata.logo_uri).to eq('https://myapp.example.com/logo.png')
+      expect(client_info.metadata.tos_uri).to eq('https://myapp.example.com/tos')
+      expect(client_info.metadata.policy_uri).to eq('https://myapp.example.com/privacy')
+      expect(client_info.metadata.contacts).to eq(['admin@myapp.example.com'])
+    end
+
+    it 'omits nil extra fields from DCR request' do
+      minimal_provider = described_class.new(
+        server_url: 'https://mcp.example.com',
+        redirect_uri: redirect_uri,
+        logger: logger,
+        storage: storage_instance
+      )
+      minimal_provider.instance_variable_set(:@http_client, http_client)
+
+      minimal_provider.send(:register_client, server_metadata)
+
+      body = sent_bodies.first
+      expect(body).not_to have_key('client_name')
+      expect(body).not_to have_key('contacts')
     end
   end
 end
