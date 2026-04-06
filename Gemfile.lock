@@ -43,7 +43,7 @@ GEM
       logger
     faraday-follow_redirects (0.5.0)
       faraday (>= 1, < 3)
-    faraday-multipart (1.1.1)
+    faraday-multipart (1.2.0)
       multipart-post (~> 2.0)
     faraday-net_http (3.4.2)
       net-http (~> 0.5)
@@ -74,7 +74,7 @@ GEM
       signet (>= 0.16, < 2.a)
     hashdiff (1.2.1)
     io-console (0.8.2)
-    json (2.19.2)
+    json (2.19.3)
     jwt (3.1.2)
       base64
     language_server-protocol (3.17.0.5)
@@ -141,7 +141,7 @@ GEM
       faraday (>= 1)
       faraday-multipart (>= 1)
     ruby-progressbar (1.13.0)
-    ruby_llm (1.14.0)
+    ruby_llm (1.14.1)
       base64
       event_stream_parser (~> 1)
       faraday (>= 1.10.0)
