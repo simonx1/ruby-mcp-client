@@ -74,7 +74,7 @@ GEM
       signet (>= 0.16, < 2.a)
     hashdiff (1.2.1)
     io-console (0.8.2)
-    json (2.19.3)
+    json (2.19.5)
     jwt (3.1.2)
       base64
     language_server-protocol (3.17.0.5)
@@ -141,7 +141,7 @@ GEM
       faraday (>= 1)
       faraday-multipart (>= 1)
     ruby-progressbar (1.13.0)
-    ruby_llm (1.14.1)
+    ruby_llm (1.15.0)
       base64
       event_stream_parser (~> 1)
       faraday (>= 1.10.0)
