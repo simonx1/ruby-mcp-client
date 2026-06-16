@@ -1,6 +1,6 @@
 GIT
   remote: https://github.com/openai/openai-ruby.git
-  revision: 7ebca61d12a9c5feb787d18851a25534790f1bde
+  revision: 98da2dc816ac8e5fac09471e051ed5219f931337
   branch: main
   specs:
     openai (0.66.1)
