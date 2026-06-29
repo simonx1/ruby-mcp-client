@@ -31,9 +31,8 @@ GEM
     crack (1.0.1)
       bigdecimal
       rexml
-    date (3.5.1)
     diff-lcs (1.6.2)
-    erb (6.0.1)
+    erb (6.0.4)
     ethon (0.17.0)
       ffi (>= 1.15.0)
     event_stream_parser (1.0.0)
@@ -91,15 +90,17 @@ GEM
       ast (~> 2.4.1)
       racc
     prism (1.9.0)
-    psych (5.3.1)
-      date
-      stringio
     public_suffix (7.0.5)
     racc (1.8.1)
     rainbow (3.1.1)
-    rdoc (7.2.0)
+    rbs (4.0.3)
+      logger
+      prism (>= 1.6.0)
+      tsort
+    rdoc (8.0.0)
       erb
-      psych (>= 4.0.0)
+      prism (>= 1.6.0)
+      rbs (>= 4.0.0)
       tsort
     regexp_parser (2.12.0)
     reline (0.6.3)
@@ -157,7 +158,6 @@ GEM
       faraday (>= 0.17.5, < 3.a)
       jwt (>= 1.5, < 4.0)
       multi_json (~> 1.10)
-    stringio (3.2.0)
     tsort (0.2.0)
     typhoeus (1.4.1)
       ethon (>= 0.9.0)
@@ -181,7 +181,7 @@ DEPENDENCIES
   byebug
   gemini-ai
   openai!
-  rdoc (~> 7.0)
+  rdoc (~> 8.0)
   rspec (~> 3.12)
   rubocop (~> 1.62)
   ruby-anthropic
