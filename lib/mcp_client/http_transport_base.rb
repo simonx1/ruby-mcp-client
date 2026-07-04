@@ -243,9 +243,13 @@ module MCPClient
       when 401, 403
         raise MCPClient::Errors::ConnectionError, "Authorization failed: HTTP #{response.status}"
       when 400..499
+        # Deterministic client errors: the request was processed/rejected and
+        # will not succeed on retry, so raise a plain (non-retryable) ServerError.
         raise MCPClient::Errors::ServerError, "Client error: HTTP #{response.status}#{reason_text}"
       when 500..599
-        raise MCPClient::Errors::ServerError, "Server error: HTTP #{response.status}#{reason_text}"
+        # Server-side failures are plausibly transient: raise the retryable
+        # subclass so with_retry can re-attempt them.
+        raise MCPClient::Errors::TransientServerError, "Server error: HTTP #{response.status}#{reason_text}"
       else
         raise MCPClient::Errors::ServerError, "HTTP error: #{response.status}#{reason_text}"
       end
