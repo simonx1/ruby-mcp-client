@@ -21,6 +21,14 @@ module MCPClient
     # Timeout in seconds for responses
     READ_TIMEOUT = 15
 
+    # Chunk size (bytes) used when draining the subprocess stderr pipe
+    STDERR_READ_CHUNK_SIZE = 8192
+
+    # Maximum bytes buffered for a single unterminated stderr line before it is
+    # flushed. Bounds memory when a server writes to stderr without newlines
+    # (e.g. progress output using carriage returns).
+    STDERR_MAX_LINE_SIZE = 64 * 1024
+
     # Initialize a new ServerStdio instance
     # @param command [String, Array] the stdio command to launch the MCP JSON-RPC server
     #   For improved security, passing an Array is recommended to avoid shell injection issues
@@ -49,6 +57,8 @@ module MCPClient
       @elicitation_request_callback = nil # MCP 2025-06-18
       @roots_list_request_callback = nil # MCP 2025-06-18
       @sampling_request_callback = nil # MCP 2025-11-25
+      @reader_thread = nil
+      @stderr_thread = nil
     end
 
     # Server info from the initialize response
@@ -88,6 +98,36 @@ module MCPClient
         end
       rescue StandardError
         # Reader thread aborted unexpectedly
+      end
+    end
+
+    # Spawn a thread to continuously drain the subprocess stderr.
+    #
+    # The child's stderr pipe has a fixed OS buffer (typically 64KB). If it is
+    # never read, a server that logs verbosely to stderr eventually blocks on
+    # write once the buffer fills, which stalls the whole subprocess (it stops
+    # producing stdout / reading stdin) and deadlocks the client. Draining
+    # stderr keeps the pipe empty; lines are surfaced at debug level.
+    #
+    # Reads happen in bounded chunks (not IO#each_line) so that a server which
+    # writes to stderr without newline delimiters cannot make the client buffer
+    # a single "line" without limit: any pending fragment larger than
+    # STDERR_MAX_LINE_SIZE is flushed rather than retained.
+    # @return [Thread] the stderr reader thread
+    def start_stderr_reader
+      @stderr_thread = Thread.new do
+        buffer = +''
+        loop do
+          buffer << @stderr.readpartial(STDERR_READ_CHUNK_SIZE)
+          flush_stderr_lines(buffer)
+          flush_stderr_overflow(buffer)
+        end
+      rescue IOError
+        # EOFError (a subclass of IOError) on EOF, or IOError on close;
+        # emit any trailing partial line before exiting
+        @logger.debug("[stderr] #{buffer.chomp}") if buffer && !buffer.empty?
+      rescue StandardError
+        # reader aborted unexpectedly; nothing actionable
       end
     end
 
@@ -588,6 +628,27 @@ module MCPClient
       @logger.error("Error sending message: #{e.message}")
     end
 
+    # Emit and remove all newline-terminated lines from the stderr buffer.
+    # @param buffer [String] mutable buffer of accumulated stderr bytes
+    # @return [void]
+    def flush_stderr_lines(buffer)
+      while (newline_index = buffer.index("\n"))
+        line = buffer.slice!(0, newline_index + 1)
+        @logger.debug("[stderr] #{line.chomp}")
+      end
+    end
+
+    # Flush an unterminated stderr fragment that has grown past the size cap,
+    # so a newline-less stderr stream cannot buffer without bound.
+    # @param buffer [String] mutable buffer of accumulated stderr bytes
+    # @return [void]
+    def flush_stderr_overflow(buffer)
+      return if buffer.bytesize <= STDERR_MAX_LINE_SIZE
+
+      @logger.debug("[stderr] #{buffer}")
+      buffer.clear
+    end
+
     # Clean up the server connection
     # Closes all stdio handles and terminates any running processes and threads
     # @return [void]
@@ -602,10 +663,11 @@ module MCPClient
         @wait_thread.join(1)
       end
       @reader_thread&.kill
+      @stderr_thread&.kill
     rescue StandardError
       # Clean up resources during unexpected termination
     ensure
-      @stdin = @stdout = @stderr = @wait_thread = @reader_thread = nil
+      @stdin = @stdout = @stderr = @wait_thread = @reader_thread = @stderr_thread = nil
     end
   end
 end
