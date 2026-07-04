@@ -448,6 +448,25 @@ module MCPClient
 
     private
 
+    # Perform the MCP initialize handshake, then announce readiness.
+    #
+    # The base handshake sends the initialize request and captures
+    # serverInfo/capabilities. Per the MCP lifecycle the client MUST send an
+    # `initialized` notification after a successful initialize before issuing
+    # any other requests; the plain HTTP transport previously skipped it.
+    # @return [void]
+    # @raise [MCPClient::Errors::TransportError] if the notification fails to send
+    def perform_initialize
+      super
+
+      notification = build_jsonrpc_notification('notifications/initialized', {})
+      begin
+        send_http_request(notification)
+      rescue MCPClient::Errors::ServerError, MCPClient::Errors::ConnectionError, Faraday::ConnectionFailed => e
+        raise MCPClient::Errors::TransportError, "Failed to send initialized notification: #{e.message}"
+      end
+    end
+
     # Default options for server initialization
     # @return [Hash] Default options
     def default_options

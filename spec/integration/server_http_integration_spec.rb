@@ -92,6 +92,8 @@ RSpec.describe 'HTTP Transport Integration', type: :integration do
           case body['method']
           when 'initialize'
             { status: 200, body: initialize_response.to_json, headers: { 'Content-Type' => 'application/json' } }
+          when 'notifications/initialized'
+            { status: 202, body: '' }
           when 'tools/list'
             { status: 200, body: tools_response.to_json, headers: { 'Content-Type' => 'application/json' } }
           when 'tools/call'
@@ -123,7 +125,8 @@ RSpec.describe 'HTTP Transport Integration', type: :integration do
       expect(result['content'].first['text']).to include('Weather in San Francisco')
 
       # Verify all expected requests were made
-      expect(WebMock).to have_requested(:post, "#{base_url}#{endpoint}").times(3)
+      # 4 POSTs: initialize, initialized notification, tools/list, tools/call
+      expect(WebMock).to have_requested(:post, "#{base_url}#{endpoint}").times(4)
     end
 
     it 'sends correct headers in all requests' do
@@ -133,7 +136,8 @@ RSpec.describe 'HTTP Transport Integration', type: :integration do
 
       # Verify all requests were made to the correct endpoint
       # Headers verification is covered in unit tests
-      expect(WebMock).to have_requested(:post, "#{base_url}#{endpoint}").times(3)
+      # 4 POSTs: initialize, initialized notification, tools/list, tools/call
+      expect(WebMock).to have_requested(:post, "#{base_url}#{endpoint}").times(4)
     end
 
     it 'handles streaming tool calls' do
@@ -201,6 +205,10 @@ RSpec.describe 'HTTP Transport Integration', type: :integration do
         stub_request(:post, "#{base_url}#{endpoint}")
           .with(body: hash_including(method: 'tools/list'))
           .to_return(status: 200, body: 'invalid json response')
+
+        stub_request(:post, "#{base_url}#{endpoint}")
+          .with(body: hash_including(method: 'notifications/initialized'))
+          .to_return(status: 202, body: '')
       end
 
       it 'raises TransportError for invalid JSON' do
@@ -245,6 +253,10 @@ RSpec.describe 'HTTP Transport Integration', type: :integration do
             }.to_json,
             headers: { 'Content-Type' => 'application/json' }
           )
+
+        stub_request(:post, "#{base_url}#{endpoint}")
+          .with(body: hash_including(method: 'notifications/initialized'))
+          .to_return(status: 202, body: '')
       end
 
       it 'raises ToolCallError with wrapped error message' do
@@ -273,6 +285,11 @@ RSpec.describe 'HTTP Transport Integration', type: :integration do
       stub_request(:post, "#{base_url}#{endpoint}")
         .with(body: hash_including(method: 'notification'))
         .to_return(status: 200, body: '')
+
+      # initialized notification sent during connect (MCP lifecycle MUST)
+      stub_request(:post, "#{base_url}#{endpoint}")
+        .with(body: hash_including(method: 'notifications/initialized'))
+        .to_return(status: 202, body: '')
     end
 
     it 'sends notifications without expecting responses' do
@@ -346,6 +363,11 @@ RSpec.describe 'HTTP Transport Integration', type: :integration do
           status: 200,
           body: { jsonrpc: '2.0', id: 1, result: 'pong' }.to_json
         )
+
+      # initialized notification sent during connect (MCP lifecycle MUST)
+      stub_request(:post, "#{base_url}#{endpoint}")
+        .with(body: hash_including(method: 'notifications/initialized'))
+        .to_return(status: 202, body: '')
     end
 
     it 'handles concurrent requests correctly' do

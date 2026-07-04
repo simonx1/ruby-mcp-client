@@ -67,6 +67,10 @@ RSpec.describe MCPClient::ServerHTTP do
                               }),
           headers: { 'Content-Type' => 'application/json' }
         )
+      # Lifecycle: client MUST send an initialized notification after initialize
+      stub_request(:post, "#{base_url}#{endpoint}")
+        .with(body: hash_including(method: 'notifications/initialized'))
+        .to_return(status: 202, body: '')
 
       server.connect
 
@@ -126,12 +130,22 @@ RSpec.describe MCPClient::ServerHTTP do
           body: initialize_response.to_json,
           headers: { 'Content-Type' => 'application/json' }
         )
+      # Lifecycle: client MUST send an initialized notification after initialize
+      stub_request(:post, "#{base_url}#{endpoint}")
+        .with(body: hash_including(method: 'notifications/initialized'))
+        .to_return(status: 202, body: '')
     end
 
     it 'successfully connects and initializes' do
       expect(server.connect).to be true
       expect(server.server_info).to eq({ 'name' => 'test-server', 'version' => '1.0.0' })
       expect(server.capabilities).to eq({ 'tools' => {} })
+    end
+
+    it 'sends the initialized notification after initialize (MCP lifecycle MUST)' do
+      server.connect
+      expect(WebMock).to have_requested(:post, "#{base_url}#{endpoint}")
+        .with(body: hash_including('method' => 'notifications/initialized'))
     end
 
     it 'sets connection state correctly' do
@@ -586,6 +600,10 @@ RSpec.describe MCPClient::ServerHTTP do
       before do
         server.instance_variable_set(:@connection_established, true)
         server.instance_variable_set(:@initialized, true)
+        # Lifecycle: perform_initialize also emits an initialized notification
+        stub_request(:post, "#{base_url}#{endpoint}")
+          .with(body: hash_including(method: 'notifications/initialized'))
+          .to_return(status: 202, body: '')
       end
 
       it 'captures valid session ID from initialize response' do
@@ -658,6 +676,9 @@ RSpec.describe MCPClient::ServerHTTP do
             status: 200,
             body: { jsonrpc: '2.0', id: 1, result: {} }.to_json
           )
+        stub_request(:post, "#{base_url}#{endpoint}")
+          .with(body: hash_including(method: 'notifications/initialized'))
+          .to_return(status: 202, body: '')
 
         server.send(:perform_initialize)
         expect(WebMock).to(have_requested(:post, "#{base_url}#{endpoint}")
