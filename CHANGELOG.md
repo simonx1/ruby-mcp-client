@@ -1,5 +1,34 @@
 # Changelog
 
+## Unreleased
+
+### Breaking Changes
+
+- **Tasks API rewritten to conform to MCP 2025-11-25.** The previous implementation
+  targeted a `tasks/create` method that does not exist in the specification.
+  - Removed `Client#create_task`. To create a task, augment a `tools/call` via the new
+    `Client#call_tool_as_task(name, arguments, ttl:)`, which returns a `MCPClient::Task`.
+  - `MCPClient::Task` fields renamed and reduced to the spec set: `id`→`task_id`,
+    `state`→`status`; added `status_message`, `created_at`, `last_updated_at`, `ttl`,
+    `poll_interval`; removed `progress`, `total`, `message`, `result`, `progress_token`,
+    and `progress_percentage`. Statuses are now `working`, `input_required`,
+    `completed`, `failed`, `cancelled` (was `pending`/`running`/…).
+  - `Client#get_task` and `Client#cancel_task` now send the `taskId` parameter (was `id`)
+    and return a `Task` with the new field set.
+
+### New Features
+
+- `Client#call_tool_as_task` — create a task by augmenting `tools/call` (gated on the
+  server's `tasks.requests.tools.call` capability and the tool's `execution.taskSupport`).
+- `Client#get_task_result` (`tasks/result`) — retrieve the underlying task result.
+- `Client#list_tasks` (`tasks/list`, paginated).
+- Tool-level task negotiation: `Tool#task_support`, `#supports_task?`, `#task_required?`,
+  `#task_optional?`, `#task_forbidden?` (parsed from `execution.taskSupport`).
+- The client handles `notifications/tasks/status` server notifications. (It does not
+  declare a client `tasks` capability: that marks a task *receiver* for
+  sampling/elicitation, which is not implemented — the client is a task requestor for
+  `tools/call` only.)
+
 ## 1.0.1 (2026-03-22)
 
 ### New Features

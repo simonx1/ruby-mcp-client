@@ -4,302 +4,142 @@ require 'spec_helper'
 
 RSpec.describe MCPClient::Task do
   describe '#initialize' do
-    it 'creates a task with required attributes' do
-      task = described_class.new(id: 'task-123')
-      expect(task.id).to eq('task-123')
-      expect(task.state).to eq('pending')
-    end
-
-    it 'creates a task with all attributes' do
+    it 'creates a task with the given fields' do
       task = described_class.new(
-        id: 'task-123',
-        state: 'running',
-        progress_token: 'pt-456',
-        progress: 50,
-        total: 100,
-        message: 'Processing...',
-        result: { 'data' => 'value' }
+        task_id: 't1', status: 'working', status_message: 'in progress',
+        created_at: '2025-11-25T10:30:00Z', last_updated_at: '2025-11-25T10:40:00Z',
+        ttl: 30_000, poll_interval: 5000
       )
-      expect(task.id).to eq('task-123')
-      expect(task.state).to eq('running')
-      expect(task.progress_token).to eq('pt-456')
-      expect(task.progress).to eq(50)
-      expect(task.total).to eq(100)
-      expect(task.message).to eq('Processing...')
-      expect(task.result).to eq({ 'data' => 'value' })
+      expect(task.task_id).to eq('t1')
+      expect(task.status).to eq('working')
+      expect(task.status_message).to eq('in progress')
+      expect(task.created_at).to eq('2025-11-25T10:30:00Z')
+      expect(task.last_updated_at).to eq('2025-11-25T10:40:00Z')
+      expect(task.ttl).to eq(30_000)
+      expect(task.poll_interval).to eq(5000)
     end
 
-    it 'raises ArgumentError for invalid state' do
-      expect do
-        described_class.new(id: 'task-123', state: 'invalid')
-      end.to raise_error(ArgumentError, /Invalid task state/)
+    it 'defaults status to working' do
+      expect(described_class.new(task_id: 't1').status).to eq('working')
     end
 
-    it 'accepts all valid states' do
-      %w[pending running completed failed cancelled].each do |state|
-        task = described_class.new(id: 'task-123', state: state)
-        expect(task.state).to eq(state)
+    %w[working input_required completed failed cancelled].each do |status|
+      it "accepts the valid status #{status}" do
+        expect { described_class.new(task_id: 't1', status: status) }.not_to raise_error
       end
     end
 
-    it 'stores server reference' do
-      server = instance_double(MCPClient::ServerBase)
-      task = described_class.new(id: 'task-123', server: server)
-      expect(task.server).to eq(server)
+    %w[pending running unknown].each do |status|
+      it "rejects the invalid status #{status}" do
+        expect { described_class.new(task_id: 't1', status: status) }
+          .to raise_error(ArgumentError, /Invalid task status/)
+      end
     end
   end
 
   describe '.from_json' do
-    it 'parses JSON with string keys' do
-      json = {
-        'id' => 'task-abc',
-        'state' => 'running',
-        'progressToken' => 'pt-xyz',
-        'progress' => 25,
-        'total' => 100,
-        'message' => 'In progress',
-        'result' => { 'output' => 'data' }
-      }
-      task = described_class.from_json(json)
-
-      expect(task.id).to eq('task-abc')
-      expect(task.state).to eq('running')
-      expect(task.progress_token).to eq('pt-xyz')
-      expect(task.progress).to eq(25)
-      expect(task.total).to eq(100)
-      expect(task.message).to eq('In progress')
-      expect(task.result).to eq({ 'output' => 'data' })
+    it 'parses a flat GetTaskResult shape' do
+      task = described_class.from_json(
+        {
+          'taskId' => 't1', 'status' => 'working',
+          'createdAt' => '2025-11-25T10:30:00Z', 'lastUpdatedAt' => '2025-11-25T10:40:00Z',
+          'ttl' => 30_000, 'pollInterval' => 5000, 'statusMessage' => 'running'
+        }
+      )
+      expect(task.task_id).to eq('t1')
+      expect(task.status).to eq('working')
+      expect(task.created_at).to eq('2025-11-25T10:30:00Z')
+      expect(task.last_updated_at).to eq('2025-11-25T10:40:00Z')
+      expect(task.ttl).to eq(30_000)
+      expect(task.poll_interval).to eq(5000)
+      expect(task.status_message).to eq('running')
     end
 
-    it 'parses JSON with symbol keys' do
-      json = {
-        id: 'task-abc',
-        state: 'completed',
-        progressToken: 'pt-xyz',
-        progress: 100,
-        total: 100,
-        message: 'Done',
-        result: { 'output' => 'data' }
-      }
-      task = described_class.from_json(json)
+    it 'preserves a null ttl (key present, value null)' do
+      task = described_class.from_json({ 'taskId' => 't1', 'status' => 'working', 'ttl' => nil })
+      expect(task.ttl).to be_nil
+    end
+  end
 
-      expect(task.id).to eq('task-abc')
-      expect(task.state).to eq('completed')
-      expect(task.progress_token).to eq('pt-xyz')
+  describe '.from_create_result' do
+    it 'unwraps the task under the "task" key of a CreateTaskResult' do
+      task = described_class.from_create_result({ 'task' => { 'taskId' => 'x', 'status' => 'working',
+                                                              'ttl' => 60_000 } })
+      expect(task.task_id).to eq('x')
+      expect(task.status).to eq('working')
+      expect(task.ttl).to eq(60_000)
     end
 
-    it 'handles missing optional fields' do
-      json = { 'id' => 'task-abc' }
-      task = described_class.from_json(json)
+    it 'tolerates a flat result without a task wrapper' do
+      task = described_class.from_create_result({ 'taskId' => 'x', 'status' => 'working' })
+      expect(task.task_id).to eq('x')
+    end
+  end
 
-      expect(task.id).to eq('task-abc')
-      expect(task.state).to eq('pending')
-      expect(task.progress_token).to be_nil
-      expect(task.progress).to be_nil
-      expect(task.total).to be_nil
-      expect(task.message).to be_nil
-      expect(task.result).to be_nil
+  describe 'status predicates' do
+    def build(status)
+      described_class.new(task_id: 't', status: status)
     end
 
-    it 'accepts a server parameter' do
-      server = instance_double(MCPClient::ServerBase)
-      json = { 'id' => 'task-abc', 'state' => 'pending' }
-      task = described_class.from_json(json, server: server)
-
-      expect(task.server).to eq(server)
+    it '#terminal? is true only for completed/failed/cancelled' do
+      expect(build('completed').terminal?).to be true
+      expect(build('failed').terminal?).to be true
+      expect(build('cancelled').terminal?).to be true
+      expect(build('working').terminal?).to be false
+      expect(build('input_required').terminal?).to be false
     end
 
-    it 'handles snake_case progress_token key' do
-      json = { id: 'task-abc', progress_token: 'pt-xyz' }
-      task = described_class.from_json(json)
+    it '#active? is the inverse of terminal?' do
+      expect(build('working').active?).to be true
+      expect(build('input_required').active?).to be true
+      expect(build('completed').active?).to be false
+    end
 
-      expect(task.progress_token).to eq('pt-xyz')
+    it '#input_required? and #working? reflect the status' do
+      expect(build('input_required').input_required?).to be true
+      expect(build('working').working?).to be true
+      expect(build('working').input_required?).to be false
     end
   end
 
   describe '#to_h' do
-    it 'returns hash with required fields only' do
-      task = described_class.new(id: 'task-123', state: 'pending')
-      expect(task.to_h).to eq({ 'id' => 'task-123', 'state' => 'pending' })
+    it 'emits spec-shaped keys' do
+      task = described_class.new(task_id: 't1', status: 'working', ttl: 30_000, poll_interval: 5000)
+      expect(task.to_h).to eq('taskId' => 't1', 'status' => 'working', 'ttl' => 30_000, 'pollInterval' => 5000)
     end
 
-    it 'includes optional fields when present' do
-      task = described_class.new(
-        id: 'task-123',
-        state: 'running',
-        progress_token: 'pt-456',
-        progress: 50,
-        total: 100,
-        message: 'Working...',
-        result: { 'data' => 'value' }
-      )
-      hash = task.to_h
-
-      expect(hash['id']).to eq('task-123')
-      expect(hash['state']).to eq('running')
-      expect(hash['progressToken']).to eq('pt-456')
-      expect(hash['progress']).to eq(50)
-      expect(hash['total']).to eq(100)
-      expect(hash['message']).to eq('Working...')
-      expect(hash['result']).to eq({ 'data' => 'value' })
-    end
-
-    it 'excludes nil optional fields' do
-      task = described_class.new(id: 'task-123')
-      hash = task.to_h
-
-      expect(hash).not_to have_key('progressToken')
-      expect(hash).not_to have_key('progress')
-      expect(hash).not_to have_key('total')
-      expect(hash).not_to have_key('message')
-      expect(hash).not_to have_key('result')
+    it 'always includes ttl (a required Task field, value may be null)' do
+      task = described_class.new(task_id: 't1', status: 'working')
+      expect(task.to_h).to eq('taskId' => 't1', 'status' => 'working', 'ttl' => nil)
     end
   end
 
-  describe '#to_json' do
-    it 'serializes to JSON string' do
-      task = described_class.new(id: 'task-123', state: 'running', message: 'Working')
-      json = task.to_json
-      parsed = JSON.parse(json)
+  describe 'equality and representation' do
+    it 'considers tasks with the same id and status equal' do
+      a = described_class.new(task_id: 't1', status: 'working')
+      b = described_class.new(task_id: 't1', status: 'working')
+      expect(a).to eq(b)
+      expect(a.hash).to eq(b.hash)
+    end
 
-      expect(parsed['id']).to eq('task-123')
-      expect(parsed['state']).to eq('running')
-      expect(parsed['message']).to eq('Working')
+    it 'considers tasks with a different status not equal' do
+      a = described_class.new(task_id: 't1', status: 'working')
+      b = described_class.new(task_id: 't1', status: 'completed')
+      expect(a).not_to eq(b)
+    end
+
+    it '#to_s and #inspect show the id and status' do
+      task = described_class.new(task_id: 't1', status: 'working', status_message: 'busy')
+      expect(task.to_s).to include('t1', 'working', 'busy')
+      expect(task.inspect).to include('t1', 'working')
     end
   end
 
-  describe '#terminal?' do
-    it 'returns true for completed state' do
-      expect(described_class.new(id: 't', state: 'completed').terminal?).to be true
-    end
-
-    it 'returns true for failed state' do
-      expect(described_class.new(id: 't', state: 'failed').terminal?).to be true
-    end
-
-    it 'returns true for cancelled state' do
-      expect(described_class.new(id: 't', state: 'cancelled').terminal?).to be true
-    end
-
-    it 'returns false for pending state' do
-      expect(described_class.new(id: 't', state: 'pending').terminal?).to be false
-    end
-
-    it 'returns false for running state' do
-      expect(described_class.new(id: 't', state: 'running').terminal?).to be false
-    end
-  end
-
-  describe '#active?' do
-    it 'returns true for pending state' do
-      expect(described_class.new(id: 't', state: 'pending').active?).to be true
-    end
-
-    it 'returns true for running state' do
-      expect(described_class.new(id: 't', state: 'running').active?).to be true
-    end
-
-    it 'returns false for completed state' do
-      expect(described_class.new(id: 't', state: 'completed').active?).to be false
-    end
-
-    it 'returns false for failed state' do
-      expect(described_class.new(id: 't', state: 'failed').active?).to be false
-    end
-
-    it 'returns false for cancelled state' do
-      expect(described_class.new(id: 't', state: 'cancelled').active?).to be false
-    end
-  end
-
-  describe '#progress_percentage' do
-    it 'calculates percentage when progress and total are set' do
-      task = described_class.new(id: 't', state: 'running', progress: 25, total: 200)
-      expect(task.progress_percentage).to eq(12.5)
-    end
-
-    it 'returns 100.0 when progress equals total' do
-      task = described_class.new(id: 't', state: 'completed', progress: 100, total: 100)
-      expect(task.progress_percentage).to eq(100.0)
-    end
-
-    it 'returns nil when progress is nil' do
-      task = described_class.new(id: 't', state: 'running', total: 100)
-      expect(task.progress_percentage).to be_nil
-    end
-
-    it 'returns nil when total is nil' do
-      task = described_class.new(id: 't', state: 'running', progress: 50)
-      expect(task.progress_percentage).to be_nil
-    end
-
-    it 'returns nil when total is zero' do
-      task = described_class.new(id: 't', state: 'running', progress: 0, total: 0)
-      expect(task.progress_percentage).to be_nil
-    end
-  end
-
-  describe 'equality' do
-    it 'considers tasks with same id and state as equal' do
-      task1 = described_class.new(id: 'task-123', state: 'running')
-      task2 = described_class.new(id: 'task-123', state: 'running')
-
-      expect(task1).to eq(task2)
-      expect(task1.eql?(task2)).to be true
-      expect(task1.hash).to eq(task2.hash)
-    end
-
-    it 'considers tasks with different id as not equal' do
-      task1 = described_class.new(id: 'task-123', state: 'running')
-      task2 = described_class.new(id: 'task-456', state: 'running')
-
-      expect(task1).not_to eq(task2)
-    end
-
-    it 'considers tasks with different state as not equal' do
-      task1 = described_class.new(id: 'task-123', state: 'running')
-      task2 = described_class.new(id: 'task-123', state: 'completed')
-
-      expect(task1).not_to eq(task2)
-    end
-  end
-
-  describe '#to_s' do
-    it 'returns basic string for simple task' do
-      task = described_class.new(id: 'task-123', state: 'pending')
-      expect(task.to_s).to eq('Task[task-123]: pending')
-    end
-
-    it 'includes progress when available' do
-      task = described_class.new(id: 'task-123', state: 'running', progress: 50, total: 100)
-      expect(task.to_s).to eq('Task[task-123]: running (50/100)')
-    end
-
-    it 'includes message when available' do
-      task = described_class.new(id: 'task-123', state: 'running', message: 'Processing files')
-      expect(task.to_s).to eq('Task[task-123]: running - Processing files')
-    end
-
-    it 'includes both progress and message' do
-      task = described_class.new(id: 'task-123', state: 'running', progress: 3, total: 10, message: 'Step 3')
-      expect(task.to_s).to eq('Task[task-123]: running (3/10) - Step 3')
-    end
-  end
-
-  describe '#inspect' do
-    it 'returns a readable representation' do
-      task = described_class.new(id: 'task-123', state: 'running')
-      expect(task.inspect).to eq('#<MCPClient::Task id="task-123" state="running">')
-    end
-  end
-
-  describe 'VALID_STATES' do
-    it 'contains all expected states' do
-      expect(described_class::VALID_STATES).to eq(%w[pending running completed failed cancelled])
-    end
-
-    it 'is frozen' do
-      expect(described_class::VALID_STATES).to be_frozen
+  describe 'constants' do
+    it 'exposes the spec statuses' do
+      expect(described_class::VALID_STATUSES).to eq(%w[working input_required completed failed cancelled])
+      expect(described_class::VALID_STATUSES).to be_frozen
+      expect(described_class::TERMINAL_STATUSES).to eq(%w[completed failed cancelled])
     end
   end
 end

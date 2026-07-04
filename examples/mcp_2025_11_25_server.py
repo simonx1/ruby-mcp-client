@@ -8,7 +8,7 @@ A Python MCP server demonstrating ALL new MCP 2025-11-25 features:
 - Tool annotations (readOnlyHint, destructiveHint, idempotentHint, openWorldHint)
 - Completion with context parameter
 - ResourceLink in tool results
-- Task management (tasks/create, tasks/get, tasks/cancel)
+- Task-augmented tools/call (tasks/get, tasks/result, tasks/list, tasks/cancel)
 
 Transport: stdio (JSON-RPC over stdin/stdout)
 No external dependencies required (Python 3.7+ stdlib only).
@@ -26,6 +26,7 @@ import time
 import threading
 import uuid
 import math
+from datetime import datetime, timezone
 
 
 # ---------------------------------------------------------------------------
@@ -102,17 +103,26 @@ tasks = {}          # id -> task dict
 tasks_lock = threading.Lock()
 
 
-def create_task_record(task_id, method, params, progress_token=None):
+def _now_iso():
+    return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+
+
+def create_task_record(task_id, tool_name, arguments, ttl=None):
+    """Create a task record in the MCP 2025-11-25 shape."""
+    now = _now_iso()
     task = {
-        "id": task_id,
-        "state": "pending",
-        "method": method,
-        "params": params,
-        "progressToken": progress_token,
-        "progress": None,
-        "total": None,
-        "message": "Task created",
-        "result": None,
+        # Spec Task fields
+        "taskId": task_id,
+        "status": "working",
+        "statusMessage": "Task created",
+        "createdAt": now,
+        "lastUpdatedAt": now,
+        "ttl": ttl,
+        "pollInterval": 500,
+        # Internal bookkeeping (not sent to the client)
+        "_tool_name": tool_name,
+        "_arguments": arguments,
+        "_result": None,
     }
     with tasks_lock:
         tasks[task_id] = task
@@ -120,57 +130,55 @@ def create_task_record(task_id, method, params, progress_token=None):
 
 
 def task_to_response(task):
-    """Return the public-facing task fields."""
-    result = {"id": task["id"], "state": task["state"]}
-    if task.get("progressToken"):
-        result["progressToken"] = task["progressToken"]
-    if task.get("progress") is not None:
-        result["progress"] = task["progress"]
-    if task.get("total") is not None:
-        result["total"] = task["total"]
-    if task.get("message"):
-        result["message"] = task["message"]
-    if task.get("result") is not None:
-        result["result"] = task["result"]
-    return result
+    """Return the flat, spec-shaped Task fields (GetTaskResult / CancelTaskResult)."""
+    response = {
+        "taskId": task["taskId"],
+        "status": task["status"],
+        "createdAt": task["createdAt"],
+        "lastUpdatedAt": task["lastUpdatedAt"],
+        "ttl": task.get("ttl"),
+    }
+    if task.get("statusMessage"):
+        response["statusMessage"] = task["statusMessage"]
+    if task.get("pollInterval") is not None:
+        response["pollInterval"] = task["pollInterval"]
+    return response
+
+
+def send_task_status(task):
+    """Emit a notifications/tasks/status (params are a flat Task)."""
+    send_notification("notifications/tasks/status", task_to_response(task))
 
 
 def run_task_in_background(task_id):
-    """Simulate long-running work for a task."""
-    # Brief delay so the create response is sent while task is still "pending"
-    time.sleep(0.1)
-    with tasks_lock:
-        task = tasks.get(task_id)
-        if not task:
-            return
-        task["state"] = "running"
-        task["total"] = 5
-        task["progress"] = 0
-        task["message"] = "Starting work..."
+    """Simulate long-running work for a task, then store its CallToolResult."""
+    time.sleep(0.1)  # let the CreateTaskResult response go out first
 
-    for step in range(1, 6):
+    for _ in range(5):
         time.sleep(0.3)
         with tasks_lock:
             task = tasks.get(task_id)
-            if not task or task["state"] == "cancelled":
+            if not task or task["status"] == "cancelled":
                 return
-            task["progress"] = step
-            task["message"] = f"Step {step} of 5"
-
-        # Send progress notification if we have a token
-        if task.get("progressToken"):
-            send_notification("notifications/progress", {
-                "progressToken": task["progressToken"],
-                "progress": step,
-                "total": 5,
-            })
+            task["lastUpdatedAt"] = _now_iso()
 
     with tasks_lock:
         task = tasks.get(task_id)
-        if task and task["state"] != "cancelled":
-            task["state"] = "completed"
-            task["message"] = "All steps done"
-            task["result"] = {"summary": "Background task finished successfully"}
+        if not task or task["status"] == "cancelled":
+            return
+        task["status"] = "completed"
+        task["statusMessage"] = "All steps done"
+        task["lastUpdatedAt"] = _now_iso()
+        # tasks/result returns exactly what tools/call would have returned
+        task["_result"] = {
+            "content": [
+                {"type": "text", "text": "Background task finished successfully"},
+            ],
+            "isError": False,
+        }
+        completed = dict(task)
+
+    send_task_status(completed)
 
 
 # ---------------------------------------------------------------------------
@@ -196,7 +204,11 @@ def handle_initialize(request_id, _params):
             "tools": {},
             "resources": {"listChanged": True},
             "completions": {},
-            "tasks": {},
+            "tasks": {
+                "list": {},
+                "cancel": {},
+                "requests": {"tools": {"call": {}}},
+            },
         },
         "serverInfo": {
             "name": "MCP 2025-11-25 Feature Demo",
@@ -313,6 +325,15 @@ def handle_tools_list(request_id, _params):
                 "openWorldHint": False,
             },
         },
+        {
+            "name": "background_work",
+            "description": "A long-running job — call it as a task (execution.taskSupport: optional)",
+            "inputSchema": {
+                "type": "object",
+                "properties": {"input": {"type": "string", "description": "Job input"}},
+            },
+            "execution": {"taskSupport": "optional"},
+        },
     ]
     return make_result(request_id, {"tools": tools})
 
@@ -320,6 +341,22 @@ def handle_tools_list(request_id, _params):
 def handle_tools_call(request_id, params):
     tool_name = params.get("name")
     args = params.get("arguments", {})
+
+    # Task-augmented request: create a task and return a CreateTaskResult now;
+    # the actual result is retrieved later via tasks/result.
+    task_aug = params.get("task")
+    if task_aug is not None and tool_name == "background_work":
+        task_id = str(uuid.uuid4())
+        ttl = task_aug.get("ttl") if isinstance(task_aug, dict) else None
+        task = create_task_record(task_id, tool_name, args, ttl=ttl)
+        threading.Thread(target=run_task_in_background, args=(task_id,), daemon=True).start()
+        return make_result(request_id, {"task": task_to_response(task)})
+
+    if tool_name == "background_work":
+        # Synchronous fallback when not called as a task
+        return make_result(request_id, {
+            "content": [{"type": "text", "text": "Background task finished successfully"}],
+        })
 
     if tool_name == "get_audio":
         frequency = args.get("frequency", 440)
@@ -528,25 +565,8 @@ def handle_completion(request_id, params):
     })
 
 
-def handle_tasks_create(request_id, params):
-    task_id = str(uuid.uuid4())
-    method = params.get("method", "unknown")
-    task_params = params.get("params", {})
-    progress_token = params.get("progressToken")
-
-    task = create_task_record(task_id, method, task_params, progress_token)
-    # Snapshot response while still in "pending" state
-    response = make_result(request_id, task_to_response(task))
-
-    # Start background work (will transition to "running" after a brief delay)
-    thread = threading.Thread(target=run_task_in_background, args=(task_id,), daemon=True)
-    thread.start()
-
-    return response
-
-
 def handle_tasks_get(request_id, params):
-    task_id = params.get("id", "")
+    task_id = params.get("taskId", "")
     with tasks_lock:
         task = tasks.get(task_id)
     if not task:
@@ -554,17 +574,39 @@ def handle_tasks_get(request_id, params):
     return make_result(request_id, task_to_response(task))
 
 
-def handle_tasks_cancel(request_id, params):
-    task_id = params.get("id", "")
+def handle_tasks_result(request_id, params):
+    task_id = params.get("taskId", "")
     with tasks_lock:
         task = tasks.get(task_id)
         if not task:
             return make_error(request_id, -32602, f"Task not found: {task_id}")
-        if task["state"] in ("completed", "failed", "cancelled"):
+        if task["status"] != "completed":
             return make_error(request_id, -32602,
-                              f"Cannot cancel task in state '{task['state']}'")
-        task["state"] = "cancelled"
-        task["message"] = "Cancelled by client"
+                              f"Task '{task_id}' is not complete (status: {task['status']})")
+        result = dict(task["_result"] or {})
+    # tasks/result MUST carry the related-task metadata
+    result.setdefault("_meta", {})["io.modelcontextprotocol/related-task"] = {"taskId": task_id}
+    return make_result(request_id, result)
+
+
+def handle_tasks_list(request_id, _params):
+    with tasks_lock:
+        task_list = [task_to_response(t) for t in tasks.values()]
+    return make_result(request_id, {"tasks": task_list})
+
+
+def handle_tasks_cancel(request_id, params):
+    task_id = params.get("taskId", "")
+    with tasks_lock:
+        task = tasks.get(task_id)
+        if not task:
+            return make_error(request_id, -32602, f"Task not found: {task_id}")
+        if task["status"] in ("completed", "failed", "cancelled"):
+            return make_error(request_id, -32602,
+                              f"Cannot cancel task in terminal status '{task['status']}'")
+        task["status"] = "cancelled"
+        task["statusMessage"] = "Cancelled by client"
+        task["lastUpdatedAt"] = _now_iso()
     return make_result(request_id, task_to_response(task))
 
 
@@ -580,8 +622,9 @@ HANDLERS = {
     "resources/list": handle_resources_list,
     "resources/read": handle_resources_read,
     "completion/complete": handle_completion,
-    "tasks/create": handle_tasks_create,
     "tasks/get": handle_tasks_get,
+    "tasks/result": handle_tasks_result,
+    "tasks/list": handle_tasks_list,
     "tasks/cancel": handle_tasks_cancel,
     "ping": lambda rid, _p: make_result(rid, {}),
 }

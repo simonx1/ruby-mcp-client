@@ -17,7 +17,10 @@ module MCPClient
     #   @return [Hash, nil] optional annotations describing tool behavior (e.g., readOnly, destructive)
     # @!attribute [r] server
     #   @return [MCPClient::ServerBase, nil] the server this tool belongs to
-    attr_reader :name, :title, :description, :schema, :output_schema, :annotations, :server
+    # @!attribute [r] task_support
+    #   @return [String, nil] tool-level task negotiation (MCP 2025-11-25):
+    #     'forbidden' (default), 'optional', or 'required'; nil when not advertised
+    attr_reader :name, :title, :description, :schema, :output_schema, :annotations, :server, :task_support
 
     # Initialize a new Tool
     # @param name [String] the name of the tool
@@ -27,7 +30,9 @@ module MCPClient
     # @param output_schema [Hash, nil] optional JSON schema for structured tool outputs (MCP 2025-06-18)
     # @param annotations [Hash, nil] optional annotations describing tool behavior
     # @param server [MCPClient::ServerBase, nil] the server this tool belongs to
-    def initialize(name:, description:, schema:, title: nil, output_schema: nil, annotations: nil, server: nil)
+    # @param task_support [String, nil] execution.taskSupport value (MCP 2025-11-25)
+    def initialize(name:, description:, schema:, title: nil, output_schema: nil, annotations: nil, server: nil,
+                   task_support: nil)
       @name = name
       @title = title
       @description = description
@@ -35,6 +40,7 @@ module MCPClient
       @output_schema = output_schema
       @annotations = annotations
       @server = server
+      @task_support = task_support
     end
 
     # Create a Tool instance from JSON data
@@ -48,6 +54,8 @@ module MCPClient
       output_schema = data['outputSchema'] || data[:outputSchema]
       annotations = data['annotations'] || data[:annotations]
       title = data['title'] || data[:title]
+      execution = data['execution'] || data[:execution]
+      task_support = execution && (execution['taskSupport'] || execution[:taskSupport])
       new(
         name: data['name'] || data[:name],
         description: data['description'] || data[:description],
@@ -55,7 +63,8 @@ module MCPClient
         title: title,
         output_schema: output_schema,
         annotations: annotations,
-        server: server
+        server: server,
+        task_support: task_support
       )
     end
 
@@ -154,6 +163,31 @@ module MCPClient
     # @return [Boolean] true if the tool has an output schema defined
     def structured_output?
       !@output_schema.nil? && !@output_schema.empty?
+    end
+
+    # Whether task-augmented execution is allowed for this tool (MCP 2025-11-25).
+    # True when execution.taskSupport is 'optional' or 'required'.
+    # @return [Boolean]
+    def supports_task?
+      %w[optional required].include?(@task_support)
+    end
+
+    # Whether task-augmented execution is required for this tool
+    # @return [Boolean]
+    def task_required?
+      @task_support == 'required'
+    end
+
+    # Whether task-augmented execution is optional for this tool
+    # @return [Boolean]
+    def task_optional?
+      @task_support == 'optional'
+    end
+
+    # Whether task-augmented execution is forbidden (the default when unset)
+    # @return [Boolean]
+    def task_forbidden?
+      @task_support.nil? || @task_support == 'forbidden'
     end
 
     private

@@ -934,222 +934,217 @@ RSpec.describe MCPClient::Client do
     end
   end
 
-  describe '#create_task' do
+  describe '#call_tool_as_task' do
     let(:client) { described_class.new(mcp_server_configs: [{ type: 'stdio', command: 'test' }]) }
-    let(:task_result) do
-      { 'id' => 'task-123', 'state' => 'pending', 'progressToken' => 'pt-abc' }
+    let(:task_tool) do
+      MCPClient::Tool.from_json(
+        {
+          'name' => 'long_job',
+          'description' => 'A long job',
+          'inputSchema' => { 'type' => 'object', 'properties' => { 'input' => { 'type' => 'string' } } },
+          'execution' => { 'taskSupport' => 'optional' }
+        }, server: mock_server
+      )
     end
+    let(:create_result) do
+      { 'task' => { 'taskId' => 'task-x', 'status' => 'working', 'ttl' => 60_000,
+                    'createdAt' => '2025-11-25T10:00:00Z' } }
+    end
+    let(:task_caps) { { 'tasks' => { 'requests' => { 'tools' => { 'call' => {} } } } } }
 
     before do
-      allow(mock_server).to receive(:rpc_request)
-        .with('tasks/create', { method: 'longRunningOp', params: { input: 'data' }, progressToken: 'pt-abc' })
-        .and_return(task_result)
+      allow(mock_server).to receive(:list_tools).and_return([task_tool])
+      allow(mock_server).to receive(:capabilities).and_return(task_caps)
     end
 
-    it 'creates a task and returns a Task object' do
-      task = client.create_task('longRunningOp', params: { input: 'data' }, progress_token: 'pt-abc')
+    it 'augments tools/call with a task field and returns a Task from the CreateTaskResult' do
+      expect(mock_server).to receive(:rpc_request)
+        .with('tools/call', { name: 'long_job', arguments: { 'input' => 'x' }, task: { ttl: 60_000 } })
+        .and_return(create_result)
+
+      task = client.call_tool_as_task('long_job', { 'input' => 'x' }, ttl: 60_000)
       expect(task).to be_a(MCPClient::Task)
-      expect(task.id).to eq('task-123')
-      expect(task.state).to eq('pending')
-      expect(task.progress_token).to eq('pt-abc')
+      expect(task.task_id).to eq('task-x')
+      expect(task.status).to eq('working')
       expect(task.server).to eq(mock_server)
     end
 
-    it 'creates a task without progress token' do
-      allow(mock_server).to receive(:rpc_request)
-        .with('tasks/create', { method: 'simpleOp', params: {} })
-        .and_return({ 'id' => 'task-456', 'state' => 'pending' })
+    it 'sends an empty task object when no ttl is given' do
+      expect(mock_server).to receive(:rpc_request)
+        .with('tools/call', { name: 'long_job', arguments: {}, task: {} })
+        .and_return(create_result)
 
-      task = client.create_task('simpleOp')
-      expect(task.id).to eq('task-456')
-      expect(task.progress_token).to be_nil
+      client.call_tool_as_task('long_job', {})
     end
 
-    it 'raises TaskError on server error' do
-      allow(mock_server).to receive(:rpc_request)
-        .with('tasks/create', { method: 'failOp', params: {} })
-        .and_raise(MCPClient::Errors::ServerError.new('Internal error'))
+    it 'keeps a symbol _meta key as a top-level request field rather than inside arguments' do
+      expect(mock_server).to receive(:rpc_request)
+        .with('tools/call', { name: 'long_job', arguments: { 'input' => 'x' }, task: {}, _meta: { 'a' => 1 } })
+        .and_return(create_result)
 
-      expect do
-        client.create_task('failOp')
-      end.to raise_error(MCPClient::Errors::TaskError, /Error creating task/)
+      client.call_tool_as_task('long_job', { 'input' => 'x', _meta: { 'a' => 1 } })
     end
 
-    it 'raises TaskError on transport error' do
-      allow(mock_server).to receive(:rpc_request)
-        .with('tasks/create', { method: 'failOp', params: {} })
-        .and_raise(MCPClient::Errors::TransportError.new('Connection lost'))
+    it 'keeps a string "_meta" key as a top-level request field (e.g. from JSON)' do
+      expect(mock_server).to receive(:rpc_request)
+        .with('tools/call', { name: 'long_job', arguments: { 'input' => 'x' }, task: {}, _meta: { 'a' => 1 } })
+        .and_return(create_result)
 
-      expect do
-        client.create_task('failOp')
-      end.to raise_error(MCPClient::Errors::TaskError, /Error creating task/)
+      client.call_tool_as_task('long_job', { 'input' => 'x', '_meta' => { 'a' => 1 } })
     end
 
-    context 'with server selection' do
-      let(:mock_server2) { instance_double(MCPClient::ServerBase, name: 'server2') }
-      let(:multi_client) do
-        client = described_class.new(mcp_server_configs: [
-                                       { type: 'stdio', command: 'test1' },
-                                       { type: 'stdio', command: 'test2' }
-                                     ])
-        client.instance_variable_set(:@servers, [mock_server, mock_server2])
-        client
-      end
+    it 'raises TaskError and sends no request when the server lacks tasks.requests.tools.call' do
+      allow(mock_server).to receive(:capabilities).and_return({ 'tools' => {} })
+      expect(mock_server).not_to receive(:rpc_request)
 
-      before do
-        allow(mock_server2).to receive(:on_notification)
-        allow(mock_server2).to receive(:rpc_request)
-          .with('tasks/create', { method: 'op', params: {} })
-          .and_return({ 'id' => 'task-s2', 'state' => 'pending' })
-      end
+      expect { client.call_tool_as_task('long_job', {}) }
+        .to raise_error(MCPClient::Errors::TaskError, /does not support task-augmented/)
+    end
 
-      it 'creates a task on a specific server by name' do
-        task = multi_client.create_task('op', server: 'server2')
-        expect(task.id).to eq('task-s2')
-        expect(task.server).to eq(mock_server2)
-      end
+    it 'raises TaskError and sends no request when the tool does not support tasks' do
+      forbidden_tool = MCPClient::Tool.from_json(
+        { 'name' => 'long_job', 'description' => 'd', 'inputSchema' => {} }, server: mock_server
+      )
+      allow(mock_server).to receive(:list_tools).and_return([forbidden_tool])
+      expect(mock_server).not_to receive(:rpc_request)
+
+      expect { client.call_tool_as_task('long_job', {}) }
+        .to raise_error(MCPClient::Errors::TaskError, /does not support task execution/)
+    end
+
+    it 'validates parameters before issuing any request' do
+      required_tool = MCPClient::Tool.from_json(
+        {
+          'name' => 'long_job', 'description' => 'd',
+          'inputSchema' => { 'type' => 'object', 'required' => ['input'], 'properties' => {} },
+          'execution' => { 'taskSupport' => 'required' }
+        }, server: mock_server
+      )
+      allow(mock_server).to receive(:list_tools).and_return([required_tool])
+      expect(mock_server).not_to receive(:rpc_request)
+
+      expect { client.call_tool_as_task('long_job', {}) }
+        .to raise_error(MCPClient::Errors::ValidationError, /Missing required parameters/)
+    end
+  end
+
+  describe '#call_tool with a task-required tool' do
+    let(:client) { described_class.new(mcp_server_configs: [{ type: 'stdio', command: 'test' }]) }
+
+    it 'rejects a plain call and points the caller at call_tool_as_task' do
+      required_tool = MCPClient::Tool.from_json(
+        {
+          'name' => 'must_task', 'description' => 'd', 'inputSchema' => {},
+          'execution' => { 'taskSupport' => 'required' }
+        }, server: mock_server
+      )
+      allow(mock_server).to receive(:list_tools).and_return([required_tool])
+      expect(mock_server).not_to receive(:call_tool)
+
+      expect { client.call_tool('must_task', {}) }
+        .to raise_error(MCPClient::Errors::ToolCallError, /call_tool_as_task/)
     end
   end
 
   describe '#get_task' do
     let(:client) { described_class.new(mcp_server_configs: [{ type: 'stdio', command: 'test' }]) }
-    let(:task_result) do
-      { 'id' => 'task-123', 'state' => 'running', 'progress' => 50, 'total' => 100, 'message' => 'Halfway' }
-    end
+    let(:task_result) { { 'taskId' => 'task-123', 'status' => 'working', 'pollInterval' => 5000 } }
 
     before do
-      allow(mock_server).to receive(:rpc_request)
-        .with('tasks/get', { id: 'task-123' })
-        .and_return(task_result)
+      allow(mock_server).to receive(:rpc_request).with('tasks/get', { taskId: 'task-123' }).and_return(task_result)
     end
 
-    it 'gets a task and returns a Task object' do
+    it 'sends taskId (not id) and returns a Task' do
       task = client.get_task('task-123')
       expect(task).to be_a(MCPClient::Task)
-      expect(task.id).to eq('task-123')
-      expect(task.state).to eq('running')
-      expect(task.progress).to eq(50)
-      expect(task.total).to eq(100)
-      expect(task.message).to eq('Halfway')
+      expect(task.task_id).to eq('task-123')
+      expect(task.status).to eq('working')
+      expect(task.poll_interval).to eq(5000)
       expect(task.server).to eq(mock_server)
     end
 
-    it 'raises TaskNotFound when task does not exist' do
-      allow(mock_server).to receive(:rpc_request)
-        .with('tasks/get', { id: 'nonexistent' })
-        .and_raise(MCPClient::Errors::ServerError.new('Task not found'))
-
-      expect do
-        client.get_task('nonexistent')
-      end.to raise_error(MCPClient::Errors::TaskNotFound, "Task 'nonexistent' not found")
-    end
-
-    it 'raises TaskNotFound for unknown task error' do
-      allow(mock_server).to receive(:rpc_request)
-        .with('tasks/get', { id: 'bad-id' })
-        .and_raise(MCPClient::Errors::ServerError.new('unknown task'))
-
-      expect do
-        client.get_task('bad-id')
-      end.to raise_error(MCPClient::Errors::TaskNotFound)
+    it 'raises TaskNotFound when the task does not exist' do
+      allow(mock_server).to receive(:rpc_request).with('tasks/get', { taskId: 'nope' })
+                                                 .and_raise(MCPClient::Errors::ServerError.new('Task not found'))
+      expect { client.get_task('nope') }.to raise_error(MCPClient::Errors::TaskNotFound)
     end
 
     it 'raises TaskError on other server errors' do
-      allow(mock_server).to receive(:rpc_request)
-        .with('tasks/get', { id: 'task-err' })
-        .and_raise(MCPClient::Errors::ServerError.new('Internal error'))
-
-      expect do
-        client.get_task('task-err')
-      end.to raise_error(MCPClient::Errors::TaskError, /Error getting task/)
+      allow(mock_server).to receive(:rpc_request).with('tasks/get', { taskId: 'e' })
+                                                 .and_raise(MCPClient::Errors::ServerError.new('Internal error'))
+      expect { client.get_task('e') }.to raise_error(MCPClient::Errors::TaskError, /Error getting task/)
     end
 
     it 'raises TaskError on transport error' do
-      allow(mock_server).to receive(:rpc_request)
-        .with('tasks/get', { id: 'task-err' })
-        .and_raise(MCPClient::Errors::TransportError.new('Connection lost'))
+      allow(mock_server).to receive(:rpc_request).with('tasks/get', { taskId: 'e' })
+                                                 .and_raise(MCPClient::Errors::TransportError.new('Connection lost'))
+      expect { client.get_task('e') }.to raise_error(MCPClient::Errors::TaskError)
+    end
+  end
 
-      expect do
-        client.get_task('task-err')
-      end.to raise_error(MCPClient::Errors::TaskError, /Error getting task/)
+  describe '#get_task_result' do
+    let(:client) { described_class.new(mcp_server_configs: [{ type: 'stdio', command: 'test' }]) }
+
+    it 'returns the raw underlying result without wrapping it in a Task' do
+      call_tool_result = { 'content' => [{ 'type' => 'text', 'text' => 'done' }], 'isError' => false }
+      allow(mock_server).to receive(:rpc_request).with('tasks/result', { taskId: 't1' }).and_return(call_tool_result)
+
+      expect(client.get_task_result('t1')).to eq(call_tool_result)
+    end
+
+    it 'raises TaskNotFound when the task does not exist' do
+      allow(mock_server).to receive(:rpc_request).with('tasks/result', { taskId: 'nope' })
+                                                 .and_raise(MCPClient::Errors::ServerError.new('unknown task'))
+      expect { client.get_task_result('nope') }.to raise_error(MCPClient::Errors::TaskNotFound)
+    end
+  end
+
+  describe '#list_tasks' do
+    let(:client) { described_class.new(mcp_server_configs: [{ type: 'stdio', command: 'test' }]) }
+
+    it 'lists tasks and returns Task objects with a next cursor' do
+      allow(mock_server).to receive(:rpc_request).with('tasks/list', {}).and_return(
+        { 'tasks' => [{ 'taskId' => 'a', 'status' => 'working' }, { 'taskId' => 'b', 'status' => 'completed' }],
+          'nextCursor' => 'page2' }
+      )
+
+      result = client.list_tasks
+      expect(result[:tasks].map(&:task_id)).to eq(%w[a b])
+      expect(result[:next_cursor]).to eq('page2')
+    end
+
+    it 'passes a cursor when given' do
+      expect(mock_server).to receive(:rpc_request).with('tasks/list', { cursor: 'c1' })
+                                                  .and_return({ 'tasks' => [] })
+      result = client.list_tasks(cursor: 'c1')
+      expect(result[:next_cursor]).to be_nil
     end
   end
 
   describe '#cancel_task' do
     let(:client) { described_class.new(mcp_server_configs: [{ type: 'stdio', command: 'test' }]) }
-    let(:cancel_result) do
-      { 'id' => 'task-123', 'state' => 'cancelled', 'message' => 'Cancelled by user' }
-    end
 
     before do
-      allow(mock_server).to receive(:rpc_request)
-        .with('tasks/cancel', { id: 'task-123' })
-        .and_return(cancel_result)
+      allow(mock_server).to receive(:rpc_request).with('tasks/cancel', { taskId: 'task-123' })
+                                                 .and_return({ 'taskId' => 'task-123', 'status' => 'cancelled' })
     end
 
-    it 'cancels a task and returns updated Task object' do
+    it 'sends taskId and returns the cancelled Task' do
       task = client.cancel_task('task-123')
-      expect(task).to be_a(MCPClient::Task)
-      expect(task.id).to eq('task-123')
-      expect(task.state).to eq('cancelled')
-      expect(task.message).to eq('Cancelled by user')
-      expect(task.server).to eq(mock_server)
+      expect(task.task_id).to eq('task-123')
+      expect(task.status).to eq('cancelled')
     end
 
-    it 'raises TaskNotFound when task does not exist' do
-      allow(mock_server).to receive(:rpc_request)
-        .with('tasks/cancel', { id: 'nonexistent' })
-        .and_raise(MCPClient::Errors::ServerError.new('Task not found'))
-
-      expect do
-        client.cancel_task('nonexistent')
-      end.to raise_error(MCPClient::Errors::TaskNotFound, "Task 'nonexistent' not found")
+    it 'raises TaskError (not TaskNotFound) when cancelling a terminal task' do
+      terminal_error = MCPClient::Errors::ServerError.new('Task is in a terminal status')
+      allow(mock_server).to receive(:rpc_request).with('tasks/cancel', { taskId: 'done' }).and_raise(terminal_error)
+      expect { client.cancel_task('done') }.to raise_error(MCPClient::Errors::TaskError, /Error cancelling/)
     end
 
-    it 'raises TaskError on other server errors' do
-      allow(mock_server).to receive(:rpc_request)
-        .with('tasks/cancel', { id: 'task-err' })
-        .and_raise(MCPClient::Errors::ServerError.new('Cannot cancel completed task'))
-
-      expect do
-        client.cancel_task('task-err')
-      end.to raise_error(MCPClient::Errors::TaskError, /Error cancelling task/)
-    end
-
-    it 'raises TaskError on transport error' do
-      allow(mock_server).to receive(:rpc_request)
-        .with('tasks/cancel', { id: 'task-err' })
-        .and_raise(MCPClient::Errors::TransportError.new('Connection lost'))
-
-      expect do
-        client.cancel_task('task-err')
-      end.to raise_error(MCPClient::Errors::TaskError, /Error cancelling task/)
-    end
-
-    context 'with server selection' do
-      let(:mock_server2) { instance_double(MCPClient::ServerBase, name: 'server2') }
-      let(:multi_client) do
-        client = described_class.new(mcp_server_configs: [
-                                       { type: 'stdio', command: 'test1' },
-                                       { type: 'stdio', command: 'test2' }
-                                     ])
-        client.instance_variable_set(:@servers, [mock_server, mock_server2])
-        client
-      end
-
-      before do
-        allow(mock_server2).to receive(:on_notification)
-        allow(mock_server2).to receive(:rpc_request)
-          .with('tasks/cancel', { id: 'task-s2' })
-          .and_return({ 'id' => 'task-s2', 'state' => 'cancelled' })
-      end
-
-      it 'cancels a task on a specific server by name' do
-        task = multi_client.cancel_task('task-s2', server: 'server2')
-        expect(task.id).to eq('task-s2')
-        expect(task.state).to eq('cancelled')
-        expect(task.server).to eq(mock_server2)
-      end
+    it 'raises TaskNotFound when the task does not exist' do
+      allow(mock_server).to receive(:rpc_request).with('tasks/cancel', { taskId: 'nope' })
+                                                 .and_raise(MCPClient::Errors::ServerError.new('Task not found'))
+      expect { client.cancel_task('nope') }.to raise_error(MCPClient::Errors::TaskNotFound)
     end
   end
 
