@@ -225,7 +225,8 @@ module MCPClient
     # OAuth authorization server metadata
     class ServerMetadata
       attr_reader :issuer, :authorization_endpoint, :token_endpoint, :registration_endpoint,
-                  :scopes_supported, :response_types_supported, :grant_types_supported
+                  :scopes_supported, :response_types_supported, :grant_types_supported,
+                  :code_challenge_methods_supported
 
       # @param issuer [String] Issuer identifier URL
       # @param authorization_endpoint [String] Authorization endpoint URL
@@ -234,8 +235,10 @@ module MCPClient
       # @param scopes_supported [Array<String>, nil] Supported OAuth scopes
       # @param response_types_supported [Array<String>, nil] Supported response types
       # @param grant_types_supported [Array<String>, nil] Supported grant types
+      # @param code_challenge_methods_supported [Array<String>, nil] Supported PKCE code challenge methods (RFC 8414)
       def initialize(issuer:, authorization_endpoint:, token_endpoint:, registration_endpoint: nil,
-                     scopes_supported: nil, response_types_supported: nil, grant_types_supported: nil)
+                     scopes_supported: nil, response_types_supported: nil, grant_types_supported: nil,
+                     code_challenge_methods_supported: nil)
         @issuer = issuer
         @authorization_endpoint = authorization_endpoint
         @token_endpoint = token_endpoint
@@ -243,6 +246,7 @@ module MCPClient
         @scopes_supported = scopes_supported
         @response_types_supported = response_types_supported
         @grant_types_supported = grant_types_supported
+        @code_challenge_methods_supported = code_challenge_methods_supported
       end
 
       # Check if dynamic client registration is supported
@@ -261,7 +265,8 @@ module MCPClient
           registration_endpoint: @registration_endpoint,
           scopes_supported: @scopes_supported,
           response_types_supported: @response_types_supported,
-          grant_types_supported: @grant_types_supported
+          grant_types_supported: @grant_types_supported,
+          code_challenge_methods_supported: @code_challenge_methods_supported
         }.compact
       end
 
@@ -276,7 +281,9 @@ module MCPClient
           registration_endpoint: data[:registration_endpoint] || data['registration_endpoint'],
           scopes_supported: data[:scopes_supported] || data['scopes_supported'],
           response_types_supported: data[:response_types_supported] || data['response_types_supported'],
-          grant_types_supported: data[:grant_types_supported] || data['grant_types_supported']
+          grant_types_supported: data[:grant_types_supported] || data['grant_types_supported'],
+          code_challenge_methods_supported: data[:code_challenge_methods_supported] ||
+            data['code_challenge_methods_supported']
         )
       end
     end

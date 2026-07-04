@@ -62,9 +62,20 @@ token = oauth_provider.complete_authorization_flow(code, state)
 
 The implementation follows the standard OAuth 2.1 authorization code flow with PKCE:
 
-1. **Server Discovery**: Discover authorization server via `.well-known/oauth-protected-resource`
-   - Uses the origin (scheme + host + port) of the MCP server URL for discovery
-   - Example: `https://api.example.com/mcp/path?query=123` → `https://api.example.com/.well-known/oauth-protected-resource`
+1. **Server Discovery**: Protected Resource Metadata is authoritative (RFC 9728). On a `401` the client
+   parses the `resource_metadata` parameter from the `WWW-Authenticate` header (a legacy `resource`
+   parameter is accepted as a fallback); otherwise it probes the `.well-known` URLs in priority order.
+   - **Protected Resource Metadata (RFC 9728 §3.1)** is path-aware: the well-known segment is inserted
+     between host and path, then a root fallback is tried.
+     - Example: `https://api.example.com/mcp` →
+       `https://api.example.com/.well-known/oauth-protected-resource/mcp`, then
+       `https://api.example.com/.well-known/oauth-protected-resource`
+   - **Authorization Server Metadata (RFC 8414 §3.1 + OpenID Connect Discovery)**: for an issuer with a
+     path, the well-known segment is *inserted* (not appended); both `oauth-authorization-server` and
+     `openid-configuration` forms are tried in priority order.
+   - The discovered protected-resource `resource` is validated against the server host (confused-deputy
+     protection), and every authorization-server endpoint must use HTTPS (localhost is allowed for
+     local development).
 2. **Client Registration**: Automatically register OAuth client if dynamic registration is supported
 3. **Authorization**: Redirect user to authorization server with PKCE parameters
 4. **Token Exchange**: Exchange authorization code for access token using PKCE verifier
@@ -177,7 +188,8 @@ metadata = MCPClient::Auth::ServerMetadata.new(
   issuer: 'https://auth.example.com',
   authorization_endpoint: 'https://auth.example.com/authorize',
   token_endpoint: 'https://auth.example.com/token',
-  registration_endpoint: 'https://auth.example.com/register'
+  registration_endpoint: 'https://auth.example.com/register',
+  code_challenge_methods_supported: ['S256'] # advertised PKCE methods (RFC 8414)
 )
 ```
 
@@ -204,12 +216,17 @@ end
 
 This implementation follows OAuth 2.1 security best practices:
 
-- **PKCE is mandatory** for all authorization code flows
+- **PKCE is mandatory** for all authorization code flows. The client uses `S256` and **verifies the
+  authorization server's `code_challenge_methods_supported`**: it refuses to proceed if the server
+  explicitly advertises methods without `S256`, and warns (but proceeds) if the field is omitted.
 - **State parameter** is used to prevent CSRF attacks
-- **Resource parameter** (RFC 8707) ensures token audience binding
-- **Token validation** ensures tokens are used only with intended servers
+- **Resource parameter** (RFC 8707) ensures token audience binding — sent in both the authorization
+  and token requests as the canonical server URI
+- **Confused-deputy protection**: the protected-resource metadata `resource` is validated against the
+  server host before its advertised authorization server is trusted
+- **HTTPS is enforced** on all discovered authorization-server endpoints (authorization, token, and
+  registration), with a `localhost`/`127.0.0.1` exception for local development
 - **Secure token storage** guidelines should be followed
-- **HTTPS is required** for all OAuth endpoints
 
 ## Examples
 

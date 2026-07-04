@@ -85,6 +85,364 @@ RSpec.describe MCPClient::Auth::OAuthProvider do
     end
   end
 
+  describe 'RFC-compliant discovery' do
+    describe '#protected_resource_metadata_urls (RFC 9728 path-aware)' do
+      it 'inserts the well-known segment before the path, then falls back to root' do
+        p = described_class.new(server_url: 'https://ex.com/public/mcp')
+        expect(p.send(:protected_resource_metadata_urls, p.server_url)).to eq(
+          [
+            'https://ex.com/.well-known/oauth-protected-resource/public/mcp',
+            'https://ex.com/.well-known/oauth-protected-resource'
+          ]
+        )
+      end
+
+      it 'returns only the root URL for a path-less server' do
+        p = described_class.new(server_url: 'https://ex.com')
+        expect(p.send(:protected_resource_metadata_urls, p.server_url))
+          .to eq(['https://ex.com/.well-known/oauth-protected-resource'])
+      end
+    end
+
+    describe '#authorization_server_metadata_urls (RFC 8414 path-insertion + OIDC)' do
+      let(:p) { described_class.new(server_url: server_url) }
+
+      it 'path-inserts oauth + OIDC and appends OIDC for an issuer with a path' do
+        expect(p.send(:authorization_server_metadata_urls, 'https://auth.example.com/tenant1')).to eq(
+          [
+            'https://auth.example.com/.well-known/oauth-authorization-server/tenant1',
+            'https://auth.example.com/.well-known/openid-configuration/tenant1',
+            'https://auth.example.com/tenant1/.well-known/openid-configuration'
+          ]
+        )
+      end
+
+      it 'tries oauth then OIDC for a path-less issuer' do
+        expect(p.send(:authorization_server_metadata_urls, 'https://auth.example.com')).to eq(
+          [
+            'https://auth.example.com/.well-known/oauth-authorization-server',
+            'https://auth.example.com/.well-known/openid-configuration'
+          ]
+        )
+      end
+    end
+
+    describe '#extract_resource_metadata_url (WWW-Authenticate)' do
+      let(:p) { described_class.new(server_url: server_url) }
+
+      it 'parses the quoted resource_metadata parameter' do
+        header = 'Bearer resource_metadata="https://mcp.example.com/meta", scope="files:read"'
+        expect(p.send(:extract_resource_metadata_url, header)).to eq('https://mcp.example.com/meta')
+      end
+
+      it 'parses the unquoted resource_metadata parameter' do
+        header = 'Bearer resource_metadata=https://mcp.example.com/meta'
+        expect(p.send(:extract_resource_metadata_url, header)).to eq('https://mcp.example.com/meta')
+      end
+
+      it 'falls back to the legacy resource parameter' do
+        header = 'Bearer resource="https://mcp.example.com/legacy"'
+        expect(p.send(:extract_resource_metadata_url, header)).to eq('https://mcp.example.com/legacy')
+      end
+
+      it 'tolerates whitespace around the parameter equals sign' do
+        header = 'Bearer resource_metadata = "https://mcp.example.com/meta"'
+        expect(p.send(:extract_resource_metadata_url, header)).to eq('https://mcp.example.com/meta')
+      end
+    end
+
+    describe '#verify_pkce_support!' do
+      def metadata(methods)
+        MCPClient::Auth::ServerMetadata.new(
+          issuer: 'https://a', authorization_endpoint: 'https://a/auth',
+          token_endpoint: 'https://a/token', code_challenge_methods_supported: methods
+        )
+      end
+
+      it 'raises when S256 is explicitly not offered' do
+        expect { oauth_provider.send(:verify_pkce_support!, metadata(['plain'])) }
+          .to raise_error(MCPClient::Errors::ConnectionError, /PKCE S256/)
+      end
+
+      it 'passes when S256 is offered' do
+        expect { oauth_provider.send(:verify_pkce_support!, metadata(['S256'])) }.not_to raise_error
+      end
+
+      it 'warns but proceeds when not advertised' do
+        expect(logger).to receive(:warn).with(/omits code_challenge_methods_supported/)
+        oauth_provider.send(:verify_pkce_support!, metadata(nil))
+      end
+    end
+
+    describe '#enforce_https!' do
+      it 'rejects a non-localhost http endpoint' do
+        expect { oauth_provider.send(:enforce_https!, 'http://evil.com/token', 'token endpoint') }
+          .to raise_error(MCPClient::Errors::ConnectionError, /must use HTTPS/)
+      end
+
+      it 'allows https endpoints' do
+        expect { oauth_provider.send(:enforce_https!, 'https://auth.example.com/token', 'token endpoint') }
+          .not_to raise_error
+      end
+
+      it 'allows http on localhost for local development' do
+        expect { oauth_provider.send(:enforce_https!, 'http://localhost:9292/token', 'token endpoint') }
+          .not_to raise_error
+      end
+
+      it 'allows http on an IPv6 loopback endpoint' do
+        expect { oauth_provider.send(:enforce_https!, 'http://[::1]:9292/token', 'token endpoint') }
+          .not_to raise_error
+      end
+
+      it 'rejects a non-http scheme even on a loopback host' do
+        expect { oauth_provider.send(:enforce_https!, 'ftp://localhost/token', 'token endpoint') }
+          .to raise_error(MCPClient::Errors::ConnectionError, /must use HTTPS/)
+      end
+    end
+
+    describe '#validate_resource_matches!' do
+      def resource_metadata(resource)
+        MCPClient::Auth::ResourceMetadata.new(resource: resource, authorization_servers: ['https://auth.example.com'])
+      end
+
+      it 'accepts an exact canonical resource match' do
+        expect { oauth_provider.send(:validate_resource_matches!, resource_metadata('https://mcp.example.com')) }
+          .not_to raise_error
+      end
+
+      it 'ignores a trailing slash on an exact match' do
+        expect { oauth_provider.send(:validate_resource_matches!, resource_metadata('https://mcp.example.com/')) }
+          .not_to raise_error
+      end
+
+      it 'treats the query as part of the resource identity' do
+        q_provider = described_class.new(server_url: 'https://mcp.example.com/mcp?serverId=a', logger: logger)
+        expect do
+          q_provider.send(:validate_resource_matches!, resource_metadata('https://mcp.example.com/mcp?serverId=b'))
+        end.to raise_error(MCPClient::Errors::ConnectionError, /does not match/)
+      end
+
+      it 'rejects a different resource host (confused deputy protection)' do
+        expect { oauth_provider.send(:validate_resource_matches!, resource_metadata('https://other.com')) }
+          .to raise_error(MCPClient::Errors::ConnectionError, /does not match/)
+      end
+
+      it 'rejects a same-host but different-path resource (multi-tenant safety)' do
+        tenant_provider = described_class.new(server_url: 'https://api.example.com/tenant-b/mcp', logger: logger)
+        expect do
+          tenant_provider.send(:validate_resource_matches!, resource_metadata('https://api.example.com/tenant-a/mcp'))
+        end.to raise_error(MCPClient::Errors::ConnectionError, /does not match/)
+      end
+
+      it 'rejects protected resource metadata that omits the required resource identifier' do
+        expect { oauth_provider.send(:validate_resource_matches!, resource_metadata(nil)) }
+          .to raise_error(MCPClient::Errors::ConnectionError, /missing the required "resource"/)
+      end
+
+      it 'raises a ConnectionError (not NoMethodError) for a non-absolute resource value' do
+        expect { oauth_provider.send(:validate_resource_matches!, resource_metadata('mcp.example.com')) }
+          .to raise_error(MCPClient::Errors::ConnectionError, /must be absolute/)
+      end
+    end
+
+    describe '#fetch_resource_metadata (404 handling)' do
+      let(:http_client) { instance_double('Faraday::Connection') }
+
+      before { oauth_provider.instance_variable_set(:@http_client, http_client) }
+
+      def response(status, body = '{}')
+        instance_double('Faraday::Response', status: status, success?: (200..299).cover?(status), body: body)
+      end
+
+      it 'returns nil for a speculative well-known 404 (non-strict)' do
+        allow(http_client).to receive(:get).and_return(response(404))
+        expect(oauth_provider.send(:fetch_resource_metadata, 'https://x.example.com/meta')).to be_nil
+      end
+
+      it 'raises for a 404 on an explicitly-advertised challenge URL (strict)' do
+        allow(http_client).to receive(:get).and_return(response(404))
+        expect { oauth_provider.send(:fetch_resource_metadata, 'https://x.example.com/meta', strict: true) }
+          .to raise_error(MCPClient::Errors::ConnectionError, /HTTP 404/)
+      end
+    end
+
+    describe '#discover_authorization_server (PRM-first)' do
+      let(:storage_instance) { MCPClient::Auth::OAuthProvider::MemoryStorage.new }
+      let(:provider) do
+        described_class.new(server_url: 'https://mcp.example.com/mcp', logger: logger, storage: storage_instance)
+      end
+      let(:resource_meta) do
+        MCPClient::Auth::ResourceMetadata.new(
+          resource: 'https://mcp.example.com/mcp', authorization_servers: ['https://auth.example.com']
+        )
+      end
+
+      def server_meta(methods)
+        MCPClient::Auth::ServerMetadata.new(
+          issuer: 'https://auth.example.com',
+          authorization_endpoint: 'https://auth.example.com/authorize',
+          token_endpoint: 'https://auth.example.com/token',
+          code_challenge_methods_supported: methods
+        )
+      end
+
+      it 'follows PRM to the authorization server, verifies S256, and caches' do
+        allow(provider).to receive(:fetch_resource_metadata).and_return(resource_meta)
+        allow(provider).to receive(:fetch_server_metadata).and_return(server_meta(['S256']))
+
+        result = provider.send(:discover_authorization_server)
+        expect(result.token_endpoint).to eq('https://auth.example.com/token')
+        expect(storage_instance.get_server_metadata('https://mcp.example.com/mcp')).not_to be_nil
+      end
+
+      it 'refuses an authorization server that does not support PKCE S256' do
+        allow(provider).to receive(:fetch_resource_metadata).and_return(resource_meta)
+        allow(provider).to receive(:fetch_server_metadata).and_return(server_meta(['plain']))
+
+        expect { provider.send(:discover_authorization_server) }
+          .to raise_error(MCPClient::Errors::ConnectionError, /PKCE S256/)
+      end
+
+      it 'falls back to direct AS discovery when no PRM document exists (404)' do
+        # fetch_resource_metadata returns nil for a genuine 404 (absent candidate)
+        allow(provider).to receive(:fetch_resource_metadata).and_return(nil)
+        allow(provider).to receive(:fetch_server_metadata).and_return(server_meta(['S256']))
+
+        result = provider.send(:discover_authorization_server)
+        expect(result.token_endpoint).to eq('https://auth.example.com/token')
+      end
+
+      it 'hard-fails (no fallback) when a PRM candidate exists but is malformed or errors' do
+        # A non-404 failure (malformed JSON / 5xx) at a PRM URL must not fall
+        # through to root PRM or direct-AS discovery.
+        allow(provider).to receive(:fetch_resource_metadata)
+          .and_raise(MCPClient::Errors::ConnectionError, 'Invalid resource metadata JSON')
+        # If a fallback were (wrongly) taken, this would let discovery succeed:
+        allow(provider).to receive(:fetch_server_metadata).and_return(server_meta(['S256']))
+
+        expect { provider.send(:discover_authorization_server) }
+          .to raise_error(MCPClient::Errors::ConnectionError, /Invalid resource metadata JSON/)
+      end
+
+      it 'hard-fails (no origin fallback) when PRM is found but its advertised AS is unreachable' do
+        allow(provider).to receive(:fetch_resource_metadata).and_return(resource_meta)
+        # The AS advertised by the authoritative PRM cannot be loaded
+        allow(provider).to receive(:fetch_server_metadata)
+          .and_raise(MCPClient::Errors::ConnectionError, 'HTTP 500')
+
+        expect { provider.send(:discover_authorization_server) }
+          .to raise_error(MCPClient::Errors::ConnectionError, /could not be discovered/)
+      end
+
+      it 'validates a cached metadata entry (rejects a cached AS lacking S256)' do
+        storage_instance.set_server_metadata('https://mcp.example.com/mcp', server_meta(['plain']))
+
+        expect { provider.send(:discover_authorization_server) }
+          .to raise_error(MCPClient::Errors::ConnectionError, /PKCE S256/)
+      end
+
+      it 'reuses protected resource metadata learned from a 401 challenge' do
+        provider.instance_variable_set(:@challenge_resource_metadata, resource_meta)
+        # No PRM well-known fetch should be needed; only the AS lookup runs
+        expect(provider).not_to receive(:fetch_resource_metadata)
+        allow(provider).to receive(:fetch_server_metadata).and_return(server_meta(['S256']))
+
+        result = provider.send(:discover_authorization_server)
+        expect(result.token_endpoint).to eq('https://auth.example.com/token')
+      end
+
+      it 'lets a 401 challenge override stale cached AS metadata' do
+        # A previously direct-discovered AS is cached...
+        stale = MCPClient::Auth::ServerMetadata.new(
+          issuer: 'https://stale.example.com',
+          authorization_endpoint: 'https://stale.example.com/authorize',
+          token_endpoint: 'https://stale.example.com/token',
+          code_challenge_methods_supported: ['S256']
+        )
+        storage_instance.set_server_metadata('https://mcp.example.com/mcp', stale)
+
+        # ...but a fresh 401 challenge points at the authoritative PRM/AS
+        provider.instance_variable_set(:@challenge_resource_metadata, resource_meta)
+        allow(provider).to receive(:fetch_server_metadata).and_return(server_meta(['S256']))
+
+        result = provider.send(:discover_authorization_server)
+        expect(result.token_endpoint).to eq('https://auth.example.com/token')
+      end
+
+      it 'discards a cached client registered with the previous AS when the AS changes' do
+        stale = MCPClient::Auth::ServerMetadata.new(
+          issuer: 'https://stale.example.com',
+          authorization_endpoint: 'https://stale.example.com/authorize',
+          token_endpoint: 'https://stale.example.com/token',
+          code_challenge_methods_supported: ['S256']
+        )
+        storage_instance.set_server_metadata('https://mcp.example.com/mcp', stale)
+        storage_instance.set_client_info('https://mcp.example.com/mcp', double('old-client'))
+
+        provider.instance_variable_set(:@challenge_resource_metadata, resource_meta)
+        allow(provider).to receive(:fetch_server_metadata).and_return(server_meta(['S256']))
+
+        provider.send(:discover_authorization_server)
+        expect(storage_instance.get_client_info('https://mcp.example.com/mcp')).to be_nil
+      end
+
+      it 'does not persist AS metadata that fails validation' do
+        allow(provider).to receive(:fetch_resource_metadata).and_return(resource_meta)
+        allow(provider).to receive(:fetch_server_metadata).and_return(server_meta(['plain']))
+
+        expect { provider.send(:discover_authorization_server) }
+          .to raise_error(MCPClient::Errors::ConnectionError, /PKCE S256/)
+        expect(storage_instance.get_server_metadata('https://mcp.example.com/mcp')).to be_nil
+      end
+
+      it 'resets memoized supported_scopes when the AS changes' do
+        stale = MCPClient::Auth::ServerMetadata.new(
+          issuer: 'https://stale.example.com', authorization_endpoint: 'https://stale.example.com/authorize',
+          token_endpoint: 'https://stale.example.com/token', code_challenge_methods_supported: ['S256']
+        )
+        storage_instance.set_server_metadata('https://mcp.example.com/mcp', stale)
+        provider.instance_variable_set(:@supported_scopes, ['old:scope'])
+        provider.instance_variable_set(:@challenge_resource_metadata, resource_meta)
+        allow(provider).to receive(:fetch_server_metadata).and_return(server_meta(['S256']))
+
+        provider.send(:discover_authorization_server)
+        expect(provider.instance_variable_get(:@supported_scopes)).to be_nil
+      end
+
+      it 'clears client info via set_client_info(nil) for storage without delete_client_info' do
+        # A minimal custom storage that intentionally does NOT implement
+        # delete_client_info (only the documented get/set interface).
+        storage_class = Class.new do
+          def initialize(stale)
+            @server_metadata = stale
+            @client_info = :registered_with_old_as
+          end
+
+          def get_server_metadata(_url) = @server_metadata
+          def set_server_metadata(_url, meta) = (@server_metadata = meta)
+          def get_client_info(_url) = @client_info
+          def set_client_info(_url, info) = (@client_info = info)
+          # deliberately no delete_client_info
+        end
+
+        stale = MCPClient::Auth::ServerMetadata.new(
+          issuer: 'https://stale.example.com', authorization_endpoint: 'https://stale.example.com/authorize',
+          token_endpoint: 'https://stale.example.com/token', code_challenge_methods_supported: ['S256']
+        )
+        custom_storage = storage_class.new(stale)
+        custom_provider = described_class.new(
+          server_url: 'https://mcp.example.com/mcp', logger: logger, storage: custom_storage
+        )
+        custom_provider.instance_variable_set(:@challenge_resource_metadata, resource_meta)
+        allow(custom_provider).to receive(:fetch_server_metadata).and_return(server_meta(['S256']))
+
+        custom_provider.send(:discover_authorization_server)
+        expect(custom_storage.get_client_info(nil)).to be_nil
+      end
+    end
+  end
+
   describe '#access_token' do
     context 'when no token is stored' do
       before do
