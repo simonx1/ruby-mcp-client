@@ -38,7 +38,7 @@ Implements **MCP 2025-11-25** specification:
 - **Sampling**: Server-requested LLM completions with modelPreferences
 - **Completion**: Autocomplete for prompts/resources with context
 - **Logging**: Server log messages with level filtering
-- **Tasks**: Structured task management with progress tracking
+- **Tasks**: Task-augmented `tools/call` — create with a `ttl`, poll `tasks/get`, retrieve via `tasks/result`, plus `tasks/list` and `tasks/cancel`
 - **Audio**: Audio content type support
 - **OAuth 2.1**: PKCE, server discovery, dynamic registration
 
@@ -205,6 +205,39 @@ client.on_notification do |server, method, params|
   if method == 'notifications/message'
     puts "[#{params['level']}] #{params['logger']}: #{params['data']}"
   end
+end
+```
+
+### Tasks (Long-running, task-augmented tools)
+
+A task-capable server (one advertising `tasks.requests.tools.call`) can run a tool
+whose `execution.taskSupport` is `optional` or `required` as a background task:
+the call returns immediately with a task handle, and the result is fetched later.
+
+```ruby
+tool = client.find_tool('long_job')
+tool.supports_task?   # execution.taskSupport is optional/required?
+
+# Create the task (returns immediately); ttl is the requested lifetime in ms
+task = client.call_tool_as_task('long_job', { input: 'data' }, ttl: 60_000)
+
+# Poll until the task reaches a terminal (or input-required) status,
+# honoring the server's suggested poll interval
+until task.terminal? || task.input_required?
+  sleep((task.poll_interval || 1000) / 1000.0)
+  task = client.get_task(task.task_id)   # tasks/get
+end
+
+# Retrieve the underlying result (e.g. a CallToolResult) via tasks/result
+result = client.get_task_result(task.task_id)
+
+# List and cancel tasks
+page = client.list_tasks               # { tasks: [...], next_cursor: ... }
+client.cancel_task(task.task_id)       # tasks/cancel
+
+# React to server-pushed status updates
+client.on_notification do |server, method, params|
+  puts "Task #{params['taskId']} -> #{params['status']}" if method == 'notifications/tasks/status'
 end
 ```
 

@@ -290,6 +290,7 @@ module MCPClient
 
       # Validate parameters against tool schema
       validate_params!(tool, parameters)
+      reject_task_required!(tool, tool_name)
 
       # Use the tool's associated server
       server = tool.server
@@ -435,6 +436,7 @@ module MCPClient
 
       # Validate parameters against tool schema
       validate_params!(tool, parameters)
+      reject_task_required!(tool, tool_name)
 
       # Use the tool's associated server
       server = tool.server
@@ -506,32 +508,59 @@ module MCPClient
       srv.complete(ref: ref, argument: argument, context: context)
     end
 
-    # Create a new task on a server (MCP 2025-11-25)
-    # Tasks represent long-running operations that can report progress
-    # @param method [String] the method to execute as a task
-    # @param params [Hash] parameters for the task method
-    # @param progress_token [String, nil] optional token for receiving progress notifications
-    # @param server [Integer, String, Symbol, MCPClient::ServerBase, nil] server selector
-    # @return [MCPClient::Task] the created task
-    # @raise [MCPClient::Errors::ServerNotFound] if no server is available
-    # @raise [MCPClient::Errors::TaskError] if task creation fails
-    def create_task(method, params: {}, progress_token: nil, server: nil)
-      srv = select_server(server)
-      rpc_params = { method: method, params: params }
-      rpc_params[:progressToken] = progress_token if progress_token
+    # Call a tool as a task (task-augmented tools/call, MCP 2025-11-25).
+    #
+    # Instead of blocking for the result, the server accepts the request and
+    # immediately returns a task handle; the actual result is retrieved later
+    # via {#get_task_result} once the task reaches a terminal status. The server
+    # must advertise the tasks.requests.tools.call capability, and the tool must
+    # declare execution.taskSupport of 'optional' or 'required'.
+    # @param tool_name [String] the name of the tool to call
+    # @param parameters [Hash] the parameters to pass to the tool
+    # @param ttl [Integer, nil] optional requested task lifetime in milliseconds
+    # @param server [String, Symbol, Integer, MCPClient::ServerBase, nil] optional server to use
+    # @return [MCPClient::Task] the created task (status typically 'working')
+    # @raise [MCPClient::Errors::ToolNotFound] if the tool is not found
+    # @raise [MCPClient::Errors::ValidationError] if required parameters are missing
+    # @raise [MCPClient::Errors::TaskError] if the server or tool does not support tasks, or creation fails
+    def call_tool_as_task(tool_name, parameters, ttl: nil, server: nil)
+      tool = resolve_tool(tool_name, server: server)
+      validate_params!(tool, parameters)
+
+      srv = tool.server
+      raise MCPClient::Errors::ServerNotFound, "No server found for tool '#{tool_name}'" unless srv
+
+      unless server_supports_task_tool_call?(srv)
+        raise MCPClient::Errors::TaskError,
+              'Server does not support task-augmented tools/call (no tasks.requests.tools.call capability)'
+      end
+      unless tool.supports_task?
+        raise MCPClient::Errors::TaskError,
+              "Tool '#{tool_name}' does not support task execution (execution.taskSupport is forbidden/unset)"
+      end
+
+      task_params = {}
+      task_params[:ttl] = ttl if ttl
+      # Keep _meta (string or symbol key) as a top-level request field rather
+      # than a tool argument, so request metadata is preserved and does not fail
+      # tool input-schema validation.
+      meta_key = [:_meta, '_meta'].find { |k| parameters.key?(k) }
+      arguments = meta_key ? parameters.reject { |k, _| k == meta_key } : parameters
+      rpc_params = { name: tool_name, arguments: arguments, task: task_params }
+      rpc_params[:_meta] = parameters[meta_key] if meta_key
 
       begin
-        result = srv.rpc_request('tasks/create', rpc_params)
-        MCPClient::Task.from_json(result, server: srv)
+        result = srv.rpc_request('tools/call', rpc_params)
+        MCPClient::Task.from_create_result(result, server: srv)
       rescue MCPClient::Errors::ServerError, MCPClient::Errors::TransportError, MCPClient::Errors::ConnectionError => e
-        raise MCPClient::Errors::TaskError, "Error creating task: #{e.message}"
+        raise MCPClient::Errors::TaskError, "Error creating task for tool '#{tool_name}': #{e.message}"
       end
     end
 
-    # Get the current state of a task (MCP 2025-11-25)
+    # Get the current state of a task (tasks/get, MCP 2025-11-25)
     # @param task_id [String] the ID of the task to query
     # @param server [Integer, String, Symbol, MCPClient::ServerBase, nil] server selector
-    # @return [MCPClient::Task] the task with current state
+    # @return [MCPClient::Task] the task with current status
     # @raise [MCPClient::Errors::ServerNotFound] if no server is available
     # @raise [MCPClient::Errors::TaskNotFound] if the task does not exist
     # @raise [MCPClient::Errors::TaskError] if retrieving the task fails
@@ -539,38 +568,75 @@ module MCPClient
       srv = select_server(server)
 
       begin
-        result = srv.rpc_request('tasks/get', { id: task_id })
+        result = srv.rpc_request('tasks/get', { taskId: task_id })
         MCPClient::Task.from_json(result, server: srv)
       rescue MCPClient::Errors::ServerError => e
-        if e.message.include?('not found') || e.message.include?('unknown task')
-          raise MCPClient::Errors::TaskNotFound, "Task '#{task_id}' not found"
-        end
-
-        raise MCPClient::Errors::TaskError, "Error getting task '#{task_id}': #{e.message}"
+        raise task_error_from(e, task_id, 'getting')
       rescue MCPClient::Errors::TransportError, MCPClient::Errors::ConnectionError => e
         raise MCPClient::Errors::TaskError, "Error getting task '#{task_id}': #{e.message}"
       end
     end
 
-    # Cancel a running task (MCP 2025-11-25)
+    # Retrieve the result of a completed task (tasks/result, MCP 2025-11-25).
+    # Returns exactly what the underlying request would have returned (e.g. a
+    # CallToolResult hash with 'content'/'isError'/'structuredContent'); it is
+    # NOT wrapped in a Task. Blocks on the server until the task is terminal.
+    # @param task_id [String] the ID of the task
+    # @param server [Integer, String, Symbol, MCPClient::ServerBase, nil] server selector
+    # @return [Object] the underlying task result
+    # @raise [MCPClient::Errors::TaskNotFound] if the task does not exist
+    # @raise [MCPClient::Errors::TaskError] if retrieval fails
+    def get_task_result(task_id, server: nil)
+      srv = select_server(server)
+
+      begin
+        srv.rpc_request('tasks/result', { taskId: task_id })
+      rescue MCPClient::Errors::ServerError => e
+        raise task_error_from(e, task_id, 'getting result for')
+      rescue MCPClient::Errors::TransportError, MCPClient::Errors::ConnectionError => e
+        raise MCPClient::Errors::TaskError, "Error getting result for task '#{task_id}': #{e.message}"
+      end
+    end
+
+    # List tasks known to a server (tasks/list, paginated, MCP 2025-11-25)
+    # @param cursor [String, nil] optional pagination cursor
+    # @param server [Integer, String, Symbol, MCPClient::ServerBase, nil] server selector
+    # @return [Hash] { tasks: Array<MCPClient::Task>, next_cursor: String, nil }
+    # @raise [MCPClient::Errors::TaskError] if listing fails
+    def list_tasks(cursor: nil, server: nil)
+      srv = select_server(server)
+      params = cursor ? { cursor: cursor } : {}
+
+      begin
+        result = srv.rpc_request('tasks/list', params) || {}
+        tasks = (result['tasks'] || []).map { |t| MCPClient::Task.from_json(t, server: srv) }
+        { tasks: tasks, next_cursor: result['nextCursor'] }
+      rescue MCPClient::Errors::ServerError, MCPClient::Errors::TransportError, MCPClient::Errors::ConnectionError => e
+        raise MCPClient::Errors::TaskError, "Error listing tasks: #{e.message}"
+      end
+    end
+
+    # Cancel a task (tasks/cancel, MCP 2025-11-25)
     # @param task_id [String] the ID of the task to cancel
     # @param server [Integer, String, Symbol, MCPClient::ServerBase, nil] server selector
-    # @return [MCPClient::Task] the task with updated (cancelled) state
+    # @return [MCPClient::Task] the task with updated (cancelled) status
     # @raise [MCPClient::Errors::ServerNotFound] if no server is available
     # @raise [MCPClient::Errors::TaskNotFound] if the task does not exist
-    # @raise [MCPClient::Errors::TaskError] if cancellation fails
+    # @raise [MCPClient::Errors::TaskError] if cancellation fails (including cancelling a terminal task)
     def cancel_task(task_id, server: nil)
       srv = select_server(server)
 
       begin
-        result = srv.rpc_request('tasks/cancel', { id: task_id })
+        result = srv.rpc_request('tasks/cancel', { taskId: task_id })
         MCPClient::Task.from_json(result, server: srv)
       rescue MCPClient::Errors::ServerError => e
-        if e.message.include?('not found') || e.message.include?('unknown task')
-          raise MCPClient::Errors::TaskNotFound, "Task '#{task_id}' not found"
+        # A terminal task cannot be cancelled (-32602); that is an error, not a
+        # missing task, so keep it as a TaskError.
+        if e.message.match?(/terminal/i)
+          raise MCPClient::Errors::TaskError, "Error cancelling task '#{task_id}': #{e.message}"
         end
 
-        raise MCPClient::Errors::TaskError, "Error cancelling task '#{task_id}': #{e.message}"
+        raise task_error_from(e, task_id, 'cancelling')
       rescue MCPClient::Errors::TransportError, MCPClient::Errors::ConnectionError => e
         raise MCPClient::Errors::TaskError, "Error cancelling task '#{task_id}': #{e.message}"
       end
@@ -610,6 +676,9 @@ module MCPClient
       when 'notifications/message'
         # MCP 2025-06-18: Handle logging messages from server
         handle_log_message(server_id, params)
+      when 'notifications/tasks/status'
+        # MCP 2025-11-25: task status update (params are a flat Task)
+        handle_task_status_notification(server_id, params)
       else
         # Log unknown notification types for debugging purposes
         logger.debug("[#{server_id}] Received unknown notification: #{method} - #{params}")
@@ -707,6 +776,91 @@ module MCPClient
       servers.find do |server|
         server.list_tools.any? { |t| t.name == tool.name }
       end
+    end
+
+    # Resolve a tool by name (optionally scoped to a server), raising the same
+    # not-found / ambiguity errors as call_tool.
+    # @param tool_name [String] the tool name
+    # @param server [String, Symbol, Integer, MCPClient::ServerBase, nil] optional server selector
+    # @return [MCPClient::Tool] the resolved tool
+    # @raise [MCPClient::Errors::ToolNotFound, MCPClient::Errors::AmbiguousToolName]
+    def resolve_tool(tool_name, server: nil)
+      tools = list_tools
+
+      if server
+        srv = select_server(server)
+        tool = tools.find { |t| t.name == tool_name && t.server == srv }
+        unless tool
+          raise MCPClient::Errors::ToolNotFound,
+                "Tool '#{tool_name}' not found on server '#{srv.name || srv.class.name}'"
+        end
+        return tool
+      end
+
+      matching_tools = tools.select { |t| t.name == tool_name }
+      if matching_tools.empty?
+        raise MCPClient::Errors::ToolNotFound, "Tool '#{tool_name}' not found"
+      elsif matching_tools.size > 1
+        server_names = matching_tools.map { |t| t.server&.name || 'unnamed' }
+        raise MCPClient::Errors::AmbiguousToolName,
+              "Multiple tools named '#{tool_name}' found across servers (#{server_names.join(', ')}). " \
+              "Please specify a server using the 'server' parameter."
+      end
+
+      matching_tools.first
+    end
+
+    # Reject a plain (synchronous) call for a tool whose execution.taskSupport is
+    # 'required'. A compliant server would reject a non-task-augmented tools/call
+    # for such a tool, so fail fast and point the caller at call_tool_as_task.
+    # @param tool [MCPClient::Tool] the resolved tool
+    # @param tool_name [String] the tool name (for the message)
+    # @raise [MCPClient::Errors::ToolCallError] if the tool requires task execution
+    def reject_task_required!(tool, tool_name)
+      return unless tool.task_required?
+
+      raise MCPClient::Errors::ToolCallError,
+            "Tool '#{tool_name}' requires task-augmented execution; call it with call_tool_as_task instead"
+    end
+
+    # Whether a server advertised support for task-augmented tools/call, i.e.
+    # capabilities.tasks.requests.tools.call.
+    # @param srv [MCPClient::ServerBase] the server
+    # @return [Boolean]
+    def server_supports_task_tool_call?(srv)
+      caps = srv.respond_to?(:capabilities) ? srv.capabilities : nil
+      return false unless caps.is_a?(Hash)
+
+      tasks = caps['tasks'] || caps[:tasks]
+      requests = tasks && (tasks['requests'] || tasks[:requests])
+      tools = requests && (requests['tools'] || requests[:tools])
+      call = tools && (tools['call'] || tools[:call])
+      !call.nil?
+    end
+
+    # Map a ServerError from a task operation to TaskNotFound or TaskError.
+    # @param error [MCPClient::Errors::ServerError] the server error
+    # @param task_id [String] the task id
+    # @param action [String] a verb phrase for the error message (e.g. 'getting')
+    # @return [MCPClient::Errors::TaskNotFound, MCPClient::Errors::TaskError]
+    def task_error_from(error, task_id, action)
+      if error.message.match?(/not found|unknown task|expired/i)
+        return MCPClient::Errors::TaskNotFound.new("Task '#{task_id}' not found")
+      end
+
+      MCPClient::Errors::TaskError.new("Error #{action} task '#{task_id}': #{error.message}")
+    end
+
+    # Handle a notifications/tasks/status notification (MCP 2025-11-25).
+    # The params are a flat Task.
+    # @param server_id [String] server identifier for the log prefix
+    # @param params [Hash] the flat task params
+    # @return [void]
+    def handle_task_status_notification(server_id, params)
+      task = MCPClient::Task.from_json(params)
+      logger.info("[#{server_id}] Task #{task.task_id} status: #{task.status}")
+    rescue StandardError => e
+      logger.debug("[#{server_id}] Failed to parse task status notification: #{e.message}")
     end
 
     # Generate a cache key for server-specific items

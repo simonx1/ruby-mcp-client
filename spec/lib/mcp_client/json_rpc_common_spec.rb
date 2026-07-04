@@ -200,6 +200,10 @@ RSpec.describe MCPClient::JsonRpcCommon do
         }
       )
     end
+
+    it 'does not declare a client tasks capability (requestor-only, not a task receiver)' do
+      expect(instance.initialization_params['capabilities']).not_to have_key('tasks')
+    end
   end
 
   describe '#process_jsonrpc_response' do

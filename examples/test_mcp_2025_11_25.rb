@@ -289,40 +289,37 @@ begin
   puts
   puts '--- Task Management ---'
 
-  # Create a task
-  task = client.create_task('background_work', params: { input: 'test' }, progress_token: 'tok-1')
-  runner.assert('create_task returns a Task', task.is_a?(MCPClient::Task))
-  runner.assert('task has an id', !task.id.nil? && !task.id.empty?)
-  runner.assert('task initial state is pending', task.state == 'pending')
-  runner.assert('task has message', !task.message.nil?)
+  # Create a task by augmenting tools/call (background_work has taskSupport: optional)
+  task = client.call_tool_as_task('background_work', { input: 'test' }, ttl: 60_000)
+  runner.assert('call_tool_as_task returns a Task', task.is_a?(MCPClient::Task))
+  runner.assert('task has a task_id', !task.task_id.nil? && !task.task_id.empty?)
+  runner.assert('task initial status is working', task.status == 'working')
 
-  # Wait briefly then get task state (should be running or completed)
-  sleep 0.5
-  task_state = client.get_task(task.id)
-  runner.assert('get_task returns a Task', task_state.is_a?(MCPClient::Task))
-  runner.assert(
-    'task is running or completed after 0.5s',
-    %w[running completed].include?(task_state.state),
-    "state: #{task_state.state}"
-  )
+  # Poll until the task reaches a terminal status, honoring poll_interval
+  final = task
+  20.times do
+    break if final.terminal?
 
-  # Wait for completion
-  sleep 2.5
-  final_state = client.get_task(task.id)
-  runner.assert('task is completed after waiting', final_state.state == 'completed')
-  runner.assert('completed task has result', !final_state.result.nil?) if final_state.state == 'completed'
+    sleep((final.poll_interval || 500) / 1000.0)
+    final = client.get_task(task.task_id)
+  end
+  runner.assert('get_task returns a Task', final.is_a?(MCPClient::Task))
+  runner.assert('task is completed after waiting', final.status == 'completed', "status: #{final.status}")
+
+  # Retrieve the underlying result via tasks/result
+  if final.status == 'completed'
+    result = client.get_task_result(task.task_id)
+    runner.assert('get_task_result returns the underlying content', result['content'].is_a?(Array))
+  end
+
+  # tasks/list returns the tasks
+  listing = client.list_tasks
+  runner.assert('list_tasks returns tasks', listing[:tasks].any? { |t| t.task_id == task.task_id })
 
   # Create another task and cancel it quickly
-  cancel_task = client.create_task('cancel_test', params: {})
-  runner.assert('cancel test task created', cancel_task.is_a?(MCPClient::Task))
-
-  cancelled = client.cancel_task(cancel_task.id)
-  runner.assert('cancel_task returns a Task', cancelled.is_a?(MCPClient::Task))
-  runner.assert('cancelled task state is cancelled', cancelled.state == 'cancelled')
-
-  # Verify get on cancelled task
-  cancelled_get = client.get_task(cancel_task.id)
-  runner.assert('get_task on cancelled task returns cancelled', cancelled_get.state == 'cancelled')
+  cancel_target = client.call_tool_as_task('background_work', {})
+  cancelled = client.cancel_task(cancel_target.task_id)
+  runner.assert('cancel_task returns a cancelled Task', cancelled.status == 'cancelled')
 
   # Task error handling: get non-existent task
   begin

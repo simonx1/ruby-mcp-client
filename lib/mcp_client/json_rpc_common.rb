@@ -76,6 +76,11 @@ module MCPClient
         'elicitation' => {}, # MCP 2025-11-25: Support for server-initiated user interactions
         'roots' => { 'listChanged' => true }, # MCP 2025-11-25: Support for roots
         'sampling' => {} # MCP 2025-11-25: Support for server-initiated LLM sampling
+        # NOTE: we intentionally do NOT declare a client `tasks` capability. That
+        # capability marks the client as a RECEIVER of task-augmented
+        # sampling/elicitation requests, which is not implemented here — this
+        # client only acts as a task REQUESTOR for tools/call (see
+        # Client#call_tool_as_task), which requires no client-side declaration.
       }
 
       {
