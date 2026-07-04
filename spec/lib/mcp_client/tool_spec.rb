@@ -314,13 +314,13 @@ RSpec.describe MCPClient::Tool do
 
   describe 'MCP 2025-11-25 annotation hints' do
     describe '#read_only_hint?' do
-      it 'defaults to true when no annotations' do
-        expect(tool.read_only_hint?).to be true
+      it 'defaults to false when no annotations (MCP ToolAnnotations default)' do
+        expect(tool.read_only_hint?).to be false
       end
 
-      it 'defaults to true when annotations exist but readOnlyHint is not set' do
+      it 'defaults to false when annotations exist but readOnlyHint is not set' do
         t = described_class.new(name: 't', description: 'd', schema: {}, annotations: {})
-        expect(t.read_only_hint?).to be true
+        expect(t.read_only_hint?).to be false
       end
 
       it 'returns true when readOnlyHint is true (string key)' do
@@ -343,13 +343,13 @@ RSpec.describe MCPClient::Tool do
     end
 
     describe '#destructive_hint?' do
-      it 'defaults to false when no annotations' do
-        expect(tool.destructive_hint?).to be false
+      it 'defaults to true when no annotations (MCP ToolAnnotations default)' do
+        expect(tool.destructive_hint?).to be true
       end
 
-      it 'defaults to false when annotations exist but destructiveHint is not set' do
+      it 'defaults to true when annotations exist but destructiveHint is not set' do
         t = described_class.new(name: 't', description: 'd', schema: {}, annotations: {})
-        expect(t.destructive_hint?).to be false
+        expect(t.destructive_hint?).to be true
       end
 
       it 'returns false when destructiveHint is false (string key)' do

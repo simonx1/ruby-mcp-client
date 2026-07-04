@@ -114,21 +114,25 @@ module MCPClient
 
     # Check the readOnlyHint annotation (MCP 2025-11-25)
     # When true, the tool does not modify its environment.
-    # @return [Boolean] defaults to true when not specified
+    # Per the MCP ToolAnnotations schema the default is false, i.e. a tool
+    # without this hint is assumed to potentially modify its environment.
+    # @return [Boolean] defaults to false when not specified
     def read_only_hint?
-      return true unless @annotations
+      return false unless @annotations
 
-      fetch_annotation_hint('readOnlyHint', :readOnlyHint, true)
+      fetch_annotation_hint('readOnlyHint', :readOnlyHint, false)
     end
 
     # Check the destructiveHint annotation (MCP 2025-11-25)
     # When true, the tool may perform destructive updates.
-    # Only meaningful when readOnlyHint is false.
-    # @return [Boolean] defaults to false when not specified
+    # Only meaningful when readOnlyHint is false. Per the MCP ToolAnnotations
+    # schema the default is true, i.e. a non-read-only tool without this hint
+    # is assumed to be potentially destructive.
+    # @return [Boolean] defaults to true when not specified
     def destructive_hint?
-      return false unless @annotations
+      return true unless @annotations
 
-      fetch_annotation_hint('destructiveHint', :destructiveHint, false)
+      fetch_annotation_hint('destructiveHint', :destructiveHint, true)
     end
 
     # Check the idempotentHint annotation (MCP 2025-11-25)

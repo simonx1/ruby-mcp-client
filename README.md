@@ -124,9 +124,12 @@ end
 tool = client.find_tool('delete_user')
 
 # Hint-style annotations (MCP 2025-11-25)
-tool.read_only_hint?      # Defaults to true; tool does not modify environment
-tool.destructive_hint?    # Defaults to false; tool may perform destructive updates
-tool.idempotent_hint?     # Defaults to false; repeated calls have no additional effect
+# Defaults follow the MCP ToolAnnotations schema: when a hint is absent the
+# client assumes the less-safe value, so an un-annotated tool is treated as
+# writable, potentially destructive, and open-world.
+tool.read_only_hint?      # Defaults to false; tool may modify its environment
+tool.destructive_hint?    # Defaults to true; tool may perform destructive updates
+tool.idempotent_hint?     # Defaults to false; repeated calls may have additional effects
 tool.open_world_hint?     # Defaults to true; tool may interact with external entities
 
 # Legacy annotations
