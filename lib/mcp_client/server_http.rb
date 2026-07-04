@@ -246,8 +246,8 @@ module MCPClient
       begin
         ensure_connected
 
-        prompts_data = rpc_request('prompts/list')
-        prompts = prompts_data['prompts'] || []
+        # Follow nextCursor across pages so the full prompt list is returned.
+        prompts = request_paginated_list('prompts/list', 'prompts')
 
         @mutex.synchronize do
           @prompts = prompts.map do |prompt_data|
@@ -497,24 +497,15 @@ module MCPClient
     # @raise [MCPClient::Errors::ToolCallError] if tools list retrieval fails
     def request_tools_list
       @mutex.synchronize do
-        return @tools_data if @tools_data
+        return @tools_data.dup if @tools_data
       end
 
-      result = rpc_request('tools/list')
+      # Follow nextCursor across pages so the full tool list is returned even
+      # when the server paginates.
+      tools = request_paginated_list('tools/list', 'tools')
 
-      if result && result['tools']
-        @mutex.synchronize do
-          @tools_data = result['tools']
-        end
-        return @mutex.synchronize { @tools_data.dup }
-      elsif result
-        @mutex.synchronize do
-          @tools_data = result
-        end
-        return @mutex.synchronize { @tools_data.dup }
-      end
-
-      raise MCPClient::Errors::ToolCallError, 'Failed to get tools list from JSON-RPC request'
+      @mutex.synchronize { @tools_data = tools }
+      @mutex.synchronize { @tools_data.dup }
     end
   end
 end

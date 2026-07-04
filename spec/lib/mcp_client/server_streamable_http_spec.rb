@@ -311,6 +311,37 @@ RSpec.describe MCPClient::ServerStreamableHTTP do
       end
     end
 
+    context 'when the tool list is paginated across pages' do
+      before do
+        # Page 1 (no cursor) carries a nextCursor; page 2 (cursor) ends the list
+        stub_request(:post, "#{base_url}#{endpoint}")
+          .with(body: hash_including('method' => 'tools/list', 'params' => {}))
+          .to_return(
+            status: 200,
+            body: "event: message\ndata: #{{ jsonrpc: '2.0', id: 2,
+                                             result: { tools: [{ name: 'tool_a', description: 'A',
+                                                                 inputSchema: {} }],
+                                                       nextCursor: 'p2' } }.to_json}\n\n",
+            headers: { 'Content-Type' => 'text/event-stream' }
+          )
+        stub_request(:post, "#{base_url}#{endpoint}")
+          .with(body: hash_including('method' => 'tools/list', 'params' => { 'cursor' => 'p2' }))
+          .to_return(
+            status: 200,
+            body: "event: message\ndata: #{{ jsonrpc: '2.0', id: 3,
+                                             result: { tools: [{ name: 'tool_b', description: 'B',
+                                                                 inputSchema: {} }] } }.to_json}\n\n",
+            headers: { 'Content-Type' => 'text/event-stream' }
+          )
+      end
+
+      it 'follows nextCursor and returns tools from every page' do
+        expect(server.list_tools.map(&:name)).to eq(%w[tool_a tool_b])
+        expect(WebMock).to have_requested(:post, "#{base_url}#{endpoint}")
+          .with(body: hash_including('params' => { 'cursor' => 'p2' })).once
+      end
+    end
+
     context 'when server returns error' do
       before do
         stub_request(:post, "#{base_url}#{endpoint}")

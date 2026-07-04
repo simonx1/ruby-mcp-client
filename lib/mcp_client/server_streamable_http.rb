@@ -575,24 +575,15 @@ module MCPClient
     # @raise [MCPClient::Errors::ToolCallError] if tools list retrieval fails
     def request_tools_list
       @mutex.synchronize do
-        return @tools_data if @tools_data
+        return @tools_data.dup if @tools_data
       end
 
-      result = rpc_request('tools/list')
+      # Follow nextCursor across pages so the full tool list is returned even
+      # when the server paginates.
+      tools = request_paginated_list('tools/list', 'tools')
 
-      if result.is_a?(Hash) && result['tools']
-        @mutex.synchronize do
-          @tools_data = result['tools']
-        end
-        return @mutex.synchronize { @tools_data.dup }
-      elsif result.is_a?(Array) || result
-        @mutex.synchronize do
-          @tools_data = result
-        end
-        return @mutex.synchronize { @tools_data.dup }
-      end
-
-      raise MCPClient::Errors::ToolCallError, 'Failed to get tools list from JSON-RPC request'
+      @mutex.synchronize { @tools_data = tools }
+      @mutex.synchronize { @tools_data.dup }
     end
 
     # Request the prompts list using JSON-RPC
@@ -600,24 +591,14 @@ module MCPClient
     # @raise [MCPClient::Errors::PromptGetError] if prompts list retrieval fails
     def request_prompts_list
       @mutex.synchronize do
-        return @prompts_data if @prompts_data
+        return @prompts_data.dup if @prompts_data
       end
 
-      result = rpc_request('prompts/list')
+      # Follow nextCursor across pages so the full prompt list is returned.
+      prompts = request_paginated_list('prompts/list', 'prompts')
 
-      if result.is_a?(Hash) && result['prompts']
-        @mutex.synchronize do
-          @prompts_data = result['prompts']
-        end
-        return @mutex.synchronize { @prompts_data.dup }
-      elsif result.is_a?(Array) || result
-        @mutex.synchronize do
-          @prompts_data = result
-        end
-        return @mutex.synchronize { @prompts_data.dup }
-      end
-
-      raise MCPClient::Errors::PromptGetError, 'Failed to get prompts list from JSON-RPC request'
+      @mutex.synchronize { @prompts_data = prompts }
+      @mutex.synchronize { @prompts_data.dup }
     end
 
     # Request the resources list using JSON-RPC

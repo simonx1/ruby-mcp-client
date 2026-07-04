@@ -133,7 +133,80 @@ module MCPClient
       @notification_callback = block
     end
 
+    # Safety bound on the number of pages followed when auto-paginating a
+    # cursor-based list operation, to protect against a server that returns
+    # a nextCursor indefinitely.
+    MAX_LIST_PAGES = 1000
+
     protected
+
+    # Follow cursor-based pagination across pages, collecting every item.
+    #
+    # Yields the current cursor (nil for the first page) and expects the block
+    # to return a two-element array: [items_for_this_page, next_cursor]. The
+    # loop stops when next_cursor is nil or empty, when a cursor repeats
+    # (malformed server), or when MAX_LIST_PAGES pages have been fetched.
+    #
+    # @param kind [String] label used in diagnostic log messages
+    # @yieldparam cursor [String, nil] cursor for the page to fetch
+    # @yieldreturn [Array(Array, String), Array(Array, nil)] page items and next cursor
+    # @return [Array] all items collected across pages
+    def collect_paginated(kind = 'items')
+      items = []
+      cursor = nil
+      seen_cursors = {}
+      pages = 0
+
+      loop do
+        page_items, next_cursor = yield(cursor)
+        items.concat(Array(page_items))
+        pages += 1
+
+        break if next_cursor.nil? || next_cursor.to_s.empty?
+
+        if seen_cursors[next_cursor]
+          @logger.warn("Pagination for #{kind} stopped: server returned a repeated cursor #{next_cursor.inspect}")
+          break
+        end
+        if pages >= MAX_LIST_PAGES
+          @logger.warn("Pagination for #{kind} stopped after #{pages} pages (safety bound reached)")
+          break
+        end
+
+        seen_cursors[next_cursor] = true
+        cursor = next_cursor
+      end
+
+      items
+    end
+
+    # Fetch a full, cursor-paginated list result via rpc_request, following
+    # nextCursor across pages until the server stops returning one.
+    #
+    # Accepts either a spec-shaped Hash ({ key => [...], 'nextCursor' => ... })
+    # or, leniently, a bare Array (a single unpaginated page). A response that
+    # is neither (e.g. a null/missing result or a scalar) is a malformed list
+    # response and raises, rather than being silently treated as an empty list.
+    #
+    # @param method [String] the list method, e.g. 'tools/list'
+    # @param key [String] the result array key, e.g. 'tools'
+    # @return [Array<Hash>] all raw item hashes collected across pages
+    # @raise [MCPClient::Errors::TransportError] if a page result is not a Hash or Array
+    def request_paginated_list(method, key)
+      collect_paginated(key) do |cursor|
+        params = cursor ? { cursor: cursor } : {}
+        result = rpc_request(method, params)
+        case result
+        when Hash
+          [result[key] || [], result['nextCursor']]
+        when Array
+          [result, nil]
+        else
+          raise MCPClient::Errors::TransportError,
+                "Invalid #{method} response: expected an object or array, got #{result.class}"
+        end
+      end
+    end
 
     # Initialize logger with proper formatter handling
     # Preserves custom formatter if logger is provided, otherwise sets a default formatter
