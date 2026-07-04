@@ -88,6 +88,10 @@ module MCPClient
 
             cleanup
 
+            # Clear any stale auth error from the previous connection so it does
+            # not spuriously abort this reconnect via wait_for_connection.
+            @mutex.synchronize { @auth_error = nil }
+
             connect
             @logger.info('Successfully reconnected after ping failures')
 

@@ -405,28 +405,42 @@ module MCPClient
         @sse_connected = false
         @initialized = false # Reset initialization state for reconnection
 
+        # Reset the SSE parse buffer so a reconnect never inherits a leftover
+        # partial event from the previous connection.
+        @buffer = ''
+
         # Log cleanup for debugging
         @logger.debug('Cleaning up SSE connection')
 
         # Store threads locally to avoid race conditions
         sse_thread = @sse_thread
+
+        # The activity monitor drives reconnection, and reconnection calls this
+        # method FROM that thread. Killing the current thread here would abort
+        # the reconnect before connect() runs (the historical dead-code bug), so
+        # never kill/clear the activity thread when we are running on it. Leaving
+        # @activity_timer_thread referenced also makes start_activity_monitor
+        # short-circuit, preventing a duplicate monitor after reconnect.
         activity_thread = @activity_timer_thread
+        kill_activity_thread = activity_thread && activity_thread != Thread.current
 
         # Clear thread references first
         @sse_thread = nil
-        @activity_timer_thread = nil
+        @activity_timer_thread = nil if kill_activity_thread
 
-        # Kill threads outside the critical section
+        # Kill threads
         begin
           sse_thread&.kill
         rescue StandardError => e
           @logger.debug("Error killing SSE thread: #{e.message}")
         end
 
-        begin
-          activity_thread&.kill
-        rescue StandardError => e
-          @logger.debug("Error killing activity thread: #{e.message}")
+        if kill_activity_thread
+          begin
+            activity_thread.kill
+          rescue StandardError => e
+            @logger.debug("Error killing activity thread: #{e.message}")
+          end
         end
 
         if @http_client
