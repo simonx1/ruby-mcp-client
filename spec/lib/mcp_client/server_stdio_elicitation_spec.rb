@@ -57,6 +57,23 @@ RSpec.describe MCPClient::ServerStdio, 'Elicitation (MCP 2025-06-18)' do
       end
     end
 
+    context 'when method is ping' do
+      let(:message) do
+        {
+          'id' => request_id,
+          'method' => 'ping',
+          'params' => {}
+        }
+      end
+
+      it 'responds with an empty result (MCP ping utility)' do
+        server.handle_server_request(message)
+        expect(stdin_mock.string).to include('"id":123')
+        expect(stdin_mock.string).to include('"result":{}')
+        expect(stdin_mock.string).not_to include('error')
+      end
+    end
+
     context 'when method is unknown' do
       let(:message) do
         {

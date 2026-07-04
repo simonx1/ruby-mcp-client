@@ -476,6 +476,8 @@ module MCPClient
       @logger.debug("Received server request: #{method} (id: #{request_id})")
 
       case method
+      when 'ping'
+        handle_ping(request_id)
       when 'elicitation/create'
         handle_elicitation_create(request_id, params)
       when 'roots/list'
@@ -489,6 +491,21 @@ module MCPClient
     rescue StandardError => e
       @logger.error("Error handling server request: #{e.message}")
       send_error_response(request_id, -32_603, "Internal error: #{e.message}")
+    end
+
+    # Handle a server-initiated ping request (MCP ping utility)
+    # The receiver MUST respond promptly with an empty result.
+    # @param request_id [String, Integer] the JSON-RPC request ID
+    # @return [void]
+    def handle_ping(request_id)
+      response = {
+        'jsonrpc' => '2.0',
+        'id' => request_id,
+        'result' => {}
+      }
+      post_jsonrpc_response(response)
+    rescue StandardError => e
+      @logger.error("Error sending ping response: #{e.message}")
     end
 
     # Handle elicitation/create request from server (MCP 2025-06-18)
