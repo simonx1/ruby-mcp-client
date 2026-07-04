@@ -208,6 +208,7 @@ RSpec.describe MCPClient::ServerStdio do
       @stderr = double('stderr', close: nil, closed?: false)
       @wait_thread = double('wait_thread', pid: 12_345, alive?: true, join: nil)
       @reader_thread = double('reader_thread', kill: nil)
+      @stderr_thread = double('stderr_thread', kill: nil)
 
       allow(Open3).to receive(:popen3).and_return([@stdin, @stdout, @stderr, @wait_thread])
       allow(Process).to receive(:kill)
@@ -217,6 +218,7 @@ RSpec.describe MCPClient::ServerStdio do
       server.instance_variable_set(:@stderr, @stderr)
       server.instance_variable_set(:@wait_thread, @wait_thread)
       server.instance_variable_set(:@reader_thread, @reader_thread)
+      server.instance_variable_set(:@stderr_thread, @stderr_thread)
     end
 
     it 'closes the streams' do
@@ -237,6 +239,11 @@ RSpec.describe MCPClient::ServerStdio do
       server.cleanup
     end
 
+    it 'kills the stderr reader thread' do
+      expect(@stderr_thread).to receive(:kill)
+      server.cleanup
+    end
+
     it 'handles already closed streams' do
       allow(@stdin).to receive(:closed?).and_return(true)
       expect(@stdin).not_to receive(:close)
@@ -250,6 +257,65 @@ RSpec.describe MCPClient::ServerStdio do
       expect(server.instance_variable_get(:@stderr)).to be_nil
       expect(server.instance_variable_get(:@wait_thread)).to be_nil
       expect(server.instance_variable_get(:@reader_thread)).to be_nil
+      expect(server.instance_variable_get(:@stderr_thread)).to be_nil
+    end
+  end
+
+  describe '#start_stderr_reader' do
+    it 'continuously drains the subprocess stderr so its pipe buffer cannot fill and deadlock' do
+      stderr = StringIO.new("line one\nline two\n")
+      server.instance_variable_set(:@stderr, stderr)
+      logger = server.instance_variable_get(:@logger)
+      allow(logger).to receive(:debug)
+
+      server.start_stderr_reader
+      server.instance_variable_get(:@stderr_thread).join(2)
+
+      expect(logger).to have_received(:debug).with('[stderr] line one')
+      expect(logger).to have_received(:debug).with('[stderr] line two')
+    end
+
+    it 'does not raise when the stderr stream is closed underneath it' do
+      reader, writer = IO.pipe
+      server.instance_variable_set(:@stderr, reader)
+      server.start_stderr_reader
+      writer.close
+      thread = server.instance_variable_get(:@stderr_thread)
+      expect { thread.join(2) }.not_to raise_error
+      reader.close unless reader.closed?
+    end
+
+    it 'flushes a trailing partial line (no newline) when the stream closes' do
+      reader, writer = IO.pipe
+      server.instance_variable_set(:@stderr, reader)
+      logger = server.instance_variable_get(:@logger)
+      allow(logger).to receive(:debug)
+
+      server.start_stderr_reader
+      writer.write('progress without newline')
+      writer.close
+      server.instance_variable_get(:@stderr_thread).join(2)
+
+      expect(logger).to have_received(:debug).with('[stderr] progress without newline')
+      reader.close unless reader.closed?
+    end
+
+    it 'bounds an unterminated stderr line instead of buffering it without limit' do
+      reader, writer = IO.pipe
+      server.instance_variable_set(:@stderr, reader)
+      logger = server.instance_variable_get(:@logger)
+      allow(logger).to receive(:debug)
+
+      server.start_stderr_reader
+      # Write more than STDERR_MAX_LINE_SIZE bytes with no newline delimiter.
+      writer.write('x' * (described_class::STDERR_MAX_LINE_SIZE + 1024))
+      writer.close
+      server.instance_variable_get(:@stderr_thread).join(2)
+
+      # The oversize fragment is flushed rather than retained; at least one
+      # debug line is emitted and the reader does not hang.
+      expect(logger).to have_received(:debug).at_least(:once)
+      reader.close unless reader.closed?
     end
   end
 

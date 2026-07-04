@@ -16,6 +16,7 @@ module MCPClient
 
         connect
         start_reader
+        start_stderr_reader
         perform_initialize
 
         @initialized = true
