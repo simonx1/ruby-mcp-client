@@ -54,7 +54,7 @@ Full implementation of the **MCP 2025-11-25** specification, upgrading from 2025
 
 #### MCP 2025-06-18 Protocol Compliance (#62)
 - **Roots Support**: Define filesystem scope boundaries
-  - `client.set_roots([{ uri: 'file:///path', name: 'Root' }])`
+  - `client.roots = [{ uri: 'file:///path', name: 'Root' }]`
   - Sends `notifications/roots/list_changed` to servers
   - Handles `roots/list` requests from servers
 
@@ -69,7 +69,7 @@ Full implementation of the **MCP 2025-11-25** specification, upgrading from 2025
   - Returns completion values with pagination info
 
 - **Logging Support**: Server log messages
-  - `client.set_log_level(level)` method
+  - `client.log_level = level`
   - Handles `notifications/message` from servers
   - Maps MCP levels to Ruby Logger levels
 

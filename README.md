@@ -340,6 +340,7 @@ See `examples/` for complete implementations:
 ## OAuth 2.1 Authentication
 
 ```ruby
+require 'mcp_client'
 require 'mcp_client/auth/browser_oauth'
 
 oauth = MCPClient::Auth::OAuthProvider.new(
