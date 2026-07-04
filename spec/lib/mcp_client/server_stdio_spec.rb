@@ -125,6 +125,54 @@ RSpec.describe MCPClient::ServerStdio do
     end
   end
 
+  describe 'list pagination' do
+    before do
+      allow(server).to receive(:ensure_initialized)
+      allow(server).to receive(:send_request)
+    end
+
+    def tools_page(id, names, next_cursor = nil)
+      result = { 'tools' => names.map { |n| { 'name' => n, 'description' => 'd', 'inputSchema' => {} } } }
+      result['nextCursor'] = next_cursor if next_cursor
+      { 'jsonrpc' => '2.0', 'id' => id, 'result' => result }
+    end
+
+    it 'follows nextCursor across pages for list_tools' do
+      allow(server).to receive(:wait_response).and_return(
+        tools_page(1, %w[a b], 'cursor-2'),
+        tools_page(2, %w[c], 'cursor-3'),
+        tools_page(3, %w[d])
+      )
+      expect(server.list_tools.map(&:name)).to eq(%w[a b c d])
+    end
+
+    it 'sends the cursor on subsequent pages' do
+      allow(server).to receive(:wait_response).and_return(
+        tools_page(1, %w[a], 'CURSOR'),
+        tools_page(2, %w[b])
+      )
+      sent = []
+      allow(server).to receive(:send_request) { |req| sent << req }
+      server.list_tools
+      expect(sent[0]['params']).to eq({})
+      expect(sent[1]['params']).to eq({ 'cursor' => 'CURSOR' })
+    end
+
+    it 'stops when the server repeats a cursor (infinite-loop guard)' do
+      allow(server).to receive(:wait_response).and_return(tools_page(1, %w[x], 'same'))
+      # Every page returns the same cursor; the guard must stop after it repeats
+      expect(server.list_tools.map(&:name)).to eq(%w[x x])
+    end
+
+    it 'follows nextCursor across pages for list_prompts' do
+      page1 = { 'jsonrpc' => '2.0', 'id' => 1,
+                'result' => { 'prompts' => [{ 'name' => 'p1' }], 'nextCursor' => 'n' } }
+      page2 = { 'jsonrpc' => '2.0', 'id' => 2, 'result' => { 'prompts' => [{ 'name' => 'p2' }] } }
+      allow(server).to receive(:wait_response).and_return(page1, page2)
+      expect(server.list_prompts.map(&:name)).to eq(%w[p1 p2])
+    end
+  end
+
   describe '#call_tool' do
     let(:tool_name) { 'test_tool' }
     let(:parameters) { { 'foo' => 'bar' } }

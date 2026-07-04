@@ -260,6 +260,35 @@ RSpec.describe MCPClient::ServerHTTP do
       expect(WebMock).to have_requested(:post, "#{base_url}#{endpoint}").once
     end
 
+    context 'with a paginated tool list' do
+      before do
+        # First page carries a nextCursor, second page ends the list
+        stub_request(:post, "#{base_url}#{endpoint}")
+          .with(body: hash_including('method' => 'tools/list', 'params' => {}))
+          .to_return(
+            status: 200,
+            body: { jsonrpc: '2.0', id: 2,
+                    result: { tools: [{ name: 'tool_a', description: 'A', inputSchema: {} }],
+                              nextCursor: 'page-2' } }.to_json,
+            headers: { 'Content-Type' => 'application/json' }
+          )
+        stub_request(:post, "#{base_url}#{endpoint}")
+          .with(body: hash_including('method' => 'tools/list', 'params' => { 'cursor' => 'page-2' }))
+          .to_return(
+            status: 200,
+            body: { jsonrpc: '2.0', id: 3,
+                    result: { tools: [{ name: 'tool_b', description: 'B', inputSchema: {} }] } }.to_json,
+            headers: { 'Content-Type' => 'application/json' }
+          )
+      end
+
+      it 'follows nextCursor and returns tools from every page' do
+        expect(server.list_tools.map(&:name)).to eq(%w[tool_a tool_b])
+        expect(WebMock).to have_requested(:post, "#{base_url}#{endpoint}")
+          .with(body: hash_including('params' => { 'cursor' => 'page-2' })).once
+      end
+    end
+
     context 'when not connected' do
       before do
         server.instance_variable_set(:@connection_established, false)

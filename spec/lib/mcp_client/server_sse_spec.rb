@@ -284,6 +284,27 @@ RSpec.describe MCPClient::ServerSSE do
       expect(server.tools.first).to be_a(MCPClient::Tool)
     end
 
+    context 'when the tool list is paginated' do
+      before do
+        uri = URI.parse(base_url)
+        rpc_url = "#{uri.scheme}://#{uri.host}:#{uri.port}/rpc"
+        # Sequential responses: page 1 carries nextCursor, page 2 ends the list
+        stub_request(:post, rpc_url).to_return(
+          { status: 200,
+            body: { result: { tools: [{ 'name' => 'tool_a', 'description' => 'A', 'inputSchema' => {} }],
+                              nextCursor: 'p2' } }.to_json,
+            headers: { 'Content-Type' => 'application/json' } },
+          { status: 200,
+            body: { result: { tools: [{ 'name' => 'tool_b', 'description' => 'B', 'inputSchema' => {} }] } }.to_json,
+            headers: { 'Content-Type' => 'application/json' } }
+        )
+      end
+
+      it 'follows nextCursor and returns tools from every page' do
+        expect(server.list_tools.map(&:name)).to eq(%w[tool_a tool_b])
+      end
+    end
+
     it 'raises ServerError on non-success response' do
       # Stub error response
       uri = URI.parse(base_url)

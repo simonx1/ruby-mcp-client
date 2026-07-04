@@ -107,6 +107,11 @@ end
 prompts = client.list_prompts
 result = client.get_prompt('greeting', { name: 'Alice' })
 
+# Pagination: list_tools and list_prompts automatically follow the server's
+# nextCursor and return the COMPLETE set across all pages (with a per-call
+# safety bound and an identical-cursor loop guard). No manual cursor handling
+# is required.
+
 # Resources
 result = client.list_resources
 contents = client.read_resource('file:///example.txt')

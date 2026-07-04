@@ -70,5 +70,18 @@ RSpec.describe MCPClient::ServerSSE::SseParser do
       parser.parse_and_handle_sse_event(raw)
       expect(parser.notification_calls).to eq([['n', { 'a' => 1 }]])
     end
+
+    it 'delivers a JSON-RPC response into @sse_results without touching @tools_data' do
+      # A tools/list response must NOT be written into @tools_data as a side
+      # effect; that would let a concurrent list_tools observe a partial page
+      # mid-pagination. request_tools_list is the sole writer of @tools_data.
+      response = { jsonrpc: '2.0', id: 7, result: { tools: [{ name: 'a' }], nextCursor: 'p2' } }
+      raw = "event: message\ndata: #{response.to_json}\n\n"
+      parser.parse_and_handle_sse_event(raw)
+
+      expect(parser.instance_variable_get(:@sse_results)[7]).to eq('tools' => [{ 'name' => 'a' }],
+                                                                   'nextCursor' => 'p2')
+      expect(parser.instance_variable_get(:@tools_data)).to be_nil
+    end
   end
 end

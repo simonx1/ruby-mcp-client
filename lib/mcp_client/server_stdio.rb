@@ -179,15 +179,21 @@ module MCPClient
     # @raise [MCPClient::Errors::PromptGetError] for other errors during prompt listing
     def list_prompts
       ensure_initialized
-      req_id = next_id
-      req = { 'jsonrpc' => '2.0', 'id' => req_id, 'method' => 'prompts/list', 'params' => {} }
-      send_request(req)
-      res = wait_response(req_id)
-      if (err = res['error'])
-        raise MCPClient::Errors::ServerError, err['message']
-      end
+      collect_paginated('prompts') do |cursor|
+        params = {}
+        params['cursor'] = cursor if cursor
+        req_id = next_id
+        req = { 'jsonrpc' => '2.0', 'id' => req_id, 'method' => 'prompts/list', 'params' => params }
+        send_request(req)
+        res = wait_response(req_id)
+        if (err = res['error'])
+          raise MCPClient::Errors::ServerError, err['message']
+        end
 
-      (res.dig('result', 'prompts') || []).map { |td| MCPClient::Prompt.from_json(td, server: self) }
+        result = res['result'] || {}
+        prompts = (result['prompts'] || []).map { |td| MCPClient::Prompt.from_json(td, server: self) }
+        [prompts, result['nextCursor']]
+      end
     rescue StandardError => e
       raise MCPClient::Errors::PromptGetError, "Error listing prompts: #{e.message}"
     end
@@ -351,16 +357,22 @@ module MCPClient
     # @raise [MCPClient::Errors::ToolCallError] for other errors during tool listing
     def list_tools
       ensure_initialized
-      req_id = next_id
-      # JSON-RPC method for listing tools
-      req = { 'jsonrpc' => '2.0', 'id' => req_id, 'method' => 'tools/list', 'params' => {} }
-      send_request(req)
-      res = wait_response(req_id)
-      if (err = res['error'])
-        raise MCPClient::Errors::ServerError, err['message']
-      end
+      collect_paginated('tools') do |cursor|
+        params = {}
+        params['cursor'] = cursor if cursor
+        req_id = next_id
+        # JSON-RPC method for listing tools
+        req = { 'jsonrpc' => '2.0', 'id' => req_id, 'method' => 'tools/list', 'params' => params }
+        send_request(req)
+        res = wait_response(req_id)
+        if (err = res['error'])
+          raise MCPClient::Errors::ServerError, err['message']
+        end
 
-      (res.dig('result', 'tools') || []).map { |td| MCPClient::Tool.from_json(td, server: self) }
+        result = res['result'] || {}
+        tools = (result['tools'] || []).map { |td| MCPClient::Tool.from_json(td, server: self) }
+        [tools, result['nextCursor']]
+      end
     rescue StandardError => e
       raise MCPClient::Errors::ToolCallError, "Error listing tools: #{e.message}"
     end

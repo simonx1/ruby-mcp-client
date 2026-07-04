@@ -85,9 +85,12 @@ module MCPClient
       def process_response?(data)
         return false unless data['id']
 
+        # Deliver the response to the waiting caller via @sse_results only.
+        # We intentionally do NOT write @tools_data here: request_tools_list is
+        # the sole writer of that cache and sets it to the COMPLETE, fully
+        # paginated list. Writing each page as it arrives would let a concurrent
+        # list_tools observe a partial (page-1-only) cache mid-pagination.
         @mutex.synchronize do
-          @tools_data = data['result']['tools'] if data['result'] && data['result']['tools']
-
           @sse_results[data['id']] =
             if data['error']
               { 'isError' => true,
