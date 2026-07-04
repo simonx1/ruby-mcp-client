@@ -45,12 +45,15 @@ module MCPClient
         @stdin.puts(notif.to_json)
       end
 
-      # Generate a new unique request ID
+      # Generate a new unique request ID and mark it as awaiting a response.
+      # Registering the id before the request is sent lets the reader thread
+      # distinguish expected responses from late/unsolicited ones.
       # @return [Integer] a unique request ID
       def next_id
         @mutex.synchronize do
           id = @next_id
           @next_id += 1
+          @awaiting[id] = true
           id
         end
       end
@@ -63,6 +66,10 @@ module MCPClient
         @logger.debug("Sending JSONRPC request: #{req.to_json}")
         @stdin.puts(req.to_json)
       rescue StandardError => e
+        # A request that failed to send will never receive a response, so drop
+        # its awaiting marker; otherwise a broken transport (e.g. the server
+        # exited) would leak an entry per retry/attempt into @awaiting.
+        @mutex.synchronize { @awaiting.delete(req['id']) } if req.is_a?(Hash) && req['id']
         raise MCPClient::Errors::TransportError, "Failed to send JSONRPC request: #{e.message}"
       end
 
@@ -79,8 +86,10 @@ module MCPClient
 
             @cond.wait(@mutex, remaining)
           end
-          msg = @pending[id]
-          @pending[id] = nil
+          # Remove the response and the awaiting marker on both success and
+          # timeout so neither @pending nor @awaiting accumulates entries.
+          msg = @pending.delete(id)
+          @awaiting.delete(id)
           raise MCPClient::Errors::TransportError, "Timeout waiting for JSONRPC response id=#{id}" unless msg
 
           msg

@@ -8,13 +8,14 @@ RSpec.describe MCPClient::ServerStdio::JsonRpcTransport do
     Class.new do
       include MCPClient::ServerStdio::JsonRpcTransport
 
-      attr_accessor :stdin, :mutex, :cond, :pending,
+      attr_accessor :stdin, :mutex, :cond, :pending, :awaiting,
                     :logger, :max_retries, :retry_backoff, :read_timeout
 
       def initialize
         @mutex = Mutex.new
         @cond = ConditionVariable.new
         @pending = {}
+        @awaiting = {}
         @next_id = 1
         @logger = Logger.new(StringIO.new)
         @stdin = StringIO.new
