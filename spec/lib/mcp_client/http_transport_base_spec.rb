@@ -363,17 +363,35 @@ RSpec.describe MCPClient::HttpTransportBase do
               transport.test_handle_http_error_response(response)
             end.to raise_error(MCPClient::Errors::ServerError, /Client error.*#{status}.*Test Error/)
           end
+
+          it "raises a NON-retryable (plain) ServerError for HTTP #{status}" do
+            allow(response).to receive(:status).and_return(status)
+
+            begin
+              transport.test_handle_http_error_response(response)
+            rescue MCPClient::Errors::ServerError => e
+              expect(e).not_to be_a(MCPClient::Errors::TransientServerError)
+            end
+          end
         end
       end
 
       context 'with server errors' do
         [500, 502, 503, 504].each do |status|
-          it "raises ServerError for HTTP #{status}" do
+          it "raises a retryable TransientServerError for HTTP #{status}" do
             allow(response).to receive(:status).and_return(status)
 
             expect do
               transport.test_handle_http_error_response(response)
-            end.to raise_error(MCPClient::Errors::ServerError, /Server error.*#{status}.*Test Error/)
+            end.to raise_error(MCPClient::Errors::TransientServerError, /Server error.*#{status}.*Test Error/)
+          end
+
+          it "TransientServerError for HTTP #{status} is still a ServerError (backward compatible)" do
+            allow(response).to receive(:status).and_return(status)
+
+            expect do
+              transport.test_handle_http_error_response(response)
+            end.to raise_error(MCPClient::Errors::ServerError)
           end
         end
       end
@@ -400,6 +418,50 @@ RSpec.describe MCPClient::HttpTransportBase do
             transport.test_handle_http_error_response(response)
           end.to raise_error(MCPClient::Errors::ServerError, /Server error.*500$/)
         end
+      end
+    end
+
+    describe '#rpc_request retry behavior' do
+      before { transport.retry_backoff = 0.01 }
+
+      it 'does NOT re-send a request that failed with a plain ServerError' do
+        # A JSON-RPC error response or HTTP 4xx means the server already
+        # processed the request; retrying would re-execute a non-idempotent call.
+        calls = 0
+        allow(transport).to receive(:send_jsonrpc_request) do
+          calls += 1
+          raise MCPClient::Errors::ServerError, 'tool failed'
+        end
+
+        expect { transport.rpc_request('tools/call', { name: 't' }) }
+          .to raise_error(MCPClient::Errors::ServerError, 'tool failed')
+        expect(calls).to eq(1)
+      end
+
+      it 'retries a TransientServerError (HTTP 5xx) and can then succeed' do
+        calls = 0
+        allow(transport).to receive(:send_jsonrpc_request) do
+          calls += 1
+          raise MCPClient::Errors::TransientServerError, 'Server error: HTTP 503' if calls < 3
+
+          'ok'
+        end
+
+        expect(transport.rpc_request('tools/call', {})).to eq('ok')
+        expect(calls).to eq(3)
+      end
+
+      it 'retries a transient transport (network) error and can then succeed' do
+        calls = 0
+        allow(transport).to receive(:send_jsonrpc_request) do
+          calls += 1
+          raise MCPClient::Errors::TransportError, 'connection reset' if calls < 2
+
+          'ok'
+        end
+
+        expect(transport.rpc_request('tools/call', {})).to eq('ok')
+        expect(calls).to eq(2)
       end
     end
   end

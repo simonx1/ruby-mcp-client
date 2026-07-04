@@ -69,6 +69,33 @@ RSpec.describe MCPClient::ServerSSE::JsonRpcTransport do
     end
   end
 
+  describe '#post_json_rpc_request error classification' do
+    before do
+      transport.instance_variable_set(:@mutex, Mutex.new)
+      transport.instance_variable_set(:@rpc_conn, double('conn'))
+    end
+
+    it 'raises a retryable TransientServerError for a 5xx response' do
+      resp = instance_double(Faraday::Response, status: 503, reason_phrase: 'Service Unavailable', success?: false)
+      allow(transport).to receive(:send_http_request).and_return(resp)
+
+      expect { transport.send(:post_json_rpc_request, { id: 1 }) }
+        .to raise_error(MCPClient::Errors::TransientServerError, /Server returned error: 503/)
+    end
+
+    it 'raises a plain (non-retryable) ServerError for a 4xx response' do
+      resp = instance_double(Faraday::Response, status: 400, reason_phrase: 'Bad Request', success?: false)
+      allow(transport).to receive(:send_http_request).and_return(resp)
+
+      begin
+        transport.send(:post_json_rpc_request, { id: 1 })
+      rescue MCPClient::Errors::ServerError => e
+        expect(e).not_to be_a(MCPClient::Errors::TransientServerError)
+        expect(e.message).to match(/Server returned error: 400/)
+      end
+    end
+  end
+
   describe '#parse_direct_response' do
     it 'parses JSON and returns result key' do
       resp = double('resp', body: '{"result":{"ok":true}}')

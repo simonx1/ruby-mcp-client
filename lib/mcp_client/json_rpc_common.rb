@@ -3,16 +3,26 @@
 module MCPClient
   # Shared retry/backoff logic for JSON-RPC transports
   module JsonRpcCommon
-    # Execute the block with retry/backoff for transient errors
+    # Execute the block with retry/backoff for transient errors only.
+    #
+    # Retries genuinely transient failures where the request most likely did not
+    # complete at the server: transport/network errors (TransportError, IOError,
+    # Errno::ETIMEDOUT/ECONNRESET/EPIPE) and TransientServerError (HTTP 5xx).
+    #
+    # It deliberately does NOT retry a plain ServerError. A plain ServerError is
+    # raised for a JSON-RPC error response or an HTTP 4xx — cases where the
+    # server received and processed (or deterministically rejected) the request.
+    # Re-sending those would silently re-execute a non-idempotent operation
+    # (e.g. a tools/call), which JSON-RPC provides no way to make safe.
     # @yield block to execute
     # @return [Object] result of block
-    # @raise original exception if max retries exceeded
+    # @raise original exception if max retries exceeded or the error is not retryable
     def with_retry
       attempts = 0
       begin
         yield
-      rescue MCPClient::Errors::ServerError, MCPClient::Errors::TransportError, IOError, Errno::ETIMEDOUT,
-             Errno::ECONNRESET => e
+      rescue MCPClient::Errors::TransientServerError, MCPClient::Errors::TransportError, IOError,
+             Errno::ETIMEDOUT, Errno::ECONNRESET, Errno::EPIPE => e
         attempts += 1
         if attempts <= @max_retries
           delay = @retry_backoff * (2**(attempts - 1))

@@ -246,6 +246,18 @@ client = MCPClient.create_client(
 client = MCPClient.create_client(server_definition_file: 'servers.json')
 ```
 
+### Retries
+
+The `retries:` option controls automatic retry with exponential backoff. Only
+failures where the request most likely did **not** complete at the server are
+retried: transport/network errors and HTTP **5xx** responses. Application-level
+failures — a JSON-RPC error response or an HTTP **4xx** — are **never** retried,
+because the server already processed or rejected the request and re-sending
+would risk re-executing a non-idempotent `tools/call`. Retryable server failures
+raise `MCPClient::Errors::TransientServerError`, a subclass of
+`MCPClient::Errors::ServerError`, so existing `rescue ServerError` handlers are
+unaffected.
+
 ### Faraday Customization
 
 ```ruby

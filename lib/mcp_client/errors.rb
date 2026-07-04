@@ -33,6 +33,15 @@ module MCPClient
     # Raised when the MCP server returns an error response
     class ServerError < MCPError; end
 
+    # Raised for a server-side failure that is plausibly transient and safe to
+    # retry — chiefly HTTP 5xx responses, where the request likely did not
+    # complete at the application layer. It is a subclass of ServerError so that
+    # existing `rescue MCPClient::Errors::ServerError` handlers keep catching it,
+    # while the retry logic can single it out. Application-level failures
+    # (JSON-RPC error responses, HTTP 4xx) use plain ServerError and are NOT
+    # retried, since the server already processed/rejected the request.
+    class TransientServerError < ServerError; end
+
     # Raised when there's an error in the MCP server transport
     class TransportError < MCPError; end
 

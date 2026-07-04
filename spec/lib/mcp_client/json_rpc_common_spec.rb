@@ -57,6 +57,62 @@ RSpec.describe MCPClient::JsonRpcCommon do
 
       expect(attempts).to eq(3) # Initial + 2 retries
     end
+
+    it 'does NOT retry a plain ServerError (application-level failure)' do
+      attempts = 0
+
+      expect do
+        instance.with_retry do
+          attempts += 1
+          raise MCPClient::Errors::ServerError, 'JSON-RPC error'
+        end
+      end.to raise_error(MCPClient::Errors::ServerError, 'JSON-RPC error')
+
+      # A plain ServerError means the server already processed the request, so
+      # it must be raised immediately without re-execution.
+      expect(attempts).to eq(1)
+    end
+
+    it 'DOES retry a TransientServerError (HTTP 5xx) up to max_retries' do
+      attempts = 0
+
+      expect do
+        instance.with_retry do
+          attempts += 1
+          raise MCPClient::Errors::TransientServerError, 'Server error: HTTP 503'
+        end
+      end.to raise_error(MCPClient::Errors::TransientServerError, 'Server error: HTTP 503')
+
+      expect(attempts).to eq(3) # Initial + 2 retries
+    end
+
+    it 'retries a TransientServerError and can then succeed' do
+      attempts = 0
+
+      result = instance.with_retry do
+        attempts += 1
+        raise MCPClient::Errors::TransientServerError, 'Server error: HTTP 502' if attempts < 2
+
+        'recovered'
+      end
+
+      expect(attempts).to eq(2)
+      expect(result).to eq('recovered')
+    end
+
+    it 'retries Errno::EPIPE (broken pipe)' do
+      attempts = 0
+
+      result = instance.with_retry do
+        attempts += 1
+        raise Errno::EPIPE if attempts < 2
+
+        'recovered'
+      end
+
+      expect(attempts).to eq(2)
+      expect(result).to eq('recovered')
+    end
   end
 
   describe '#ping' do

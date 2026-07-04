@@ -126,7 +126,10 @@ module MCPClient
           record_activity
 
           unless response.success?
-            raise MCPClient::Errors::ServerError, "Server returned error: #{response.status} #{response.reason_phrase}"
+            # 5xx failures are plausibly transient (retryable); 4xx and other
+            # statuses are deterministic and raise a plain (non-retryable) error.
+            error_class = (500..599).cover?(response.status) ? MCPClient::Errors::TransientServerError : MCPClient::Errors::ServerError
+            raise error_class, "Server returned error: #{response.status} #{response.reason_phrase}"
           end
 
           response
