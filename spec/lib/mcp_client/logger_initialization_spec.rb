@@ -150,6 +150,36 @@ RSpec.describe 'Logger Initialization' do
     end
   end
 
+  describe 'MCPClient::Client logger handling' do
+    it 'preserves a caller-supplied logger formatter (does not reconfigure the app logger)' do
+      client = MCPClient::Client.new(logger: custom_logger)
+
+      logger = client.instance_variable_get(:@logger)
+      expect(logger).to eq(custom_logger)
+      expect(logger.formatter).to eq(custom_formatter)
+    end
+
+    it 'tags the caller-supplied logger progname without touching its level' do
+      custom_logger.level = Logger::ERROR
+      client = MCPClient::Client.new(logger: custom_logger)
+
+      logger = client.instance_variable_get(:@logger)
+      expect(logger.progname).to eq(MCPClient::Client.name)
+      expect(logger.level).to eq(Logger::ERROR)
+    end
+
+    it 'installs the default formatter only on a logger it creates' do
+      client = MCPClient::Client.new
+      logger = client.instance_variable_get(:@logger)
+
+      output = StringIO.new
+      logger.instance_variable_set(:@logdev, Logger::LogDevice.new(output))
+      logger.warn('hello')
+
+      expect(output.string).to match(/WARN \[#{MCPClient::Client.name}\] hello\n/)
+    end
+  end
+
   describe 'logger usage in server operations' do
     let(:server) { MCPClient::ServerHTTP.new(base_url: 'http://example.com', logger: custom_logger) }
 

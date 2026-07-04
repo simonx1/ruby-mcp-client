@@ -27,9 +27,18 @@ module MCPClient
     # @param roots [Array<MCPClient::Root, Hash>, nil] optional list of roots (MCP 2025-06-18)
     # @param sampling_handler [Proc, nil] optional handler for sampling requests (MCP 2025-11-25)
     def initialize(mcp_server_configs: [], logger: nil, elicitation_handler: nil, roots: nil, sampling_handler: nil)
-      @logger = logger || Logger.new($stdout, level: Logger::WARN)
-      @logger.progname = self.class.name
-      @logger.formatter = proc { |severity, _datetime, progname, msg| "#{severity} [#{progname}] #{msg}\n" }
+      # Preserve a caller-supplied logger's formatter (only tag progname), and
+      # install the default formatter solely on a logger we create ourselves.
+      # Overwriting the formatter of an application's logger would silently
+      # reformat every log line it emits elsewhere.
+      if logger
+        @logger = logger
+        @logger.progname = self.class.name
+      else
+        @logger = Logger.new($stdout, level: Logger::WARN)
+        @logger.progname = self.class.name
+        @logger.formatter = proc { |severity, _datetime, progname, msg| "#{severity} [#{progname}] #{msg}\n" }
+      end
       @servers = mcp_server_configs.map do |config|
         @logger.debug("Creating server with config: #{config.inspect}")
         MCPClient::ServerFactory.create(config, logger: @logger)
