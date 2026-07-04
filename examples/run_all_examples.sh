@@ -280,7 +280,10 @@ if wait_ready 40; then
     bundle exec ruby examples/elicitation/test_elicitation_sse_simple.rb
   # Interactive: feed accept answers. ❌ can be legitimate content here (a declined
   # confirmation), so tolerate it and gate on the end-of-run "Transport Summary".
+  # Pin MCP_SERVER_URL/ENDPOINT to the local server so a value inherited from
+  # secrets.env (e.g. an ngrok URL for the OAuth example) can't redirect it.
   IGNORE_XMARK=1 run_example "elicitation/test_elicitation_streamable.rb" "Transport Summary" "$STDIN_ACCEPT" -- \
+    env MCP_SERVER_URL=http://localhost:8000 MCP_SERVER_ENDPOINT=/mcp \
     bundle exec ruby examples/elicitation/test_elicitation_streamable.rb
 else
   skip_example "elicitation/test_elicitation_sse_simple.rb" "elicitation server (:8000) not ready"
@@ -375,8 +378,26 @@ else
   skip_example "streamable_http_example.rb" "set ZAPIER_MCP_TOKEN in examples/secrets.env to run against Zapier (Authorization: Bearer). Transport also verified locally by echo_server_streamable_client.rb + test_mcp_protocol_features.rb"
 fi
 skip_example "tasks_example.rb"       "needs a task-capable remote HTTP MCP server (default https://example.com/mcp placeholder); local tasks server is stdio-only"
-skip_example "oauth_browser_auth.rb"  "interactive browser OAuth against an external/ngrok server"
-skip_example "oauth_example.rb"        "illustrative; placeholder <ZAPIER_MCP_TOKEN>; hits network for OAuth discovery"
+
+# oauth_example.rb → walks the OAuth API; connects to Zapier for real when
+# ZAPIER_MCP_TOKEN is set (Authorization: Bearer), otherwise stays illustrative.
+if [ -n "${ZAPIER_MCP_TOKEN:-}" ]; then
+  run_example "oauth_example.rb (→ Zapier)" "Connected to Zapier MCP" - -- \
+    bundle exec ruby examples/oauth_example.rb
+else
+  skip_example "oauth_example.rb" "set ZAPIER_MCP_TOKEN in examples/secrets.env to connect to Zapier; otherwise illustrative only"
+fi
+
+# oauth_browser_auth.rb → full interactive browser OAuth: opens a browser and waits
+# for a human to authorize, so it is OFF by default. Set RUN_OAUTH=1 (and provide
+# MCP_SERVER_URL, e.g. in examples/secrets.env) to run it, with a generous timeout
+# for the manual step.
+if [ "${RUN_OAUTH:-0}" = "1" ] && [ -n "${MCP_SERVER_URL:-}" ]; then
+  RUN_TIMEOUT=300 run_example "oauth_browser_auth.rb" "Successfully connected to MCP server" - -- \
+    bundle exec ruby examples/oauth_browser_auth.rb
+else
+  skip_example "oauth_browser_auth.rb" "interactive browser OAuth; set RUN_OAUTH=1 and MCP_SERVER_URL (e.g. in examples/secrets.env) to run it"
+fi
 
 # =========================================================================
 # Summary

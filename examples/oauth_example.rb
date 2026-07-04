@@ -12,19 +12,37 @@ require 'logger'
 logger = Logger.new($stdout)
 logger.level = Logger::DEBUG
 
-# Example 1: Create an OAuth-enabled HTTP server
+# Example 1: Create an OAuth-enabled HTTP server.
+# Zapier authenticates via an `Authorization: Bearer <token>` header ("Option 1",
+# the recommended form). Provide the token via ZAPIER_MCP_TOKEN (e.g. in
+# examples/secrets.env); when unset the example falls back to the illustrative
+# OAuth-authorization flow below.
+zapier_token = ENV.fetch('ZAPIER_MCP_TOKEN', nil)
 puts 'Creating OAuth-enabled HTTP server...'
 
 server = MCPClient::OAuthClient.create_streamable_http_server(
-  server_url: 'https://mcp.zapier.com/api/v1/connect?token=<ZAPIER_MCP_TOKEN>',
+  server_url: 'https://mcp.zapier.com/api/v1/connect',
+  headers: zapier_token ? { 'Authorization' => "Bearer #{zapier_token}" } : {},
   logger:
 )
 
-# Example 2: Check if server has valid token
-if MCPClient::OAuthClient.valid_token?(server)
+# Example 2: Access the server. With a token embedded in the URL, Zapier is already
+# authenticated, so no interactive OAuth flow is needed - connect and list tools.
+if zapier_token
+  puts '✓ Using ZAPIER_MCP_TOKEN from the environment; connecting to Zapier...'
+  begin
+    tools = server.list_tools
+    puts "Connected to Zapier MCP - #{tools.size} tool(s) available:"
+    tools.first(10).each { |tool| puts "  - #{tool.name}" }
+  rescue StandardError => e
+    puts "Connection failed: #{e.class}: #{e.message}"
+  ensure
+    server.cleanup if server.respond_to?(:cleanup)
+  end
+elsif MCPClient::OAuthClient.valid_token?(server)
   puts '✓ Server already has a valid OAuth token'
 else
-  puts '⚠ Server needs OAuth authorization'
+  puts '⚠ Server needs OAuth authorization (set ZAPIER_MCP_TOKEN to skip this)'
 
   # Start OAuth authorization flow
   auth_url = MCPClient::OAuthClient.start_oauth_flow(server)
@@ -37,8 +55,6 @@ else
 
   puts 'After authorization, you would call:'
   puts 'token = MCPClient::OAuthClient.complete_oauth_flow(server, authorization_code, state)'
-  # require 'byebug'
-  # byebug
 end
 
 # Example 3: Create OAuth-enabled Streamable HTTP server

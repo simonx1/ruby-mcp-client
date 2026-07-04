@@ -389,7 +389,7 @@ See `examples/` for complete implementations:
 
 ## Running the Examples
 
-The `examples/run_all_examples.sh` harness runs every example that can run on the current machine — self-contained stdio servers, the Python/Flask/FastMCP echo and elicitation servers, `npx`-based MCP servers, and (optionally) the paid LLM integrations. It starts and tears down each server automatically and prints a `PASS`/`FAIL`/`SKIP` summary. A few examples that need a real remote service or interactive input (`tasks_example.rb`, `oauth_browser_auth.rb`, `oauth_example.rb`) are always skipped.
+The `examples/run_all_examples.sh` harness runs every example that can run on the current machine — self-contained stdio servers, the Python/Flask/FastMCP echo and elicitation servers, `npx`-based MCP servers, and (optionally) the paid LLM integrations. It starts and tears down each server automatically and prints a `PASS`/`FAIL`/`SKIP` summary. `tasks_example.rb` is always skipped (it needs a task-capable remote server); `oauth_browser_auth.rb` is interactive and only runs when you opt in with `RUN_OAUTH=1`.
 
 ### Prerequisites
 
@@ -429,7 +429,7 @@ cp examples/secrets.env.example examples/secrets.env
 # then set ZAPIER_MCP_TOKEN=... to enable the Zapier streamable-HTTP example
 ```
 
-Set `ZAPIER_MCP_TOKEN` (from the Zapier MCP setup page, "Option 1: Authorization header") to run `streamable_http_example.rb` against Zapier; override `ZAPIER_MCP_URL` if your connect URL differs. The LLM examples each need their own credentials in the environment and are skipped without them:
+Set `ZAPIER_MCP_TOKEN` (from the Zapier MCP setup page, "Option 1: Authorization header") to run `streamable_http_example.rb` and `oauth_example.rb` against Zapier; override `ZAPIER_MCP_URL` if your connect URL differs. To run the interactive `oauth_browser_auth.rb`, set `MCP_SERVER_URL` (e.g. an ngrok tunnel to your OAuth-protected MCP server) in `secrets.env` and pass `RUN_OAUTH=1`. The LLM examples each need their own credentials in the environment and are skipped without them:
 
 - `ruby_anthropic_mcp.rb` - `ANTHROPIC_API_KEY` (+ `npx`)
 - `openai_ruby_mcp.rb` - `OPENAI_API_KEY` (+ `npx`)
