@@ -42,6 +42,11 @@ RSpec.describe 'Session Management Integration', type: :integration do
             headers: { 'Mcp-Session-Id' => session_id }
           )
 
+        # Step 1b: initialized notification (MCP lifecycle MUST)
+        stub_request(:post, "#{base_url}#{endpoint}")
+          .with(body: hash_including(method: 'notifications/initialized'))
+          .to_return(status: 202, body: '')
+
         # Step 2: Tools list request with session header
         stub_request(:post, "#{base_url}#{endpoint}")
           .with(
@@ -102,7 +107,8 @@ RSpec.describe 'Session Management Integration', type: :integration do
         expect(http_server.instance_variable_get(:@session_id)).to be_nil
 
         # Verify all expected requests were made
-        expect(WebMock).to have_requested(:post, "#{base_url}#{endpoint}").times(3)
+        # 4 POSTs: initialize, initialized notification, tools/list, tools/call
+        expect(WebMock).to have_requested(:post, "#{base_url}#{endpoint}").times(4)
         expect(WebMock).to have_requested(:delete, "#{base_url}#{endpoint}").once
       end
 
@@ -119,6 +125,11 @@ RSpec.describe 'Session Management Integration', type: :integration do
             }.to_json,
             headers: {} # No session ID provided
           )
+
+        # initialized notification (MCP lifecycle MUST)
+        stub_request(:post, "#{base_url}#{endpoint}")
+          .with(body: hash_including(method: 'notifications/initialized'))
+          .to_return(status: 202, body: '')
 
         # Tools list without session header
         stub_request(:post, "#{base_url}#{endpoint}")
@@ -150,6 +161,11 @@ RSpec.describe 'Session Management Integration', type: :integration do
             body: { jsonrpc: '2.0', id: 1, result: {} }.to_json,
             headers: { 'Mcp-Session-Id' => 'invalid@session!' } # Invalid format
           )
+
+        # initialized notification (MCP lifecycle MUST)
+        stub_request(:post, "#{base_url}#{endpoint}")
+          .with(body: hash_including(method: 'notifications/initialized'))
+          .to_return(status: 202, body: '')
 
         expect(http_server.connect).to be true
         expect(http_server.instance_variable_get(:@session_id)).to be_nil
