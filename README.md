@@ -387,6 +387,61 @@ See `examples/` for complete implementations:
 - `gemini_ai_mcp.rb` - Google Vertex AI integration
 - `ruby_llm_mcp.rb` - RubyLLM integration (OpenAI provider)
 
+## Running the Examples
+
+The `examples/run_all_examples.sh` harness runs every example that can run on the current machine — self-contained stdio servers, the Python/Flask/FastMCP echo and elicitation servers, `npx`-based MCP servers, and (optionally) the paid LLM integrations. It starts and tears down each server automatically and prints a `PASS`/`FAIL`/`SKIP` summary. `tasks_example.rb` is always skipped (it needs a task-capable remote server); `oauth_browser_auth.rb` is interactive and only runs when you opt in with `RUN_OAUTH=1`.
+
+### Prerequisites
+
+Run `bundle install` first. The script preflight-checks the following and prints a warning (it does **not** abort) for anything missing; affected examples are then skipped or fail:
+
+- `ruby`, `bundle`, `curl`, `lsof` - on `PATH`
+- `python3` (or `$PYTHON`) plus a separate `python` binary - on `PATH`
+- Python packages `flask`, `fastmcp`, `mcp` - importable by `$PYTHON`
+- `npx` (Node) - needed by the `npx`-based example (`json_input`) and by every LLM example, which spawn `npx` filesystem/Playwright servers
+
+### Usage
+
+```bash
+examples/run_all_examples.sh                       # run everything runnable on this machine
+RUN_AI=0 examples/run_all_examples.sh              # skip the paid-LLM examples
+RUN_NPX=0 examples/run_all_examples.sh             # skip the npx-based example (json_input)
+LOG_DIR=/path examples/run_all_examples.sh         # write logs to a chosen dir
+PYTHON=python3.12 TIMEOUT=180 examples/run_all_examples.sh  # override interpreter and per-example timeout
+```
+
+### Environment Knobs
+
+| Variable | Default | Effect |
+|----------|---------|--------|
+| `RUN_AI` | `1` | Set to `0` to skip the LLM integrations, which make **real, paid** API calls. |
+| `RUN_NPX` | `1` | Set to `0` (or leave `npx` off `PATH`) to skip the `npx`-based example (`json_input`). The LLM examples spawn `npx` servers too, but are gated by `RUN_AI` and their API keys instead. |
+| `PYTHON` | `python3` | Interpreter used to launch the Python/Flask/FastMCP servers and run the import preflight checks. |
+| `TIMEOUT` | `120` | Per-example wall-clock timeout in seconds; a timeout is reported as a `FAIL`. |
+| `LOG_DIR` | fresh `mktemp` dir | Directory for per-example and per-server logs; the path is printed after preflight and in the summary. |
+
+### Secrets and API Keys
+
+Real secrets live in `examples/secrets.env`, which is **gitignored** and sourced automatically (every `KEY=value` line is exported) when present. Copy the tracked template to get started:
+
+```bash
+cp examples/secrets.env.example examples/secrets.env
+# then set ZAPIER_MCP_TOKEN=... to enable the Zapier streamable-HTTP example
+```
+
+Set `ZAPIER_MCP_TOKEN` (from the Zapier MCP setup page, "Option 1: Authorization header") to run `streamable_http_example.rb` and `oauth_example.rb` against Zapier; override `ZAPIER_MCP_URL` if your connect URL differs. To run the interactive `oauth_browser_auth.rb`, set `MCP_SERVER_URL` (e.g. an ngrok tunnel to your OAuth-protected MCP server) in `secrets.env` and pass `RUN_OAUTH=1`. The LLM examples each need their own credentials in the environment and are skipped without them:
+
+- `ruby_anthropic_mcp.rb` - `ANTHROPIC_API_KEY` (+ `npx`)
+- `openai_ruby_mcp.rb` - `OPENAI_API_KEY` (+ `npx`)
+- `ruby_openai_mcp.rb`, `ruby_llm_mcp.rb` - `OPENAI_API_KEY` (+ `npx`, plus a Playwright MCP server on `:8931`)
+- `gemini_ai_mcp.rb` - a Vertex service-account JSON at `VERTEX_CREDENTIALS_FILE` (default `examples/google-credentials.json`, + `npx`)
+
+### How Pass/Fail Is Judged
+
+Most examples print their own success/failure marks but exit `0` regardless, so the harness combines the exit code with a scan of the output rather than trusting the exit status alone. An example `FAIL`s when it exits nonzero, times out (exit `124`), prints a hard-error signature (a Ruby/Python traceback, `Connection refused`, `uninitialized constant`, and similar), prints a `❌` mark, or is missing its expected success marker; otherwise it `PASS`es. (The `❌` check is suppressed with `IGNORE_XMARK=1` for the interactive elicitation demos, where `❌` can be legitimate "declined" output.) The script exits `0` only if zero examples failed — `SKIP`s do not affect the exit status.
+
+For deeper, per-topic walkthroughs see [`examples/README.md`](examples/README.md), [`examples/README_ECHO_SERVER.md`](examples/README_ECHO_SERVER.md), [`examples/STREAMABLE_HTTP_TESTING.md`](examples/STREAMABLE_HTTP_TESTING.md), and [`examples/elicitation/README.md`](examples/elicitation/README.md).
+
 ## OAuth 2.1 Authentication
 
 ```ruby

@@ -9,6 +9,7 @@
 #    `google-credentials.json` in the project root, or set its location in
 #      export VERTEX_CREDENTIALS_FILE=/path/to/file.json
 #  - (Optional) choose region with `VERTEX_REGION` (default: us-east4).
+#  - (Optional) choose model with `VERTEX_MODEL` (default: gemini-2.5-flash).
 #
 # This example shows a full round-trip interaction:
 # 1. The assistant is provided with the MCP tool definitions (as Gemini "function_declarations").
@@ -62,6 +63,10 @@ mcp_client = MCPClient.connect(
 # -----------------------------------------------------------------------------
 
 vertex_region = ENV['VERTEX_REGION'] || 'us-east4'
+# Model is overridable so you can pick one your project/region has access to.
+# (Older gemini-1.5/2.0 IDs have been retired for some projects — list what your
+# project can use with `gcloud ai models list` if you hit a 404 NOT_FOUND.)
+vertex_model = ENV['VERTEX_MODEL'] || 'gemini-2.5-flash'
 
 client = Gemini.new(
   credentials: {
@@ -70,12 +75,12 @@ client = Gemini.new(
     region: vertex_region
   },
   options: {
-    model: 'gemini-2.0-flash-001',
+    model: vertex_model,
     server_sent_events: false # non-streaming for simplicity
   }
 )
 
-puts "Gemini Vertex client initialised (region=#{vertex_region})."
+puts "Gemini Vertex client initialised (region=#{vertex_region}, model=#{vertex_model})."
 
 # -----------------------------------------------------------------------------
 # 2. Prepare tool definitions for Gemini
