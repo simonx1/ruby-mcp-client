@@ -51,6 +51,22 @@ RSpec.describe MCPClient::ServerSSE, 'Elicitation (MCP 2025-06-18)' do
       end
     end
 
+    context 'when method is ping' do
+      let(:message) do
+        {
+          'id' => request_id,
+          'method' => 'ping',
+          'params' => {}
+        }
+      end
+
+      it 'responds with an empty result (MCP ping utility)' do
+        expected_response = { 'jsonrpc' => '2.0', 'id' => request_id, 'result' => {} }
+        expect(server).to receive(:post_jsonrpc_response).with(expected_response)
+        server.handle_server_request(message)
+      end
+    end
+
     context 'when method is unknown' do
       let(:message) do
         {
