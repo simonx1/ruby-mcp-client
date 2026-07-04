@@ -17,6 +17,10 @@ Gem::Specification.new do |spec|
   spec.files         = Dir.glob('lib/**/*.rb') + ['README.md', 'LICENSE']
   spec.required_ruby_version = '>= 3.2.0'
   spec.require_paths = ['lib']
+  # base64 is required by the OAuth/PKCE and content helpers. It became a
+  # bundled (non-default) gem in Ruby 3.4, so it must be declared explicitly
+  # or `require 'base64'` fails under Bundler on Ruby >= 3.4.
+  spec.add_dependency 'base64', '~> 0.2'
   # HTTP instrumentation
   spec.add_dependency 'faraday', '~> 2.0'
   spec.add_dependency 'faraday-follow_redirects', '~> 0.3'
