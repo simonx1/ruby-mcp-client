@@ -262,6 +262,8 @@ RSpec.describe MCPClient::ServerStdio, 'Elicitation (MCP 2025-06-18)' do
 
     context 'with response (has id, no method)' do
       it 'stores in pending responses' do
+        # Mark the id as awaited so the reader retains the response
+        server.instance_variable_set(:@awaiting, { 123 => true })
         message = {
           'id' => 123,
           'result' => { 'success' => true }

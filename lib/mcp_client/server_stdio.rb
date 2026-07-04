@@ -46,6 +46,9 @@ module MCPClient
       @cond = ConditionVariable.new
       @next_id = 1
       @pending = {}
+      # Ids of requests awaiting a response; used to drop late/unsolicited
+      # responses so @pending cannot grow without bound on a long-lived session
+      @awaiting = {}
       @initialized = false
       @server_info = nil
       @capabilities = nil
@@ -156,8 +159,15 @@ module MCPClient
       return unless id
 
       @mutex.synchronize do
-        @pending[id] = msg
-        @cond.broadcast
+        # Only retain a response that corresponds to an outstanding request.
+        # Late responses (arriving after the caller timed out) and unsolicited
+        # responses are dropped so @pending cannot grow without bound.
+        if @awaiting.key?(id)
+          @pending[id] = msg
+          @cond.broadcast
+        else
+          @logger.debug("Discarding response for unknown or expired request id=#{id}")
+        end
       end
     rescue JSON::ParserError
       # Skip non-JSONRPC lines in the output stream
@@ -667,6 +677,11 @@ module MCPClient
     rescue StandardError
       # Clean up resources during unexpected termination
     ensure
+      # Release any buffered responses / awaiting markers
+      @mutex.synchronize do
+        @pending.clear
+        @awaiting.clear
+      end
       @stdin = @stdout = @stderr = @wait_thread = @reader_thread = @stderr_thread = nil
     end
   end

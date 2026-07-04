@@ -373,10 +373,17 @@ RSpec.describe MCPClient::ServerStdio do
     end
 
     describe '#handle_line' do
-      it 'parses JSON and stores response by ID' do
+      it 'parses JSON and stores a response for an awaited ID' do
+        server.instance_variable_set(:@awaiting, { 1 => true })
         response = { 'jsonrpc' => '2.0', 'id' => 1, 'result' => 'success' }
         server.send(:handle_line, response.to_json)
         expect(server.instance_variable_get(:@pending)[1]).to eq(response)
+      end
+
+      it 'drops a response whose ID is not awaited (late or unsolicited)' do
+        response = { 'jsonrpc' => '2.0', 'id' => 999, 'result' => 'stale' }
+        server.send(:handle_line, response.to_json)
+        expect(server.instance_variable_get(:@pending)).to be_empty
       end
 
       it 'ignores responses without an ID' do
@@ -387,6 +394,52 @@ RSpec.describe MCPClient::ServerStdio do
 
       it 'ignores non-JSON lines' do
         expect { server.send(:handle_line, 'not json') }.not_to raise_error
+      end
+    end
+
+    describe 'pending-response map bounding' do
+      it 'removes the awaiting marker and buffered response once consumed' do
+        server.instance_variable_set(:@awaiting, { 1 => true })
+        server.instance_variable_set(:@pending, { 1 => { 'result' => 'ok' } })
+
+        expect(server.send(:wait_response, 1)).to eq({ 'result' => 'ok' })
+        expect(server.instance_variable_get(:@pending)).to be_empty
+        expect(server.instance_variable_get(:@awaiting)).to be_empty
+      end
+
+      it 'clears the awaiting marker on timeout so a late response is dropped' do
+        server.instance_variable_set(:@awaiting, { 1 => true })
+        # Shorten the instance timeout so the wait returns promptly
+        server.instance_variable_set(:@read_timeout, 0.1)
+
+        expect { server.send(:wait_response, 1) }.to raise_error(MCPClient::Errors::TransportError, /Timeout/)
+        expect(server.instance_variable_get(:@awaiting)).to be_empty
+
+        # A response that arrives after the timeout is discarded, not buffered
+        late = { 'jsonrpc' => '2.0', 'id' => 1, 'result' => 'late' }
+        server.send(:handle_line, late.to_json)
+        expect(server.instance_variable_get(:@pending)).to be_empty
+      end
+
+      it 'drops the awaiting marker when the request fails to send' do
+        broken = StringIO.new
+        allow(broken).to receive(:puts).and_raise(IOError, 'broken pipe')
+        server.instance_variable_set(:@stdin, broken)
+
+        id = server.send(:next_id)
+        req = { 'jsonrpc' => '2.0', 'id' => id, 'method' => 'ping', 'params' => {} }
+        expect { server.send(:send_request, req) }.to raise_error(MCPClient::Errors::TransportError)
+        expect(server.instance_variable_get(:@awaiting)).to be_empty
+      end
+
+      it 'does not accumulate entries across many sequential requests' do
+        100.times do |i|
+          id = server.send(:next_id)
+          server.send(:handle_line, { 'jsonrpc' => '2.0', 'id' => id, 'result' => i }.to_json)
+          server.send(:wait_response, id)
+        end
+        expect(server.instance_variable_get(:@pending)).to be_empty
+        expect(server.instance_variable_get(:@awaiting)).to be_empty
       end
     end
   end
