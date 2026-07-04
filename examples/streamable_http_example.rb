@@ -51,16 +51,25 @@ begin
     puts "  - #{tool.name}: #{tool.description&.split("\n")&.first || 'No description'}"
   end
 
-  # Example tool call (adjust based on your server's tools)
+  # Example tool call. Prefer a tool that needs no required arguments so the demo
+  # succeeds regardless of which tools the server exposes (e.g. an arbitrary set of
+  # connected Zapier actions); fall back to describing how to call one explicitly.
   if tools.any?
-    first_tool = tools.first
-    puts "\n🔧 Calling tool: #{first_tool.name}"
+    callable = tools.find do |tool|
+      required = (tool.schema && (tool.schema['required'] || tool.schema[:required])) || []
+      required.empty?
+    end
 
-    # NOTE: Adjust parameters based on your tool's input schema
-    result = client.call_tool(first_tool.name, {})
-
-    puts 'Tool result:'
-    puts result.inspect
+    if callable
+      puts "\n🔧 Calling tool: #{callable.name}"
+      result = client.call_tool(callable.name, {})
+      puts 'Tool result:'
+      puts result.inspect
+    else
+      puts "\nℹ️  Every advertised tool requires arguments, so no zero-arg demo call is possible."
+      puts '   Call one explicitly with its parameters, e.g.:'
+      puts "   client.call_tool('#{tools.first.name}', { ... })"
+    end
   else
     puts "\n⚠️  No tools available to call"
   end

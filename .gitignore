@@ -62,3 +62,12 @@ build-iPhoneSimulator/
 .env
 
 examples/__pycache__/
+**/__pycache__/
+
+# Session artifacts written to the cwd by the Playwright MCP server when the
+# browser examples run (see examples/run_all_examples.sh).
+.playwright-mcp/
+
+# Local, real secrets for the example runner (Zapier MCP token, etc.).
+# Copy examples/secrets.env.example -> examples/secrets.env and fill it in.
+examples/secrets.env

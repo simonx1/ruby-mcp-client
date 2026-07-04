@@ -59,11 +59,11 @@ filesystem_tools = all_tools.select { |tool| tool.server&.name == 'filesystem' }
 puts "Tools from Playwright server: #{playwright_tools.length}"
 puts "Tools from Filesystem server: #{filesystem_tools.length}"
 
-# Launch a browser - explicitly specify server by name for disambiguation
+# Launch a browser by navigating. The Playwright MCP server auto-launches (and
+# installs, if needed) the browser on first navigation, so there is no separate
+# install step. Older Playwright MCP versions exposed a `browser_install` tool
+# which has since been removed from @playwright/mcp.
 puts "\nLaunching browser..."
-mcp_client.call_tool('browser_install', {}, server: 'playwright')
-puts 'Browser installed'
-
 # You can call tools on a specific server directly
 playwright_server.call_tool('browser_navigate', { url: 'about:blank' })
 puts 'Browser launched and navigated to blank page'
