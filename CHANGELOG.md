@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 1.1.0 (2026-07-04)
 
 ### Breaking Changes
 
@@ -28,6 +28,48 @@
   declare a client `tasks` capability: that marks a task *receiver* for
   sampling/elicitation, which is not implemented — the client is a task requestor for
   `tools/call` only.)
+- **Automatic pagination**: `list_tools` and `list_prompts` now follow the server's
+  `nextCursor` and return the complete set across all pages, with a per-call safety
+  bound and an identical-cursor loop guard. No manual cursor handling is required (#148).
+
+### Bug Fixes
+
+- **Tool annotations**: corrected `readOnlyHint`/`destructiveHint` defaults to match the
+  MCP 2025-11-25 `ToolAnnotations` schema — an un-annotated tool is treated as writable,
+  potentially destructive, and open-world (#140).
+- **Ping utility**: the stdio and SSE transports now respond to a server-initiated `ping`
+  with an empty result (#141).
+- **stdio deadlock**: drain the subprocess's stderr so a server that writes heavily to
+  stderr can no longer block the pipe (#142).
+- **MCP lifecycle**: HTTP and Streamable HTTP transports now send
+  `notifications/initialized` after `initialize`, as the specification requires (#143).
+- **stdio memory leak**: bound the pending-response map so responses to abandoned
+  requests can no longer accumulate (#144).
+- **Logger**: stop overwriting a caller-supplied logger's formatter (#145).
+- **Ruby 3.4+**: declare `base64` as a runtime dependency to avoid a `LoadError` (#146).
+- **Retry safety**: application-level `ServerError`s are no longer retried; only transport
+  errors and transient HTTP 5xx responses (`TransientServerError`) are retried, so
+  non-idempotent requests are not executed twice (#149).
+- **SSE reconnection**: repaired the auto-reconnect path that could never fire because the
+  monitor thread killed itself (#150).
+- **OAuth discovery**: authorization-server and protected-resource metadata discovery now
+  follows RFC 8414 and RFC 9728 (#151).
+
+### Examples & Tooling
+
+- Added `examples/run_all_examples.sh`, a pre-release harness that boots each example's
+  server, runs every example, and reports PASS/FAIL/SKIP, plus an `examples/README.md`
+  index. Fixed stale examples (removed the retired Playwright `browser_install` call,
+  robust first-tool selection in `streamable_http_example.rb`, updated the Gemini model)
+  and wired the Zapier/OAuth examples through a gitignored `examples/secrets.env` (#153).
+
+### Documentation
+
+- Fixed the README OAuth snippet `require` and corrected method names in the changelog (#147).
+
+### Dependencies
+
+- Bumped `faraday` to 2.14.3, plus routine development-dependency updates.
 
 ## 1.0.1 (2026-03-22)
 
