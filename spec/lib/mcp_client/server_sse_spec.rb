@@ -438,6 +438,31 @@ RSpec.describe MCPClient::ServerSSE do
       expect(server.instance_variable_get(:@initialized)).to be false
     end
 
+    it 'resets the SSE parse buffer so a reconnect does not inherit a partial event' do
+      server.instance_variable_set(:@buffer, 'data: {"jso')
+      server.cleanup
+      expect(server.instance_variable_get(:@buffer)).to eq('')
+    end
+
+    it 'does NOT kill the activity monitor thread when called on that same thread' do
+      # Reconnection drives cleanup from the activity monitor thread; killing the
+      # current thread there is the historical dead-code bug.
+      ran_to_completion = false
+
+      monitor = Thread.new do
+        server.instance_variable_set(:@activity_timer_thread, Thread.current)
+        server.instance_variable_set(:@connection_established, true)
+        server.cleanup
+        ran_to_completion = true # unreachable if cleanup killed this thread
+      end
+      monitor.join(2)
+
+      # If cleanup had killed the current thread, ran_to_completion stays false
+      expect(ran_to_completion).to be true
+      # The reference is preserved so start_activity_monitor won't spawn a duplicate
+      expect(server.instance_variable_get(:@activity_timer_thread)).to eq(monitor)
+    end
+
     it 'sets flags before closing threads' do
       # Create mock threads
       sse_thread = double('sse_thread')
@@ -660,6 +685,57 @@ RSpec.describe MCPClient::ServerSSE do
       expect(server.instance_variable_get(:@consecutive_ping_failures)).to eq(0)
       # And reset the reconnect attempt counter
       expect(server.instance_variable_get(:@reconnect_attempts)).to eq(0)
+    end
+
+    it 'reconnects without the monitor thread killing itself (regression)' do
+      server.instance_variable_set(:@consecutive_ping_failures, 3)
+      server.instance_variable_set(:@reconnect_attempts, 0)
+      server.instance_variable_set(:@max_ping_failures, 3)
+      server.instance_variable_set(:@max_reconnect_attempts, 5)
+      server.instance_variable_set(:@connection_established, true)
+      server.instance_variable_set(:@sse_connected, true)
+      allow(server).to receive(:sleep)
+
+      connect_called = false
+      allow(server).to receive(:connect) do
+        connect_called = true
+        server.instance_variable_set(:@connection_established, true)
+        true
+      end
+      # NOTE: cleanup is NOT stubbed — the real cleanup runs, exercising the
+      # self-kill guard that made reconnection dead code before this fix.
+
+      completed = false
+      monitor = Thread.new do
+        server.instance_variable_set(:@activity_timer_thread, Thread.current)
+        server.send(:attempt_reconnection)
+        completed = true
+      end
+      monitor.join(3)
+
+      expect(connect_called).to be true
+      expect(completed).to be true # would be false if cleanup killed this thread
+      expect(server.instance_variable_get(:@consecutive_ping_failures)).to eq(0)
+      expect(server.instance_variable_get(:@reconnect_attempts)).to eq(0)
+    end
+
+    it 'clears a stale auth error before reconnecting' do
+      server.instance_variable_set(:@consecutive_ping_failures, 3)
+      server.instance_variable_set(:@reconnect_attempts, 0)
+      server.instance_variable_set(:@max_ping_failures, 3)
+      server.instance_variable_set(:@max_reconnect_attempts, 5)
+      server.instance_variable_set(:@auth_error, 'Authorization failed: stale token')
+      allow(server).to receive(:cleanup)
+      allow(server).to receive(:sleep)
+
+      auth_error_at_connect = :unset
+      allow(server).to receive(:connect) do
+        auth_error_at_connect = server.instance_variable_get(:@auth_error)
+        true
+      end
+
+      server.send(:attempt_reconnection)
+      expect(auth_error_at_connect).to be_nil
     end
   end
 
