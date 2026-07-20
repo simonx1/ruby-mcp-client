@@ -141,7 +141,7 @@ RSpec.describe MCPClient::HttpTransportBase do
         'sess-123-abc_def',       # with hyphens and underscores
         'a1b2c3d4e5f6g7h8',       # mixed alphanumeric
         '1234',                   # short ids are spec-valid
-        'A' * 512,                # generous length cap
+        'A' * 4096,               # generous length cap
         'eyJhbGci.eyJzdWIi.SflK', # JWT-style with dots
         'c2Vzc2lvbisvPQ==',       # base64 with + / =
         'session@id!#$%^&*()'     # other visible ASCII
@@ -161,7 +161,7 @@ RSpec.describe MCPClient::HttpTransportBase do
         "tab\tid",                # control character
         "newline\nid",            # control character
         'sessão-1',               # non-ASCII
-        'A' * 513                 # over the length cap
+        'A' * 4097                # over the length cap
       ]
 
       invalid_session_ids.each do |session_id|

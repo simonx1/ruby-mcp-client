@@ -750,7 +750,7 @@ RSpec.describe MCPClient::ServerHTTP do
         'session id',        # space is outside visible ASCII 0x21-0x7E
         "tab\tid",           # control character
         'sessão',            # non-ASCII
-        'x' * 513            # over the length cap
+        'x' * 4097           # over the length cap
       ]
 
       valid_session_ids.each do |session_id|

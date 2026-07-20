@@ -30,6 +30,62 @@ RSpec.describe 'Streamable HTTP session lifecycle (MCP 2025-11-25)' do
         expect(server.valid_session_id?(id)).to be(false), "expected #{id.inspect} to be rejected"
       end
     end
+
+    it 'accepts very long ids (the spec imposes no length limit)' do
+      expect(server.valid_session_id?('a' * 2048)).to be(true)
+    end
+  end
+
+  describe '404 recovery with raise_error middleware' do
+    let(:base_url) { 'https://example.com' }
+    let(:endpoint) { '/rpc' }
+    let(:server) do
+      MCPClient::ServerStreamableHTTP.new(
+        base_url: base_url, endpoint: endpoint, retries: 0, name: 'raise-test',
+        faraday_config: ->(conn) { conn.response :raise_error }
+      )
+    end
+
+    after { server.cleanup }
+
+    it 'still starts a new session on 404 when raise_error is configured' do
+      init_bodies = []
+      stub_request(:post, "#{base_url}#{endpoint}")
+        .with(body: hash_including('method' => 'initialize'))
+        .to_return do |request|
+          init_bodies << request
+          { status: 200,
+            body: "event: message\ndata: #{JSON.generate(
+              jsonrpc: '2.0', id: 1,
+              result: { protocolVersion: MCPClient::PROTOCOL_VERSION, capabilities: {},
+                        serverInfo: { name: 's', version: '1' } }
+            )}\n\n",
+            headers: { 'Content-Type' => 'text/event-stream',
+                       'Mcp-Session-Id' => "sess-#{init_bodies.size}" } }
+        end
+      stub_request(:post, "#{base_url}#{endpoint}")
+        .with(body: hash_including('method' => 'notifications/initialized'))
+        .to_return(status: 202, body: '')
+      stub_request(:get, "#{base_url}#{endpoint}").to_return(status: 200, body: '')
+
+      list_count = 0
+      stub_request(:post, "#{base_url}#{endpoint}")
+        .with(body: hash_including('method' => 'tools/list'))
+        .to_return do |_request|
+          list_count += 1
+          if list_count == 1
+            { status: 404, body: '' }
+          else
+            { status: 200,
+              body: "event: message\ndata: #{JSON.generate(jsonrpc: '2.0', id: 2, result: { tools: [] })}\n\n",
+              headers: { 'Content-Type' => 'text/event-stream' } }
+          end
+        end
+
+      server.connect
+      expect(server.rpc_request('tools/list', {})).to eq({ 'tools' => [] })
+      expect(init_bodies.size).to eq(2)
+    end
   end
 
   describe '404 session expiry recovery' do

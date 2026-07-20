@@ -88,7 +88,9 @@ module MCPClient
     def valid_session_id?(session_id)
       return false unless session_id.is_a?(String)
 
-      session_id.match?(/\A[\x21-\x7E]{1,512}\z/)
+      # The 4096-char cap is header-size hygiene, not MCP grammar — the spec
+      # imposes no length limit on session IDs.
+      session_id.match?(/\A[\x21-\x7E]{1,4096}\z/)
     end
 
     # Validate the server's base URL for security
@@ -183,7 +185,7 @@ module MCPClient
         # MCP 2025-11-25 session management: HTTP 404 for a request carrying
         # Mcp-Session-Id means the session expired — the client MUST start a
         # new session with a fresh InitializeRequest (without a session ID).
-        return restart_session_and_resend(request) if response.status == 404 && @session_id && !@restarting_session
+        return restart_session_and_resend(request) if response.status == 404 && session_restart_applicable?
 
         handle_http_error_response(response) unless response.success?
         handle_successful_response(response, request)
@@ -192,6 +194,12 @@ module MCPClient
         response
       rescue Faraday::UnauthorizedError, Faraday::ForbiddenError => e
         handle_auth_error(e)
+      rescue Faraday::ResourceNotFound => e
+        # User-configured raise_error middleware surfaces 404 as an exception;
+        # apply the same session-expiry recovery as the response path.
+        return restart_session_and_resend(request) if session_restart_applicable?
+
+        raise MCPClient::Errors::ServerError, "Client error: HTTP 404 #{e.message}"
       rescue Faraday::ConnectionFailed => e
         raise MCPClient::Errors::ConnectionError, "Server connection lost: #{e.message}"
       rescue Faraday::Error => e
@@ -205,14 +213,24 @@ module MCPClient
     # @param request [Hash] the JSON-RPC request that hit the expired session
     # @return [Faraday::Response] the response to the resent request
     def restart_session_and_resend(request)
-      @logger.warn("Session #{@session_id} no longer valid (HTTP 404); starting a new session")
-      @restarting_session = true
-      @session_id = nil
-      @last_event_id = nil if instance_variable_defined?(:@last_event_id)
-      perform_initialize
-      send_http_request(request)
-    ensure
-      @restarting_session = false
+      # Serialized on the transport monitor so concurrent 404s trigger a
+      # single restart; the monitor is reentrant, so the nested
+      # perform_initialize/id generation inside is safe.
+      @mutex.synchronize do
+        @logger.warn("Session #{@session_id} no longer valid (HTTP 404); starting a new session")
+        @restarting_session = true
+        @session_id = nil
+        @last_event_id = nil if instance_variable_defined?(:@last_event_id)
+        perform_initialize
+        send_http_request(request)
+      ensure
+        @restarting_session = false
+      end
+    end
+
+    # @return [Boolean] whether a 404 should trigger session re-initialization
+    def session_restart_applicable?
+      @mutex.synchronize { !@session_id.nil? && !@restarting_session }
     end
 
     # Apply headers to the HTTP request (can be overridden by subclasses)
