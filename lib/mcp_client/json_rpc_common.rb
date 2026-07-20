@@ -73,7 +73,9 @@ module MCPClient
     # @return [Hash] the initialization parameters
     def initialization_params
       capabilities = {
-        'elicitation' => {}, # MCP 2025-11-25: Support for server-initiated user interactions
+        # MCP 2025-11-25: server-initiated user interactions; both defined
+        # modes are implemented (an empty object would mean form-only).
+        'elicitation' => { 'form' => {}, 'url' => {} },
         'roots' => { 'listChanged' => true }, # MCP 2025-11-25: Support for roots
         'sampling' => {} # MCP 2025-11-25: Support for server-initiated LLM sampling
         # NOTE: we intentionally do NOT declare a client `tasks` capability. That

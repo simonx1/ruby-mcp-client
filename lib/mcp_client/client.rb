@@ -6,6 +6,10 @@ module MCPClient
   # MCP Client for integrating with the Model Context Protocol
   # This is the main entry point for using MCP tools
   class Client
+    # Elicitation modes implemented by this client (MCP 2025-11-25).
+    # Requests with a mode outside this set are rejected with -32602.
+    SUPPORTED_ELICITATION_MODES = %w[form url].freeze
+
     # @!attribute [r] servers
     #   @return [Array<MCPClient::ServerBase>] list of servers
     # @!attribute [r] tool_cache
@@ -934,13 +938,21 @@ module MCPClient
     # @param params [Hash] the elicitation parameters
     # @return [Hash] the elicitation response
     def handle_elicitation_request(_request_id, params)
-      # If no handler is configured, decline the request
+      # Without a handler there is no user to interact with: answer with a
+      # JSON-RPC error rather than fabricating a user "decline".
       unless @elicitation_handler
-        @logger.warn('Received elicitation request but no handler configured, declining')
-        return { 'action' => 'decline' }
+        @logger.warn('Received elicitation request but no elicitation handler is configured')
+        return jsonrpc_error_result(-32_601, 'Elicitation not supported: no elicitation handler configured')
       end
 
       mode = params['mode'] || 'form'
+      # MCP 2025-11-25: requests with a mode not declared in client
+      # capabilities MUST be rejected with -32602 (Invalid params).
+      unless SUPPORTED_ELICITATION_MODES.include?(mode)
+        @logger.warn("Rejecting elicitation request with unsupported mode '#{mode}'")
+        return jsonrpc_error_result(-32_602, "Elicitation mode '#{mode}' is not supported")
+      end
+
       message = params['message']
 
       begin
@@ -954,8 +966,17 @@ module MCPClient
       rescue StandardError => e
         @logger.error("Elicitation handler error: #{e.message}")
         @logger.debug(e.backtrace.join("\n"))
-        { 'action' => 'decline' }
+        jsonrpc_error_result(-32_603, "Elicitation handler error: #{e.message}")
       end
+    end
+
+    # Build an error-shaped handler result that transports turn into a
+    # JSON-RPC error response (mirroring the sampling error path).
+    # @param code [Integer] JSON-RPC error code
+    # @param message [String] error message
+    # @return [Hash] error result
+    def jsonrpc_error_result(code, message)
+      { 'error' => { 'code' => code, 'message' => message } }
     end
 
     # Handle form mode elicitation (MCP 2025-11-25)
@@ -1030,8 +1051,17 @@ module MCPClient
                    { 'action' => 'accept', 'content' => result }
                  end
 
-      # Validate content against schema for form mode accept responses
-      validate_elicitation_content(response, params)
+      # Per the ElicitResult schema, content is only present for form mode
+      # accepts; it is omitted for out-of-band (url) mode responses.
+      response.delete('content') if (params['mode'] || 'form') == 'url'
+
+      # Validate content against schema for form mode accept responses; do not
+      # transmit content that violates the requestedSchema (spec SHOULD).
+      errors = validate_elicitation_content(response, params)
+      unless errors.empty?
+        @logger.warn("Elicitation content validation failed: #{errors.join('; ')}")
+        return jsonrpc_error_result(-32_603, "Elicitation content failed schema validation: #{errors.join('; ')}")
+      end
 
       response
     end
@@ -1039,20 +1069,17 @@ module MCPClient
     # Validate elicitation response content against the requestedSchema
     # @param response [Hash] the formatted response
     # @param params [Hash] original request params
-    # @return [void]
+    # @return [Array<String>] validation errors (empty when conforming or not applicable)
     def validate_elicitation_content(response, params)
-      return unless response['action'] == 'accept' && response['content'].is_a?(Hash)
+      return [] unless response['action'] == 'accept' && response['content'].is_a?(Hash)
 
       mode = params['mode'] || 'form'
-      return unless mode == 'form'
+      return [] unless mode == 'form'
 
       schema = params['requestedSchema'] || params['schema']
-      return unless schema.is_a?(Hash)
+      return [] unless schema.is_a?(Hash)
 
-      errors = ElicitationValidator.validate_content(response['content'], schema)
-      return if errors.empty?
-
-      @logger.warn("Elicitation content validation warnings: #{errors.join('; ')}")
+      ElicitationValidator.validate_content(response['content'], schema)
     end
 
     # Ensure the action value conforms to MCP spec (accept, decline, cancel)

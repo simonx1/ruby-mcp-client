@@ -872,18 +872,16 @@ module MCPClient
       send_error_response(request_id, -32_603, "Internal error: #{e.message}")
     end
 
-    # Handle elicitation/create request from server (MCP 2025-06-18)
-    # @param request_id [String, Integer] the JSON-RPC request ID (used as elicitationId)
+    # Handle elicitation/create request from server (MCP 2025-11-25)
+    # @param request_id [String, Integer] the JSON-RPC request ID
     # @param params [Hash] the elicitation parameters
     # @return [void]
     def handle_elicitation_create(request_id, params)
-      # The request_id is the elicitationId per MCP spec
-      elicitation_id = request_id
-
-      # If no callback is registered, decline the request
+      # Without a callback there is no user to interact with: answer with a
+      # JSON-RPC error rather than fabricating a user "decline".
       unless @elicitation_request_callback
-        @logger.warn('Received elicitation request but no callback registered, declining')
-        send_elicitation_response(elicitation_id, { 'action' => 'decline' })
+        @logger.warn('Received elicitation request but no callback registered')
+        send_error_response(request_id, -32_601, 'Elicitation not supported: no handler configured')
         return
       end
 
@@ -891,7 +889,7 @@ module MCPClient
       result = @elicitation_request_callback.call(request_id, params)
 
       # Send the response back to the server
-      send_elicitation_response(elicitation_id, result)
+      send_elicitation_response(request_id, result)
     end
 
     # Handle roots/list request from server (MCP 2025-06-18)
@@ -972,29 +970,29 @@ module MCPClient
       @logger.error("Error sending sampling response: #{e.message}")
     end
 
-    # Send elicitation response back to server via HTTP POST (MCP 2025-06-18)
-    # For streamable HTTP, this is sent as a JSON-RPC request (not response)
-    # because HTTP is unidirectional.
-    # @param elicitation_id [String] the elicitation ID from the server
+    # Send elicitation response back to server via HTTP POST (MCP 2025-11-25)
+    # The reply to a server's elicitation/create request is a standard
+    # JSON-RPC response echoing the request id, POSTed like every other
+    # response on this transport.
+    # @param request_id [String, Integer] the JSON-RPC request ID
     # @param result [Hash] the elicitation result (action and optional content)
     # @return [void]
-    def send_elicitation_response(elicitation_id, result)
-      params = {
-        'elicitationId' => elicitation_id,
-        'action' => result['action']
-      }
+    def send_elicitation_response(request_id, result)
+      # Error-shaped results become JSON-RPC error responses (e.g. -32602 for
+      # an undeclared elicitation mode), mirroring the sampling error path.
+      if result.is_a?(Hash) && result['error']
+        send_error_response(request_id, result['error']['code'] || -32_603,
+                            result['error']['message'] || 'Elicitation error')
+        return
+      end
 
-      # Only include content if present (typically for 'accept' action)
-      params['content'] = result['content'] if result['content']
-
-      request = {
+      response = {
         'jsonrpc' => '2.0',
-        'method' => 'elicitation/response',
-        'params' => params
+        'id' => request_id,
+        'result' => result
       }
 
-      # Send as a JSON-RPC request via HTTP POST
-      post_jsonrpc_response(request)
+      post_jsonrpc_response(response)
     rescue StandardError => e
       @logger.error("Error sending elicitation response: #{e.message}")
     end
