@@ -208,6 +208,59 @@ RSpec.describe 'OAuth challenge handling (MCP 2025-11-25)' do
     end
   end
 
+  describe 'provider-side Bearer-segment parameter extraction' do
+    let(:provider) { MCPClient::Auth::OAuthProvider.new(server_url: base_url) }
+
+    def response_with(header)
+      instance_double(Faraday::Response, headers: { 'WWW-Authenticate' => header })
+    end
+
+    it 'does not let another scheme\'s resource_metadata drive discovery or scope' do
+      provider.instance_variable_set(:@challenge_scope, 'old:scope')
+      header = 'Basic resource_metadata="https://evil.example/prm", Bearer realm="mcp"'
+
+      expect(provider.handle_unauthorized_response(response_with(header))).to be_nil
+
+      expect(a_request(:get, 'https://evil.example/prm')).not_to have_been_made
+      expect(provider.instance_variable_get(:@challenge_metadata_url)).to be_nil
+      expect(provider.challenge_scope).to be_nil
+    end
+
+    it 'does not capture a scope parameter carried by a non-Bearer challenge' do
+      header = 'Basic scope="basic:only", Bearer realm="mcp"'
+
+      provider.handle_unauthorized_response(response_with(header))
+
+      expect(provider.challenge_scope).to be_nil
+    end
+
+    it 'treats a header without a Bearer challenge as carrying no usable parameters' do
+      provider.instance_variable_set(:@challenge_scope, 'old:scope')
+      header = 'Basic resource_metadata="https://evil.example/prm", scope="basic:only"'
+
+      expect(provider.handle_unauthorized_response(response_with(header))).to be_nil
+
+      expect(a_request(:get, 'https://evil.example/prm')).not_to have_been_made
+      expect(provider.challenge_scope).to be_nil
+    end
+
+    it 'still drives discovery and scope from a normal Bearer challenge' do
+      stub_request(:get, "#{base_url}/.well-known/oauth-protected-resource")
+        .to_return(
+          status: 200,
+          headers: { 'Content-Type' => 'application/json' },
+          body: { resource: base_url, authorization_servers: ['https://auth.example.com'] }.to_json
+        )
+      header = "Bearer resource_metadata=\"#{base_url}/.well-known/oauth-protected-resource\", scope=\"mcp:tools\""
+
+      metadata = provider.handle_unauthorized_response(response_with(header))
+
+      expect(metadata).to be_a(MCPClient::Auth::ResourceMetadata)
+      expect(metadata.authorization_servers).to include('https://auth.example.com')
+      expect(provider.challenge_scope).to eq('mcp:tools')
+    end
+  end
+
   describe 'challenge-advertised metadata URL authority' do
     let(:provider) { MCPClient::Auth::OAuthProvider.new(server_url: base_url) }
     let(:challenge_url) { "#{base_url}/.well-known/oauth-protected-resource/tenant" }

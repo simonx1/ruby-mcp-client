@@ -11,6 +11,18 @@ module MCPClient
     # Handles the complete OAuth flow including server discovery, client registration,
     # authorization, token exchange, and refresh
     class OAuthProvider
+      # One auth-param (name = token / quoted-string) as it appears in a
+      # WWW-Authenticate challenge (RFC 7235 §2.1, optional whitespace around
+      # '='). Mirrors HttpTransportBase::AUTH_PARAM so provider-side challenge
+      # parsing segments headers exactly like the transport does.
+      AUTH_PARAM = /[A-Za-z0-9._~+-]+\s*=\s*(?:"(?:[^"\\]|\\.)*"|[^,\s]*)/
+      # A run of comma/space separated auth-params anchored at the start of a
+      # string. The run ends before a token that is NOT followed by '=' — the
+      # auth-scheme introducing the next challenge — while commas inside quoted
+      # values are consumed by the quoted-string branch, not treated as
+      # boundaries. Mirrors HttpTransportBase::AUTH_PARAMS_RUN.
+      AUTH_PARAMS_RUN = /\A(?:[\s,]*#{AUTH_PARAM})*/
+
       # @!attribute [rw] redirect_uri
       #   @return [String] OAuth redirect URI
       # @!attribute [rw] scope
@@ -148,11 +160,18 @@ module MCPClient
         www_authenticate = response.headers['WWW-Authenticate'] || response.headers['www-authenticate']
         return nil unless www_authenticate
 
+        # Challenge parameters are read from the Bearer challenge's own
+        # segment only — never from the whole (possibly multi-challenge)
+        # header — so parameters belonging to Basic or another scheme cannot
+        # drive Bearer scope selection or resource metadata discovery. A
+        # header without a Bearer challenge carries no usable Bearer params.
+        bearer_params = bearer_challenge_segment(www_authenticate)
+
         # MCP 2025-11-25: "Clients MUST treat the scopes provided in the
         # challenge as authoritative for satisfying the current request" —
         # including resetting a previously challenged scope when the current
         # challenge carries none.
-        @challenge_scope = extract_challenge_param(www_authenticate, 'scope')
+        @challenge_scope = bearer_params && extract_challenge_param(bearer_params, 'scope')
 
         url = extract_resource_metadata_url(www_authenticate)
         return nil unless url
@@ -173,23 +192,45 @@ module MCPClient
 
       # Extract the protected-resource-metadata URL from a WWW-Authenticate header.
       # Per RFC 9728 the parameter is `resource_metadata`; a legacy `resource`
-      # parameter is accepted as a fallback for older servers.
+      # parameter is accepted as a fallback for older servers. Only the Bearer
+      # challenge's own segment is consulted, so a parameter belonging to
+      # another scheme's challenge can never drive discovery.
       # @param header [String] the WWW-Authenticate header value
       # @return [String, nil] the metadata URL if present
       def extract_resource_metadata_url(header)
+        params = bearer_challenge_segment(header)
+        return nil unless params
+
         # Auth-params may include optional whitespace around '=' (RFC 7235).
         # Quoted form: resource_metadata = "https://..."
-        if (m = header.match(/resource_metadata\s*=\s*"([^"]+)"/))
+        if (m = params.match(/resource_metadata\s*=\s*"([^"]+)"/))
           return m[1]
         end
 
         # Unquoted token form: resource_metadata = https://...
-        if (m = header.match(/resource_metadata\s*=\s*([^,\s]+)/))
+        if (m = params.match(/resource_metadata\s*=\s*([^,\s]+)/))
           return m[1]
         end
 
         # Legacy fallback: resource="https://..."
-        header.match(/resource\s*=\s*"([^"]+)"/)&.captures&.first
+        params.match(/resource\s*=\s*"([^"]+)"/)&.captures&.first
+      end
+
+      # Extract the Bearer challenge's own parameter segment from a (possibly
+      # multi-challenge) WWW-Authenticate header, so params belonging to other
+      # schemes (e.g. `Basic resource_metadata="...", Bearer realm="x"`) are
+      # never attributed to the Bearer challenge. Mirrors
+      # HttpTransportBase#bearer_challenge_segment.
+      # @param header [String, nil] the WWW-Authenticate header value
+      # @return [String, nil] the Bearer challenge's parameters (possibly
+      #   empty), or nil when the header has no Bearer challenge
+      def bearer_challenge_segment(header)
+        return nil unless header
+
+        match = header.match(/(?:\A|[\s,])Bearer(?=[\s,]|\z)/i)
+        return nil unless match
+
+        match.post_match[AUTH_PARAMS_RUN]
       end
 
       # Extract an auth-param value from a WWW-Authenticate header
