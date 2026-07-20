@@ -235,4 +235,24 @@ RSpec.describe MCPClient::ServerSSE do
       expect(server.instance_variable_get(:@initialized)).to be_falsey
     end
   end
+
+  describe 'review hardening (Codex findings)' do
+    it 'fails the handshake on an unresolvable endpoint URI' do
+      server = MCPClient::ServerSSE.new(base_url: 'https://example.com/sse')
+
+      expect do
+        server.send(:handle_endpoint_event, 'http://[invalid uri')
+      end.to raise_error(MCPClient::Errors::TransportError, /endpoint URI/)
+      expect(server.instance_variable_get(:@connection_established)).to be_falsey
+    end
+
+    it 'clears the negotiated protocol version on cleanup' do
+      server = MCPClient::ServerSSE.new(base_url: 'https://example.com/sse')
+      server.instance_variable_set(:@protocol_version, '2025-06-18')
+
+      server.cleanup
+
+      expect(server.instance_variable_get(:@protocol_version)).to be_nil
+    end
+  end
 end

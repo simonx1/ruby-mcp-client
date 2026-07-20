@@ -162,8 +162,12 @@ module MCPClient
       def resolve_endpoint_uri(data)
         URI.join(@base_url, data).to_s
       rescue URI::Error => e
-        @logger.warn("Failed to resolve endpoint URI #{data.inspect} against #{@base_url}: #{e.message}")
-        data
+        # The endpoint event is the handshake's core payload; an unresolvable
+        # URI must fail the handshake rather than deferring a broken POST
+        # target to the first request.
+        @logger.error("Failed to resolve endpoint URI #{data.inspect} against #{@base_url}: #{e.message}")
+        raise MCPClient::Errors::TransportError,
+              "Invalid endpoint URI in SSE endpoint event: #{data.inspect} (#{e.message})"
       end
     end
   end

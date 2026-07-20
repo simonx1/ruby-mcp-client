@@ -407,6 +407,10 @@ module MCPClient
         @connection_established = false
         @sse_connected = false
         @initialized = false # Reset initialization state for reconnection
+        # A fresh session negotiates its own protocol version; keeping the old
+        # one would leak the previous session's version into the next
+        # initialize POST's MCP-Protocol-Version header.
+        @protocol_version = nil
 
         # Reset the SSE parse buffer so a reconnect never inherits a leftover
         # partial event from the previous connection.
