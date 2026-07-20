@@ -1,6 +1,7 @@
 # frozen_string_literal: true
 
 require 'logger'
+require 'securerandom'
 
 module MCPClient
   # MCP Client for integrating with the Model Context Protocol
@@ -44,6 +45,9 @@ module MCPClient
         MCPClient::ServerFactory.create(config, logger: @logger)
       end
       @tool_cache = {}
+      # Active progressToken -> callback registrations (MCP progress utility)
+      @progress_callbacks = {}
+      @progress_mutex = Mutex.new
       @prompt_cache = {}
       @resource_cache = {}
       # JSON-RPC notification listeners
@@ -259,34 +263,8 @@ module MCPClient
     # @param parameters [Hash] the parameters to pass to the tool
     # @param server [String, Symbol, Integer, MCPClient::ServerBase, nil] optional server to use
     # @return [Object] the result of the tool invocation
-    def call_tool(tool_name, parameters, server: nil)
-      tools = list_tools
-
-      if server
-        # Use the specified server
-        srv = select_server(server)
-        # Find the tool on this specific server
-        tool = tools.find { |t| t.name == tool_name && t.server == srv }
-        unless tool
-          raise MCPClient::Errors::ToolNotFound,
-                "Tool '#{tool_name}' not found on server '#{srv.name || srv.class.name}'"
-        end
-      else
-        # Find the tool across all servers
-        matching_tools = tools.select { |t| t.name == tool_name }
-
-        if matching_tools.empty?
-          raise MCPClient::Errors::ToolNotFound, "Tool '#{tool_name}' not found"
-        elsif matching_tools.size > 1
-          # If multiple matches, disambiguate with server names
-          server_names = matching_tools.map { |t| t.server&.name || 'unnamed' }
-          raise MCPClient::Errors::AmbiguousToolName,
-                "Multiple tools named '#{tool_name}' found across servers (#{server_names.join(', ')}). " \
-                "Please specify a server using the 'server' parameter."
-        end
-
-        tool = matching_tools.first
-      end
+    def call_tool(tool_name, parameters, server: nil, progress: nil)
+      tool = resolve_tool(tool_name, server: server)
 
       # Validate parameters against tool schema
       validate_params!(tool, parameters)
@@ -296,12 +274,21 @@ module MCPClient
       server = tool.server
       raise MCPClient::Errors::ServerNotFound, "No server found for tool '#{tool_name}'" unless server
 
+      # MCP progress utility: attach an auto-generated progressToken to the
+      # request _meta and route matching notifications/progress to the
+      # caller's callback while the request is active.
+      parameters, token = setup_progress_tracking(parameters, progress)
+
       begin
         server.call_tool(tool_name, parameters)
       rescue MCPClient::Errors::ConnectionError => e
         # Add server identity information to the error for better context
         server_id = server.name ? "#{server.class}[#{server.name}]" : server.class.name
         raise MCPClient::Errors::ToolCallError, "Error calling tool '#{tool_name}': #{e.message} (Server: #{server_id})"
+      ensure
+        # Tokens are only valid for the lifetime of the request: dropping the
+        # registration filters out stale post-completion notifications.
+        unregister_progress_callback(token) if token
       end
     end
 
@@ -406,33 +393,7 @@ module MCPClient
     # @param server [String, Symbol, Integer, MCPClient::ServerBase, nil] optional server to use
     # @return [Enumerator] streaming enumerator or single-value enumerator
     def call_tool_streaming(tool_name, parameters, server: nil)
-      tools = list_tools
-
-      if server
-        # Use the specified server
-        srv = select_server(server)
-        # Find the tool on this specific server
-        tool = tools.find { |t| t.name == tool_name && t.server == srv }
-        unless tool
-          raise MCPClient::Errors::ToolNotFound,
-                "Tool '#{tool_name}' not found on server '#{srv.name || srv.class.name}'"
-        end
-      else
-        # Find the tool across all servers
-        matching_tools = tools.select { |t| t.name == tool_name }
-
-        if matching_tools.empty?
-          raise MCPClient::Errors::ToolNotFound, "Tool '#{tool_name}' not found"
-        elsif matching_tools.size > 1
-          # If multiple matches, disambiguate with server names
-          server_names = matching_tools.map { |t| t.server&.name || 'unnamed' }
-          raise MCPClient::Errors::AmbiguousToolName,
-                "Multiple tools named '#{tool_name}' found across servers (#{server_names.join(', ')}). " \
-                "Please specify a server using the 'server' parameter."
-        end
-
-        tool = matching_tools.first
-      end
+      tool = resolve_tool(tool_name, server: server)
 
       # Validate parameters against tool schema
       validate_params!(tool, parameters)
@@ -679,6 +640,8 @@ module MCPClient
       when 'notifications/tasks/status'
         # MCP 2025-11-25: task status update (params are a flat Task)
         handle_task_status_notification(server_id, params)
+      when 'notifications/progress'
+        handle_progress_notification(server_id, params)
       else
         # Log unknown notification types for debugging purposes
         logger.debug("[#{server_id}] Received unknown notification: #{method} - #{params}")
@@ -689,6 +652,66 @@ module MCPClient
     # @param server_id [String] server identifier for log prefix
     # @param params [Hash] log message params (level, logger, data)
     # @return [void]
+    # Route a notifications/progress message to the callback registered for
+    # its progressToken; unknown or stale tokens are debug-logged and dropped
+    # (MCP: "Senders and receivers SHOULD track active progress tokens").
+    # @param server_id [String] identity of the emitting server (for logs)
+    # @param params [Hash, nil] notification params
+    # @return [void]
+    def handle_progress_notification(server_id, params)
+      token = params && params['progressToken']
+      callback = @progress_mutex.synchronize { @progress_callbacks[token] }
+      unless callback
+        logger.debug("[#{server_id}] Progress for unknown or completed token #{token.inspect}")
+        return
+      end
+
+      callback.call(params['progress'], params['total'], params['message'])
+    rescue StandardError => e
+      logger.warn("[#{server_id}] Progress callback error: #{e.message}")
+    end
+
+    # Attach progress tracking to an outgoing request when requested.
+    # @param parameters [Hash] user arguments
+    # @param progress [#call, nil] optional progress callback
+    # @return [Array(Hash, String|nil)] possibly-augmented parameters and token
+    def setup_progress_tracking(parameters, progress)
+      return [parameters, nil] unless progress
+
+      token = generate_progress_token
+      register_progress_callback(token, progress)
+      [attach_progress_token(parameters, token), token]
+    end
+
+    # @return [String] a unique progress token for an outgoing request
+    def generate_progress_token
+      "rb-mcp-#{SecureRandom.hex(8)}"
+    end
+
+    # @param parameters [Hash] user arguments (not mutated)
+    # @param token [String] progress token
+    # @return [Hash] parameters with _meta.progressToken merged in
+    def attach_progress_token(parameters, token)
+      params = parameters.dup
+      meta = (params['_meta'] || params[:_meta] || {}).merge('progressToken' => token)
+      params.delete(:_meta)
+      params['_meta'] = meta
+      params
+    end
+
+    # @param token [String] progress token
+    # @param callback [#call] receives (progress, total, message)
+    # @return [void]
+    def register_progress_callback(token, callback)
+      @progress_mutex.synchronize { @progress_callbacks[token] = callback }
+    end
+
+    # @param token [String] progress token
+    # @return [void]
+    def unregister_progress_callback(token)
+      @progress_mutex.synchronize { @progress_callbacks.delete(token) }
+    end
+
     def handle_log_message(server_id, params)
       level = params['level'] || 'info'
       logger_name = params['logger']

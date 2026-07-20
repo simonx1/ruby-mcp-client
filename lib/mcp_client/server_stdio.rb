@@ -212,7 +212,7 @@ module MCPClient
         'jsonrpc' => '2.0',
         'id' => req_id,
         'method' => 'prompts/get',
-        'params' => { 'name' => prompt_name, 'arguments' => parameters }
+        'params' => build_named_request_params(prompt_name, parameters)
       }
       send_request(req)
       res = wait_response(req_id)
@@ -391,7 +391,7 @@ module MCPClient
         'jsonrpc' => '2.0',
         'id' => req_id,
         'method' => 'tools/call',
-        'params' => { 'name' => tool_name, 'arguments' => parameters }
+        'params' => build_named_request_params(tool_name, parameters)
       }
       send_request(req)
       res = wait_response(req_id)
