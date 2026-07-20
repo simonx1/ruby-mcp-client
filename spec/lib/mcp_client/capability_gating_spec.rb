@@ -78,8 +78,8 @@ RSpec.describe 'Capability gating (MCP 2025-11-25)' do
 
   describe 'Client#log_level=' do
     it 'skips servers that did not negotiate the logging capability' do
-      with_logging = double('srv-a', capability?: true)
-      without_logging = double('srv-b')
+      with_logging = double('srv-a', capability?: true, capabilities: { 'logging' => {} })
+      without_logging = double('srv-b', capabilities: {})
       allow(without_logging).to receive(:capability?).with('logging').and_return(false)
       allow(with_logging).to receive(:log_level=)
       allow(without_logging).to receive(:log_level=)
@@ -93,11 +93,24 @@ RSpec.describe 'Capability gating (MCP 2025-11-25)' do
       expect(with_logging).to have_received(:log_level=).with('debug')
       expect(without_logging).not_to have_received(:log_level=)
     end
+
+    it 'attempts servers whose capabilities are not yet known' do
+      unknown = double('srv-c', name: 'c')
+      allow(unknown).to receive(:capabilities).and_return(nil)
+      allow(unknown).to receive(:log_level=)
+
+      client = MCPClient::Client.new
+      client.instance_variable_set(:@servers, [unknown])
+
+      client.log_level = 'info'
+
+      expect(unknown).to have_received(:log_level=).with('info')
+    end
   end
 
   describe 'Client task operations' do
     let(:srv) do
-      double('server', name: 'srv-1')
+      double('server', name: 'srv-1', capabilities: {})
     end
     let(:client) do
       c = MCPClient::Client.new
@@ -117,6 +130,14 @@ RSpec.describe 'Capability gating (MCP 2025-11-25)' do
       expect(srv).not_to receive(:rpc_request)
 
       expect { client.cancel_task('t-1') }.to raise_error(MCPClient::Errors::CapabilityError, /tasks\.cancel/)
+    end
+
+    it 'does not falsely reject task operations before initialization' do
+      allow(srv).to receive(:capabilities).and_return(nil)
+      allow(srv).to receive(:capability?).and_return(false)
+      allow(srv).to receive(:rpc_request).with('tasks/list', {}).and_return({ 'tasks' => [] })
+
+      expect(client.list_tasks[:tasks]).to eq([])
     end
 
     it 'lists tasks when the capability was negotiated' do
