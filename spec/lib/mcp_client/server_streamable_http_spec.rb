@@ -1077,7 +1077,7 @@ RSpec.describe MCPClient::ServerStreamableHTTP do
             status: 200,
             body: "event: message\ndata: {\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{}}\n\n",
             headers: {
-              'Mcp-Session-Id' => 'invalid@session$format!',
+              'Mcp-Session-Id' => 'invalid session format',
               'Content-Type' => 'text/event-stream'
             }
           )
@@ -1389,7 +1389,7 @@ RSpec.describe MCPClient::ServerStreamableHTTP do
             status: 200,
             body: "event: message\ndata: {\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{}}\n\n",
             headers: {
-              'Mcp-Session-Id' => 'invalid/session@123!',
+              'Mcp-Session-Id' => 'invalid session 123',
               'Content-Type' => 'text/event-stream'
             }
           )

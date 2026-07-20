@@ -78,16 +78,17 @@ module MCPClient
       end
     end
 
-    # Validate session ID format for security
+    # Validate session ID format
+    # Per MCP 2025-11-25, the server-assigned session ID "MUST only contain
+    # visible ASCII characters (ranging from 0x21 to 0x7E)" — e.g. a UUID, a
+    # JWT, or a cryptographic hash — and the client MUST echo whatever the
+    # server assigned. A generous length cap guards against abuse.
     # @param session_id [String] the session ID to validate
     # @return [Boolean] true if session ID is valid
     def valid_session_id?(session_id)
       return false unless session_id.is_a?(String)
-      return false if session_id.empty?
 
-      # Session ID should be alphanumeric with optional hyphens and underscores
-      # Length should be reasonable (8-128 characters)
-      session_id.match?(/\A[a-zA-Z0-9\-_]{8,128}\z/)
+      session_id.match?(/\A[\x21-\x7E]{1,512}\z/)
     end
 
     # Validate the server's base URL for security
@@ -179,6 +180,11 @@ module MCPClient
           req.body = request.to_json
         end
 
+        # MCP 2025-11-25 session management: HTTP 404 for a request carrying
+        # Mcp-Session-Id means the session expired — the client MUST start a
+        # new session with a fresh InitializeRequest (without a session ID).
+        return restart_session_and_resend(request) if response.status == 404 && @session_id && !@restarting_session
+
         handle_http_error_response(response) unless response.success?
         handle_successful_response(response, request)
 
@@ -191,6 +197,22 @@ module MCPClient
       rescue Faraday::Error => e
         raise MCPClient::Errors::TransportError, "HTTP request failed: #{e.message}"
       end
+    end
+
+    # Start a new session after the server invalidated the current one, then
+    # resend the original request once. The @restarting_session flag prevents
+    # a second restart if the fresh session also answers 404.
+    # @param request [Hash] the JSON-RPC request that hit the expired session
+    # @return [Faraday::Response] the response to the resent request
+    def restart_session_and_resend(request)
+      @logger.warn("Session #{@session_id} no longer valid (HTTP 404); starting a new session")
+      @restarting_session = true
+      @session_id = nil
+      @last_event_id = nil if instance_variable_defined?(:@last_event_id)
+      perform_initialize
+      send_http_request(request)
+    ensure
+      @restarting_session = false
     end
 
     # Apply headers to the HTTP request (can be overridden by subclasses)

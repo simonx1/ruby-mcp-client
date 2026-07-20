@@ -159,7 +159,7 @@ RSpec.describe 'Session Management Integration', type: :integration do
           .to_return(
             status: 200,
             body: { jsonrpc: '2.0', id: 1, result: {} }.to_json,
-            headers: { 'Mcp-Session-Id' => 'invalid@session!' } # Invalid format
+            headers: { 'Mcp-Session-Id' => 'invalid session id' } # Invalid format
           )
 
         # initialized notification (MCP lifecycle MUST)
@@ -447,7 +447,7 @@ RSpec.describe 'Session Management Integration', type: :integration do
           .to_return(
             status: 200,
             body: { jsonrpc: '2.0', id: 2, result: {} }.to_json,
-            headers: { 'Mcp-Session-Id' => 'invalid@session!' }
+            headers: { 'Mcp-Session-Id' => 'invalid session id' }
           )
 
         http_server.send(:perform_initialize)
