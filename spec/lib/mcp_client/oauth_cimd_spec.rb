@@ -118,6 +118,49 @@ RSpec.describe 'OAuth Client ID Metadata Documents (SEP-991)' do
         end.to raise_error(ArgumentError)
       end
 
+      # The Client ID Metadata Document draft additionally forbids userinfo,
+      # fragments, and dot path segments, and requires a host.
+      it 'rejects a URL without a host with ArgumentError' do
+        expect do
+          described_class.new(server_url: server_url, client_id_metadata_url: 'https:///client-metadata.json')
+        end.to raise_error(ArgumentError, /host/i)
+      end
+
+      it 'rejects a URL containing userinfo with ArgumentError' do
+        expect do
+          described_class.new(server_url: server_url,
+                              client_id_metadata_url: 'https://user:pass@app.example.com/client-metadata.json')
+        end.to raise_error(ArgumentError, /userinfo/i)
+      end
+
+      it 'rejects a URL containing a fragment with ArgumentError' do
+        expect do
+          described_class.new(server_url: server_url,
+                              client_id_metadata_url: 'https://app.example.com/client-metadata.json#section')
+        end.to raise_error(ArgumentError, /fragment/i)
+      end
+
+      it "rejects a URL containing a '.' path segment with ArgumentError" do
+        expect do
+          described_class.new(server_url: server_url,
+                              client_id_metadata_url: 'https://app.example.com/./client-metadata.json')
+        end.to raise_error(ArgumentError, /path segment/i)
+      end
+
+      it "rejects a URL containing a '..' path segment with ArgumentError" do
+        expect do
+          described_class.new(server_url: server_url,
+                              client_id_metadata_url: 'https://app.example.com/oauth/../client-metadata.json')
+        end.to raise_error(ArgumentError, /path segment/i)
+      end
+
+      it 'still accepts a valid nested-path URL with a query string' do
+        url = 'https://app.example.com/oauth/client-metadata.json?v=1'
+        provider = described_class.new(server_url: server_url, client_id_metadata_url: url)
+
+        expect(provider.client_id_metadata_url).to eq(url)
+      end
+
       it 'validates assignment through the writer as well' do
         provider = described_class.new(server_url: server_url)
 
@@ -244,6 +287,37 @@ RSpec.describe 'OAuth Client ID Metadata Documents (SEP-991)' do
         expect(params['client_id']).to eq(client_id_metadata_url)
         expect(params['redirect_uri']).to eq(redirect_uri)
       end
+    end
+  end
+
+  describe MCPClient::OAuthClient do
+    it 'forwards client_id_metadata_url to the OAuth provider in create_http_server' do
+      server = described_class.create_http_server(
+        server_url: server_url,
+        client_id_metadata_url: client_id_metadata_url,
+        logger: logger
+      )
+
+      provider = server.instance_variable_get(:@oauth_provider)
+      expect(provider.client_id_metadata_url).to eq(client_id_metadata_url)
+    end
+
+    it 'forwards client_id_metadata_url to the OAuth provider in create_streamable_http_server' do
+      server = described_class.create_streamable_http_server(
+        server_url: server_url,
+        client_id_metadata_url: client_id_metadata_url,
+        logger: logger
+      )
+
+      provider = server.instance_variable_get(:@oauth_provider)
+      expect(provider.client_id_metadata_url).to eq(client_id_metadata_url)
+    end
+
+    it 'defaults client_id_metadata_url to nil when not given' do
+      server = described_class.create_http_server(server_url: server_url, logger: logger)
+
+      provider = server.instance_variable_get(:@oauth_provider)
+      expect(provider.client_id_metadata_url).to be_nil
     end
   end
 end

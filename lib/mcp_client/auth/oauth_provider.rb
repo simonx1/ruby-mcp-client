@@ -734,18 +734,32 @@ module MCPClient
 
       # Validate a Client ID Metadata Document URL (SEP-991): "The client_id
       # URL MUST use the 'https' scheme and contain a path component, e.g.
-      # https://example.com/client.json".
+      # https://example.com/client.json". Per the Client ID Metadata Document
+      # draft the URL must also have a host and must not contain userinfo,
+      # a fragment, or single-/double-dot path segments.
       # @param url [String] Candidate metadata URL
       # @return [String] The validated URL
-      # @raise [ArgumentError] if the URL is invalid, not HTTPS, or lacks a path component
+      # @raise [ArgumentError] if the URL is invalid, not HTTPS, lacks a host or path
+      #   component, or contains userinfo, a fragment, or dot path segments
       def validate_client_id_metadata_url(url)
         uri = URI.parse(url)
         raise ArgumentError, "client_id_metadata_url must be an HTTPS URL: #{url.inspect}" unless uri.is_a?(URI::HTTPS)
+
+        raise ArgumentError, "client_id_metadata_url must include a host: #{url.inspect}" if uri.host.to_s.empty?
+
+        raise ArgumentError, "client_id_metadata_url must not contain userinfo: #{url.inspect}" if uri.userinfo
+
+        raise ArgumentError, "client_id_metadata_url must not contain a fragment: #{url.inspect}" if uri.fragment
 
         if uri.path.to_s.empty? || uri.path == '/'
           raise ArgumentError,
                 'client_id_metadata_url must contain a path component ' \
                 "(e.g. https://example.com/client.json): #{url.inspect}"
+        end
+
+        if uri.path.split('/').intersect?(['.', '..'])
+          raise ArgumentError,
+                "client_id_metadata_url must not contain '.' or '..' path segments: #{url.inspect}"
         end
 
         url
