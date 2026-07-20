@@ -18,16 +18,21 @@ module MCPClient
   # of scope: unrecognized keywords are ignored rather than misapplied, so
   # validation is best-effort — it may accept data a full validator would
   # reject, but it does not reject data that conforms to the schema. So that
-  # this gap is never silent, {.unsupported_keywords} reports which unsupported
-  # applicator keywords a schema uses; callers surface them as a warning.
+  # this gap is never silent, {.unsupported_keywords} reports which unapplied
+  # validation keywords a schema uses; callers surface them as a warning.
   module SchemaValidator
-    # JSON Schema 2020-12 applicator/reference keywords this validator does
-    # not evaluate. Their presence means validation is partial: data may pass
-    # here that a full validator would reject.
+    # JSON Schema 2020-12 keywords that affect validation but that this
+    # validator does not evaluate: applicator/reference keywords, assertion
+    # keywords (multipleOf, uniqueItems, contains bounds, property-count
+    # bounds, dependentRequired), and format (asserted by full validators in
+    # format-assertion mode). Their presence means validation is partial: data
+    # may pass here that a full validator would reject.
     UNSUPPORTED_KEYWORDS = %w[
-      $ref $defs allOf anyOf oneOf not if then else
-      additionalProperties patternProperties
-      unevaluatedProperties unevaluatedItems dependentSchemas
+      $ref $dynamicRef $defs allOf anyOf oneOf not if then else
+      additionalProperties patternProperties propertyNames dependentSchemas
+      prefixItems contains minContains maxContains uniqueItems
+      multipleOf format dependentRequired minProperties maxProperties
+      unevaluatedProperties unevaluatedItems
     ].freeze
 
     # Keywords whose value is a single subschema to walk.

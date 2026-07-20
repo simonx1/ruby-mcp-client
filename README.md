@@ -157,9 +157,11 @@ data = result['structuredContent']  # Type-safe structured data
 # tool's output schema, and a tool that declares an outputSchema must return
 # structuredContent in successful results. call_tool checks both automatically
 # for the common JSON Schema keywords (type, properties, required, items, enum,
-# numeric/string bounds). The full 2020-12 vocabulary ($ref/$defs, allOf/anyOf/
-# oneOf/not, if/then/else, additionalProperties, patternProperties,
-# unevaluated*, dependentSchemas) is NOT evaluated: when a schema uses any of
+# numeric/string bounds). The full 2020-12 vocabulary ($ref/$dynamicRef/$defs,
+# allOf/anyOf/oneOf/not, if/then/else, additionalProperties, patternProperties,
+# propertyNames, prefixItems, contains/minContains/maxContains, uniqueItems,
+# multipleOf, format, dependentRequired/dependentSchemas, minProperties/
+# maxProperties, unevaluated*) is NOT evaluated: when a schema uses any of
 # those keywords, call_tool logs a "validation is partial" warning naming them
 # (in both modes), since data may pass this check that a full validator would
 # reject. By default a violation (mismatch, or missing structuredContent on a
