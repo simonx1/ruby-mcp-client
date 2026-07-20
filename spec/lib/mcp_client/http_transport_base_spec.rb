@@ -338,6 +338,7 @@ RSpec.describe MCPClient::HttpTransportBase do
 
     before do
       allow(response).to receive(:respond_to?).with(:reason_phrase).and_return(true)
+      allow(response).to receive(:respond_to?).with(:headers).and_return(true)
       allow(response).to receive(:reason_phrase).and_return('Test Error')
     end
 
@@ -346,6 +347,7 @@ RSpec.describe MCPClient::HttpTransportBase do
         [401, 403].each do |status|
           it "raises ConnectionError for HTTP #{status}" do
             allow(response).to receive(:status).and_return(status)
+            allow(response).to receive(:headers).and_return({})
 
             expect do
               transport.test_handle_http_error_response(response)

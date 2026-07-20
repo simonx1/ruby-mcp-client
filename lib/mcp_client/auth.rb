@@ -290,13 +290,16 @@ module MCPClient
 
     # Protected resource metadata for authorization server discovery
     class ResourceMetadata
-      attr_reader :resource, :authorization_servers
+      attr_reader :resource, :authorization_servers, :scopes_supported
 
       # @param resource [String] Resource server identifier
       # @param authorization_servers [Array<String>] List of authorization server URLs
-      def initialize(resource:, authorization_servers:)
+      # @param scopes_supported [Array<String>, nil] Scopes the resource supports (RFC 9728);
+      #   per MCP, the default scope set when a challenge provides none
+      def initialize(resource:, authorization_servers:, scopes_supported: nil)
         @resource = resource
         @authorization_servers = authorization_servers
+        @scopes_supported = scopes_supported
       end
 
       # Convert to hash
@@ -304,8 +307,9 @@ module MCPClient
       def to_h
         {
           resource: @resource,
-          authorization_servers: @authorization_servers
-        }
+          authorization_servers: @authorization_servers,
+          scopes_supported: @scopes_supported
+        }.compact
       end
 
       # Create resource metadata from hash
@@ -314,7 +318,8 @@ module MCPClient
       def self.from_h(data)
         new(
           resource: data[:resource] || data['resource'],
-          authorization_servers: data[:authorization_servers] || data['authorization_servers']
+          authorization_servers: data[:authorization_servers] || data['authorization_servers'],
+          scopes_supported: data[:scopes_supported] || data['scopes_supported']
         )
       end
     end

@@ -146,6 +146,12 @@ module MCPClient
         www_authenticate = response.headers['WWW-Authenticate'] || response.headers['www-authenticate']
         return nil unless www_authenticate
 
+        # MCP 2025-11-25: "Clients MUST treat the scopes provided in the
+        # challenge as authoritative for satisfying the current request."
+        if (challenge_scope = extract_challenge_param(www_authenticate, 'scope'))
+          @challenge_scope = challenge_scope
+        end
+
         url = extract_resource_metadata_url(www_authenticate)
         return nil unless url
 
@@ -179,7 +185,42 @@ module MCPClient
         header.match(/resource\s*=\s*"([^"]+)"/)&.captures&.first
       end
 
+      # Extract an auth-param value from a WWW-Authenticate header
+      # (quoted or unquoted form, optional whitespace around '=').
+      # @param header [String] the WWW-Authenticate header value
+      # @param name [String] the auth-param name
+      # @return [String, nil] the parameter value if present
+      def extract_challenge_param(header, name)
+        if (m = header.match(/#{Regexp.escape(name)}\s*=\s*"([^"]*)"/))
+          return m[1]
+        end
+
+        header.match(/#{Regexp.escape(name)}\s*=\s*([^,\s]+)/)&.captures&.first
+      end
+
+      # Scope requested by the most recent WWW-Authenticate challenge.
+      # @return [String, nil]
+      attr_reader :challenge_scope
+
       private
+
+      # Resolve the scope for authorization/registration requests using the
+      # MCP 2025-11-25 scope selection strategy: the challenge's scope
+      # parameter is authoritative; then an explicitly configured scope
+      # (:all resolves to the AS-advertised scope list); then the Protected
+      # Resource Metadata's scopes_supported; otherwise omit scope entirely.
+      # @return [String, nil]
+      def resolved_scope
+        return @challenge_scope if @challenge_scope && !@challenge_scope.empty?
+        return supported_scopes.join(' ') if scope == :all
+        return scope if scope
+
+        prm = @challenge_resource_metadata || @resource_metadata
+        prm_scopes = prm&.scopes_supported
+        return prm_scopes.join(' ') if prm_scopes && !prm_scopes.empty?
+
+        nil
+      end
 
       # Normalize server URL to canonical form
       # @param url [String] Server URL
@@ -571,7 +612,11 @@ module MCPClient
         end
 
         data = JSON.parse(response.body)
-        ResourceMetadata.from_h(data)
+        metadata = ResourceMetadata.from_h(data)
+        # Retain the most recently fetched PRM so scope resolution can fall
+        # back to its scopes_supported (MCP scope selection priority 2).
+        @resource_metadata = metadata
+        metadata
       rescue JSON::ParserError => e
         raise MCPClient::Errors::ConnectionError, "Invalid resource metadata JSON: #{e.message}"
       rescue Faraday::Error => e
@@ -628,8 +673,6 @@ module MCPClient
       # @raise [MCPClient::Errors::ConnectionError] if registration fails
       def register_client(server_metadata)
         logger.debug("Registering OAuth client at: #{server_metadata.registration_endpoint}")
-
-        resolved_scope = scope == :all ? supported_scopes.join(' ') : scope
 
         metadata = ClientMetadata.new(
           redirect_uris: [redirect_uri],
@@ -705,8 +748,6 @@ module MCPClient
       def build_authorization_url(server_metadata, client_info, pkce, state)
         # Use the redirect_uri that was actually registered
         registered_redirect_uri = client_info.metadata.redirect_uris.first
-
-        resolved_scope = scope == :all ? supported_scopes.join(' ') : scope
 
         params = {
           response_type: 'code',

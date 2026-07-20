@@ -241,7 +241,11 @@ module MCPClient
 
       case response.status
       when 401, 403
-        raise MCPClient::Errors::ConnectionError, "Authorization failed: HTTP #{response.status}"
+        # MCP 2025-11-25: clients MUST parse WWW-Authenticate headers on 401
+        # responses and use the advertised resource metadata; the challenge's
+        # scope parameter is authoritative for the next authorization.
+        process_authorization_challenge(response)
+        raise_authorization_error(response)
       when 400..499
         # Deterministic client errors: the request was processed/rejected and
         # will not succeed on retry, so raise a plain (non-retryable) ServerError.
@@ -253,6 +257,48 @@ module MCPClient
       else
         raise MCPClient::Errors::ServerError, "HTTP error: #{response.status}#{reason_text}"
       end
+    end
+
+    # Surface a 401/403 WWW-Authenticate challenge to the OAuth provider so
+    # the advertised resource metadata and challenge scope are captured before
+    # the error propagates. Discovery failures must not mask the original
+    # authorization error.
+    # @param response [Faraday::Response] the 401/403 response
+    # @return [void]
+    def process_authorization_challenge(response)
+      return unless @oauth_provider && response.respond_to?(:headers)
+
+      @oauth_provider.handle_unauthorized_response(response)
+    rescue StandardError => e
+      @logger.debug("OAuth challenge processing failed: #{e.message}")
+    end
+
+    # Raise the appropriate error for a 401/403: an insufficient_scope 403
+    # challenge (SEP-835) raises InsufficientScopeError exposing the required
+    # scopes so hosts can run a step-up authorization flow.
+    # @param response [Faraday::Response] the 401/403 response
+    # @raise [MCPClient::Errors::InsufficientScopeError, MCPClient::Errors::ConnectionError]
+    def raise_authorization_error(response)
+      header = www_authenticate_header(response)
+
+      if response.status == 403 && header&.match?(/error\s*=\s*"?insufficient_scope"?/)
+        scope = header[/scope\s*=\s*"([^"]*)"/, 1] || header[/scope\s*=\s*([^,\s"]+)/, 1]
+        description = header[/error_description\s*=\s*"([^"]*)"/, 1]
+        raise MCPClient::Errors::InsufficientScopeError.new(
+          "Authorization failed: HTTP 403 insufficient_scope#{" (required scopes: #{scope})" if scope}",
+          scope: scope, error_description: description
+        )
+      end
+
+      raise MCPClient::Errors::ConnectionError, "Authorization failed: HTTP #{response.status}"
+    end
+
+    # @param response [Faraday::Response] an HTTP response
+    # @return [String, nil] the WWW-Authenticate header value, if any
+    def www_authenticate_header(response)
+      return nil unless response.respond_to?(:headers) && response.headers
+
+      response.headers['WWW-Authenticate'] || response.headers['www-authenticate']
     end
 
     # Get or create HTTP connection
