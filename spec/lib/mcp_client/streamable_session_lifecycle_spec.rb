@@ -149,6 +149,44 @@ RSpec.describe 'Streamable HTTP session lifecycle (MCP 2025-11-25)' do
       expect(list_requests.last.headers['Mcp-Session-Id']).to eq('sess-2')
     end
 
+    it 'skips re-initialization when another caller already restarted the session' do
+      init_count = 0
+      stub_request(:post, "#{base_url}#{endpoint}")
+        .with(body: hash_including('method' => 'initialize'))
+        .to_return do |_request|
+          init_count += 1
+          { status: 200, body: init_body,
+            headers: { 'Content-Type' => 'text/event-stream', 'Mcp-Session-Id' => "sess-#{init_count}" } }
+        end
+      stub_request(:post, "#{base_url}#{endpoint}")
+        .with(body: hash_including('method' => 'notifications/initialized'))
+        .to_return(status: 202, body: '')
+      stub_request(:get, "#{base_url}#{endpoint}").to_return(status: 200, body: '')
+
+      list_requests = []
+      stub_request(:post, "#{base_url}#{endpoint}")
+        .with(body: hash_including('method' => 'tools/list'))
+        .to_return do |request|
+          list_requests << request
+          { status: 200, body: tools_body, headers: { 'Content-Type' => 'text/event-stream' } }
+        end
+
+      server.connect
+
+      # Simulate the race: this caller saw a 404 against sess-1, but while it
+      # waited for the monitor another caller already restarted the session
+      # and obtained sess-2. The stale expired id must not trigger a third
+      # session; the request is simply resent against the fresh session.
+      server.instance_variable_set(:@session_id, 'sess-2')
+      request = { 'jsonrpc' => '2.0', 'id' => 42, 'method' => 'tools/list', 'params' => {} }
+      server.send(:restart_session_and_resend, request, 'sess-1')
+
+      expect(init_count).to eq(1) # only the initial connect, no second initialize POST
+      expect(list_requests.size).to eq(1)
+      expect(list_requests.first.headers['Mcp-Session-Id']).to eq('sess-2')
+      expect(server.instance_variable_get(:@session_id)).to eq('sess-2')
+    end
+
     it 'does not loop when the resent request also gets 404' do
       stub_request(:post, "#{base_url}#{endpoint}")
         .with(body: hash_including('method' => 'initialize'))
