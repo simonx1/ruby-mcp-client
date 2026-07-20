@@ -20,7 +20,12 @@ module MCPClient
     # @!attribute [r] task_support
     #   @return [String, nil] tool-level task negotiation (MCP 2025-11-25):
     #     'forbidden' (default), 'optional', or 'required'; nil when not advertised
-    attr_reader :name, :title, :description, :schema, :output_schema, :annotations, :server, :task_support
+    # @!attribute [r] icons
+    #   @return [Array<Hash>, nil] optional icons for display in user interfaces (MCP 2025-11-25, SEP-973)
+    # @!attribute [r] meta
+    #   @return [Hash, nil] optional `_meta` metadata attached to the tool (MCP 2025-11-25)
+    attr_reader :name, :title, :description, :schema, :output_schema, :annotations, :server, :task_support,
+                :icons, :meta
 
     # Initialize a new Tool
     # @param name [String] the name of the tool
@@ -31,8 +36,11 @@ module MCPClient
     # @param annotations [Hash, nil] optional annotations describing tool behavior
     # @param server [MCPClient::ServerBase, nil] the server this tool belongs to
     # @param task_support [String, nil] execution.taskSupport value (MCP 2025-11-25)
+    # @param icons [Array<Hash>, nil] optional icons for display in user interfaces (MCP 2025-11-25)
+    # @param meta [Hash, nil] optional `_meta` metadata attached to the tool (MCP 2025-11-25)
+    # rubocop:disable Metrics/ParameterLists
     def initialize(name:, description:, schema:, title: nil, output_schema: nil, annotations: nil, server: nil,
-                   task_support: nil)
+                   task_support: nil, icons: nil, meta: nil)
       @name = name
       @title = title
       @description = description
@@ -41,7 +49,10 @@ module MCPClient
       @annotations = annotations
       @server = server
       @task_support = task_support
+      @icons = icons
+      @meta = meta
     end
+    # rubocop:enable Metrics/ParameterLists
 
     # Create a Tool instance from JSON data
     # @param data [Hash] JSON data from MCP server
@@ -56,6 +67,8 @@ module MCPClient
       title = data['title'] || data[:title]
       execution = data['execution'] || data[:execution]
       task_support = execution && (execution['taskSupport'] || execution[:taskSupport])
+      icons = data['icons'] || data[:icons]
+      meta = data['_meta'] || data[:_meta]
       new(
         name: data['name'] || data[:name],
         description: data['description'] || data[:description],
@@ -64,7 +77,9 @@ module MCPClient
         output_schema: output_schema,
         annotations: annotations,
         server: server,
-        task_support: task_support
+        task_support: task_support,
+        icons: icons,
+        meta: meta
       )
     end
 
