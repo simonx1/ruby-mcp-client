@@ -173,6 +173,109 @@ RSpec.describe 'OAuth challenge handling (MCP 2025-11-25)' do
       expect { server.send(:raise_authorization_error, response_with(header)) }
         .to raise_error(MCPClient::Errors::InsufficientScopeError) { |e| expect(e.scope).to eq('right') }
     end
+
+    it 'does not misclassify when a preceding non-Bearer challenge carries error=insufficient_scope' do
+      header = 'Basic error="insufficient_scope", Bearer realm="x"'
+      expect { server.send(:raise_authorization_error, response_with(header)) }
+        .to raise_error(MCPClient::Errors::ConnectionError) do |e|
+          expect(e).not_to be_a(MCPClient::Errors::InsufficientScopeError)
+        end
+    end
+
+    it 'does not misclassify when a trailing non-Bearer challenge carries error=insufficient_scope' do
+      header = 'Bearer realm="r", Basic error="insufficient_scope"'
+      expect { server.send(:raise_authorization_error, response_with(header)) }
+        .to raise_error(MCPClient::Errors::ConnectionError) do |e|
+          expect(e).not_to be_a(MCPClient::Errors::InsufficientScopeError)
+        end
+    end
+
+    it 'does not treat an extended error token such as insufficient_scope.extra as a match' do
+      expect { server.send(:raise_authorization_error, response_with('Bearer error="insufficient_scope.extra"')) }
+        .to raise_error(MCPClient::Errors::ConnectionError) do |e|
+          expect(e).not_to be_a(MCPClient::Errors::InsufficientScopeError)
+        end
+    end
+
+    it 'extracts scope and error_description only from the Bearer challenge segment' do
+      header = 'Basic realm="b", scope="basic:only", error_description="basic reason", ' \
+               'Bearer error="insufficient_scope", scope="mcp:tools", error_description="Bearer reason"'
+      expect { server.send(:raise_authorization_error, response_with(header)) }
+        .to raise_error(MCPClient::Errors::InsufficientScopeError) do |e|
+          expect(e.scope).to eq('mcp:tools')
+          expect(e.error_description).to eq('Bearer reason')
+        end
+    end
+  end
+
+  describe 'challenge-advertised metadata URL authority' do
+    let(:provider) { MCPClient::Auth::OAuthProvider.new(server_url: base_url) }
+    let(:challenge_url) { "#{base_url}/.well-known/oauth-protected-resource/tenant" }
+    let(:prm_body) do
+      { resource: base_url, authorization_servers: ['https://auth.example.com'] }.to_json
+    end
+    let(:as_metadata_body) do
+      { issuer: 'https://auth.example.com',
+        authorization_endpoint: 'https://auth.example.com/authorize',
+        token_endpoint: 'https://auth.example.com/token',
+        code_challenge_methods_supported: ['S256'] }.to_json
+    end
+
+    def challenge_response
+      instance_double(
+        Faraday::Response,
+        headers: { 'WWW-Authenticate' => "Bearer resource_metadata=\"#{challenge_url}\"" }
+      )
+    end
+
+    it 'retries the advertised URL strictly on discovery with no well-known fallback when it 404s' do
+      stub_request(:get, challenge_url).to_return(status: 404)
+      # Well-known candidates that MUST NOT be consulted while the challenge URL stands.
+      fallback = stub_request(:get, "#{base_url}/.well-known/oauth-protected-resource")
+                 .to_return(status: 200, headers: { 'Content-Type' => 'application/json' }, body: prm_body)
+      stub_request(:get, 'https://auth.example.com/.well-known/oauth-authorization-server')
+        .to_return(status: 200, headers: { 'Content-Type' => 'application/json' }, body: as_metadata_body)
+
+      expect { provider.handle_unauthorized_response(challenge_response) }
+        .to raise_error(MCPClient::Errors::ConnectionError)
+
+      expect { provider.send(:discover_authorization_server) }
+        .to raise_error(MCPClient::Errors::ConnectionError, /404/)
+      expect(fallback).not_to have_been_requested
+    end
+
+    it 'bypasses cached authorization server metadata while a challenge metadata URL is pending' do
+      cached = MCPClient::Auth::ServerMetadata.new(
+        issuer: 'https://stale.example.com',
+        authorization_endpoint: 'https://stale.example.com/authorize',
+        token_endpoint: 'https://stale.example.com/token',
+        code_challenge_methods_supported: ['S256']
+      )
+      provider.storage.set_server_metadata(provider.server_url, cached)
+      stub_request(:get, challenge_url).to_return(status: 404)
+
+      expect { provider.handle_unauthorized_response(challenge_response) }
+        .to raise_error(MCPClient::Errors::ConnectionError)
+
+      expect { provider.send(:discover_authorization_server) }
+        .to raise_error(MCPClient::Errors::ConnectionError, /404/)
+    end
+
+    it 'consumes the challenge metadata URL after successful discovery' do
+      stub_request(:get, challenge_url)
+        .to_return(status: 200, headers: { 'Content-Type' => 'application/json' }, body: prm_body)
+      as_stub = stub_request(:get, 'https://auth.example.com/.well-known/oauth-authorization-server')
+                .to_return(status: 200, headers: { 'Content-Type' => 'application/json' }, body: as_metadata_body)
+
+      provider.handle_unauthorized_response(challenge_response)
+
+      expect(provider.send(:discover_authorization_server).issuer).to eq('https://auth.example.com')
+      # The challenge URL was consumed: a later discovery serves the cache
+      # instead of re-fetching challenge or authorization server metadata.
+      expect(provider.send(:discover_authorization_server).issuer).to eq('https://auth.example.com')
+      expect(as_stub).to have_been_requested.once
+      expect(a_request(:get, challenge_url)).to have_been_made.once
+    end
   end
 
   describe 'challenge scope lifecycle' do

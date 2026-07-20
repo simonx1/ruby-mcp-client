@@ -43,8 +43,10 @@ module MCPClient
         @http_client = create_http_client
         # Protected resource metadata learned from a 401 WWW-Authenticate
         # challenge, reused by discovery so a challenge-advertised metadata URL
-        # is not re-derived (and possibly missed).
+        # is not re-derived (and possibly missed). The URL itself is retained
+        # separately so a failed fetch is retried authoritatively by discovery.
         @challenge_resource_metadata = nil
+        @challenge_metadata_url = nil
       end
 
       # @param url [String] Server URL to normalize
@@ -350,8 +352,11 @@ module MCPClient
       # @raise [MCPClient::Errors::ConnectionError] if discovery fails
       def discover_authorization_server
         # A fresh 401 challenge is authoritative and overrides any cached
-        # (possibly stale or direct-discovered) authorization server metadata.
-        cached = storage.get_server_metadata(server_url) unless @challenge_resource_metadata
+        # (possibly stale or direct-discovered) authorization server metadata —
+        # whether the challenge-advertised PRM was already fetched or only its
+        # URL is pending (e.g. the initial fetch failed and must be retried).
+        challenge_pending = @challenge_resource_metadata || @challenge_metadata_url
+        cached = storage.get_server_metadata(server_url) unless challenge_pending
         if cached
           # Validate the cached entry before use so a persisted/older cache with
           # an HTTP endpoint or without S256 is still rejected.
@@ -384,6 +389,7 @@ module MCPClient
 
         storage.set_server_metadata(server_url, server_metadata)
         @challenge_resource_metadata = nil # consumed
+        @challenge_metadata_url = nil # consumed
         server_metadata
       end
 
@@ -426,9 +432,7 @@ module MCPClient
         # once PRM IS found it is authoritative: any subsequent failure must be a
         # hard error, never a silent fallback to an authorization server the PRM
         # did not advertise.
-        candidate_urls = ([@challenge_metadata_url] + protected_resource_metadata_urls(server_url)).compact.uniq
-        resource_metadata = @challenge_resource_metadata ||
-                            fetch_first_resource_metadata(candidate_urls)
+        resource_metadata = challenge_or_well_known_resource_metadata
         return nil unless resource_metadata
 
         validate_resource_matches!(resource_metadata)
@@ -447,6 +451,25 @@ module MCPClient
         end
 
         server_metadata
+      end
+
+      # Resolve the Protected Resource Metadata for discovery.
+      #
+      # MCP 2025-11-25 MUST: use the resource metadata URL from the parsed
+      # WWW-Authenticate headers when present; otherwise fall back to the
+      # well-known URIs. A challenge-advertised URL is therefore authoritative:
+      # it is fetched strictly, and any failure (including a 404) raises rather
+      # than falling through to constructed well-known candidates the challenge
+      # superseded.
+      # @return [ResourceMetadata, nil] metadata, or nil when no PRM exists at
+      #   the speculative well-known URLs (permitting the direct-AS fallback)
+      # @raise [MCPClient::Errors::ConnectionError] if the challenge-advertised
+      #   URL cannot be fetched, or a well-known candidate exists but is invalid
+      def challenge_or_well_known_resource_metadata
+        return @challenge_resource_metadata if @challenge_resource_metadata
+        return fetch_resource_metadata(@challenge_metadata_url, strict: true) if @challenge_metadata_url
+
+        fetch_first_resource_metadata(protected_resource_metadata_urls(server_url))
       end
 
       # Legacy/self-hosted discovery: treat the MCP server ORIGIN as its own

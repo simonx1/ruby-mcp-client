@@ -13,6 +13,15 @@ module MCPClient
     # so the exception path and the default path share one challenge pipeline.
     NormalizedResponse = Struct.new(:status, :headers)
 
+    # One auth-param (name = token / quoted-string) as it appears in a
+    # WWW-Authenticate challenge (RFC 7235 §2.1, optional whitespace around '=').
+    AUTH_PARAM = /[A-Za-z0-9._~+-]+\s*=\s*(?:"(?:[^"\\]|\\.)*"|[^,\s]*)/
+    # A run of comma/space separated auth-params anchored at the start of a
+    # string. The run ends before a token that is NOT followed by '=' — the
+    # auth-scheme introducing the next challenge — while commas inside quoted
+    # values are consumed by the quoted-string branch, not treated as boundaries.
+    AUTH_PARAMS_RUN = /\A(?:[\s,]*#{AUTH_PARAM})*/
+
     # Generic JSON-RPC request: send method with params and return result
     # @param method [String] JSON-RPC method name
     # @param params [Hash] parameters for the request
@@ -291,11 +300,12 @@ module MCPClient
     # @param response [Faraday::Response] the 401/403 response
     # @raise [MCPClient::Errors::InsufficientScopeError, MCPClient::Errors::ConnectionError]
     def raise_authorization_error(response)
-      header = www_authenticate_header(response)
+      challenge = bearer_challenge_segment(www_authenticate_header(response))
 
-      if response.status == 403 && insufficient_scope_challenge?(header)
-        scope = header[/(?:^|[\s,])scope\s*=\s*"([^"]*)"/i, 1] || header[/(?:^|[\s,])scope\s*=\s*([^,\s"]+)/i, 1]
-        description = header[/(?:^|[\s,])error_description\s*=\s*"([^"]*)"/i, 1]
+      if response.status == 403 && insufficient_scope_challenge?(challenge)
+        scope = challenge[/(?:^|[\s,])scope\s*=\s*"([^"]*)"/i, 1] ||
+                challenge[/(?:^|[\s,])scope\s*=\s*([^,\s"]+)/i, 1]
+        description = challenge[/(?:^|[\s,])error_description\s*=\s*"([^"]*)"/i, 1]
         raise MCPClient::Errors::InsufficientScopeError.new(
           "Authorization failed: HTTP 403 insufficient_scope#{" (required scopes: #{scope})" if scope}",
           scope: scope, error_description: description
@@ -305,15 +315,31 @@ module MCPClient
       raise MCPClient::Errors::ConnectionError, "Authorization failed: HTTP #{response.status}"
     end
 
-    # A Bearer challenge whose error auth-param is exactly insufficient_scope
-    # (RFC 6750 / SEP-835); prefixed schemes or extended tokens do not match.
+    # Extract the Bearer challenge's own parameter segment from a (possibly
+    # multi-challenge) WWW-Authenticate header, so params belonging to other
+    # schemes (e.g. `Basic error="insufficient_scope", Bearer realm="x"`) are
+    # never attributed to the Bearer challenge.
     # @param header [String, nil] the WWW-Authenticate header value
-    # @return [Boolean]
-    def insufficient_scope_challenge?(header)
-      return false unless header
+    # @return [String, nil] the Bearer challenge's parameters (possibly empty),
+    #   or nil when the header has no Bearer challenge
+    def bearer_challenge_segment(header)
+      return nil unless header
 
-      header.match?(/\bBearer\b/i) &&
-        header.match?(/(?:^|[\s,])error\s*=\s*"?insufficient_scope"?(?![\w-])/i)
+      match = header.match(/(?:\A|[\s,])Bearer(?=[\s,]|\z)/i)
+      return nil unless match
+
+      match.post_match[AUTH_PARAMS_RUN]
+    end
+
+    # The Bearer challenge segment carries an error auth-param that is exactly
+    # insufficient_scope (RFC 6750 / SEP-835); prefixed or extended tokens
+    # (e.g. insufficient_scope.extra) do not match.
+    # @param challenge [String, nil] the Bearer challenge segment
+    # @return [Boolean]
+    def insufficient_scope_challenge?(challenge)
+      return false unless challenge
+
+      challenge.match?(/(?:^|[\s,])error\s*=\s*"?insufficient_scope"?(?![\w.-])/i)
     end
 
     # @param response [Faraday::Response] an HTTP response
