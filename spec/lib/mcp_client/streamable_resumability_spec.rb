@@ -105,13 +105,75 @@ RSpec.describe 'Streamable HTTP resumability (SEP-1699)' do
     it 'resumes with the closed stream own cursor, not the shared one' do
       server.instance_variable_set(:@last_event_id, 'other-stream-cursor')
       allow(server).to receive(:resume_response_via_get)
-        .with(3, 'evt-42').and_return({ 'jsonrpc' => '2.0', 'id' => 3, 'result' => {} })
+        .with(3, 'evt-42', nil).and_return({ 'jsonrpc' => '2.0', 'id' => 3, 'result' => {} })
 
       body = "id: evt-42\ndata:\n\n"
       result = server.send(:parse_sse_response, body, 3)
 
       expect(result['id']).to eq(3)
-      expect(server).to have_received(:resume_response_via_get).with(3, 'evt-42')
+      expect(server).to have_received(:resume_response_via_get).with(3, 'evt-42', nil)
+    end
+  end
+
+  describe 'resumption retry delay isolation' do
+    it 'passes the POST stream own retry directive to resumption, not the shared ivar' do
+      # A concurrent GET/POST stream moved the shared directive; this POST
+      # stream carries its own retry directive which must be the one used.
+      server.instance_variable_set(:@sse_retry_ms, 10_000)
+      allow(server).to receive(:resume_response_via_get)
+        .and_return({ 'jsonrpc' => '2.0', 'id' => 3, 'result' => {} })
+
+      body = "retry: 50\nid: evt-42\ndata:\n\n"
+      server.send(:parse_sse_response, body, 3)
+
+      expect(server).to have_received(:resume_response_via_get).with(3, 'evt-42', 50)
+    end
+
+    it 'passes no delay when the POST stream carried no retry directive' do
+      server.instance_variable_set(:@sse_retry_ms, 10_000)
+      allow(server).to receive(:resume_response_via_get)
+        .and_return({ 'jsonrpc' => '2.0', 'id' => 3, 'result' => {} })
+
+      server.send(:parse_sse_response, "id: evt-42\ndata:\n\n", 3)
+
+      expect(server).to have_received(:resume_response_via_get).with(3, 'evt-42', nil)
+    end
+  end
+
+  describe 'resumption GET stream parsing' do
+    it 'dispatches a CRLF-delimited resumed response' do
+      response = { jsonrpc: '2.0', id: 8, result: { 'ok' => true } }
+      stub_request(:get, "#{base_url}#{endpoint}")
+        .with(headers: { 'Last-Event-ID' => 'evt-1' })
+        .to_return(status: 200,
+                   body: "id: evt-2\r\nevent: message\r\ndata: #{response.to_json}\r\n\r\n",
+                   headers: { 'Content-Type' => 'text/event-stream' })
+
+      result = server.send(:resume_response_via_get, 8, 'evt-1', 0)
+
+      expect(result).to include('id' => 8, 'result' => { 'ok' => true })
+    end
+
+    it 'reconnects with the updated cursor when the resumed stream closes without the response' do
+      # First resumed GET (cursor evt-1) delivers only a priming event with a
+      # new cursor and retry directive, then closes — the SEP-1699 polling
+      # pattern applied to the resumed stream itself.
+      first_get = stub_request(:get, "#{base_url}#{endpoint}")
+                  .with(headers: { 'Last-Event-ID' => 'evt-1' })
+                  .to_return(status: 200, body: "id: evt-2\nretry: 50\ndata:\n\n",
+                             headers: { 'Content-Type' => 'text/event-stream' })
+      response = { jsonrpc: '2.0', id: 7, result: { 'ok' => true } }
+      second_get = stub_request(:get, "#{base_url}#{endpoint}")
+                   .with(headers: { 'Last-Event-ID' => 'evt-2' })
+                   .to_return(status: 200,
+                              body: "id: evt-3\nevent: message\ndata: #{response.to_json}\n\n",
+                              headers: { 'Content-Type' => 'text/event-stream' })
+
+      result = server.send(:resume_response_via_get, 7, 'evt-1', 50)
+
+      expect(result).to include('id' => 7, 'result' => { 'ok' => true })
+      expect(first_get).to have_been_requested
+      expect(second_get).to have_been_requested
     end
   end
 

@@ -61,7 +61,7 @@ module MCPClient
       # @return [Hash] the parsed JSON-RPC response
       # @raise [MCPClient::Errors::TransportError] if no response is found
       def parse_sse_response(sse_body, request_id = nil)
-        events = extract_sse_events(sse_body)
+        events, retry_ms = extract_sse_events(sse_body)
 
         raise MCPClient::Errors::TransportError, 'No data found in SSE response' if events.empty?
 
@@ -74,7 +74,7 @@ module MCPClient
                 'Invalid JSON response from server: SSE stream contained no valid JSON-RPC response'
         end
 
-        resume_or_fail(events, request_id)
+        resume_or_fail(events, request_id, retry_ms)
       end
 
       # SEP-1699 polling pattern: the server MAY close the POST stream before
@@ -83,15 +83,17 @@ module MCPClient
       # non-idempotent) request.
       # @param events [Array<Hash>] parsed SSE events
       # @param request_id [Integer, String, nil] id of the originating request
+      # @param retry_ms [Integer, nil] retry directive received on THIS stream
       # @return [Hash] the replayed JSON-RPC response
       # @raise [MCPClient::Errors::ServerError] when resumption fails
       # @raise [MCPClient::Errors::TransportError] when no cursor was received
-      def resume_or_fail(events, request_id)
+      def resume_or_fail(events, request_id, retry_ms = nil)
         cursor = events.reverse.find { |e| e[:id] && !e[:id].empty? }&.dig(:id)
         if request_id && cursor
-          # Resume with THIS stream's cursor (event ids are per-stream), not
-          # the shared @last_event_id which a concurrent stream may have moved.
-          resumed = resume_response_via_get(request_id, cursor)
+          # Resume with THIS stream's cursor and retry directive (both are
+          # per-stream), not the shared @last_event_id / @sse_retry_ms which a
+          # concurrent stream may have moved between parsing and resumption.
+          resumed = resume_response_via_get(request_id, cursor, retry_ms)
           return resumed if resumed
 
           # Non-retryable: the request may already be executing server-side,
@@ -107,9 +109,11 @@ module MCPClient
       # field has the default type "message" per the SSE specification; events
       # carrying only an id (priming events) are kept so their id is tracked.
       # @param sse_body [String] the SSE formatted response body
-      # @return [Array<Hash>] parsed events
+      # @return [Array(Array<Hash>, Integer, nil)] parsed events and the last
+      #   retry directive (ms) received on this stream, if any
       def extract_sse_events(sse_body)
         events = []
+        retry_ms = nil
         current_event = { type: 'message', data_lines: [], id: nil }
 
         sse_body.lines.each do |line|
@@ -126,15 +130,20 @@ module MCPClient
           elsif line.start_with?('id:')
             current_event[:id] = line.sub(/^id:\s*/, '').strip
           elsif line.start_with?('retry:')
-            # SEP-1699: the client MUST respect the server's retry directive
+            # SEP-1699: the client MUST respect the server's retry directive.
+            # Track it locally for this stream's resumption; the shared ivar is
+            # only a hint for the general events loop.
             raw = line.sub(/^retry:\s*/, '').strip
-            @sse_retry_ms = raw.to_i if raw.match?(/\A\d+\z/)
+            if raw.match?(/\A\d+\z/)
+              retry_ms = raw.to_i
+              @sse_retry_ms = retry_ms
+            end
           end
         end
 
         # Handle last event if no trailing empty line
         events << current_event if sse_event_present?(current_event)
-        events
+        [events, retry_ms]
       end
 
       # @param event [Hash] a parsed SSE event

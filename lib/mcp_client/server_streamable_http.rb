@@ -728,22 +728,20 @@ module MCPClient
     end
 
     # Wait for a response replayed after the POST stream was closed before
-    # delivering it (SEP-1699 polling pattern). Issues a dedicated HTTP GET
-    # carrying the disconnected stream's Last-Event-ID cursor — the general
-    # events stream (opened without that cursor) cannot receive the replay.
+    # delivering it (SEP-1699 polling pattern). A dedicated worker issues
+    # HTTP GETs carrying the disconnected stream's Last-Event-ID cursor — the
+    # general events stream (opened without that cursor) cannot receive the
+    # replay.
     # @param request_id [Integer, String] id of the outstanding request
     # @param cursor [String] last event id received on the closed stream
+    # @param retry_ms [Integer, nil] retry directive received on the closed
+    #   stream itself (not the shared events-stream directive)
     # @return [Hash, nil] the replayed JSON-RPC response, or nil on timeout
-    def resume_response_via_get(request_id, cursor)
+    def resume_response_via_get(request_id, cursor, retry_ms = nil)
       queue = Thread::Queue.new
       @mutex.synchronize { @pending_stream_responses[request_id] = queue }
 
-      # SEP-1699: the client MUST respect the server's retry directive before
-      # attempting to reconnect.
-      retry_ms = @sse_retry_ms
-      sleep(retry_ms / 1000.0) if retry_ms&.positive?
-
-      resume_thread = Thread.new { issue_resumption_get(cursor) }
+      resume_thread = Thread.new { run_resumption_loop(request_id, cursor, retry_ms) }
       begin
         queue.pop(timeout: @read_timeout)
       ensure
@@ -753,12 +751,41 @@ module MCPClient
       end
     end
 
-    # One-shot GET with the given cursor; complete SSE events are dispatched
-    # through the standard server-message path, which routes replayed
-    # responses to their registered waiters.
-    # @param cursor [String] Last-Event-ID value for the resumption request
+    # Reconnecting worker for SEP-1699 resumption. The server MAY close a
+    # resumed stream again before returning the response (polling pattern),
+    # so each iteration issues a GET with the CURRENT cursor until the
+    # overall read timeout elapses or the waiter has been served. `id:`
+    # fields received on the resumed stream advance the cursor and `retry:`
+    # fields update the delay honored before the next reconnect (zero is a
+    # valid immediate-reconnect directive).
+    # @param request_id [Integer, String] id of the outstanding request
+    # @param cursor [String] Last-Event-ID cursor from the closed stream
+    # @param retry_ms [Integer, nil] retry directive from the closed stream
     # @return [void]
-    def issue_resumption_get(cursor)
+    def run_resumption_loop(request_id, cursor, retry_ms)
+      deadline = Process.clock_gettime(Process::CLOCK_MONOTONIC) + @read_timeout
+      state = { cursor: cursor, retry_ms: retry_ms }
+      # SEP-1699: the client MUST respect the server's retry directive before
+      # attempting to reconnect.
+      delay = retry_ms ? retry_ms / 1000.0 : 0
+
+      loop do
+        sleep(delay) if delay.positive?
+        issue_resumption_get(state)
+        break unless @mutex.synchronize { @pending_stream_responses.key?(request_id) }
+        break if Process.clock_gettime(Process::CLOCK_MONOTONIC) >= deadline
+
+        delay = state[:retry_ms] ? state[:retry_ms] / 1000.0 : SSE_RECONNECT_DELAY
+      end
+    end
+
+    # One GET with the current cursor; complete SSE events are dispatched
+    # through the standard server-message path, which routes replayed
+    # responses to their registered waiters. `id:` and `retry:` fields
+    # received on this stream update the resumption state live.
+    # @param state [Hash] mutable resumption state (:cursor, :retry_ms)
+    # @return [void]
+    def issue_resumption_get(state)
       conn = Faraday.new(url: @base_url) do |f|
         f.options.open_timeout = 10
         f.options.timeout = @read_timeout
@@ -768,26 +795,60 @@ module MCPClient
       buffer = +''
       conn.get(@endpoint) do |req|
         apply_events_headers(req)
-        req.headers['Last-Event-ID'] = cursor
+        req.headers['Last-Event-ID'] = state[:cursor]
         req.options.on_data = proc do |chunk, _bytes|
           buffer << chunk
-          while (idx = buffer.index("\n\n"))
-            event_text = buffer.slice!(0, idx + 2)
-            data_lines = event_text.lines.filter_map { |l| l.sub(/\Adata:\s*/, '').chomp if l.start_with?('data:') }
-            handle_server_message(data_lines.join("\n")) unless data_lines.empty?
-          end
+          process_resumption_buffer(buffer, state)
         end
       end
     rescue StandardError => e
       @logger.debug("Resumption GET failed: #{e.message}")
     end
 
+    # Extract complete SSE events (terminated by a blank line, LF or CRLF)
+    # from the resumption buffer and handle each of them.
+    # @param buffer [String] mutable stream buffer
+    # @param state [Hash] mutable resumption state (:cursor, :retry_ms)
+    # @return [void]
+    def process_resumption_buffer(buffer, state)
+      while (separator = buffer.match(/\r\n\r\n|\n\n/))
+        event_text = buffer.slice!(0, separator.end(0))
+        handle_resumption_event(event_text, state)
+      end
+    end
+
+    # Parse one SSE event received on a resumption stream: track `id:` lines
+    # (advancing the cursor used by the next reconnect) and `retry:` lines
+    # (updating the reconnect delay; zero is valid), then dispatch any data.
+    # @param event_text [String] one complete SSE event, separator included
+    # @param state [Hash] mutable resumption state (:cursor, :retry_ms)
+    # @return [void]
+    def handle_resumption_event(event_text, state)
+      data_lines = []
+      event_text.each_line do |raw_line|
+        line = raw_line.chomp
+        if line.start_with?('data:')
+          data_lines << line.sub(/\Adata:\s*/, '')
+        elsif line.start_with?('id:')
+          id = line.sub(/\Aid:\s*/, '').strip
+          state[:cursor] = id unless id.empty?
+        elsif line.start_with?('retry:')
+          raw = line.sub(/\Aretry:\s*/, '').strip
+          state[:retry_ms] = raw.to_i if raw.match?(/\A\d+\z/)
+        end
+      end
+      handle_server_message(data_lines.join("\n")) unless data_lines.empty?
+    end
+
     # Deliver a response replayed on the events stream to a waiting request.
+    # The pending entry is removed on delivery so resumption workers can see
+    # that their waiter has been served.
     # @param message [Hash] a JSON-RPC response message
     # @return [void]
     def deliver_stream_response(message)
       queue = @mutex.synchronize do
-        @pending_stream_responses[message['id']] || @pending_stream_responses[message['id'].to_s]
+        key = [message['id'], message['id'].to_s].find { |k| @pending_stream_responses.key?(k) }
+        @pending_stream_responses.delete(key) unless key.nil?
       end
       queue << message if queue
     end
