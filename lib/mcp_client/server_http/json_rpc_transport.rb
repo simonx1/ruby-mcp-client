@@ -12,10 +12,11 @@ module MCPClient
 
       # Parse an HTTP JSON-RPC response
       # @param response [Faraday::Response] the HTTP response
+      # @param _request [Hash, nil] the originating JSON-RPC request (unused)
       # @return [Hash] the parsed result
       # @raise [MCPClient::Errors::TransportError] if parsing fails
       # @raise [MCPClient::Errors::ServerError] if the response contains an error
-      def parse_response(response)
+      def parse_response(response, _request = nil)
         body = response.body.strip
         data = JSON.parse(body)
         process_jsonrpc_response(data)

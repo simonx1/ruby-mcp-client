@@ -153,7 +153,7 @@ module MCPClient
 
       begin
         response = send_http_request(request)
-        parse_response(response)
+        parse_response(response, request)
       rescue MCPClient::Errors::ConnectionError, MCPClient::Errors::TransportError, MCPClient::Errors::ServerError
         raise
       rescue JSON::ParserError => e
@@ -288,7 +288,7 @@ module MCPClient
     # @param response [Faraday::Response] the HTTP response
     # @return [Hash] the parsed result
     # @raise [NotImplementedError] if not implemented by concrete transport
-    def parse_response(response)
+    def parse_response(response, _request = nil)
       raise NotImplementedError, 'Subclass must implement parse_response'
     end
   end

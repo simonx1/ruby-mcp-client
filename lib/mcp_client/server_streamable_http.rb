@@ -798,21 +798,27 @@ module MCPClient
       return if data.empty?
 
       begin
-        message = JSON.parse(data)
-
-        # Handle ping requests from server (keepalive mechanism)
-        if message['method'] == 'ping' && message.key?('id')
-          handle_ping_request(message['id'])
-        elsif message['method'] && message.key?('id')
-          # Handle server-to-client requests (MCP 2025-06-18)
-          handle_server_request(message)
-        elsif message['method'] && !message.key?('id')
-          # Handle server notifications (messages without id)
-          @notification_callback&.call(message['method'], message['params'])
-        end
+        dispatch_server_message(JSON.parse(data))
       rescue JSON::ParserError => e
         @logger.error("Invalid JSON in server message: #{e.message}")
         @logger.debug("Raw data: #{data.inspect}") if @logger.level <= Logger::DEBUG
+      end
+    end
+
+    # Dispatch a parsed server message (request, ping, or notification).
+    # Used for messages arriving on the GET events stream and for messages
+    # interleaved on a POST SSE response stream.
+    # @param message [Hash] the parsed JSON-RPC message
+    def dispatch_server_message(message)
+      # Handle ping requests from server (keepalive mechanism)
+      if message['method'] == 'ping' && message.key?('id')
+        handle_ping_request(message['id'])
+      elsif message['method'] && message.key?('id')
+        # Handle server-to-client requests (MCP 2025-06-18)
+        handle_server_request(message)
+      elsif message['method'] && !message.key?('id')
+        # Handle server notifications (messages without id)
+        @notification_callback&.call(message['method'], message['params'])
       end
     end
 
