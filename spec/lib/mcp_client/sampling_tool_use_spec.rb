@@ -200,6 +200,39 @@ RSpec.describe 'Sampling tool use (MCP 2025-11-25, SEP-1577)' do
       expect(received_args.last['tools']).to eq(tools)
     end
 
+    # Non-lambda procs with only optional parameters report their mandatory
+    # minimum as a nonnegative arity (proc { |m, p = nil| }.arity == 1), so
+    # arity-based sizing would starve them of everything past messages.
+    it 'passes all five arguments to a non-lambda proc with optional parameters' do
+      received_extra = :not_called
+      handler = proc do |_messages, _model_prefs = nil, _system_prompt = nil, _max_tokens = nil, extra = nil|
+        received_extra = extra
+        { 'role' => 'assistant', 'content' => { 'type' => 'text', 'text' => 'OK' } }
+      end
+      client = MCPClient::Client.new(sampling_handler: handler, sampling_supports_tools: true)
+
+      client.send(:handle_sampling_request, request_id, tool_params)
+
+      expect(received_extra).to be_a(Hash)
+      expect(received_extra['tools']).to eq(tools)
+      expect(received_extra['toolChoice']).to eq({ 'mode' => 'auto' })
+    end
+
+    it 'still passes a single argument to a plain proc { |m| } handler' do
+      received_messages = :not_called
+      handler = proc do |messages|
+        received_messages = messages
+        { 'role' => 'assistant', 'content' => { 'type' => 'text', 'text' => 'OK' } }
+      end
+      client = MCPClient::Client.new(sampling_handler: handler, sampling_supports_tools: true)
+
+      result = client.send(:handle_sampling_request, request_id, tool_params)
+
+      expect(client.send(:sampling_handler_arg_count)).to eq(1)
+      expect(received_messages).to eq(tool_params['messages'])
+      expect(result).not_to have_key('error')
+    end
+
     it 'sizes optional-arity handlers by their acceptable count, not their required minimum' do
       received_max_tokens = :not_called
       handler = lambda do |_messages, _model_prefs, _system_prompt, max_tokens = :missing|

@@ -1215,21 +1215,26 @@ module MCPClient
     end
 
     # Number of the five positional sampling arguments the handler can accept.
-    # Ruby reports negative arity for optional or rest parameters, and
-    # normalizing that to the minimum required count would starve e.g.
-    # ->(messages, prefs, system, max_tokens, extra = nil) of the raw params
-    # (including the SEP-1577 tools/toolChoice fields), so variable-arity
-    # handlers are sized from Proc#parameters instead: each :req/:opt
-    # parameter accepts one argument and a :rest accepts the full list.
+    # Arity alone cannot size variable-arity handlers: lambdas with optional
+    # or rest parameters report a negative arity, and non-lambda procs with
+    # optional parameters report their mandatory minimum as a nonnegative
+    # arity (proc { |m, p = nil, s = nil, t = nil, extra = nil| }.arity == 1).
+    # Normalizing either to the minimum required count would starve the
+    # handler of the raw params (including the SEP-1577 tools/toolChoice
+    # fields), so any handler whose parameters include :opt or :rest entries
+    # (or whose arity is negative) is sized from Proc#parameters instead:
+    # each :req/:opt parameter accepts one argument and a :rest accepts the
+    # full list. Plain fixed-arity handlers keep arity-based sizing.
     # @return [Integer] how many arguments to pass, capped at 5
     def sampling_handler_arg_count
-      arity = @sampling_handler.arity
-      return [arity, 5].min unless arity.negative?
-
       parameters = @sampling_handler.parameters
       return 5 if parameters.any? { |type, _name| type == :rest }
 
-      [parameters.count { |type, _name| %i[req opt].include?(type) }, 5].min
+      if @sampling_handler.arity.negative? || parameters.any? { |type, _name| type == :opt }
+        return [parameters.count { |type, _name| %i[req opt].include?(type) }, 5].min
+      end
+
+      [@sampling_handler.arity, 5].min
     end
 
     # Normalize and validate modelPreferences from sampling request (MCP 2025-11-25)
