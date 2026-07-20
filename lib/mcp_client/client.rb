@@ -821,7 +821,10 @@ module MCPClient
     # @param tool_name [String] the tool name (for the message)
     # @raise [MCPClient::Errors::ToolCallError] if the tool requires task execution
     def reject_task_required!(tool, tool_name)
-      return unless tool.task_required?
+      # Tasks Tool-Level Negotiation rule 1: without tasks.requests.tools.call
+      # in the server capabilities, taskSupport is disregarded entirely and
+      # the tool is invoked as a plain call.
+      return unless tool.task_required? && server_supports_task_tool_call?(tool.server)
 
       raise MCPClient::Errors::ToolCallError,
             "Tool '#{tool_name}' requires task-augmented execution; call it with call_tool_as_task instead"
@@ -1071,7 +1074,8 @@ module MCPClient
         return { 'action' => 'accept', 'content' => result } unless action
 
         content = result.key?('content') || result.key?(:content) ? (result['content'] || result[:content]) : nil
-        normalised_action_response({ 'action' => action.to_s, 'content' => content }.compact)
+        meta = result['_meta'] || result[:_meta]
+        normalised_action_response({ 'action' => action.to_s, 'content' => content, '_meta' => meta }.compact)
       when nil
         { 'action' => 'cancel' }
       else
