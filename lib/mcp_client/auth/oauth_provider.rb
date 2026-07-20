@@ -444,17 +444,18 @@ module MCPClient
       end
 
       # Verify the authorization server supports PKCE S256 (RFC 8414 / MCP).
-      # Refuses when S256 is explicitly not offered; warns (and proceeds, since
-      # the client always uses S256) when the field is not advertised at all.
+      # Per MCP 2025-11-25, "If code_challenge_methods_supported is absent,
+      # the authorization server does not support PKCE and MCP clients MUST
+      # refuse to proceed" — absence is a hard stop, not a warning, because
+      # proceeding would defeat the authorization-code downgrade protection.
       # @param server_metadata [ServerMetadata]
-      # @raise [MCPClient::Errors::ConnectionError] if S256 is explicitly unsupported
+      # @raise [MCPClient::Errors::ConnectionError] if PKCE S256 support cannot be verified
       def verify_pkce_support!(server_metadata)
         methods = server_metadata.code_challenge_methods_supported
         if methods.nil?
-          logger.warn(
-            'Authorization server metadata omits code_challenge_methods_supported; ' \
-            'proceeding with PKCE S256'
-          )
+          raise MCPClient::Errors::ConnectionError,
+                'Authorization server metadata omits code_challenge_methods_supported; ' \
+                'the server does not support PKCE and the client must refuse to proceed'
         elsif !methods.include?('S256')
           raise MCPClient::Errors::ConnectionError,
                 'Authorization server does not support PKCE S256 ' \
