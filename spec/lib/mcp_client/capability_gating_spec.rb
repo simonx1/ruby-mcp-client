@@ -146,5 +146,41 @@ RSpec.describe 'Capability gating (MCP 2025-11-25)' do
 
       expect(client.list_tasks[:tasks]).to eq([])
     end
+
+    context 'when the server is not yet initialized' do
+      # A previously uninitialized server that negotiates no tasks capability
+      # must never receive the prohibited request: the gate has to trigger the
+      # handshake first and then re-check the freshly negotiated set.
+      it 'initializes via ping and re-applies the tasks.list gate before sending' do
+        caps = nil
+        allow(srv).to receive(:capabilities) { caps }
+        allow(srv).to receive(:ping) { caps = {} }
+        allow(srv).to receive(:capability?).with('tasks', 'list').and_return(false)
+        expect(srv).not_to receive(:rpc_request)
+
+        expect { client.list_tasks }.to raise_error(MCPClient::Errors::CapabilityError, /tasks\.list/)
+        expect(srv).to have_received(:ping)
+      end
+
+      it 'initializes via ping and re-applies the tasks.cancel gate before sending' do
+        caps = nil
+        allow(srv).to receive(:capabilities) { caps }
+        allow(srv).to receive(:ping) { caps = {} }
+        allow(srv).to receive(:capability?).with('tasks', 'cancel').and_return(false)
+        expect(srv).not_to receive(:rpc_request)
+
+        expect { client.cancel_task('t-1') }.to raise_error(MCPClient::Errors::CapabilityError, /tasks\.cancel/)
+        expect(srv).to have_received(:ping)
+      end
+
+      it 'lets a ping failure fall through to the normal task error path' do
+        allow(srv).to receive(:capabilities).and_return(nil)
+        allow(srv).to receive(:ping).and_raise(MCPClient::Errors::ConnectionError, 'down')
+        allow(srv).to receive(:rpc_request).with('tasks/list', {})
+                                           .and_raise(MCPClient::Errors::ConnectionError, 'down')
+
+        expect { client.list_tasks }.to raise_error(MCPClient::Errors::TaskError, /down/)
+      end
+    end
   end
 end
