@@ -50,6 +50,19 @@ RSpec.describe 'Protocol version negotiation (MCP 2025-11-25)' do
       )
     end
 
+    it 'disconnects when the initialize result is not an object' do
+      stub_request(:post, "#{base_url}#{endpoint}")
+        .with(body: hash_including('method' => 'initialize'))
+        .to_return(status: 200,
+                   body: "event: message\ndata: {\"jsonrpc\":\"2.0\",\"id\":1,\"result\":\"ok\"}\n\n",
+                   headers: { 'Content-Type' => 'text/event-stream' })
+      stub_request(:get, "#{base_url}#{endpoint}").to_return(status: 200, body: '')
+
+      expect { server.connect }.to raise_error(
+        MCPClient::Errors::ConnectionError, /initialize result/i
+      )
+    end
+
     it 'accepts a supported older version and records it' do
       stub_initialize({ protocolVersion: '2025-06-18', capabilities: {},
                         serverInfo: { name: 's', version: '1' } })
