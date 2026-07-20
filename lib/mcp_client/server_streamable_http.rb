@@ -724,23 +724,62 @@ module MCPClient
     # @return [Numeric] delay in seconds
     def events_reconnect_delay(fallback_seconds)
       retry_ms = @sse_retry_ms
-      retry_ms&.positive? ? retry_ms / 1000.0 : fallback_seconds
+      retry_ms ? retry_ms / 1000.0 : fallback_seconds
     end
 
-    # Wait for a response replayed on the GET events stream after the POST
-    # stream was closed before delivering it (SEP-1699 polling pattern).
+    # Wait for a response replayed after the POST stream was closed before
+    # delivering it (SEP-1699 polling pattern). Issues a dedicated HTTP GET
+    # carrying the disconnected stream's Last-Event-ID cursor — the general
+    # events stream (opened without that cursor) cannot receive the replay.
     # @param request_id [Integer, String] id of the outstanding request
+    # @param cursor [String] last event id received on the closed stream
     # @return [Hash, nil] the replayed JSON-RPC response, or nil on timeout
-    def resume_response_via_get(request_id)
+    def resume_response_via_get(request_id, cursor)
       queue = Thread::Queue.new
       @mutex.synchronize { @pending_stream_responses[request_id] = queue }
 
+      # SEP-1699: the client MUST respect the server's retry directive before
+      # attempting to reconnect.
+      retry_ms = @sse_retry_ms
+      sleep(retry_ms / 1000.0) if retry_ms&.positive?
+
+      resume_thread = Thread.new { issue_resumption_get(cursor) }
       begin
-        start_events_connection unless @events_thread&.alive?
         queue.pop(timeout: @read_timeout)
       ensure
         @mutex.synchronize { @pending_stream_responses.delete(request_id) }
+        resume_thread.kill
+        resume_thread.join(1)
       end
+    end
+
+    # One-shot GET with the given cursor; complete SSE events are dispatched
+    # through the standard server-message path, which routes replayed
+    # responses to their registered waiters.
+    # @param cursor [String] Last-Event-ID value for the resumption request
+    # @return [void]
+    def issue_resumption_get(cursor)
+      conn = Faraday.new(url: @base_url) do |f|
+        f.options.open_timeout = 10
+        f.options.timeout = @read_timeout
+        f.adapter :net_http
+      end
+
+      buffer = +''
+      conn.get(@endpoint) do |req|
+        apply_events_headers(req)
+        req.headers['Last-Event-ID'] = cursor
+        req.options.on_data = proc do |chunk, _bytes|
+          buffer << chunk
+          while (idx = buffer.index("\n\n"))
+            event_text = buffer.slice!(0, idx + 2)
+            data_lines = event_text.lines.filter_map { |l| l.sub(/\Adata:\s*/, '').chomp if l.start_with?('data:') }
+            handle_server_message(data_lines.join("\n")) unless data_lines.empty?
+          end
+        end
+      end
+    rescue StandardError => e
+      @logger.debug("Resumption GET failed: #{e.message}")
     end
 
     # Deliver a response replayed on the events stream to a waiting request.
@@ -821,10 +860,10 @@ module MCPClient
           @last_event_id = event[:id]
         elsif line.start_with?('retry:')
           # SEP-1699: the client MUST respect the server's retry directive
-          # (milliseconds) when reconnecting.
-          retry_ms = line[6..].strip.to_i
-          @sse_retry_ms = retry_ms if retry_ms.positive?
-          @logger.debug("Server suggested retry delay: #{retry_ms}ms") if @logger.level <= Logger::DEBUG
+          # (milliseconds) when reconnecting; zero is a valid directive.
+          raw = line[6..].strip
+          @sse_retry_ms = raw.to_i if raw.match?(/\A\d+\z/)
+          @logger.debug("Server suggested retry delay: #{raw}ms") if @logger.level <= Logger::DEBUG
         end
       end
 

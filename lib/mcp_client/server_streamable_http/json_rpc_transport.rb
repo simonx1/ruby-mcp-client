@@ -87,8 +87,11 @@ module MCPClient
       # @raise [MCPClient::Errors::ServerError] when resumption fails
       # @raise [MCPClient::Errors::TransportError] when no cursor was received
       def resume_or_fail(events, request_id)
-        if request_id && events.any? { |e| e[:id] && !e[:id].empty? }
-          resumed = resume_response_via_get(request_id)
+        cursor = events.reverse.find { |e| e[:id] && !e[:id].empty? }&.dig(:id)
+        if request_id && cursor
+          # Resume with THIS stream's cursor (event ids are per-stream), not
+          # the shared @last_event_id which a concurrent stream may have moved.
+          resumed = resume_response_via_get(request_id, cursor)
           return resumed if resumed
 
           # Non-retryable: the request may already be executing server-side,
@@ -124,8 +127,8 @@ module MCPClient
             current_event[:id] = line.sub(/^id:\s*/, '').strip
           elsif line.start_with?('retry:')
             # SEP-1699: the client MUST respect the server's retry directive
-            retry_ms = line.sub(/^retry:\s*/, '').strip.to_i
-            @sse_retry_ms = retry_ms if retry_ms.positive?
+            raw = line.sub(/^retry:\s*/, '').strip
+            @sse_retry_ms = raw.to_i if raw.match?(/\A\d+\z/)
           end
         end
 

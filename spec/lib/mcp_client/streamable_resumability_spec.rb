@@ -94,6 +94,25 @@ RSpec.describe 'Streamable HTTP resumability (SEP-1699)' do
     it 'falls back to the caller delay without a directive' do
       expect(server.send(:events_reconnect_delay, 4)).to eq(4)
     end
+
+    it 'accepts retry: 0 as a valid immediate-reconnect directive' do
+      server.send(:parse_and_handle_event, "retry: 0\ndata: \n")
+
+      expect(server.instance_variable_get(:@sse_retry_ms)).to eq(0)
+      expect(server.send(:events_reconnect_delay, 4)).to eq(0)
+    end
+
+    it 'resumes with the closed stream own cursor, not the shared one' do
+      server.instance_variable_set(:@last_event_id, 'other-stream-cursor')
+      allow(server).to receive(:resume_response_via_get)
+        .with(3, 'evt-42').and_return({ 'jsonrpc' => '2.0', 'id' => 3, 'result' => {} })
+
+      body = "id: evt-42\ndata:\n\n"
+      result = server.send(:parse_sse_response, body, 3)
+
+      expect(result['id']).to eq(3)
+      expect(server).to have_received(:resume_response_via_get).with(3, 'evt-42')
+    end
   end
 
   describe 'polling pattern: stream closed before the response' do
