@@ -21,8 +21,10 @@ module MCPClient
       #   @return [Object] Storage backend for tokens and client info
       # @!attribute [r] server_url
       #   @return [String] The MCP server URL (normalized)
+      # @!attribute [r] client_id_metadata_url
+      #   @return [String, nil] HTTPS URL of this client's Client ID Metadata Document (SEP-991)
       attr_accessor :redirect_uri, :scope, :logger, :storage
-      attr_reader :server_url
+      attr_reader :server_url, :client_id_metadata_url
 
       # Initialize OAuth provider
       # @param server_url [String] The MCP server URL (used as OAuth resource parameter)
@@ -32,13 +34,20 @@ module MCPClient
       # @param storage [Object, nil] Storage backend for tokens and client info
       # @param client_metadata [Hash] Extra OIDC client metadata fields for DCR registration.
       #   Supported keys: :client_name, :client_uri, :logo_uri, :tos_uri, :policy_uri, :contacts
+      # @param client_id_metadata_url [String, nil] HTTPS URL identifying this client per
+      #   MCP 2025-11-25 Client ID Metadata Documents (SEP-991). The URL doubles as the OAuth
+      #   client_id when the authorization server advertises client_id_metadata_document_supported,
+      #   skipping dynamic registration. Hosting the metadata JSON at that URL is the
+      #   application's responsibility.
+      # @raise [ArgumentError] if client_id_metadata_url is not an HTTPS URL with a path component
       def initialize(server_url:, redirect_uri: 'http://localhost:8080/callback', scope: nil, logger: nil, storage: nil,
-                     client_metadata: {})
+                     client_metadata: {}, client_id_metadata_url: nil)
         self.server_url = server_url
         self.redirect_uri = redirect_uri
         self.scope = scope
         self.logger = logger || Logger.new($stdout, level: Logger::WARN)
         self.storage = storage || MemoryStorage.new
+        self.client_id_metadata_url = client_id_metadata_url
         @extra_client_metadata = client_metadata
         @http_client = create_http_client
         # Protected resource metadata learned from a 401 WWW-Authenticate
@@ -50,6 +59,15 @@ module MCPClient
       # @param url [String] Server URL to normalize
       def server_url=(url)
         @server_url = normalize_server_url(url)
+      end
+
+      # Set the Client ID Metadata Document URL (SEP-991), validating it per the
+      # MCP spec: the client_id URL MUST use the "https" scheme and contain a
+      # path component (e.g. https://example.com/client.json).
+      # @param url [String, nil] HTTPS URL of this client's metadata document, or nil to clear
+      # @raise [ArgumentError] if the URL is not HTTPS or lacks a path component
+      def client_id_metadata_url=(url)
+        @client_id_metadata_url = url.nil? ? nil : validate_client_id_metadata_url(url)
       end
 
       # Get current access token (refresh if needed)
@@ -657,18 +675,28 @@ module MCPClient
         raise MCPClient::Errors::ConnectionError, "Network error fetching server metadata: #{e.message}"
       end
 
-      # Get or register OAuth client
+      # Get or register OAuth client, following the MCP 2025-11-25 client
+      # registration priority order: pre-registered/cached client information
+      # first, then Client ID Metadata Documents (SEP-991) when the
+      # authorization server advertises support and a metadata URL is
+      # configured, then Dynamic Client Registration as a fallback.
       # @param server_metadata [ServerMetadata] Authorization server metadata
       # @return [ClientInfo] Client information
       # @raise [MCPClient::Errors::ConnectionError] if registration fails
       def get_or_register_client(server_metadata)
-        # Try to get existing client info from storage
+        # 1. Pre-registered or previously registered client info from storage
         if (client_info = storage.get_client_info(server_url)) && !client_info.client_secret_expired?
           logger.debug("Using cached OAuth client for #{server_url}")
           return client_info
         end
 
-        # Register new client if server supports it
+        # 2. Client ID Metadata Documents (SEP-991): the HTTPS metadata URL is
+        # itself the client_id — no registration request is needed.
+        if client_id_metadata_url && server_metadata.supports_client_id_metadata_documents?
+          return client_info_from_metadata_url
+        end
+
+        # 3. Dynamic Client Registration (RFC 7591) fallback
         logger.debug('No cached client found, registering new OAuth client...')
         if server_metadata.supports_registration?
           register_client(server_metadata)
@@ -676,6 +704,53 @@ module MCPClient
           raise MCPClient::Errors::ConnectionError,
                 'Dynamic client registration not supported and no client credentials found'
         end
+      end
+
+      # Build client information for a Client ID Metadata Document client
+      # (SEP-991): the configured HTTPS metadata URL is used directly as the
+      # client_id in authorization and token requests, without a dynamic
+      # registration POST. Serving the metadata JSON at that URL is the
+      # application's responsibility, not this library's.
+      # @return [ClientInfo] Client information with the metadata URL as client_id
+      def client_info_from_metadata_url
+        logger.debug("Using Client ID Metadata Document URL as client_id: #{client_id_metadata_url}")
+
+        metadata = ClientMetadata.new(
+          redirect_uris: [redirect_uri],
+          token_endpoint_auth_method: 'none', # Public client
+          grant_types: %w[authorization_code refresh_token],
+          response_types: ['code'],
+          scope: resolved_scope,
+          **@extra_client_metadata
+        )
+
+        client_info = ClientInfo.new(client_id: client_id_metadata_url, metadata: metadata)
+
+        # Persist so complete_authorization_flow and token refresh can find it
+        storage.set_client_info(server_url, client_info)
+
+        client_info
+      end
+
+      # Validate a Client ID Metadata Document URL (SEP-991): "The client_id
+      # URL MUST use the 'https' scheme and contain a path component, e.g.
+      # https://example.com/client.json".
+      # @param url [String] Candidate metadata URL
+      # @return [String] The validated URL
+      # @raise [ArgumentError] if the URL is invalid, not HTTPS, or lacks a path component
+      def validate_client_id_metadata_url(url)
+        uri = URI.parse(url)
+        raise ArgumentError, "client_id_metadata_url must be an HTTPS URL: #{url.inspect}" unless uri.is_a?(URI::HTTPS)
+
+        if uri.path.to_s.empty? || uri.path == '/'
+          raise ArgumentError,
+                'client_id_metadata_url must contain a path component ' \
+                "(e.g. https://example.com/client.json): #{url.inspect}"
+        end
+
+        url
+      rescue URI::InvalidURIError
+        raise ArgumentError, "client_id_metadata_url is not a valid URL: #{url.inspect}"
       end
 
       # Register OAuth client dynamically
