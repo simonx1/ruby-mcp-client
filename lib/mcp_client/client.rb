@@ -1204,28 +1204,32 @@ module MCPClient
     # @param system_prompt [String, nil] system prompt
     # @param max_tokens [Integer, nil] max tokens
     # @param params [Hash] the complete sampling/createMessage request params;
-    #   arity-5+ handlers receive this hash verbatim as their fifth argument,
-    #   so they can read includeContext, temperature, stopSequences, metadata,
-    #   the SEP-1577 tools/toolChoice fields, _meta, and any future params
+    #   handlers whose fifth parameter is required, optional, or part of a
+    #   rest argument receive this hash verbatim, so they can read
+    #   includeContext, temperature, stopSequences, metadata, the SEP-1577
+    #   tools/toolChoice fields, _meta, and any future params
     # @return [Hash] the handler result
     def call_sampling_handler(messages, model_preferences, system_prompt, max_tokens, params)
+      args = [messages, model_preferences, system_prompt, max_tokens, params]
+      @sampling_handler.call(*args.first(sampling_handler_arg_count))
+    end
+
+    # Number of the five positional sampling arguments the handler can accept.
+    # Ruby reports negative arity for optional or rest parameters, and
+    # normalizing that to the minimum required count would starve e.g.
+    # ->(messages, prefs, system, max_tokens, extra = nil) of the raw params
+    # (including the SEP-1577 tools/toolChoice fields), so variable-arity
+    # handlers are sized from Proc#parameters instead: each :req/:opt
+    # parameter accepts one argument and a :rest accepts the full list.
+    # @return [Integer] how many arguments to pass, capped at 5
+    def sampling_handler_arg_count
       arity = @sampling_handler.arity
-      # Normalize negative arity (optional params) to minimum required args
-      arity = -(arity + 1) if arity.negative?
-      case arity
-      when 0
-        @sampling_handler.call
-      when 1
-        @sampling_handler.call(messages)
-      when 2
-        @sampling_handler.call(messages, model_preferences)
-      when 3
-        @sampling_handler.call(messages, model_preferences, system_prompt)
-      when 4
-        @sampling_handler.call(messages, model_preferences, system_prompt, max_tokens)
-      else
-        @sampling_handler.call(messages, model_preferences, system_prompt, max_tokens, params)
-      end
+      return [arity, 5].min unless arity.negative?
+
+      parameters = @sampling_handler.parameters
+      return 5 if parameters.any? { |type, _name| type == :rest }
+
+      [parameters.count { |type, _name| %i[req opt].include?(type) }, 5].min
     end
 
     # Normalize and validate modelPreferences from sampling request (MCP 2025-11-25)

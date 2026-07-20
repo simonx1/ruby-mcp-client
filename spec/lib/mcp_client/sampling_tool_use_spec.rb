@@ -167,6 +167,55 @@ RSpec.describe 'Sampling tool use (MCP 2025-11-25, SEP-1577)' do
       expect(received_extra['maxTokens']).to eq(1000)
     end
 
+    # Ruby reports negative arity for optional parameters, and normalizing it
+    # to the minimum required count would starve an optional fifth parameter
+    # of the raw params (including SEP-1577 tools/toolChoice).
+    it 'passes the full params to a lambda with an optional fifth parameter' do
+      received_extra = :not_called
+      handler = lambda do |_messages, _model_prefs, _system_prompt, _max_tokens, extra = nil|
+        received_extra = extra
+        { 'role' => 'assistant', 'content' => { 'type' => 'text', 'text' => 'OK' } }
+      end
+      client = MCPClient::Client.new(sampling_handler: handler, sampling_supports_tools: true)
+
+      client.send(:handle_sampling_request, request_id, tool_params)
+
+      expect(received_extra).to be_a(Hash)
+      expect(received_extra['tools']).to eq(tools)
+      expect(received_extra['toolChoice']).to eq({ 'mode' => 'auto' })
+    end
+
+    it 'passes the full five-argument list to a variadic handler' do
+      received_args = nil
+      handler = lambda do |messages, *rest|
+        received_args = [messages, *rest]
+        { 'role' => 'assistant', 'content' => { 'type' => 'text', 'text' => 'OK' } }
+      end
+      client = MCPClient::Client.new(sampling_handler: handler, sampling_supports_tools: true)
+
+      client.send(:handle_sampling_request, request_id, tool_params)
+
+      expect(received_args.length).to eq(5)
+      expect(received_args.first).to eq(tool_params['messages'])
+      expect(received_args.last['tools']).to eq(tools)
+    end
+
+    it 'sizes optional-arity handlers by their acceptable count, not their required minimum' do
+      received_max_tokens = :not_called
+      handler = lambda do |_messages, _model_prefs, _system_prompt, max_tokens = :missing|
+        received_max_tokens = max_tokens
+        { 'role' => 'assistant', 'content' => { 'type' => 'text', 'text' => 'OK' } }
+      end
+      client = MCPClient::Client.new(sampling_handler: handler)
+
+      client.send(:handle_sampling_request, request_id, {
+                    'messages' => [{ 'role' => 'user', 'content' => { 'type' => 'text', 'text' => 'Hi' } }],
+                    'maxTokens' => 512
+                  })
+
+      expect(received_max_tokens).to eq(512)
+    end
+
     it 'keeps the historical extra keys for tool-free requests' do
       received_extra = nil
       handler = lambda do |_messages, _model_prefs, _system_prompt, _max_tokens, extra|
