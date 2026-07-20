@@ -97,6 +97,9 @@ module MCPClient
       @connection_established = false
       @connection_cv = @mutex.new_cond
       @initialized = false
+      # Negotiated protocol version captured from the initialize result
+      # (sent as the MCP-Protocol-Version header on post-initialize requests)
+      @protocol_version = nil
       @auth_error = nil
       # Whether to use SSE transport; may disable if handshake fails
       @use_sse = true
@@ -685,6 +688,9 @@ module MCPClient
       @rpc_conn.post do |req|
         req.url @rpc_endpoint
         req.headers['Content-Type'] = 'application/json'
+        # MCP lifecycle "Version Negotiation": include the MCP-Protocol-Version
+        # header on all HTTP requests after the initialize handshake.
+        req.headers['Mcp-Protocol-Version'] = @protocol_version if @protocol_version
         @headers.each { |k, v| req.headers[k] = v }
         req.body = json_body
       end

@@ -1164,7 +1164,10 @@ RSpec.describe MCPClient::ServerSSE do
 
       # Verify the state changes
       expect(server.instance_variable_get(:@connection_established)).to eq(true)
-      expect(server.instance_variable_get(:@rpc_endpoint)).to eq('/messages')
+      # MCP 2024-11-05 HTTP with SSE: the endpoint event data is a URI
+      # reference that is resolved against the SSE connection URL (RFC 3986
+      # section 5.1.3), so the stored endpoint is absolute.
+      expect(server.instance_variable_get(:@rpc_endpoint)).to eq('https://example.com/messages')
     end
 
     it 'handles empty message events' do
@@ -1204,14 +1207,16 @@ RSpec.describe MCPClient::ServerSSE do
     end
 
     it 'detects and handles authorization errors in message events' do
-      # Create a JSON-RPC error response with authorization error
+      # Create a connection-level (id-less) JSON-RPC error with an
+      # authorization error. Id-bearing error RESPONSES are no longer handled
+      # here: per MCP lifecycle "Error Handling" they belong to the pending
+      # request and are delivered to the waiting caller as ServerError.
       error_data = {
         jsonrpc: '2.0',
         error: {
           code: -32_000,
           message: 'Unauthorized: Invalid API token'
-        },
-        id: 1
+        }
       }
       event_data = "event: message\ndata: #{error_data.to_json}\n\n"
 
@@ -1226,14 +1231,15 @@ RSpec.describe MCPClient::ServerSSE do
     end
 
     it 'detects authorization errors with specific error codes' do
-      # Create a JSON-RPC error response with 401 error code
+      # Create a connection-level (id-less) JSON-RPC error with a 401 error
+      # code. Id-bearing error RESPONSES are routed to the pending request
+      # instead (MCP lifecycle "Error Handling").
       error_data = {
         jsonrpc: '2.0',
         error: {
           code: 401,
           message: 'Authentication required'
-        },
-        id: 1
+        }
       }
       event_data = "event: message\ndata: #{error_data.to_json}\n\n"
 
@@ -1258,13 +1264,16 @@ RSpec.describe MCPClient::ServerSSE do
       }
       event_data = "event: message\ndata: #{error_data.to_json}\n\n"
 
-      # Should log the error but not raise ConnectionError
-      expect(server.instance_variable_get(:@logger)).to receive(:error).with(/Server error/)
-
       # Should not raise an error
       expect do
         server.send(:parse_and_handle_sse_event, event_data)
       end.not_to raise_error
+
+      # Per MCP lifecycle "Error Handling", an id-bearing error RESPONSE is
+      # delivered to the pending request (via @sse_results) rather than being
+      # logged and swallowed, so the waiting caller can raise ServerError
+      # instead of timing out.
+      expect(server.instance_variable_get(:@sse_results)).to have_key(1)
 
       # Should not set auth_error
       expect(server.instance_variable_get(:@auth_error)).to be_nil

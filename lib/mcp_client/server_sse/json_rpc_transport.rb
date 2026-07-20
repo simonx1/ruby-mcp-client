@@ -62,15 +62,29 @@ module MCPClient
 
       # Perform JSON-RPC initialize handshake with the MCP server
       # @return [void]
+      # @raise [MCPClient::Errors::ConnectionError] if the initialize result is malformed
       def perform_initialize
         request_id = @mutex.synchronize { @request_id += 1 }
         json_rpc_request = build_jsonrpc_request('initialize', initialization_params, request_id)
         @logger.debug("Performing initialize RPC: #{json_rpc_request}")
         result = send_jsonrpc_request(json_rpc_request)
-        return unless result.is_a?(Hash)
+        unless result.is_a?(Hash)
+          # A non-object initialize result means the handshake did not succeed.
+          # Continuing would enter the Operation phase without ever sending the
+          # mandatory notifications/initialized (MCP lifecycle "Initialization":
+          # "After successful initialization, the client MUST send an
+          # `initialized` notification"), so fail the connection instead.
+          cleanup
+          raise MCPClient::Errors::ConnectionError,
+                "Invalid initialize response from server: expected an object, got #{result.inspect}"
+        end
 
         @server_info = result['serverInfo']
         @capabilities = result['capabilities']
+        # Capture the negotiated protocol version for the MCP-Protocol-Version
+        # header required on all subsequent HTTP requests (MCP lifecycle
+        # "Version Negotiation").
+        @protocol_version = result['protocolVersion']
 
         # Send initialized notification to acknowledge completion of initialization
         initialized_notification = build_jsonrpc_notification('notifications/initialized', {})
@@ -160,6 +174,11 @@ module MCPClient
         response = conn.post(endpoint) do |req|
           req.headers['Content-Type'] = 'application/json'
           req.headers['Accept'] = 'application/json'
+          # MCP lifecycle "Version Negotiation": the client MUST include the
+          # MCP-Protocol-Version header on all requests after the initialize
+          # handshake. The guard naturally skips the initialize POST itself,
+          # since the negotiated version is only known from its result.
+          req.headers['Mcp-Protocol-Version'] = @protocol_version if @protocol_version
           (@headers.dup.tap do |h|
             h.delete('Accept')
             h.delete('Cache-Control')
@@ -228,6 +247,7 @@ module MCPClient
       # Check if a result is available for the given request ID
       # @param request_id [Integer] the request ID to check
       # @return [Hash, nil] the result if available, nil otherwise
+      # @raise [MCPClient::Errors::ServerError] if the stored result is a JSON-RPC error response
       def check_for_result(request_id)
         result = nil
         @mutex.synchronize do
@@ -236,10 +256,25 @@ module MCPClient
 
         if result
           record_activity
+          # SseParser#process_response? stores JSON-RPC error responses under
+          # the Symbol :error key; deliver them to the caller as ServerError
+          # (MCP lifecycle "Error Handling") instead of timing out.
+          raise_sse_error_response(result[:error]) if result.is_a?(Hash) && result.key?(:error)
           return result
         end
 
         nil
+      end
+
+      # Raise a ServerError for a JSON-RPC error response received over SSE,
+      # mirroring JsonRpcCommon#process_jsonrpc_response for the other transports.
+      # @param error [Hash, nil] the JSON-RPC error object ('code', 'message', 'data')
+      # @raise [MCPClient::Errors::ServerError] always
+      def raise_sse_error_response(error)
+        error ||= {}
+        message = error['message'] || 'Unknown server error'
+        message = "#{message} (code #{error['code']})" if error['code']
+        raise MCPClient::Errors::ServerError, message
       end
 
       # Parse a direct (non-SSE) JSON-RPC response
