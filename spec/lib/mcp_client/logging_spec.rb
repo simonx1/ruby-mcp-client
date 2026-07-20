@@ -15,6 +15,8 @@ RSpec.describe 'Logging (MCP 2025-06-18)' do
     allow(mock_server).to receive(:on_roots_list_request)
     allow(mock_server).to receive(:on_sampling_request)
     allow(mock_server).to receive(:capability?).with('logging').and_return(true)
+    allow(mock_server).to receive(:respond_to?).with(:capabilities).and_return(true)
+    allow(mock_server).to receive(:capabilities).and_return({ 'logging' => {} })
   end
 
   describe MCPClient::Client do
