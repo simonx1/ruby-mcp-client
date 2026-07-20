@@ -88,6 +88,38 @@ module MCPClient
       raise NotImplementedError, 'Subclasses must implement capabilities'
     end
 
+    # Whether the server declared the given (possibly nested) capability
+    # during initialization.
+    # @param path [Array<String, Symbol>] capability key path, e.g. 'logging'
+    #   or 'resources', 'subscribe'
+    # @return [Boolean]
+    def capability?(*path)
+      node = begin
+        capabilities
+      rescue NotImplementedError
+        nil
+      end
+      path.each do |key|
+        return false unless node.is_a?(Hash)
+
+        node = node[key.to_s]
+      end
+      !node.nil? && node != false
+    end
+
+    # Raise unless the server negotiated the given capability (MCP lifecycle:
+    # "Only use capabilities that were successfully negotiated").
+    # @param path [Array<String, Symbol>] capability key path
+    # @param method [String] the JSON-RPC method the caller wants to send
+    # @raise [MCPClient::Errors::CapabilityError]
+    def require_capability!(*path, method:)
+      return if capability?(*path)
+
+      raise MCPClient::Errors::CapabilityError,
+            "Server #{name || self.class.name} did not declare the #{path.join('.')} capability " \
+            "required for #{method}"
+    end
+
     # Clean up the server connection
     def cleanup
       raise NotImplementedError, 'Subclasses must implement cleanup'

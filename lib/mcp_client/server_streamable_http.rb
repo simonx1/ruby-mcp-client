@@ -226,11 +226,14 @@ module MCPClient
     # @return [Hash] completion result with 'values', optional 'total', and 'hasMore' fields
     # @raise [MCPClient::Errors::ServerError] if server returns an error
     def complete(ref:, argument:, context: nil)
+      ensure_connected
+      require_capability!('completions', method: 'completion/complete')
       params = { ref: ref, argument: argument }
       params[:context] = context if context
       result = rpc_request('completion/complete', params)
       result['completion'] || { 'values' => [] }
-    rescue MCPClient::Errors::ConnectionError, MCPClient::Errors::TransportError
+    rescue MCPClient::Errors::ConnectionError, MCPClient::Errors::TransportError,
+           MCPClient::Errors::CapabilityError
       raise
     rescue StandardError => e
       raise MCPClient::Errors::ServerError, "Error requesting completion: #{e.message}"
@@ -242,8 +245,11 @@ module MCPClient
     # @return [Hash] empty result on success
     # @raise [MCPClient::Errors::ServerError] if server returns an error
     def log_level=(level)
+      ensure_connected
+      require_capability!('logging', method: 'logging/setLevel')
       rpc_request('logging/setLevel', { level: level })
-    rescue MCPClient::Errors::ConnectionError, MCPClient::Errors::TransportError
+    rescue MCPClient::Errors::ConnectionError, MCPClient::Errors::TransportError,
+           MCPClient::Errors::CapabilityError
       raise
     rescue StandardError => e
       raise MCPClient::Errors::ServerError, "Error setting log level: #{e.message}"
@@ -371,9 +377,12 @@ module MCPClient
     # @return [Boolean] true if subscription successful
     # @raise [MCPClient::Errors::ResourceReadError] for other errors during subscription
     def subscribe_resource(uri)
+      ensure_connected
+      require_capability!('resources', 'subscribe', method: 'resources/subscribe')
       rpc_request('resources/subscribe', { uri: uri })
       true
-    rescue MCPClient::Errors::ConnectionError, MCPClient::Errors::TransportError, MCPClient::Errors::ServerError
+    rescue MCPClient::Errors::ConnectionError, MCPClient::Errors::TransportError, MCPClient::Errors::ServerError,
+           MCPClient::Errors::CapabilityError
       raise
     rescue StandardError => e
       raise MCPClient::Errors::ResourceReadError, "Error subscribing to resource '#{uri}': #{e.message}"
@@ -384,9 +393,12 @@ module MCPClient
     # @return [Boolean] true if unsubscription successful
     # @raise [MCPClient::Errors::ResourceReadError] for other errors during unsubscription
     def unsubscribe_resource(uri)
+      ensure_connected
+      require_capability!('resources', 'subscribe', method: 'resources/unsubscribe')
       rpc_request('resources/unsubscribe', { uri: uri })
       true
-    rescue MCPClient::Errors::ConnectionError, MCPClient::Errors::TransportError, MCPClient::Errors::ServerError
+    rescue MCPClient::Errors::ConnectionError, MCPClient::Errors::TransportError, MCPClient::Errors::ServerError,
+           MCPClient::Errors::CapabilityError
       raise
     rescue StandardError => e
       raise MCPClient::Errors::ResourceReadError, "Error unsubscribing from resource '#{uri}': #{e.message}"

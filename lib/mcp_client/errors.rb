@@ -30,6 +30,11 @@ module MCPClient
     # Raised when there's a connection error with an MCP server
     class ConnectionError < MCPError; end
 
+    # Raised when a request requires a server capability that was not
+    # negotiated during initialization (MCP lifecycle: "Only use capabilities
+    # that were successfully negotiated")
+    class CapabilityError < MCPError; end
+
     # Raised when the MCP server returns an error response
     class ServerError < MCPError; end
 

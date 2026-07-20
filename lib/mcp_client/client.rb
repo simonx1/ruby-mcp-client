@@ -605,6 +605,11 @@ module MCPClient
     # @raise [MCPClient::Errors::TaskError] if listing fails
     def list_tasks(cursor: nil, server: nil)
       srv = select_server(server)
+      unless srv.capability?('tasks', 'list')
+        raise MCPClient::Errors::CapabilityError,
+              "Server #{srv.name || srv.class.name} did not declare the tasks.list capability"
+      end
+
       params = cursor ? { cursor: cursor } : {}
 
       begin
@@ -625,6 +630,10 @@ module MCPClient
     # @raise [MCPClient::Errors::TaskError] if cancellation fails (including cancelling a terminal task)
     def cancel_task(task_id, server: nil)
       srv = select_server(server)
+      unless srv.capability?('tasks', 'cancel')
+        raise MCPClient::Errors::CapabilityError,
+              "Server #{srv.name || srv.class.name} did not declare the tasks.cancel capability"
+      end
 
       begin
         result = srv.rpc_request('tasks/cancel', { taskId: task_id })
@@ -649,7 +658,17 @@ module MCPClient
     # @return [Array<Hash>] results from servers
     # @raise [MCPClient::Errors::ServerError] if server returns an error
     def log_level=(level)
-      @servers.map { |srv| srv.log_level = level }
+      @servers.filter_map do |srv|
+        # MCP lifecycle: only use capabilities that were successfully
+        # negotiated — skip servers that did not declare logging.
+        unless srv.capability?('logging')
+          @logger.debug("Skipping logging/setLevel for #{srv.name || srv.class.name}: " \
+                        'logging capability not negotiated')
+          next
+        end
+
+        srv.log_level = level
+      end
     end
 
     private

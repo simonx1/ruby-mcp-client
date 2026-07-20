@@ -308,6 +308,7 @@ module MCPClient
     # @raise [MCPClient::Errors::ResourceReadError] for other errors during subscription
     def subscribe_resource(uri)
       ensure_initialized
+      require_capability!('resources', 'subscribe', method: 'resources/subscribe')
       req_id = next_id
       req = {
         'jsonrpc' => '2.0',
@@ -322,6 +323,8 @@ module MCPClient
       end
 
       true
+    rescue MCPClient::Errors::CapabilityError
+      raise
     rescue StandardError => e
       raise MCPClient::Errors::ResourceReadError, "Error subscribing to resource '#{uri}': #{e.message}"
     end
@@ -333,6 +336,7 @@ module MCPClient
     # @raise [MCPClient::Errors::ResourceReadError] for other errors during unsubscription
     def unsubscribe_resource(uri)
       ensure_initialized
+      require_capability!('resources', 'subscribe', method: 'resources/unsubscribe')
       req_id = next_id
       req = {
         'jsonrpc' => '2.0',
@@ -347,6 +351,8 @@ module MCPClient
       end
 
       true
+    rescue MCPClient::Errors::CapabilityError
+      raise
     rescue StandardError => e
       raise MCPClient::Errors::ResourceReadError, "Error unsubscribing from resource '#{uri}': #{e.message}"
     end
@@ -412,6 +418,7 @@ module MCPClient
     # @raise [MCPClient::Errors::ServerError] if server returns an error
     def complete(ref:, argument:, context: nil)
       ensure_initialized
+      require_capability!('completions', method: 'completion/complete')
       req_id = next_id
       params = { 'ref' => ref, 'argument' => argument }
       params['context'] = context if context
@@ -428,6 +435,8 @@ module MCPClient
       end
 
       res.dig('result', 'completion') || { 'values' => [] }
+    rescue MCPClient::Errors::CapabilityError
+      raise
     rescue StandardError => e
       raise MCPClient::Errors::ServerError, "Error requesting completion: #{e.message}"
     end
@@ -439,6 +448,7 @@ module MCPClient
     # @raise [MCPClient::Errors::ServerError] if server returns an error
     def log_level=(level)
       ensure_initialized
+      require_capability!('logging', method: 'logging/setLevel')
       req_id = next_id
       req = {
         'jsonrpc' => '2.0',
@@ -453,6 +463,8 @@ module MCPClient
       end
 
       res['result'] || {}
+    rescue MCPClient::Errors::CapabilityError
+      raise
     rescue StandardError => e
       raise MCPClient::Errors::ServerError, "Error setting log level: #{e.message}"
     end

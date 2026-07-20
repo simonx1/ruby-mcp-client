@@ -14,6 +14,7 @@ RSpec.describe 'Logging (MCP 2025-06-18)' do
     allow(mock_server).to receive(:on_elicitation_request)
     allow(mock_server).to receive(:on_roots_list_request)
     allow(mock_server).to receive(:on_sampling_request)
+    allow(mock_server).to receive(:capability?).with('logging').and_return(true)
   end
 
   describe MCPClient::Client do
@@ -155,6 +156,7 @@ RSpec.describe 'Logging (MCP 2025-06-18)' do
       end
 
       before do
+        server.instance_variable_set(:@capabilities, { 'logging' => {} })
         allow(server).to receive(:ensure_initialized)
         allow(server).to receive(:next_id).and_return(1)
         allow(server).to receive(:send_request)
@@ -189,6 +191,10 @@ RSpec.describe 'Logging (MCP 2025-06-18)' do
       end
 
       before do
+        server.instance_variable_set(:@capabilities, { 'logging' => {} })
+        %i[ensure_initialized ensure_connected].each do |m|
+          allow(server).to receive(m) if server.respond_to?(m, true)
+        end
         allow(server).to receive(:rpc_request).and_return({})
       end
 
@@ -207,6 +213,10 @@ RSpec.describe 'Logging (MCP 2025-06-18)' do
       end
 
       before do
+        server.instance_variable_set(:@capabilities, { 'logging' => {} })
+        %i[ensure_initialized ensure_connected].each do |m|
+          allow(server).to receive(m) if server.respond_to?(m, true)
+        end
         allow(server).to receive(:rpc_request).and_return({})
       end
 
@@ -225,6 +235,10 @@ RSpec.describe 'Logging (MCP 2025-06-18)' do
       end
 
       before do
+        server.instance_variable_set(:@capabilities, { 'logging' => {} })
+        %i[ensure_initialized ensure_connected].each do |m|
+          allow(server).to receive(m) if server.respond_to?(m, true)
+        end
         allow(server).to receive(:rpc_request).and_return({})
       end
 
