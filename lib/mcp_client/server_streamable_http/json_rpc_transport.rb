@@ -115,7 +115,7 @@ module MCPClient
 
         events.each do |event|
           if event[:id] && !event[:id].empty?
-            @last_event_id = event[:id]
+            @mutex.synchronize { @last_event_id = event[:id] }
             @logger.debug("Tracking event ID for resumability: #{event[:id]}")
           end
           next unless event[:type] == 'message'
