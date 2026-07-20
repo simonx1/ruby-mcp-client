@@ -30,7 +30,8 @@ module MCPClient
     # @param elicitation_handler [Proc, nil] optional handler for elicitation requests (MCP 2025-06-18)
     # @param roots [Array<MCPClient::Root, Hash>, nil] optional list of roots (MCP 2025-06-18)
     # @param sampling_handler [Proc, nil] optional handler for sampling requests (MCP 2025-11-25)
-    def initialize(mcp_server_configs: [], logger: nil, elicitation_handler: nil, roots: nil, sampling_handler: nil)
+    def initialize(mcp_server_configs: [], logger: nil, elicitation_handler: nil, roots: nil, sampling_handler: nil,
+                   client_info: nil)
       # Preserve a caller-supplied logger's formatter (only tag progname), and
       # install the default formatter solely on a logger we create ourselves.
       # Overwriting the formatter of an application's logger would silently
@@ -60,6 +61,8 @@ module MCPClient
       @roots = normalize_roots(roots)
       # Register default and user-defined notification handlers on each server
       @servers.each do |server|
+        # Host-provided Implementation info for the initialize clientInfo
+        server.client_info = client_info if client_info && server.respond_to?(:client_info=)
         server.on_notification do |method, params|
           # Default notification processing (e.g., cache invalidation, logging)
           process_notification(server, method, params)
