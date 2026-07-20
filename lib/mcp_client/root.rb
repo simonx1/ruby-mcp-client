@@ -17,6 +17,9 @@ module MCPClient
     # @raise [ArgumentError] if uri is not a valid file:// URI or contains '..' path segments
     def initialize(uri:, name: nil, meta: nil)
       validate_uri!(uri)
+      # Root._meta is an object of arbitrary keys per the schema
+      raise ArgumentError, "Root _meta must be a Hash, got #{meta.class}" if meta && !meta.is_a?(Hash)
+
       @uri = uri
       @name = name
       @meta = meta
@@ -84,13 +87,19 @@ module MCPClient
       raise ArgumentError, 'Root uri must be a String, got nil' if uri.nil?
       raise ArgumentError, "Root uri must be a String, got #{uri.class}" unless uri.is_a?(String)
 
-      parsed = parse_uri(uri)
-      unless parsed.scheme&.casecmp('file')&.zero?
+      # The schema requires the literal file:// form ("must start with
+      # file://"), not merely a file scheme — file:relative and file:/path
+      # forms are rejected.
+      unless uri.downcase.start_with?('file://')
         raise ArgumentError,
               "Root uri must be a file:// URI (MCP spec: 'This MUST be a file:// URI'), got: #{uri.inspect}"
       end
 
-      return unless parsed.path.to_s.split('/').include?('..')
+      parsed = parse_uri(uri)
+      # Decode before the traversal check so percent-encoded segments
+      # (%2e%2e) cannot smuggle a '..' past validation.
+      decoded_path = URI::DEFAULT_PARSER.unescape(parsed.path.to_s)
+      return unless decoded_path.split('/').include?('..')
 
       raise ArgumentError, "Root uri must not contain '..' path traversal segments, got: #{uri.inspect}"
     end

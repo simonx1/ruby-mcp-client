@@ -156,4 +156,23 @@ RSpec.describe 'Root URI validation and _meta support' do
       expect(response).to eq({ 'roots' => [{ 'uri' => 'file:///path', '_meta' => { 'k' => 'v' } }] })
     end
   end
+
+  describe 'review hardening (Codex findings)' do
+    let(:described_root) { MCPClient::Root }
+
+    it 'rejects percent-encoded traversal segments' do
+      expect { described_root.new(uri: 'file:///safe/%2e%2e/etc') }
+        .to raise_error(ArgumentError, /traversal/)
+    end
+
+    it 'rejects file: forms that do not start with file://' do
+      expect { described_root.new(uri: 'file:relative/path') }.to raise_error(ArgumentError, /file:/)
+      expect { described_root.new(uri: 'file:/absolute/path') }.to raise_error(ArgumentError, /file:/)
+    end
+
+    it 'rejects non-Hash _meta' do
+      expect { described_root.new(uri: 'file:///ws', meta: 'not-an-object') }
+        .to raise_error(ArgumentError, /_meta/)
+    end
+  end
 end
