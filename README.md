@@ -154,14 +154,21 @@ result = client.call_tool('get_weather', { location: 'SF' })
 data = result['structuredContent']  # Type-safe structured data
 
 # Per MCP 2025-11-25, clients SHOULD validate structured results against the
-# tool's output schema. call_tool does this automatically for the common JSON
-# Schema keywords (type, properties, required, items, enum, numeric/string
-# bounds; the full 2020-12 vocabulary is out of scope). By default a mismatch
-# logs a warning; opt in to strict mode to raise instead:
+# tool's output schema, and a tool that declares an outputSchema must return
+# structuredContent in successful results. call_tool checks both automatically
+# for the common JSON Schema keywords (type, properties, required, items, enum,
+# numeric/string bounds). The full 2020-12 vocabulary ($ref/$defs, allOf/anyOf/
+# oneOf/not, if/then/else, additionalProperties, patternProperties,
+# unevaluated*, dependentSchemas) is NOT evaluated: when a schema uses any of
+# those keywords, call_tool logs a "validation is partial" warning naming them
+# (in both modes), since data may pass this check that a full validator would
+# reject. By default a violation (mismatch, or missing structuredContent on a
+# successful result) logs a warning; opt in to strict mode to raise instead:
 client = MCPClient::Client.new(
   mcp_server_configs: [...],
-  validate_structured_content: :strict # raises MCPClient::Errors::ValidationError on mismatch
+  validate_structured_content: :strict # raises MCPClient::Errors::ValidationError on violation
 )
+# Task-delivered results (get_task_result) are not validated yet.
 ```
 
 ### Roots

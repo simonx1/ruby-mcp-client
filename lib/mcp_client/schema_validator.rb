@@ -17,8 +17,63 @@ module MCPClient
   # conditional keywords, additionalProperties, format assertions, ...) is out
   # of scope: unrecognized keywords are ignored rather than misapplied, so
   # validation is best-effort — it may accept data a full validator would
-  # reject, but it does not reject data that conforms to the schema.
+  # reject, but it does not reject data that conforms to the schema. So that
+  # this gap is never silent, {.unsupported_keywords} reports which unsupported
+  # applicator keywords a schema uses; callers surface them as a warning.
   module SchemaValidator
+    # JSON Schema 2020-12 applicator/reference keywords this validator does
+    # not evaluate. Their presence means validation is partial: data may pass
+    # here that a full validator would reject.
+    UNSUPPORTED_KEYWORDS = %w[
+      $ref $defs allOf anyOf oneOf not if then else
+      additionalProperties patternProperties
+      unevaluatedProperties unevaluatedItems dependentSchemas
+    ].freeze
+
+    # Keywords whose value is a single subschema to walk.
+    SUBSCHEMA_KEYWORDS = %w[
+      items contains additionalProperties propertyNames not if then else
+      unevaluatedItems unevaluatedProperties
+    ].freeze
+
+    # Keywords whose value is a map of name => subschema.
+    SUBSCHEMA_MAP_KEYWORDS = %w[properties patternProperties $defs definitions dependentSchemas].freeze
+
+    # Keywords whose value is an array of subschemas.
+    SUBSCHEMA_ARRAY_KEYWORDS = %w[allOf anyOf oneOf prefixItems].freeze
+
+    # List the unsupported JSON Schema keywords a schema uses (anywhere: at the
+    # top level or nested in subschemas). Property names that merely look like
+    # keywords (e.g. a property called 'not') are not reported, and
+    # data-carrying keywords (enum/const/default/examples) are not scanned.
+    # @param schema [Object] the JSON schema (string or symbol keys)
+    # @return [Array<String>] unique unsupported keywords, in discovery order
+    def self.unsupported_keywords(schema)
+      found = []
+      collect_unsupported_keywords(schema, found)
+      found.uniq
+    end
+
+    # Recursively collect unsupported keywords from a schema.
+    # @param schema [Object] a (sub)schema; non-Hash values are ignored
+    # @param found [Array<String>] accumulator
+    # @return [void]
+    def self.collect_unsupported_keywords(schema, found)
+      return unless schema.is_a?(Hash)
+
+      schema = schema.transform_keys(&:to_s)
+      found.concat(schema.keys & UNSUPPORTED_KEYWORDS)
+      schema.each do |keyword, value|
+        if SUBSCHEMA_KEYWORDS.include?(keyword)
+          collect_unsupported_keywords(value, found)
+        elsif SUBSCHEMA_MAP_KEYWORDS.include?(keyword) && value.is_a?(Hash)
+          value.each_value { |subschema| collect_unsupported_keywords(subschema, found) }
+        elsif SUBSCHEMA_ARRAY_KEYWORDS.include?(keyword) && value.is_a?(Array)
+          value.each { |subschema| collect_unsupported_keywords(subschema, found) }
+        end
+      end
+    end
+
     # Validate data against a JSON Schema subset.
     # Schema and data hashes may use string or symbol keys.
     # @param data [Object] the value to validate

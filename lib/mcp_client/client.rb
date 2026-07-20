@@ -598,6 +598,12 @@ module MCPClient
     # Returns exactly what the underlying request would have returned (e.g. a
     # CallToolResult hash with 'content'/'isError'/'structuredContent'); it is
     # NOT wrapped in a Task. Blocks on the server until the task is terminal.
+    #
+    # NOTE: structured-content validation (see #validate_structured_content!)
+    # does not cover task-delivered results yet: a task ID alone does not
+    # identify which tool (and therefore which outputSchema) produced the
+    # result, and the client keeps no task-to-tool registry. Callers who need
+    # validation here can run MCPClient::SchemaValidator.validate themselves.
     # @param task_id [String] the ID of the task
     # @param server [Integer, String, Symbol, MCPClient::ServerBase, nil] server selector
     # @return [Object] the underlying task result
@@ -791,31 +797,69 @@ module MCPClient
 
     # Validate a tools/call result's structuredContent against the tool's
     # declared outputSchema (MCP 2025-11-25 server/tools spec: "Clients SHOULD
-    # validate structured results against this schema"). Error results
-    # (isError: true) are exempt: the conformance requirement applies to
-    # successful structured results. Validation covers the common JSON Schema
-    # keywords only; the full 2020-12 vocabulary is out of scope (see
-    # MCPClient::SchemaValidator). On mismatch a warning is always logged, and
+    # validate structured results against this schema"; a tool declaring an
+    # outputSchema must return structuredContent in successful results). Error
+    # results (isError: true) are exempt: the conformance requirements apply to
+    # successful results only. Validation covers the common JSON Schema
+    # keywords; the full 2020-12 vocabulary is out of scope (see
+    # MCPClient::SchemaValidator), and when the schema uses keywords outside
+    # that subset a partial-coverage warning is logged in both modes so :strict
+    # never silently passes what it cannot fully check. On a violation
+    # (mismatch or missing structuredContent) a warning is always logged, and
     # in :strict mode a ValidationError is raised as well.
     # @param tool [MCPClient::Tool] the tool that produced the result
     # @param result [Object] the raw tools/call result
     # @return [Object] the result, unchanged
-    # @raise [MCPClient::Errors::ValidationError] in :strict mode when structuredContent does not match
+    # @raise [MCPClient::Errors::ValidationError] in :strict mode when structuredContent
+    #   is missing from a successful result or does not match the schema
     def validate_structured_content!(tool, result)
       return result unless tool.structured_output? && result.is_a?(Hash)
       return result if result['isError'] || result[:isError]
 
+      warn_partial_schema_coverage(tool)
+
       structured = result.key?('structuredContent') ? result['structuredContent'] : result[:structuredContent]
-      return result if structured.nil?
+      if structured.nil?
+        handle_structured_content_violation(
+          "Tool '#{tool.name}' declares an output schema but its successful result carries no structuredContent " \
+          '(required by the MCP 2025-11-25 tools spec)'
+        )
+        return result
+      end
 
       errors = MCPClient::SchemaValidator.validate(structured, tool.output_schema)
-      return result if errors.empty?
+      unless errors.empty?
+        handle_structured_content_violation(
+          "Structured content for tool '#{tool.name}' does not match its output schema: #{errors.join('; ')}"
+        )
+      end
+      result
+    end
 
-      message = "Structured content for tool '#{tool.name}' does not match its output schema: #{errors.join('; ')}"
+    # Warn (in both :warn and :strict modes) when a tool's output schema uses
+    # JSON Schema keywords the built-in validator cannot evaluate, so partial
+    # coverage is never silent.
+    # @param tool [MCPClient::Tool] the tool whose output schema is being used
+    # @return [void]
+    def warn_partial_schema_coverage(tool)
+      unsupported = MCPClient::SchemaValidator.unsupported_keywords(tool.output_schema)
+      return if unsupported.empty?
+
+      @logger.warn(
+        "Structured content check for tool '#{tool.name}': validation is partial: schema uses unsupported " \
+        "keywords: #{unsupported.join(', ')} (full JSON Schema 2020-12 evaluation is not implemented, so " \
+        'conforming-looking data may still violate the schema)'
+      )
+    end
+
+    # Log a structured-content conformance violation and, in :strict mode,
+    # raise it as a ValidationError.
+    # @param message [String] the violation description
+    # @return [void]
+    # @raise [MCPClient::Errors::ValidationError] in :strict mode
+    def handle_structured_content_violation(message)
       @logger.warn(message)
       raise MCPClient::Errors::ValidationError, message if @validate_structured_content == :strict
-
-      result
     end
 
     def find_server_for_tool(tool)

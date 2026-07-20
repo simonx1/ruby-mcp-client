@@ -113,6 +113,88 @@ RSpec.describe MCPClient::SchemaValidator do
         .to contain_exactly(a_string_matching(%r{#/name: expected type string}))
     end
   end
+
+  describe '.unsupported_keywords' do
+    it 'returns an empty array for a schema using only the supported subset' do
+      schema = {
+        'type' => 'object',
+        'properties' => { 'n' => { 'type' => 'number', 'minimum' => 0 } },
+        'required' => ['n']
+      }
+      expect(described_class.unsupported_keywords(schema)).to eq([])
+    end
+
+    it 'detects top-level unsupported keywords' do
+      schema = { 'type' => 'object', 'additionalProperties' => false, 'allOf' => [{ 'type' => 'object' }] }
+      expect(described_class.unsupported_keywords(schema)).to contain_exactly('additionalProperties', 'allOf')
+    end
+
+    it 'detects every keyword in the unsupported list' do
+      %w[$ref $defs allOf anyOf oneOf not if then else additionalProperties patternProperties
+         unevaluatedProperties unevaluatedItems dependentSchemas].each do |keyword|
+        expect(described_class.unsupported_keywords({ keyword => {} })).to eq([keyword])
+      end
+    end
+
+    it 'detects unsupported keywords nested in properties and items' do
+      schema = {
+        'type' => 'object',
+        'properties' => {
+          'a' => { 'oneOf' => [{ 'type' => 'string' }] },
+          'b' => { 'type' => 'array', 'items' => { '$ref' => '#/$defs/x' } }
+        }
+      }
+      expect(described_class.unsupported_keywords(schema)).to contain_exactly('oneOf', '$ref')
+    end
+
+    it 'detects unsupported keywords nested inside applicator schemas' do
+      schema = { 'anyOf' => [{ 'type' => 'object', 'patternProperties' => { '^x' => { 'type' => 'string' } } }] }
+      expect(described_class.unsupported_keywords(schema)).to contain_exactly('anyOf', 'patternProperties')
+    end
+
+    it 'does not mistake property names for keywords' do
+      schema = {
+        'type' => 'object',
+        'properties' => {
+          'not' => { 'type' => 'string' },
+          'if' => { 'type' => 'boolean' },
+          '$ref' => { 'type' => 'string' }
+        }
+      }
+      expect(described_class.unsupported_keywords(schema)).to eq([])
+    end
+
+    it 'does not scan data-carrying keywords such as enum and const' do
+      schema = {
+        'type' => 'object',
+        'properties' => {
+          'mode' => { 'enum' => [{ 'allOf' => 'just data' }], 'const' => { '$ref' => 'also data' } }
+        }
+      }
+      expect(described_class.unsupported_keywords(schema)).to eq([])
+    end
+
+    it 'deduplicates repeated keywords' do
+      schema = {
+        'type' => 'object',
+        'properties' => {
+          'a' => { '$ref' => '#/$defs/x' },
+          'b' => { '$ref' => '#/$defs/y' }
+        }
+      }
+      expect(described_class.unsupported_keywords(schema)).to eq(['$ref'])
+    end
+
+    it 'handles symbol-keyed schemas' do
+      schema = { type: 'object', additionalProperties: false, properties: { a: { anyOf: [{ type: 'string' }] } } }
+      expect(described_class.unsupported_keywords(schema)).to contain_exactly('additionalProperties', 'anyOf')
+    end
+
+    it 'returns an empty array for non-hash input' do
+      expect(described_class.unsupported_keywords(nil)).to eq([])
+      expect(described_class.unsupported_keywords('nope')).to eq([])
+    end
+  end
 end
 
 RSpec.describe MCPClient::Client do
@@ -176,12 +258,14 @@ RSpec.describe MCPClient::Client do
         expect(log_output.string).to include("missing required property 'conditions'")
       end
 
-      it 'does not warn when the result carries no structuredContent' do
+      it 'warns when a successful result carries no structuredContent despite a declared output schema' do
+        # MCP 2025-11-25 server/tools: a tool declaring an outputSchema must
+        # return structuredContent in successful results.
         result = { 'content' => [{ 'type' => 'text', 'text' => 'hi' }] }
         allow(mock_server).to receive(:call_tool).and_return(result)
 
         expect(build_client.call_tool('get_weather', {})).to eq(result)
-        expect(log_output.string).not_to include('output schema')
+        expect(log_output.string).to match(/get_weather.*declares an output schema.*no structuredContent/)
       end
 
       it 'does not validate tools without an output schema' do
@@ -192,12 +276,28 @@ RSpec.describe MCPClient::Client do
         expect(log_output.string).not_to include('output schema')
       end
 
+      it 'does not require structuredContent from tools without an output schema' do
+        result = { 'content' => [{ 'type' => 'text', 'text' => 'hi' }] }
+        allow(mock_server).to receive(:call_tool).and_return(result)
+
+        expect(build_client.call_tool('plain_tool', {})).to eq(result)
+        expect(log_output.string).not_to include('structuredContent')
+      end
+
       it 'skips validation for error results (isError: true)' do
         result = { 'isError' => true, 'content' => [], 'structuredContent' => { 'temperature' => 'hot' } }
         allow(mock_server).to receive(:call_tool).and_return(result)
 
         expect(build_client.call_tool('get_weather', {})).to eq(result)
         expect(log_output.string).not_to include('output schema')
+      end
+
+      it 'does not require structuredContent on error results' do
+        result = { 'isError' => true, 'content' => [{ 'type' => 'text', 'text' => 'boom' }] }
+        allow(mock_server).to receive(:call_tool).and_return(result)
+
+        expect(build_client.call_tool('get_weather', {})).to eq(result)
+        expect(log_output.string).not_to include('structuredContent')
       end
     end
 
@@ -227,6 +327,73 @@ RSpec.describe MCPClient::Client do
         client = build_client(validate_structured_content: :strict)
 
         expect(client.call_tool('get_weather', {})).to eq(result)
+      end
+
+      it 'raises when a successful result carries no structuredContent despite a declared output schema' do
+        result = { 'content' => [{ 'type' => 'text', 'text' => 'hi' }] }
+        allow(mock_server).to receive(:call_tool).and_return(result)
+        client = build_client(validate_structured_content: :strict)
+
+        expect { client.call_tool('get_weather', {}) }.to raise_error(
+          MCPClient::Errors::ValidationError, /get_weather.*declares an output schema.*no structuredContent/
+        )
+      end
+
+      it 'does not raise for error results without structuredContent' do
+        result = { 'isError' => true, 'content' => [{ 'type' => 'text', 'text' => 'boom' }] }
+        allow(mock_server).to receive(:call_tool).and_return(result)
+        client = build_client(validate_structured_content: :strict)
+
+        expect(client.call_tool('get_weather', {})).to eq(result)
+      end
+    end
+
+    context 'when the output schema uses keywords outside the supported subset' do
+      let(:output_schema) do
+        {
+          'type' => 'object',
+          'properties' => {
+            'temperature' => { 'type' => 'number' },
+            'conditions' => { 'oneOf' => [{ 'type' => 'string' }, { 'type' => 'null' }] }
+          },
+          'required' => %w[temperature conditions],
+          'additionalProperties' => false
+        }
+      end
+      let(:result) do
+        { 'content' => [], 'structuredContent' => { 'temperature' => 22.5, 'conditions' => 'sunny' } }
+      end
+
+      before { allow(mock_server).to receive(:call_tool).and_return(result) }
+
+      it 'warns that validation is partial, naming the unsupported keywords, in the default mode' do
+        expect(build_client.call_tool('get_weather', {})).to eq(result)
+        expect(log_output.string).to match(/get_weather.*validation is partial: schema uses unsupported keywords/)
+        expect(log_output.string).to include('oneOf').and include('additionalProperties')
+      end
+
+      it 'warns that validation is partial in :strict mode instead of silently passing' do
+        client = build_client(validate_structured_content: :strict)
+
+        expect(client.call_tool('get_weather', {})).to eq(result)
+        expect(log_output.string).to match(/get_weather.*validation is partial: schema uses unsupported keywords/)
+        expect(log_output.string).to include('oneOf').and include('additionalProperties')
+      end
+
+      it 'still validates and reports mismatches on the supported subset' do
+        mismatch = { 'content' => [], 'structuredContent' => { 'temperature' => 'hot', 'conditions' => 'sunny' } }
+        allow(mock_server).to receive(:call_tool).and_return(mismatch)
+
+        expect(build_client.call_tool('get_weather', {})).to eq(mismatch)
+        expect(log_output.string).to match(/get_weather.*does not match its output schema/)
+      end
+
+      it 'does not warn about partial validation for error results' do
+        error_result = { 'isError' => true, 'content' => [] }
+        allow(mock_server).to receive(:call_tool).and_return(error_result)
+
+        expect(build_client.call_tool('get_weather', {})).to eq(error_result)
+        expect(log_output.string).not_to include('validation is partial')
       end
     end
 
