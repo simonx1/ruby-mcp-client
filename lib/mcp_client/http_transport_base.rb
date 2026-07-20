@@ -116,16 +116,6 @@ module MCPClient
 
     private
 
-    # Generate initialization parameters for HTTP MCP protocol
-    # @return [Hash] the initialization parameters
-    def initialization_params
-      {
-        'protocolVersion' => MCPClient::PROTOCOL_VERSION,
-        'capabilities' => {},
-        'clientInfo' => { 'name' => 'ruby-mcp-client', 'version' => MCPClient::VERSION }
-      }
-    end
-
     # Perform JSON-RPC initialize handshake with the MCP server
     # @return [void]
     # @raise [MCPClient::Errors::ConnectionError] if initialization fails
