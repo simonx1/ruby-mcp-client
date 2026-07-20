@@ -30,7 +30,11 @@ module MCPClient
     # @param elicitation_handler [Proc, nil] optional handler for elicitation requests (MCP 2025-06-18)
     # @param roots [Array<MCPClient::Root, Hash>, nil] optional list of roots (MCP 2025-06-18)
     # @param sampling_handler [Proc, nil] optional handler for sampling requests (MCP 2025-11-25)
-    def initialize(mcp_server_configs: [], logger: nil, elicitation_handler: nil, roots: nil, sampling_handler: nil)
+    # @param sampling_supports_tools [Boolean] whether the sampling handler supports tool use
+    #   (MCP 2025-11-25 / SEP-1577); declares the sampling.tools capability and forwards
+    #   tools/toolChoice params to the handler instead of rejecting tool-enabled requests
+    def initialize(mcp_server_configs: [], logger: nil, elicitation_handler: nil, roots: nil, sampling_handler: nil,
+                   sampling_supports_tools: false)
       # Preserve a caller-supplied logger's formatter (only tag progname), and
       # install the default formatter solely on a logger we create ourselves.
       # Overwriting the formatter of an application's logger would silently
@@ -56,6 +60,8 @@ module MCPClient
       @elicitation_handler = elicitation_handler
       # Sampling handler (MCP 2025-11-25)
       @sampling_handler = sampling_handler
+      # Whether the sampling handler supports tool use (SEP-1577)
+      @sampling_supports_tools = sampling_supports_tools
       # Roots (MCP 2025-06-18)
       @roots = normalize_roots(roots)
       # Register default and user-defined notification handlers on each server
@@ -76,9 +82,13 @@ module MCPClient
         # The client always implements the roots feature (roots/list and
         # list_changed notifications), independent of the current roots list.
         server.on_roots_list_request(&method(:handle_roots_list_request)) if server.respond_to?(:on_roots_list_request)
-        if @sampling_handler && server.respond_to?(:on_sampling_request)
-          server.on_sampling_request(&method(:handle_sampling_request))
-        end
+        next unless @sampling_handler && server.respond_to?(:on_sampling_request)
+
+        server.on_sampling_request(&method(:handle_sampling_request))
+        # Declare the sampling.tools sub-capability (SEP-1577) only when the
+        # host opted in; the transport derives its initialize declaration
+        # from this before connecting.
+        server.declare_sampling_tools if @sampling_supports_tools && server.respond_to?(:declare_sampling_tools)
       end
     end
 
@@ -1147,32 +1157,44 @@ module MCPClient
     # @param params [Hash] the sampling parameters
     # @return [Hash] the sampling response (role, content, model, stopReason)
     def handle_sampling_request(_request_id, params)
-      # If no handler is configured, return an error
+      # Without a handler the sampling capability was never declared, so the
+      # request targets an unsupported method: answer -32601 (Method not
+      # found) rather than -1, which sampling.mdx § Error Handling reserves
+      # for "User rejected sampling request".
       unless @sampling_handler
-        @logger.warn('Received sampling request but no handler configured')
-        return { 'error' => { 'code' => -1, 'message' => 'Sampling not supported' } }
+        @logger.warn('Received sampling request but no sampling handler is configured')
+        return jsonrpc_error_result(-32_601, 'Sampling not supported: no sampling handler configured')
+      end
+
+      # SEP-1577 (schema.ts CreateMessageRequestParams.tools/.toolChoice):
+      # "The client MUST return an error if this field is provided but
+      # ClientCapabilities.sampling.tools is not declared." -32602 is the
+      # Invalid params code used by sampling.mdx § Error Handling.
+      if (params.key?('tools') || params.key?('toolChoice')) && !@sampling_supports_tools
+        @logger.warn('Rejecting tool-enabled sampling request: sampling.tools capability not declared')
+        return jsonrpc_error_result(-32_602,
+                                    'Invalid params: tools/toolChoice provided but the sampling.tools ' \
+                                    'capability was not declared')
       end
 
       messages = params['messages'] || []
       model_preferences = normalize_model_preferences(params['modelPreferences'])
       system_prompt = params['systemPrompt']
       max_tokens = params['maxTokens']
-      include_context = params['includeContext']
-      temperature = params['temperature']
-      stop_sequences = params['stopSequences']
-      metadata = params['metadata']
 
       begin
         # Call the user-defined handler with parameters based on arity
-        result = call_sampling_handler(messages, model_preferences, system_prompt, max_tokens,
-                                       include_context, temperature, stop_sequences, metadata)
+        result = call_sampling_handler(messages, model_preferences, system_prompt, max_tokens, params)
 
         # Validate and format response
         validate_sampling_response(result)
       rescue StandardError => e
         @logger.error("Sampling handler error: #{e.message}")
         @logger.debug(e.backtrace.join("\n"))
-        { 'error' => { 'code' => -1, 'message' => "Sampling error: #{e.message}" } }
+        # A handler exception is an internal client failure (-32603), not a
+        # user rejection: sampling.mdx § Error Handling reserves -1 for
+        # "User rejected sampling request".
+        jsonrpc_error_result(-32_603, "Sampling error: #{e.message}")
       end
     end
 
@@ -1181,13 +1203,12 @@ module MCPClient
     # @param model_preferences [Hash, nil] normalized model preferences
     # @param system_prompt [String, nil] system prompt
     # @param max_tokens [Integer, nil] max tokens
-    # @param include_context [String, nil] context inclusion setting
-    # @param temperature [Float, nil] temperature
-    # @param stop_sequences [Array, nil] stop sequences
-    # @param metadata [Hash, nil] metadata
+    # @param params [Hash] the complete sampling/createMessage request params;
+    #   arity-5+ handlers receive this hash verbatim as their fifth argument,
+    #   so they can read includeContext, temperature, stopSequences, metadata,
+    #   the SEP-1577 tools/toolChoice fields, _meta, and any future params
     # @return [Hash] the handler result
-    def call_sampling_handler(messages, model_preferences, system_prompt, max_tokens,
-                              include_context, temperature, stop_sequences, metadata)
+    def call_sampling_handler(messages, model_preferences, system_prompt, max_tokens, params)
       arity = @sampling_handler.arity
       # Normalize negative arity (optional params) to minimum required args
       arity = -(arity + 1) if arity.negative?
@@ -1203,9 +1224,7 @@ module MCPClient
       when 4
         @sampling_handler.call(messages, model_preferences, system_prompt, max_tokens)
       else
-        @sampling_handler.call(messages, model_preferences, system_prompt, max_tokens,
-                               { 'includeContext' => include_context, 'temperature' => temperature,
-                                 'stopSequences' => stop_sequences, 'metadata' => metadata })
+        @sampling_handler.call(messages, model_preferences, system_prompt, max_tokens, params)
       end
     end
 
@@ -1243,7 +1262,11 @@ module MCPClient
     # @param result [Hash] the result from the sampling handler
     # @return [Hash] validated sampling response
     def validate_sampling_response(result)
-      return { 'error' => { 'code' => -1, 'message' => 'Sampling rejected' } } if result.nil?
+      # A nil handler result is the host's rejection signal; -1 is the code
+      # sampling.mdx § Error Handling assigns to "User rejected sampling
+      # request" (internal failures use -32603 instead, see
+      # handle_sampling_request).
+      return jsonrpc_error_result(-1, 'Sampling rejected') if result.nil?
 
       # Convert symbol keys to string keys
       result = result.transform_keys(&:to_s) if result.is_a?(Hash) && result.keys.first.is_a?(Symbol)
@@ -1258,15 +1281,27 @@ module MCPClient
         }
       end
 
-      # Set defaults for missing fields
+      # Set defaults for missing fields. ToolUseContent blocks (SEP-1577) are
+      # passed through verbatim; when the handler omits stopReason for them,
+      # default to "toolUse" per the CreateMessageResult stopReason values.
       result['role'] ||= 'assistant'
       result['model'] ||= 'unknown'
-      result['stopReason'] ||= 'endTurn'
+      result['stopReason'] ||= tool_use_content?(result['content']) ? 'toolUse' : 'endTurn'
 
       # Normalize content if it's a string
       result['content'] = { 'type' => 'text', 'text' => result['content'] } if result['content'].is_a?(String)
 
       result
+    end
+
+    # Whether sampling response content contains ToolUseContent blocks (MCP 2025-11-25 / SEP-1577)
+    # @param content [Object] the content field of a CreateMessageResult
+    # @return [Boolean] true when any content block has type "tool_use"
+    def tool_use_content?(content)
+      blocks = content.is_a?(Array) ? content : [content]
+      blocks.any? do |block|
+        block.is_a?(Hash) && (block['type'] == 'tool_use' || block[:type] == 'tool_use')
+      end
     end
   end
 end
