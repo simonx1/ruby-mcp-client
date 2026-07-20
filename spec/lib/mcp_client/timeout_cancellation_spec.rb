@@ -51,6 +51,21 @@ RSpec.describe 'Request timeouts and cancellation (MCP 2025-11-25)' do
       expect(cancelled).to be_nil
     end
 
+    it 'does not send a cancellation for a timed-out task-augmented request' do
+      expect { server.rpc_request('tools/call', { 'name' => 't', 'task' => { 'ttl' => 60_000 } }) }
+        .to raise_error(MCPClient::Errors::RequestTimeoutError)
+
+      cancelled = stdin_lines.map { |l| JSON.parse(l) }.find { |m| m['method'] == 'notifications/cancelled' }
+      expect(cancelled).to be_nil
+    end
+
+    it 'does not send a cancellation for a timed-out initialize sent via rpc_request' do
+      expect { server.rpc_request('initialize', {}) }.to raise_error(MCPClient::Errors::RequestTimeoutError)
+
+      cancelled = stdin_lines.map { |l| JSON.parse(l) }.find { |m| m['method'] == 'notifications/cancelled' }
+      expect(cancelled).to be_nil
+    end
+
     it 'honors a per-request timeout override' do
       expect(server).to receive(:wait_response).with(1, timeout: 7).and_return({ 'result' => {} })
 

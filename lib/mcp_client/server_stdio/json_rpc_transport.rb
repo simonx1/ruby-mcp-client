@@ -124,7 +124,7 @@ module MCPClient
           rescue MCPClient::Errors::RequestTimeoutError
             # MCP lifecycle: on timeout the sender SHOULD issue a cancellation
             # notification for the abandoned request and stop waiting.
-            send_cancellation_notification(req_id)
+            send_cancellation_notification(req_id) if cancellable_request?(method, params)
             raise
           end
           process_jsonrpc_response(res)

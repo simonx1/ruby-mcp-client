@@ -47,6 +47,19 @@ module MCPClient
       rpc_request('ping')
     end
 
+    # Whether automatic notifications/cancelled on timeout is appropriate
+    # for this request: never for initialize (MUST NOT be cancelled), and
+    # never for task-augmented requests (tasks use tasks/cancel instead).
+    # @param method [String] JSON-RPC method
+    # @param params [Hash] request params
+    # @return [Boolean]
+    def cancellable_request?(method, params)
+      return false if method == 'initialize'
+      return false if params.is_a?(Hash) && (params.key?('task') || params.key?(:task))
+
+      true
+    end
+
     # Build a JSON-RPC request object
     # @param method [String] JSON-RPC method name
     # @param params [Hash] parameters for the request
