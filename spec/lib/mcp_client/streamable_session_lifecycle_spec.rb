@@ -187,6 +187,48 @@ RSpec.describe 'Streamable HTTP session lifecycle (MCP 2025-11-25)' do
       expect(server.instance_variable_get(:@session_id)).to eq('sess-2')
     end
 
+    it 'does not re-initialize when a 404 races a restart completed by another caller' do
+      init_count = 0
+      stub_request(:post, "#{base_url}#{endpoint}")
+        .with(body: hash_including('method' => 'initialize'))
+        .to_return do |_request|
+          init_count += 1
+          { status: 200, body: init_body,
+            headers: { 'Content-Type' => 'text/event-stream', 'Mcp-Session-Id' => "sess-#{init_count}" } }
+        end
+      stub_request(:post, "#{base_url}#{endpoint}")
+        .with(body: hash_including('method' => 'notifications/initialized'))
+        .to_return(status: 202, body: '')
+      stub_request(:get, "#{base_url}#{endpoint}").to_return(status: 200, body: '')
+
+      list_requests = []
+      stub_request(:post, "#{base_url}#{endpoint}")
+        .with(body: hash_including('method' => 'tools/list'))
+        .to_return do |request|
+          list_requests << request
+          if list_requests.size == 1
+            # Simulate the race: this request was sent under sess-1, but while
+            # its 404 travels back another caller completes a restart, so by
+            # 404-handling time the transport already holds fresh sess-2.
+            server.instance_variable_set(:@session_id, 'sess-2')
+            { status: 404, body: '' }
+          else
+            { status: 200, body: tools_body, headers: { 'Content-Type' => 'text/event-stream' } }
+          end
+        end
+
+      server.connect
+      expect(server.rpc_request('tools/list', {})).to eq({ 'tools' => [] })
+
+      # The expired id is the one the 404'd request was sent with (sess-1),
+      # not the fresh @session_id (sess-2) — so recovery must resend against
+      # sess-2 without performing a second initialize.
+      expect(init_count).to eq(1)
+      expect(list_requests.size).to eq(2)
+      expect(list_requests.first.headers['Mcp-Session-Id']).to eq('sess-1')
+      expect(list_requests.last.headers['Mcp-Session-Id']).to eq('sess-2')
+    end
+
     it 'does not loop when the resent request also gets 404' do
       stub_request(:post, "#{base_url}#{endpoint}")
         .with(body: hash_including('method' => 'initialize'))

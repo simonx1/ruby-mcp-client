@@ -175,6 +175,12 @@ module MCPClient
     # @raise [MCPClient::Errors::ConnectionError] if connection fails
     def send_http_request(request)
       conn = http_connection
+      # Capture the session id this request goes out with — the value
+      # apply_request_headers attaches — so a later 404 is attributed to the
+      # id that actually accompanied the request, not to whatever @session_id
+      # holds by 404-handling time (another caller may have completed a
+      # restart in between, and its fresh session must not be re-initialized).
+      sent_session_id = @mutex.synchronize { @session_id }
 
       begin
         response = conn.post(@endpoint) do |req|
@@ -185,8 +191,8 @@ module MCPClient
         # MCP 2025-11-25 session management: HTTP 404 for a request carrying
         # Mcp-Session-Id means the session expired — the client MUST start a
         # new session with a fresh InitializeRequest (without a session ID).
-        if response.status == 404 && (expired_session = expired_session_for_restart)
-          return restart_session_and_resend(request, expired_session)
+        if response.status == 404 && session_restart_applicable?(sent_session_id)
+          return restart_session_and_resend(request, sent_session_id)
         end
 
         handle_http_error_response(response) unless response.success?
@@ -199,9 +205,7 @@ module MCPClient
       rescue Faraday::ResourceNotFound => e
         # User-configured raise_error middleware surfaces 404 as an exception;
         # apply the same session-expiry recovery as the response path.
-        if (expired_session = expired_session_for_restart)
-          return restart_session_and_resend(request, expired_session)
-        end
+        return restart_session_and_resend(request, sent_session_id) if session_restart_applicable?(sent_session_id)
 
         raise MCPClient::Errors::ServerError, "Client error: HTTP 404 #{e.message}"
       rescue Faraday::ConnectionFailed => e
@@ -215,7 +219,7 @@ module MCPClient
     # resend the original request once. The @restarting_session flag prevents
     # a second restart if the fresh session also answers 404.
     # @param request [Hash] the JSON-RPC request that hit the expired session
-    # @param expired_session_id [String] the session id that received the 404
+    # @param expired_session_id [String] the session id the 404'd request was sent with
     # @return [Faraday::Response] the response to the resent request
     def restart_session_and_resend(request, expired_session_id)
       # Serialized on the transport monitor so concurrent 404s trigger a
@@ -238,12 +242,15 @@ module MCPClient
       end
     end
 
-    # Capture the session id a 404 was observed against, or nil when session
-    # restart is not applicable. Taken under the monitor so the restart can
-    # later recheck it and detect a restart completed by another caller.
-    # @return [String, nil] the expired session id, or nil if no restart applies
-    def expired_session_for_restart
-      @mutex.synchronize { @restarting_session ? nil : @session_id }
+    # Whether a 404 should trigger a session restart: only when the 404'd
+    # request was actually sent with a session id and no restart is already
+    # in flight (a restart's own resend answering 404 must not loop).
+    # @param sent_session_id [String, nil] session id captured when the request was sent
+    # @return [Boolean] true if session restart recovery applies
+    def session_restart_applicable?(sent_session_id)
+      return false if sent_session_id.nil?
+
+      @mutex.synchronize { !@restarting_session }
     end
 
     # Apply headers to the HTTP request (can be overridden by subclasses)
