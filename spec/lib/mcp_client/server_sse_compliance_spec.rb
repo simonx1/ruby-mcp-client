@@ -246,6 +246,26 @@ RSpec.describe MCPClient::ServerSSE do
       expect(server.instance_variable_get(:@connection_established)).to be_falsey
     end
 
+    it 'surfaces an invalid endpoint promptly via wait_for_connection instead of timing out' do
+      server = MCPClient::ServerSSE.new(base_url: 'https://example.com/sse')
+
+      # In the real connection path the SSE worker thread swallows the
+      # TransportError with a generic rescue, so the failure must also be
+      # recorded for the connect caller blocked in wait_for_connection.
+      begin
+        server.send(:handle_endpoint_event, 'http://[invalid uri')
+      rescue MCPClient::Errors::TransportError
+        # Swallowed, mirroring the worker thread's generic rescue.
+      end
+
+      started = Time.now
+      expect do
+        server.send(:wait_for_connection, timeout: 5)
+      end.to raise_error(MCPClient::Errors::ConnectionError,
+                         %r{Invalid endpoint URI in SSE endpoint event: "http://\[invalid uri"})
+      expect(Time.now - started).to be < 2
+    end
+
     it 'clears the negotiated protocol version on cleanup' do
       server = MCPClient::ServerSSE.new(base_url: 'https://example.com/sse')
       server.instance_variable_set(:@protocol_version, '2025-06-18')

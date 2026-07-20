@@ -101,6 +101,9 @@ module MCPClient
       # (sent as the MCP-Protocol-Version header on post-initialize requests)
       @protocol_version = nil
       @auth_error = nil
+      # Non-auth connection failure cause (e.g. invalid endpoint event URI)
+      # recorded by the SSE worker for wait_for_connection to surface
+      @connection_error = nil
       # Whether to use SSE transport; may disable if handshake fails
       @use_sse = true
 
@@ -372,6 +375,8 @@ module MCPClient
       begin
         # Don't reset auth error if it's pre-existing
         @mutex.synchronize { @auth_error = nil } unless pre_existing_auth_error
+        # Clear any stale connection failure cause from a previous attempt
+        @mutex.synchronize { @connection_error = nil }
 
         start_sse_thread
         effective_timeout = [@read_timeout || 30, 30].min

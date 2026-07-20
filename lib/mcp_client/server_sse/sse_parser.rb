@@ -166,8 +166,16 @@ module MCPClient
         # URI must fail the handshake rather than deferring a broken POST
         # target to the first request.
         @logger.error("Failed to resolve endpoint URI #{data.inspect} against #{@base_url}: #{e.message}")
-        raise MCPClient::Errors::TransportError,
-              "Invalid endpoint URI in SSE endpoint event: #{data.inspect} (#{e.message})"
+        message = "Invalid endpoint URI in SSE endpoint event: #{data.inspect} (#{e.message})"
+        # The SSE worker thread swallows this exception with a generic rescue,
+        # so also record the failure cause (mirroring @auth_error) for the
+        # connect caller blocked in wait_for_connection to surface promptly.
+        @mutex.synchronize do
+          @connection_error = message
+          @connection_established = false
+          @connection_cv.broadcast
+        end
+        raise MCPClient::Errors::TransportError, message
       end
     end
   end
