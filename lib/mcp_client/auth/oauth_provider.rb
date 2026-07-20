@@ -147,13 +147,18 @@ module MCPClient
         return nil unless www_authenticate
 
         # MCP 2025-11-25: "Clients MUST treat the scopes provided in the
-        # challenge as authoritative for satisfying the current request."
-        if (challenge_scope = extract_challenge_param(www_authenticate, 'scope'))
-          @challenge_scope = challenge_scope
-        end
+        # challenge as authoritative for satisfying the current request" —
+        # including resetting a previously challenged scope when the current
+        # challenge carries none.
+        @challenge_scope = extract_challenge_param(www_authenticate, 'scope')
 
         url = extract_resource_metadata_url(www_authenticate)
         return nil unless url
+
+        # Remember the advertised URL even if the fetch below fails, so a
+        # later discovery retries it instead of probing well-known URIs the
+        # challenge already superseded.
+        @challenge_metadata_url = url
 
         # This URL was explicitly advertised by the 401 challenge, so a 404 is a
         # misconfiguration to surface (strict), not a speculative miss to skip.
@@ -191,11 +196,11 @@ module MCPClient
       # @param name [String] the auth-param name
       # @return [String, nil] the parameter value if present
       def extract_challenge_param(header, name)
-        if (m = header.match(/#{Regexp.escape(name)}\s*=\s*"([^"]*)"/))
+        if (m = header.match(/(?:^|[\s,])#{Regexp.escape(name)}\s*=\s*"([^"]*)"/i))
           return m[1]
         end
 
-        header.match(/#{Regexp.escape(name)}\s*=\s*([^,\s]+)/)&.captures&.first
+        header.match(/(?:^|[\s,])#{Regexp.escape(name)}\s*=\s*([^,\s]+)/i)&.captures&.first
       end
 
       # Scope requested by the most recent WWW-Authenticate challenge.
@@ -212,8 +217,13 @@ module MCPClient
       # @return [String, nil]
       def resolved_scope
         return @challenge_scope if @challenge_scope && !@challenge_scope.empty?
-        return supported_scopes.join(' ') if scope == :all
-        return scope if scope
+
+        if scope == :all
+          all_scopes = supported_scopes
+          return all_scopes.join(' ') unless all_scopes.empty?
+        elsif scope
+          return scope
+        end
 
         prm = @challenge_resource_metadata || @resource_metadata
         prm_scopes = prm&.scopes_supported
@@ -416,8 +426,9 @@ module MCPClient
         # once PRM IS found it is authoritative: any subsequent failure must be a
         # hard error, never a silent fallback to an authorization server the PRM
         # did not advertise.
+        candidate_urls = ([@challenge_metadata_url] + protected_resource_metadata_urls(server_url)).compact.uniq
         resource_metadata = @challenge_resource_metadata ||
-                            fetch_first_resource_metadata(protected_resource_metadata_urls(server_url))
+                            fetch_first_resource_metadata(candidate_urls)
         return nil unless resource_metadata
 
         validate_resource_matches!(resource_metadata)

@@ -126,6 +126,80 @@ RSpec.describe 'OAuth challenge handling (MCP 2025-11-25)' do
     end
   end
 
+  describe 'exception-path (raise_error middleware) parity' do
+    it 'routes Hash-shaped exception responses through the same challenge pipeline' do
+      provider = instance_double(MCPClient::Auth::OAuthProvider)
+      allow(provider).to receive(:handle_unauthorized_response)
+
+      server = MCPClient::ServerHTTP.new(base_url: base_url, endpoint: '/rpc', oauth_provider: provider)
+      error = Faraday::ForbiddenError.new(
+        nil,
+        { status: 403,
+          headers: { 'www-authenticate' =>
+            'Bearer error="insufficient_scope", scope="mcp:admin"' },
+          body: '' }
+      )
+
+      expect { server.send(:handle_auth_error, error) }.to raise_error(
+        MCPClient::Errors::InsufficientScopeError
+      ) do |e|
+        expect(e.scope).to eq('mcp:admin')
+      end
+      expect(provider).to have_received(:handle_unauthorized_response) do |response|
+        expect(response.headers['www-authenticate']).to include('insufficient_scope')
+      end
+    end
+  end
+
+  describe 'challenge parsing robustness' do
+    let(:server) { MCPClient::ServerHTTP.new(base_url: base_url, endpoint: '/rpc') }
+
+    def response_with(header, status: 403)
+      Struct.new(:status, :headers).new(status, { 'WWW-Authenticate' => header })
+    end
+
+    it 'ignores non-Bearer challenges' do
+      expect { server.send(:raise_authorization_error, response_with('Basic error="insufficient_scope"')) }
+        .to raise_error(MCPClient::Errors::ConnectionError) { |e| expect(e).not_to be_a(MCPClient::Errors::InsufficientScopeError) }
+    end
+
+    it 'does not treat a prefixed error token as insufficient_scope' do
+      expect { server.send(:raise_authorization_error, response_with('Bearer error="insufficient_scope_extra"')) }
+        .to raise_error(MCPClient::Errors::ConnectionError) { |e| expect(e).not_to be_a(MCPClient::Errors::InsufficientScopeError) }
+    end
+
+    it 'does not capture a prefixed scope parameter' do
+      header = 'Bearer error="insufficient_scope", previous_scope="wrong", scope="right"'
+      expect { server.send(:raise_authorization_error, response_with(header)) }
+        .to raise_error(MCPClient::Errors::InsufficientScopeError) { |e| expect(e.scope).to eq('right') }
+    end
+  end
+
+  describe 'challenge scope lifecycle' do
+    let(:provider) { MCPClient::Auth::OAuthProvider.new(server_url: base_url) }
+
+    it 'clears the previous challenge scope when a new challenge carries none' do
+      provider.instance_variable_set(:@challenge_scope, 'old:scope')
+      response = instance_double(Faraday::Response, headers: { 'WWW-Authenticate' => 'Bearer realm="mcp"' })
+
+      provider.handle_unauthorized_response(response)
+
+      expect(provider.challenge_scope).to be_nil
+    end
+
+    it 'falls back to PRM scopes when :all resolves to an empty AS scope list' do
+      provider.scope = :all
+      allow(provider).to receive(:supported_scopes).and_return([])
+      prm = MCPClient::Auth::ResourceMetadata.new(
+        resource: base_url, authorization_servers: ['https://auth.example.com'],
+        scopes_supported: %w[mcp:tools]
+      )
+      provider.instance_variable_set(:@resource_metadata, prm)
+
+      expect(provider.send(:resolved_scope)).to eq('mcp:tools')
+    end
+  end
+
   describe MCPClient::Auth::ResourceMetadata do
     it 'parses and round-trips scopes_supported from RFC 9728 metadata' do
       metadata = described_class.from_h(
