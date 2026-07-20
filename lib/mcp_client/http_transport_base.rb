@@ -59,6 +59,8 @@ module MCPClient
           @headers.each { |k, v| req.headers[k] = v }
           req.headers['Mcp-Session-Id'] = @session_id
           req.headers['Mcp-Protocol-Version'] = @protocol_version if @protocol_version
+          # MCP: authorization MUST be included in every HTTP request
+          @oauth_provider&.apply_authorization(req)
         end
 
         if response.success?
