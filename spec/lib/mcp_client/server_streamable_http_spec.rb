@@ -1029,7 +1029,7 @@ RSpec.describe MCPClient::ServerStreamableHTTP do
           .with(body: hash_including(method: 'initialize'))
           .to_return(
             status: 200,
-            body: "event: message\ndata: {\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{}}\n\n",
+            body: "event: message\ndata: {\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"protocolVersion\":\"#{MCPClient::PROTOCOL_VERSION}\"}}\n\n",
             headers: {
               'Mcp-Session-Id' => 'valid-streamable-session-456',
               'Content-Type' => 'text/event-stream'
@@ -1075,7 +1075,7 @@ RSpec.describe MCPClient::ServerStreamableHTTP do
           .with(body: hash_including(method: 'initialize'))
           .to_return(
             status: 200,
-            body: "event: message\ndata: {\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{}}\n\n",
+            body: "event: message\ndata: {\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"protocolVersion\":\"#{MCPClient::PROTOCOL_VERSION}\"}}\n\n",
             headers: {
               'Mcp-Session-Id' => 'invalid@session$format!',
               'Content-Type' => 'text/event-stream'
@@ -1099,7 +1099,7 @@ RSpec.describe MCPClient::ServerStreamableHTTP do
           .with(body: hash_including(method: 'initialize'))
           .to_return(
             status: 200,
-            body: "event: message\ndata: {\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{}}\n\n",
+            body: "event: message\ndata: {\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"protocolVersion\":\"#{MCPClient::PROTOCOL_VERSION}\"}}\n\n",
             headers: { 'Content-Type' => 'text/event-stream' }
           )
 
@@ -1164,7 +1164,7 @@ RSpec.describe MCPClient::ServerStreamableHTTP do
           .with(body: hash_including(method: 'initialize'))
           .to_return(
             status: 200,
-            body: "event: message\ndata: {\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{}}\n\n",
+            body: "event: message\ndata: {\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"protocolVersion\":\"#{MCPClient::PROTOCOL_VERSION}\"}}\n\n",
             headers: { 'Content-Type' => 'text/event-stream' }
           )
 
@@ -1372,7 +1372,7 @@ RSpec.describe MCPClient::ServerStreamableHTTP do
         stub_request(:post, "#{base_url}#{endpoint}")
           .to_return(
             status: 200,
-            body: "event: message\ndata: {\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{}}\n\n",
+            body: "event: message\ndata: {\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"protocolVersion\":\"#{MCPClient::PROTOCOL_VERSION}\"}}\n\n",
             headers: {
               'Mcp-Session-Id' => 'valid_session-123_abc',
               'Content-Type' => 'text/event-stream'
@@ -1387,7 +1387,7 @@ RSpec.describe MCPClient::ServerStreamableHTTP do
         stub_request(:post, "#{base_url}#{endpoint}")
           .to_return(
             status: 200,
-            body: "event: message\ndata: {\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{}}\n\n",
+            body: "event: message\ndata: {\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"protocolVersion\":\"#{MCPClient::PROTOCOL_VERSION}\"}}\n\n",
             headers: {
               'Mcp-Session-Id' => 'invalid/session@123!',
               'Content-Type' => 'text/event-stream'

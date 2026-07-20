@@ -90,6 +90,28 @@ module MCPClient
       }
     end
 
+    # Validate the protocol version the server negotiated in its initialize
+    # result. Per the MCP lifecycle, the server may answer with a different
+    # version than requested; if the client cannot support it, it MUST
+    # disconnect. Disconnects (via the transport's cleanup) and raises when
+    # the version is unsupported or absent.
+    # @param result [Hash] the initialize result
+    # @return [String] the negotiated protocol version
+    # @raise [MCPClient::Errors::ConnectionError] if the version is unsupported
+    def validate_protocol_version!(result)
+      version = result['protocolVersion']
+      return version if MCPClient::SUPPORTED_PROTOCOL_VERSIONS.include?(version)
+
+      begin
+        cleanup if respond_to?(:cleanup)
+      rescue StandardError => e
+        @logger.debug("Cleanup after protocol version mismatch failed: #{e.message}")
+      end
+      raise MCPClient::Errors::ConnectionError,
+            "Server negotiated unsupported protocol version #{version.inspect} " \
+            "(supported: #{MCPClient::SUPPORTED_PROTOCOL_VERSIONS.join(', ')}); disconnecting"
+    end
+
     # Process JSON-RPC response
     # @param response [Hash] the parsed JSON-RPC response
     # @return [Object] the result field from the response

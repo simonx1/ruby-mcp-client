@@ -137,9 +137,10 @@ module MCPClient
       result = send_jsonrpc_request(json_rpc_request)
       return unless result.is_a?(Hash)
 
+      # Disconnects if the server negotiated a version we cannot speak.
+      @protocol_version = validate_protocol_version!(result)
       @server_info = result['serverInfo']
       @capabilities = result['capabilities']
-      @protocol_version = result['protocolVersion']
     end
 
     # Send a JSON-RPC request to the server and wait for result
