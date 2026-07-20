@@ -66,7 +66,38 @@ module MCPClient
         raise MCPClient::Errors::TransportError, 'No data found in SSE response' if events.empty?
 
         responses, saw_invalid_json = route_sse_events(events)
-        select_sse_response(responses, saw_invalid_json, request_id)
+        matched = select_sse_response(responses, request_id)
+        return matched if matched
+
+        if saw_invalid_json
+          raise MCPClient::Errors::TransportError,
+                'Invalid JSON response from server: SSE stream contained no valid JSON-RPC response'
+        end
+
+        resume_or_fail(events, request_id)
+      end
+
+      # SEP-1699 polling pattern: the server MAY close the POST stream before
+      # delivering the response. When a cursor was received, resume via HTTP
+      # GET with Last-Event-ID instead of re-POSTing the (possibly
+      # non-idempotent) request.
+      # @param events [Array<Hash>] parsed SSE events
+      # @param request_id [Integer, String, nil] id of the originating request
+      # @return [Hash] the replayed JSON-RPC response
+      # @raise [MCPClient::Errors::ServerError] when resumption fails
+      # @raise [MCPClient::Errors::TransportError] when no cursor was received
+      def resume_or_fail(events, request_id)
+        if request_id && events.any? { |e| e[:id] && !e[:id].empty? }
+          resumed = resume_response_via_get(request_id)
+          return resumed if resumed
+
+          # Non-retryable: the request may already be executing server-side,
+          # so a blind re-POST could run a non-idempotent operation twice.
+          raise MCPClient::Errors::ServerError,
+                'SSE stream closed before delivering the response and resumption via GET failed'
+        end
+
+        raise MCPClient::Errors::TransportError, 'No JSON-RPC response found in SSE response'
       end
 
       # Split an SSE body into events. An event without an explicit `event:`
@@ -91,6 +122,10 @@ module MCPClient
             current_event[:data_lines] << line.sub(/^data:\s*/, '').strip
           elsif line.start_with?('id:')
             current_event[:id] = line.sub(/^id:\s*/, '').strip
+          elsif line.start_with?('retry:')
+            # SEP-1699: the client MUST respect the server's retry directive
+            retry_ms = line.sub(/^retry:\s*/, '').strip.to_i
+            @sse_retry_ms = retry_ms if retry_ms.positive?
           end
         end
 
@@ -152,11 +187,9 @@ module MCPClient
 
       # Choose the JSON-RPC response answering the originating request.
       # @param responses [Array<Hash>] response candidates from the stream
-      # @param saw_invalid_json [Boolean] whether any event contained invalid JSON
       # @param request_id [Integer, String, nil] id of the originating request
-      # @return [Hash] the selected response
-      # @raise [MCPClient::Errors::TransportError] if no response is found
-      def select_sse_response(responses, saw_invalid_json, request_id)
+      # @return [Hash, nil] the selected response, if any
+      def select_sse_response(responses, request_id)
         matched = if request_id.nil?
                     responses.first
                   else
@@ -171,14 +204,7 @@ module MCPClient
           )
         end
 
-        return matched if matched
-
-        if saw_invalid_json
-          raise MCPClient::Errors::TransportError,
-                'Invalid JSON response from server: SSE stream contained no valid JSON-RPC response'
-        end
-
-        raise MCPClient::Errors::TransportError, 'No JSON-RPC response found in SSE response'
+        matched
       end
     end
   end
