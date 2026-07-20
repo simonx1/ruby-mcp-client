@@ -152,6 +152,16 @@ tool.output_schema       # JSON Schema for output
 
 result = client.call_tool('get_weather', { location: 'SF' })
 data = result['structuredContent']  # Type-safe structured data
+
+# Per MCP 2025-11-25, clients SHOULD validate structured results against the
+# tool's output schema. call_tool does this automatically for the common JSON
+# Schema keywords (type, properties, required, items, enum, numeric/string
+# bounds; the full 2020-12 vocabulary is out of scope). By default a mismatch
+# logs a warning; opt in to strict mode to raise instead:
+client = MCPClient::Client.new(
+  mcp_server_configs: [...],
+  validate_structured_content: :strict # raises MCPClient::Errors::ValidationError on mismatch
+)
 ```
 
 ### Roots
