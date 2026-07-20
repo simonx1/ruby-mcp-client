@@ -479,9 +479,13 @@ module MCPClient
     # @param params [Hash] parameters for the request
     # @param server [Integer, String, Symbol, MCPClient::ServerBase, nil] server selector
     # @return [Object] result from the JSON-RPC response
-    def send_rpc(method, params: {}, server: nil)
+    def send_rpc(method, params: {}, server: nil, timeout: nil)
       srv = select_server(server)
-      srv.rpc_request(method, params)
+      # Only pass the per-request timeout when set, so transports (and test
+      # doubles) with the two-argument signature keep working.
+      return srv.rpc_request(method, params) unless timeout
+
+      srv.rpc_request(method, params, timeout: timeout)
     end
 
     # Send a raw JSON-RPC notification to a server (no response expected)
@@ -679,6 +683,14 @@ module MCPClient
       when 'notifications/tasks/status'
         # MCP 2025-11-25: task status update (params are a flat Task)
         handle_task_status_notification(server_id, params)
+      when 'notifications/cancelled'
+        # MCP 2025-11-25 cancellation utility: the server cancelled one of its
+        # own in-flight requests (sampling/elicitation). Server-request
+        # dispatch is synchronous per transport, so by the time this arrives
+        # the handler has usually completed; receivers MAY ignore
+        # cancellations they cannot honor — log for observability.
+        logger.debug("[#{server_id}] Server cancelled request #{params&.dig('requestId')}: " \
+                     "#{params&.dig('reason') || 'no reason given'}")
       else
         # Log unknown notification types for debugging purposes
         logger.debug("[#{server_id}] Received unknown notification: #{method} - #{params}")

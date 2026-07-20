@@ -23,6 +23,10 @@ module MCPClient
         yield
       rescue MCPClient::Errors::TransientServerError, MCPClient::Errors::TransportError, IOError,
              Errno::ETIMEDOUT, Errno::ECONNRESET, Errno::EPIPE => e
+        # A timed-out request may still be executing server-side; re-sending
+        # it could run a non-idempotent operation twice. Never retry those.
+        raise if e.is_a?(MCPClient::Errors::RequestTimeoutError)
+
         attempts += 1
         if attempts <= @max_retries
           delay = @retry_backoff * (2**(attempts - 1))

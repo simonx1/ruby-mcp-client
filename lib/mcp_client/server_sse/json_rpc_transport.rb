@@ -16,14 +16,33 @@ module MCPClient
       # @raise [MCPClient::Errors::ServerError] if server returns an error
       # @raise [MCPClient::Errors::TransportError] if response isn't valid JSON
       # @raise [MCPClient::Errors::ToolCallError] for other errors during request execution
-      def rpc_request(method, params = {})
+      def rpc_request(method, params = {}, timeout: nil)
         ensure_initialized
 
         with_retry do
           request_id = @mutex.synchronize { @request_id += 1 }
           request = build_jsonrpc_request(method, params, request_id)
-          send_jsonrpc_request(request)
+          begin
+            send_jsonrpc_request(request, timeout: timeout)
+          rescue MCPClient::Errors::RequestTimeoutError
+            # MCP lifecycle: on timeout the sender SHOULD issue a cancellation
+            # notification for the abandoned request and stop waiting.
+            send_cancellation_notification(request_id)
+            raise
+          end
         end
+      end
+
+      # Best-effort notifications/cancelled for a request the client stopped
+      # waiting on. Failures are swallowed.
+      # @param request_id [Integer] id of the abandoned request
+      # @return [void]
+      def send_cancellation_notification(request_id)
+        notif = build_jsonrpc_notification('notifications/cancelled',
+                                           { 'requestId' => request_id, 'reason' => 'Request timed out' })
+        post_json_rpc_request(notif)
+      rescue StandardError => e
+        @logger.debug("Failed to send cancellation notification: #{e.message}")
       end
 
       # Send a JSON-RPC notification (no response expected)
@@ -86,7 +105,7 @@ module MCPClient
       # @raise [MCPClient::Errors::ConnectionError] if connection fails
       # @raise [MCPClient::Errors::TransportError] if response isn't valid JSON
       # @raise [MCPClient::Errors::ToolCallError] for other errors during request execution
-      def send_jsonrpc_request(request)
+      def send_jsonrpc_request(request, timeout: nil)
         @logger.debug("Sending JSON-RPC request: #{request.to_json}")
         record_activity
 
@@ -94,7 +113,7 @@ module MCPClient
           response = post_json_rpc_request(request)
 
           if @use_sse
-            wait_for_sse_result(request)
+            wait_for_sse_result(request, timeout: timeout)
           else
             parse_direct_response(response)
           end
@@ -177,10 +196,10 @@ module MCPClient
       # @param request [Hash] the original JSON-RPC request
       # @return [Hash] the result data
       # @raise [MCPClient::Errors::ConnectionError, MCPClient::Errors::ToolCallError] on errors
-      def wait_for_sse_result(request)
+      def wait_for_sse_result(request, timeout: nil)
         request_id = request['id']
         start_time = Time.now
-        timeout = @read_timeout || 10
+        timeout ||= @read_timeout || 10
 
         ensure_sse_connection_active
 
@@ -222,7 +241,7 @@ module MCPClient
           sleep 0.1
         end
 
-        raise MCPClient::Errors::ToolCallError, "Timeout waiting for SSE result for request #{request_id}"
+        raise MCPClient::Errors::RequestTimeoutError, "Timeout waiting for SSE result for request #{request_id}"
       end
 
       # Check if a result is available for the given request ID
