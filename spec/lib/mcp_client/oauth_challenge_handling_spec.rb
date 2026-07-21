@@ -368,4 +368,27 @@ RSpec.describe 'OAuth challenge handling (MCP 2025-11-25)' do
       expect(metadata.to_h[:scopes_supported]).to eq(%w[mcp:tools mcp:resources])
     end
   end
+
+  describe 'quoted-string masking in Bearer segment location' do
+    it 'does not anchor on a Bearer token embedded in a quoted value (transport)' do
+      server = MCPClient::ServerHTTP.new(base_url: base_url, endpoint: '/rpc')
+      header = 'Basic realm="prefix Bearer scope=basic:only", Bearer realm="mcp"'
+      response = Struct.new(:status, :headers).new(403, { 'WWW-Authenticate' => header })
+
+      expect { server.send(:raise_authorization_error, response) }
+        .to raise_error(MCPClient::Errors::ConnectionError) do |e|
+          expect(e).not_to be_a(MCPClient::Errors::InsufficientScopeError)
+        end
+    end
+
+    it 'does not capture scope from a quoted value preceding the real Bearer challenge (provider)' do
+      provider = MCPClient::Auth::OAuthProvider.new(server_url: base_url)
+      header = 'Basic realm="prefix Bearer scope=evil:scope", Bearer realm="mcp"'
+      response = instance_double(Faraday::Response, headers: { 'WWW-Authenticate' => header })
+
+      provider.handle_unauthorized_response(response)
+
+      expect(provider.challenge_scope).to be_nil
+    end
+  end
 end

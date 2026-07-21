@@ -325,10 +325,13 @@ module MCPClient
     def bearer_challenge_segment(header)
       return nil unless header
 
-      match = header.match(/(?:\A|[\s,])Bearer(?=[\s,]|\z)/i)
+      # Locate the Bearer scheme token only OUTSIDE quoted strings: a quoted
+      # value such as realm="prefix Bearer x" must not anchor the segment.
+      masked = header.gsub(/"(?:\\.|[^"\\])*"/) { |q| "\"#{' ' * (q.length - 2)}\"" }
+      match = masked.match(/(?:\A|[\s,])Bearer(?=[\s,]|\z)/i)
       return nil unless match
 
-      match.post_match[AUTH_PARAMS_RUN]
+      header[match.end(0)..][AUTH_PARAMS_RUN]
     end
 
     # The Bearer challenge segment carries an error auth-param that is exactly
