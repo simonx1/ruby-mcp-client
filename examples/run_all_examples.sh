@@ -377,7 +377,18 @@ if [ -n "${ZAPIER_MCP_TOKEN:-}" ]; then
 else
   skip_example "streamable_http_example.rb" "set ZAPIER_MCP_TOKEN in examples/secrets.env to run against Zapier (Authorization: Bearer). Transport also verified locally by echo_server_streamable_client.rb + test_mcp_protocol_features.rb"
 fi
-skip_example "tasks_example.rb"       "needs a task-capable remote HTTP MCP server (default https://example.com/mcp placeholder); local tasks server is stdio-only"
+# tasks_example.rb → Zapier MCP. Zapier does not (yet) implement the
+# experimental 2025-11-25 tasks capability, so against it the example
+# demonstrates the client's capability-aware degradation (TaskError /
+# CapabilityError) rather than a full task lifecycle.
+if [ -n "${ZAPIER_MCP_TOKEN:-}" ]; then
+  ZAPIER_URL="${ZAPIER_MCP_URL:-https://mcp.zapier.com/api/v1/connect}"
+  run_example "tasks_example.rb (→ Zapier)" "Tasks example completed" - -- \
+    env MCP_SERVER_URL="$ZAPIER_URL" MCP_BEARER_TOKEN="$ZAPIER_MCP_TOKEN" \
+    bundle exec ruby examples/tasks_example.rb
+else
+  skip_example "tasks_example.rb" "set ZAPIER_MCP_TOKEN in examples/secrets.env to run against Zapier; a full task lifecycle additionally needs a task-capable server (MCP_SERVER_URL)"
+fi
 
 # oauth_example.rb → walks the OAuth API; connects to Zapier for real when
 # ZAPIER_MCP_TOKEN is set (Authorization: Bearer), otherwise stays illustrative.
