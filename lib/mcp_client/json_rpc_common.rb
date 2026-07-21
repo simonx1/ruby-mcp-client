@@ -94,7 +94,11 @@ module MCPClient
         capabilities['elicitation'] = { 'form' => {}, 'url' => {} }
       end
       capabilities['roots'] = { 'listChanged' => true } if registered_callback?(:@roots_list_request_callback)
-      capabilities['sampling'] = {} if registered_callback?(:@sampling_request_callback)
+      if registered_callback?(:@sampling_request_callback)
+        # SEP-1577: servers may only send tool-enabled sampling requests when
+        # the client declares the sampling.tools sub-capability.
+        capabilities['sampling'] = sampling_tools_supported? ? { 'tools' => {} } : {}
+      end
       # NOTE: we intentionally do NOT declare a client `tasks` capability. That
       # capability marks the client as a RECEIVER of task-augmented
       # sampling/elicitation requests, which is not implemented here — this
@@ -103,10 +107,25 @@ module MCPClient
       capabilities
     end
 
+    # Opt this transport into declaring tool-use support for sampling
+    # (ClientCapabilities.sampling.tools, MCP 2025-11-25 / SEP-1577). Call
+    # before connect so the initialize request advertises it; it only takes
+    # effect when a sampling request callback is also registered, since
+    # sampling.tools is a sub-capability of sampling.
+    # @return [void]
+    def declare_sampling_tools
+      @sampling_tools_supported = true
+    end
+
     # @param ivar [Symbol] callback instance variable name
     # @return [Boolean] whether the callback is registered on this transport
     def registered_callback?(ivar)
       instance_variable_defined?(ivar) && !instance_variable_get(ivar).nil?
+    end
+
+    # @return [Boolean] whether the host opted into sampling tool use
+    def sampling_tools_supported?
+      instance_variable_defined?(:@sampling_tools_supported) && @sampling_tools_supported
     end
 
     # Process JSON-RPC response
