@@ -21,6 +21,12 @@ module MCPClient
     # Timeout in seconds for responses
     READ_TIMEOUT = 15
 
+    # Grace period in seconds allowed at each stage of the shutdown sequence
+    # (after closing stdin, then after SIGTERM) before escalating further, per
+    # MCP 2025-11-25 basic/lifecycle.mdx (Shutdown / stdio): close stdin, wait
+    # for the server to exit, send SIGTERM, then SIGKILL if it still runs.
+    SHUTDOWN_GRACE_PERIOD = 2
+
     # Chunk size (bytes) used when draining the subprocess stderr pipe
     STDERR_READ_CHUNK_SIZE = 8192
 
@@ -87,9 +93,23 @@ module MCPClient
       else
         @stdin, @stdout, @stderr, @wait_thread = Open3.popen3(@command)
       end
+      pin_pipe_encodings
       true
     rescue StandardError => e
       raise MCPClient::Errors::ConnectionError, "Failed to connect to MCP server: #{e.message}"
+    end
+
+    # Pin the subprocess pipe encodings to UTF-8 instead of inheriting the
+    # process locale (Encoding.default_external). JSON-RPC messages MUST be
+    # UTF-8 encoded (MCP 2025-11-25 basic/transports.mdx); under a non-UTF-8
+    # locale (e.g. LANG=C) a valid UTF-8 message would otherwise fail to
+    # decode and kill the reader thread. The server MAY also write UTF-8 to
+    # stderr, so that pipe is pinned as well.
+    # @return [void]
+    def pin_pipe_encodings
+      [@stdin, @stdout, @stderr].each do |io|
+        io&.set_encoding(Encoding::UTF_8)
+      end
     end
 
     # Spawn a reader thread to collect JSON-RPC responses
@@ -142,6 +162,13 @@ module MCPClient
       msg = JSON.parse(line)
       @logger.debug("Received line: #{line.chomp}")
 
+      # A JSON-parseable line that is not an object cannot be a JSON-RPC
+      # message; skip it rather than raising inside the reader thread
+      unless msg.is_a?(Hash)
+        @logger.debug("Skipping non-object JSON-RPC line: #{line.chomp}")
+        return
+      end
+
       # Dispatch JSON-RPC requests from server (has id AND method) - MCP 2025-06-18
       if msg['method'] && msg.key?('id')
         handle_server_request(msg)
@@ -169,8 +196,9 @@ module MCPClient
           @logger.debug("Discarding response for unknown or expired request id=#{id}")
         end
       end
-    rescue JSON::ParserError
-      # Skip non-JSONRPC lines in the output stream
+    rescue JSON::ParserError, EncodingError
+      # Skip non-JSONRPC or undecodable lines in the output stream so a single
+      # bad line cannot kill the reader thread
     end
 
     # List all prompts available from the MCP server
@@ -682,17 +710,17 @@ module MCPClient
 
     # Clean up the server connection
     # Closes all stdio handles and terminates any running processes and threads
+    # following the MCP 2025-11-25 stdio shutdown sequence (basic/lifecycle.mdx):
+    # close stdin, wait for the server to exit, send SIGTERM if it does not exit
+    # within a reasonable time, then SIGKILL if it still does not exit.
     # @return [void]
     def cleanup
       return unless @stdin
 
       @stdin.close unless @stdin.closed?
+      terminate_server_process
       @stdout.close unless @stdout.closed?
       @stderr.close unless @stderr.closed?
-      if @wait_thread&.alive?
-        Process.kill('TERM', @wait_thread.pid)
-        @wait_thread.join(1)
-      end
       @reader_thread&.kill
       @stderr_thread&.kill
     rescue StandardError
@@ -704,6 +732,32 @@ module MCPClient
         @awaiting.clear
       end
       @stdin = @stdout = @stderr = @wait_thread = @reader_thread = @stderr_thread = nil
+    end
+
+    # Terminate the spawned server process per the MCP 2025-11-25 stdio
+    # shutdown sequence (basic/lifecycle.mdx): stdin has already been closed,
+    # so wait for the process to exit on its own; if it does not exit within
+    # the grace period send SIGTERM, wait again, and finally send SIGKILL.
+    # @return [void]
+    def terminate_server_process
+      return unless @wait_thread
+      return if @wait_thread.join(SHUTDOWN_GRACE_PERIOD)
+
+      signal_server_process('TERM')
+      return if @wait_thread.join(SHUTDOWN_GRACE_PERIOD)
+
+      signal_server_process('KILL')
+      @wait_thread.join(SHUTDOWN_GRACE_PERIOD)
+    end
+
+    # Send a signal to the server process, tolerating a process that has
+    # already exited or cannot be signalled.
+    # @param signal [String] signal name, e.g. 'TERM' or 'KILL'
+    # @return [void]
+    def signal_server_process(signal)
+      Process.kill(signal, @wait_thread.pid)
+    rescue Errno::ESRCH, Errno::EPERM => e
+      @logger.debug("Could not send SIG#{signal} to server process: #{e.class}")
     end
   end
 end
