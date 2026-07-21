@@ -43,6 +43,33 @@ module MCPClient
       rpc_request('ping')
     end
 
+    # Split request-level _meta (RequestParams._meta, e.g. progressToken or
+    # related-task metadata) out of user-supplied tool/prompt arguments.
+    # Accepts both :_meta and '_meta' key spellings; per MCP, _meta belongs at
+    # the request params level, not inside the tool's arguments.
+    # @param arguments [Hash, nil] user-supplied arguments
+    # @return [Array(Hash, Hash|nil)] [arguments without _meta, _meta or nil]
+    def split_request_meta(arguments)
+      return [arguments, nil] unless arguments.is_a?(Hash)
+
+      meta = arguments[:_meta] || arguments['_meta']
+      return [arguments, nil] unless meta
+
+      [arguments.except(:_meta, '_meta'), meta]
+    end
+
+    # Build tools/call- or prompts/get-style params with request-level _meta
+    # hoisted out of the arguments (string keys, matching the JSON wire form).
+    # @param name [String] tool or prompt name
+    # @param arguments [Hash] user-supplied arguments (possibly carrying _meta)
+    # @return [Hash] params hash for the JSON-RPC request
+    def build_named_request_params(name, arguments)
+      args, meta = split_request_meta(arguments)
+      params = { 'name' => name, 'arguments' => args }
+      params['_meta'] = meta if meta
+      params
+    end
+
     # Build a JSON-RPC request object
     # @param method [String] JSON-RPC method name
     # @param params [Hash] parameters for the request

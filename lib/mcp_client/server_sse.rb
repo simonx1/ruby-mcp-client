@@ -157,10 +157,7 @@ module MCPClient
     # @raise [MCPClient::Errors::PromptGetError] for other errors during prompt interpolation
     # @raise [MCPClient::Errors::ConnectionError] if server is disconnected
     def get_prompt(prompt_name, parameters)
-      rpc_request('prompts/get', {
-                    name: prompt_name,
-                    arguments: parameters
-                  })
+      rpc_request('prompts/get', build_named_request_params(prompt_name, parameters))
     rescue MCPClient::Errors::ConnectionError, MCPClient::Errors::TransportError
       # Re-raise connection/transport errors directly to match test expectations
       raise
@@ -315,10 +312,7 @@ module MCPClient
     # @raise [MCPClient::Errors::ToolCallError] for other errors during tool execution
     # @raise [MCPClient::Errors::ConnectionError] if server is disconnected
     def call_tool(tool_name, parameters)
-      rpc_request('tools/call', {
-                    name: tool_name,
-                    arguments: parameters
-                  })
+      rpc_request('tools/call', build_named_request_params(tool_name, parameters))
     rescue MCPClient::Errors::ConnectionError, MCPClient::Errors::TransportError
       # Re-raise connection/transport errors directly to match test expectations
       raise
