@@ -226,7 +226,7 @@ module MCPClient
     class ServerMetadata
       attr_reader :issuer, :authorization_endpoint, :token_endpoint, :registration_endpoint,
                   :scopes_supported, :response_types_supported, :grant_types_supported,
-                  :code_challenge_methods_supported
+                  :code_challenge_methods_supported, :client_id_metadata_document_supported
 
       # @param issuer [String] Issuer identifier URL
       # @param authorization_endpoint [String] Authorization endpoint URL
@@ -236,9 +236,13 @@ module MCPClient
       # @param response_types_supported [Array<String>, nil] Supported response types
       # @param grant_types_supported [Array<String>, nil] Supported grant types
       # @param code_challenge_methods_supported [Array<String>, nil] Supported PKCE code challenge methods (RFC 8414)
+      # @param client_id_metadata_document_supported [Boolean, nil] Whether the server accepts
+      #   Client ID Metadata Document client IDs (MCP 2025-11-25 / SEP-991)
+      # rubocop:disable Metrics/ParameterLists
       def initialize(issuer:, authorization_endpoint:, token_endpoint:, registration_endpoint: nil,
                      scopes_supported: nil, response_types_supported: nil, grant_types_supported: nil,
-                     code_challenge_methods_supported: nil)
+                     code_challenge_methods_supported: nil, client_id_metadata_document_supported: nil)
+        # rubocop:enable Metrics/ParameterLists
         @issuer = issuer
         @authorization_endpoint = authorization_endpoint
         @token_endpoint = token_endpoint
@@ -247,12 +251,20 @@ module MCPClient
         @response_types_supported = response_types_supported
         @grant_types_supported = grant_types_supported
         @code_challenge_methods_supported = code_challenge_methods_supported
+        @client_id_metadata_document_supported = client_id_metadata_document_supported
       end
 
       # Check if dynamic client registration is supported
       # @return [Boolean] true if registration endpoint is available
       def supports_registration?
         !@registration_endpoint.nil?
+      end
+
+      # Check if the server accepts clients using Client ID Metadata Documents
+      # (MCP 2025-11-25 / SEP-991), i.e. HTTPS URLs as client identifiers
+      # @return [Boolean] true if client_id_metadata_document_supported is true
+      def supports_client_id_metadata_documents?
+        @client_id_metadata_document_supported == true
       end
 
       # Convert to hash
@@ -266,7 +278,8 @@ module MCPClient
           scopes_supported: @scopes_supported,
           response_types_supported: @response_types_supported,
           grant_types_supported: @grant_types_supported,
-          code_challenge_methods_supported: @code_challenge_methods_supported
+          code_challenge_methods_supported: @code_challenge_methods_supported,
+          client_id_metadata_document_supported: @client_id_metadata_document_supported
         }.compact
       end
 
@@ -283,9 +296,22 @@ module MCPClient
           response_types_supported: data[:response_types_supported] || data['response_types_supported'],
           grant_types_supported: data[:grant_types_supported] || data['grant_types_supported'],
           code_challenge_methods_supported: data[:code_challenge_methods_supported] ||
-            data['code_challenge_methods_supported']
+            data['code_challenge_methods_supported'],
+          client_id_metadata_document_supported: fetch_boolean(data, :client_id_metadata_document_supported)
         )
       end
+
+      # Fetch a possibly-false value from a hash by symbol or string key.
+      # Unlike the `||` chains above, this preserves an explicit false.
+      # @param data [Hash] Source hash
+      # @param key [Symbol] Key to fetch
+      # @return [Object, nil] The value, or nil when absent under both keys
+      def self.fetch_boolean(data, key)
+        return data[key] if data.key?(key)
+
+        data[key.to_s]
+      end
+      private_class_method :fetch_boolean
     end
 
     # Protected resource metadata for authorization server discovery
