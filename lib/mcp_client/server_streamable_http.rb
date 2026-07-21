@@ -851,6 +851,8 @@ module MCPClient
       @headers.each { |k, v| req.headers[k] = v }
       req.headers['Mcp-Session-Id'] = @session_id if @session_id
       req.headers['Mcp-Protocol-Version'] = @protocol_version if @protocol_version
+      # MCP: authorization MUST be included in every HTTP request
+      @oauth_provider&.apply_authorization(req)
       # SEP-1699: resumption is via GET with the Last-Event-ID cursor, so the
       # server can replay messages missed since the last received event.
       last_event_id = @mutex.synchronize { @last_event_id }
@@ -978,6 +980,8 @@ module MCPClient
           @headers.each { |k, v| req.headers[k] = v }
           req.headers['Mcp-Session-Id'] = @session_id if @session_id
           req.headers['Mcp-Protocol-Version'] = @protocol_version if @protocol_version
+          # MCP: authorization MUST be included in every HTTP request
+          @oauth_provider&.apply_authorization(req)
           req.body = pong_response.to_json
         end
 
@@ -1177,6 +1181,8 @@ module MCPClient
           @headers.each { |k, v| req.headers[k] = v }
           req.headers['Mcp-Session-Id'] = @session_id if @session_id
           req.headers['Mcp-Protocol-Version'] = @protocol_version if @protocol_version
+          # MCP: authorization MUST be included in every HTTP request
+          @oauth_provider&.apply_authorization(req)
           req.body = json_body
         end
 
