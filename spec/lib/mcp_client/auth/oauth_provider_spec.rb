@@ -168,9 +168,9 @@ RSpec.describe MCPClient::Auth::OAuthProvider do
         expect { oauth_provider.send(:verify_pkce_support!, metadata(['S256'])) }.not_to raise_error
       end
 
-      it 'warns but proceeds when not advertised' do
-        expect(logger).to receive(:warn).with(/omits code_challenge_methods_supported/)
-        oauth_provider.send(:verify_pkce_support!, metadata(nil))
+      it 'refuses to proceed when not advertised (MCP: absence means no PKCE support)' do
+        expect { oauth_provider.send(:verify_pkce_support!, metadata(nil)) }
+          .to raise_error(MCPClient::Errors::ConnectionError, /code_challenge_methods_supported/)
       end
     end
 
@@ -610,7 +610,8 @@ RSpec.describe MCPClient::Auth::OAuthProvider do
         authorization_endpoint: 'https://mcp.example.com/authorize',
         token_endpoint: 'https://mcp.example.com/token',
         registration_endpoint: 'https://mcp.example.com/register',
-        scopes_supported: %w[read write admin]
+        scopes_supported: %w[read write admin],
+        code_challenge_methods_supported: ['S256']
       )
     end
 
