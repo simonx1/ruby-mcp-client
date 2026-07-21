@@ -836,7 +836,10 @@ module MCPClient
     # @param tool_name [String] the tool name (for the message)
     # @raise [MCPClient::Errors::ToolCallError] if the tool requires task execution
     def reject_task_required!(tool, tool_name)
-      return unless tool.task_required?
+      # Tasks Tool-Level Negotiation rule 1: without tasks.requests.tools.call
+      # in the server capabilities, taskSupport is disregarded entirely and
+      # the tool is invoked as a plain call.
+      return unless tool.task_required? && server_supports_task_tool_call?(tool.server)
 
       raise MCPClient::Errors::ToolCallError,
             "Tool '#{tool_name}' requires task-augmented execution; call it with call_tool_as_task instead"
@@ -953,19 +956,21 @@ module MCPClient
     # @param params [Hash] the elicitation parameters
     # @return [Hash] the elicitation response
     def handle_elicitation_request(_request_id, params)
+      mode = params['mode'] || 'form'
+      # MCP 2025-11-25: requests with a mode not declared in client
+      # capabilities MUST be rejected with -32602 (Invalid params). This check
+      # precedes everything else — an undeclared mode is -32602 even when no
+      # handler is configured.
+      unless SUPPORTED_ELICITATION_MODES.include?(mode)
+        @logger.warn("Rejecting elicitation request with unsupported mode '#{mode}'")
+        return jsonrpc_error_result(-32_602, "Elicitation mode '#{mode}' is not supported")
+      end
+
       # Without a handler there is no user to interact with: answer with a
       # JSON-RPC error rather than fabricating a user "decline".
       unless @elicitation_handler
         @logger.warn('Received elicitation request but no elicitation handler is configured')
         return jsonrpc_error_result(-32_601, 'Elicitation not supported: no elicitation handler configured')
-      end
-
-      mode = params['mode'] || 'form'
-      # MCP 2025-11-25: requests with a mode not declared in client
-      # capabilities MUST be rejected with -32602 (Invalid params).
-      unless SUPPORTED_ELICITATION_MODES.include?(mode)
-        @logger.warn("Rejecting elicitation request with unsupported mode '#{mode}'")
-        return jsonrpc_error_result(-32_602, "Elicitation mode '#{mode}' is not supported")
       end
 
       message = params['message']
@@ -1048,27 +1053,19 @@ module MCPClient
     # @param params [Hash] original request params (for schema validation)
     # @return [Hash] formatted response
     def format_elicitation_response(result, params)
-      response = case result
-                 when Hash
-                   if result['action']
-                     normalised_action_response(result)
-                   elsif result[:action]
-                     {
-                       'action' => result[:action].to_s,
-                       'content' => result[:content]
-                     }.compact.then { |payload| normalised_action_response(payload) }
-                   else
-                     { 'action' => 'accept', 'content' => result }
-                   end
-                 when nil
-                   { 'action' => 'cancel' }
-                 else
-                   { 'action' => 'accept', 'content' => result }
-                 end
+      response = normalize_elicitation_result(result)
 
-      # Per the ElicitResult schema, content is only present for form mode
-      # accepts; it is omitted for out-of-band (url) mode responses.
-      response.delete('content') if (params['mode'] || 'form') == 'url'
+      # Per the ElicitResult schema, content is only present when the action
+      # is accept and the mode was form; it is omitted for decline/cancel and
+      # for out-of-band (url) mode responses.
+      response.delete('content') if response['action'] != 'accept' || (params['mode'] || 'form') == 'url'
+
+      # ElicitResult.content is an object mapping property names to primitive
+      # values — a scalar cannot be transmitted.
+      if response.key?('content') && !response['content'].is_a?(Hash)
+        @logger.warn("Elicitation handler returned non-object content (#{response['content'].class})")
+        return jsonrpc_error_result(-32_603, 'Elicitation content must be an object of primitive values')
+      end
 
       # Validate content against schema for form mode accept responses; do not
       # transmit content that violates the requestedSchema (spec SHOULD).
@@ -1079,6 +1076,26 @@ module MCPClient
       end
 
       response
+    end
+
+    # Normalize a handler's return value into a string-keyed ElicitResult
+    # shape, so mixed or symbol keys cannot bypass content handling.
+    # @param result [Object] handler result
+    # @return [Hash] normalized response with string keys
+    def normalize_elicitation_result(result)
+      case result
+      when Hash
+        action = result['action'] || result[:action]
+        return { 'action' => 'accept', 'content' => result } unless action
+
+        content = result.key?('content') || result.key?(:content) ? (result['content'] || result[:content]) : nil
+        meta = result['_meta'] || result[:_meta]
+        normalised_action_response({ 'action' => action.to_s, 'content' => content, '_meta' => meta }.compact)
+      when nil
+        { 'action' => 'cancel' }
+      else
+        { 'action' => 'accept', 'content' => result }
+      end
     end
 
     # Validate elicitation response content against the requestedSchema

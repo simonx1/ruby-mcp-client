@@ -25,7 +25,7 @@ RSpec.describe MCPClient::HttpTransportBase do
       end
 
       # Stub parse_response since it's abstract in the base module
-      def parse_response(_response)
+      def parse_response(_response, _request = nil)
         { 'result' => 'test' }
       end
 
