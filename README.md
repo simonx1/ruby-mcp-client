@@ -28,7 +28,10 @@ Built-in API conversions: `to_openai_tools()`, `to_anthropic_tools()`, `to_googl
 
 ## MCP Protocol Support
 
-Implements **MCP 2025-11-25** specification:
+Implements the **MCP 2025-11-25** specification. The client negotiates the
+protocol version during `initialize` and disconnects if the server answers
+with a revision it cannot speak (supported: `2025-11-25`, `2025-06-18`,
+`2025-03-26`, `2024-11-05`):
 
 - **Tools**: list, call, streaming, annotations (hint-style), structured outputs, title
 - **Prompts**: list, get with parameters
@@ -40,7 +43,9 @@ Implements **MCP 2025-11-25** specification:
 - **Logging**: Server log messages with level filtering
 - **Tasks**: Task-augmented `tools/call` — create with a `ttl`, poll `tasks/get`, retrieve via `tasks/result`, plus `tasks/list` and `tasks/cancel`
 - **Audio**: Audio content type support
-- **OAuth 2.1**: PKCE, server discovery, dynamic registration
+- **Progress & Cancellation**: `progressToken` plumbing with per-call callbacks; automatic `notifications/cancelled` for abandoned requests
+- **Metadata**: `icons`, `title` and `_meta` parsed on tools, prompts and resources
+- **OAuth 2.1**: PKCE (S256 required), RFC 8414/9728 discovery, dynamic registration, Client ID Metadata Documents, scope step-up challenges
 
 ## Quick Connect API (Recommended)
 
@@ -307,6 +312,9 @@ end
 A task-capable server (one advertising `tasks.requests.tools.call`) can run a tool
 whose `execution.taskSupport` is `optional` or `required` as a background task:
 the call returns immediately with a task handle, and the result is fetched later.
+Try it locally: `python3 examples/echo_server_streamable.py &` then
+`./examples/tasks_example.rb` runs the full lifecycle against a task-capable
+demo server.
 
 ```ruby
 tool = client.find_tool('long_job')
@@ -600,7 +608,9 @@ Both HTTP and Streamable HTTP transports automatically handle session-based serv
 - **Session capture**: Extracts `Mcp-Session-Id` from initialize response
 - **Session persistence**: Includes session header in subsequent requests
 - **Session termination**: Sends DELETE request during cleanup
-- **Resumability** (Streamable HTTP): Tracks event IDs for message replay
+- **Resumability** (Streamable HTTP, SEP-1699): tracks SSE event IDs and, when a
+  response stream is interrupted, resumes via GET with `Last-Event-ID` so the
+  server can replay missed messages — honoring the server's `retry:` directive
 
 No configuration required - works automatically.
 
