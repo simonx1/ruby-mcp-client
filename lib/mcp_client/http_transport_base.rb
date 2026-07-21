@@ -185,6 +185,17 @@ module MCPClient
       begin
         response = conn.post(@endpoint) do |req|
           apply_request_headers(req, request)
+          # The wire header must match the captured id exactly: a restart
+          # completing between capture and header attachment would otherwise
+          # attach a different (or fresh) session than the one attributed to
+          # this request at 404-handling time.
+          if req.headers.key?('Mcp-Session-Id')
+            if sent_session_id
+              req.headers['Mcp-Session-Id'] = sent_session_id
+            else
+              req.headers.delete('Mcp-Session-Id')
+            end
+          end
           req.body = request.to_json
         end
 

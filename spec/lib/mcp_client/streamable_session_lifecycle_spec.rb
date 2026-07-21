@@ -251,4 +251,39 @@ RSpec.describe 'Streamable HTTP session lifecycle (MCP 2025-11-25)' do
       expect(list_stub).to have_been_requested.twice
     end
   end
+
+  describe 'send-time session attribution' do
+    it 'sends exactly the captured session id even if a restart lands mid-flight' do
+      server = MCPClient::ServerStreamableHTTP.new(base_url: 'https://example.com', endpoint: '/rpc',
+                                                   retries: 0, name: 'attr-test')
+      server.instance_variable_set(:@connection_established, true)
+      server.instance_variable_set(:@initialized, true)
+      server.instance_variable_set(:@session_id, 'sess-1')
+
+      captured_headers = nil
+      conn = double('conn')
+      allow(server).to receive(:http_connection).and_return(conn)
+      allow(conn).to receive(:delete)
+        .and_return(Struct.new(:status, :headers, :body, :success?).new(200, {}, '', true))
+      allow(conn).to receive(:post) do |_endpoint, &blk|
+        req = Struct.new(:headers, :body, :options).new({}, nil, Struct.new(:timeout).new(nil))
+        # Simulate a concurrent restart completing between capture and header
+        # application: the live session changes under the request.
+        allow(server).to receive(:apply_request_headers) do |r, _request|
+          r.headers['Mcp-Session-Id'] = 'sess-2'
+        end
+        blk&.call(req)
+        captured_headers = req.headers
+        Struct.new(:status, :headers, :body, :success?).new(
+          200, { 'content-type' => 'application/json' },
+          JSON.generate(jsonrpc: '2.0', id: 1, result: {}), true
+        )
+      end
+
+      server.rpc_request('tools/list', {})
+
+      expect(captured_headers['Mcp-Session-Id']).to eq('sess-1')
+      server.cleanup
+    end
+  end
 end
