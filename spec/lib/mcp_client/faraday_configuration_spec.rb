@@ -61,7 +61,7 @@ RSpec.describe 'Faraday Configuration' do
         end
 
         # Stub abstract methods
-        def parse_response(_response)
+        def parse_response(_response, _request = nil)
           {}
         end
 

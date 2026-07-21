@@ -19,7 +19,11 @@ module MCPClient
     #   @return [String, nil] optional display title for the resource
     # @!attribute [r] size
     #   @return [Integer, nil] optional size of the resource in bytes
-    attr_reader :uri, :name, :description, :mime_type, :annotations, :title, :size
+    # @!attribute [r] icons
+    #   @return [Array<Hash>, nil] optional icons for display in user interfaces (MCP 2025-11-25, SEP-973)
+    # @!attribute [r] meta
+    #   @return [Hash, nil] optional `_meta` metadata attached to the resource link (MCP 2025-11-25)
+    attr_reader :uri, :name, :description, :mime_type, :annotations, :title, :size, :icons, :meta
 
     # Initialize a resource link
     # @param uri [String] URI of the linked resource
@@ -29,7 +33,11 @@ module MCPClient
     # @param annotations [Hash, nil] optional annotations that provide hints to clients
     # @param title [String, nil] optional display title for the resource
     # @param size [Integer, nil] optional size of the resource in bytes
-    def initialize(uri:, name:, description: nil, mime_type: nil, annotations: nil, title: nil, size: nil)
+    # @param icons [Array<Hash>, nil] optional icons for display in user interfaces (MCP 2025-11-25)
+    # @param meta [Hash, nil] optional `_meta` metadata attached to the resource link (MCP 2025-11-25)
+    # rubocop:disable Metrics/ParameterLists
+    def initialize(uri:, name:, description: nil, mime_type: nil, annotations: nil, title: nil, size: nil,
+                   icons: nil, meta: nil)
       @uri = uri
       @name = name
       @description = description
@@ -37,7 +45,10 @@ module MCPClient
       @annotations = annotations
       @title = title
       @size = size
+      @icons = icons
+      @meta = meta
     end
+    # rubocop:enable Metrics/ParameterLists
 
     # Create a ResourceLink instance from JSON data
     # @param data [Hash] JSON data from MCP server (content item with type 'resource_link')
@@ -50,7 +61,9 @@ module MCPClient
         mime_type: data['mimeType'],
         annotations: data['annotations'],
         title: data['title'],
-        size: data['size']
+        size: data['size'],
+        icons: data['icons'],
+        meta: data['_meta']
       )
     end
 
