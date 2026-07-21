@@ -35,10 +35,13 @@ module MCPClient
           raise MCPClient::Errors::ConnectionError, "Initialize failed: #{err['message']}"
         end
 
-        # Store server info and capabilities
+        # Store negotiated protocol version, server info and capabilities.
+        # Disconnects if the server negotiated a version we cannot speak.
         result = res['result'] || {}
+        @protocol_version = validate_protocol_version!(result)
         @server_info = result['serverInfo']
         @capabilities = result['capabilities']
+        @instructions = result['instructions']
 
         # Send initialized notification
         notif = build_jsonrpc_notification('notifications/initialized', {})

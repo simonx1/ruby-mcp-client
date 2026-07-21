@@ -1,11 +1,16 @@
 # frozen_string_literal: true
 
 require 'logger'
+require 'securerandom'
 
 module MCPClient
   # MCP Client for integrating with the Model Context Protocol
   # This is the main entry point for using MCP tools
   class Client
+    # Elicitation modes implemented by this client (MCP 2025-11-25).
+    # Requests with a mode outside this set are rejected with -32602.
+    SUPPORTED_ELICITATION_MODES = %w[form url].freeze
+
     # @!attribute [r] servers
     #   @return [Array<MCPClient::ServerBase>] list of servers
     # @!attribute [r] tool_cache
@@ -30,12 +35,17 @@ module MCPClient
     # @param elicitation_handler [Proc, nil] optional handler for elicitation requests (MCP 2025-06-18)
     # @param roots [Array<MCPClient::Root, Hash>, nil] optional list of roots (MCP 2025-06-18)
     # @param sampling_handler [Proc, nil] optional handler for sampling requests (MCP 2025-11-25)
+    # @param sampling_supports_tools [Boolean] whether the sampling handler supports tool use
+    #   (MCP 2025-11-25 / SEP-1577); declares the sampling.tools capability and forwards
+    #   tools/toolChoice params to the handler instead of rejecting tool-enabled requests
+    # @param client_info [Hash, nil] host-provided Implementation info sent as clientInfo
+    #   (name and version required; title, description, websiteUrl, icons optional)
     # @param validate_structured_content [Symbol] how to treat a tools/call result whose
     #   structuredContent does not match the tool's declared outputSchema (MCP 2025-11-25:
     #   "Clients SHOULD validate structured results against this schema"): :warn (default)
     #   logs a warning, :strict raises MCPClient::Errors::ValidationError
     def initialize(mcp_server_configs: [], logger: nil, elicitation_handler: nil, roots: nil, sampling_handler: nil,
-                   validate_structured_content: :warn)
+                   sampling_supports_tools: false, client_info: nil, validate_structured_content: :warn)
       unless STRUCTURED_CONTENT_MODES.include?(validate_structured_content)
         raise ArgumentError, "validate_structured_content must be one of #{STRUCTURED_CONTENT_MODES.inspect}, " \
                              "got #{validate_structured_content.inspect}"
@@ -59,6 +69,9 @@ module MCPClient
         MCPClient::ServerFactory.create(config, logger: @logger)
       end
       @tool_cache = {}
+      # Active progressToken -> callback registrations (MCP progress utility)
+      @progress_callbacks = {}
+      @progress_mutex = Mutex.new
       @prompt_cache = {}
       @resource_cache = {}
       # JSON-RPC notification listeners
@@ -67,24 +80,37 @@ module MCPClient
       @elicitation_handler = elicitation_handler
       # Sampling handler (MCP 2025-11-25)
       @sampling_handler = sampling_handler
+      # Whether the sampling handler supports tool use (SEP-1577)
+      @sampling_supports_tools = sampling_supports_tools
       # Roots (MCP 2025-06-18)
       @roots = normalize_roots(roots)
       # Register default and user-defined notification handlers on each server
       @servers.each do |server|
+        # Host-provided Implementation info for the initialize clientInfo
+        server.client_info = client_info if client_info && server.respond_to?(:client_info=)
         server.on_notification do |method, params|
           # Default notification processing (e.g., cache invalidation, logging)
           process_notification(server, method, params)
           # Invoke user-defined listeners
           @notification_listeners.each { |cb| cb.call(server, method, params) }
         end
-        # Register elicitation handler on each server
-        if server.respond_to?(:on_elicitation_request)
+        # Register feature callbacks only for features the host actually
+        # supports: transports derive their declared client capabilities from
+        # the callbacks registered before connecting, and MCP forbids using
+        # capabilities that were not negotiated.
+        if @elicitation_handler && server.respond_to?(:on_elicitation_request)
           server.on_elicitation_request(&method(:handle_elicitation_request))
         end
-        # Register roots list handler on each server (MCP 2025-06-18)
+        # The client always implements the roots feature (roots/list and
+        # list_changed notifications), independent of the current roots list.
         server.on_roots_list_request(&method(:handle_roots_list_request)) if server.respond_to?(:on_roots_list_request)
-        # Register sampling handler on each server (MCP 2025-11-25)
-        server.on_sampling_request(&method(:handle_sampling_request)) if server.respond_to?(:on_sampling_request)
+        next unless @sampling_handler && server.respond_to?(:on_sampling_request)
+
+        server.on_sampling_request(&method(:handle_sampling_request))
+        # Declare the sampling.tools sub-capability (SEP-1577) only when the
+        # host opted in; the transport derives its initialize declaration
+        # from this before connecting.
+        server.declare_sampling_tools if @sampling_supports_tools && server.respond_to?(:declare_sampling_tools)
       end
     end
 
@@ -274,34 +300,8 @@ module MCPClient
     # @param parameters [Hash] the parameters to pass to the tool
     # @param server [String, Symbol, Integer, MCPClient::ServerBase, nil] optional server to use
     # @return [Object] the result of the tool invocation
-    def call_tool(tool_name, parameters, server: nil)
-      tools = list_tools
-
-      if server
-        # Use the specified server
-        srv = select_server(server)
-        # Find the tool on this specific server
-        tool = tools.find { |t| t.name == tool_name && t.server == srv }
-        unless tool
-          raise MCPClient::Errors::ToolNotFound,
-                "Tool '#{tool_name}' not found on server '#{srv.name || srv.class.name}'"
-        end
-      else
-        # Find the tool across all servers
-        matching_tools = tools.select { |t| t.name == tool_name }
-
-        if matching_tools.empty?
-          raise MCPClient::Errors::ToolNotFound, "Tool '#{tool_name}' not found"
-        elsif matching_tools.size > 1
-          # If multiple matches, disambiguate with server names
-          server_names = matching_tools.map { |t| t.server&.name || 'unnamed' }
-          raise MCPClient::Errors::AmbiguousToolName,
-                "Multiple tools named '#{tool_name}' found across servers (#{server_names.join(', ')}). " \
-                "Please specify a server using the 'server' parameter."
-        end
-
-        tool = matching_tools.first
-      end
+    def call_tool(tool_name, parameters, server: nil, progress: nil)
+      tool = resolve_tool(tool_name, server: server)
 
       # Validate parameters against tool schema
       validate_params!(tool, parameters)
@@ -311,12 +311,21 @@ module MCPClient
       server = tool.server
       raise MCPClient::Errors::ServerNotFound, "No server found for tool '#{tool_name}'" unless server
 
+      # MCP progress utility: attach an auto-generated progressToken to the
+      # request _meta and route matching notifications/progress to the
+      # caller's callback while the request is active.
+      parameters, token = setup_progress_tracking(parameters, progress)
+
       result = begin
         server.call_tool(tool_name, parameters)
       rescue MCPClient::Errors::ConnectionError => e
         # Add server identity information to the error for better context
         server_id = server.name ? "#{server.class}[#{server.name}]" : server.class.name
         raise MCPClient::Errors::ToolCallError, "Error calling tool '#{tool_name}': #{e.message} (Server: #{server_id})"
+      ensure
+        # Tokens are only valid for the lifetime of the request: dropping the
+        # registration filters out stale post-completion notifications.
+        unregister_progress_callback(token) if token
       end
 
       validate_structured_content!(tool, result)
@@ -423,33 +432,7 @@ module MCPClient
     # @param server [String, Symbol, Integer, MCPClient::ServerBase, nil] optional server to use
     # @return [Enumerator] streaming enumerator or single-value enumerator
     def call_tool_streaming(tool_name, parameters, server: nil)
-      tools = list_tools
-
-      if server
-        # Use the specified server
-        srv = select_server(server)
-        # Find the tool on this specific server
-        tool = tools.find { |t| t.name == tool_name && t.server == srv }
-        unless tool
-          raise MCPClient::Errors::ToolNotFound,
-                "Tool '#{tool_name}' not found on server '#{srv.name || srv.class.name}'"
-        end
-      else
-        # Find the tool across all servers
-        matching_tools = tools.select { |t| t.name == tool_name }
-
-        if matching_tools.empty?
-          raise MCPClient::Errors::ToolNotFound, "Tool '#{tool_name}' not found"
-        elsif matching_tools.size > 1
-          # If multiple matches, disambiguate with server names
-          server_names = matching_tools.map { |t| t.server&.name || 'unnamed' }
-          raise MCPClient::Errors::AmbiguousToolName,
-                "Multiple tools named '#{tool_name}' found across servers (#{server_names.join(', ')}). " \
-                "Please specify a server using the 'server' parameter."
-        end
-
-        tool = matching_tools.first
-      end
+      tool = resolve_tool(tool_name, server: server)
 
       # Validate parameters against tool schema
       validate_params!(tool, parameters)
@@ -628,6 +611,8 @@ module MCPClient
     # @raise [MCPClient::Errors::TaskError] if listing fails
     def list_tasks(cursor: nil, server: nil)
       srv = select_server(server)
+      ensure_task_capability!(srv, 'list')
+
       params = cursor ? { cursor: cursor } : {}
 
       begin
@@ -648,6 +633,7 @@ module MCPClient
     # @raise [MCPClient::Errors::TaskError] if cancellation fails (including cancelling a terminal task)
     def cancel_task(task_id, server: nil)
       srv = select_server(server)
+      ensure_task_capability!(srv, 'cancel')
 
       begin
         result = srv.rpc_request('tasks/cancel', { taskId: task_id })
@@ -672,10 +658,56 @@ module MCPClient
     # @return [Array<Hash>] results from servers
     # @raise [MCPClient::Errors::ServerError] if server returns an error
     def log_level=(level)
-      @servers.map { |srv| srv.log_level = level }
+      @servers.filter_map do |srv|
+        # MCP lifecycle: only use capabilities that were successfully
+        # negotiated — skip servers whose NEGOTIATED set lacks logging.
+        # Unconnected servers proceed: the transport-level gate re-checks
+        # after its handshake establishes the capability set.
+        unless !capabilities_known?(srv) || srv.capability?('logging')
+          @logger.debug("Skipping logging/setLevel for #{srv.name || srv.class.name}: " \
+                        'logging capability not negotiated')
+          next
+        end
+
+        srv.log_level = level
+      end
     end
 
     private
+
+    # Whether the server's negotiated capability set is available yet.
+    # @param srv [MCPClient::ServerBase] the server
+    # @return [Boolean]
+    def capabilities_known?(srv)
+      srv.respond_to?(:capabilities) && !srv.capabilities.nil?
+    end
+
+    # Enforce the tasks.<operation> capability gate for a server (MCP
+    # lifecycle: "Only use capabilities that were successfully negotiated").
+    # When the negotiated capability set is not yet known, first trigger the
+    # handshake with a cheap standard request (ping) and then re-apply the
+    # gate against the freshly negotiated set, so a previously uninitialized
+    # server that negotiates no tasks capability never receives the
+    # prohibited request.
+    # @param srv [MCPClient::ServerBase] the selected server
+    # @param operation [String] the tasks sub-capability ('list' or 'cancel')
+    # @return [void]
+    # @raise [MCPClient::Errors::CapabilityError] if the negotiated set lacks the capability
+    def ensure_task_capability!(srv, operation)
+      if !capabilities_known?(srv) && srv.respond_to?(:ping)
+        begin
+          srv.ping
+        rescue MCPClient::Errors::MCPError
+          # Initialization failed; fall through and let the task request
+          # itself surface the failure via the normal error path.
+        end
+      end
+
+      return if !capabilities_known?(srv) || srv.capability?('tasks', operation)
+
+      raise MCPClient::Errors::CapabilityError,
+            "Server #{srv.name || srv.class.name} did not declare the tasks.#{operation} capability"
+    end
 
     # Process incoming JSON-RPC notifications with default handlers
     # @param server [MCPClient::ServerBase] the server that emitted the notification
@@ -702,6 +734,8 @@ module MCPClient
       when 'notifications/tasks/status'
         # MCP 2025-11-25: task status update (params are a flat Task)
         handle_task_status_notification(server_id, params)
+      when 'notifications/progress'
+        handle_progress_notification(server_id, params)
       else
         # Log unknown notification types for debugging purposes
         logger.debug("[#{server_id}] Received unknown notification: #{method} - #{params}")
@@ -712,6 +746,66 @@ module MCPClient
     # @param server_id [String] server identifier for log prefix
     # @param params [Hash] log message params (level, logger, data)
     # @return [void]
+    # Route a notifications/progress message to the callback registered for
+    # its progressToken; unknown or stale tokens are debug-logged and dropped
+    # (MCP: "Senders and receivers SHOULD track active progress tokens").
+    # @param server_id [String] identity of the emitting server (for logs)
+    # @param params [Hash, nil] notification params
+    # @return [void]
+    def handle_progress_notification(server_id, params)
+      token = params && params['progressToken']
+      callback = @progress_mutex.synchronize { @progress_callbacks[token] }
+      unless callback
+        logger.debug("[#{server_id}] Progress for unknown or completed token #{token.inspect}")
+        return
+      end
+
+      callback.call(params['progress'], params['total'], params['message'])
+    rescue StandardError => e
+      logger.warn("[#{server_id}] Progress callback error: #{e.message}")
+    end
+
+    # Attach progress tracking to an outgoing request when requested.
+    # @param parameters [Hash] user arguments
+    # @param progress [#call, nil] optional progress callback
+    # @return [Array(Hash, String|nil)] possibly-augmented parameters and token
+    def setup_progress_tracking(parameters, progress)
+      return [parameters, nil] unless progress
+
+      token = generate_progress_token
+      register_progress_callback(token, progress)
+      [attach_progress_token(parameters, token), token]
+    end
+
+    # @return [String] a unique progress token for an outgoing request
+    def generate_progress_token
+      "rb-mcp-#{SecureRandom.hex(8)}"
+    end
+
+    # @param parameters [Hash] user arguments (not mutated)
+    # @param token [String] progress token
+    # @return [Hash] parameters with _meta.progressToken merged in
+    def attach_progress_token(parameters, token)
+      params = parameters.dup
+      meta = (params['_meta'] || params[:_meta] || {}).merge('progressToken' => token)
+      params.delete(:_meta)
+      params['_meta'] = meta
+      params
+    end
+
+    # @param token [String] progress token
+    # @param callback [#call] receives (progress, total, message)
+    # @return [void]
+    def register_progress_callback(token, callback)
+      @progress_mutex.synchronize { @progress_callbacks[token] = callback }
+    end
+
+    # @param token [String] progress token
+    # @return [void]
+    def unregister_progress_callback(token)
+      @progress_mutex.synchronize { @progress_callbacks.delete(token) }
+    end
+
     def handle_log_message(server_id, params)
       level = params['level'] || 'info'
       logger_name = params['logger']
@@ -907,7 +1001,10 @@ module MCPClient
     # @param tool_name [String] the tool name (for the message)
     # @raise [MCPClient::Errors::ToolCallError] if the tool requires task execution
     def reject_task_required!(tool, tool_name)
-      return unless tool.task_required?
+      # Tasks Tool-Level Negotiation rule 1: without tasks.requests.tools.call
+      # in the server capabilities, taskSupport is disregarded entirely and
+      # the tool is invoked as a plain call.
+      return unless tool.task_required? && server_supports_task_tool_call?(tool.server)
 
       raise MCPClient::Errors::ToolCallError,
             "Tool '#{tool_name}' requires task-augmented execution; call it with call_tool_as_task instead"
@@ -1024,13 +1121,23 @@ module MCPClient
     # @param params [Hash] the elicitation parameters
     # @return [Hash] the elicitation response
     def handle_elicitation_request(_request_id, params)
-      # If no handler is configured, decline the request
-      unless @elicitation_handler
-        @logger.warn('Received elicitation request but no handler configured, declining')
-        return { 'action' => 'decline' }
+      mode = params['mode'] || 'form'
+      # MCP 2025-11-25: requests with a mode not declared in client
+      # capabilities MUST be rejected with -32602 (Invalid params). This check
+      # precedes everything else — an undeclared mode is -32602 even when no
+      # handler is configured.
+      unless SUPPORTED_ELICITATION_MODES.include?(mode)
+        @logger.warn("Rejecting elicitation request with unsupported mode '#{mode}'")
+        return jsonrpc_error_result(-32_602, "Elicitation mode '#{mode}' is not supported")
       end
 
-      mode = params['mode'] || 'form'
+      # Without a handler there is no user to interact with: answer with a
+      # JSON-RPC error rather than fabricating a user "decline".
+      unless @elicitation_handler
+        @logger.warn('Received elicitation request but no elicitation handler is configured')
+        return jsonrpc_error_result(-32_601, 'Elicitation not supported: no elicitation handler configured')
+      end
+
       message = params['message']
 
       begin
@@ -1044,8 +1151,17 @@ module MCPClient
       rescue StandardError => e
         @logger.error("Elicitation handler error: #{e.message}")
         @logger.debug(e.backtrace.join("\n"))
-        { 'action' => 'decline' }
+        jsonrpc_error_result(-32_603, "Elicitation handler error: #{e.message}")
       end
+    end
+
+    # Build an error-shaped handler result that transports turn into a
+    # JSON-RPC error response (mirroring the sampling error path).
+    # @param code [Integer] JSON-RPC error code
+    # @param message [String] error message
+    # @return [Hash] error result
+    def jsonrpc_error_result(code, message)
+      { 'error' => { 'code' => code, 'message' => message } }
     end
 
     # Handle form mode elicitation (MCP 2025-11-25)
@@ -1102,47 +1218,65 @@ module MCPClient
     # @param params [Hash] original request params (for schema validation)
     # @return [Hash] formatted response
     def format_elicitation_response(result, params)
-      response = case result
-                 when Hash
-                   if result['action']
-                     normalised_action_response(result)
-                   elsif result[:action]
-                     {
-                       'action' => result[:action].to_s,
-                       'content' => result[:content]
-                     }.compact.then { |payload| normalised_action_response(payload) }
-                   else
-                     { 'action' => 'accept', 'content' => result }
-                   end
-                 when nil
-                   { 'action' => 'cancel' }
-                 else
-                   { 'action' => 'accept', 'content' => result }
-                 end
+      response = normalize_elicitation_result(result)
 
-      # Validate content against schema for form mode accept responses
-      validate_elicitation_content(response, params)
+      # Per the ElicitResult schema, content is only present when the action
+      # is accept and the mode was form; it is omitted for decline/cancel and
+      # for out-of-band (url) mode responses.
+      response.delete('content') if response['action'] != 'accept' || (params['mode'] || 'form') == 'url'
+
+      # ElicitResult.content is an object mapping property names to primitive
+      # values — a scalar cannot be transmitted.
+      if response.key?('content') && !response['content'].is_a?(Hash)
+        @logger.warn("Elicitation handler returned non-object content (#{response['content'].class})")
+        return jsonrpc_error_result(-32_603, 'Elicitation content must be an object of primitive values')
+      end
+
+      # Validate content against schema for form mode accept responses; do not
+      # transmit content that violates the requestedSchema (spec SHOULD).
+      errors = validate_elicitation_content(response, params)
+      unless errors.empty?
+        @logger.warn("Elicitation content validation failed: #{errors.join('; ')}")
+        return jsonrpc_error_result(-32_603, "Elicitation content failed schema validation: #{errors.join('; ')}")
+      end
 
       response
+    end
+
+    # Normalize a handler's return value into a string-keyed ElicitResult
+    # shape, so mixed or symbol keys cannot bypass content handling.
+    # @param result [Object] handler result
+    # @return [Hash] normalized response with string keys
+    def normalize_elicitation_result(result)
+      case result
+      when Hash
+        action = result['action'] || result[:action]
+        return { 'action' => 'accept', 'content' => result } unless action
+
+        content = result.key?('content') || result.key?(:content) ? (result['content'] || result[:content]) : nil
+        meta = result['_meta'] || result[:_meta]
+        normalised_action_response({ 'action' => action.to_s, 'content' => content, '_meta' => meta }.compact)
+      when nil
+        { 'action' => 'cancel' }
+      else
+        { 'action' => 'accept', 'content' => result }
+      end
     end
 
     # Validate elicitation response content against the requestedSchema
     # @param response [Hash] the formatted response
     # @param params [Hash] original request params
-    # @return [void]
+    # @return [Array<String>] validation errors (empty when conforming or not applicable)
     def validate_elicitation_content(response, params)
-      return unless response['action'] == 'accept' && response['content'].is_a?(Hash)
+      return [] unless response['action'] == 'accept' && response['content'].is_a?(Hash)
 
       mode = params['mode'] || 'form'
-      return unless mode == 'form'
+      return [] unless mode == 'form'
 
       schema = params['requestedSchema'] || params['schema']
-      return unless schema.is_a?(Hash)
+      return [] unless schema.is_a?(Hash)
 
-      errors = ElicitationValidator.validate_content(response['content'], schema)
-      return if errors.empty?
-
-      @logger.warn("Elicitation content validation warnings: #{errors.join('; ')}")
+      ElicitationValidator.validate_content(response['content'], schema)
     end
 
     # Ensure the action value conforms to MCP spec (accept, decline, cancel)
@@ -1185,10 +1319,18 @@ module MCPClient
     # @return [void]
     def notify_roots_changed
       @servers.each do |server|
-        server.rpc_notify('notifications/roots/list_changed', {})
-      rescue StandardError => e
-        server_id = server.name ? "#{server.class}[#{server.name}]" : server.class
-        @logger.warn("[#{server_id}] Failed to send roots/list_changed notification: #{e.message}")
+        # Only notify sessions where the roots capability could be declared:
+        # MCP forbids using capabilities that were not negotiated, and
+        # transports without a server-request channel (plain HTTP) never
+        # declare roots.
+        next unless server.respond_to?(:on_roots_list_request)
+
+        begin
+          server.rpc_notify('notifications/roots/list_changed', {})
+        rescue StandardError => e
+          server_id = server.name ? "#{server.class}[#{server.name}]" : server.class
+          @logger.warn("[#{server_id}] Failed to send roots/list_changed notification: #{e.message}")
+        end
       end
     end
 
@@ -1197,32 +1339,44 @@ module MCPClient
     # @param params [Hash] the sampling parameters
     # @return [Hash] the sampling response (role, content, model, stopReason)
     def handle_sampling_request(_request_id, params)
-      # If no handler is configured, return an error
+      # Without a handler the sampling capability was never declared, so the
+      # request targets an unsupported method: answer -32601 (Method not
+      # found) rather than -1, which sampling.mdx § Error Handling reserves
+      # for "User rejected sampling request".
       unless @sampling_handler
-        @logger.warn('Received sampling request but no handler configured')
-        return { 'error' => { 'code' => -1, 'message' => 'Sampling not supported' } }
+        @logger.warn('Received sampling request but no sampling handler is configured')
+        return jsonrpc_error_result(-32_601, 'Sampling not supported: no sampling handler configured')
+      end
+
+      # SEP-1577 (schema.ts CreateMessageRequestParams.tools/.toolChoice):
+      # "The client MUST return an error if this field is provided but
+      # ClientCapabilities.sampling.tools is not declared." -32602 is the
+      # Invalid params code used by sampling.mdx § Error Handling.
+      if (params.key?('tools') || params.key?('toolChoice')) && !@sampling_supports_tools
+        @logger.warn('Rejecting tool-enabled sampling request: sampling.tools capability not declared')
+        return jsonrpc_error_result(-32_602,
+                                    'Invalid params: tools/toolChoice provided but the sampling.tools ' \
+                                    'capability was not declared')
       end
 
       messages = params['messages'] || []
       model_preferences = normalize_model_preferences(params['modelPreferences'])
       system_prompt = params['systemPrompt']
       max_tokens = params['maxTokens']
-      include_context = params['includeContext']
-      temperature = params['temperature']
-      stop_sequences = params['stopSequences']
-      metadata = params['metadata']
 
       begin
         # Call the user-defined handler with parameters based on arity
-        result = call_sampling_handler(messages, model_preferences, system_prompt, max_tokens,
-                                       include_context, temperature, stop_sequences, metadata)
+        result = call_sampling_handler(messages, model_preferences, system_prompt, max_tokens, params)
 
         # Validate and format response
         validate_sampling_response(result)
       rescue StandardError => e
         @logger.error("Sampling handler error: #{e.message}")
         @logger.debug(e.backtrace.join("\n"))
-        { 'error' => { 'code' => -1, 'message' => "Sampling error: #{e.message}" } }
+        # A handler exception is an internal client failure (-32603), not a
+        # user rejection: sampling.mdx § Error Handling reserves -1 for
+        # "User rejected sampling request".
+        jsonrpc_error_result(-32_603, "Sampling error: #{e.message}")
       end
     end
 
@@ -1231,32 +1385,38 @@ module MCPClient
     # @param model_preferences [Hash, nil] normalized model preferences
     # @param system_prompt [String, nil] system prompt
     # @param max_tokens [Integer, nil] max tokens
-    # @param include_context [String, nil] context inclusion setting
-    # @param temperature [Float, nil] temperature
-    # @param stop_sequences [Array, nil] stop sequences
-    # @param metadata [Hash, nil] metadata
+    # @param params [Hash] the complete sampling/createMessage request params;
+    #   handlers whose fifth parameter is required, optional, or part of a
+    #   rest argument receive this hash verbatim, so they can read
+    #   includeContext, temperature, stopSequences, metadata, the SEP-1577
+    #   tools/toolChoice fields, _meta, and any future params
     # @return [Hash] the handler result
-    def call_sampling_handler(messages, model_preferences, system_prompt, max_tokens,
-                              include_context, temperature, stop_sequences, metadata)
-      arity = @sampling_handler.arity
-      # Normalize negative arity (optional params) to minimum required args
-      arity = -(arity + 1) if arity.negative?
-      case arity
-      when 0
-        @sampling_handler.call
-      when 1
-        @sampling_handler.call(messages)
-      when 2
-        @sampling_handler.call(messages, model_preferences)
-      when 3
-        @sampling_handler.call(messages, model_preferences, system_prompt)
-      when 4
-        @sampling_handler.call(messages, model_preferences, system_prompt, max_tokens)
-      else
-        @sampling_handler.call(messages, model_preferences, system_prompt, max_tokens,
-                               { 'includeContext' => include_context, 'temperature' => temperature,
-                                 'stopSequences' => stop_sequences, 'metadata' => metadata })
+    def call_sampling_handler(messages, model_preferences, system_prompt, max_tokens, params)
+      args = [messages, model_preferences, system_prompt, max_tokens, params]
+      @sampling_handler.call(*args.first(sampling_handler_arg_count))
+    end
+
+    # Number of the five positional sampling arguments the handler can accept.
+    # Arity alone cannot size variable-arity handlers: lambdas with optional
+    # or rest parameters report a negative arity, and non-lambda procs with
+    # optional parameters report their mandatory minimum as a nonnegative
+    # arity (proc { |m, p = nil, s = nil, t = nil, extra = nil| }.arity == 1).
+    # Normalizing either to the minimum required count would starve the
+    # handler of the raw params (including the SEP-1577 tools/toolChoice
+    # fields), so any handler whose parameters include :opt or :rest entries
+    # (or whose arity is negative) is sized from Proc#parameters instead:
+    # each :req/:opt parameter accepts one argument and a :rest accepts the
+    # full list. Plain fixed-arity handlers keep arity-based sizing.
+    # @return [Integer] how many arguments to pass, capped at 5
+    def sampling_handler_arg_count
+      parameters = @sampling_handler.parameters
+      return 5 if parameters.any? { |type, _name| type == :rest }
+
+      if @sampling_handler.arity.negative? || parameters.any? { |type, _name| type == :opt }
+        return [parameters.count { |type, _name| %i[req opt].include?(type) }, 5].min
       end
+
+      [@sampling_handler.arity, 5].min
     end
 
     # Normalize and validate modelPreferences from sampling request (MCP 2025-11-25)
@@ -1293,7 +1453,11 @@ module MCPClient
     # @param result [Hash] the result from the sampling handler
     # @return [Hash] validated sampling response
     def validate_sampling_response(result)
-      return { 'error' => { 'code' => -1, 'message' => 'Sampling rejected' } } if result.nil?
+      # A nil handler result is the host's rejection signal; -1 is the code
+      # sampling.mdx § Error Handling assigns to "User rejected sampling
+      # request" (internal failures use -32603 instead, see
+      # handle_sampling_request).
+      return jsonrpc_error_result(-1, 'Sampling rejected') if result.nil?
 
       # Convert symbol keys to string keys
       result = result.transform_keys(&:to_s) if result.is_a?(Hash) && result.keys.first.is_a?(Symbol)
@@ -1308,15 +1472,27 @@ module MCPClient
         }
       end
 
-      # Set defaults for missing fields
+      # Set defaults for missing fields. ToolUseContent blocks (SEP-1577) are
+      # passed through verbatim; when the handler omits stopReason for them,
+      # default to "toolUse" per the CreateMessageResult stopReason values.
       result['role'] ||= 'assistant'
       result['model'] ||= 'unknown'
-      result['stopReason'] ||= 'endTurn'
+      result['stopReason'] ||= tool_use_content?(result['content']) ? 'toolUse' : 'endTurn'
 
       # Normalize content if it's a string
       result['content'] = { 'type' => 'text', 'text' => result['content'] } if result['content'].is_a?(String)
 
       result
+    end
+
+    # Whether sampling response content contains ToolUseContent blocks (MCP 2025-11-25 / SEP-1577)
+    # @param content [Object] the content field of a CreateMessageResult
+    # @return [Boolean] true when any content block has type "tool_use"
+    def tool_use_content?(content)
+      blocks = content.is_a?(Array) ? content : [content]
+      blocks.any? do |block|
+        block.is_a?(Hash) && (block['type'] == 'tool_use' || block[:type] == 'tool_use')
+      end
     end
   end
 end

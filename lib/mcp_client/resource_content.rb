@@ -18,7 +18,9 @@ module MCPClient
     #   @return [String, nil] base64-encoded binary content (mutually exclusive with text)
     # @!attribute [r] annotations
     #   @return [Hash, nil] optional annotations that provide hints to clients
-    attr_reader :uri, :name, :title, :mime_type, :text, :blob, :annotations
+    # @!attribute [r] meta
+    #   @return [Hash, nil] optional `_meta` metadata attached to the resource contents (MCP 2025-11-25)
+    attr_reader :uri, :name, :title, :mime_type, :text, :blob, :annotations, :meta
 
     # Initialize resource content
     # @param uri [String] unique identifier for the resource
@@ -28,7 +30,8 @@ module MCPClient
     # @param text [String, nil] text content (mutually exclusive with blob)
     # @param blob [String, nil] base64-encoded binary content (mutually exclusive with text)
     # @param annotations [Hash, nil] optional annotations that provide hints to clients
-    def initialize(uri:, name:, title: nil, mime_type: nil, text: nil, blob: nil, annotations: nil)
+    # @param meta [Hash, nil] optional `_meta` metadata attached to the resource contents (MCP 2025-11-25)
+    def initialize(uri:, name:, title: nil, mime_type: nil, text: nil, blob: nil, annotations: nil, meta: nil)
       raise ArgumentError, 'ResourceContent cannot have both text and blob' if text && blob
       raise ArgumentError, 'ResourceContent must have either text or blob' if !text && !blob
 
@@ -39,6 +42,7 @@ module MCPClient
       @text = text
       @blob = blob
       @annotations = annotations
+      @meta = meta
     end
 
     # Create a ResourceContent instance from JSON data
@@ -52,7 +56,8 @@ module MCPClient
         mime_type: data['mimeType'],
         text: data['text'],
         blob: data['blob'],
-        annotations: data['annotations']
+        annotations: data['annotations'],
+        meta: data['_meta']
       )
     end
 

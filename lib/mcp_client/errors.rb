@@ -30,6 +30,30 @@ module MCPClient
     # Raised when there's a connection error with an MCP server
     class ConnectionError < MCPError; end
 
+    # Raised when a request requires a server capability that was not
+    # negotiated during initialization (MCP lifecycle: "Only use capabilities
+    # that were successfully negotiated")
+    class CapabilityError < MCPError; end
+
+    # Raised for an HTTP 403 with a WWW-Authenticate insufficient_scope
+    # challenge (MCP 2025-11-25 / SEP-835). Exposes the challenge parameters
+    # so hosts can run a step-up authorization flow with the required scopes.
+    class InsufficientScopeError < ConnectionError
+      # @return [String, nil] the scopes required by the server's challenge
+      attr_reader :scope
+      # @return [String, nil] the challenge's human-readable error description
+      attr_reader :error_description
+
+      # @param message [String] error message
+      # @param scope [String, nil] scopes from the challenge's scope parameter
+      # @param error_description [String, nil] challenge error_description
+      def initialize(message, scope: nil, error_description: nil)
+        super(message)
+        @scope = scope
+        @error_description = error_description
+      end
+    end
+
     # Raised when the MCP server returns an error response
     class ServerError < MCPError; end
 

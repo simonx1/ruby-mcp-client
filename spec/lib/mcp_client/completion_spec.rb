@@ -80,6 +80,7 @@ RSpec.describe 'Completion (MCP 2025-06-18 / 2025-11-25 context)' do
       let(:argument) { { 'name' => 'language', 'value' => 'py' } }
 
       before do
+        server.instance_variable_set(:@capabilities, { 'completions' => {} })
         allow(server).to receive(:ensure_initialized)
         allow(server).to receive(:next_id).and_return(1)
         allow(server).to receive(:send_request)
@@ -157,6 +158,10 @@ RSpec.describe 'Completion (MCP 2025-06-18 / 2025-11-25 context)' do
       let(:argument) { { 'name' => 'path', 'value' => '/home/user/' } }
 
       before do
+        server.instance_variable_set(:@capabilities, { 'completions' => {} })
+        %i[ensure_initialized ensure_connected].each do |m|
+          allow(server).to receive(m) if server.respond_to?(m, true)
+        end
         allow(server).to receive(:rpc_request).and_return({
                                                             'completion' => {
                                                               'values' => ['/home/user/documents',
@@ -216,6 +221,10 @@ RSpec.describe 'Completion (MCP 2025-06-18 / 2025-11-25 context)' do
       let(:argument) { { 'name' => 'style', 'value' => 'for' } }
 
       before do
+        server.instance_variable_set(:@capabilities, { 'completions' => {} })
+        %i[ensure_initialized ensure_connected].each do |m|
+          allow(server).to receive(m) if server.respond_to?(m, true)
+        end
         allow(server).to receive(:rpc_request).and_return({
                                                             'completion' => {
                                                               'values' => %w[formal friendly],
@@ -274,6 +283,10 @@ RSpec.describe 'Completion (MCP 2025-06-18 / 2025-11-25 context)' do
       let(:argument) { { 'name' => 'language', 'value' => 'en' } }
 
       before do
+        server.instance_variable_set(:@capabilities, { 'completions' => {} })
+        %i[ensure_initialized ensure_connected].each do |m|
+          allow(server).to receive(m) if server.respond_to?(m, true)
+        end
         allow(server).to receive(:rpc_request).and_return({
                                                             'completion' => {
                                                               'values' => %w[english esperanto],

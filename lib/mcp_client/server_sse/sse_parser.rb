@@ -1,6 +1,7 @@
 # frozen_string_literal: true
 
 require 'json'
+require 'uri'
 
 module MCPClient
   class ServerSSE
@@ -30,7 +31,7 @@ module MCPClient
         begin
           data = JSON.parse(event[:data])
 
-          return if process_error_in_message(data)
+          return if process_error_in_message?(data)
           return if process_server_request?(data)
           return if process_notification?(data)
 
@@ -44,11 +45,17 @@ module MCPClient
         end
       end
 
-      # Process a JSON-RPC error() in the SSE stream.
+      # Process a connection-level JSON-RPC error payload in the SSE stream.
+      # Error RESPONSES (id-bearing) belong to a pending request and are
+      # delivered to the waiting caller via process_response? instead, per the
+      # MCP lifecycle "Error Handling" section (implementations SHOULD handle
+      # error cases such as protocol version mismatch), so they must not be
+      # swallowed here.
       # @param data [Hash] the parsed JSON payload
-      # @return [Boolean] true if we saw & handled an error
-      def process_error_in_message(data)
-        return unless data['error']
+      # @return [Boolean] true if we saw & handled an id-less error
+      def process_error_in_message?(data)
+        return false unless data['error']
+        return false if data['id']
 
         error_message = data['error']['message'] || 'Unknown server error'
         error_code    = data['error']['code']
@@ -93,8 +100,10 @@ module MCPClient
         @mutex.synchronize do
           @sse_results[data['id']] =
             if data['error']
-              { 'isError' => true,
-                'content' => [{ 'type' => 'text', 'text' => data['error'].to_json }] }
+              # JSON-RPC error response: store the error under a Symbol key
+              # (JSON.parse only produces String keys, so this cannot collide
+              # with a success result) for the waiter to raise ServerError.
+              { error: data['error'] }
             else
               data['result']
             end
@@ -130,15 +139,43 @@ module MCPClient
         has_content ? event : nil
       end
 
-      # Handle the special "endpoint" control frame (for SSE handshake)
+      # Handle the special "endpoint" control frame (for SSE handshake).
+      # The event data is a URI reference (MCP 2024-11-05 HTTP with SSE: the
+      # server sends "an `endpoint` event containing a URI for the client to
+      # use for sending messages") which must be resolved against the SSE
+      # connection URL per RFC 3986 section 5.1.3, so relative endpoint URIs
+      # POST to the URL the server actually designated.
       # @param data [String] the raw endpoint payload
       def handle_endpoint_event(data)
+        endpoint = resolve_endpoint_uri(data)
         @mutex.synchronize do
-          @rpc_endpoint = data
+          @rpc_endpoint = endpoint
           @sse_connected = true
           @connection_established = true
           @connection_cv.broadcast
         end
+      end
+
+      # Resolve an endpoint URI reference against the SSE connection URL
+      # @param data [String] the endpoint event payload (absolute or relative URI)
+      # @return [String] the absolute endpoint URL
+      def resolve_endpoint_uri(data)
+        URI.join(@base_url, data).to_s
+      rescue URI::Error => e
+        # The endpoint event is the handshake's core payload; an unresolvable
+        # URI must fail the handshake rather than deferring a broken POST
+        # target to the first request.
+        @logger.error("Failed to resolve endpoint URI #{data.inspect} against #{@base_url}: #{e.message}")
+        message = "Invalid endpoint URI in SSE endpoint event: #{data.inspect} (#{e.message})"
+        # The SSE worker thread swallows this exception with a generic rescue,
+        # so also record the failure cause (mirroring @auth_error) for the
+        # connect caller blocked in wait_for_connection to surface promptly.
+        @mutex.synchronize do
+          @connection_error = message
+          @connection_established = false
+          @connection_cv.broadcast
+        end
+        raise MCPClient::Errors::TransportError, message
       end
     end
   end
