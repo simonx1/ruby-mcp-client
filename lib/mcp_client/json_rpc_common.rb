@@ -43,6 +43,33 @@ module MCPClient
       rpc_request('ping')
     end
 
+    # Split request-level _meta (RequestParams._meta, e.g. progressToken or
+    # related-task metadata) out of user-supplied tool/prompt arguments.
+    # Accepts both :_meta and '_meta' key spellings; per MCP, _meta belongs at
+    # the request params level, not inside the tool's arguments.
+    # @param arguments [Hash, nil] user-supplied arguments
+    # @return [Array(Hash, Hash|nil)] [arguments without _meta, _meta or nil]
+    def split_request_meta(arguments)
+      return [arguments, nil] unless arguments.is_a?(Hash)
+
+      meta = arguments[:_meta] || arguments['_meta']
+      return [arguments, nil] unless meta
+
+      [arguments.except(:_meta, '_meta'), meta]
+    end
+
+    # Build tools/call- or prompts/get-style params with request-level _meta
+    # hoisted out of the arguments (string keys, matching the JSON wire form).
+    # @param name [String] tool or prompt name
+    # @param arguments [Hash] user-supplied arguments (possibly carrying _meta)
+    # @return [Hash] params hash for the JSON-RPC request
+    def build_named_request_params(name, arguments)
+      args, meta = split_request_meta(arguments)
+      params = { 'name' => name, 'arguments' => args }
+      params['_meta'] = meta if meta
+      params
+    end
+
     # Build a JSON-RPC request object
     # @param method [String] JSON-RPC method name
     # @param params [Hash] parameters for the request
@@ -72,21 +99,10 @@ module MCPClient
     # Generate initialization parameters for MCP protocol
     # @return [Hash] the initialization parameters
     def initialization_params
-      capabilities = {
-        'elicitation' => {}, # MCP 2025-11-25: Support for server-initiated user interactions
-        'roots' => { 'listChanged' => true }, # MCP 2025-11-25: Support for roots
-        'sampling' => {} # MCP 2025-11-25: Support for server-initiated LLM sampling
-        # NOTE: we intentionally do NOT declare a client `tasks` capability. That
-        # capability marks the client as a RECEIVER of task-augmented
-        # sampling/elicitation requests, which is not implemented here — this
-        # client only acts as a task REQUESTOR for tools/call (see
-        # Client#call_tool_as_task), which requires no client-side declaration.
-      }
-
       {
         'protocolVersion' => MCPClient::PROTOCOL_VERSION,
-        'capabilities' => capabilities,
-        'clientInfo' => { 'name' => 'ruby-mcp-client', 'version' => MCPClient::VERSION }
+        'capabilities' => client_capabilities,
+        'clientInfo' => client_info_payload
       }
     end
 
@@ -110,6 +126,64 @@ module MCPClient
       raise MCPClient::Errors::ConnectionError,
             "Server negotiated unsupported protocol version #{version.inspect} " \
             "(supported: #{MCPClient::SUPPORTED_PROTOCOL_VERSIONS.join(', ')}); disconnecting"
+    end
+
+    # The Implementation object sent as clientInfo: the host-provided info
+    # when configured (client_info=), otherwise the gem's identity.
+    # @return [Hash]
+    def client_info_payload
+      return @client_info if defined?(@client_info) && @client_info
+
+      { 'name' => 'ruby-mcp-client', 'version' => MCPClient::VERSION }
+    end
+
+    # Declared client capabilities, derived from the server-request callbacks
+    # the host actually registered before connecting. Per MCP 2025-11-25,
+    # clients that support a feature MUST declare it during initialization,
+    # and only negotiated capabilities may be used afterwards — so declaring
+    # a hardcoded set independent of host support violates the lifecycle in
+    # both directions.
+    # @return [Hash] the capabilities object for the initialize request
+    def client_capabilities
+      capabilities = {}
+      if registered_callback?(:@elicitation_request_callback)
+        # Both defined elicitation modes are implemented (an empty object
+        # would mean form-only per the spec's backwards-compatibility rule).
+        capabilities['elicitation'] = { 'form' => {}, 'url' => {} }
+      end
+      capabilities['roots'] = { 'listChanged' => true } if registered_callback?(:@roots_list_request_callback)
+      if registered_callback?(:@sampling_request_callback)
+        # SEP-1577: servers may only send tool-enabled sampling requests when
+        # the client declares the sampling.tools sub-capability.
+        capabilities['sampling'] = sampling_tools_supported? ? { 'tools' => {} } : {}
+      end
+      # NOTE: we intentionally do NOT declare a client `tasks` capability. That
+      # capability marks the client as a RECEIVER of task-augmented
+      # sampling/elicitation requests, which is not implemented here — this
+      # client only acts as a task REQUESTOR for tools/call (see
+      # Client#call_tool_as_task), which requires no client-side declaration.
+      capabilities
+    end
+
+    # Opt this transport into declaring tool-use support for sampling
+    # (ClientCapabilities.sampling.tools, MCP 2025-11-25 / SEP-1577). Call
+    # before connect so the initialize request advertises it; it only takes
+    # effect when a sampling request callback is also registered, since
+    # sampling.tools is a sub-capability of sampling.
+    # @return [void]
+    def declare_sampling_tools
+      @sampling_tools_supported = true
+    end
+
+    # @param ivar [Symbol] callback instance variable name
+    # @return [Boolean] whether the callback is registered on this transport
+    def registered_callback?(ivar)
+      instance_variable_defined?(ivar) && !instance_variable_get(ivar).nil?
+    end
+
+    # @return [Boolean] whether the host opted into sampling tool use
+    def sampling_tools_supported?
+      instance_variable_defined?(:@sampling_tools_supported) && @sampling_tools_supported
     end
 
     # Process JSON-RPC response

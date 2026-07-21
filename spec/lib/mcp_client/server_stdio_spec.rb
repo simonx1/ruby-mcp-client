@@ -18,15 +18,20 @@ RSpec.describe MCPClient::ServerStdio do
   end
 
   describe '#connect' do
+    # Pipe doubles must accept set_encoding: connect pins the subprocess pipes
+    # to UTF-8 because JSON-RPC messages MUST be UTF-8 encoded
+    # (MCP 2025-11-25 basic/transports.mdx)
+    let(:pipe_doubles) { Array.new(3) { double('pipe', set_encoding: nil) } }
+
     it 'starts the command process with Open3' do
-      expect(Open3).to receive(:popen3).with(command).and_return([double, double, double, double])
+      expect(Open3).to receive(:popen3).with(command).and_return([*pipe_doubles, double])
       expect(server.connect).to be true
     end
 
     it 'passes environment variables when env is provided' do
       env = { 'FOO' => 'bar' }
       server_env = described_class.new(command: command, env: env)
-      expect(Open3).to receive(:popen3).with(env, command).and_return([double, double, double, double])
+      expect(Open3).to receive(:popen3).with(env, command).and_return([*pipe_doubles, double])
       expect(server_env.connect).to be true
     end
 
@@ -276,9 +281,14 @@ RSpec.describe MCPClient::ServerStdio do
       server.cleanup
     end
 
-    it 'kills the process' do
-      expect(Process).to receive(:kill).with('TERM', @wait_thread.pid)
-      expect(@wait_thread).to receive(:join).with(1)
+    # MCP 2025-11-25 basic/lifecycle.mdx (Shutdown / stdio): after closing
+    # stdin the client waits for exit, sends SIGTERM if the server has not
+    # exited within a reasonable time, then SIGKILL. The double's join always
+    # returns nil (timeout), so the full escalation runs.
+    it 'terminates a process that never exits with SIGTERM then SIGKILL' do
+      expect(@wait_thread).to receive(:join).with(described_class::SHUTDOWN_GRACE_PERIOD).exactly(3).times
+      expect(Process).to receive(:kill).with('TERM', @wait_thread.pid).ordered
+      expect(Process).to receive(:kill).with('KILL', @wait_thread.pid).ordered
       server.cleanup
     end
 

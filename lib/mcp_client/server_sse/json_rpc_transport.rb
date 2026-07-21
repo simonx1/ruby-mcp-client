@@ -76,6 +76,7 @@ module MCPClient
         @protocol_version = validate_protocol_version!(result)
         @server_info = result['serverInfo']
         @capabilities = result['capabilities']
+        @instructions = result['instructions']
 
         # Send initialized notification to acknowledge completion of initialization
         initialized_notification = build_jsonrpc_notification('notifications/initialized', {})

@@ -654,7 +654,7 @@ RSpec.describe MCPClient::ServerHTTP do
           .to_return(
             status: 200,
             body: { jsonrpc: '2.0', id: 1, result: { protocolVersion: MCPClient::PROTOCOL_VERSION } }.to_json,
-            headers: { 'Mcp-Session-Id' => 'invalid@session!' }
+            headers: { 'Mcp-Session-Id' => 'invalid session id' }
           )
 
         server.send(:perform_initialize)
@@ -740,18 +740,17 @@ RSpec.describe MCPClient::ServerHTTP do
         'session_id_123',
         'sess-123-abc_def',
         'a1b2c3d4e5f6g7h8',
-        '12345678' # minimum length
+        '1234',                   # short ids are spec-valid
+        'eyJhbGci.eyJzdWIi.SflK', # JWT-style with dots
+        'c2Vzc2lvbisvPQ=='        # base64 with + / =
       ]
 
       invalid_session_ids = [
-        '', # empty
-        'short', # too short
-        'x' * 200,           # too long
-        'session@id',        # invalid characters
-        'session id',        # spaces
-        'session.id',        # dots
-        'session/id',        # slashes
-        'session%id'         # percent encoding
+        '',                  # empty
+        'session id',        # space is outside visible ASCII 0x21-0x7E
+        "tab\tid",           # control character
+        'sessão',            # non-ASCII
+        'x' * 4097           # over the length cap
       ]
 
       valid_session_ids.each do |session_id|

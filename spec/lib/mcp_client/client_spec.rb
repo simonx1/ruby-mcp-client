@@ -1039,6 +1039,11 @@ RSpec.describe MCPClient::Client do
         }, server: mock_server
       )
       allow(mock_server).to receive(:list_tools).and_return([required_tool])
+      # Tasks Tool-Level Negotiation rule 2 applies only when the server
+      # declares tasks.requests.tools.call (rule 1 disregards taskSupport
+      # otherwise), so this server must declare the capability.
+      allow(mock_server).to receive(:capabilities)
+        .and_return({ 'tasks' => { 'requests' => { 'tools' => { 'call' => {} } } } })
       expect(mock_server).not_to receive(:call_tool)
 
       expect { client.call_tool('must_task', {}) }

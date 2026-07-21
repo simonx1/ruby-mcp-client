@@ -112,15 +112,16 @@ RSpec.describe MCPClient::ServerStreamableHTTP, 'Elicitation (MCP 2025-06-18)' d
     end
 
     context 'when no callback is registered' do
-      it 'sends decline response' do
-        expect(server).to receive(:send_elicitation_response).with(request_id, { 'action' => 'decline' })
+      it 'sends a -32601 error response' do
+        expect(server).to receive(:send_error_response)
+          .with(request_id, -32_601, 'Elicitation not supported: no handler configured')
         server.send(:handle_elicitation_create, request_id, params)
       end
 
       it 'logs a warning' do
-        allow(server).to receive(:send_elicitation_response)
+        allow(server).to receive(:send_error_response)
         logger = server.instance_variable_get(:@logger)
-        expect(logger).to receive(:warn).with('Received elicitation request but no callback registered, declining')
+        expect(logger).to receive(:warn).with('Received elicitation request but no callback registered')
         server.send(:handle_elicitation_create, request_id, params)
       end
     end
@@ -156,19 +157,14 @@ RSpec.describe MCPClient::ServerStreamableHTTP, 'Elicitation (MCP 2025-06-18)' d
     let(:request_id) { 123 }
     let(:result) { { 'action' => 'accept', 'content' => { 'name' => 'John' } } }
 
-    it 'sends JSON-RPC request via HTTP POST' do
-      # Elicitation responses are sent as JSON-RPC requests, not responses
-      expected_request = {
+    it 'sends a standard JSON-RPC response via HTTP POST' do
+      expected_response = {
         'jsonrpc' => '2.0',
-        'method' => 'elicitation/response',
-        'params' => {
-          'elicitationId' => request_id,
-          'action' => result['action'],
-          'content' => result['content']
-        }
+        'id' => request_id,
+        'result' => result
       }
 
-      expect(server).to receive(:post_jsonrpc_response).with(expected_request)
+      expect(server).to receive(:post_jsonrpc_response).with(expected_response)
       server.send(:send_elicitation_response, request_id, result)
     end
   end
@@ -394,7 +390,7 @@ RSpec.describe MCPClient::ServerStreamableHTTP, 'Elicitation (MCP 2025-06-18)' d
         user_response
       end
 
-      # Stub HTTP POST for response (sent as JSON-RPC request, not response)
+      # Stub HTTP POST for the standard JSON-RPC response
       response_stub = stub_request(:post, "#{base_url}#{endpoint}")
                       .with(
                         headers: {
@@ -403,12 +399,8 @@ RSpec.describe MCPClient::ServerStreamableHTTP, 'Elicitation (MCP 2025-06-18)' d
                         },
                         body: {
                           'jsonrpc' => '2.0',
-                          'method' => 'elicitation/response',
-                          'params' => {
-                            'elicitationId' => 456,
-                            'action' => user_response['action'],
-                            'content' => user_response['content']
-                          }
+                          'id' => 456,
+                          'result' => user_response
                         }.to_json
                       )
                       .to_return(status: 200, body: '')
@@ -438,16 +430,15 @@ RSpec.describe MCPClient::ServerStreamableHTTP, 'Elicitation (MCP 2025-06-18)' d
       expect(response_stub).to have_been_requested.once
     end
 
-    it 'handles decline response' do
-      # No callback registered, should auto-decline
+    it 'answers with a -32601 error when no callback is registered' do
       response_stub = stub_request(:post, "#{base_url}#{endpoint}")
                       .with(
                         body: {
                           'jsonrpc' => '2.0',
-                          'method' => 'elicitation/response',
-                          'params' => {
-                            'elicitationId' => 789,
-                            'action' => 'decline'
+                          'id' => 789,
+                          'error' => {
+                            'code' => -32_601,
+                            'message' => 'Elicitation not supported: no handler configured'
                           }
                         }.to_json
                       )
