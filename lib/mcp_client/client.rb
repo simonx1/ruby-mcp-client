@@ -25,6 +25,10 @@ module MCPClient
     #   @return [Array<MCPClient::Root>] list of MCP roots (MCP 2025-06-18)
     attr_reader :servers, :tool_cache, :prompt_cache, :resource_cache, :logger, :roots
 
+    # Supported modes for structuredContent validation (MCP 2025-11-25):
+    # :warn logs a warning on mismatch, :strict raises a ValidationError.
+    STRUCTURED_CONTENT_MODES = %i[warn strict].freeze
+
     # Initialize a new MCPClient::Client
     # @param mcp_server_configs [Array<Hash>] configurations for MCP servers
     # @param logger [Logger, nil] optional logger, defaults to STDOUT
@@ -36,8 +40,18 @@ module MCPClient
     #   tools/toolChoice params to the handler instead of rejecting tool-enabled requests
     # @param client_info [Hash, nil] host-provided Implementation info sent as clientInfo
     #   (name and version required; title, description, websiteUrl, icons optional)
+    # @param validate_structured_content [Symbol] how to treat a tools/call result whose
+    #   structuredContent does not match the tool's declared outputSchema (MCP 2025-11-25:
+    #   "Clients SHOULD validate structured results against this schema"): :warn (default)
+    #   logs a warning, :strict raises MCPClient::Errors::ValidationError
     def initialize(mcp_server_configs: [], logger: nil, elicitation_handler: nil, roots: nil, sampling_handler: nil,
-                   sampling_supports_tools: false, client_info: nil)
+                   sampling_supports_tools: false, client_info: nil, validate_structured_content: :warn)
+      unless STRUCTURED_CONTENT_MODES.include?(validate_structured_content)
+        raise ArgumentError, "validate_structured_content must be one of #{STRUCTURED_CONTENT_MODES.inspect}, " \
+                             "got #{validate_structured_content.inspect}"
+      end
+
+      @validate_structured_content = validate_structured_content
       # Preserve a caller-supplied logger's formatter (only tag progname), and
       # install the default formatter solely on a logger we create ourselves.
       # Overwriting the formatter of an application's logger would silently
@@ -302,7 +316,7 @@ module MCPClient
       # caller's callback while the request is active.
       parameters, token = setup_progress_tracking(parameters, progress)
 
-      begin
+      result = begin
         server.call_tool(tool_name, parameters)
       rescue MCPClient::Errors::ConnectionError => e
         # Add server identity information to the error for better context
@@ -313,6 +327,8 @@ module MCPClient
         # registration filters out stale post-completion notifications.
         unregister_progress_callback(token) if token
       end
+
+      validate_structured_content!(tool, result)
     end
 
     # Convert MCP tools to OpenAI function specifications
@@ -565,6 +581,12 @@ module MCPClient
     # Returns exactly what the underlying request would have returned (e.g. a
     # CallToolResult hash with 'content'/'isError'/'structuredContent'); it is
     # NOT wrapped in a Task. Blocks on the server until the task is terminal.
+    #
+    # NOTE: structured-content validation (see #validate_structured_content!)
+    # does not cover task-delivered results yet: a task ID alone does not
+    # identify which tool (and therefore which outputSchema) produced the
+    # result, and the client keeps no task-to-tool registry. Callers who need
+    # validation here can run MCPClient::SchemaValidator.validate themselves.
     # @param task_id [String] the ID of the task
     # @param server [Integer, String, Symbol, MCPClient::ServerBase, nil] server selector
     # @return [Object] the underlying task result
@@ -865,6 +887,73 @@ module MCPClient
       return unless missing.any?
 
       raise MCPClient::Errors::ValidationError, "Missing required parameters: #{missing.join(', ')}"
+    end
+
+    # Validate a tools/call result's structuredContent against the tool's
+    # declared outputSchema (MCP 2025-11-25 server/tools spec: "Clients SHOULD
+    # validate structured results against this schema"; a tool declaring an
+    # outputSchema must return structuredContent in successful results). Error
+    # results (isError: true) are exempt: the conformance requirements apply to
+    # successful results only. Validation covers the common JSON Schema
+    # keywords; the full 2020-12 vocabulary is out of scope (see
+    # MCPClient::SchemaValidator), and when the schema uses keywords outside
+    # that subset a partial-coverage warning is logged in both modes so :strict
+    # never silently passes what it cannot fully check. On a violation
+    # (mismatch or missing structuredContent) a warning is always logged, and
+    # in :strict mode a ValidationError is raised as well.
+    # @param tool [MCPClient::Tool] the tool that produced the result
+    # @param result [Object] the raw tools/call result
+    # @return [Object] the result, unchanged
+    # @raise [MCPClient::Errors::ValidationError] in :strict mode when structuredContent
+    #   is missing from a successful result or does not match the schema
+    def validate_structured_content!(tool, result)
+      return result unless tool.structured_output? && result.is_a?(Hash)
+      return result if result['isError'] || result[:isError]
+
+      warn_partial_schema_coverage(tool)
+
+      structured = result.key?('structuredContent') ? result['structuredContent'] : result[:structuredContent]
+      if structured.nil?
+        handle_structured_content_violation(
+          "Tool '#{tool.name}' declares an output schema but its successful result carries no structuredContent " \
+          '(required by the MCP 2025-11-25 tools spec)'
+        )
+        return result
+      end
+
+      errors = MCPClient::SchemaValidator.validate(structured, tool.output_schema)
+      unless errors.empty?
+        handle_structured_content_violation(
+          "Structured content for tool '#{tool.name}' does not match its output schema: #{errors.join('; ')}"
+        )
+      end
+      result
+    end
+
+    # Warn (in both :warn and :strict modes) when a tool's output schema uses
+    # JSON Schema keywords the built-in validator cannot evaluate, so partial
+    # coverage is never silent.
+    # @param tool [MCPClient::Tool] the tool whose output schema is being used
+    # @return [void]
+    def warn_partial_schema_coverage(tool)
+      unsupported = MCPClient::SchemaValidator.unsupported_keywords(tool.output_schema)
+      return if unsupported.empty?
+
+      @logger.warn(
+        "Structured content check for tool '#{tool.name}': validation is partial: schema uses unsupported " \
+        "keywords: #{unsupported.join(', ')} (full JSON Schema 2020-12 evaluation is not implemented, so " \
+        'conforming-looking data may still violate the schema)'
+      )
+    end
+
+    # Log a structured-content conformance violation and, in :strict mode,
+    # raise it as a ValidationError.
+    # @param message [String] the violation description
+    # @return [void]
+    # @raise [MCPClient::Errors::ValidationError] in :strict mode
+    def handle_structured_content_violation(message)
+      @logger.warn(message)
+      raise MCPClient::Errors::ValidationError, message if @validate_structured_content == :strict
     end
 
     def find_server_for_tool(tool)
