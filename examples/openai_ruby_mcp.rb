@@ -4,6 +4,10 @@
 # MCPClient integration example using the openai/openai-ruby gem
 require 'bundler/setup'
 require_relative '../lib/mcp_client'
+# Both the official 'openai' gem and 'ruby-openai' are bundled and both expose
+# lib/openai.rb + OpenAI::Client; load the official gem's lib first so
+# require resolves deterministically to the gem this example targets.
+$LOAD_PATH.unshift(*Gem::Specification.find_by_name('openai').full_require_paths)
 require 'openai'
 require 'json'
 require 'logger'
