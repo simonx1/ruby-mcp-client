@@ -30,6 +30,11 @@ module MCPClient
     # Raised when there's a connection error with an MCP server
     class ConnectionError < MCPError; end
 
+    # Raised when a request requires a server capability that was not
+    # negotiated during initialization (MCP lifecycle: "Only use capabilities
+    # that were successfully negotiated")
+    class CapabilityError < MCPError; end
+
     # Raised for an HTTP 403 with a WWW-Authenticate insufficient_scope
     # challenge (MCP 2025-11-25 / SEP-835). Exposes the challenge parameters
     # so hosts can run a step-up authorization flow with the required scopes.

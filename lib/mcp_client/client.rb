@@ -589,6 +589,8 @@ module MCPClient
     # @raise [MCPClient::Errors::TaskError] if listing fails
     def list_tasks(cursor: nil, server: nil)
       srv = select_server(server)
+      ensure_task_capability!(srv, 'list')
+
       params = cursor ? { cursor: cursor } : {}
 
       begin
@@ -609,6 +611,7 @@ module MCPClient
     # @raise [MCPClient::Errors::TaskError] if cancellation fails (including cancelling a terminal task)
     def cancel_task(task_id, server: nil)
       srv = select_server(server)
+      ensure_task_capability!(srv, 'cancel')
 
       begin
         result = srv.rpc_request('tasks/cancel', { taskId: task_id })
@@ -633,10 +636,56 @@ module MCPClient
     # @return [Array<Hash>] results from servers
     # @raise [MCPClient::Errors::ServerError] if server returns an error
     def log_level=(level)
-      @servers.map { |srv| srv.log_level = level }
+      @servers.filter_map do |srv|
+        # MCP lifecycle: only use capabilities that were successfully
+        # negotiated — skip servers whose NEGOTIATED set lacks logging.
+        # Unconnected servers proceed: the transport-level gate re-checks
+        # after its handshake establishes the capability set.
+        unless !capabilities_known?(srv) || srv.capability?('logging')
+          @logger.debug("Skipping logging/setLevel for #{srv.name || srv.class.name}: " \
+                        'logging capability not negotiated')
+          next
+        end
+
+        srv.log_level = level
+      end
     end
 
     private
+
+    # Whether the server's negotiated capability set is available yet.
+    # @param srv [MCPClient::ServerBase] the server
+    # @return [Boolean]
+    def capabilities_known?(srv)
+      srv.respond_to?(:capabilities) && !srv.capabilities.nil?
+    end
+
+    # Enforce the tasks.<operation> capability gate for a server (MCP
+    # lifecycle: "Only use capabilities that were successfully negotiated").
+    # When the negotiated capability set is not yet known, first trigger the
+    # handshake with a cheap standard request (ping) and then re-apply the
+    # gate against the freshly negotiated set, so a previously uninitialized
+    # server that negotiates no tasks capability never receives the
+    # prohibited request.
+    # @param srv [MCPClient::ServerBase] the selected server
+    # @param operation [String] the tasks sub-capability ('list' or 'cancel')
+    # @return [void]
+    # @raise [MCPClient::Errors::CapabilityError] if the negotiated set lacks the capability
+    def ensure_task_capability!(srv, operation)
+      if !capabilities_known?(srv) && srv.respond_to?(:ping)
+        begin
+          srv.ping
+        rescue MCPClient::Errors::MCPError
+          # Initialization failed; fall through and let the task request
+          # itself surface the failure via the normal error path.
+        end
+      end
+
+      return if !capabilities_known?(srv) || srv.capability?('tasks', operation)
+
+      raise MCPClient::Errors::CapabilityError,
+            "Server #{srv.name || srv.class.name} did not declare the tasks.#{operation} capability"
+    end
 
     # Process incoming JSON-RPC notifications with default handlers
     # @param server [MCPClient::ServerBase] the server that emitted the notification

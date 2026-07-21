@@ -1107,6 +1107,10 @@ RSpec.describe MCPClient::Client do
   describe '#list_tasks' do
     let(:client) { described_class.new(mcp_server_configs: [{ type: 'stdio', command: 'test' }]) }
 
+    before do
+      allow(mock_server).to receive(:capability?).with('tasks', 'list').and_return(true)
+    end
+
     it 'lists tasks and returns Task objects with a next cursor' do
       allow(mock_server).to receive(:rpc_request).with('tasks/list', {}).and_return(
         { 'tasks' => [{ 'taskId' => 'a', 'status' => 'working' }, { 'taskId' => 'b', 'status' => 'completed' }],
@@ -1128,6 +1132,10 @@ RSpec.describe MCPClient::Client do
 
   describe '#cancel_task' do
     let(:client) { described_class.new(mcp_server_configs: [{ type: 'stdio', command: 'test' }]) }
+
+    before do
+      allow(mock_server).to receive(:capability?).with('tasks', 'cancel').and_return(true)
+    end
 
     before do
       allow(mock_server).to receive(:rpc_request).with('tasks/cancel', { taskId: 'task-123' })
