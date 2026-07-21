@@ -287,7 +287,11 @@ while (line = $stdin.gets)
   id = msg['id']
   case msg['method']
   when 'initialize'
-    send_response(id, {})
+    send_response(id, {
+                    'protocolVersion' => '2025-11-25',
+                    'capabilities' => { 'tools' => {} },
+                    'serverInfo' => { 'name' => 'fake-filesystem', 'version' => '1.0.0' }
+                  })
   when 'tools/list'
     send_response(id, { 'tools' => TOOLS })
   when 'tools/call'

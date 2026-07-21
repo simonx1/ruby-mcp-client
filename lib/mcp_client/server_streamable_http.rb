@@ -111,6 +111,8 @@ module MCPClient
       @http_conn = nil
       @session_id = nil
       @last_event_id = nil
+      @sse_retry_ms = nil
+      @pending_stream_responses = {}
       @oauth_provider = opts[:oauth_provider]
 
       # SSE events connection state
@@ -196,11 +198,7 @@ module MCPClient
     # @raise [MCPClient::Errors::ToolCallError] for other errors during tool execution
     # @raise [MCPClient::Errors::ConnectionError] if server is disconnected
     def call_tool(tool_name, parameters)
-      rpc_request('tools/call', {
-                    name: tool_name,
-                    arguments: parameters.except(:_meta),
-                    **parameters.slice(:_meta)
-                  })
+      rpc_request('tools/call', build_named_request_params(tool_name, parameters))
     rescue MCPClient::Errors::ConnectionError, MCPClient::Errors::TransportError
       # Re-raise connection/transport errors directly to match test expectations
       raise
@@ -226,11 +224,14 @@ module MCPClient
     # @return [Hash] completion result with 'values', optional 'total', and 'hasMore' fields
     # @raise [MCPClient::Errors::ServerError] if server returns an error
     def complete(ref:, argument:, context: nil)
+      ensure_connected
+      require_capability!('completions', method: 'completion/complete')
       params = { ref: ref, argument: argument }
       params[:context] = context if context
       result = rpc_request('completion/complete', params)
       result['completion'] || { 'values' => [] }
-    rescue MCPClient::Errors::ConnectionError, MCPClient::Errors::TransportError
+    rescue MCPClient::Errors::ConnectionError, MCPClient::Errors::TransportError,
+           MCPClient::Errors::CapabilityError
       raise
     rescue StandardError => e
       raise MCPClient::Errors::ServerError, "Error requesting completion: #{e.message}"
@@ -242,8 +243,11 @@ module MCPClient
     # @return [Hash] empty result on success
     # @raise [MCPClient::Errors::ServerError] if server returns an error
     def log_level=(level)
+      ensure_connected
+      require_capability!('logging', method: 'logging/setLevel')
       rpc_request('logging/setLevel', { level: level })
-    rescue MCPClient::Errors::ConnectionError, MCPClient::Errors::TransportError
+    rescue MCPClient::Errors::ConnectionError, MCPClient::Errors::TransportError,
+           MCPClient::Errors::CapabilityError
       raise
     rescue StandardError => e
       raise MCPClient::Errors::ServerError, "Error setting log level: #{e.message}"
@@ -282,11 +286,7 @@ module MCPClient
     # @return [Object] the result of the prompt (with string keys for backward compatibility)
     # @raise [MCPClient::Errors::PromptGetError] if prompt retrieval fails
     def get_prompt(prompt_name, parameters)
-      rpc_request('prompts/get', {
-                    name: prompt_name,
-                    arguments: parameters.except(:_meta),
-                    **parameters.slice(:_meta)
-                  })
+      rpc_request('prompts/get', build_named_request_params(prompt_name, parameters))
     rescue MCPClient::Errors::ConnectionError, MCPClient::Errors::TransportError
       # Re-raise connection/transport errors directly
       raise
@@ -371,9 +371,12 @@ module MCPClient
     # @return [Boolean] true if subscription successful
     # @raise [MCPClient::Errors::ResourceReadError] for other errors during subscription
     def subscribe_resource(uri)
+      ensure_connected
+      require_capability!('resources', 'subscribe', method: 'resources/subscribe')
       rpc_request('resources/subscribe', { uri: uri })
       true
-    rescue MCPClient::Errors::ConnectionError, MCPClient::Errors::TransportError, MCPClient::Errors::ServerError
+    rescue MCPClient::Errors::ConnectionError, MCPClient::Errors::TransportError, MCPClient::Errors::ServerError,
+           MCPClient::Errors::CapabilityError
       raise
     rescue StandardError => e
       raise MCPClient::Errors::ResourceReadError, "Error subscribing to resource '#{uri}': #{e.message}"
@@ -384,9 +387,12 @@ module MCPClient
     # @return [Boolean] true if unsubscription successful
     # @raise [MCPClient::Errors::ResourceReadError] for other errors during unsubscription
     def unsubscribe_resource(uri)
+      ensure_connected
+      require_capability!('resources', 'subscribe', method: 'resources/unsubscribe')
       rpc_request('resources/unsubscribe', { uri: uri })
       true
-    rescue MCPClient::Errors::ConnectionError, MCPClient::Errors::TransportError, MCPClient::Errors::ServerError
+    rescue MCPClient::Errors::ConnectionError, MCPClient::Errors::TransportError, MCPClient::Errors::ServerError,
+           MCPClient::Errors::CapabilityError
       raise
     rescue StandardError => e
       raise MCPClient::Errors::ResourceReadError, "Error unsubscribing from resource '#{uri}': #{e.message}"
@@ -397,23 +403,20 @@ module MCPClient
       super
 
       # Add session and protocol version headers for non-initialize requests
-      if request['method'] != 'initialize'
-        if @session_id
-          req.headers['Mcp-Session-Id'] = @session_id
-          @logger.debug("Adding session header: Mcp-Session-Id: #{@session_id}")
-        end
+      return unless request['method'] != 'initialize'
 
-        if @protocol_version
-          req.headers['Mcp-Protocol-Version'] = @protocol_version
-          @logger.debug("Adding protocol version header: Mcp-Protocol-Version: #{@protocol_version}")
-        end
+      if @session_id
+        req.headers['Mcp-Session-Id'] = @session_id
+        @logger.debug("Adding session header: Mcp-Session-Id: #{@session_id}")
       end
 
-      # Add Last-Event-ID header for resumability (if available)
-      return unless @last_event_id
+      return unless @protocol_version
 
-      req.headers['Last-Event-ID'] = @last_event_id
-      @logger.debug("Adding Last-Event-ID header: #{@last_event_id}")
+      req.headers['Mcp-Protocol-Version'] = @protocol_version
+      @logger.debug("Adding protocol version header: Mcp-Protocol-Version: #{@protocol_version}")
+
+      # NOTE: Last-Event-ID is deliberately NOT sent on POSTs — per SEP-1699,
+      # resumption is always via HTTP GET with Last-Event-ID.
     end
 
     # Override handle_successful_response to capture session ID
@@ -478,6 +481,9 @@ module MCPClient
         @events_connection = nil
         @session_id = nil
         @last_event_id = nil
+        @sse_retry_ms = nil
+        @pending_stream_responses.each_value(&:close)
+        @pending_stream_responses.clear
 
         # Clear cached data
         @tools = nil
@@ -688,7 +694,7 @@ module MCPClient
         break unless @mutex.synchronize { @connection_established }
 
         @logger.info('Events connection closed, reconnecting...')
-        sleep reconnect_delay
+        sleep events_reconnect_delay(reconnect_delay)
         reconnect_delay = [reconnect_delay * 2, SSE_MAX_RECONNECT_DELAY].min
 
       # Intentional shutdown
@@ -697,23 +703,158 @@ module MCPClient
         break unless @mutex.synchronize { @connection_established }
 
         @logger.debug('Events connection timed out after inactivity, reconnecting...')
-        sleep reconnect_delay
+        sleep events_reconnect_delay(reconnect_delay)
       rescue Faraday::ConnectionFailed => e
         break unless @mutex.synchronize { @connection_established }
 
         @logger.warn("Events connection failed: #{e.message}, retrying in #{reconnect_delay}s...")
-        sleep reconnect_delay
+        sleep events_reconnect_delay(reconnect_delay)
         reconnect_delay = [reconnect_delay * 2, SSE_MAX_RECONNECT_DELAY].min
       rescue StandardError => e
         break unless @mutex.synchronize { @connection_established }
 
         @logger.error("Unexpected error in events connection: #{e.class} - #{e.message}")
         @logger.debug(e.backtrace.join("\n")) if @logger.level <= Logger::DEBUG
-        sleep reconnect_delay
+        sleep events_reconnect_delay(reconnect_delay)
         reconnect_delay = [reconnect_delay * 2, SSE_MAX_RECONNECT_DELAY].min
       end
     ensure
       @logger.info('Events connection thread terminated')
+    end
+
+    # Reconnect delay for the events stream: the server's SSE retry directive
+    # (in ms) when present, otherwise the caller's backoff value.
+    # @param fallback_seconds [Numeric] exponential-backoff fallback
+    # @return [Numeric] delay in seconds
+    def events_reconnect_delay(fallback_seconds)
+      retry_ms = @sse_retry_ms
+      retry_ms ? retry_ms / 1000.0 : fallback_seconds
+    end
+
+    # Wait for a response replayed after the POST stream was closed before
+    # delivering it (SEP-1699 polling pattern). A dedicated worker issues
+    # HTTP GETs carrying the disconnected stream's Last-Event-ID cursor — the
+    # general events stream (opened without that cursor) cannot receive the
+    # replay.
+    # @param request_id [Integer, String] id of the outstanding request
+    # @param cursor [String] last event id received on the closed stream
+    # @param retry_ms [Integer, nil] retry directive received on the closed
+    #   stream itself (not the shared events-stream directive)
+    # @return [Hash, nil] the replayed JSON-RPC response, or nil on timeout
+    def resume_response_via_get(request_id, cursor, retry_ms = nil)
+      queue = Thread::Queue.new
+      @mutex.synchronize { @pending_stream_responses[request_id] = queue }
+
+      resume_thread = Thread.new { run_resumption_loop(request_id, cursor, retry_ms) }
+      begin
+        queue.pop(timeout: @read_timeout)
+      ensure
+        @mutex.synchronize { @pending_stream_responses.delete(request_id) }
+        resume_thread.kill
+        resume_thread.join(1)
+      end
+    end
+
+    # Reconnecting worker for SEP-1699 resumption. The server MAY close a
+    # resumed stream again before returning the response (polling pattern),
+    # so each iteration issues a GET with the CURRENT cursor until the
+    # overall read timeout elapses or the waiter has been served. `id:`
+    # fields received on the resumed stream advance the cursor and `retry:`
+    # fields update the delay honored before the next reconnect (zero is a
+    # valid immediate-reconnect directive).
+    # @param request_id [Integer, String] id of the outstanding request
+    # @param cursor [String] Last-Event-ID cursor from the closed stream
+    # @param retry_ms [Integer, nil] retry directive from the closed stream
+    # @return [void]
+    def run_resumption_loop(request_id, cursor, retry_ms)
+      deadline = Process.clock_gettime(Process::CLOCK_MONOTONIC) + @read_timeout
+      state = { cursor: cursor, retry_ms: retry_ms }
+      # SEP-1699: the client MUST respect the server's retry directive before
+      # attempting to reconnect.
+      delay = retry_ms ? retry_ms / 1000.0 : 0
+
+      loop do
+        sleep(delay) if delay.positive?
+        issue_resumption_get(state)
+        break unless @mutex.synchronize { @pending_stream_responses.key?(request_id) }
+        break if Process.clock_gettime(Process::CLOCK_MONOTONIC) >= deadline
+
+        delay = state[:retry_ms] ? state[:retry_ms] / 1000.0 : SSE_RECONNECT_DELAY
+      end
+    end
+
+    # One GET with the current cursor; complete SSE events are dispatched
+    # through the standard server-message path, which routes replayed
+    # responses to their registered waiters. `id:` and `retry:` fields
+    # received on this stream update the resumption state live.
+    # @param state [Hash] mutable resumption state (:cursor, :retry_ms)
+    # @return [void]
+    def issue_resumption_get(state)
+      conn = Faraday.new(url: @base_url) do |f|
+        f.options.open_timeout = 10
+        f.options.timeout = @read_timeout
+        f.adapter :net_http
+      end
+
+      buffer = +''
+      conn.get(@endpoint) do |req|
+        apply_events_headers(req)
+        req.headers['Last-Event-ID'] = state[:cursor]
+        req.options.on_data = proc do |chunk, _bytes|
+          buffer << chunk
+          process_resumption_buffer(buffer, state)
+        end
+      end
+    rescue StandardError => e
+      @logger.debug("Resumption GET failed: #{e.message}")
+    end
+
+    # Extract complete SSE events (terminated by a blank line, LF or CRLF)
+    # from the resumption buffer and handle each of them.
+    # @param buffer [String] mutable stream buffer
+    # @param state [Hash] mutable resumption state (:cursor, :retry_ms)
+    # @return [void]
+    def process_resumption_buffer(buffer, state)
+      while (separator = buffer.match(/\r\n\r\n|\n\n/))
+        event_text = buffer.slice!(0, separator.end(0))
+        handle_resumption_event(event_text, state)
+      end
+    end
+
+    # Parse one SSE event received on a resumption stream: track `id:` lines
+    # (advancing the cursor used by the next reconnect) and `retry:` lines
+    # (updating the reconnect delay; zero is valid), then dispatch any data.
+    # @param event_text [String] one complete SSE event, separator included
+    # @param state [Hash] mutable resumption state (:cursor, :retry_ms)
+    # @return [void]
+    def handle_resumption_event(event_text, state)
+      data_lines = []
+      event_text.each_line do |raw_line|
+        line = raw_line.chomp
+        if line.start_with?('data:')
+          data_lines << line.sub(/\Adata:\s*/, '')
+        elsif line.start_with?('id:')
+          id = line.sub(/\Aid:\s*/, '').strip
+          state[:cursor] = id unless id.empty?
+        elsif line.start_with?('retry:')
+          raw = line.sub(/\Aretry:\s*/, '').strip
+          state[:retry_ms] = raw.to_i if raw.match?(/\A\d+\z/)
+        end
+      end
+      handle_server_message(data_lines.join("\n")) unless data_lines.empty?
+    end
+
+    # Deliver a response replayed on the events stream to a waiting request.
+    # The pending entry is removed on delivery so resumption workers can see
+    # that their waiter has been served.
+    # @param message [Hash] a JSON-RPC response message
+    # @return [void]
+    def deliver_stream_response(message)
+      queue = @mutex.synchronize do
+        key = [message['id'], message['id'].to_s].find { |k| @pending_stream_responses.key?(k) }
+        @pending_stream_responses.delete(key) unless key.nil?
+      end
+      queue << message if queue
     end
 
     # Apply headers for events connection
@@ -722,6 +863,12 @@ module MCPClient
       @headers.each { |k, v| req.headers[k] = v }
       req.headers['Mcp-Session-Id'] = @session_id if @session_id
       req.headers['Mcp-Protocol-Version'] = @protocol_version if @protocol_version
+      # MCP: authorization MUST be included in every HTTP request
+      @oauth_provider&.apply_authorization(req)
+      # SEP-1699: resumption is via GET with the Last-Event-ID cursor, so the
+      # server can replay messages missed since the last received event.
+      last_event_id = @mutex.synchronize { @last_event_id }
+      req.headers['Last-Event-ID'] = last_event_id if last_event_id
     end
 
     # Process event chunks from the server
@@ -779,9 +926,11 @@ module MCPClient
           event[:id] = line[3..].strip
           @last_event_id = event[:id]
         elsif line.start_with?('retry:')
-          # Server can suggest reconnection delay (in milliseconds)
-          retry_ms = line[6..].strip.to_i
-          @logger.debug("Server suggested retry delay: #{retry_ms}ms") if @logger.level <= Logger::DEBUG
+          # SEP-1699: the client MUST respect the server's retry directive
+          # (milliseconds) when reconnecting; zero is a valid directive.
+          raw = line[6..].strip
+          @sse_retry_ms = raw.to_i if raw.match?(/\A\d+\z/)
+          @logger.debug("Server suggested retry delay: #{raw}ms") if @logger.level <= Logger::DEBUG
         end
       end
 
@@ -798,21 +947,31 @@ module MCPClient
       return if data.empty?
 
       begin
-        message = JSON.parse(data)
-
-        # Handle ping requests from server (keepalive mechanism)
-        if message['method'] == 'ping' && message.key?('id')
-          handle_ping_request(message['id'])
-        elsif message['method'] && message.key?('id')
-          # Handle server-to-client requests (MCP 2025-06-18)
-          handle_server_request(message)
-        elsif message['method'] && !message.key?('id')
-          # Handle server notifications (messages without id)
-          @notification_callback&.call(message['method'], message['params'])
-        end
+        dispatch_server_message(JSON.parse(data))
       rescue JSON::ParserError => e
         @logger.error("Invalid JSON in server message: #{e.message}")
         @logger.debug("Raw data: #{data.inspect}") if @logger.level <= Logger::DEBUG
+      end
+    end
+
+    # Dispatch a parsed server message (request, ping, or notification).
+    # Used for messages arriving on the GET events stream and for messages
+    # interleaved on a POST SSE response stream.
+    # @param message [Hash] the parsed JSON-RPC message
+    def dispatch_server_message(message)
+      # Handle ping requests from server (keepalive mechanism)
+      if message['method'] == 'ping' && message.key?('id')
+        handle_ping_request(message['id'])
+      elsif message['method'] && message.key?('id')
+        # Handle server-to-client requests (MCP 2025-06-18)
+        handle_server_request(message)
+      elsif message['method'] && !message.key?('id')
+        # Handle server notifications (messages without id)
+        @notification_callback&.call(message['method'], message['params'])
+      elsif message.key?('id')
+        # A response replayed on the events stream after its POST stream was
+        # closed before delivery (SEP-1699 resumption)
+        deliver_stream_response(message)
       end
     end
 
@@ -833,6 +992,8 @@ module MCPClient
           @headers.each { |k, v| req.headers[k] = v }
           req.headers['Mcp-Session-Id'] = @session_id if @session_id
           req.headers['Mcp-Protocol-Version'] = @protocol_version if @protocol_version
+          # MCP: authorization MUST be included in every HTTP request
+          @oauth_provider&.apply_authorization(req)
           req.body = pong_response.to_json
         end
 
@@ -872,26 +1033,24 @@ module MCPClient
       send_error_response(request_id, -32_603, "Internal error: #{e.message}")
     end
 
-    # Handle elicitation/create request from server (MCP 2025-06-18)
-    # @param request_id [String, Integer] the JSON-RPC request ID (used as elicitationId)
+    # Handle elicitation/create request from server (MCP 2025-11-25)
+    # @param request_id [String, Integer] the JSON-RPC request ID
     # @param params [Hash] the elicitation parameters
     # @return [void]
     def handle_elicitation_create(request_id, params)
-      # The request_id is the elicitationId per MCP spec
-      elicitation_id = request_id
-
-      # If no callback is registered, decline the request
+      # Without a callback there is no user to interact with: answer with a
+      # JSON-RPC error rather than fabricating a user "decline".
       unless @elicitation_request_callback
-        @logger.warn('Received elicitation request but no callback registered, declining')
-        send_elicitation_response(elicitation_id, { 'action' => 'decline' })
+        @logger.warn('Received elicitation request but no callback registered')
+        send_error_response(request_id, -32_601, 'Elicitation not supported: no handler configured')
         return
       end
 
       # Call the registered callback
       result = @elicitation_request_callback.call(request_id, params)
 
-      # Send the response back to the server
-      send_elicitation_response(elicitation_id, result)
+      # Send the response back to the server (echoing related-task _meta)
+      send_elicitation_response(request_id, merge_related_task_meta(result, params))
     end
 
     # Handle roots/list request from server (MCP 2025-06-18)
@@ -909,8 +1068,8 @@ module MCPClient
       # Call the registered callback
       result = @roots_list_request_callback.call(request_id, params)
 
-      # Send the response back to the server
-      send_roots_list_response(request_id, result)
+      # Send the response back to the server (echoing related-task _meta)
+      send_roots_list_response(request_id, merge_related_task_meta(result, params))
     end
 
     # Handle sampling/createMessage request from server (MCP 2025-11-25)
@@ -928,8 +1087,8 @@ module MCPClient
       # Call the registered callback
       result = @sampling_request_callback.call(request_id, params)
 
-      # Send the response back to the server
-      send_sampling_response(request_id, result)
+      # Send the response back to the server (echoing related-task _meta)
+      send_sampling_response(request_id, merge_related_task_meta(result, params))
     end
 
     # Send roots/list response back to server via HTTP POST (MCP 2025-06-18)
@@ -972,29 +1131,29 @@ module MCPClient
       @logger.error("Error sending sampling response: #{e.message}")
     end
 
-    # Send elicitation response back to server via HTTP POST (MCP 2025-06-18)
-    # For streamable HTTP, this is sent as a JSON-RPC request (not response)
-    # because HTTP is unidirectional.
-    # @param elicitation_id [String] the elicitation ID from the server
+    # Send elicitation response back to server via HTTP POST (MCP 2025-11-25)
+    # The reply to a server's elicitation/create request is a standard
+    # JSON-RPC response echoing the request id, POSTed like every other
+    # response on this transport.
+    # @param request_id [String, Integer] the JSON-RPC request ID
     # @param result [Hash] the elicitation result (action and optional content)
     # @return [void]
-    def send_elicitation_response(elicitation_id, result)
-      params = {
-        'elicitationId' => elicitation_id,
-        'action' => result['action']
-      }
+    def send_elicitation_response(request_id, result)
+      # Error-shaped results become JSON-RPC error responses (e.g. -32602 for
+      # an undeclared elicitation mode), mirroring the sampling error path.
+      if result.is_a?(Hash) && result['error']
+        send_error_response(request_id, result['error']['code'] || -32_603,
+                            result['error']['message'] || 'Elicitation error')
+        return
+      end
 
-      # Only include content if present (typically for 'accept' action)
-      params['content'] = result['content'] if result['content']
-
-      request = {
+      response = {
         'jsonrpc' => '2.0',
-        'method' => 'elicitation/response',
-        'params' => params
+        'id' => request_id,
+        'result' => result
       }
 
-      # Send as a JSON-RPC request via HTTP POST
-      post_jsonrpc_response(request)
+      post_jsonrpc_response(response)
     rescue StandardError => e
       @logger.error("Error sending elicitation response: #{e.message}")
     end
@@ -1034,6 +1193,8 @@ module MCPClient
           @headers.each { |k, v| req.headers[k] = v }
           req.headers['Mcp-Session-Id'] = @session_id if @session_id
           req.headers['Mcp-Protocol-Version'] = @protocol_version if @protocol_version
+          # MCP: authorization MUST be included in every HTTP request
+          @oauth_provider&.apply_authorization(req)
           req.body = json_body
         end
 

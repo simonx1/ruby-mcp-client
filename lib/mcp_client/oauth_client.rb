@@ -20,6 +20,8 @@ module MCPClient
     # @option options [String, nil] :name Optional name for this server
     # @option options [Logger, nil] :logger Optional logger
     # @option options [Object, nil] :storage Storage backend for OAuth tokens and client info
+    # @option options [String, nil] :client_id_metadata_url HTTPS URL of this client's
+    #   Client ID Metadata Document (SEP-991)
     # @return [ServerHTTP] OAuth-enabled HTTP server
     def self.create_http_server(server_url:, **options)
       opts = default_server_options.merge(options)
@@ -29,7 +31,8 @@ module MCPClient
         redirect_uri: opts[:redirect_uri],
         scope: opts[:scope],
         logger: opts[:logger],
-        storage: opts[:storage]
+        storage: opts[:storage],
+        client_id_metadata_url: opts[:client_id_metadata_url]
       )
 
       ServerHTTP.new(
@@ -57,7 +60,8 @@ module MCPClient
         redirect_uri: opts[:redirect_uri],
         scope: opts[:scope],
         logger: opts[:logger],
-        storage: opts[:storage]
+        storage: opts[:storage],
+        client_id_metadata_url: opts[:client_id_metadata_url]
       )
 
       ServerStreamableHTTP.new(
@@ -120,7 +124,8 @@ module MCPClient
         retry_backoff: 1,
         name: nil,
         logger: nil,
-        storage: nil
+        storage: nil,
+        client_id_metadata_url: nil
       }
     end
   end

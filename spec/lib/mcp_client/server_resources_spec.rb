@@ -3,7 +3,14 @@
 require 'spec_helper'
 
 RSpec.shared_examples 'resource server methods' do
-  let(:server) { described_class.new(**server_config) }
+  let(:server) do
+    described_class.new(**server_config).tap do |s|
+      # Subscriptions are capability-gated (MCP lifecycle: only use
+      # negotiated capabilities); these examples model a subscribing server.
+      s.instance_variable_set(:@capabilities,
+                              { 'resources' => { 'subscribe' => true, 'listChanged' => true } })
+    end
+  end
 
   describe '#list_resources' do
     context 'without pagination' do

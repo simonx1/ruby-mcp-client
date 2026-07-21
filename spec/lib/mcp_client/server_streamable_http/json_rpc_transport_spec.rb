@@ -553,7 +553,19 @@ RSpec.describe MCPClient::ServerStreamableHTTP::JsonRpcTransport do
     context 'without data line' do
       let(:sse_body) { "event: message\nid: 123\n\n" }
 
-      it 'raises error when no data line found' do
+      it 'treats the event as a priming event, tracks its id, and raises for the missing response' do
+        expect { transport.send(:parse_sse_response, sse_body) }.to raise_error(
+          MCPClient::Errors::TransportError,
+          /No JSON-RPC response found in SSE response/
+        )
+        expect(transport.instance_variable_get(:@last_event_id)).to eq('123')
+      end
+    end
+
+    context 'without any SSE fields' do
+      let(:sse_body) { "event: message\nno data line\n\n" }
+
+      it 'raises error when no data found' do
         expect { transport.send(:parse_sse_response, sse_body) }.to raise_error(
           MCPClient::Errors::TransportError,
           /No data found in SSE response/

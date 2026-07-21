@@ -25,7 +25,7 @@ RSpec.describe MCPClient::HttpTransportBase do
       end
 
       # Stub parse_response since it's abstract in the base module
-      def parse_response(_response)
+      def parse_response(_response, _request = nil)
         { 'result' => 'test' }
       end
 
@@ -133,13 +133,18 @@ RSpec.describe MCPClient::HttpTransportBase do
 
   describe '#valid_session_id?' do
     context 'with valid session IDs' do
+      # MCP 2025-11-25: session IDs may contain any visible ASCII character
+      # (0x21-0x7E) — e.g. a UUID, a JWT, or a cryptographic hash.
       valid_session_ids = [
         'abc123def456',           # alphanumeric
         'session_id_123',         # with underscores
         'sess-123-abc_def',       # with hyphens and underscores
-        'a1b2c3d4e5f6g7h8', # mixed alphanumeric
-        '12345678',               # minimum length (8 chars)
-        'A' * 128                 # maximum length (128 chars)
+        'a1b2c3d4e5f6g7h8',       # mixed alphanumeric
+        '1234',                   # short ids are spec-valid
+        'A' * 4096,               # generous length cap
+        'eyJhbGci.eyJzdWIi.SflK', # JWT-style with dots
+        'c2Vzc2lvbisvPQ==',       # base64 with + / =
+        'session@id!#$%^&*()'     # other visible ASCII
       ]
 
       valid_session_ids.each do |session_id|
@@ -152,33 +157,11 @@ RSpec.describe MCPClient::HttpTransportBase do
     context 'with invalid session IDs' do
       invalid_session_ids = [
         '',                       # empty string
-        'short',                  # too short (< 8 chars)
-        'A' * 129,               # too long (> 128 chars)
-        'session@id',            # invalid character (@)
-        'session id',            # space character
-        'session.id',            # dot character
-        'session/id',            # slash character
-        'session%id',            # percent character
-        'session#id',            # hash character
-        'session+id',            # plus character
-        'session=id',            # equals character
-        'session?id',            # question mark
-        'session&id',            # ampersand
-        'session|id',            # pipe character
-        'session;id',            # semicolon
-        'session:id',            # colon
-        'session<id>',           # angle brackets
-        'session[id]',           # square brackets
-        'session{id}',           # curly brackets
-        'session(id)',           # parentheses
-        'session"id"',           # quotes
-        "session'id'",           # single quotes
-        'session`id`',           # backticks
-        'session~id',            # tilde
-        'session!id',            # exclamation mark
-        'session$id',            # dollar sign
-        'session^id',            # caret
-        'session*id'             # asterisk
+        'session id',             # space (0x20) is outside 0x21-0x7E
+        "tab\tid",                # control character
+        "newline\nid",            # control character
+        'sessão-1',               # non-ASCII
+        'A' * 4097                # over the length cap
       ]
 
       invalid_session_ids.each do |session_id|
@@ -338,6 +321,7 @@ RSpec.describe MCPClient::HttpTransportBase do
 
     before do
       allow(response).to receive(:respond_to?).with(:reason_phrase).and_return(true)
+      allow(response).to receive(:respond_to?).with(:headers).and_return(true)
       allow(response).to receive(:reason_phrase).and_return('Test Error')
     end
 
@@ -346,6 +330,7 @@ RSpec.describe MCPClient::HttpTransportBase do
         [401, 403].each do |status|
           it "raises ConnectionError for HTTP #{status}" do
             allow(response).to receive(:status).and_return(status)
+            allow(response).to receive(:headers).and_return({})
 
             expect do
               transport.test_handle_http_error_response(response)

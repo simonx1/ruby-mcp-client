@@ -9,6 +9,22 @@ module MCPClient
 
     # Initialize the server with a name
     # @param name [String, nil] server name
+    # Server-declared instructions from the initialize result, if any
+    # @return [String, nil]
+    attr_reader :instructions
+
+    # Host-supplied Implementation info sent as clientInfo during initialize
+    # (MCP 2025-11-25 Implementation: name, version, plus optional title,
+    # description, websiteUrl, icons). Defaults to the gem's identity.
+    # @param info [Hash] implementation info; must include name and version
+    # @raise [ArgumentError] when name or version is missing
+    def client_info=(info)
+      raise ArgumentError, 'client_info must include name' unless info['name'] || info[:name]
+      raise ArgumentError, 'client_info must include version' unless info['version'] || info[:version]
+
+      @client_info = info.transform_keys(&:to_s)
+    end
+
     def initialize(name: nil)
       @name = name
     end
@@ -83,9 +99,59 @@ module MCPClient
     end
 
     # Get server capabilities
+    # MCP 2025-11-25 tasks: all messages related to a task MUST carry the
+    # io.modelcontextprotocol/related-task key in _meta. Reserved key name:
+    RELATED_TASK_META_KEY = 'io.modelcontextprotocol/related-task'
+
+    # Echo the related-task _meta of an incoming server request onto the
+    # outgoing result, so responses to task-related requests (elicitation or
+    # sampling during input_required) stay associated with their task.
+    # @param result [Hash] the outgoing JSON-RPC result payload
+    # @param params [Hash, nil] the incoming request params
+    # @return [Hash] result with related-task _meta merged when applicable
+    def merge_related_task_meta(result, params)
+      related = params.is_a?(Hash) ? params.dig('_meta', RELATED_TASK_META_KEY) : nil
+      return result unless related && result.is_a?(Hash) && !result.key?('error')
+
+      meta = (result['_meta'] || {}).merge(RELATED_TASK_META_KEY => related)
+      result.merge('_meta' => meta)
+    end
+
     # @return [Hash, nil] server capabilities
     def capabilities
       raise NotImplementedError, 'Subclasses must implement capabilities'
+    end
+
+    # Whether the server declared the given (possibly nested) capability
+    # during initialization.
+    # @param path [Array<String, Symbol>] capability key path, e.g. 'logging'
+    #   or 'resources', 'subscribe'
+    # @return [Boolean]
+    def capability?(*path)
+      node = begin
+        capabilities
+      rescue NotImplementedError
+        nil
+      end
+      path.each do |key|
+        return false unless node.is_a?(Hash)
+
+        node = node[key.to_s]
+      end
+      !node.nil? && node != false
+    end
+
+    # Raise unless the server negotiated the given capability (MCP lifecycle:
+    # "Only use capabilities that were successfully negotiated").
+    # @param path [Array<String, Symbol>] capability key path
+    # @param method [String] the JSON-RPC method the caller wants to send
+    # @raise [MCPClient::Errors::CapabilityError]
+    def require_capability!(*path, method:)
+      return if capability?(*path)
+
+      raise MCPClient::Errors::CapabilityError,
+            "Server #{name || self.class.name} did not declare the #{path.join('.')} capability " \
+            "required for #{method}"
     end
 
     # Clean up the server connection
