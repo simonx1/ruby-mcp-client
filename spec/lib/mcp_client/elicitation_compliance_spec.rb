@@ -88,6 +88,52 @@ RSpec.describe 'Elicitation compliance (MCP 2025-11-25)' do
       end
     end
 
+    context 'when the server requests an unknown mode and no handler is configured' do
+      it 'returns -32602 (mode check precedes handler check)' do
+        client = described_class.new
+
+        result = client.send(:handle_elicitation_request, 1, params.merge('mode' => 'voice'))
+
+        expect(result['error']).to include('code' => -32_602)
+      end
+    end
+
+    context 'when the handler returns scalar content' do
+      it 'returns -32603 instead of sending non-object content' do
+        handler = ->(_m, _s) { 'yes' }
+        client = described_class.new(elicitation_handler: handler)
+
+        result = client.send(:handle_elicitation_request, 5, params)
+
+        expect(result['error']).to include('code' => -32_603)
+      end
+    end
+
+    context 'when the handler uses symbol keys in URL mode' do
+      it 'still omits the content field' do
+        handler = ->(_m, _p) { { action: :accept, content: { 'stray' => 'data' } } }
+        client = described_class.new(elicitation_handler: handler)
+
+        url_params = { 'mode' => 'url', 'message' => 'Visit', 'url' => 'https://e.com', 'elicitationId' => 'e2' }
+        result = client.send(:handle_elicitation_request, 6, url_params)
+
+        expect(result['action']).to eq('accept')
+        expect(result).not_to have_key('content')
+        expect(result).not_to have_key(:content)
+      end
+    end
+
+    context 'when the handler attaches content to a decline' do
+      it 'strips content (only accept results carry content)' do
+        handler = ->(_m, _s) { { 'action' => 'decline', 'content' => { 'name' => 'x' } } }
+        client = described_class.new(elicitation_handler: handler)
+
+        result = client.send(:handle_elicitation_request, 7, params)
+
+        expect(result).to eq({ 'action' => 'decline' })
+      end
+    end
+
     context 'when the handler returns conforming content' do
       it 'returns the accept result unchanged' do
         handler = ->(_m, _s) { { 'name' => 'Alice' } }

@@ -99,6 +99,24 @@ module MCPClient
     end
 
     # Get server capabilities
+    # MCP 2025-11-25 tasks: all messages related to a task MUST carry the
+    # io.modelcontextprotocol/related-task key in _meta. Reserved key name:
+    RELATED_TASK_META_KEY = 'io.modelcontextprotocol/related-task'
+
+    # Echo the related-task _meta of an incoming server request onto the
+    # outgoing result, so responses to task-related requests (elicitation or
+    # sampling during input_required) stay associated with their task.
+    # @param result [Hash] the outgoing JSON-RPC result payload
+    # @param params [Hash, nil] the incoming request params
+    # @return [Hash] result with related-task _meta merged when applicable
+    def merge_related_task_meta(result, params)
+      related = params.is_a?(Hash) ? params.dig('_meta', RELATED_TASK_META_KEY) : nil
+      return result unless related && result.is_a?(Hash) && !result.key?('error')
+
+      meta = (result['_meta'] || {}).merge(RELATED_TASK_META_KEY => related)
+      result.merge('_meta' => meta)
+    end
+
     # @return [Hash, nil] server capabilities
     def capabilities
       raise NotImplementedError, 'Subclasses must implement capabilities'
