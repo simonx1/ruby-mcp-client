@@ -1,5 +1,182 @@
 # Changelog
 
+## 2.0.0 (2026-07-21)
+
+Full compliance pass against the **MCP 2025-11-25** specification: every transport,
+utility and auth flow was audited against the spec and brought into conformance
+(PRs #158–#185). The wire behavior and several error semantics changed as a result,
+so this is a major release. See **Migration notes** below.
+
+### Breaking Changes
+
+- **Elicitation error semantics and wire format** (#158, #159). Elicitation replies
+  are now proper JSON-RPC *responses* (the previous Streamable HTTP implementation
+  invented an `elicitation/response` request that no spec defines). Hosts get spec
+  error codes instead of fabricated user answers: no handler configured → `-32601`
+  (was an automatic `'decline'`); handler raised → `-32603` (was `'decline'`);
+  undeclared mode → `-32602` (mode is checked before the handler); non-object or
+  scalar `content` → `-32603` instead of being transmitted. `content` is omitted for
+  `decline`/`cancel` and for out-of-band (`url`) accepts, per the `ElicitResult` schema.
+- **Sampling error semantics** (#177). No handler → `-32601`, handler exception →
+  `-32603` (both were the user-rejection code `-1`); tool-enabled sampling requests
+  (`tools`/`toolChoice`, SEP-1577) are rejected with `-32602` unless the host opts in
+  via `sampling_supports_tools: true`.
+- **Declared client capabilities are derived from registered handlers** (#160).
+  stdio and SSE no longer unconditionally declare `sampling`/`elicitation`; every
+  transport declares exactly what the host wired up before `connect` (elicitation
+  modes `form`+`url`, `roots.listChanged`, `sampling`). Compliant servers will stop
+  sending requests your host never handled — previously they were answered with
+  fabricated declines.
+- **Protocol version negotiation is enforced** (#161). If the server's `initialize`
+  result carries an unsupported or missing `protocolVersion` (supported: `2025-11-25`,
+  `2025-06-18`, `2025-03-26`, `2024-11-05`), the client disconnects and raises
+  `MCPClient::Errors::ConnectionError`. Non-object initialize results also fail the
+  connection (#161, #172).
+- **Server capability gating** (#173). `subscribe_resource`, `unsubscribe_resource`,
+  `complete`, `list_tasks` and `cancel_task` raise the new
+  `MCPClient::Errors::CapabilityError` when the server did not negotiate the
+  corresponding capability (the lifecycle forbids using un-negotiated capabilities).
+  `Client#log_level=` now *skips* servers without the `logging` capability instead of
+  raising on the first one — its return value only covers logging-capable servers.
+- **Timeouts no longer re-send** (#178). A request that exceeds its timeout raises the
+  new `MCPClient::Errors::RequestTimeoutError` (a `TransportError` subclass — existing
+  rescues keep working) and is excluded from automatic retries, because the server may
+  still be executing it; a best-effort `notifications/cancelled` is sent instead
+  (never for `initialize`; task-augmented calls use `tasks/cancel`). Previously
+  timed-out requests were retried up to `retries` times, risking double execution.
+- **Roots are validated** (#169). `MCPClient::Root` (and `Client.new(roots:)`) raises
+  `ArgumentError` for non-`file://` URIs, `..` traversal segments (checked after
+  percent-decoding), and non-Hash `_meta`.
+- **PKCE is mandatory** (#165). The OAuth flow refuses to proceed (raises
+  `ConnectionError`) when the authorization server does not advertise
+  `code_challenge_methods_supported` including `S256`, instead of silently continuing
+  without PKCE.
+- **OAuth challenge parsing is Bearer-scoped** (#163). `WWW-Authenticate` parameters
+  are read from the Bearer challenge's own segment only (quoted-string aware), a 403
+  with `error="insufficient_scope"` raises the new
+  `MCPClient::Errors::InsufficientScopeError` (a `ConnectionError` subclass exposing
+  `#scope`/`#error_description`), challenge-advertised scopes take priority for the
+  next authorization, and a challenge-advertised `resource_metadata` URL is
+  authoritative (no silent fallback to well-known paths).
+- **`_meta` moved out of tool arguments** (#179). Request-level `_meta` supplied in
+  `call_tool`/`get_prompt` arguments (as `:_meta` or `'_meta'`) is hoisted to the
+  JSON-RPC `params` level on the wire on every transport, instead of being serialized
+  as a tool argument (where it could fail the tool's input schema).
+- **Streamable HTTP resumability follows SEP-1699** (#168, #181). `Last-Event-ID` is
+  no longer sent on POST requests; interrupted response streams are resumed via GET
+  with the per-stream cursor, honoring the server's `retry:` directive.
+- **Legacy SSE fixes change failure modes** (#172). Server JSON-RPC *error* responses
+  now surface immediately as `MCPClient::Errors::ServerError` (previously the request
+  hung until the read timeout); an endpoint URL that cannot be resolved fails
+  `connect` with `ConnectionError`; the negotiated `MCP-Protocol-Version` header is
+  sent on subsequent HTTP requests.
+- **Session handling** (#162). Session IDs are validated against the spec charset
+  (any visible ASCII, 1–4096 chars — JWTs and base64 IDs now accepted; the previous
+  `[A-Za-z0-9_-]{8,128}` rule rejected them), and an HTTP 404 on a session-bearing
+  request transparently re-initializes and re-sends once (Streamable HTTP session
+  expiry recovery).
+- **`taskSupport: "required"` without a task-capable server is a plain call** (#174).
+  Per tasks tool-level negotiation, when the server lacks `tasks.requests.tools.call`
+  the tool's `execution.taskSupport` is disregarded entirely — previously the client
+  raised `ToolCallError`.
+- **stdio shutdown and encoding** (#171). `cleanup` closes stdin and gives the server
+  a grace period to exit before SIGTERM/SIGKILL (previously immediate); pipes are
+  pinned to UTF-8 so multibyte content cannot corrupt framing on non-UTF-8 locales.
+
+### New Features
+
+- **Streamable HTTP POST SSE streams** (#158): server requests and notifications
+  interleaved on a POST response stream are dispatched (elicitation/sampling/roots/
+  ping work mid-call), instead of the first event being taken as "the response".
+- **Resumability** (#168, #181): GET-based resumption with `Last-Event-ID`, per-stream
+  cursors, and support for the SSE `retry:` directive (including `retry: 0`).
+- **Progress tracking** (#179): `client.call_tool(name, args, progress: ->(progress, total, message) { ... })`
+  auto-generates a `progressToken`, routes matching `notifications/progress` to the
+  callback while the request is active, and drops stale tokens afterwards.
+- **Per-request timeouts** (#178): `Client#send_rpc(..., timeout:)` and
+  `ServerBase#rpc_request(..., timeout:)` override the per-server `read_timeout`.
+- **Client identity & server instructions** (#180): `Client.new(client_info: {...})`
+  sends a host-provided `Implementation` as `clientInfo`; `server.instructions`
+  exposes the server's `initialize` instructions hint.
+- **Sampling tool calling, SEP-1577** (#177): `sampling_supports_tools: true` declares
+  `sampling.tools` and forwards `tools`/`toolChoice` to the handler (optional fifth
+  handler argument receives the full request params).
+- **Structured content validation** (#176): tool results with `structuredContent` are
+  validated against the tool's `outputSchema` — `validate_structured_content: :warn`
+  (default) logs mismatches, `:strict` raises `ValidationError`; unsupported schema
+  keywords are surfaced transparently.
+- **OAuth**: Client ID Metadata Documents, SEP-991 (#175) via
+  `client_id_metadata_url:` (skips dynamic registration when the AS supports CIMD);
+  scope step-up via `InsufficientScopeError` (#163); authorization applied to every
+  HTTP request including SSE GETs and pong/response POSTs (#167).
+- **Model metadata** (#170): `icons`, `title` and `_meta` parsed and exposed on
+  `Tool`, `Prompt`, `Resource` and `ResourceTemplate`.
+- **Capability introspection** (#173): `ServerBase#capability?('tasks', 'list')` and
+  `require_capability!` are public API.
+- **Tasks related-task metadata** (#174): `io.modelcontextprotocol/related-task`
+  `_meta` is echoed on responses to server requests issued within a task context.
+- **New error classes**: `CapabilityError`, `RequestTimeoutError`,
+  `InsufficientScopeError`.
+
+### Bug Fixes
+
+- Streamable HTTP: server requests arriving on a POST SSE stream are answered instead
+  of being mistaken for the call's response; lone responses with mismatched IDs are
+  tracked per stream (#158).
+- Elicitation over Streamable HTTP uses real JSON-RPC responses, so compliant servers
+  (e.g. FastMCP) receive answers they understand (#159).
+- Legacy SSE: JSON-RPC error responses are delivered to waiters; connection failures
+  during endpoint resolution surface through `wait_for_connection` (#172).
+- OAuth: Bearer tokens embedded in quoted parameter values no longer confuse
+  challenge parsing (quoted-string masking) (#163).
+- stdio: tolerates non-object JSON lines on stdout without killing the reader (#171).
+- Cancellation is suppressed for requests that must not be cancelled (`initialize`)
+  and for task-augmented calls (#178).
+
+### Examples & Tooling
+
+- The Streamable HTTP echo server implements the full tasks feature (capability,
+  `background_work` tool, `tasks/get|result|list|cancel`, status notifications), and
+  `tasks_example.rb` runs the complete lifecycle against it locally (#184, #185).
+- The elicitation demo server accepts standard JSON-RPC `ElicitResult` responses
+  (previously it only understood the pre-2.0 invented method) (#182).
+- The two OpenAI examples pin their intended gem (`openai` vs `ruby-openai` both
+  provide `lib/openai.rb`) onto the load path explicitly (#182).
+- The Anthropic example surfaces API error bodies (e.g. billing errors) and rejects
+  an empty `ANTHROPIC_API_KEY` (#183).
+- README documents all new public APIs (#182) and the supported protocol revisions.
+
+### Migration notes
+
+Upgrading a **host application**:
+
+- If you rescued elicitation/sampling failures by inspecting fabricated `'decline'`
+  results or the `-1` error code, switch to the JSON-RPC codes above.
+- Wrap `subscribe_resource`/`complete`/`list_tasks`/`cancel_task` calls in
+  `rescue MCPClient::Errors::CapabilityError` (or check `server.capability?` first)
+  if you talk to servers that do not negotiate those capabilities.
+- If you relied on timed-out requests being retried, retry explicitly — and treat
+  `RequestTimeoutError` as "outcome unknown", not "not executed".
+- Audit `roots:` values: only `file://` URIs without traversal segments are accepted.
+- If a server you depend on omits `protocolVersion` or answers with an unknown
+  revision, it will no longer connect — fix the server or pin an older gem.
+- Exact-class checks (`instance_of?`) on `TransportError`/`ConnectionError` will not
+  match the new subclasses; `rescue` hierarchies are unaffected.
+- `Client.new` gained keyword arguments only (`sampling_supports_tools:`,
+  `client_info:`, `validate_structured_content:`); existing positional usage is
+  unchanged.
+
+Upgrading a **server implementation tested against this client**:
+
+- Expect elicitation answers as JSON-RPC responses (id echoing your request), not
+  `elicitation/response` requests.
+- Expect request-level `_meta` in `params._meta`, not inside `params.arguments`.
+- Expect `Last-Event-ID` on GET resumption requests only, `MCP-Protocol-Version` on
+  legacy SSE POSTs, and `notifications/cancelled` after client-side timeouts.
+- Declared client capabilities now reflect what the host registered — do not send
+  elicitation/sampling requests unless the capability was declared.
+
+
 ## 1.1.0 (2026-07-04)
 
 ### Breaking Changes
