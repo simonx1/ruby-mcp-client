@@ -129,6 +129,7 @@ module MCPClient
 
       @server_info = result['serverInfo']
       @capabilities = result['capabilities']
+      @instructions = result['instructions']
       @protocol_version = result['protocolVersion']
     end
 

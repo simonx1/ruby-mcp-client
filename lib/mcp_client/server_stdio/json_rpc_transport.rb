@@ -39,6 +39,7 @@ module MCPClient
         result = res['result'] || {}
         @server_info = result['serverInfo']
         @capabilities = result['capabilities']
+        @instructions = result['instructions']
 
         # Send initialized notification
         notif = build_jsonrpc_notification('notifications/initialized', {})

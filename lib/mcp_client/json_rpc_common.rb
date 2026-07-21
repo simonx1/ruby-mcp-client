@@ -75,8 +75,17 @@ module MCPClient
       {
         'protocolVersion' => MCPClient::PROTOCOL_VERSION,
         'capabilities' => client_capabilities,
-        'clientInfo' => { 'name' => 'ruby-mcp-client', 'version' => MCPClient::VERSION }
+        'clientInfo' => client_info_payload
       }
+    end
+
+    # The Implementation object sent as clientInfo: the host-provided info
+    # when configured (client_info=), otherwise the gem's identity.
+    # @return [Hash]
+    def client_info_payload
+      return @client_info if defined?(@client_info) && @client_info
+
+      { 'name' => 'ruby-mcp-client', 'version' => MCPClient::VERSION }
     end
 
     # Declared client capabilities, derived from the server-request callbacks

@@ -9,6 +9,22 @@ module MCPClient
 
     # Initialize the server with a name
     # @param name [String, nil] server name
+    # Server-declared instructions from the initialize result, if any
+    # @return [String, nil]
+    attr_reader :instructions
+
+    # Host-supplied Implementation info sent as clientInfo during initialize
+    # (MCP 2025-11-25 Implementation: name, version, plus optional title,
+    # description, websiteUrl, icons). Defaults to the gem's identity.
+    # @param info [Hash] implementation info; must include name and version
+    # @raise [ArgumentError] when name or version is missing
+    def client_info=(info)
+      raise ArgumentError, 'client_info must include name' unless info['name'] || info[:name]
+      raise ArgumentError, 'client_info must include version' unless info['version'] || info[:version]
+
+      @client_info = info.transform_keys(&:to_s)
+    end
+
     def initialize(name: nil)
       @name = name
     end
