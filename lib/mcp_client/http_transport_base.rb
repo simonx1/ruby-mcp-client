@@ -9,6 +9,19 @@ module MCPClient
   module HttpTransportBase
     include JsonRpcCommon
 
+    # Lightweight response wrapper for Faraday exception payloads (Hashes),
+    # so the exception path and the default path share one challenge pipeline.
+    NormalizedResponse = Struct.new(:status, :headers)
+
+    # One auth-param (name = token / quoted-string) as it appears in a
+    # WWW-Authenticate challenge (RFC 7235 §2.1, optional whitespace around '=').
+    AUTH_PARAM = /[A-Za-z0-9._~+-]+\s*=\s*(?:"(?:[^"\\]|\\.)*"|[^,\s]*)/
+    # A run of comma/space separated auth-params anchored at the start of a
+    # string. The run ends before a token that is NOT followed by '=' — the
+    # auth-scheme introducing the next challenge — while commas inside quoted
+    # values are consumed by the quoted-string branch, not treated as boundaries.
+    AUTH_PARAMS_RUN = /\A(?:[\s,]*#{AUTH_PARAM})*/
+
     # Generic JSON-RPC request: send method with params and return result
     # @param method [String] JSON-RPC method name
     # @param params [Hash] parameters for the request
@@ -203,22 +216,30 @@ module MCPClient
       # Default: no additional handling
     end
 
-    # Handle authentication errors
+    # Handle authentication errors raised by user-configured raise_error
+    # middleware; routes through the same challenge pipeline as the default
+    # response path.
     # @param error [Faraday::UnauthorizedError, Faraday::ForbiddenError] Auth error
-    # @raise [MCPClient::Errors::ConnectionError] Connection error
+    # @raise [MCPClient::Errors::InsufficientScopeError, MCPClient::Errors::ConnectionError]
     def handle_auth_error(error)
-      # Handle OAuth authorization challenges
-      if error.response && @oauth_provider
-        resource_metadata = @oauth_provider.handle_unauthorized_response(error.response)
-        if resource_metadata
-          @logger.debug('Received OAuth challenge, discovered resource metadata')
-          # Re-raise the error to trigger OAuth flow in calling code
-          raise MCPClient::Errors::ConnectionError, "OAuth authorization required: HTTP #{error.response[:status]}"
-        end
+      response = normalize_error_response(error.response)
+      if response
+        process_authorization_challenge(response)
+        raise_authorization_error(response)
       end
 
-      error_status = error.response ? error.response[:status] : 'unknown'
-      raise MCPClient::Errors::ConnectionError, "Authorization failed: HTTP #{error_status}"
+      raise MCPClient::Errors::ConnectionError, 'Authorization failed: HTTP unknown'
+    end
+
+    # @param raw [Faraday::Response, Hash, nil] an exception's response payload
+    # @return [#status, nil] a response-like object with #status and #headers
+    def normalize_error_response(raw)
+      return nil unless raw
+      return raw if raw.respond_to?(:status) && raw.respond_to?(:headers)
+
+      status = raw[:status] || raw['status']
+      headers = raw[:headers] || raw['headers'] || {}
+      NormalizedResponse.new(status, headers)
     end
 
     # Handle HTTP error responses
@@ -232,7 +253,11 @@ module MCPClient
 
       case response.status
       when 401, 403
-        raise MCPClient::Errors::ConnectionError, "Authorization failed: HTTP #{response.status}"
+        # MCP 2025-11-25: clients MUST parse WWW-Authenticate headers on 401
+        # responses and use the advertised resource metadata; the challenge's
+        # scope parameter is authoritative for the next authorization.
+        process_authorization_challenge(response)
+        raise_authorization_error(response)
       when 400..499
         # Deterministic client errors: the request was processed/rejected and
         # will not succeed on retry, so raise a plain (non-retryable) ServerError.
@@ -244,6 +269,79 @@ module MCPClient
       else
         raise MCPClient::Errors::ServerError, "HTTP error: #{response.status}#{reason_text}"
       end
+    end
+
+    # Surface a 401/403 WWW-Authenticate challenge to the OAuth provider so
+    # the advertised resource metadata and challenge scope are captured before
+    # the error propagates. Discovery failures must not mask the original
+    # authorization error.
+    # @param response [Faraday::Response] the 401/403 response
+    # @return [void]
+    def process_authorization_challenge(response)
+      return unless @oauth_provider && response.respond_to?(:headers)
+
+      @oauth_provider.handle_unauthorized_response(response)
+    rescue StandardError => e
+      @logger.debug("OAuth challenge processing failed: #{e.message}")
+    end
+
+    # Raise the appropriate error for a 401/403: an insufficient_scope 403
+    # challenge (SEP-835) raises InsufficientScopeError exposing the required
+    # scopes so hosts can run a step-up authorization flow.
+    # @param response [Faraday::Response] the 401/403 response
+    # @raise [MCPClient::Errors::InsufficientScopeError, MCPClient::Errors::ConnectionError]
+    def raise_authorization_error(response)
+      challenge = bearer_challenge_segment(www_authenticate_header(response))
+
+      if response.status == 403 && insufficient_scope_challenge?(challenge)
+        scope = challenge[/(?:^|[\s,])scope\s*=\s*"([^"]*)"/i, 1] ||
+                challenge[/(?:^|[\s,])scope\s*=\s*([^,\s"]+)/i, 1]
+        description = challenge[/(?:^|[\s,])error_description\s*=\s*"([^"]*)"/i, 1]
+        raise MCPClient::Errors::InsufficientScopeError.new(
+          "Authorization failed: HTTP 403 insufficient_scope#{" (required scopes: #{scope})" if scope}",
+          scope: scope, error_description: description
+        )
+      end
+
+      raise MCPClient::Errors::ConnectionError, "Authorization failed: HTTP #{response.status}"
+    end
+
+    # Extract the Bearer challenge's own parameter segment from a (possibly
+    # multi-challenge) WWW-Authenticate header, so params belonging to other
+    # schemes (e.g. `Basic error="insufficient_scope", Bearer realm="x"`) are
+    # never attributed to the Bearer challenge.
+    # @param header [String, nil] the WWW-Authenticate header value
+    # @return [String, nil] the Bearer challenge's parameters (possibly empty),
+    #   or nil when the header has no Bearer challenge
+    def bearer_challenge_segment(header)
+      return nil unless header
+
+      # Locate the Bearer scheme token only OUTSIDE quoted strings: a quoted
+      # value such as realm="prefix Bearer x" must not anchor the segment.
+      masked = header.gsub(/"(?:\\.|[^"\\])*"/) { |q| "\"#{' ' * (q.length - 2)}\"" }
+      match = masked.match(/(?:\A|[\s,])Bearer(?=[\s,]|\z)/i)
+      return nil unless match
+
+      header[match.end(0)..][AUTH_PARAMS_RUN]
+    end
+
+    # The Bearer challenge segment carries an error auth-param that is exactly
+    # insufficient_scope (RFC 6750 / SEP-835); prefixed or extended tokens
+    # (e.g. insufficient_scope.extra) do not match.
+    # @param challenge [String, nil] the Bearer challenge segment
+    # @return [Boolean]
+    def insufficient_scope_challenge?(challenge)
+      return false unless challenge
+
+      challenge.match?(/(?:^|[\s,])error\s*=\s*"?insufficient_scope"?(?![\w.-])/i)
+    end
+
+    # @param response [Faraday::Response] an HTTP response
+    # @return [String, nil] the WWW-Authenticate header value, if any
+    def www_authenticate_header(response)
+      return nil unless response.respond_to?(:headers) && response.headers
+
+      response.headers['WWW-Authenticate'] || response.headers['www-authenticate']
     end
 
     # Get or create HTTP connection
