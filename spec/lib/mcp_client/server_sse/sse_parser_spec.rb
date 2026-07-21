@@ -15,6 +15,7 @@ RSpec.describe MCPClient::ServerSSE::SseParser do
         cv = Object.new
         def cv.broadcast; end
         @connection_cv = cv
+        @base_url = 'https://example.com/sse'
         @logger = Logger.new(StringIO.new)
         @notification_callback = proc { |m, p|
           @notification_calls ||= []
@@ -55,7 +56,10 @@ RSpec.describe MCPClient::ServerSSE::SseParser do
     it 'handles endpoint events by setting rpc_endpoint and connection flags' do
       raw = "event: endpoint\ndata: /foo\n\n"
       parser.parse_and_handle_sse_event(raw)
-      expect(parser.rpc_endpoint).to eq('/foo')
+      # MCP 2024-11-05 HTTP with SSE: the endpoint event data is a URI
+      # reference resolved against the SSE connection URL (RFC 3986
+      # section 5.1.3), so the stored endpoint is absolute.
+      expect(parser.rpc_endpoint).to eq('https://example.com/foo')
       expect(parser.sse_connected).to be true
       expect(parser.connection_established).to be true
     end

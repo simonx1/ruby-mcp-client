@@ -97,7 +97,13 @@ module MCPClient
       @connection_established = false
       @connection_cv = @mutex.new_cond
       @initialized = false
+      # Negotiated protocol version captured from the initialize result
+      # (sent as the MCP-Protocol-Version header on post-initialize requests)
+      @protocol_version = nil
       @auth_error = nil
+      # Non-auth connection failure cause (e.g. invalid endpoint event URI)
+      # recorded by the SSE worker for wait_for_connection to surface
+      @connection_error = nil
       # Whether to use SSE transport; may disable if handshake fails
       @use_sse = true
 
@@ -363,6 +369,8 @@ module MCPClient
       begin
         # Don't reset auth error if it's pre-existing
         @mutex.synchronize { @auth_error = nil } unless pre_existing_auth_error
+        # Clear any stale connection failure cause from a previous attempt
+        @mutex.synchronize { @connection_error = nil }
 
         start_sse_thread
         effective_timeout = [@read_timeout || 30, 30].min
@@ -398,6 +406,10 @@ module MCPClient
         @connection_established = false
         @sse_connected = false
         @initialized = false # Reset initialization state for reconnection
+        # A fresh session negotiates its own protocol version; keeping the old
+        # one would leak the previous session's version into the next
+        # initialize POST's MCP-Protocol-Version header.
+        @protocol_version = nil
 
         # Reset the SSE parse buffer so a reconnect never inherits a leftover
         # partial event from the previous connection.
@@ -688,6 +700,9 @@ module MCPClient
       @rpc_conn.post do |req|
         req.url @rpc_endpoint
         req.headers['Content-Type'] = 'application/json'
+        # MCP lifecycle "Version Negotiation": include the MCP-Protocol-Version
+        # header on all HTTP requests after the initialize handshake.
+        req.headers['Mcp-Protocol-Version'] = @protocol_version if @protocol_version
         @headers.each { |k, v| req.headers[k] = v }
         req.body = json_body
       end
