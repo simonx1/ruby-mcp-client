@@ -203,6 +203,81 @@ client = MCPClient.connect('http://server/mcp',
 )
 ```
 
+Sampling tool calling (SEP-1577) is opt-in: pass `sampling_supports_tools: true`
+to declare the `sampling.tools` capability. The handler then receives the full
+request params (including `tools`/`toolChoice`) as an optional fifth argument;
+without the opt-in, tool-enabled sampling requests are rejected with `-32602`
+as the spec requires:
+
+```ruby
+client = MCPClient::Client.new(
+  mcp_server_configs: [...],
+  sampling_supports_tools: true,
+  sampling_handler: ->(messages, prefs, system_prompt, max_tokens, params = nil) {
+    tools = params && params['tools'] # ToolUseContent may be returned in content
+    # ...
+  }
+)
+```
+
+### Progress Tracking
+
+Attach a per-call progress callback — the client generates a unique
+`progressToken`, places it in the request `_meta`, and routes matching
+`notifications/progress` to your block while the request is active (stale
+tokens after completion are dropped):
+
+```ruby
+client.call_tool('long_running', args, progress: ->(progress, total, message) {
+  puts "#{message}: #{progress}/#{total}"
+})
+```
+
+A request-level `_meta` (e.g. a hand-picked `progressToken`) can also be passed
+inside the arguments under the `'_meta'` key on every transport — it is hoisted
+to the JSON-RPC params level on the wire, never sent as a tool argument.
+
+### Timeouts and Cancellation
+
+Timeouts are configurable per request in addition to the per-server
+`read_timeout`. A timed-out request raises
+`MCPClient::Errors::RequestTimeoutError` (a `TransportError` subclass), is
+**never** silently re-sent by the retry layer, and a best-effort
+`notifications/cancelled` is sent for the abandoned request (never for
+`initialize`, and task-augmented calls use `tasks/cancel` instead):
+
+```ruby
+client.send_rpc('tools/call', params: { name: 'slow', arguments: {} }, timeout: 300)
+server.rpc_request('tools/list', {}, timeout: 5)
+```
+
+### Client Identity and Server Instructions
+
+Hosts can present their own `Implementation` info (sent as `clientInfo` during
+initialize; `name` and `version` required — `title`, `description`,
+`websiteUrl`, `icons` optional), and read the server's `instructions` hint
+after connecting:
+
+```ruby
+client = MCPClient::Client.new(
+  mcp_server_configs: [...],
+  client_info: { 'name' => 'my-ide', 'version' => '2.0.0', 'description' => 'An MCP-powered IDE' }
+)
+client.servers.first.connect
+puts client.servers.first.instructions # e.g. "Use the search tool before answering."
+```
+
+### Capability Gating
+
+Optional server features (`logging/setLevel`, `resources/subscribe`,
+`completion/complete`, `tasks/list`, `tasks/cancel`) are only sent to servers
+that negotiated the corresponding capability; otherwise
+`MCPClient::Errors::CapabilityError` is raised (the lifecycle forbids using
+capabilities that were not negotiated). `Client#log_level=` skips
+non-logging servers instead of failing. Declared *client* capabilities are
+derived from what the host actually registered (handlers, roots), never
+hardcoded.
+
 ### Completion (Autocomplete)
 
 ```ruby
@@ -488,6 +563,20 @@ client = MCPClient::Client.new(
 Features: PKCE, server discovery (`.well-known`), dynamic registration, token refresh.
 
 See [OAUTH.md](OAUTH.md) for full documentation.
+
+### OAuth Extras (2025-11-25)
+
+- **Client ID Metadata Documents (SEP-991)** — pass
+  `client_id_metadata_url: 'https://myapp.example/oauth-client.json'` (an HTTPS
+  URL with a path, which doubles as the `client_id`); when the authorization
+  server advertises `client_id_metadata_document_supported`, dynamic client
+  registration is skipped entirely.
+- **Scope challenges (SEP-835)** — an HTTP 403 `insufficient_scope` challenge
+  raises `MCPClient::Errors::InsufficientScopeError` (a `ConnectionError`
+  subclass) exposing `#scope` and `#error_description`; the challenged scopes
+  are treated as authoritative for the next authorization flow.
+- **PKCE** — authorization refuses to proceed when the authorization server
+  does not advertise `code_challenge_methods_supported` including `S256`.
 
 ## Server Notifications
 

@@ -355,6 +355,21 @@ def handle_rpc():
         params = request_data.get('params', {})
         request_id = request_data.get('id')
 
+        # MCP 2025-11-25: the client answers elicitation/create with a standard
+        # JSON-RPC *response* (no method; the id echoes our request id). Accept
+        # that shape in addition to the legacy 'elicitation/response' request.
+        if method is None and request_id is not None and session_id and session_id in sessions:
+            session = sessions[session_id]
+            if request_id in session.elicitation_events:
+                result = request_data.get('result') or {}
+                session.elicitation_responses[request_id] = {
+                    'action': result.get('action'),
+                    'content': result.get('content', {})
+                }
+                session.elicitation_events[request_id].set()
+                logger.info(f"Received JSON-RPC elicitation result for {request_id}: {result.get('action')}")
+                return Response('', status=202)
+
         # Handle different methods
         if method == 'initialize':
             # Create new session
@@ -736,6 +751,18 @@ def handle_sse_rpc():
 
         logger.info(f"SSE RPC {'notification' if rpc_id is None else 'request'}: {
                     method} (id: {rpc_id})")
+
+        # MCP 2025-11-25: accept a standard JSON-RPC elicitation *response*
+        # (no method; id echoes our elicitation request id).
+        if method is None and rpc_id is not None and rpc_id in session.elicitation_events:
+            result = data.get('result') or {}
+            session.elicitation_responses[rpc_id] = {
+                'action': result.get('action'),
+                'content': result.get('content', {})
+            }
+            session.elicitation_events[rpc_id].set()
+            logger.info(f"Received JSON-RPC elicitation result for {rpc_id}: {result.get('action')}")
+            return Response('', status=202)
 
         # Handle notifications (no response needed)
         if method and rpc_id is None:

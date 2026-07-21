@@ -6,6 +6,10 @@
 #  npx @playwright/mcp@latest --port 8931
 require 'bundler/setup'
 require_relative '../lib/mcp_client'
+# Both 'ruby-openai' and the official 'openai' gem are bundled and both expose
+# lib/openai.rb + OpenAI::Client; load ruby-openai's lib first so require
+# resolves deterministically to the gem this example targets.
+$LOAD_PATH.unshift(*Gem::Specification.find_by_name('ruby-openai').full_require_paths)
 require 'openai'
 require 'json'
 require 'logger'
