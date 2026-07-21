@@ -158,7 +158,7 @@ RSpec.describe 'Session Management Integration', type: :integration do
           .with(body: hash_including(method: 'initialize'))
           .to_return(
             status: 200,
-            body: { jsonrpc: '2.0', id: 1, result: {} }.to_json,
+            body: { jsonrpc: '2.0', id: 1, result: { protocolVersion: MCPClient::PROTOCOL_VERSION } }.to_json,
             headers: { 'Mcp-Session-Id' => 'invalid session id' } # Invalid format
           )
 
@@ -212,7 +212,9 @@ RSpec.describe 'Session Management Integration', type: :integration do
           .with(body: hash_including(method: 'initialize'))
           .to_return(
             status: 200,
-            body: "event: message\nid: #{event_id}-init\ndata: {\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{}}\n\n",
+            body: "event: message\nid: #{event_id}-init\n" \
+                  "data: #{{ jsonrpc: '2.0', id: 1,
+                             result: { protocolVersion: MCPClient::PROTOCOL_VERSION } }.to_json}\n\n",
             headers: {
               'Mcp-Session-Id' => session_id,
               'Content-Type' => 'text/event-stream'
@@ -433,7 +435,7 @@ RSpec.describe 'Session Management Integration', type: :integration do
         stub_request(:post, "#{base_url}/rpc")
           .to_return(
             status: 200,
-            body: { jsonrpc: '2.0', id: 1, result: {} }.to_json,
+            body: { jsonrpc: '2.0', id: 1, result: { protocolVersion: MCPClient::PROTOCOL_VERSION } }.to_json,
             headers: { 'Mcp-Session-Id' => 'valid_session-123_abc' }
           )
 
@@ -444,7 +446,7 @@ RSpec.describe 'Session Management Integration', type: :integration do
         stub_request(:post, "#{base_url}/rpc")
           .to_return(
             status: 200,
-            body: { jsonrpc: '2.0', id: 2, result: {} }.to_json,
+            body: { jsonrpc: '2.0', id: 2, result: { protocolVersion: MCPClient::PROTOCOL_VERSION } }.to_json,
             headers: { 'Mcp-Session-Id' => 'invalid session id' }
           )
 

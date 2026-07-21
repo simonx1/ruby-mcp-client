@@ -640,7 +640,7 @@ RSpec.describe MCPClient::ServerHTTP do
           .with(body: hash_including(method: 'initialize'))
           .to_return(
             status: 200,
-            body: { jsonrpc: '2.0', id: 1, result: {} }.to_json,
+            body: { jsonrpc: '2.0', id: 1, result: { protocolVersion: MCPClient::PROTOCOL_VERSION } }.to_json,
             headers: { 'Mcp-Session-Id' => 'valid-session-123' }
           )
 
@@ -653,7 +653,7 @@ RSpec.describe MCPClient::ServerHTTP do
           .with(body: hash_including(method: 'initialize'))
           .to_return(
             status: 200,
-            body: { jsonrpc: '2.0', id: 1, result: {} }.to_json,
+            body: { jsonrpc: '2.0', id: 1, result: { protocolVersion: MCPClient::PROTOCOL_VERSION } }.to_json,
             headers: { 'Mcp-Session-Id' => 'invalid session id' }
           )
 
@@ -666,7 +666,7 @@ RSpec.describe MCPClient::ServerHTTP do
           .with(body: hash_including(method: 'initialize'))
           .to_return(
             status: 200,
-            body: { jsonrpc: '2.0', id: 1, result: {} }.to_json,
+            body: { jsonrpc: '2.0', id: 1, result: { protocolVersion: MCPClient::PROTOCOL_VERSION } }.to_json,
             headers: {}
           )
 
@@ -703,7 +703,7 @@ RSpec.describe MCPClient::ServerHTTP do
           .with(body: hash_including(method: 'initialize'))
           .to_return(
             status: 200,
-            body: { jsonrpc: '2.0', id: 1, result: {} }.to_json
+            body: { jsonrpc: '2.0', id: 1, result: { protocolVersion: MCPClient::PROTOCOL_VERSION } }.to_json
           )
         stub_request(:post, "#{base_url}#{endpoint}")
           .with(body: hash_including(method: 'notifications/initialized'))
