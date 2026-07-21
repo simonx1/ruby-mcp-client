@@ -30,7 +30,7 @@ import time
 import threading
 import uuid
 import base64
-from datetime import datetime
+from datetime import datetime, timezone
 from flask import Flask, request, Response, jsonify
 from queue import Queue
 import logging
@@ -61,6 +61,97 @@ class Session:
         self.log_level = 'info'  # Default log level
         self.sampling_requests = {}  # Track pending sampling requests
         self.sampling_responses = {}  # Store sampling responses
+
+# ---------------------------------------------------------------------------
+# Tasks (MCP 2025-11-25): task-augmented tools/call with get/result/list/cancel
+# ---------------------------------------------------------------------------
+
+tasks_store = {}     # taskId -> task dict
+tasks_lock = threading.Lock()
+
+
+def _now_iso():
+    return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+
+
+def create_task_record(task_id, tool_name, arguments, ttl=None):
+    """Create a task record in the MCP 2025-11-25 shape."""
+    now = _now_iso()
+    task = {
+        "taskId": task_id,
+        "status": "working",
+        "statusMessage": "Task created",
+        "createdAt": now,
+        "lastUpdatedAt": now,
+        "ttl": ttl,
+        "pollInterval": 300,
+        # Internal bookkeeping (not sent to the client)
+        "_tool_name": tool_name,
+        "_arguments": arguments,
+        "_result": None,
+    }
+    with tasks_lock:
+        tasks_store[task_id] = task
+    return task
+
+
+def task_to_response(task):
+    """Return the flat, spec-shaped Task fields (GetTaskResult / CancelTaskResult)."""
+    response = {
+        "taskId": task["taskId"],
+        "status": task["status"],
+        "createdAt": task["createdAt"],
+        "lastUpdatedAt": task["lastUpdatedAt"],
+        "ttl": task.get("ttl"),
+    }
+    if task.get("statusMessage"):
+        response["statusMessage"] = task["statusMessage"]
+    if task.get("pollInterval") is not None:
+        response["pollInterval"] = task["pollInterval"]
+    return response
+
+
+def push_task_status(session_id, task):
+    """Deliver notifications/tasks/status on the session's GET events stream."""
+    session = sessions.get(session_id)
+    if not session or not session.active:
+        return
+    notification = {
+        "jsonrpc": "2.0",
+        "method": "notifications/tasks/status",
+        "params": task_to_response(task),
+    }
+    session.event_queue.put(format_sse_event("message", notification))
+
+
+def run_task_in_background(task_id, session_id):
+    """Simulate long-running work for a task, then store its CallToolResult."""
+    for _ in range(4):
+        time.sleep(0.3)
+        with tasks_lock:
+            task = tasks_store.get(task_id)
+            if not task or task["status"] == "cancelled":
+                return
+            task["lastUpdatedAt"] = _now_iso()
+
+    with tasks_lock:
+        task = tasks_store.get(task_id)
+        if not task or task["status"] == "cancelled":
+            return
+        task["status"] = "completed"
+        task["statusMessage"] = "All steps done"
+        task["lastUpdatedAt"] = _now_iso()
+        # tasks/result returns exactly what tools/call would have returned
+        task["_result"] = {
+            "content": [
+                {"type": "text", "text": "Background task finished successfully"},
+            ],
+            "isError": False,
+        }
+        completed = dict(task)
+
+    push_task_status(session_id, completed)
+
 
 def generate_session_id():
     """Generate a cryptographically secure session ID"""
@@ -178,6 +269,11 @@ def handle_rpc():
                         "logging": {},
                         "sampling": {},
                         "completions": {},
+                        "tasks": {
+                            "list": {},
+                            "cancel": {},
+                            "requests": {"tools": {"call": {}}}
+                        },
                         "roots": {
                             "listChanged": True
                         },
@@ -235,6 +331,17 @@ def handle_rpc():
                                 },
                                 "required": ["message"]
                             }
+                        },
+                        {
+                            "name": "background_work",
+                            "description": "A long-running job that can run as a task (MCP 2025-11-25 Tasks)",
+                            "inputSchema": {
+                                "type": "object",
+                                "properties": {
+                                    "input": {"type": "string", "description": "Arbitrary input for the job"}
+                                }
+                            },
+                            "execution": {"taskSupport": "optional"}
                         },
                         {
                             "name": "long_task",
@@ -769,7 +876,35 @@ End of sample data.""".format(datetime.now().isoformat())
             tool_name = params.get('name')
             tool_args = params.get('arguments', {})
             
-            if tool_name == 'echo':
+            if tool_name == 'background_work':
+                # Task-augmented request: create a task and return a
+                # CreateTaskResult now; the result comes later via tasks/result.
+                task_aug = params.get('task')
+                if task_aug is not None:
+                    task_id = str(uuid.uuid4())
+                    ttl = task_aug.get('ttl') if isinstance(task_aug, dict) else None
+                    task = create_task_record(task_id, tool_name, tool_args, ttl=ttl)
+                    threading.Thread(
+                        target=run_task_in_background, args=(task_id, session_id), daemon=True
+                    ).start()
+                    response_data = {
+                        "jsonrpc": "2.0",
+                        "id": request_id,
+                        "result": {"task": task_to_response(task)}
+                    }
+                else:
+                    # Synchronous fallback when not called as a task
+                    response_data = {
+                        "jsonrpc": "2.0",
+                        "id": request_id,
+                        "result": {
+                            "content": [
+                                {"type": "text", "text": "Background task finished successfully"}
+                            ]
+                        }
+                    }
+
+            elif tool_name == 'echo':
                 message = tool_args.get('message', '')
                 response_data = {
                     "jsonrpc": "2.0",
@@ -1121,6 +1256,89 @@ End of sample data.""".format(datetime.now().isoformat())
                 sessions[session_id].last_activity = datetime.now()
             return Response("", status=200)
             
+        elif method == 'tasks/get':
+            task_id = params.get('taskId', '')
+            with tasks_lock:
+                task = tasks_store.get(task_id)
+            if task:
+                response_data = {"jsonrpc": "2.0", "id": request_id, "result": task_to_response(task)}
+            else:
+                response_data = {
+                    "jsonrpc": "2.0", "id": request_id,
+                    "error": {"code": -32602, "message": f"Task not found: {task_id}"}
+                }
+            return Response(
+                format_sse_event("message", response_data),
+                content_type='text/event-stream',
+                headers={'Cache-Control': 'no-cache'}
+            )
+
+        elif method == 'tasks/result':
+            task_id = params.get('taskId', '')
+            with tasks_lock:
+                task = tasks_store.get(task_id)
+                if not task:
+                    response_data = {
+                        "jsonrpc": "2.0", "id": request_id,
+                        "error": {"code": -32602, "message": f"Task not found: {task_id}"}
+                    }
+                elif task['status'] != 'completed':
+                    response_data = {
+                        "jsonrpc": "2.0", "id": request_id,
+                        "error": {
+                            "code": -32602,
+                            "message": f"Task '{task_id}' is not complete (status: {task['status']})"
+                        }
+                    }
+                else:
+                    result = dict(task['_result'] or {})
+                    # tasks/result MUST carry the related-task metadata
+                    result.setdefault('_meta', {})['io.modelcontextprotocol/related-task'] = {'taskId': task_id}
+                    response_data = {"jsonrpc": "2.0", "id": request_id, "result": result}
+            return Response(
+                format_sse_event("message", response_data),
+                content_type='text/event-stream',
+                headers={'Cache-Control': 'no-cache'}
+            )
+
+        elif method == 'tasks/list':
+            with tasks_lock:
+                task_list = [task_to_response(t) for t in tasks_store.values()]
+            response_data = {"jsonrpc": "2.0", "id": request_id, "result": {"tasks": task_list}}
+            return Response(
+                format_sse_event("message", response_data),
+                content_type='text/event-stream',
+                headers={'Cache-Control': 'no-cache'}
+            )
+
+        elif method == 'tasks/cancel':
+            task_id = params.get('taskId', '')
+            with tasks_lock:
+                task = tasks_store.get(task_id)
+                if not task:
+                    response_data = {
+                        "jsonrpc": "2.0", "id": request_id,
+                        "error": {"code": -32602, "message": f"Task not found: {task_id}"}
+                    }
+                elif task['status'] in ('completed', 'failed', 'cancelled'):
+                    response_data = {
+                        "jsonrpc": "2.0", "id": request_id,
+                        "error": {
+                            "code": -32602,
+                            "message": f"Cannot cancel task in terminal status '{task['status']}'"
+                        }
+                    }
+                else:
+                    task['status'] = 'cancelled'
+                    task['statusMessage'] = 'Cancelled by client'
+                    task['lastUpdatedAt'] = _now_iso()
+                    response_data = {"jsonrpc": "2.0", "id": request_id, "result": task_to_response(task)}
+            return Response(
+                format_sse_event("message", response_data),
+                content_type='text/event-stream',
+                headers={'Cache-Control': 'no-cache'}
+            )
+
         else:
             # Unknown method
             response_data = {

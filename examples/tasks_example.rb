@@ -8,18 +8,20 @@
 # "required". Calling such a tool as a task returns immediately with a task
 # handle; the actual result is fetched later once the task is terminal.
 #
-# Tasks are an experimental 2025-11-25 feature that most servers (including
-# Zapier, the default target here) do not implement yet. Against such servers
-# this example demonstrates the client's capability-aware behavior instead:
-# tool.supports_task?, the TaskError from call_tool_as_task, and the
-# CapabilityError raised by list_tasks (MCP lifecycle: "Only use capabilities
-# that were successfully negotiated").
+# The local streamable echo server implements the full tasks feature
+# (capability, background_work tool, tasks/get|result|list|cancel, status
+# notifications), so the default target runs the complete task lifecycle:
 #
-# Run against Zapier (default):
+#   python3 examples/echo_server_streamable.py &   # port 8931
+#   ./examples/tasks_example.rb
+#
+# Against servers that have not negotiated the experimental tasks capability
+# the example demonstrates the client's capability-aware behavior instead
+# (tool.supports_task?, TaskError from call_tool_as_task, CapabilityError
+# from list_tasks), e.g.:
+#
+#   MCP_SERVER_URL='https://mcp.zapier.com/api/v1/connect' \
 #   MCP_BEARER_TOKEN='your_zapier_token' ./examples/tasks_example.rb
-# Or against any task-capable server:
-#   MCP_SERVER_URL='https://example.com/mcp' \
-#   MCP_BEARER_TOKEN='your_token' ./examples/tasks_example.rb long_job
 
 require 'bundler/setup'
 require_relative '../lib/mcp_client'
@@ -28,7 +30,7 @@ require 'logger'
 logger = Logger.new($stdout)
 logger.level = Logger::WARN
 
-server_url = ENV.fetch('MCP_SERVER_URL', 'https://mcp.zapier.com/api/v1/connect')
+server_url = ENV.fetch('MCP_SERVER_URL', 'http://localhost:8931/mcp')
 bearer_token = ENV.fetch('MCP_BEARER_TOKEN', nil)
 tool_name = ARGV[0]
 
