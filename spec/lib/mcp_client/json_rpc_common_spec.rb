@@ -185,19 +185,27 @@ RSpec.describe MCPClient::JsonRpcCommon do
   end
 
   describe '#initialization_params' do
-    it 'returns the correct initialization parameters' do
+    it 'declares no feature capabilities when no callbacks are registered' do
       params = instance.initialization_params
       expect(params).to include(
         'protocolVersion' => MCPClient::PROTOCOL_VERSION,
-        'capabilities' => {
-          'elicitation' => {}, # MCP 2025-11-25
-          'roots' => { 'listChanged' => true }, # MCP 2025-11-25
-          'sampling' => {} # MCP 2025-11-25
-        },
+        'capabilities' => {},
         'clientInfo' => {
           'name' => 'ruby-mcp-client',
           'version' => MCPClient::VERSION
         }
+      )
+    end
+
+    it 'derives declared capabilities from registered callbacks' do
+      instance.instance_variable_set(:@elicitation_request_callback, proc {})
+      instance.instance_variable_set(:@roots_list_request_callback, proc {})
+      instance.instance_variable_set(:@sampling_request_callback, proc {})
+
+      expect(instance.initialization_params['capabilities']).to eq(
+        'elicitation' => { 'form' => {}, 'url' => {} }, # MCP 2025-11-25
+        'roots' => { 'listChanged' => true }, # MCP 2025-11-25
+        'sampling' => {} # MCP 2025-11-25
       )
     end
 

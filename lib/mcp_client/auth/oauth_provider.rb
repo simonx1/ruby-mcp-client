@@ -11,6 +11,18 @@ module MCPClient
     # Handles the complete OAuth flow including server discovery, client registration,
     # authorization, token exchange, and refresh
     class OAuthProvider
+      # One auth-param (name = token / quoted-string) as it appears in a
+      # WWW-Authenticate challenge (RFC 7235 §2.1, optional whitespace around
+      # '='). Mirrors HttpTransportBase::AUTH_PARAM so provider-side challenge
+      # parsing segments headers exactly like the transport does.
+      AUTH_PARAM = /[A-Za-z0-9._~+-]+\s*=\s*(?:"(?:[^"\\]|\\.)*"|[^,\s]*)/
+      # A run of comma/space separated auth-params anchored at the start of a
+      # string. The run ends before a token that is NOT followed by '=' — the
+      # auth-scheme introducing the next challenge — while commas inside quoted
+      # values are consumed by the quoted-string branch, not treated as
+      # boundaries. Mirrors HttpTransportBase::AUTH_PARAMS_RUN.
+      AUTH_PARAMS_RUN = /\A(?:[\s,]*#{AUTH_PARAM})*/
+
       # @!attribute [rw] redirect_uri
       #   @return [String] OAuth redirect URI
       # @!attribute [rw] scope
@@ -52,8 +64,10 @@ module MCPClient
         @http_client = create_http_client
         # Protected resource metadata learned from a 401 WWW-Authenticate
         # challenge, reused by discovery so a challenge-advertised metadata URL
-        # is not re-derived (and possibly missed).
+        # is not re-derived (and possibly missed). The URL itself is retained
+        # separately so a failed fetch is retried authoritatively by discovery.
         @challenge_resource_metadata = nil
+        @challenge_metadata_url = nil
       end
 
       # @param url [String] Server URL to normalize
@@ -164,11 +178,18 @@ module MCPClient
         www_authenticate = response.headers['WWW-Authenticate'] || response.headers['www-authenticate']
         return nil unless www_authenticate
 
+        # Challenge parameters are read from the Bearer challenge's own
+        # segment only — never from the whole (possibly multi-challenge)
+        # header — so parameters belonging to Basic or another scheme cannot
+        # drive Bearer scope selection or resource metadata discovery. A
+        # header without a Bearer challenge carries no usable Bearer params.
+        bearer_params = bearer_challenge_segment(www_authenticate)
+
         # MCP 2025-11-25: "Clients MUST treat the scopes provided in the
         # challenge as authoritative for satisfying the current request" —
         # including resetting a previously challenged scope when the current
         # challenge carries none.
-        @challenge_scope = extract_challenge_param(www_authenticate, 'scope')
+        @challenge_scope = bearer_params && extract_challenge_param(bearer_params, 'scope')
 
         url = extract_resource_metadata_url(www_authenticate)
         return nil unless url
@@ -189,23 +210,49 @@ module MCPClient
 
       # Extract the protected-resource-metadata URL from a WWW-Authenticate header.
       # Per RFC 9728 the parameter is `resource_metadata`; a legacy `resource`
-      # parameter is accepted as a fallback for older servers.
+      # parameter is accepted as a fallback for older servers. Only the Bearer
+      # challenge's own segment is consulted, so a parameter belonging to
+      # another scheme's challenge can never drive discovery.
       # @param header [String] the WWW-Authenticate header value
       # @return [String, nil] the metadata URL if present
       def extract_resource_metadata_url(header)
+        params = bearer_challenge_segment(header)
+        return nil unless params
+
         # Auth-params may include optional whitespace around '=' (RFC 7235).
         # Quoted form: resource_metadata = "https://..."
-        if (m = header.match(/resource_metadata\s*=\s*"([^"]+)"/))
+        if (m = params.match(/resource_metadata\s*=\s*"([^"]+)"/))
           return m[1]
         end
 
         # Unquoted token form: resource_metadata = https://...
-        if (m = header.match(/resource_metadata\s*=\s*([^,\s]+)/))
+        if (m = params.match(/resource_metadata\s*=\s*([^,\s]+)/))
           return m[1]
         end
 
         # Legacy fallback: resource="https://..."
-        header.match(/resource\s*=\s*"([^"]+)"/)&.captures&.first
+        params.match(/resource\s*=\s*"([^"]+)"/)&.captures&.first
+      end
+
+      # Extract the Bearer challenge's own parameter segment from a (possibly
+      # multi-challenge) WWW-Authenticate header, so params belonging to other
+      # schemes (e.g. `Basic resource_metadata="...", Bearer realm="x"`) are
+      # never attributed to the Bearer challenge. Mirrors
+      # HttpTransportBase#bearer_challenge_segment.
+      # @param header [String, nil] the WWW-Authenticate header value
+      # @return [String, nil] the Bearer challenge's parameters (possibly
+      #   empty), or nil when the header has no Bearer challenge
+      def bearer_challenge_segment(header)
+        return nil unless header
+
+        # Locate the Bearer scheme token only OUTSIDE quoted strings: a
+        # quoted value such as realm="prefix Bearer x" must not anchor the
+        # segment.
+        masked = header.gsub(/"(?:\\.|[^"\\])*"/) { |q| "\"#{' ' * (q.length - 2)}\"" }
+        match = masked.match(/(?:\A|[\s,])Bearer(?=[\s,]|\z)/i)
+        return nil unless match
+
+        header[match.end(0)..][AUTH_PARAMS_RUN]
       end
 
       # Extract an auth-param value from a WWW-Authenticate header
@@ -368,8 +415,11 @@ module MCPClient
       # @raise [MCPClient::Errors::ConnectionError] if discovery fails
       def discover_authorization_server
         # A fresh 401 challenge is authoritative and overrides any cached
-        # (possibly stale or direct-discovered) authorization server metadata.
-        cached = storage.get_server_metadata(server_url) unless @challenge_resource_metadata
+        # (possibly stale or direct-discovered) authorization server metadata —
+        # whether the challenge-advertised PRM was already fetched or only its
+        # URL is pending (e.g. the initial fetch failed and must be retried).
+        challenge_pending = @challenge_resource_metadata || @challenge_metadata_url
+        cached = storage.get_server_metadata(server_url) unless challenge_pending
         if cached
           # Validate the cached entry before use so a persisted/older cache with
           # an HTTP endpoint or without S256 is still rejected.
@@ -402,6 +452,7 @@ module MCPClient
 
         storage.set_server_metadata(server_url, server_metadata)
         @challenge_resource_metadata = nil # consumed
+        @challenge_metadata_url = nil # consumed
         server_metadata
       end
 
@@ -444,9 +495,7 @@ module MCPClient
         # once PRM IS found it is authoritative: any subsequent failure must be a
         # hard error, never a silent fallback to an authorization server the PRM
         # did not advertise.
-        candidate_urls = ([@challenge_metadata_url] + protected_resource_metadata_urls(server_url)).compact.uniq
-        resource_metadata = @challenge_resource_metadata ||
-                            fetch_first_resource_metadata(candidate_urls)
+        resource_metadata = challenge_or_well_known_resource_metadata
         return nil unless resource_metadata
 
         validate_resource_matches!(resource_metadata)
@@ -465,6 +514,25 @@ module MCPClient
         end
 
         server_metadata
+      end
+
+      # Resolve the Protected Resource Metadata for discovery.
+      #
+      # MCP 2025-11-25 MUST: use the resource metadata URL from the parsed
+      # WWW-Authenticate headers when present; otherwise fall back to the
+      # well-known URIs. A challenge-advertised URL is therefore authoritative:
+      # it is fetched strictly, and any failure (including a 404) raises rather
+      # than falling through to constructed well-known candidates the challenge
+      # superseded.
+      # @return [ResourceMetadata, nil] metadata, or nil when no PRM exists at
+      #   the speculative well-known URLs (permitting the direct-AS fallback)
+      # @raise [MCPClient::Errors::ConnectionError] if the challenge-advertised
+      #   URL cannot be fetched, or a well-known candidate exists but is invalid
+      def challenge_or_well_known_resource_metadata
+        return @challenge_resource_metadata if @challenge_resource_metadata
+        return fetch_resource_metadata(@challenge_metadata_url, strict: true) if @challenge_metadata_url
+
+        fetch_first_resource_metadata(protected_resource_metadata_urls(server_url))
       end
 
       # Legacy/self-hosted discovery: treat the MCP server ORIGIN as its own

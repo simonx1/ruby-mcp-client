@@ -37,8 +37,8 @@ RSpec.describe MCPClient::Client, 'Sampling (MCP 2025-11-25)' do
     end
 
     context 'when sampling_handler is not provided' do
-      it 'still registers handler on servers (for error response)' do
-        expect(mock_server).to receive(:on_sampling_request)
+      it 'does not register the sampling callback (capability stays undeclared)' do
+        expect(mock_server).not_to receive(:on_sampling_request)
 
         described_class.new(
           mcp_server_configs: [{ type: 'stdio', command: 'test' }]
@@ -86,10 +86,14 @@ RSpec.describe MCPClient::Client, 'Sampling (MCP 2025-11-25)' do
     context 'when no sampling handler is configured' do
       let(:client) { described_class.new }
 
-      it 'returns error response' do
+      it 'returns a -32601 error response' do
         result = client.send(:handle_sampling_request, request_id, params)
 
         expect(result).to include('error')
+        # sampling.mdx § Error Handling reserves -1 for "User rejected
+        # sampling request"; with no handler the sampling capability is
+        # undeclared, so the truthful code is -32601 (Method not found).
+        expect(result['error']['code']).to eq(-32_601)
         expect(result['error']['message']).to include('Sampling not supported')
       end
     end
@@ -244,25 +248,32 @@ RSpec.describe MCPClient::Client, 'Sampling (MCP 2025-11-25)' do
     end
 
     context 'when handler returns nil' do
-      it 'returns error response' do
+      it 'returns a -1 rejection error response' do
         handler = ->(_messages) {}
 
         client = described_class.new(sampling_handler: handler)
         result = client.send(:handle_sampling_request, request_id, params)
 
         expect(result).to include('error')
+        # A nil handler result is the host's rejection signal, matching
+        # sampling.mdx § Error Handling: "User rejected sampling request: -1"
+        expect(result['error']['code']).to eq(-1)
         expect(result['error']['message']).to include('Sampling rejected')
       end
     end
 
     context 'when handler raises an exception' do
-      it 'catches the exception and returns error' do
+      it 'catches the exception and returns a -32603 internal error' do
         handler = ->(_messages) { raise StandardError, 'Handler error' }
 
         client = described_class.new(sampling_handler: handler)
         result = client.send(:handle_sampling_request, request_id, params)
 
         expect(result).to include('error')
+        # Previously -1, but sampling.mdx § Error Handling reserves -1 for
+        # "User rejected sampling request"; a handler exception is an
+        # internal client failure and must surface as -32603.
+        expect(result['error']['code']).to eq(-32_603)
         expect(result['error']['message']).to include('Sampling error')
       end
     end
