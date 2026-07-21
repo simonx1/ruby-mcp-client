@@ -72,24 +72,41 @@ module MCPClient
     # Generate initialization parameters for MCP protocol
     # @return [Hash] the initialization parameters
     def initialization_params
-      capabilities = {
-        # MCP 2025-11-25: server-initiated user interactions; both defined
-        # modes are implemented (an empty object would mean form-only).
-        'elicitation' => { 'form' => {}, 'url' => {} },
-        'roots' => { 'listChanged' => true }, # MCP 2025-11-25: Support for roots
-        'sampling' => {} # MCP 2025-11-25: Support for server-initiated LLM sampling
-        # NOTE: we intentionally do NOT declare a client `tasks` capability. That
-        # capability marks the client as a RECEIVER of task-augmented
-        # sampling/elicitation requests, which is not implemented here — this
-        # client only acts as a task REQUESTOR for tools/call (see
-        # Client#call_tool_as_task), which requires no client-side declaration.
-      }
-
       {
         'protocolVersion' => MCPClient::PROTOCOL_VERSION,
-        'capabilities' => capabilities,
+        'capabilities' => client_capabilities,
         'clientInfo' => { 'name' => 'ruby-mcp-client', 'version' => MCPClient::VERSION }
       }
+    end
+
+    # Declared client capabilities, derived from the server-request callbacks
+    # the host actually registered before connecting. Per MCP 2025-11-25,
+    # clients that support a feature MUST declare it during initialization,
+    # and only negotiated capabilities may be used afterwards — so declaring
+    # a hardcoded set independent of host support violates the lifecycle in
+    # both directions.
+    # @return [Hash] the capabilities object for the initialize request
+    def client_capabilities
+      capabilities = {}
+      if registered_callback?(:@elicitation_request_callback)
+        # Both defined elicitation modes are implemented (an empty object
+        # would mean form-only per the spec's backwards-compatibility rule).
+        capabilities['elicitation'] = { 'form' => {}, 'url' => {} }
+      end
+      capabilities['roots'] = { 'listChanged' => true } if registered_callback?(:@roots_list_request_callback)
+      capabilities['sampling'] = {} if registered_callback?(:@sampling_request_callback)
+      # NOTE: we intentionally do NOT declare a client `tasks` capability. That
+      # capability marks the client as a RECEIVER of task-augmented
+      # sampling/elicitation requests, which is not implemented here — this
+      # client only acts as a task REQUESTOR for tools/call (see
+      # Client#call_tool_as_task), which requires no client-side declaration.
+      capabilities
+    end
+
+    # @param ivar [Symbol] callback instance variable name
+    # @return [Boolean] whether the callback is registered on this transport
+    def registered_callback?(ivar)
+      instance_variable_defined?(ivar) && !instance_variable_get(ivar).nil?
     end
 
     # Process JSON-RPC response

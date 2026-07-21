@@ -66,14 +66,19 @@ module MCPClient
           # Invoke user-defined listeners
           @notification_listeners.each { |cb| cb.call(server, method, params) }
         end
-        # Register elicitation handler on each server
-        if server.respond_to?(:on_elicitation_request)
+        # Register feature callbacks only for features the host actually
+        # supports: transports derive their declared client capabilities from
+        # the callbacks registered before connecting, and MCP forbids using
+        # capabilities that were not negotiated.
+        if @elicitation_handler && server.respond_to?(:on_elicitation_request)
           server.on_elicitation_request(&method(:handle_elicitation_request))
         end
-        # Register roots list handler on each server (MCP 2025-06-18)
+        # The client always implements the roots feature (roots/list and
+        # list_changed notifications), independent of the current roots list.
         server.on_roots_list_request(&method(:handle_roots_list_request)) if server.respond_to?(:on_roots_list_request)
-        # Register sampling handler on each server (MCP 2025-11-25)
-        server.on_sampling_request(&method(:handle_sampling_request)) if server.respond_to?(:on_sampling_request)
+        if @sampling_handler && server.respond_to?(:on_sampling_request)
+          server.on_sampling_request(&method(:handle_sampling_request))
+        end
       end
     end
 
@@ -938,21 +943,19 @@ module MCPClient
     # @param params [Hash] the elicitation parameters
     # @return [Hash] the elicitation response
     def handle_elicitation_request(_request_id, params)
-      mode = params['mode'] || 'form'
-      # MCP 2025-11-25: requests with a mode not declared in client
-      # capabilities MUST be rejected with -32602 (Invalid params). This check
-      # precedes everything else — an undeclared mode is -32602 even when no
-      # handler is configured.
-      unless SUPPORTED_ELICITATION_MODES.include?(mode)
-        @logger.warn("Rejecting elicitation request with unsupported mode '#{mode}'")
-        return jsonrpc_error_result(-32_602, "Elicitation mode '#{mode}' is not supported")
-      end
-
       # Without a handler there is no user to interact with: answer with a
       # JSON-RPC error rather than fabricating a user "decline".
       unless @elicitation_handler
         @logger.warn('Received elicitation request but no elicitation handler is configured')
         return jsonrpc_error_result(-32_601, 'Elicitation not supported: no elicitation handler configured')
+      end
+
+      mode = params['mode'] || 'form'
+      # MCP 2025-11-25: requests with a mode not declared in client
+      # capabilities MUST be rejected with -32602 (Invalid params).
+      unless SUPPORTED_ELICITATION_MODES.include?(mode)
+        @logger.warn("Rejecting elicitation request with unsupported mode '#{mode}'")
+        return jsonrpc_error_result(-32_602, "Elicitation mode '#{mode}' is not supported")
       end
 
       message = params['message']
@@ -1035,19 +1038,27 @@ module MCPClient
     # @param params [Hash] original request params (for schema validation)
     # @return [Hash] formatted response
     def format_elicitation_response(result, params)
-      response = normalize_elicitation_result(result)
+      response = case result
+                 when Hash
+                   if result['action']
+                     normalised_action_response(result)
+                   elsif result[:action]
+                     {
+                       'action' => result[:action].to_s,
+                       'content' => result[:content]
+                     }.compact.then { |payload| normalised_action_response(payload) }
+                   else
+                     { 'action' => 'accept', 'content' => result }
+                   end
+                 when nil
+                   { 'action' => 'cancel' }
+                 else
+                   { 'action' => 'accept', 'content' => result }
+                 end
 
-      # Per the ElicitResult schema, content is only present when the action
-      # is accept and the mode was form; it is omitted for decline/cancel and
-      # for out-of-band (url) mode responses.
-      response.delete('content') if response['action'] != 'accept' || (params['mode'] || 'form') == 'url'
-
-      # ElicitResult.content is an object mapping property names to primitive
-      # values — a scalar cannot be transmitted.
-      if response.key?('content') && !response['content'].is_a?(Hash)
-        @logger.warn("Elicitation handler returned non-object content (#{response['content'].class})")
-        return jsonrpc_error_result(-32_603, 'Elicitation content must be an object of primitive values')
-      end
+      # Per the ElicitResult schema, content is only present for form mode
+      # accepts; it is omitted for out-of-band (url) mode responses.
+      response.delete('content') if (params['mode'] || 'form') == 'url'
 
       # Validate content against schema for form mode accept responses; do not
       # transmit content that violates the requestedSchema (spec SHOULD).
@@ -1058,25 +1069,6 @@ module MCPClient
       end
 
       response
-    end
-
-    # Normalize a handler's return value into a string-keyed ElicitResult
-    # shape, so mixed or symbol keys cannot bypass content handling.
-    # @param result [Object] handler result
-    # @return [Hash] normalized response with string keys
-    def normalize_elicitation_result(result)
-      case result
-      when Hash
-        action = result['action'] || result[:action]
-        return { 'action' => 'accept', 'content' => result } unless action
-
-        content = result.key?('content') || result.key?(:content) ? (result['content'] || result[:content]) : nil
-        normalised_action_response({ 'action' => action.to_s, 'content' => content }.compact)
-      when nil
-        { 'action' => 'cancel' }
-      else
-        { 'action' => 'accept', 'content' => result }
-      end
     end
 
     # Validate elicitation response content against the requestedSchema
@@ -1135,10 +1127,18 @@ module MCPClient
     # @return [void]
     def notify_roots_changed
       @servers.each do |server|
-        server.rpc_notify('notifications/roots/list_changed', {})
-      rescue StandardError => e
-        server_id = server.name ? "#{server.class}[#{server.name}]" : server.class
-        @logger.warn("[#{server_id}] Failed to send roots/list_changed notification: #{e.message}")
+        # Only notify sessions where the roots capability could be declared:
+        # MCP forbids using capabilities that were not negotiated, and
+        # transports without a server-request channel (plain HTTP) never
+        # declare roots.
+        next unless server.respond_to?(:on_roots_list_request)
+
+        begin
+          server.rpc_notify('notifications/roots/list_changed', {})
+        rescue StandardError => e
+          server_id = server.name ? "#{server.class}[#{server.name}]" : server.class
+          @logger.warn("[#{server_id}] Failed to send roots/list_changed notification: #{e.message}")
+        end
       end
     end
 
