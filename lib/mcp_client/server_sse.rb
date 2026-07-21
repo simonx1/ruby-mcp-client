@@ -163,10 +163,7 @@ module MCPClient
     # @raise [MCPClient::Errors::PromptGetError] for other errors during prompt interpolation
     # @raise [MCPClient::Errors::ConnectionError] if server is disconnected
     def get_prompt(prompt_name, parameters)
-      rpc_request('prompts/get', {
-                    name: prompt_name,
-                    arguments: parameters
-                  })
+      rpc_request('prompts/get', build_named_request_params(prompt_name, parameters))
     rescue MCPClient::Errors::ConnectionError, MCPClient::Errors::TransportError
       # Re-raise connection/transport errors directly to match test expectations
       raise
@@ -321,10 +318,7 @@ module MCPClient
     # @raise [MCPClient::Errors::ToolCallError] for other errors during tool execution
     # @raise [MCPClient::Errors::ConnectionError] if server is disconnected
     def call_tool(tool_name, parameters)
-      rpc_request('tools/call', {
-                    name: tool_name,
-                    arguments: parameters
-                  })
+      rpc_request('tools/call', build_named_request_params(tool_name, parameters))
     rescue MCPClient::Errors::ConnectionError, MCPClient::Errors::TransportError
       # Re-raise connection/transport errors directly to match test expectations
       raise
@@ -539,18 +533,19 @@ module MCPClient
     # @param params [Hash] the elicitation parameters
     # @return [void]
     def handle_elicitation_create(request_id, params)
-      # If no callback is registered, decline the request
+      # Without a callback there is no user to interact with: answer with a
+      # JSON-RPC error rather than fabricating a user "decline".
       unless @elicitation_request_callback
-        @logger.warn('Received elicitation request but no callback registered, declining')
-        send_elicitation_response(request_id, { 'action' => 'decline' })
+        @logger.warn('Received elicitation request but no callback registered')
+        send_error_response(request_id, -32_601, 'Elicitation not supported: no handler configured')
         return
       end
 
       # Call the registered callback
       result = @elicitation_request_callback.call(request_id, params)
 
-      # Send the response back to the server
-      send_elicitation_response(request_id, result)
+      # Send the response back to the server (echoing related-task _meta)
+      send_elicitation_response(request_id, merge_related_task_meta(result, params))
     end
 
     # Handle roots/list request from server (MCP 2025-06-18)
@@ -568,8 +563,8 @@ module MCPClient
       # Call the registered callback
       result = @roots_list_request_callback.call(request_id, params)
 
-      # Send the response back to the server
-      send_roots_list_response(request_id, result)
+      # Send the response back to the server (echoing related-task _meta)
+      send_roots_list_response(request_id, merge_related_task_meta(result, params))
     end
 
     # Send roots/list response back to server via HTTP POST (MCP 2025-06-18)
@@ -606,8 +601,8 @@ module MCPClient
       # Call the registered callback
       result = @sampling_request_callback.call(request_id, params)
 
-      # Send the response back to the server
-      send_sampling_response(request_id, result)
+      # Send the response back to the server (echoing related-task _meta)
+      send_sampling_response(request_id, merge_related_task_meta(result, params))
     end
 
     # Send sampling response back to server via HTTP POST (MCP 2025-11-25)
@@ -640,6 +635,14 @@ module MCPClient
     # @param result [Hash] the elicitation result (action and optional content)
     # @return [void]
     def send_elicitation_response(request_id, result)
+      # Error-shaped results become JSON-RPC error responses (e.g. -32602 for
+      # an undeclared elicitation mode), mirroring the sampling error path.
+      if result.is_a?(Hash) && result['error']
+        send_error_response(request_id, result['error']['code'] || -32_603,
+                            result['error']['message'] || 'Elicitation error')
+        return
+      end
+
       ensure_initialized
 
       response = {

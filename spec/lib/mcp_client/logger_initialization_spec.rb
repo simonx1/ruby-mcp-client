@@ -189,7 +189,8 @@ RSpec.describe 'Logger Initialization' do
         .to_return(
           status: 200,
           headers: { 'Content-Type' => 'application/json' },
-          body: { jsonrpc: '2.0', id: 1, result: { serverInfo: {}, capabilities: {} } }.to_json
+          body: { jsonrpc: '2.0', id: 1,
+                  result: { protocolVersion: MCPClient::PROTOCOL_VERSION, serverInfo: {}, capabilities: {} } }.to_json
         )
     end
 

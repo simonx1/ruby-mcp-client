@@ -114,15 +114,16 @@ RSpec.describe MCPClient::ServerSSE, 'Elicitation (MCP 2025-06-18)' do
     end
 
     context 'when no callback is registered' do
-      it 'sends decline response' do
-        expect(server).to receive(:send_elicitation_response).with(request_id, { 'action' => 'decline' })
+      it 'sends a -32601 error response' do
+        expect(server).to receive(:send_error_response)
+          .with(request_id, -32_601, 'Elicitation not supported: no handler configured')
         server.handle_elicitation_create(request_id, params)
       end
 
       it 'logs a warning' do
-        allow(server).to receive(:send_elicitation_response)
+        allow(server).to receive(:send_error_response)
         logger = server.instance_variable_get(:@logger)
-        expect(logger).to receive(:warn).with('Received elicitation request but no callback registered, declining')
+        expect(logger).to receive(:warn).with('Received elicitation request but no callback registered')
         server.handle_elicitation_create(request_id, params)
       end
     end

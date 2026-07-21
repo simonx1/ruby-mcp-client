@@ -79,12 +79,11 @@ module MCPClient
                 "Invalid initialize response from server: expected an object, got #{result.inspect}"
         end
 
+        # Disconnects if the server negotiated a version we cannot speak.
+        @protocol_version = validate_protocol_version!(result)
         @server_info = result['serverInfo']
         @capabilities = result['capabilities']
-        # Capture the negotiated protocol version for the MCP-Protocol-Version
-        # header required on all subsequent HTTP requests (MCP lifecycle
-        # "Version Negotiation").
-        @protocol_version = result['protocolVersion']
+        @instructions = result['instructions']
 
         # Send initialized notification to acknowledge completion of initialization
         initialized_notification = build_jsonrpc_notification('notifications/initialized', {})
