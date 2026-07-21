@@ -8,9 +8,10 @@ require 'anthropic'
 require 'json'
 require 'logger'
 
-# Ensure the ANTHROPIC_API_KEY environment variable is set
+# Ensure the ANTHROPIC_API_KEY environment variable is set (some environments
+# export it as an empty string, which would send an empty x-api-key header)
 api_key = ENV.fetch('ANTHROPIC_API_KEY', nil)
-abort 'Please set ANTHROPIC_API_KEY' unless api_key
+abort 'Please set ANTHROPIC_API_KEY' if api_key.nil? || api_key.strip.empty?
 
 # Create an MCPClient client using the simplified connect API
 logger = Logger.new($stdout)
@@ -47,10 +48,20 @@ messages = [
   { role: 'user', content: 'List all files in current directory' }
 ]
 
+# Faraday raises on HTTP errors with only the status in the message; surface
+# the API's JSON error body so failures are diagnosable from the output.
+def send_messages(client, parameters)
+  client.messages(parameters: parameters)
+rescue Faraday::Error => e
+  warn "Anthropic API error (HTTP #{e.response&.dig(:status)}): #{e.response&.dig(:body)}"
+  raise
+end
+
 # 1) Send messages with tool definitions
 puts 'Sending request with tools...'
-response = client.messages(
-  parameters: {
+response = send_messages(
+  client,
+  {
     model: 'claude-sonnet-4-5-20250929',
     messages: messages,
     system: 'You can call filesystem tools.',
@@ -107,8 +118,9 @@ messages << {
 
 # 4) Get final response from the model
 puts 'Getting final response...'
-final = client.messages(
-  parameters: {
+final = send_messages(
+  client,
+  {
     model: 'claude-sonnet-4-5-20250929',
     messages: messages,
     system: 'You can call filesystem tools.',
