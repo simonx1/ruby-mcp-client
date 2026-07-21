@@ -22,10 +22,11 @@ module MCPClient
 
       # Parse a Streamable HTTP JSON-RPC response (JSON or SSE format)
       # @param response [Faraday::Response] the HTTP response
+      # @param request [Hash, nil] the originating JSON-RPC request, used to match the response by id
       # @return [Hash] the parsed result
       # @raise [MCPClient::Errors::TransportError] if parsing fails
       # @raise [MCPClient::Errors::ServerError] if the response contains an error
-      def parse_response(response)
+      def parse_response(response, request = nil)
         body = response.body
         content_type = response.headers['content-type'] || response.headers['Content-Type'] || ''
         content_encoding = response.headers['content-encoding'] || response.headers['Content-Encoding'] || ''
@@ -36,7 +37,7 @@ module MCPClient
         # Determine response format based on Content-Type header per MCP 2025 spec
         data = if content_type.include?('text/event-stream')
                  # Parse SSE-formatted response for streaming
-                 parse_sse_response(body)
+                 parse_sse_response(body, request && request['id'])
                else
                  # Parse regular JSON response (default for Streamable HTTP)
                  JSON.parse(body)
@@ -47,23 +48,43 @@ module MCPClient
         raise MCPClient::Errors::TransportError, "Invalid JSON response from server: #{e.message}"
       end
 
-      # Parse Server-Sent Event formatted response with event ID tracking
+      # Parse a Server-Sent Event formatted response body.
+      #
+      # Per MCP 2025-11-25, the server MAY send JSON-RPC requests and
+      # notifications on the POST response stream before the response, and MAY
+      # send priming events carrying only an event id. Every interleaved server
+      # message is dispatched exactly like on the GET events stream; the
+      # JSON-RPC response matching the originating request id is returned.
+      #
       # @param sse_body [String] the SSE formatted response body
-      # @return [Hash] the parsed JSON data
-      # @raise [MCPClient::Errors::TransportError] if no data found in SSE response
-      def parse_sse_response(sse_body)
-        # Extract JSON data from SSE format, processing events separately
-        # SSE format: event: message\nid: 123\ndata: {...}\n\n
+      # @param request_id [Integer, String, nil] id of the originating request
+      # @return [Hash] the parsed JSON-RPC response
+      # @raise [MCPClient::Errors::TransportError] if no response is found
+      def parse_sse_response(sse_body, request_id = nil)
+        events = extract_sse_events(sse_body)
+
+        raise MCPClient::Errors::TransportError, 'No data found in SSE response' if events.empty?
+
+        responses, saw_invalid_json = route_sse_events(events)
+        select_sse_response(responses, saw_invalid_json, request_id)
+      end
+
+      # Split an SSE body into events. An event without an explicit `event:`
+      # field has the default type "message" per the SSE specification; events
+      # carrying only an id (priming events) are kept so their id is tracked.
+      # @param sse_body [String] the SSE formatted response body
+      # @return [Array<Hash>] parsed events
+      def extract_sse_events(sse_body)
         events = []
-        current_event = { type: nil, data_lines: [], id: nil }
+        current_event = { type: 'message', data_lines: [], id: nil }
 
         sse_body.lines.each do |line|
           line = line.strip
 
           if line.empty?
             # Empty line marks end of an event
-            events << current_event.dup if current_event[:type] && !current_event[:data_lines].empty?
-            current_event = { type: nil, data_lines: [], id: nil }
+            events << current_event.dup if sse_event_present?(current_event)
+            current_event = { type: 'message', data_lines: [], id: nil }
           elsif line.start_with?('event:')
             current_event[:type] = line.sub(/^event:\s*/, '').strip
           elsif line.start_with?('data:')
@@ -74,23 +95,90 @@ module MCPClient
         end
 
         # Handle last event if no trailing empty line
-        events << current_event if current_event[:type] && !current_event[:data_lines].empty?
+        events << current_event if sse_event_present?(current_event)
+        events
+      end
 
-        # Find the first 'message' event which contains the JSON-RPC response
-        message_event = events.find { |e| e[:type] == 'message' }
+      # @param event [Hash] a parsed SSE event
+      # @return [Boolean] whether the event carries any data or id
+      def sse_event_present?(event)
+        (event[:id] && !event[:id].empty?) || !event[:data_lines].empty?
+      end
 
-        raise MCPClient::Errors::TransportError, 'No data found in SSE response' unless message_event
-        raise MCPClient::Errors::TransportError, 'No data found in message event' if message_event[:data_lines].empty?
+      # Track event ids for resumability, dispatch interleaved server messages
+      # (requests, notifications, pings) and collect response candidates.
+      # @param events [Array<Hash>] parsed SSE events
+      # @return [Array(Array<Hash>, Boolean)] response candidates and whether invalid JSON was seen
+      def route_sse_events(events)
+        responses = []
+        saw_invalid_json = false
 
-        # Track the event ID for resumability
-        if message_event[:id] && !message_event[:id].empty?
-          @last_event_id = message_event[:id]
-          @logger.debug("Tracking event ID for resumability: #{message_event[:id]}")
+        events.each do |event|
+          if event[:id] && !event[:id].empty?
+            @mutex.synchronize { @last_event_id = event[:id] }
+            @logger.debug("Tracking event ID for resumability: #{event[:id]}")
+          end
+          next unless event[:type] == 'message'
+
+          message = parse_sse_event_data(event[:data_lines].join("\n"))
+          saw_invalid_json = true if message == :invalid
+          next unless message.is_a?(Hash)
+
+          if message['method']
+            dispatch_server_message(message)
+          else
+            responses << message
+          end
         end
 
-        # Join multiline data fields according to SSE spec
-        json_data = message_event[:data_lines].join("\n")
-        JSON.parse(json_data)
+        [responses, saw_invalid_json]
+      end
+
+      # Parse the data payload of a single SSE event.
+      # @param json_data [String] the joined data lines
+      # @return [Hash, Symbol, nil] the parsed message, :invalid, or nil for empty/non-object data
+      def parse_sse_event_data(json_data)
+        return nil if json_data.empty?
+
+        message = JSON.parse(json_data)
+        return message if message.is_a?(Hash)
+
+        @logger.warn("Skipping non-object JSON-RPC message in SSE event: #{message.inspect}")
+        nil
+      rescue JSON::ParserError => e
+        @logger.warn("Skipping invalid JSON in SSE event: #{e.message}")
+        :invalid
+      end
+
+      # Choose the JSON-RPC response answering the originating request.
+      # @param responses [Array<Hash>] response candidates from the stream
+      # @param saw_invalid_json [Boolean] whether any event contained invalid JSON
+      # @param request_id [Integer, String, nil] id of the originating request
+      # @return [Hash] the selected response
+      # @raise [MCPClient::Errors::TransportError] if no response is found
+      def select_sse_response(responses, saw_invalid_json, request_id)
+        matched = if request_id.nil?
+                    responses.first
+                  else
+                    responses.find { |msg| msg['id'] == request_id || msg['id'].to_s == request_id.to_s }
+                  end
+
+        if matched.nil? && responses.length == 1
+          matched = responses.first
+          @logger.warn(
+            "SSE response id #{matched['id'].inspect} does not match request id #{request_id.inspect}; " \
+            'accepting the only response on the stream'
+          )
+        end
+
+        return matched if matched
+
+        if saw_invalid_json
+          raise MCPClient::Errors::TransportError,
+                'Invalid JSON response from server: SSE stream contained no valid JSON-RPC response'
+        end
+
+        raise MCPClient::Errors::TransportError, 'No JSON-RPC response found in SSE response'
       end
     end
   end
