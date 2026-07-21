@@ -30,14 +30,33 @@ module MCPClient
     # @raise [MCPClient::Errors::ServerError] if server returns an error
     # @raise [MCPClient::Errors::TransportError] if response isn't valid JSON
     # @raise [MCPClient::Errors::ToolCallError] for other errors during request execution
-    def rpc_request(method, params = {})
+    def rpc_request(method, params = {}, timeout: nil)
       ensure_connected
 
       with_retry do
         request_id = @mutex.synchronize { @request_id += 1 }
         request = build_jsonrpc_request(method, params, request_id)
-        send_jsonrpc_request(request)
+        begin
+          send_jsonrpc_request(request, timeout: timeout)
+        rescue MCPClient::Errors::RequestTimeoutError
+          # MCP lifecycle: on timeout the sender SHOULD issue a cancellation
+          # notification for the abandoned request and stop waiting.
+          send_cancellation_notification(request_id) if cancellable_request?(method, params)
+          raise
+        end
       end
+    end
+
+    # Best-effort notifications/cancelled for a request the client stopped
+    # waiting on. Failures are swallowed.
+    # @param request_id [Integer] id of the abandoned request
+    # @return [void]
+    def send_cancellation_notification(request_id)
+      notif = build_jsonrpc_notification('notifications/cancelled',
+                                         { 'requestId' => request_id, 'reason' => 'Request timed out' })
+      send_http_request(notif)
+    rescue StandardError => e
+      @logger.debug("Failed to send cancellation notification: #{e.message}")
     end
 
     # Send a JSON-RPC notification (no response expected)
@@ -161,11 +180,11 @@ module MCPClient
     # @raise [MCPClient::Errors::ConnectionError] if connection fails
     # @raise [MCPClient::Errors::TransportError] if response isn't valid JSON
     # @raise [MCPClient::Errors::ToolCallError] for other errors during request execution
-    def send_jsonrpc_request(request)
+    def send_jsonrpc_request(request, timeout: nil)
       @logger.debug("Sending JSON-RPC request: #{request.to_json}")
 
       begin
-        response = send_http_request(request)
+        response = send_http_request(request, timeout: timeout)
         parse_response(response, request)
       rescue MCPClient::Errors::ConnectionError, MCPClient::Errors::TransportError, MCPClient::Errors::ServerError
         raise
@@ -183,7 +202,7 @@ module MCPClient
     # @param request [Hash] the JSON-RPC request
     # @return [Faraday::Response] the HTTP response
     # @raise [MCPClient::Errors::ConnectionError] if connection fails
-    def send_http_request(request)
+    def send_http_request(request, timeout: nil)
       conn = http_connection
       # Capture the session id this request goes out with — the value
       # apply_request_headers attaches — so a later 404 is attributed to the
@@ -195,6 +214,9 @@ module MCPClient
       begin
         response = conn.post(@endpoint) do |req|
           apply_request_headers(req, request)
+          # Per-request timeout override (MCP lifecycle: timeouts SHOULD be
+          # configurable on a per-request basis)
+          req.options.timeout = timeout if timeout
           # The wire header must match the captured id exactly: a restart
           # completing between capture and header attachment would otherwise
           # attach a different (or fresh) session than the one attributed to
@@ -231,6 +253,8 @@ module MCPClient
         raise MCPClient::Errors::ServerError, "Client error: HTTP 404 #{e.message}"
       rescue Faraday::ConnectionFailed => e
         raise MCPClient::Errors::ConnectionError, "Server connection lost: #{e.message}"
+      rescue Faraday::TimeoutError => e
+        raise MCPClient::Errors::RequestTimeoutError, "Request timed out: #{e.message}"
       rescue Faraday::Error => e
         raise MCPClient::Errors::TransportError, "HTTP request failed: #{e.message}"
       end

@@ -80,8 +80,8 @@ module MCPClient
       # @param id [Integer] the request ID
       # @return [Hash] the JSON-RPC response message
       # @raise [MCPClient::Errors::TransportError] on timeout
-      def wait_response(id)
-        deadline = Time.now + @read_timeout
+      def wait_response(id, timeout: nil)
+        deadline = Time.now + (timeout || @read_timeout)
         @mutex.synchronize do
           until @pending.key?(id)
             remaining = deadline - Time.now
@@ -93,7 +93,7 @@ module MCPClient
           # timeout so neither @pending nor @awaiting accumulates entries.
           msg = @pending.delete(id)
           @awaiting.delete(id)
-          raise MCPClient::Errors::TransportError, "Timeout waiting for JSONRPC response id=#{id}" unless msg
+          raise MCPClient::Errors::RequestTimeoutError, "Timeout waiting for JSONRPC response id=#{id}" unless msg
 
           msg
         end
@@ -116,15 +116,35 @@ module MCPClient
       # @raise [MCPClient::Errors::ServerError] if server returns an error
       # @raise [MCPClient::Errors::TransportError] on transport errors
       # @raise [MCPClient::Errors::ToolCallError] on tool call errors
-      def rpc_request(method, params = {})
+      def rpc_request(method, params = {}, timeout: nil)
         ensure_initialized
         with_retry do
           req_id = next_id
           req = build_jsonrpc_request(method, params, req_id)
           send_request(req)
-          res = wait_response(req_id)
+          begin
+            res = wait_response(req_id, timeout: timeout)
+          rescue MCPClient::Errors::RequestTimeoutError
+            # MCP lifecycle: on timeout the sender SHOULD issue a cancellation
+            # notification for the abandoned request and stop waiting.
+            send_cancellation_notification(req_id) if cancellable_request?(method, params)
+            raise
+          end
           process_jsonrpc_response(res)
         end
+      end
+
+      # Best-effort notifications/cancelled for a request the client stopped
+      # waiting on. Failures are swallowed: the transport may be the reason
+      # the request timed out in the first place.
+      # @param request_id [Integer] id of the abandoned request
+      # @return [void]
+      def send_cancellation_notification(request_id)
+        notif = build_jsonrpc_notification('notifications/cancelled',
+                                           { 'requestId' => request_id, 'reason' => 'Request timed out' })
+        @stdin.puts(notif.to_json)
+      rescue StandardError => e
+        @logger.debug("Failed to send cancellation notification: #{e.message}")
       end
 
       # Send a JSON-RPC notification (no response expected)

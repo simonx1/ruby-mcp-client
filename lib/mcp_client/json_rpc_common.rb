@@ -23,6 +23,10 @@ module MCPClient
         yield
       rescue MCPClient::Errors::TransientServerError, MCPClient::Errors::TransportError, IOError,
              Errno::ETIMEDOUT, Errno::ECONNRESET, Errno::EPIPE => e
+        # A timed-out request may still be executing server-side; re-sending
+        # it could run a non-idempotent operation twice. Never retry those.
+        raise if e.is_a?(MCPClient::Errors::RequestTimeoutError)
+
         attempts += 1
         if attempts <= @max_retries
           delay = @retry_backoff * (2**(attempts - 1))
@@ -41,6 +45,19 @@ module MCPClient
     # @raise [MCPClient::Errors::ServerError] if the server returns an error
     def ping
       rpc_request('ping')
+    end
+
+    # Whether automatic notifications/cancelled on timeout is appropriate
+    # for this request: never for initialize (MUST NOT be cancelled), and
+    # never for task-augmented requests (tasks use tasks/cancel instead).
+    # @param method [String] JSON-RPC method
+    # @param params [Hash] request params
+    # @return [Boolean]
+    def cancellable_request?(method, params)
+      return false if method == 'initialize'
+      return false if params.is_a?(Hash) && (params.key?('task') || params.key?(:task))
+
+      true
     end
 
     # Split request-level _meta (RequestParams._meta, e.g. progressToken or

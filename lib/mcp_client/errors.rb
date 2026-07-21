@@ -69,6 +69,14 @@ module MCPClient
     # Raised when there's an error in the MCP server transport
     class TransportError < MCPError; end
 
+    # Raised when a request exceeded its timeout without receiving a
+    # response. A subclass of TransportError so existing rescues keep
+    # working, but deliberately excluded from automatic retries: the
+    # request may still be executing server-side, so a blind re-send could
+    # run a non-idempotent operation twice (MCP lifecycle: on timeout the
+    # sender SHOULD cancel and stop waiting, not re-send).
+    class RequestTimeoutError < TransportError; end
+
     # Raised when tool parameters fail validation against the tool's input
     # schema, or (in strict mode) when a tool result's structuredContent fails
     # validation against the tool's output schema
