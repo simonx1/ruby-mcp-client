@@ -1041,8 +1041,8 @@ module MCPClient
       # Call the registered callback
       result = @elicitation_request_callback.call(request_id, params)
 
-      # Send the response back to the server
-      send_elicitation_response(request_id, result)
+      # Send the response back to the server (echoing related-task _meta)
+      send_elicitation_response(request_id, merge_related_task_meta(result, params))
     end
 
     # Handle roots/list request from server (MCP 2025-06-18)
@@ -1060,8 +1060,8 @@ module MCPClient
       # Call the registered callback
       result = @roots_list_request_callback.call(request_id, params)
 
-      # Send the response back to the server
-      send_roots_list_response(request_id, result)
+      # Send the response back to the server (echoing related-task _meta)
+      send_roots_list_response(request_id, merge_related_task_meta(result, params))
     end
 
     # Handle sampling/createMessage request from server (MCP 2025-11-25)
@@ -1079,8 +1079,8 @@ module MCPClient
       # Call the registered callback
       result = @sampling_request_callback.call(request_id, params)
 
-      # Send the response back to the server
-      send_sampling_response(request_id, result)
+      # Send the response back to the server (echoing related-task _meta)
+      send_sampling_response(request_id, merge_related_task_meta(result, params))
     end
 
     # Send roots/list response back to server via HTTP POST (MCP 2025-06-18)
