@@ -458,7 +458,9 @@ RSpec.describe 'Streamable HTTP Progress Notifications Integration', type: :inte
     end
 
     it 'continues processing even when progress notification parsing fails' do
-      # This tests that the server continues to work even if individual notifications fail
+      # A malformed interleaved event must not break the request: the invalid
+      # event is skipped, the notification is dispatched, and the JSON-RPC
+      # response is still returned (MCP 2025-11-25 POST SSE stream semantics).
       mixed_response = [
         "event: message\ndata: invalid json notification\n\n",
         "event: message\ndata: #{test_progress_notification.to_json}\n\n",
@@ -475,13 +477,16 @@ RSpec.describe 'Streamable HTTP Progress Notifications Integration', type: :inte
 
       server.connect
 
-      # Should raise error due to malformed JSON in the stream
-      expect do
-        server.call_tool('longRunningOperation', {
-                           duration: 1,
-                           _meta: { progressToken: progress_token }
-                         })
-      end.to raise_error(MCPClient::Errors::TransportError, /Invalid JSON/)
+      result = server.call_tool('longRunningOperation', {
+                                  duration: 1,
+                                  _meta: { progressToken: progress_token }
+                                })
+
+      expect(result['content'].first['text']).to eq('Operation completed')
+
+      progress = received_notifications.select { |n| n[:method] == 'notifications/progress' }
+      expect(progress.size).to eq(1)
+      expect(progress.first[:params]['progressToken']).to eq(progress_token)
     end
   end
 end
