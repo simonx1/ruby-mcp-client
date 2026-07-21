@@ -188,8 +188,9 @@ RSpec.describe 'Elicitation compliance (MCP 2025-11-25)' do
   end
 
   describe 'declared elicitation capability' do
-    it 'declares both supported modes (form and url)' do
+    it 'declares both supported modes (form and url) when a callback is registered' do
       server = MCPClient::ServerStdio.new(command: 'echo test')
+      server.on_elicitation_request { |_id, _params| { 'action' => 'decline' } }
       params = server.send(:initialization_params)
 
       expect(params['capabilities']['elicitation']).to eq({ 'form' => {}, 'url' => {} })

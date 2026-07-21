@@ -37,8 +37,8 @@ RSpec.describe MCPClient::Client, 'Sampling (MCP 2025-11-25)' do
     end
 
     context 'when sampling_handler is not provided' do
-      it 'still registers handler on servers (for error response)' do
-        expect(mock_server).to receive(:on_sampling_request)
+      it 'does not register the sampling callback (capability stays undeclared)' do
+        expect(mock_server).not_to receive(:on_sampling_request)
 
         described_class.new(
           mcp_server_configs: [{ type: 'stdio', command: 'test' }]

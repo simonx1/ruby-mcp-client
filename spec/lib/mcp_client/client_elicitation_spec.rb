@@ -98,14 +98,15 @@ RSpec.describe MCPClient::Client, 'Elicitation (MCP 2025-06-18)' do
     end
 
     context 'when elicitation_handler is not provided' do
-      it 'still registers handler on servers (for decline behavior)' do
-        # Even without handler, we register the method so we can auto-decline
+      it 'does not register the elicitation callback (capability stays undeclared)' do
+        # Without a host handler the capability must not be declared, so the
+        # callback is not registered on the transport.
         allow(mock_stdio_server).to receive(:respond_to?).with(:on_elicitation_request).and_return(true)
         allow(mock_stdio_server).to receive(:respond_to?).with(:on_roots_list_request).and_return(true)
         allow(mock_stdio_server).to receive(:respond_to?).with(:on_sampling_request).and_return(true)
         allow(mock_stdio_server).to receive(:on_roots_list_request)
         allow(mock_stdio_server).to receive(:on_sampling_request)
-        expect(mock_stdio_server).to receive(:on_elicitation_request)
+        expect(mock_stdio_server).not_to receive(:on_elicitation_request)
 
         described_class.new(
           mcp_server_configs: [{ type: 'stdio', command: 'test' }]

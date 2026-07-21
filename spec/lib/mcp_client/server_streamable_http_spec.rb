@@ -1258,52 +1258,31 @@ RSpec.describe MCPClient::ServerStreamableHTTP do
       end
     end
 
-    describe 'Last-Event-ID header injection' do
+    describe 'Last-Event-ID header placement (SEP-1699)' do
       before do
         server.instance_variable_set(:@last_event_id, 'last-event-456')
       end
 
-      it 'includes Last-Event-ID header when available' do
+      it 'does not attach Last-Event-ID to JSON-RPC POSTs' do
+        captured = []
         stub_request(:post, "#{base_url}#{endpoint}")
-          .with(
-            headers: { 'Last-Event-ID' => 'last-event-456' },
-            body: hash_including(method: 'tools/list')
-          )
-          .to_return(
-            status: 200,
-            body: "event: message\nid: event-457\ndata: {\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"tools\":[]}}\n\n",
-            headers: { 'Content-Type' => 'text/event-stream' }
-          )
+          .with(body: hash_including(method: 'tools/list'))
+          .to_return do |request|
+            captured << request
+            { status: 200,
+              body: "event: message\ndata: {\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"tools\":[]}}\n\n",
+              headers: { 'Content-Type' => 'text/event-stream' } }
+          end
 
         server.send(:request_tools_list)
-        expect(WebMock).to have_requested(:post, "#{base_url}#{endpoint}")
-          .with(headers: { 'Last-Event-ID' => 'last-event-456' })
+        expect(captured.first.headers).not_to have_key('Last-Event-Id')
       end
 
-      it 'includes both session and Last-Event-ID headers when both present' do
-        server.instance_variable_set(:@session_id, 'session-123')
-        server.instance_variable_set(:@last_event_id, 'event-789')
+      it 'attaches Last-Event-ID to the GET events request (resumption is always via GET)' do
+        req = Struct.new(:headers).new({})
+        server.send(:apply_events_headers, req)
 
-        stub_request(:post, "#{base_url}#{endpoint}")
-          .with(
-            headers: {
-              'Mcp-Session-Id' => 'session-123',
-              'Last-Event-ID' => 'event-789'
-            },
-            body: hash_including(method: 'tools/list')
-          )
-          .to_return(
-            status: 200,
-            body: "event: message\ndata: {\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"tools\":[]}}\n\n",
-            headers: { 'Content-Type' => 'text/event-stream' }
-          )
-
-        server.send(:request_tools_list)
-        expect(WebMock).to have_requested(:post, "#{base_url}#{endpoint}")
-          .with(headers: {
-                  'Mcp-Session-Id' => 'session-123',
-                  'Last-Event-ID' => 'event-789'
-                })
+        expect(req.headers['Last-Event-ID']).to eq('last-event-456')
       end
     end
 

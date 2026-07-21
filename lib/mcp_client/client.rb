@@ -66,14 +66,19 @@ module MCPClient
           # Invoke user-defined listeners
           @notification_listeners.each { |cb| cb.call(server, method, params) }
         end
-        # Register elicitation handler on each server
-        if server.respond_to?(:on_elicitation_request)
+        # Register feature callbacks only for features the host actually
+        # supports: transports derive their declared client capabilities from
+        # the callbacks registered before connecting, and MCP forbids using
+        # capabilities that were not negotiated.
+        if @elicitation_handler && server.respond_to?(:on_elicitation_request)
           server.on_elicitation_request(&method(:handle_elicitation_request))
         end
-        # Register roots list handler on each server (MCP 2025-06-18)
+        # The client always implements the roots feature (roots/list and
+        # list_changed notifications), independent of the current roots list.
         server.on_roots_list_request(&method(:handle_roots_list_request)) if server.respond_to?(:on_roots_list_request)
-        # Register sampling handler on each server (MCP 2025-11-25)
-        server.on_sampling_request(&method(:handle_sampling_request)) if server.respond_to?(:on_sampling_request)
+        if @sampling_handler && server.respond_to?(:on_sampling_request)
+          server.on_sampling_request(&method(:handle_sampling_request))
+        end
       end
     end
 
@@ -1139,10 +1144,18 @@ module MCPClient
     # @return [void]
     def notify_roots_changed
       @servers.each do |server|
-        server.rpc_notify('notifications/roots/list_changed', {})
-      rescue StandardError => e
-        server_id = server.name ? "#{server.class}[#{server.name}]" : server.class
-        @logger.warn("[#{server_id}] Failed to send roots/list_changed notification: #{e.message}")
+        # Only notify sessions where the roots capability could be declared:
+        # MCP forbids using capabilities that were not negotiated, and
+        # transports without a server-request channel (plain HTTP) never
+        # declare roots.
+        next unless server.respond_to?(:on_roots_list_request)
+
+        begin
+          server.rpc_notify('notifications/roots/list_changed', {})
+        rescue StandardError => e
+          server_id = server.name ? "#{server.class}[#{server.name}]" : server.class
+          @logger.warn("[#{server_id}] Failed to send roots/list_changed notification: #{e.message}")
+        end
       end
     end
 
