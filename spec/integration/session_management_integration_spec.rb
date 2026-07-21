@@ -158,8 +158,8 @@ RSpec.describe 'Session Management Integration', type: :integration do
           .with(body: hash_including(method: 'initialize'))
           .to_return(
             status: 200,
-            body: { jsonrpc: '2.0', id: 1, result: {} }.to_json,
-            headers: { 'Mcp-Session-Id' => 'invalid@session!' } # Invalid format
+            body: { jsonrpc: '2.0', id: 1, result: { protocolVersion: MCPClient::PROTOCOL_VERSION } }.to_json,
+            headers: { 'Mcp-Session-Id' => 'invalid session id' } # Invalid format
           )
 
         # initialized notification (MCP lifecycle MUST)
@@ -212,7 +212,9 @@ RSpec.describe 'Session Management Integration', type: :integration do
           .with(body: hash_including(method: 'initialize'))
           .to_return(
             status: 200,
-            body: "event: message\nid: #{event_id}-init\ndata: {\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{}}\n\n",
+            body: "event: message\nid: #{event_id}-init\n" \
+                  "data: #{{ jsonrpc: '2.0', id: 1,
+                             result: { protocolVersion: MCPClient::PROTOCOL_VERSION } }.to_json}\n\n",
             headers: {
               'Mcp-Session-Id' => session_id,
               'Content-Type' => 'text/event-stream'
@@ -240,10 +242,7 @@ RSpec.describe 'Session Management Integration', type: :integration do
         stub_request(:post, "#{base_url}#{endpoint}")
           .with(
             body: hash_including(method: 'tools/list'),
-            headers: {
-              'Mcp-Session-Id' => session_id,
-              'Last-Event-ID' => "#{event_id}-init"
-            }
+            headers: { 'Mcp-Session-Id' => session_id }
           )
           .to_return(
             status: 200,
@@ -256,10 +255,7 @@ RSpec.describe 'Session Management Integration', type: :integration do
         stub_request(:post, "#{base_url}#{endpoint}")
           .with(
             body: hash_including(method: 'tools/call'),
-            headers: {
-              'Mcp-Session-Id' => session_id,
-              'Last-Event-ID' => "#{event_id}-tools"
-            }
+            headers: { 'Mcp-Session-Id' => session_id }
           )
           .to_return(
             status: 200,
@@ -380,30 +376,34 @@ RSpec.describe 'Session Management Integration', type: :integration do
     end
 
     context 'resumability scenarios' do
-      it 'continues from last event ID after reconnection' do
+      it 'resumes via GET with Last-Event-ID after reconnection (SEP-1699)' do
         # Set up state as if we had a previous session
         streamable_server.instance_variable_set(:@session_id, session_id)
         streamable_server.instance_variable_set(:@last_event_id, 'previous-event-123')
         streamable_server.instance_variable_set(:@connection_established, true)
         streamable_server.instance_variable_set(:@initialized, true)
 
-        # Server should replay from the last event ID
+        # Resumption is always via HTTP GET carrying the cursor; POSTs carry
+        # only session/protocol headers
+        req = Struct.new(:headers).new({})
+        streamable_server.send(:apply_events_headers, req)
+        expect(req.headers['Last-Event-ID']).to eq('previous-event-123')
+        expect(req.headers['Mcp-Session-Id']).to eq(session_id)
+
+        captured = []
         stub_request(:post, "#{base_url}#{endpoint}")
-          .with(
-            headers: {
-              'Mcp-Session-Id' => session_id,
-              'Last-Event-ID' => 'previous-event-123'
-            }
-          )
-          .to_return(
-            status: 200,
-            body: "event: message\nid: resumed-event-124\n" \
-                  "data: {\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"tools\":[]}}\n\n",
-            headers: { 'Content-Type' => 'text/event-stream' }
-          )
+          .with(headers: { 'Mcp-Session-Id' => session_id })
+          .to_return do |request|
+            captured << request
+            { status: 200,
+              body: "event: message\nid: resumed-event-124\n" \
+                    "data: {\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"tools\":[]}}\n\n",
+              headers: { 'Content-Type' => 'text/event-stream' } }
+          end
 
         result = streamable_server.send(:request_tools_list)
         expect(result).to eq([])
+        expect(captured.first.headers).not_to have_key('Last-Event-Id')
         expect(streamable_server.instance_variable_get(:@last_event_id)).to eq('resumed-event-124')
       end
     end
@@ -435,7 +435,7 @@ RSpec.describe 'Session Management Integration', type: :integration do
         stub_request(:post, "#{base_url}/rpc")
           .to_return(
             status: 200,
-            body: { jsonrpc: '2.0', id: 1, result: {} }.to_json,
+            body: { jsonrpc: '2.0', id: 1, result: { protocolVersion: MCPClient::PROTOCOL_VERSION } }.to_json,
             headers: { 'Mcp-Session-Id' => 'valid_session-123_abc' }
           )
 
@@ -446,8 +446,8 @@ RSpec.describe 'Session Management Integration', type: :integration do
         stub_request(:post, "#{base_url}/rpc")
           .to_return(
             status: 200,
-            body: { jsonrpc: '2.0', id: 2, result: {} }.to_json,
-            headers: { 'Mcp-Session-Id' => 'invalid@session!' }
+            body: { jsonrpc: '2.0', id: 2, result: { protocolVersion: MCPClient::PROTOCOL_VERSION } }.to_json,
+            headers: { 'Mcp-Session-Id' => 'invalid session id' }
           )
 
         http_server.send(:perform_initialize)

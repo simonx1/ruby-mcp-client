@@ -1,5 +1,9 @@
 # frozen_string_literal: true
 
+require 'uri'
+require 'date'
+require 'time'
+
 module MCPClient
   # Validates elicitation schemas and content per MCP 2025-11-25 spec.
   # Schemas are restricted to flat objects with primitive property types:
@@ -197,7 +201,46 @@ module MCPClient
         errors << "Field '#{field}' must be at most #{prop['maxLength']} characters"
       end
 
+      errors.concat(validate_string_format(field, value, prop['format']))
+
       errors
+    end
+
+    # Validate a string value against the schema's format constraint.
+    # The MCP elicitation schema supports email, uri, date, and date-time.
+    # @param field [String] field name
+    # @param value [String] the value
+    # @param format [String, nil] declared format
+    # @return [Array<String>] validation errors
+    def self.validate_string_format(field, value, format)
+      valid = case format
+              when 'email' then value.match?(URI::MailTo::EMAIL_REGEXP)
+              when 'uri' then valid_uri?(value)
+              when 'date' then parseable?(Date, value)
+              when 'date-time' then parseable?(Time, value)
+              else true # No format declared, or an unknown format: not validated
+              end
+
+      valid ? [] : ["Field '#{field}' must be a valid #{format}"]
+    end
+
+    # @param value [String] candidate URI
+    # @return [Boolean] whether the value is an absolute URI
+    def self.valid_uri?(value)
+      uri = URI.parse(value)
+      !uri.scheme.nil?
+    rescue URI::InvalidURIError
+      false
+    end
+
+    # @param klass [Class] Date or Time
+    # @param value [String] candidate ISO 8601 value
+    # @return [Boolean] whether the value parses
+    def self.parseable?(klass, value)
+      klass.iso8601(value)
+      true
+    rescue ArgumentError
+      false
     end
 
     # Validate a number value against its property schema.

@@ -17,9 +17,13 @@ module MCPClient
     #   @return [Integer, nil] optional size in bytes
     # @!attribute [r] annotations
     #   @return [Hash, nil] optional annotations that provide hints to clients
+    # @!attribute [r] icons
+    #   @return [Array<Hash>, nil] optional icons for display in user interfaces (MCP 2025-11-25, SEP-973)
+    # @!attribute [r] meta
+    #   @return [Hash, nil] optional `_meta` metadata attached to the resource (MCP 2025-11-25)
     # @!attribute [r] server
     #   @return [MCPClient::ServerBase, nil] the server this resource belongs to
-    attr_reader :uri, :name, :title, :description, :mime_type, :size, :annotations, :server
+    attr_reader :uri, :name, :title, :description, :mime_type, :size, :annotations, :icons, :meta, :server
 
     # Initialize a new resource
     # @param uri [String] unique identifier for the resource
@@ -29,8 +33,12 @@ module MCPClient
     # @param mime_type [String, nil] optional MIME type
     # @param size [Integer, nil] optional size in bytes
     # @param annotations [Hash, nil] optional annotations that provide hints to clients
+    # @param icons [Array<Hash>, nil] optional icons for display in user interfaces (MCP 2025-11-25)
+    # @param meta [Hash, nil] optional `_meta` metadata attached to the resource (MCP 2025-11-25)
     # @param server [MCPClient::ServerBase, nil] the server this resource belongs to
-    def initialize(uri:, name:, title: nil, description: nil, mime_type: nil, size: nil, annotations: nil, server: nil)
+    # rubocop:disable Metrics/ParameterLists
+    def initialize(uri:, name:, title: nil, description: nil, mime_type: nil, size: nil, annotations: nil,
+                   icons: nil, meta: nil, server: nil)
       @uri = uri
       @name = name
       @title = title
@@ -38,8 +46,11 @@ module MCPClient
       @mime_type = mime_type
       @size = size
       @annotations = annotations
+      @icons = icons
+      @meta = meta
       @server = server
     end
+    # rubocop:enable Metrics/ParameterLists
 
     # Return the lastModified annotation value (ISO 8601 timestamp string)
     # @return [String, nil] the lastModified timestamp, or nil if not set
@@ -62,6 +73,8 @@ module MCPClient
         mime_type: data['mimeType'],
         size: data['size'],
         annotations: data['annotations'],
+        icons: data['icons'],
+        meta: data['_meta'],
         server: server
       )
     end

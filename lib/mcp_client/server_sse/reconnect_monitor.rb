@@ -88,9 +88,13 @@ module MCPClient
 
             cleanup
 
-            # Clear any stale auth error from the previous connection so it does
-            # not spuriously abort this reconnect via wait_for_connection.
-            @mutex.synchronize { @auth_error = nil }
+            # Clear any stale auth/connection error from the previous connection
+            # so it does not spuriously abort this reconnect via
+            # wait_for_connection.
+            @mutex.synchronize do
+              @auth_error = nil
+              @connection_error = nil
+            end
 
             connect
             @logger.info('Successfully reconnected after ping failures')
@@ -169,11 +173,14 @@ module MCPClient
           deadline = Time.now + timeout
 
           until @connection_established
+            break if @connection_error
+
             remaining = [1, deadline - Time.now].min
             break if remaining <= 0 || @connection_cv.wait(remaining) { @connection_established }
           end
 
           raise MCPClient::Errors::ConnectionError, @auth_error if @auth_error
+          raise MCPClient::Errors::ConnectionError, @connection_error if @connection_error
 
           unless @connection_established
             cleanup

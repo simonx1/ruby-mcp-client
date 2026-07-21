@@ -98,14 +98,15 @@ RSpec.describe MCPClient::Client, 'Elicitation (MCP 2025-06-18)' do
     end
 
     context 'when elicitation_handler is not provided' do
-      it 'still registers handler on servers (for decline behavior)' do
-        # Even without handler, we register the method so we can auto-decline
+      it 'does not register the elicitation callback (capability stays undeclared)' do
+        # Without a host handler the capability must not be declared, so the
+        # callback is not registered on the transport.
         allow(mock_stdio_server).to receive(:respond_to?).with(:on_elicitation_request).and_return(true)
         allow(mock_stdio_server).to receive(:respond_to?).with(:on_roots_list_request).and_return(true)
         allow(mock_stdio_server).to receive(:respond_to?).with(:on_sampling_request).and_return(true)
         allow(mock_stdio_server).to receive(:on_roots_list_request)
         allow(mock_stdio_server).to receive(:on_sampling_request)
-        expect(mock_stdio_server).to receive(:on_elicitation_request)
+        expect(mock_stdio_server).not_to receive(:on_elicitation_request)
 
         described_class.new(
           mcp_server_configs: [{ type: 'stdio', command: 'test' }]
@@ -130,19 +131,19 @@ RSpec.describe MCPClient::Client, 'Elicitation (MCP 2025-06-18)' do
     end
 
     context 'when no elicitation handler is configured' do
-      it 'declines the request' do
+      it 'returns a -32601 error instead of fabricating a decline' do
         client = described_class.new
 
         result = client.send(:handle_elicitation_request, request_id, params)
 
-        expect(result).to eq({ 'action' => 'decline' })
+        expect(result['error']).to include('code' => -32_601)
       end
 
       it 'logs a warning' do
         client = described_class.new
         logger = client.instance_variable_get(:@logger)
 
-        expect(logger).to receive(:warn).with('Received elicitation request but no handler configured, declining')
+        expect(logger).to receive(:warn).with('Received elicitation request but no elicitation handler is configured')
 
         client.send(:handle_elicitation_request, request_id, params)
       end
@@ -211,12 +212,12 @@ RSpec.describe MCPClient::Client, 'Elicitation (MCP 2025-06-18)' do
         end
       end
 
-      it 'catches the exception and declines' do
+      it 'catches the exception and returns a -32603 internal error' do
         client = described_class.new(elicitation_handler: error_handler)
 
         result = client.send(:handle_elicitation_request, request_id, params)
 
-        expect(result).to eq({ 'action' => 'decline' })
+        expect(result['error']).to include('code' => -32_603)
       end
 
       it 'logs the error' do
