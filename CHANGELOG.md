@@ -1,6 +1,6 @@
 # Changelog
 
-## 2.0.0 — Conformance (2026-07-21)
+## 2.0.0 — MCP 2025-11-25 Conformance (2026-07-21)
 
 Full compliance pass against the **MCP 2025-11-25** specification: every transport,
 utility and auth flow was audited against the spec and brought into conformance
