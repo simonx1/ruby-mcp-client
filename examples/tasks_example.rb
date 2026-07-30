@@ -59,12 +59,12 @@ def run_task_flow(client, tool_name)
   # suggested poll interval (milliseconds).
   until task.terminal? || task.input_required?
     sleep((task.poll_interval || 1000) / 1000.0)
-    task = client.get_task(task.task_id)
+    task = client.get_task(task)
     puts "  status: #{task.status}"
   end
 
   if task.terminal? && task.status == 'completed'
-    result = client.get_task_result(task.task_id)
+    result = client.get_task_result(task)
     puts "Result: #{result.inspect}"
   else
     puts "Task ended in status: #{task.status}"
