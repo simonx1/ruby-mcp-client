@@ -74,7 +74,7 @@ def _now_iso():
     return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
 
 
-def create_task_record(task_id, tool_name, arguments, ttl=None):
+def create_task_record(task_id, tool_name, arguments, ttl=None, owner_session_id=None):
     """Create a task record in the MCP 2025-11-25 shape."""
     now = _now_iso()
     task = {
@@ -86,6 +86,7 @@ def create_task_record(task_id, tool_name, arguments, ttl=None):
         "ttl": ttl,
         "pollInterval": 300,
         # Internal bookkeeping (not sent to the client)
+        "_owner_session_id": owner_session_id,
         "_tool_name": tool_name,
         "_arguments": arguments,
         "_result": None,
@@ -93,6 +94,18 @@ def create_task_record(task_id, tool_name, arguments, ttl=None):
     with tasks_lock:
         tasks_store[task_id] = task
     return task
+
+
+def task_owned_by(task, session_id):
+    """Whether a task belongs to the requesting MCP session.
+
+    Task IDs are handed to one session, so every task operation must be scoped
+    to its owner: otherwise any connected client could poll, read the result
+    of, or cancel another session's task by guessing or observing its ID.
+    Tasks created before ownership was recorded have no owner and stay
+    reachable only by a session-less caller.
+    """
+    return task.get("_owner_session_id") == session_id
 
 
 def task_to_response(task):
@@ -883,7 +896,9 @@ End of sample data.""".format(datetime.now().isoformat())
                 if task_aug is not None:
                     task_id = str(uuid.uuid4())
                     ttl = task_aug.get('ttl') if isinstance(task_aug, dict) else None
-                    task = create_task_record(task_id, tool_name, tool_args, ttl=ttl)
+                    task = create_task_record(
+                        task_id, tool_name, tool_args, ttl=ttl, owner_session_id=session_id
+                    )
                     threading.Thread(
                         target=run_task_in_background, args=(task_id, session_id), daemon=True
                     ).start()
@@ -1260,6 +1275,10 @@ End of sample data.""".format(datetime.now().isoformat())
             task_id = params.get('taskId', '')
             with tasks_lock:
                 task = tasks_store.get(task_id)
+                # A task belonging to another session is reported exactly like
+                # a missing one, so IDs cannot be probed for existence.
+                if task and not task_owned_by(task, session_id):
+                    task = None
             if task:
                 response_data = {"jsonrpc": "2.0", "id": request_id, "result": task_to_response(task)}
             else:
@@ -1277,6 +1296,8 @@ End of sample data.""".format(datetime.now().isoformat())
             task_id = params.get('taskId', '')
             with tasks_lock:
                 task = tasks_store.get(task_id)
+                if task and not task_owned_by(task, session_id):
+                    task = None
                 if not task:
                     response_data = {
                         "jsonrpc": "2.0", "id": request_id,
@@ -1303,7 +1324,10 @@ End of sample data.""".format(datetime.now().isoformat())
 
         elif method == 'tasks/list':
             with tasks_lock:
-                task_list = [task_to_response(t) for t in tasks_store.values()]
+                task_list = [
+                    task_to_response(t) for t in tasks_store.values()
+                    if task_owned_by(t, session_id)
+                ]
             response_data = {"jsonrpc": "2.0", "id": request_id, "result": {"tasks": task_list}}
             return Response(
                 format_sse_event("message", response_data),
@@ -1315,6 +1339,8 @@ End of sample data.""".format(datetime.now().isoformat())
             task_id = params.get('taskId', '')
             with tasks_lock:
                 task = tasks_store.get(task_id)
+                if task and not task_owned_by(task, session_id):
+                    task = None
                 if not task:
                     response_data = {
                         "jsonrpc": "2.0", "id": request_id,
