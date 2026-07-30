@@ -194,6 +194,12 @@ module MCPClient
         url = extract_resource_metadata_url(www_authenticate)
         return nil unless url
 
+        # The challenge header is peer-controlled input: enforce the HTTPS
+        # policy on the advertised URL BEFORE it is stored or fetched, so a
+        # malicious challenge cannot pivot this host into plain-HTTP GETs
+        # against internal services (SSRF).
+        enforce_https!(url, 'resource metadata URL (from WWW-Authenticate challenge)')
+
         # Remember the advertised URL even if the fetch below fails, so a
         # later discovery retries it instead of probing well-known URIs the
         # challenge already superseded.
@@ -505,6 +511,12 @@ module MCPClient
           raise MCPClient::Errors::ConnectionError,
                 'Protected resource metadata does not advertise any authorization_servers'
         end
+
+        # authorization_servers is untrusted PRM content: enforce the HTTPS
+        # policy on the advertised origin BEFORE constructing and fetching
+        # well-known URLs on it, so a malicious protected resource cannot
+        # drive discovery GETs against internal services (SSRF).
+        enforce_https!(auth_server_url, 'authorization server (advertised by protected resource metadata)')
 
         server_metadata = fetch_first_server_metadata(authorization_server_metadata_urls(auth_server_url))
         unless server_metadata

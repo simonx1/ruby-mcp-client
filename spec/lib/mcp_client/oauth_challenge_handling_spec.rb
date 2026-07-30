@@ -85,6 +85,43 @@ RSpec.describe 'OAuth challenge handling (MCP 2025-11-25)' do
       expect(provider.challenge_scope).to eq('mcp:tools mcp:resources')
     end
 
+    it 'rejects a non-HTTPS resource_metadata challenge URL without fetching it' do
+      # The challenge header is peer-controlled input: fetching an arbitrary
+      # http:// URL from it would let the server pivot this host into GET
+      # requests against internal services (SSRF). No stub is registered, so
+      # any attempted fetch would fail the test via WebMock.
+      response = instance_double(
+        Faraday::Response,
+        headers: {
+          'WWW-Authenticate' =>
+            'Bearer resource_metadata="http://169.254.169.254/latest/meta-data"'
+        }
+      )
+
+      expect { provider.handle_unauthorized_response(response) }
+        .to raise_error(MCPClient::Errors::ConnectionError, /must use HTTPS/)
+      expect(provider.instance_variable_get(:@challenge_metadata_url)).to be_nil
+    end
+
+    it 'allows a loopback http resource_metadata challenge URL for development' do
+      stub_request(:get, 'http://localhost:9292/.well-known/oauth-protected-resource')
+        .to_return(
+          status: 200,
+          headers: { 'Content-Type' => 'application/json' },
+          body: { resource: base_url, authorization_servers: ['https://auth.example.com'] }.to_json
+        )
+
+      response = instance_double(
+        Faraday::Response,
+        headers: {
+          'WWW-Authenticate' =>
+            'Bearer resource_metadata="http://localhost:9292/.well-known/oauth-protected-resource"'
+        }
+      )
+
+      expect { provider.handle_unauthorized_response(response) }.not_to raise_error
+    end
+
     it 'captures the challenge scope even without a resource_metadata parameter' do
       response = instance_double(
         Faraday::Response,
