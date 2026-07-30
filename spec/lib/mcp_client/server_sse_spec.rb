@@ -967,6 +967,24 @@ RSpec.describe MCPClient::ServerSSE do
       expect(call_count).to eq(2) # Verify it was called twice (one fail, one success)
     end
 
+    it 'does not retry a non-idempotent tools/call after an ambiguous failure' do
+      server.instance_variable_set(:@max_retries, 2)
+      server.instance_variable_set(:@retry_backoff, 0.01)
+
+      # The failure may have arrived after the server received the request;
+      # re-sending tools/call could execute the operation twice.
+      call_count = 0
+      allow(server).to receive(:send_jsonrpc_request) do
+        call_count += 1
+        raise MCPClient::Errors::TransportError, 'Network timeout'
+      end
+
+      expect { server.rpc_request('tools/call', { name: 't' }) }.to raise_error(
+        MCPClient::Errors::TransportError, /Network timeout/
+      )
+      expect(call_count).to eq(1)
+    end
+
     it 'gives up after max retries' do
       server.instance_variable_set(:@max_retries, 1)
       server.instance_variable_set(:@retry_backoff, 0.01) # Speed up tests
