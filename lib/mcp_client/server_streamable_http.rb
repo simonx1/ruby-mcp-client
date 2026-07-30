@@ -33,6 +33,13 @@ module MCPClient
     SSE_MAX_RECONNECT_DELAY = 30   # Maximum reconnect delay in seconds
     THREAD_JOIN_TIMEOUT = 5 # Timeout for thread cleanup
 
+    # Maximum bytes an SSE parse buffer (events stream or resumption GET) may
+    # hold while waiting for an event terminator. The stream is
+    # peer-controlled: without a cap, a hostile server could withhold the
+    # blank-line delimiter forever and grow the buffer until the host runs
+    # out of memory. Generous enough for any legitimate JSON-RPC event.
+    MAX_SSE_BUFFER_BYTES = 32 * 1024 * 1024
+
     # @!attribute [r] base_url
     #   @return [String] The base URL of the MCP server
     # @!attribute [r] endpoint
@@ -803,6 +810,10 @@ module MCPClient
         req.options.on_data = proc do |chunk, _bytes|
           buffer << chunk
           process_resumption_buffer(buffer, state)
+          # A peer replaying delimiter-free data must not grow this buffer
+          # without bound: abort the GET (rescued below); the deadline-bounded
+          # resumption loop decides whether to retry with a fresh buffer.
+          enforce_sse_buffer_cap!(buffer)
         end
       end
     rescue StandardError => e
@@ -885,10 +896,33 @@ module MCPClient
           event_data = extract_event(event_end)
           parse_and_handle_event(event_data)
         end
+
+        # Everything left is a partial event awaiting its terminator; cap how
+        # much a peer may accumulate. The raise propagates (unlike processing
+        # errors below) so the events loop drops this connection and its
+        # backoff takes over — memory stays bounded either way.
+        begin
+          enforce_sse_buffer_cap!(@buffer)
+        rescue MCPClient::Errors::ConnectionError
+          @buffer = ''
+          raise
+        end
       end
+    rescue MCPClient::Errors::ConnectionError
+      raise
     rescue StandardError => e
       @logger.error("Error processing event chunk: #{e.message}")
       @logger.debug(e.backtrace.join("\n")) if @logger.level <= Logger::DEBUG
+    end
+
+    # @param buffer [String] a partial-event SSE buffer
+    # @raise [MCPClient::Errors::ConnectionError] when the buffer exceeds MAX_SSE_BUFFER_BYTES
+    def enforce_sse_buffer_cap!(buffer)
+      return if buffer.bytesize <= MAX_SSE_BUFFER_BYTES
+
+      raise MCPClient::Errors::ConnectionError,
+            "SSE event exceeded the maximum buffered size (#{MAX_SSE_BUFFER_BYTES} bytes) " \
+            'without a terminator'
     end
 
     # Extract a single event from the buffer
