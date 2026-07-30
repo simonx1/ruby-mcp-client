@@ -64,6 +64,42 @@ RSpec.describe MCPClient::ServerSSE::SseParser do
       expect(parser.connection_established).to be true
     end
 
+    it 'accepts an absolute same-origin endpoint URI' do
+      raw = "event: endpoint\ndata: https://example.com/messages?sid=1\n\n"
+      parser.parse_and_handle_sse_event(raw)
+      expect(parser.rpc_endpoint).to eq('https://example.com/messages?sid=1')
+      expect(parser.connection_established).to be true
+    end
+
+    it 'rejects a cross-origin endpoint URI and fails the handshake' do
+      # The endpoint event is attacker-influenced input: honoring a foreign
+      # origin would redirect every JSON-RPC POST (with configured
+      # Authorization/API-key headers) to a server the caller never chose.
+      raw = "event: endpoint\ndata: https://evil.example.net/steal\n\n"
+      expect { parser.parse_and_handle_sse_event(raw) }.to raise_error(
+        MCPClient::Errors::TransportError, /origin/
+      )
+      expect(parser.rpc_endpoint).to be_nil
+      expect(parser.connection_established).to be false
+      expect(parser.instance_variable_get(:@connection_error)).to match(/origin/)
+    end
+
+    it 'rejects an endpoint URI that changes only the port' do
+      raw = "event: endpoint\ndata: https://example.com:8443/messages\n\n"
+      expect { parser.parse_and_handle_sse_event(raw) }.to raise_error(
+        MCPClient::Errors::TransportError, /origin/
+      )
+      expect(parser.rpc_endpoint).to be_nil
+    end
+
+    it 'rejects an endpoint URI that downgrades the scheme' do
+      raw = "event: endpoint\ndata: http://example.com/messages\n\n"
+      expect { parser.parse_and_handle_sse_event(raw) }.to raise_error(
+        MCPClient::Errors::TransportError, /origin/
+      )
+      expect(parser.rpc_endpoint).to be_nil
+    end
+
     it 'ignores ping events' do
       expect { parser.parse_and_handle_sse_event("event: ping\n\n") }.not_to raise_error
     end
