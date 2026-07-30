@@ -1323,6 +1323,41 @@ RSpec.describe MCPClient::ServerStreamableHTTP do
     end
   end
 
+  describe 'server-initiated response POST bounding' do
+    let(:budget) { MCPClient::ServerStreamableHTTP::MAX_CONCURRENT_RESPONSE_POSTS }
+
+    it 'drops a JSON-RPC response instead of spawning a thread when the budget is exhausted' do
+      # Each server-initiated request costs one blocking HTTP POST in its own
+      # thread; without a bound a peer flooding requests on the events stream
+      # could exhaust host threads.
+      server.instance_variable_set(:@response_post_count, budget)
+
+      expect(Thread).not_to receive(:new)
+      expect(server.instance_variable_get(:@logger)).to receive(:warn).with(/[Dd]ropping/)
+
+      server.send(:post_jsonrpc_response, { 'jsonrpc' => '2.0', 'id' => 9, 'result' => {} })
+    end
+
+    it 'drops a pong instead of spawning a thread when the budget is exhausted' do
+      server.instance_variable_set(:@response_post_count, budget)
+
+      expect(Thread).not_to receive(:new)
+      expect(server.instance_variable_get(:@logger)).to receive(:warn).with(/[Dd]ropping/)
+
+      server.send(:handle_ping_request, 'ping-1')
+    end
+
+    it 'releases the slot once the response POST completes' do
+      stub_request(:post, "#{base_url}#{endpoint}").to_return(status: 200, body: '')
+
+      server.send(:post_jsonrpc_response, { 'jsonrpc' => '2.0', 'id' => 3, 'result' => {} })
+
+      deadline = Time.now + 2
+      sleep 0.05 while server.instance_variable_get(:@response_post_count).positive? && Time.now < deadline
+      expect(server.instance_variable_get(:@response_post_count)).to eq(0)
+    end
+  end
+
   describe 'security validation' do
     # Session ID and URL validation tests are shared with HTTP transport
     # through the HttpTransportBase module, so we just verify they work here
