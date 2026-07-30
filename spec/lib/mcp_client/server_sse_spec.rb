@@ -1125,6 +1125,30 @@ RSpec.describe MCPClient::ServerSSE do
       server.send(:process_sse_chunk, completion_chunk)
     end
 
+    it 'raises and drops the buffer when an unterminated event exceeds the cap' do
+      stub_const('MCPClient::ServerSSE::MAX_SSE_BUFFER_BYTES', 1024)
+
+      # A peer that withholds the blank-line terminator must not be able to
+      # grow the parse buffer without bound.
+      expect do
+        server.send(:process_sse_chunk, "event: message\ndata: #{'a' * 2048}")
+      end.to raise_error(MCPClient::Errors::ConnectionError, /buffer/i)
+
+      expect(server.instance_variable_get(:@buffer)).to eq('')
+    end
+
+    it 'accepts complete events even when a single chunk exceeds the cap' do
+      stub_const('MCPClient::ServerSSE::MAX_SSE_BUFFER_BYTES', 1024)
+
+      # The cap bounds UNPROCESSED bytes, not chunk size: terminated events
+      # inside an oversized chunk are extracted before the check.
+      chunk = "event: message\ndata: #{'a' * 2048}\n\n"
+      expect(server).to receive(:parse_and_handle_sse_event).once
+
+      expect { server.send(:process_sse_chunk, chunk) }.not_to raise_error
+      expect(server.instance_variable_get(:@buffer)).to eq('')
+    end
+
     it 'detects direct JSON-RPC error responses with authorization errors' do
       # Authorization error in JSON-RPC format that isn't an SSE event
       error_response = '{

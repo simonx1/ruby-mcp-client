@@ -40,6 +40,13 @@ module MCPClient
     MAX_RECONNECT_DELAY = 30
     JITTER_FACTOR = 0.25
 
+    # Maximum bytes the SSE parse buffer may hold while waiting for an event
+    # terminator. The stream is peer-controlled: without a cap, a hostile
+    # server could withhold the blank-line delimiter forever and grow the
+    # buffer until the host runs out of memory. Generous enough for any
+    # legitimate JSON-RPC response event.
+    MAX_SSE_BUFFER_BYTES = 32 * 1024 * 1024
+
     # @!attribute [r] base_url
     #   @return [String] The base URL of the MCP server
     # @!attribute [r] tools
@@ -907,6 +914,17 @@ module MCPClient
         while (event_end = @buffer.index("\n\n") || @buffer.index("\r\n\r\n"))
           event_data = extract_single_event(event_end)
           event_buffers << event_data
+        end
+
+        # Everything left is a partial event awaiting its terminator. The
+        # stream is peer-controlled, so cap how much may accumulate: drop the
+        # oversized data and fail the connection rather than growing without
+        # bound (the normal reconnect path takes over from there).
+        if @buffer.bytesize > MAX_SSE_BUFFER_BYTES
+          @buffer = ''
+          raise MCPClient::Errors::ConnectionError,
+                "SSE event exceeded the maximum buffered size (#{MAX_SSE_BUFFER_BYTES} bytes) " \
+                'without a terminator'
         end
       end
       event_buffers
