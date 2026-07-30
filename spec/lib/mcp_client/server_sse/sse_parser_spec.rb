@@ -22,6 +22,7 @@ RSpec.describe MCPClient::ServerSSE::SseParser do
           @notification_calls << [m, p]
         }
         @sse_results = {}
+        @pending_request_ids = Set.new
         @tools_data = nil
       end
 
@@ -79,6 +80,7 @@ RSpec.describe MCPClient::ServerSSE::SseParser do
       # A tools/list response must NOT be written into @tools_data as a side
       # effect; that would let a concurrent list_tools observe a partial page
       # mid-pagination. request_tools_list is the sole writer of @tools_data.
+      parser.instance_variable_get(:@pending_request_ids).add(7)
       response = { jsonrpc: '2.0', id: 7, result: { tools: [{ name: 'a' }], nextCursor: 'p2' } }
       raw = "event: message\ndata: #{response.to_json}\n\n"
       parser.parse_and_handle_sse_event(raw)
@@ -86,6 +88,17 @@ RSpec.describe MCPClient::ServerSSE::SseParser do
       expect(parser.instance_variable_get(:@sse_results)[7]).to eq('tools' => [{ 'name' => 'a' }],
                                                                    'nextCursor' => 'p2')
       expect(parser.instance_variable_get(:@tools_data)).to be_nil
+    end
+
+    it 'discards a response whose id matches no outstanding request' do
+      # Response events are peer-controlled: storing every id-bearing message
+      # would let a server grow @sse_results without bound by streaming
+      # unsolicited responses with fresh ids.
+      response = { jsonrpc: '2.0', id: 'unsolicited-1', result: { 'x' => 1 } }
+      raw = "event: message\ndata: #{response.to_json}\n\n"
+      parser.parse_and_handle_sse_event(raw)
+
+      expect(parser.instance_variable_get(:@sse_results)).to be_empty
     end
   end
 end

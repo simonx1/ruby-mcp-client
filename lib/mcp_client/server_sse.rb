@@ -91,6 +91,10 @@ module MCPClient
       @tools_data = nil
       @request_id = 0
       @sse_results = {}
+      # Ids of requests a caller is actively waiting on. Only responses for
+      # these ids are stored in @sse_results — everything else on the peer
+      # controlled stream is unsolicited and discarded.
+      @pending_request_ids = Set.new
       @mutex = Monitor.new
       @buffer = ''
       @sse_connected = false
@@ -424,6 +428,11 @@ module MCPClient
         # Reset the SSE parse buffer so a reconnect never inherits a leftover
         # partial event from the previous connection.
         @buffer = ''
+
+        # Drop undelivered results: their waiters fail with the connection,
+        # and retaining entries across reconnects would let stale peer data
+        # accumulate for the lifetime of the client.
+        @sse_results = {}
 
         # Log cleanup for debugging
         @logger.debug('Cleaning up SSE connection')

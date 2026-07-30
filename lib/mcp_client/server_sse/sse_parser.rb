@@ -98,6 +98,15 @@ module MCPClient
         # paginated list. Writing each page as it arrives would let a concurrent
         # list_tools observe a partial (page-1-only) cache mid-pagination.
         @mutex.synchronize do
+          # The stream is peer-controlled: only ids some caller is actually
+          # waiting on are stored. Without this check a server could stream
+          # unsolicited responses with fresh ids and grow @sse_results without
+          # bound for the lifetime of the client.
+          unless @pending_request_ids.include?(data['id'])
+            @logger.debug("Discarding unsolicited response id #{data['id'].inspect}")
+            return true
+          end
+
           @sse_results[data['id']] =
             if data['error']
               # JSON-RPC error response: store the error under a Symbol key
