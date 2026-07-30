@@ -95,11 +95,24 @@ RSpec.describe 'Streamable HTTP resumability (SEP-1699)' do
       expect(server.send(:events_reconnect_delay, 4)).to eq(4)
     end
 
-    it 'accepts retry: 0 as a valid immediate-reconnect directive' do
+    it 'parses retry: 0 but floors the events reconnect delay to the safety minimum' do
+      # retry: 0 is a valid SSE directive (and stays an immediate-poll signal
+      # for the deadline-bounded resumption loop), but the long-lived events
+      # loop must not honor it literally: a hostile server repeatedly closing
+      # the stream with retry: 0 would otherwise drive a tight reconnect loop.
+      # Waiting LONGER than the directive stays SEP-1699 compliant ("waiting
+      # the given number of milliseconds" is a lower bound).
       server.send(:parse_and_handle_event, "retry: 0\ndata: \n")
 
       expect(server.instance_variable_get(:@sse_retry_ms)).to eq(0)
-      expect(server.send(:events_reconnect_delay, 4)).to eq(0)
+      expect(server.send(:events_reconnect_delay, 4))
+        .to eq(MCPClient::ServerStreamableHTTP::MIN_EVENTS_RECONNECT_DELAY)
+    end
+
+    it 'floors sub-minimum retry directives to the safety minimum' do
+      server.instance_variable_set(:@sse_retry_ms, 10)
+      expect(server.send(:events_reconnect_delay, 4))
+        .to eq(MCPClient::ServerStreamableHTTP::MIN_EVENTS_RECONNECT_DELAY)
     end
 
     it 'resumes with the closed stream own cursor, not the shared one' do
