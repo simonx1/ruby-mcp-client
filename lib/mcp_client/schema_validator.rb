@@ -35,6 +35,11 @@ module MCPClient
       unevaluatedProperties unevaluatedItems
     ].freeze
 
+    # Wall-clock budget for matching one server-supplied `pattern`. Schemas
+    # come from the remote server, so an expensive expression must not be able
+    # to monopolize the calling thread.
+    PATTERN_MATCH_TIMEOUT = 1.0
+
     # Keywords whose value is a single subschema to walk.
     SUBSCHEMA_KEYWORDS = %w[
       items contains additionalProperties propertyNames not if then else
@@ -247,15 +252,23 @@ module MCPClient
 
     # Validate a string against a regular-expression pattern.
     # Invalid patterns are not enforced.
+    #
+    # The pattern comes from the tool's outputSchema, i.e. from the remote
+    # server, so matching runs under PATTERN_MATCH_TIMEOUT: an expensive
+    # expression cannot pin the calling thread indefinitely. A match that
+    # exceeds the budget is reported as a validation error rather than
+    # silently accepted — the value was never shown to satisfy the schema.
     # @param data [String] the string
     # @param pattern [Object] the pattern keyword value
     # @param path [String] location for error messages
     # @return [Array<String>] validation errors
     def self.validate_pattern(data, pattern, path)
       return [] unless pattern.is_a?(String)
-      return [] if data.match?(Regexp.new(pattern))
+      return [] if data.match?(Regexp.new(pattern, timeout: PATTERN_MATCH_TIMEOUT))
 
       ["#{path}: string does not match pattern #{pattern.inspect}"]
+    rescue Regexp::TimeoutError
+      ["#{path}: pattern #{pattern.inspect} timed out after #{PATTERN_MATCH_TIMEOUT}s"]
     rescue RegexpError
       []
     end

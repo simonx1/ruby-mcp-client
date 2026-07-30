@@ -59,6 +59,31 @@ RSpec.describe MCPClient::SchemaValidator do
       expect(described_class.validate('abcde', schema)).to contain_exactly(a_string_matching(/maxLength/))
     end
 
+    it 'compiles server-supplied patterns with a match timeout' do
+      # The pattern comes from the tool's outputSchema, i.e. from the remote
+      # server: an expensive expression must not be able to pin the CPU
+      # indefinitely.
+      compiled = nil
+      allow(Regexp).to receive(:new).and_wrap_original do |orig, *args, **kwargs|
+        compiled = orig.call(*args, **kwargs)
+      end
+
+      described_class.validate('abc', { 'type' => 'string', 'pattern' => '\\A[a-z]+\\z' })
+
+      expect(compiled.timeout).to eq(MCPClient::SchemaValidator::PATTERN_MATCH_TIMEOUT)
+    end
+
+    it 'reports an error instead of accepting the value when pattern matching times out' do
+      # Real timeout, no stubbing: an ambiguous alternation over a long input
+      # exceeds a tight budget, and the value must NOT be accepted just
+      # because the constraint could not be evaluated.
+      stub_const('MCPClient::SchemaValidator::PATTERN_MATCH_TIMEOUT', 0.001)
+      schema = { 'type' => 'string', 'pattern' => '\\A(a|b|ab)*\\z' }
+
+      expect(described_class.validate("#{'ab' * 20_000}c", schema))
+        .to contain_exactly(a_string_matching(/pattern.*timed out/i))
+    end
+
     it 'enforces string patterns' do
       schema = { 'type' => 'string', 'pattern' => '\\A[a-z]+\\z' }
       expect(described_class.validate('abc', schema)).to be_empty

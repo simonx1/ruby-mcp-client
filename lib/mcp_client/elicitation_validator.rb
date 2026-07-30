@@ -18,6 +18,11 @@ module MCPClient
     # Allowed string formats per MCP spec
     STRING_FORMATS = %w[email uri date date-time].freeze
 
+    # Wall-clock budget for matching one server-supplied `pattern`. The
+    # requestedSchema comes from the remote server, so an expensive
+    # expression must not be able to monopolize the calling thread.
+    PATTERN_MATCH_TIMEOUT = 1.0
+
     # Validate that a requestedSchema conforms to MCP elicitation constraints.
     # Returns an array of error messages (empty if valid).
     # @param schema [Hash] the requestedSchema
@@ -183,15 +188,7 @@ module MCPClient
         errors << "Field '#{field}' must be one of: #{allowed.join(', ')}" unless allowed.include?(value)
       end
 
-      if prop['pattern']
-        begin
-          unless value.match?(Regexp.new(prop['pattern']))
-            errors << "Field '#{field}' must match pattern '#{prop['pattern']}'"
-          end
-        rescue RegexpError
-          # Skip pattern validation if the pattern is invalid
-        end
-      end
+      errors.concat(validate_string_pattern(field, value, prop['pattern'])) if prop['pattern']
 
       if prop['minLength'] && value.length < prop['minLength']
         errors << "Field '#{field}' must be at least #{prop['minLength']} characters"
@@ -204,6 +201,27 @@ module MCPClient
       errors.concat(validate_string_format(field, value, prop['format']))
 
       errors
+    end
+
+    # Validate a string value against the schema's regular-expression pattern.
+    # An invalid pattern is not enforced (unchanged behavior), but matching
+    # runs under PATTERN_MATCH_TIMEOUT because the pattern comes from the
+    # remote server. A match that exceeds the budget is reported as a
+    # validation error rather than silently accepted — the value was never
+    # shown to satisfy the constraint.
+    # @param field [String] field name
+    # @param value [String] the value
+    # @param pattern [String] the declared pattern
+    # @return [Array<String>] validation errors
+    def self.validate_string_pattern(field, value, pattern)
+      return [] if value.match?(Regexp.new(pattern, timeout: PATTERN_MATCH_TIMEOUT))
+
+      ["Field '#{field}' must match pattern '#{pattern}'"]
+    rescue Regexp::TimeoutError
+      ["Field '#{field}' pattern '#{pattern}' timed out after #{PATTERN_MATCH_TIMEOUT}s"]
+    rescue RegexpError
+      # Skip pattern validation if the pattern is invalid
+      []
     end
 
     # Validate a string value against the schema's format constraint.
