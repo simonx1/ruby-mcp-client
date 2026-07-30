@@ -152,8 +152,18 @@ class FileTokenStorage
     {}
   end
 
+  # Access tokens, refresh tokens and client secrets end up in this file, so
+  # create it owner-readable only. File.write would leave the mode to the
+  # process umask (commonly 0644 — world-readable) on first creation.
+  #
+  # This is the minimum for a local demo. Production storage should keep
+  # credentials in an OS keychain or a secrets manager, or encrypt them at
+  # rest, rather than in a plaintext file.
   def save_data
-    File.write(@filename, JSON.pretty_generate(@data))
+    File.open(@filename, File::WRONLY | File::CREAT | File::TRUNC, 0o600) do |f|
+      f.write(JSON.pretty_generate(@data))
+    end
+    File.chmod(0o600, @filename)
   end
 end
 

@@ -51,27 +51,33 @@ begin
     puts "  - #{tool.name}: #{tool.description&.split("\n")&.first || 'No description'}"
   end
 
-  # Example tool call. Prefer a tool that needs no required arguments so the demo
-  # succeeds regardless of which tools the server exposes (e.g. an arbitrary set of
-  # connected Zapier actions); fall back to describing how to call one explicitly.
-  if tools.any?
-    callable = tools.find do |tool|
-      required = (tool.schema && (tool.schema['required'] || tool.schema[:required])) || []
-      required.empty?
-    end
+  # Example tool call. The server picks which tools exist (for Zapier, an
+  # arbitrary set of connected actions that may send mail, move money, or
+  # change records), so this demo never invokes one on its own initiative:
+  # name the tool you want with MCP_EXAMPLE_TOOL. A zero-argument tool is only
+  # suggested, not called.
+  requested_tool = ENV.fetch('MCP_EXAMPLE_TOOL', nil)
 
-    if callable
-      puts "\n🔧 Calling tool: #{callable.name}"
-      result = client.call_tool(callable.name, {})
+  if tools.empty?
+    puts "\n⚠️  No tools available to call"
+  elsif requested_tool
+    tool = tools.find { |t| t.name == requested_tool }
+    if tool
+      puts "\n🔧 Calling tool requested via MCP_EXAMPLE_TOOL: #{tool.name}"
+      result = client.call_tool(tool.name, {})
       puts 'Tool result:'
       puts result.inspect
     else
-      puts "\nℹ️  Every advertised tool requires arguments, so no zero-arg demo call is possible."
-      puts '   Call one explicitly with its parameters, e.g.:'
-      puts "   client.call_tool('#{tools.first.name}', { ... })"
+      puts "\n⚠️  MCP_EXAMPLE_TOOL=#{requested_tool} is not advertised by this server"
     end
   else
-    puts "\n⚠️  No tools available to call"
+    suggestion = tools.find do |tool|
+      required = (tool.schema && (tool.schema['required'] || tool.schema[:required])) || []
+      required.empty?
+    end
+    puts "\nℹ️  No tool was called: this example does not invoke server-advertised tools on its own."
+    puts "   Pick one explicitly, e.g. MCP_EXAMPLE_TOOL='#{(suggestion || tools.first).name}'"
+    puts "   or in code: client.call_tool('#{(suggestion || tools.first).name}', { ... })"
   end
 
   # Test server connectivity

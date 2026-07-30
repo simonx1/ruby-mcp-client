@@ -39,6 +39,12 @@ cd "$REPO_ROOT"
 PYTHON="${PYTHON:-python3}"
 RUN_AI="${RUN_AI:-1}"
 RUN_NPX="${RUN_NPX:-1}"
+# npm packages are pinned rather than tracking @latest: this script exports the
+# local secrets file into the environment of every example it launches, so a
+# changed or compromised release would run with live API credentials in reach.
+# Override to try a newer release, e.g. PLAYWRIGHT_MCP_VERSION=0.0.79 ./run_all_examples.sh
+PLAYWRIGHT_MCP_VERSION="${PLAYWRIGHT_MCP_VERSION:-0.0.78}"
+PLAYWRIGHT_MCP_PKG="@playwright/mcp@${PLAYWRIGHT_MCP_VERSION}"
 TIMEOUT="${TIMEOUT:-120}"
 LOG_DIR="${LOG_DIR:-$(mktemp -d -t mcp-examples-XXXXXX)}"
 mkdir -p "$LOG_DIR"
@@ -305,7 +311,7 @@ else
   # json_input uses BOTH a filesystem stdio server (self-launched) and a Playwright
   # MCP server on :8931 (external). Start Playwright, then run.
   start_server "playwright-mcp" 8931 "$LOG_DIR/_server_playwright.log" \
-    npx -y @playwright/mcp@latest --port 8931
+    npx -y "$PLAYWRIGHT_MCP_PKG" --port 8931
   if wait_ready 60; then
     RUN_TIMEOUT=300 run_example "json_input_mcp_servers_example.rb" "Connected to MCP servers|tools" - -- \
       bundle exec ruby examples/json_input_mcp_servers_example.rb
@@ -350,7 +356,7 @@ else
   # F2 — need an external Playwright MCP server on :8931.
   if [ -n "${OPENAI_API_KEY:-}" ] && command -v npx >/dev/null 2>&1; then
     start_server "playwright-mcp" 8931 "$LOG_DIR/_server_playwright2.log" \
-      npx -y @playwright/mcp@latest --port 8931
+      npx -y "$PLAYWRIGHT_MCP_PKG" --port 8931
     if wait_ready 60; then
       RUN_TIMEOUT=240 run_example "ruby_openai_mcp.rb" - - -- \
         bundle exec ruby examples/ruby_openai_mcp.rb

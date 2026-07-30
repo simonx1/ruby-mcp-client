@@ -8,9 +8,10 @@
       "command": "/opt/homebrew/bin/npx",
       "args": [
         "-y",
-        "@modelcontextprotocol/server-filesystem",
+        "@modelcontextprotocol/server-filesystem@2026.7.10",
         "."
-      ]
+      ],
+      "comment": "Version-pinned so a changed release cannot silently run in this process. The root ('.') is the checkout; scope it to a disposable directory for anything beyond a read-only demo."
     }
   }
 }
