@@ -90,8 +90,12 @@ RSpec.describe MCPClient::ServerStreamableHTTP, 'Elicitation (MCP 2025-06-18)' d
       end
 
       it 'sends error response for internal error' do
+        # The exception message is host-internal (paths, connection strings,
+        # library internals) and must not cross the peer boundary; details
+        # stay in the local log.
         allow(server).to receive(:handle_elicitation_create).and_raise(StandardError, 'Test error')
-        expect(server).to receive(:send_error_response).with(request_id, -32_603, 'Internal error: Test error')
+        expect(server).to receive(:send_error_response).with(request_id, -32_603, 'Internal error')
+        expect(server.instance_variable_get(:@logger)).to receive(:error).with(/Test error/)
         server.send(:handle_server_request, message)
       end
     end

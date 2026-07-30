@@ -119,7 +119,7 @@ module MCPClient
       # @raise [MCPClient::Errors::TransportError] if response isn't valid JSON
       # @raise [MCPClient::Errors::ToolCallError] for other errors during request execution
       def send_jsonrpc_request(request, timeout: nil)
-        @logger.debug("Sending JSON-RPC request: #{request.to_json}")
+        @logger.debug("Sending JSON-RPC request: #{describe_jsonrpc_message(request)}")
         record_activity
 
         begin

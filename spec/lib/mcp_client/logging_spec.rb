@@ -96,6 +96,30 @@ RSpec.describe 'Logging (MCP 2025-06-18)' do
         expect(test_logger).to have_received(:error).with('[server1] Critical message')
       end
 
+      it 'neutralizes newlines and control characters in peer-supplied messages' do
+        # A peer that can inject raw newlines can forge additional log lines
+        # in the host's log.
+        client.send(:handle_log_message, 'server1',
+                    { 'level' => 'info', 'data' => "ok\nERROR [server1] forged entry\r\n" })
+
+        expect(test_logger).to have_received(:info) do |line|
+          expect(line).not_to include("\n")
+          expect(line).not_to include("\r")
+          expect(line).to include('forged entry')
+        end
+      end
+
+      it 'truncates an oversized peer log message' do
+        # The peer controls both content and volume; an unbounded message
+        # lets it inflate host log storage at will.
+        client.send(:handle_log_message, 'server1', { 'level' => 'info', 'data' => 'a' * 20_000 })
+
+        expect(test_logger).to have_received(:info) do |line|
+          expect(line.length).to be <= MCPClient::Client::MAX_PEER_LOG_MESSAGE_LENGTH + 100
+          expect(line).to include('truncated')
+        end
+      end
+
       it 'includes logger name in prefix when provided' do
         client.send(:handle_log_message, 'server1', {
                       'level' => 'info',

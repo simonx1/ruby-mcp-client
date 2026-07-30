@@ -1029,8 +1029,11 @@ module MCPClient
         send_error_response(request_id, -32_601, "Method not found: #{method}")
       end
     rescue StandardError => e
+      # The exception message is host-internal (file paths, connection
+      # strings, library internals): log it locally, but answer the peer with
+      # a constant message so failures cannot be used to probe the host.
       @logger.error("Error handling server request: #{e.message}")
-      send_error_response(request_id, -32_603, "Internal error: #{e.message}")
+      send_error_response(request_id, -32_603, 'Internal error')
     end
 
     # Handle elicitation/create request from server (MCP 2025-11-25)
@@ -1199,7 +1202,7 @@ module MCPClient
         end
 
         if resp.success?
-          @logger.debug("Sent JSON-RPC response: #{json_body}")
+          @logger.debug("Sent JSON-RPC response: #{describe_jsonrpc_message(response)}")
         else
           @logger.warn("Failed to send JSON-RPC response: HTTP #{resp.status}")
         end
