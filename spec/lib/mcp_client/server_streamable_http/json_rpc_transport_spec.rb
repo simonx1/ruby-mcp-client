@@ -517,6 +517,28 @@ RSpec.describe MCPClient::ServerStreamableHTTP::JsonRpcTransport do
         expect(result).to eq({ 'data' => 'test' })
       end
     end
+
+    context 'with a response that expands beyond the decompression limit' do
+      let(:response_body) do
+        string_io_buffer = StringIO.new
+        Zlib::GzipWriter.wrap(string_io_buffer) do |gz|
+          gz.write('0' * (10 * 1024))
+          gz.close
+        end
+        string_io_buffer.string
+      end
+
+      before do
+        stub_const('MCPClient::ServerStreamableHTTP::JsonRpcTransport::MAX_DECOMPRESSED_BODY_BYTES', 1024)
+      end
+
+      it 'raises TransportError instead of materializing the full body' do
+        expect { transport.send(:parse_response, mock_response) }.to raise_error(
+          MCPClient::Errors::TransportError,
+          /expanded beyond/
+        )
+      end
+    end
   end
 
   describe '#parse_sse_response' do

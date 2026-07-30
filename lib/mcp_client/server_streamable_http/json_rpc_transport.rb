@@ -12,6 +12,13 @@ module MCPClient
     module JsonRpcTransport
       include HttpTransportBase
 
+      # Ceiling on the expanded size of a gzip-encoded response body. The peer
+      # controls the compression ratio, so without a bound a tiny compressed
+      # response ("gzip bomb") could expand to an arbitrarily large string and
+      # exhaust host memory before JSON parsing.
+      MAX_DECOMPRESSED_BODY_BYTES = 64 * 1024 * 1024
+      DECOMPRESS_CHUNK_BYTES = 64 * 1024
+
       private
 
       # Log HTTP response for Streamable HTTP
@@ -31,7 +38,7 @@ module MCPClient
         content_type = response.headers['content-type'] || response.headers['Content-Type'] || ''
         content_encoding = response.headers['content-encoding'] || response.headers['Content-Encoding'] || ''
 
-        body = Zlib::GzipReader.new(StringIO.new(body)).read if content_encoding.include?('gzip')
+        body = decompress_gzip(body) if content_encoding.include?('gzip')
         body = body&.strip
 
         # Determine response format based on Content-Type header per MCP 2025 spec
@@ -46,6 +53,26 @@ module MCPClient
         process_jsonrpc_response(data)
       rescue JSON::ParserError => e
         raise MCPClient::Errors::TransportError, "Invalid JSON response from server: #{e.message}"
+      end
+
+      # Incrementally decompress a gzip response body, aborting once the
+      # expanded output exceeds MAX_DECOMPRESSED_BODY_BYTES.
+      # @param body [String] the gzip-compressed response body
+      # @return [String] the decompressed body
+      # @raise [MCPClient::Errors::TransportError] if the expansion limit is exceeded
+      def decompress_gzip(body)
+        reader = Zlib::GzipReader.new(StringIO.new(body))
+        decompressed = +''
+        while (chunk = reader.read(DECOMPRESS_CHUNK_BYTES))
+          decompressed << chunk
+          next unless decompressed.bytesize > MAX_DECOMPRESSED_BODY_BYTES
+
+          raise MCPClient::Errors::TransportError,
+                "Gzip response expanded beyond #{MAX_DECOMPRESSED_BODY_BYTES} bytes"
+        end
+        decompressed
+      ensure
+        reader&.close
       end
 
       # Parse a Server-Sent Event formatted response body.
