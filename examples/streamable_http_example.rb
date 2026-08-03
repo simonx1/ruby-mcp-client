@@ -30,6 +30,10 @@ abort 'Please set MCP_SERVER_URL (and optionally MCP_BEARER_TOKEN for authentica
 headers = {}
 headers['Authorization'] = "Bearer #{bearer_token}" if bearer_token
 
+# Tracks whether anything failed, so the process exit status reflects it —
+# printing an error while exiting 0 hides failures from CI and scripts.
+example_failed = false
+
 begin
   # Create client using the simplified connect API
   client = MCPClient.connect(server_url,
@@ -62,14 +66,21 @@ begin
     puts "\n⚠️  No tools available to call"
   elsif requested_tool
     tool = tools.find { |t| t.name == requested_tool }
-    if tool
-      puts "\n🔧 Calling tool requested via MCP_EXAMPLE_TOOL: #{tool.name}"
-      result = client.call_tool(tool.name, {})
-      puts 'Tool result:'
-      puts result.inspect
-    else
-      puts "\n⚠️  MCP_EXAMPLE_TOOL=#{requested_tool} is not advertised by this server"
+    # An explicit request must not end in a success marker when it did not
+    # run: a typo or a stale tool name has to be visible to a human and to
+    # exit-code-driven automation.
+    raise "MCP_EXAMPLE_TOOL=#{requested_tool} is not advertised by this server" unless tool
+
+    required = (tool.schema && (tool.schema['required'] || tool.schema[:required])) || []
+    unless required.empty?
+      raise "MCP_EXAMPLE_TOOL=#{requested_tool} requires arguments #{required.inspect}; " \
+            'this example only performs zero-argument calls'
     end
+
+    puts "\n🔧 Calling tool requested via MCP_EXAMPLE_TOOL: #{tool.name}"
+    result = client.call_tool(tool.name, {})
+    puts 'Tool result:'
+    puts result.inspect
   else
     suggestion = tools.find do |tool|
       required = (tool.schema && (tool.schema['required'] || tool.schema[:required])) || []
@@ -87,14 +98,18 @@ begin
 
   puts "\n✅ Example completed successfully!"
 rescue MCPClient::Errors::ConnectionError => e
+  example_failed = true
   puts "\n❌ Connection Error: #{e.message}"
   puts 'Make sure your server URL and credentials are correct'
 rescue MCPClient::Errors::TransportError => e
+  example_failed = true
   puts "\n❌ Transport Error: #{e.message}"
   puts 'The server may not be returning valid SSE format'
 rescue MCPClient::Errors::ServerError => e
+  example_failed = true
   puts "\n❌ Server Error: #{e.message}"
 rescue StandardError => e
+  example_failed = true
   puts "\n❌ Unexpected Error: #{e.class}: #{e.message}"
 ensure
   # Clean up connections
@@ -110,3 +125,5 @@ puts '   data: {"jsonrpc":"2.0","id":1,"result":{...}}'
 puts '3. Client parses SSE format and extracts JSON data'
 puts '4. Standard JSON-RPC processing continues normally'
 puts "\nThis allows HTTP semantics with streaming response format!"
+
+exit(1) if example_failed

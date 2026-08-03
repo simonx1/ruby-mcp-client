@@ -27,6 +27,7 @@ logger.level = Logger::WARN
 ExampleSandbox.announce_auto_execution("filesystem tools under #{ExampleSandbox.filesystem_root}")
 mcp_client = MCPClient.connect(
   ExampleSandbox.filesystem_server_command,
+  env: ExampleSandbox.secret_free_env,
   logger: logger
 )
 

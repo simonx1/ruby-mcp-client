@@ -43,6 +43,23 @@ module ExampleSandbox
     %W[npx -y @modelcontextprotocol/server-filesystem@#{FILESYSTEM_SERVER_VERSION} #{filesystem_root}]
   end
 
+  # Environment overrides that strip credentials from a child process.
+  #
+  # Pinning the top-level npm package still leaves its transitive dependencies
+  # on version ranges, so `npx` can execute code this repo never pinned. The
+  # child also inherits the parent environment by default — which for these
+  # examples holds live API keys, and under examples/run_all_examples.sh the
+  # whole of secrets.env. Passing a key with a nil value makes Open3 unset it
+  # in the child, so a compromised package has nothing to exfiltrate.
+  #
+  # @param extra [Hash] additional variables the child does need
+  # @return [Hash] env hash for MCPClient.connect(env:)
+  def secret_free_env(extra = {})
+    stripped = ENV.keys.grep(/(_KEY|_TOKEN|_SECRET|CREDENTIAL|PASSWORD|AUTH)/i)
+                  .to_h { |key| [key, nil] }
+    stripped.merge(extra)
+  end
+
   # Print the standing caveat for examples that execute model-selected tools.
   # @param scope [String] what the model can reach in this example
   # @return [void]
