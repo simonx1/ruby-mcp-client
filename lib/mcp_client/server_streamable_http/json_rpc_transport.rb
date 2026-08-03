@@ -14,6 +14,27 @@ module MCPClient
 
       private
 
+      # Whether a server-supplied SSE event id may be retained as the
+      # resumption cursor: non-empty, bounded, and safe to place in an HTTP
+      # header. Shared by every SSE parsing path (GET events stream, POST
+      # response stream, and resumed GET), since all three feed the same
+      # Last-Event-ID header.
+      # @param id [String, nil] the raw id field
+      # @return [Boolean]
+      def retainable_event_id?(id)
+        return false if id.nil? || id.empty?
+
+        if id.length > MAX_EVENT_ID_LENGTH
+          @logger.warn("Ignoring oversized SSE event id (#{id.length} chars)")
+          return false
+        end
+
+        return true if id.match?(EVENT_ID_PATTERN)
+
+        @logger.warn('Ignoring SSE event id with characters illegal in a header value')
+        false
+      end
+
       # Log HTTP response for Streamable HTTP
       # @param response [Faraday::Response] the HTTP response
       def log_response(response)

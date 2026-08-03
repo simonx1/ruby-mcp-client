@@ -816,24 +816,6 @@ module MCPClient
       [retry_ms / 1000.0, MIN_RESUMPTION_RECONNECT_DELAY].max
     end
 
-    # Whether a server-supplied SSE event id may be retained as the resumption
-    # cursor: non-empty, bounded, and safe to place in an HTTP header.
-    # @param id [String, nil] the raw id field
-    # @return [Boolean]
-    def retainable_event_id?(id)
-      return false if id.nil? || id.empty?
-
-      if id.length > MAX_EVENT_ID_LENGTH
-        @logger.warn("Ignoring oversized SSE event id (#{id.length} chars)")
-        return false
-      end
-
-      return true if id.match?(EVENT_ID_PATTERN)
-
-      @logger.warn('Ignoring SSE event id with characters illegal in a header value')
-      false
-    end
-
     # One GET with the current cursor; complete SSE events are dispatched
     # through the standard server-message path, which routes replayed
     # responses to their registered waiters. `id:` and `retry:` fields
