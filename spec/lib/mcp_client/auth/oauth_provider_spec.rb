@@ -304,6 +304,50 @@ RSpec.describe MCPClient::Auth::OAuthProvider do
           .to raise_error(MCPClient::Errors::ConnectionError, /PKCE S256/)
       end
 
+      it 'rejects a non-HTTPS authorization server advertised by PRM without fetching it' do
+        # authorization_servers comes from the peer's PRM document: following
+        # an http:// origin would drive well-known discovery GETs against
+        # attacker-selected (possibly internal) hosts.
+        internal_meta = MCPClient::Auth::ResourceMetadata.new(
+          resource: 'https://mcp.example.com/mcp', authorization_servers: ['http://internal.corp']
+        )
+        allow(provider).to receive(:fetch_resource_metadata).and_return(internal_meta)
+        allow(provider).to receive(:fetch_server_metadata)
+
+        expect { provider.send(:discover_authorization_server) }
+          .to raise_error(MCPClient::Errors::ConnectionError, /must use HTTPS/)
+        expect(provider).not_to have_received(:fetch_server_metadata)
+      end
+
+      it 'rejects a loopback authorization server advertised to a remote server' do
+        # PRM is peer-supplied, so the operator-oriented loopback exception
+        # must not apply: it would point discovery at localhost-only services.
+        local_meta = MCPClient::Auth::ResourceMetadata.new(
+          resource: 'https://mcp.example.com/mcp', authorization_servers: ['http://localhost:9292']
+        )
+        allow(provider).to receive(:fetch_resource_metadata).and_return(local_meta)
+        allow(provider).to receive(:fetch_server_metadata)
+
+        expect { provider.send(:discover_authorization_server) }
+          .to raise_error(MCPClient::Errors::ConnectionError, /HTTPS|loopback or private/)
+        expect(provider).not_to have_received(:fetch_server_metadata)
+      end
+
+      it 'allows a loopback authorization server when the configured server is itself local' do
+        local_provider = described_class.new(
+          server_url: 'http://localhost:9292/mcp', logger: logger,
+          storage: MCPClient::Auth::OAuthProvider::MemoryStorage.new
+        )
+        local_meta = MCPClient::Auth::ResourceMetadata.new(
+          resource: 'http://localhost:9292/mcp', authorization_servers: ['http://localhost:9292']
+        )
+        allow(local_provider).to receive(:fetch_resource_metadata).and_return(local_meta)
+        allow(local_provider).to receive(:fetch_server_metadata).and_return(server_meta(['S256']))
+
+        result = local_provider.send(:discover_authorization_server)
+        expect(result.token_endpoint).to eq('https://auth.example.com/token')
+      end
+
       it 'falls back to direct AS discovery when no PRM document exists (404)' do
         # fetch_resource_metadata returns nil for a genuine 404 (absent candidate)
         allow(provider).to receive(:fetch_resource_metadata).and_return(nil)

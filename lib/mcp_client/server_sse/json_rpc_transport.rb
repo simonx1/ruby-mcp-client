@@ -2,10 +2,13 @@
 
 require_relative '../json_rpc_common'
 
+require_relative 'origin_policy'
+
 module MCPClient
   class ServerSSE
     # JSON-RPC request/notification plumbing for SSE transport
     module JsonRpcTransport
+      include OriginPolicy
       include JsonRpcCommon
 
       # Generic JSON-RPC request: send method with params and return result
@@ -203,7 +206,7 @@ module MCPClient
       def create_json_rpc_connection(base_url)
         Faraday.new(url: base_url) do |f|
           f.request :retry, max: @max_retries, interval: @retry_backoff, backoff_factor: 2
-          f.response :follow_redirects, limit: 3
+          f.response :follow_redirects, limit: 3, callback: method(:reject_cross_origin_redirect!)
           f.options.open_timeout = @read_timeout
           f.options.timeout = @read_timeout
           f.adapter Faraday.default_adapter
