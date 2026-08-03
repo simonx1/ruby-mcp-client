@@ -29,6 +29,20 @@ module MCPClient
     # :warn logs a warning on mismatch, :strict raises a ValidationError.
     STRUCTURED_CONTENT_MODES = %i[warn strict].freeze
 
+    # Server-config keys whose values carry credentials (HTTP headers, the
+    # subprocess environment, inline tokens). Their values are replaced before
+    # a config is written to the log.
+    SENSITIVE_CONFIG_KEYS = %i[headers env token access_token api_key auth authorization
+                               password secret client_secret oauth_provider].freeze
+
+    # Placeholder written in place of a redacted value.
+    REDACTED = '[REDACTED]'
+
+    # Maximum characters of a peer-supplied log message written to the host
+    # log. The remote server controls this content, so an unbounded message
+    # would let it inflate log storage at will.
+    MAX_PEER_LOG_MESSAGE_LENGTH = 4096
+
     # Initialize a new MCPClient::Client
     # @param mcp_server_configs [Array<Hash>] configurations for MCP servers
     # @param logger [Logger, nil] optional logger, defaults to STDOUT
@@ -65,7 +79,7 @@ module MCPClient
         @logger.formatter = proc { |severity, _datetime, progname, msg| "#{severity} [#{progname}] #{msg}\n" }
       end
       @servers = mcp_server_configs.map do |config|
-        @logger.debug("Creating server with config: #{config.inspect}")
+        @logger.debug("Creating server with config: #{redact_config(config).inspect}")
         MCPClient::ServerFactory.create(config, logger: @logger)
       end
       @tool_cache = {}
@@ -832,9 +846,10 @@ module MCPClient
       logger_name = params['logger']
       data = params['data']
 
-      # Format the message
-      prefix = logger_name ? "[#{server_id}:#{logger_name}]" : "[#{server_id}]"
-      message = data.is_a?(String) ? data : data.inspect
+      # Format the message. Both the logger name and the payload come from the
+      # remote server, so both are sanitized before they reach the host log.
+      prefix = logger_name ? "[#{server_id}:#{sanitize_peer_log_text(logger_name.to_s)}]" : "[#{server_id}]"
+      message = sanitize_peer_log_text(data.is_a?(String) ? data : data.inspect)
 
       # Map MCP log levels to Ruby Logger levels
       case level.to_s.downcase
@@ -847,7 +862,38 @@ module MCPClient
       when 'error', 'critical', 'alert', 'emergency'
         logger.error("#{prefix} #{message}")
       else
-        logger.info("#{prefix} [#{level}] #{message}")
+        # An out-of-enum level is peer-controlled text like any other: it must
+        # be sanitized and capped, or it becomes the log-forging vector the
+        # sanitizing of `data` was added to close.
+        logger.info("#{prefix} [#{sanitize_peer_log_text(level.to_s)}] #{message}")
+      end
+    end
+
+    # Make peer-supplied log text safe to write to the host log: control
+    # characters (notably newlines, which would let a server forge additional
+    # log entries) are escaped, and the result is capped.
+    # @param text [String] the peer-supplied text
+    # @return [String] sanitized, length-bounded text
+    def sanitize_peer_log_text(text)
+      escaped = text.gsub(/[ -]/) { |c| format('\\x%02X', c.ord) }
+      return escaped if escaped.length <= MAX_PEER_LOG_MESSAGE_LENGTH
+
+      "#{escaped[0, MAX_PEER_LOG_MESSAGE_LENGTH]}... (truncated from #{escaped.length} chars)"
+    end
+
+    # Copy of a server config with credential-bearing values replaced, for
+    # safe logging. Nested hashes (headers, env) have every value redacted;
+    # sensitive scalars are replaced outright.
+    # @param config [Hash, Object] a server configuration
+    # @return [Hash, Object] a redacted copy (non-Hash input is returned as-is)
+    def redact_config(config)
+      return config unless config.is_a?(Hash)
+
+      config.to_h do |key, value|
+        next [key, value] unless SENSITIVE_CONFIG_KEYS.include?(key.to_s.downcase.to_sym)
+
+        redacted = value.is_a?(Hash) ? value.transform_values { REDACTED } : REDACTED
+        [key, redacted]
       end
     end
 
@@ -1204,9 +1250,13 @@ module MCPClient
 
         format_elicitation_response(result, params)
       rescue StandardError => e
+        # Same reasoning as the sampling path: the handler's exception text is
+        # host-internal and must not cross to the server. Because this rescue
+        # runs inside the client, the transports' constant-message rescues
+        # never see it — so it has to be constant here.
         @logger.error("Elicitation handler error: #{e.message}")
         @logger.debug(e.backtrace.join("\n"))
-        jsonrpc_error_result(-32_603, "Elicitation handler error: #{e.message}")
+        jsonrpc_error_result(-32_603, 'Elicitation handler error')
       end
     end
 
@@ -1430,8 +1480,10 @@ module MCPClient
         @logger.debug(e.backtrace.join("\n"))
         # A handler exception is an internal client failure (-32603), not a
         # user rejection: sampling.mdx § Error Handling reserves -1 for
-        # "User rejected sampling request".
-        jsonrpc_error_result(-32_603, "Sampling error: #{e.message}")
+        # "User rejected sampling request". The exception message itself is
+        # host-internal (file paths, connection strings, library internals)
+        # and stays in the local log rather than crossing to the server.
+        jsonrpc_error_result(-32_603, 'Sampling error')
       end
     end
 
