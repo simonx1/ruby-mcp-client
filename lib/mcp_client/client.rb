@@ -853,7 +853,10 @@ module MCPClient
       when 'error', 'critical', 'alert', 'emergency'
         logger.error("#{prefix} #{message}")
       else
-        logger.info("#{prefix} [#{level}] #{message}")
+        # An out-of-enum level is peer-controlled text like any other: it must
+        # be sanitized and capped, or it becomes the log-forging vector the
+        # sanitizing of `data` was added to close.
+        logger.info("#{prefix} [#{sanitize_peer_log_text(level.to_s)}] #{message}")
       end
     end
 
@@ -1204,9 +1207,13 @@ module MCPClient
 
         format_elicitation_response(result, params)
       rescue StandardError => e
+        # Same reasoning as the sampling path: the handler's exception text is
+        # host-internal and must not cross to the server. Because this rescue
+        # runs inside the client, the transports' constant-message rescues
+        # never see it — so it has to be constant here.
         @logger.error("Elicitation handler error: #{e.message}")
         @logger.debug(e.backtrace.join("\n"))
-        jsonrpc_error_result(-32_603, "Elicitation handler error: #{e.message}")
+        jsonrpc_error_result(-32_603, 'Elicitation handler error')
       end
     end
 

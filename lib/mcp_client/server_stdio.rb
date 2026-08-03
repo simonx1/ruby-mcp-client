@@ -542,8 +542,11 @@ module MCPClient
         send_error_response(request_id, -32_601, "Method not found: #{method}")
       end
     rescue StandardError => e
+      # The exception message is host-internal (file paths, connection
+      # strings, library internals): log it locally, answer the peer with a
+      # constant message, matching the SSE and Streamable HTTP transports.
       @logger.error("Error handling server request: #{e.message}")
-      send_error_response(request_id, -32_603, "Internal error: #{e.message}")
+      send_error_response(request_id, -32_603, 'Internal error')
     end
 
     # Handle a server-initiated ping request (MCP ping utility)

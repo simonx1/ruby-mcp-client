@@ -842,7 +842,9 @@ module MCPClient
     # Process an SSE chunk from the server
     # @param chunk [String] the chunk to process
     def process_sse_chunk(chunk)
-      @logger.debug("Processing SSE chunk: #{chunk.inspect}")
+      # Size only: the chunk is raw wire data carrying sampling prompts,
+      # elicitation content and tool results.
+      @logger.debug("Processing SSE chunk (#{describe_body_size(chunk)})")
 
       # Only record activity for real events
       record_activity if chunk.include?('event:')

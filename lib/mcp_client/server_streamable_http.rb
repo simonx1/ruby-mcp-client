@@ -875,7 +875,9 @@ module MCPClient
     # Buffers partial chunks and processes complete SSE events
     # @param chunk [String] the chunk to process
     def process_event_chunk(chunk)
-      @logger.debug("Processing event chunk: #{chunk.inspect}") if @logger.level <= Logger::DEBUG
+      # Size only: the chunk is raw wire data carrying sampling prompts,
+      # elicitation content and tool results.
+      @logger.debug("Processing event chunk (#{describe_body_size(chunk)})") if @logger.level <= Logger::DEBUG
 
       @mutex.synchronize do
         @buffer += chunk

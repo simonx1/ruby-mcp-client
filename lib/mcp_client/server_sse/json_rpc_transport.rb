@@ -207,7 +207,7 @@ module MCPClient
         end
 
         msg = "Received JSON-RPC response: #{response.status}"
-        msg += " #{response.body}" if response.respond_to?(:body)
+        msg += " (#{describe_body_size(response.body)})" if response.respond_to?(:body)
         @logger.debug(msg)
         response
       end

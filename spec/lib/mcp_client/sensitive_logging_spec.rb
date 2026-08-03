@@ -70,6 +70,23 @@ RSpec.describe 'Sensitive data in logs' do
       expect(log_output.string).to include('id=7')
     end
 
+    it 'omits raw SSE chunk contents on both SSE transports' do
+      # Raw wire chunks carry sampling prompts, elicitation answers and tool
+      # results — the same payloads the JSON-RPC summaries exist to keep out.
+      sse = MCPClient::ServerSSE.new(base_url: 'https://example.com/sse', logger: logger)
+      streamable = MCPClient::ServerStreamableHTTP.new(base_url: 'https://example.com', endpoint: '/rpc',
+                                                       logger: logger)
+      secret_chunk = "event: message\ndata: {\"ssn\":\"123-45-6789\"}\n\n"
+
+      sse.send(:process_sse_chunk, secret_chunk.dup)
+      streamable.send(:process_event_chunk, secret_chunk.dup)
+
+      expect(log_output.string).not_to include('123-45-6789')
+      expect(log_output.string).to match(/bytes/)
+      sse.cleanup
+      streamable.cleanup
+    end
+
     it 'omits response bodies, logging only the status and size' do
       response = instance_double(Faraday::Response, status: 200, body: '{"result":{"ssn":"123-45-6789"}}')
 

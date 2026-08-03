@@ -109,6 +109,18 @@ RSpec.describe 'Logging (MCP 2025-06-18)' do
         end
       end
 
+      it 'sanitizes an out-of-enum level, which takes the fallback branch' do
+        # The level is peer-controlled too; the fallback interpolated it raw,
+        # so it bypassed both the newline escaping and the length cap.
+        client.send(:handle_log_message, 'server1',
+                    { 'level' => "bogus\nERROR [server1] forged", 'data' => 'x' })
+
+        expect(test_logger).to have_received(:info) do |line|
+          expect(line).not_to include("\n")
+          expect(line).to include('forged')
+        end
+      end
+
       it 'truncates an oversized peer log message' do
         # The peer controls both content and volume; an unbounded message
         # lets it inflate host log storage at will.
