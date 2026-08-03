@@ -68,6 +68,8 @@ module MCPClient
         # separately so a failed fetch is retried authoritatively by discovery.
         @challenge_resource_metadata = nil
         @challenge_metadata_url = nil
+        # Why a peer-advertised challenge URL was refused, if one was
+        @challenge_error = nil
       end
 
       # @param url [String] Server URL to normalize
@@ -189,9 +191,16 @@ module MCPClient
         # challenge as authoritative for satisfying the current request" —
         # including resetting a previously challenged scope when the current
         # challenge carries none.
-        @challenge_scope = bearer_params && extract_challenge_param(bearer_params, 'scope')
-
         url = extract_resource_metadata_url(www_authenticate)
+
+        # The challenge header is peer-controlled input: validate the
+        # advertised URL BEFORE storing, fetching, or recording any challenge
+        # state, so a malicious challenge cannot pivot this host into requests
+        # against internal services (SSRF) and cannot leave the provider
+        # holding half of a rejected challenge.
+        validate_peer_advertised_url!(url, 'resource metadata URL (from WWW-Authenticate challenge)') if url
+
+        @challenge_scope = bearer_params && extract_challenge_param(bearer_params, 'scope')
         return nil unless url
 
         # Remember the advertised URL even if the fetch below fails, so a
@@ -414,6 +423,12 @@ module MCPClient
       # @return [ServerMetadata] Authorization server metadata
       # @raise [MCPClient::Errors::ConnectionError] if discovery fails
       def discover_authorization_server
+        # A challenge we refused is still authoritative: it says the cached
+        # authorization server is no longer the right one. Falling back to
+        # that cache (or to speculative well-known probing) would quietly
+        # undo the rejection, so surface it instead.
+        raise MCPClient::Errors::ConnectionError, @challenge_error if @challenge_error
+
         # A fresh 401 challenge is authoritative and overrides any cached
         # (possibly stale or direct-discovered) authorization server metadata —
         # whether the challenge-advertised PRM was already fetched or only its
@@ -453,6 +468,7 @@ module MCPClient
         storage.set_server_metadata(server_url, server_metadata)
         @challenge_resource_metadata = nil # consumed
         @challenge_metadata_url = nil # consumed
+        @challenge_error = nil
         server_metadata
       end
 
@@ -505,6 +521,13 @@ module MCPClient
           raise MCPClient::Errors::ConnectionError,
                 'Protected resource metadata does not advertise any authorization_servers'
         end
+
+        # authorization_servers is untrusted PRM content: validate the
+        # advertised origin BEFORE constructing and fetching well-known URLs
+        # on it, so a malicious protected resource cannot drive discovery GETs
+        # against internal services (SSRF).
+        validate_peer_advertised_url!(auth_server_url,
+                                      'authorization server (advertised by protected resource metadata)')
 
         server_metadata = fetch_first_server_metadata(authorization_server_metadata_urls(auth_server_url))
         unless server_metadata
@@ -610,6 +633,71 @@ module MCPClient
         return unless server_metadata.registration_endpoint
 
         enforce_https!(server_metadata.registration_endpoint, 'registration endpoint')
+      end
+
+      # Validate a URL that a peer advertised to us (a 401 challenge's
+      # resource_metadata, or PRM authorization_servers).
+      #
+      # Stricter than enforce_https!, which exists for URLs the OPERATOR
+      # configured and therefore tolerates plain-HTTP loopback for local
+      # development. Applying that exception to peer-supplied input would
+      # leave the reported SSRF intact against the most sensitive targets of
+      # all — services listening only on localhost. The loopback exception is
+      # honored here only when the configured MCP server is itself loopback,
+      # i.e. the developer is already pointed at a local stack.
+      #
+      # The rejection is recorded so a later discovery fails closed instead of
+      # silently reusing cached authorization-server metadata.
+      #
+      # NOTE: hostnames are checked literally. This does not resolve DNS, so a
+      # public name that resolves to a private address is not caught here;
+      # that needs resolution-time checking in the HTTP layer.
+      # @param url [String] the peer-advertised URL
+      # @param label [String] human-readable name for errors
+      # @raise [MCPClient::Errors::ConnectionError] if the URL is not acceptable
+      def validate_peer_advertised_url!(url, label)
+        uri = URI.parse(url)
+        host = uri.hostname.to_s.downcase
+
+        if uri.scheme != 'https' && !(uri.scheme == 'http' && local_development?)
+          reject_challenge!("OAuth #{label} must use HTTPS: #{url}")
+        end
+        reject_challenge!("OAuth #{label} must not target a loopback or private address: #{url}") if
+          local_address?(host) && !local_development?
+      rescue URI::InvalidURIError
+        reject_challenge!("OAuth #{label} is not a valid URL: #{url}")
+      end
+
+      # @param message [String] why the challenge was refused
+      # @raise [MCPClient::Errors::ConnectionError] always
+      def reject_challenge!(message)
+        # Drop every scrap of the refused challenge so nothing half-applied
+        # survives, and remember why for the next discovery attempt.
+        @challenge_scope = nil
+        @challenge_metadata_url = nil
+        @challenge_resource_metadata = nil
+        @challenge_error = message
+        raise MCPClient::Errors::ConnectionError, message
+      end
+
+      # @return [Boolean] whether the configured MCP server is itself local,
+      #   in which case local discovery targets are expected
+      def local_development?
+        local_address?(URI.parse(server_url).hostname.to_s.downcase)
+      rescue URI::InvalidURIError
+        false
+      end
+
+      # @param host [String] a downcased hostname
+      # @return [Boolean] whether it names a loopback, private or link-local address
+      def local_address?(host)
+        return true if %w[localhost 127.0.0.1 ::1 0.0.0.0].include?(host)
+        return true if host.end_with?('.localhost', '.local', '.internal')
+        return true if host.start_with?('127.', '10.', '192.168.', '169.254.')
+        return true if host.match?(/\A172\.(1[6-9]|2\d|3[01])\./)
+        return true if host.match?(/\A\[?(fc|fd|fe80)/)
+
+        false
       end
 
       # @param url [String, nil] endpoint URL

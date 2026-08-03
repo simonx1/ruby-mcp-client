@@ -1125,6 +1125,61 @@ RSpec.describe MCPClient::ServerSSE do
       server.send(:process_sse_chunk, completion_chunk)
     end
 
+    it 'raises and drops the buffer when an unterminated event exceeds the cap' do
+      stub_const('MCPClient::ServerSSE::MAX_SSE_BUFFER_BYTES', 1024)
+
+      # A peer that withholds the blank-line terminator must not be able to
+      # grow the parse buffer without bound.
+      expect do
+        server.send(:process_sse_chunk, "event: message\ndata: #{'a' * 2048}")
+      end.to raise_error(MCPClient::Errors::ConnectionError, /buffer/i)
+
+      expect(server.instance_variable_get(:@buffer)).to eq('')
+    end
+
+    it 'accepts complete events even when a single chunk exceeds the cap' do
+      stub_const('MCPClient::ServerSSE::MAX_SSE_BUFFER_BYTES', 1024)
+
+      # The cap bounds UNPROCESSED bytes, not chunk size: terminated events
+      # inside an oversized chunk are extracted before the check.
+      chunk = "event: message\ndata: #{'a' * 2048}\n\n"
+      expect(server).to receive(:parse_and_handle_sse_event).once
+
+      expect { server.send(:process_sse_chunk, chunk) }.not_to raise_error
+      expect(server.instance_variable_get(:@buffer)).to eq('')
+    end
+
+    it 'stays fast when an unterminated event arrives in many small chunks' do
+      # The peer chooses the chunking. Appending with += and rescanning the
+      # whole buffer each time is O(N^2): memory stays capped but CPU and the
+      # allocator do not.
+      chunk = 'a' * 16_384
+      started = Process.clock_gettime(Process::CLOCK_MONOTONIC)
+      512.times { server.send(:extract_complete_events, chunk.dup) }
+      elapsed = Process.clock_gettime(Process::CLOCK_MONOTONIC) - started
+
+      expect(elapsed).to be < 1.0
+      expect(server.instance_variable_get(:@buffer).bytesize).to eq(512 * 16_384)
+    end
+
+    it 'finds a terminator split across two chunks' do
+      # The incremental scan backs up by the longest delimiter minus one, so a
+      # boundary-straddling "\r\n\r\n" is not missed.
+      expect(server).to receive(:parse_and_handle_sse_event).once
+      server.send(:process_sse_chunk, "event: message\r\ndata: x\r")
+      server.send(:process_sse_chunk, "\n\r\n")
+    end
+
+    it 'records the overflow cause so waiters see why the connection failed' do
+      stub_const('MCPClient::ServerSSE::MAX_SSE_BUFFER_BYTES', 1024)
+
+      expect { server.send(:process_sse_chunk, "event: message\ndata: #{'a' * 2048}") }
+        .to raise_error(MCPClient::Errors::ConnectionError)
+
+      expect(server.instance_variable_get(:@connection_error)).to match(/maximum buffered size/)
+      expect(server.instance_variable_get(:@connection_established)).to be false
+    end
+
     it 'detects direct JSON-RPC error responses with authorization errors' do
       # Authorization error in JSON-RPC format that isn't an SSE event
       error_response = '{

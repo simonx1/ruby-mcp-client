@@ -190,6 +190,32 @@ RSpec.describe 'Streamable HTTP resumability (SEP-1699)' do
     end
   end
 
+  describe 'resumption GET buffer cap' do
+    it 'aborts the GET when delimiter-free data exceeds the cap' do
+      stub_const('MCPClient::ServerStreamableHTTP::MAX_SSE_BUFFER_BYTES', 1024)
+
+      # A peer replaying delimiter-free data must not grow the resumption
+      # worker's buffer without bound: the cap aborts this GET (the
+      # deadline-bounded resumption loop handles any retry).
+      stub_request(:get, "#{base_url}#{endpoint}")
+        .with(headers: { 'Last-Event-ID' => 'evt-1' })
+        .to_return(status: 200, body: 'a' * 4096,
+                   headers: { 'Content-Type' => 'text/event-stream' })
+
+      expect(server).to receive(:enforce_sse_buffer_cap!).at_least(:once).and_call_original
+
+      state = { cursor: 'evt-1', retry_ms: nil }
+      expect { server.send(:issue_resumption_get, state) }.not_to raise_error
+    end
+
+    it 'raises through enforce_sse_buffer_cap! when the buffer exceeds the cap' do
+      stub_const('MCPClient::ServerStreamableHTTP::MAX_SSE_BUFFER_BYTES', 1024)
+
+      expect { server.send(:enforce_sse_buffer_cap!, +'a' * 2048) }
+        .to raise_error(MCPClient::Errors::ConnectionError, /buffer/i)
+    end
+  end
+
   describe 'polling pattern: stream closed before the response' do
     it 'resumes via GET with Last-Event-ID instead of re-POSTing' do
       # POST answers with a priming event (id, no data) and a fast retry
