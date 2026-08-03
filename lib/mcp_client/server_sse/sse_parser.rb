@@ -2,11 +2,14 @@
 
 require 'json'
 require 'uri'
+require_relative 'origin_policy'
 
 module MCPClient
   class ServerSSE
     # === Wire-level SSE parsing & dispatch ===
     module SseParser
+      include OriginPolicy
+
       # Parse and handle a raw SSE event payload.
       # @param event_data [String] the raw event chunk
       def parse_and_handle_sse_event(event_data)
@@ -98,6 +101,15 @@ module MCPClient
         # paginated list. Writing each page as it arrives would let a concurrent
         # list_tools observe a partial (page-1-only) cache mid-pagination.
         @mutex.synchronize do
+          # The stream is peer-controlled: only ids some caller is actually
+          # waiting on are stored. Without this check a server could stream
+          # unsolicited responses with fresh ids and grow @sse_results without
+          # bound for the lifetime of the client.
+          unless @pending_request_ids.include?(data['id'])
+            @logger.debug("Discarding unsolicited response id #{data['id'].inspect}")
+            return true
+          end
+
           @sse_results[data['id']] =
             if data['error']
               # JSON-RPC error response: store the error under a Symbol key
@@ -156,20 +168,39 @@ module MCPClient
         end
       end
 
-      # Resolve an endpoint URI reference against the SSE connection URL
+      # Resolve an endpoint URI reference against the SSE connection URL.
+      # The resolved endpoint MUST stay on the SSE connection's origin: the
+      # event payload is server-controlled input, and honoring a cross-origin
+      # target would redirect every JSON-RPC POST — including the configured
+      # Authorization/API-key headers and callback response bodies — to a
+      # server the caller never chose.
       # @param data [String] the endpoint event payload (absolute or relative URI)
       # @return [String] the absolute endpoint URL
       def resolve_endpoint_uri(data)
-        URI.join(@base_url, data).to_s
+        endpoint = URI.join(@base_url, data)
+        base = URI.parse(@base_url)
+        unless same_origin?(base, endpoint)
+          fail_endpoint_handshake!(
+            "Cross-origin endpoint in SSE endpoint event: #{data.inspect} " \
+            "does not match the connection origin #{origin_of(base)}"
+          )
+        end
+        endpoint.to_s
       rescue URI::Error => e
         # The endpoint event is the handshake's core payload; an unresolvable
         # URI must fail the handshake rather than deferring a broken POST
         # target to the first request.
         @logger.error("Failed to resolve endpoint URI #{data.inspect} against #{@base_url}: #{e.message}")
-        message = "Invalid endpoint URI in SSE endpoint event: #{data.inspect} (#{e.message})"
-        # The SSE worker thread swallows this exception with a generic rescue,
-        # so also record the failure cause (mirroring @auth_error) for the
-        # connect caller blocked in wait_for_connection to surface promptly.
+        fail_endpoint_handshake!("Invalid endpoint URI in SSE endpoint event: #{data.inspect} (#{e.message})")
+      end
+
+      # Record the handshake failure cause and raise. The SSE worker thread
+      # swallows this exception with a generic rescue, so also record the
+      # failure (mirroring @auth_error) for the connect caller blocked in
+      # wait_for_connection to surface promptly.
+      # @param message [String] the failure description
+      # @raise [MCPClient::Errors::TransportError] always
+      def fail_endpoint_handshake!(message)
         @mutex.synchronize do
           @connection_error = message
           @connection_established = false

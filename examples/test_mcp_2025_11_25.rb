@@ -301,14 +301,14 @@ begin
     break if final.terminal?
 
     sleep((final.poll_interval || 500) / 1000.0)
-    final = client.get_task(task.task_id)
+    final = client.get_task(task)
   end
   runner.assert('get_task returns a Task', final.is_a?(MCPClient::Task))
   runner.assert('task is completed after waiting', final.status == 'completed', "status: #{final.status}")
 
   # Retrieve the underlying result via tasks/result
   if final.status == 'completed'
-    result = client.get_task_result(task.task_id)
+    result = client.get_task_result(task)
     runner.assert('get_task_result returns the underlying content', result['content'].is_a?(Array))
   end
 
@@ -318,7 +318,7 @@ begin
 
   # Create another task and cancel it quickly
   cancel_target = client.call_tool_as_task('background_work', {})
-  cancelled = client.cancel_task(cancel_target.task_id)
+  cancelled = client.cancel_task(cancel_target)
   runner.assert('cancel_task returns a cancelled Task', cancelled.status == 'cancelled')
 
   # Task error handling: get non-existent task

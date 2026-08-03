@@ -36,6 +36,7 @@ RSpec.describe MCPClient::ServerSSE do
     end
 
     it 'stores an id-bearing error response for the waiting caller instead of swallowing it' do
+      server.send(:register_pending_request, 42)
       error_response = {
         jsonrpc: '2.0',
         id: 42,
@@ -53,7 +54,11 @@ RSpec.describe MCPClient::ServerSSE do
         id: 1,
         error: { code: -32_602, message: 'Unsupported protocol version' }
       }
-      # Deliver the error response first so the waiter finds it immediately
+      # Deliver the error response first so the waiter finds it immediately.
+      # The id must be registered as outstanding for delivery to be accepted
+      # (in production the POST that provokes the response happens after
+      # registration, so a real response can never precede it).
+      server.send(:register_pending_request, 1)
       server.send(:parse_and_handle_sse_event, "event: message\ndata: #{error_response.to_json}\n\n")
 
       request = { 'jsonrpc' => '2.0', 'id' => 1, 'method' => 'tools/call', 'params' => {} }
@@ -65,6 +70,7 @@ RSpec.describe MCPClient::ServerSSE do
     it 'does not hang until timeout when the server responds with an error' do
       server.instance_variable_set(:@read_timeout, 3)
       error_response = { jsonrpc: '2.0', id: 2, error: { code: -32_601, message: 'Method not found' } }
+      server.send(:register_pending_request, 2)
       server.send(:parse_and_handle_sse_event, "event: message\ndata: #{error_response.to_json}\n\n")
 
       request = { 'jsonrpc' => '2.0', 'id' => 2, 'method' => 'nope', 'params' => {} }

@@ -95,11 +95,24 @@ RSpec.describe 'Streamable HTTP resumability (SEP-1699)' do
       expect(server.send(:events_reconnect_delay, 4)).to eq(4)
     end
 
-    it 'accepts retry: 0 as a valid immediate-reconnect directive' do
+    it 'parses retry: 0 but floors the events reconnect delay to the safety minimum' do
+      # retry: 0 is a valid SSE directive (and stays an immediate-poll signal
+      # for the deadline-bounded resumption loop), but the long-lived events
+      # loop must not honor it literally: a hostile server repeatedly closing
+      # the stream with retry: 0 would otherwise drive a tight reconnect loop.
+      # Waiting LONGER than the directive stays SEP-1699 compliant ("waiting
+      # the given number of milliseconds" is a lower bound).
       server.send(:parse_and_handle_event, "retry: 0\ndata: \n")
 
       expect(server.instance_variable_get(:@sse_retry_ms)).to eq(0)
-      expect(server.send(:events_reconnect_delay, 4)).to eq(0)
+      expect(server.send(:events_reconnect_delay, 4))
+        .to eq(MCPClient::ServerStreamableHTTP::MIN_EVENTS_RECONNECT_DELAY)
+    end
+
+    it 'floors sub-minimum retry directives to the safety minimum' do
+      server.instance_variable_set(:@sse_retry_ms, 10)
+      expect(server.send(:events_reconnect_delay, 4))
+        .to eq(MCPClient::ServerStreamableHTTP::MIN_EVENTS_RECONNECT_DELAY)
     end
 
     it 'resumes with the closed stream own cursor, not the shared one' do
@@ -174,6 +187,112 @@ RSpec.describe 'Streamable HTTP resumability (SEP-1699)' do
       expect(result).to include('id' => 7, 'result' => { 'ok' => true })
       expect(first_get).to have_been_requested
       expect(second_get).to have_been_requested
+    end
+  end
+
+  describe 'event id hygiene' do
+    it 'records an ordinary event id for resumption' do
+      server.send(:parse_and_handle_event, "id: evt-42\ndata: \n")
+
+      expect(server.instance_variable_get(:@last_event_id)).to eq('evt-42')
+    end
+
+    it 'ignores an oversized event id instead of storing and reflecting it' do
+      # The id is echoed in the Last-Event-ID request header, so an unbounded
+      # value means unbounded retained memory and oversized outbound headers.
+      server.send(:parse_and_handle_event, "id: #{'x' * 5000}\ndata: \n")
+
+      expect(server.instance_variable_get(:@last_event_id)).to be_nil
+    end
+
+    it 'ignores an event id with characters illegal in a header value' do
+      server.send(:parse_and_handle_event, "id: bad id\ndata: \n")
+
+      expect(server.instance_variable_get(:@last_event_id)).to be_nil
+    end
+
+    it 'keeps the previous valid cursor when a rejected id arrives' do
+      server.send(:parse_and_handle_event, "id: evt-1\ndata: \n")
+      server.send(:parse_and_handle_event, "id: #{'x' * 5000}\ndata: \n")
+
+      expect(server.instance_variable_get(:@last_event_id)).to eq('evt-1')
+    end
+  end
+
+  describe 'event id validation on every parsing path' do
+    it 'ignores an oversized id on the POST SSE response path' do
+      body = "id: #{'x' * 5000}\nevent: message\ndata: #{JSON.generate(jsonrpc: '2.0', id: 3, result: {})}\n\n"
+      server.send(:parse_sse_response, body, 3)
+
+      expect(server.instance_variable_get(:@last_event_id)).to be_nil
+    end
+
+    it 'ignores an oversized id on the resumed GET path' do
+      state = { cursor: 'evt-1', retry_ms: nil }
+      server.send(:handle_resumption_event, "id: #{'x' * 5000}\ndata:\n\n", state)
+
+      expect(state[:cursor]).to eq('evt-1')
+    end
+
+    it 'accepts an id containing an internal space' do
+      # A space is legal inside an HTTP field value; rejecting it would
+      # strand resumption on a stale cursor.
+      server.send(:parse_and_handle_event, "id: cursor 42\ndata: \n")
+
+      expect(server.instance_variable_get(:@last_event_id)).to eq('cursor 42')
+    end
+  end
+
+  describe 'resumption reconnect delay' do
+    it 'floors a zero retry directive so the resumption GET loop cannot spin' do
+      # retry: 0 inside the deadline window would otherwise issue
+      # back-to-back GETs with no pause at all.
+      expect(server.send(:resumption_delay, 0))
+        .to eq(MCPClient::ServerStreamableHTTP::MIN_RESUMPTION_RECONNECT_DELAY)
+    end
+
+    it 'honors a retry directive above the floor' do
+      expect(server.send(:resumption_delay, 250)).to eq(0.25)
+    end
+
+    it 'uses the default reconnect delay between attempts when no directive was given' do
+      expect(server.send(:resumption_delay, nil)).to eq(MCPClient::ServerStreamableHTTP::SSE_RECONNECT_DELAY)
+    end
+
+    it 'issues the FIRST resumption GET immediately when no directive was given' do
+      # Delaying the first attempt adds latency to every resumption and, on a
+      # short read_timeout, can consume the budget before any I/O happens.
+      allow(server).to receive(:issue_resumption_get)
+      expect(server).not_to receive(:sleep)
+
+      server.instance_variable_set(:@pending_stream_responses, {})
+      server.send(:run_resumption_loop, 99, 'evt-1', nil)
+    end
+  end
+
+  describe 'resumption GET buffer cap' do
+    it 'aborts the GET when delimiter-free data exceeds the cap' do
+      stub_const('MCPClient::ServerStreamableHTTP::MAX_SSE_BUFFER_BYTES', 1024)
+
+      # A peer replaying delimiter-free data must not grow the resumption
+      # worker's buffer without bound: the cap aborts this GET (the
+      # deadline-bounded resumption loop handles any retry).
+      stub_request(:get, "#{base_url}#{endpoint}")
+        .with(headers: { 'Last-Event-ID' => 'evt-1' })
+        .to_return(status: 200, body: 'a' * 4096,
+                   headers: { 'Content-Type' => 'text/event-stream' })
+
+      expect(server).to receive(:enforce_sse_buffer_cap!).at_least(:once).and_call_original
+
+      state = { cursor: 'evt-1', retry_ms: nil }
+      expect { server.send(:issue_resumption_get, state) }.not_to raise_error
+    end
+
+    it 'raises through enforce_sse_buffer_cap! when the buffer exceeds the cap' do
+      stub_const('MCPClient::ServerStreamableHTTP::MAX_SSE_BUFFER_BYTES', 1024)
+
+      expect { server.send(:enforce_sse_buffer_cap!, +'a' * 2048) }
+        .to raise_error(MCPClient::Errors::ConnectionError, /buffer/i)
     end
   end
 

@@ -327,15 +327,24 @@ task = client.call_tool_as_task('long_job', { input: 'data' }, ttl: 60_000)
 # honoring the server's suggested poll interval
 until task.terminal? || task.input_required?
   sleep((task.poll_interval || 1000) / 1000.0)
-  task = client.get_task(task.task_id)   # tasks/get
+  task = client.get_task(task)          # tasks/get, routed to the task's own server
 end
 
 # Retrieve the underlying result (e.g. a CallToolResult) via tasks/result
-result = client.get_task_result(task.task_id)
+result = client.get_task_result(task)
 
 # List and cancel tasks
 page = client.list_tasks               # { tasks: [...], next_cursor: ... }
-client.cancel_task(task.task_id)       # tasks/cancel
+client.cancel_task(task)               # tasks/cancel
+```
+
+Task IDs are only unique within the server that issued them, so pass the `Task`
+returned by `call_tool_as_task` — it carries its own server. A bare task ID also
+works when the client has a single server; with several servers configured it
+raises `ArgumentError` rather than guessing, so name the server explicitly:
+
+```ruby
+client.get_task('task-123', server: 'my-server')
 
 # React to server-pushed status updates
 client.on_notification do |server, method, params|
