@@ -1349,6 +1349,39 @@ RSpec.describe MCPClient::ServerStreamableHTTP do
     end
   end
 
+  describe 'SSE buffering cost' do
+    it 'stays fast when an unterminated event arrives in many small chunks' do
+      # Capping retained bytes does not help if reaching the cap costs O(N^2)
+      # copying and rescanning.
+      chunk = 'a' * 16_384
+      started = Process.clock_gettime(Process::CLOCK_MONOTONIC)
+      512.times { server.send(:process_event_chunk, chunk.dup) }
+      elapsed = Process.clock_gettime(Process::CLOCK_MONOTONIC) - started
+
+      expect(elapsed).to be < 1.0
+      expect(server.instance_variable_get(:@buffer).bytesize).to eq(512 * 16_384)
+    end
+
+    it 'finds a terminator split across two chunks' do
+      expect(server).to receive(:parse_and_handle_event).once
+      server.send(:process_event_chunk, "event: message\r\ndata: x\r")
+      server.send(:process_event_chunk, "\n\r\n")
+    end
+
+    it 'scans the resumption buffer incrementally too' do
+      state = { cursor: 'evt-1', retry_ms: nil }
+      buffer = +''
+      started = Process.clock_gettime(Process::CLOCK_MONOTONIC)
+      512.times do
+        buffer << ('a' * 16_384)
+        server.send(:process_resumption_buffer, buffer, state)
+      end
+      elapsed = Process.clock_gettime(Process::CLOCK_MONOTONIC) - started
+
+      expect(elapsed).to be < 1.0
+    end
+  end
+
   describe 'security validation' do
     # Session ID and URL validation tests are shared with HTTP transport
     # through the HttpTransportBase module, so we just verify they work here
