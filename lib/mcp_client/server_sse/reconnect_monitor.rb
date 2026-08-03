@@ -1,9 +1,13 @@
 # frozen_string_literal: true
 
+require_relative 'origin_policy'
+
 module MCPClient
   class ServerSSE
     # Extracted module for back-off, ping, and reconnection logic
     module ReconnectMonitor
+      include OriginPolicy
+
       # Start an activity monitor thread to maintain the connection
       # @return [void]
       def start_activity_monitor
@@ -202,7 +206,9 @@ module MCPClient
           f.options.open_timeout = 10
           f.options.timeout = nil
           f.request :retry, max: @max_retries, interval: @retry_backoff, backoff_factor: 2
-          f.response :follow_redirects, limit: 3
+          # Same origin pinning as the RPC connection: the SSE stream carries
+          # the configured credential headers too.
+          f.response :follow_redirects, limit: 3, callback: method(:reject_cross_origin_redirect!)
           f.adapter Faraday.default_adapter
         end
 
