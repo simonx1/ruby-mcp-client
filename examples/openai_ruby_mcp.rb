@@ -40,7 +40,7 @@ tools = mcp_client.to_openai_tools
 # Build initial chat messages
 messages = [
   { role: 'system', content: 'You can call filesystem tools.' },
-  { role: 'user', content: 'List all files in the sandbox directory' }
+  { role: 'user', content: 'List all files in the directory path "./"' }
 ]
 
 # 1) Send chat with function definitions
