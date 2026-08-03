@@ -12,10 +12,15 @@ module MCPClient
     module JsonRpcTransport
       include HttpTransportBase
 
-      # Ceiling on the expanded size of a gzip-encoded response body. The peer
-      # controls the compression ratio, so without a bound a tiny compressed
-      # response ("gzip bomb") could expand to an arbitrarily large string and
-      # exhaust host memory before JSON parsing.
+      # Default ceiling on the expanded size of a gzip-encoded response body.
+      # The peer controls the compression ratio, so without a bound a tiny
+      # compressed response ("gzip bomb") could expand to an arbitrarily large
+      # string and exhaust host memory before JSON parsing.
+      #
+      # Hosts that legitimately exchange very large payloads (e.g. base64
+      # resource blobs or audio) can raise it per server with the
+      # max_decompressed_body_bytes option, so that whether a response is
+      # accepted does not depend on the server's choice to gzip it.
       MAX_DECOMPRESSED_BODY_BYTES = 64 * 1024 * 1024
       DECOMPRESS_CHUNK_BYTES = 64 * 1024
 
@@ -56,23 +61,33 @@ module MCPClient
       end
 
       # Incrementally decompress a gzip response body, aborting once the
-      # expanded output exceeds MAX_DECOMPRESSED_BODY_BYTES.
+      # expanded output exceeds the configured ceiling.
       # @param body [String] the gzip-compressed response body
       # @return [String] the decompressed body
-      # @raise [MCPClient::Errors::TransportError] if the expansion limit is exceeded
+      # @raise [MCPClient::Errors::ResponseTooLargeError] if the expansion limit is exceeded
       def decompress_gzip(body)
+        limit = max_decompressed_body_bytes
         reader = Zlib::GzipReader.new(StringIO.new(body))
         decompressed = +''
         while (chunk = reader.read(DECOMPRESS_CHUNK_BYTES))
           decompressed << chunk
-          next unless decompressed.bytesize > MAX_DECOMPRESSED_BODY_BYTES
+          next unless decompressed.bytesize > limit
 
-          raise MCPClient::Errors::TransportError,
-                "Gzip response expanded beyond #{MAX_DECOMPRESSED_BODY_BYTES} bytes"
+          # ResponseTooLargeError (not a plain TransportError) so with_retry
+          # does not re-POST a request the server has already executed.
+          raise MCPClient::Errors::ResponseTooLargeError,
+                "Gzip response expanded beyond #{limit} bytes"
         end
         decompressed
       ensure
         reader&.close
+      end
+
+      # Configured ceiling for decompressed response bodies.
+      # @return [Integer] positive byte limit
+      def max_decompressed_body_bytes
+        configured = defined?(@max_decompressed_body_bytes) ? @max_decompressed_body_bytes : nil
+        configured || MAX_DECOMPRESSED_BODY_BYTES
       end
 
       # Parse a Server-Sent Event formatted response body.

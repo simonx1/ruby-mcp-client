@@ -98,6 +98,7 @@ module MCPClient
 
       @read_timeout = opts[:read_timeout]
       @faraday_config = opts[:faraday_config]
+      @max_decompressed_body_bytes = validate_decompression_limit(opts[:max_decompressed_body_bytes])
       @tools = nil
       @tools_data = nil
       @prompts = nil
@@ -534,6 +535,17 @@ module MCPClient
 
     # Default options for server initialization
     # @return [Hash] Default options
+    # Validate the configured decompression ceiling.
+    # @param value [Object] the max_decompressed_body_bytes option
+    # @return [Integer] the validated positive byte limit
+    # @raise [ArgumentError] if the value is not a positive Integer
+    def validate_decompression_limit(value)
+      return value if value.is_a?(Integer) && value.positive?
+
+      raise ArgumentError,
+            "max_decompressed_body_bytes must be a positive Integer, got #{value.inspect}"
+    end
+
     def default_options
       {
         endpoint: '/rpc',
@@ -544,7 +556,8 @@ module MCPClient
         name: nil,
         logger: nil,
         oauth_provider: nil,
-        faraday_config: nil
+        faraday_config: nil,
+        max_decompressed_body_bytes: JsonRpcTransport::MAX_DECOMPRESSED_BODY_BYTES
       }
     end
 
