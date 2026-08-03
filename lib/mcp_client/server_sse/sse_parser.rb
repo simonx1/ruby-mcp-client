@@ -2,11 +2,14 @@
 
 require 'json'
 require 'uri'
+require_relative 'origin_policy'
 
 module MCPClient
   class ServerSSE
     # === Wire-level SSE parsing & dispatch ===
     module SseParser
+      include OriginPolicy
+
       # Parse and handle a raw SSE event payload.
       # @param event_data [String] the raw event chunk
       def parse_and_handle_sse_event(event_data)
@@ -180,21 +183,6 @@ module MCPClient
         # target to the first request.
         @logger.error("Failed to resolve endpoint URI #{data.inspect} against #{@base_url}: #{e.message}")
         fail_endpoint_handshake!("Invalid endpoint URI in SSE endpoint event: #{data.inspect} (#{e.message})")
-      end
-
-      # @param base [URI::Generic] the SSE connection URL
-      # @param endpoint [URI::Generic] the resolved endpoint URL
-      # @return [Boolean] whether both share scheme, host and port
-      def same_origin?(base, endpoint)
-        base.scheme == endpoint.scheme &&
-          base.host&.downcase == endpoint.host&.downcase &&
-          base.port == endpoint.port
-      end
-
-      # @param uri [URI::Generic]
-      # @return [String] scheme://host:port of the URI
-      def origin_of(uri)
-        "#{uri.scheme}://#{uri.host}:#{uri.port}"
       end
 
       # Record the handshake failure cause and raise. The SSE worker thread

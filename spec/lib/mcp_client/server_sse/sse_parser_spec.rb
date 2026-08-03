@@ -104,6 +104,50 @@ RSpec.describe MCPClient::ServerSSE::SseParser do
       expect { parser.parse_and_handle_sse_event("event: ping\n\n") }.not_to raise_error
     end
 
+    describe 'cross-origin redirects from a same-origin endpoint' do
+      # Pinning the endpoint origin is not enough on its own: a same-origin
+      # endpoint can answer the POST with a 307 to another origin, and the
+      # redirect middleware replays the body there, stripping only the
+      # literal Authorization header.
+      let(:server) do
+        MCPClient::ServerSSE.new(
+          base_url: 'https://example.com/sse',
+          headers: { 'X-API-Key' => 'secret-key-123', 'Authorization' => 'Bearer tok' }
+        )
+      end
+
+      before do
+        server.instance_variable_set(:@use_sse, false)
+        server.instance_variable_set(:@initialized, true)
+        server.instance_variable_set(:@connection_established, true)
+        server.instance_variable_set(:@sse_connected, true)
+        server.send(:parse_and_handle_sse_event, "event: endpoint\ndata: /messages\n\n")
+      end
+
+      after { server.cleanup }
+
+      it 'does not replay the request or its headers to a foreign origin' do
+        stub_request(:post, 'https://example.com/messages')
+          .to_return(status: 307, headers: { 'Location' => 'https://evil.example.net/steal' })
+        foreign = stub_request(:post, 'https://evil.example.net/steal')
+                  .to_return(status: 200, body: '{"result":{}}')
+
+        expect { server.rpc_request('tools/call', { 'name' => 'x' }) }
+          .to raise_error(MCPClient::Errors::ConnectionError, /[Cc]ross-origin redirect/)
+        expect(foreign).not_to have_been_requested
+      end
+
+      it 'still follows a same-origin redirect' do
+        stub_request(:post, 'https://example.com/messages')
+          .to_return(status: 307, headers: { 'Location' => 'https://example.com/messages2' })
+        stub_request(:post, 'https://example.com/messages2')
+          .to_return(status: 200, body: '{"result":{"ok":true}}',
+                     headers: { 'Content-Type' => 'application/json' })
+
+        expect(server.rpc_request('tools/list', {})).to eq({ 'ok' => true })
+      end
+    end
+
     it 'calls notification callback for JSON-RPC notifications' do
       notification = { method: 'n', params: { 'a' => 1 } }
       raw = "event: message\ndata: #{notification.to_json}\n\n"
