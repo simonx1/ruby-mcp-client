@@ -99,7 +99,9 @@ module MCPClient
       @request_id = 0
       @sse_results = {}
       @mutex = Monitor.new
-      @buffer = ''
+      @buffer = +''
+      # How much of @buffer has already been searched for an event terminator
+      @buffer_scanned = 0
       @sse_connected = false
       @connection_established = false
       @connection_cv = @mutex.new_cond
@@ -430,7 +432,8 @@ module MCPClient
 
         # Reset the SSE parse buffer so a reconnect never inherits a leftover
         # partial event from the previous connection.
-        @buffer = ''
+        @buffer = +''
+        @buffer_scanned = 0
 
         # Log cleanup for debugging
         @logger.debug('Cleaning up SSE connection')
@@ -904,30 +907,59 @@ module MCPClient
     # @return [Array<String>, nil] array of complete events or nil if none
     # @private
     def extract_complete_events(chunk)
-      event_buffers = nil
+      event_buffers = []
       @mutex.synchronize do
-        @buffer += chunk
+        # Append in place. `@buffer += chunk` allocates and copies the whole
+        # buffer on every callback, so an unterminated event delivered in N
+        # chunks costs O(N^2) copying — memory stays capped but a peer can
+        # still burn CPU and thrash the allocator on the way there.
+        @buffer << chunk
 
-        # Extract all complete events from the buffer
-        # Handle both Unix (\n\n) and Windows (\r\n\r\n) line endings
-        event_buffers = []
-        while (event_end = @buffer.index("\n\n") || @buffer.index("\r\n\r\n"))
-          event_data = extract_single_event(event_end)
-          event_buffers << event_data
+        # Rescan only the newly arrived bytes, backing up by the longest
+        # delimiter minus one so one split across two chunks is still found.
+        scan_from = [@buffer_scanned - 3, 0].max
+        while (event_end = next_event_end(scan_from))
+          event_buffers << extract_single_event(event_end)
+          # The buffer shifted; what remains is short (one event at most).
+          scan_from = 0
+          @buffer_scanned = 0
         end
+        @buffer_scanned = @buffer.length
 
-        # Everything left is a partial event awaiting its terminator. The
-        # stream is peer-controlled, so cap how much may accumulate: drop the
-        # oversized data and fail the connection rather than growing without
-        # bound (the normal reconnect path takes over from there).
-        if @buffer.bytesize > MAX_SSE_BUFFER_BYTES
-          @buffer = ''
-          raise MCPClient::Errors::ConnectionError,
-                "SSE event exceeded the maximum buffered size (#{MAX_SSE_BUFFER_BYTES} bytes) " \
-                'without a terminator'
-        end
+        # Whatever is left is a partial event still awaiting its terminator.
+        # The cap is applied here rather than before appending so a single
+        # oversized chunk that DOES contain complete events is still parsed.
+        fail_oversized_sse_buffer! if @buffer.bytesize > MAX_SSE_BUFFER_BYTES
       end
       event_buffers
+    end
+
+    # Index of the earliest event terminator at or after an offset.
+    # @param offset [Integer] character offset to start searching from
+    # @return [Integer, nil] index of the terminator, or nil if none yet
+    def next_event_end(offset)
+      lf = @buffer.index("\n\n", offset)
+      crlf = @buffer.index("\r\n\r\n", offset)
+      [lf, crlf].compact.min
+    end
+
+    # Drop an oversized partial event and fail the connection.
+    #
+    # Recording the cause matters: this runs inside Faraday's on_data callback
+    # on the SSE worker thread, whose generic rescue would otherwise leave
+    # callers with a bare "connection lost" and no reason. Mirrors the
+    # endpoint-URI failure path so wait_for_connection surfaces it promptly.
+    # @raise [MCPClient::Errors::ConnectionError] always
+    def fail_oversized_sse_buffer!
+      message = "SSE event exceeded the maximum buffered size (#{MAX_SSE_BUFFER_BYTES} bytes) " \
+                'without a terminator'
+      @buffer = +''
+      @buffer_scanned = 0
+      @connection_error = message
+      @connection_established = false
+      @connection_cv.broadcast
+      @logger.error(message)
+      raise MCPClient::Errors::ConnectionError, message
     end
 
     # Extract a single event from the buffer
