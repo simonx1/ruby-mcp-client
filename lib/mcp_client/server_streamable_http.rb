@@ -33,6 +33,25 @@ module MCPClient
     SSE_MAX_RECONNECT_DELAY = 30   # Maximum reconnect delay in seconds
     THREAD_JOIN_TIMEOUT = 5 # Timeout for thread cleanup
 
+    # Floor for the delay between resumption GETs. SEP-1699's polling pattern
+    # wants fast reconnects, so this is far smaller than the events-stream
+    # floor — it only prevents a peer-supplied "retry: 0" from turning the
+    # deadline window into a back-to-back request loop.
+    MIN_RESUMPTION_RECONNECT_DELAY = 0.01
+
+    # Maximum length of a server-supplied SSE event id retained as the
+    # resumption cursor. The id is echoed in the Last-Event-ID header of
+    # subsequent requests, so an unbounded value means unbounded retained
+    # memory and oversized outbound headers.
+    MAX_EVENT_ID_LENGTH = 1024
+
+    # Characters allowed in a retained event id: printable ASCII, since the
+    # value becomes an HTTP header value. Notably excludes CR/LF. The range
+    # starts at 0x20 because a space is legal inside a field value, and
+    # rejecting ids like "cursor 42" would silently strand resumption on a
+    # stale cursor.
+    EVENT_ID_PATTERN = /\A[\x20-\x7E]+\z/
+
     # Ceiling on concurrent threads POSTing server-initiated responses
     # (pongs, roots/sampling/elicitation replies, error responses). Each
     # server request on the events stream costs one blocking HTTP POST in
@@ -822,8 +841,11 @@ module MCPClient
       deadline = Process.clock_gettime(Process::CLOCK_MONOTONIC) + @read_timeout
       state = { cursor: cursor, retry_ms: retry_ms }
       # SEP-1699: the client MUST respect the server's retry directive before
-      # attempting to reconnect.
-      delay = retry_ms ? retry_ms / 1000.0 : 0
+      # attempting to reconnect. With no directive the FIRST GET goes out
+      # immediately, as before this change: delaying it adds latency to every
+      # resumption and, on a short read_timeout, can burn the whole budget
+      # before any I/O happens.
+      delay = retry_ms ? resumption_delay(retry_ms) : 0
 
       loop do
         sleep(delay) if delay.positive?
@@ -831,8 +853,19 @@ module MCPClient
         break unless @mutex.synchronize { @pending_stream_responses.key?(request_id) }
         break if Process.clock_gettime(Process::CLOCK_MONOTONIC) >= deadline
 
-        delay = state[:retry_ms] ? state[:retry_ms] / 1000.0 : SSE_RECONNECT_DELAY
+        delay = resumption_delay(state[:retry_ms])
       end
+    end
+
+    # Delay before the next resumption GET: the peer's retry directive when
+    # present, floored so "retry: 0" cannot turn the deadline window into a
+    # back-to-back request loop, otherwise the standard reconnect delay.
+    # @param retry_ms [Integer, nil] retry directive in milliseconds
+    # @return [Numeric] delay in seconds
+    def resumption_delay(retry_ms)
+      return SSE_RECONNECT_DELAY unless retry_ms
+
+      [retry_ms / 1000.0, MIN_RESUMPTION_RECONNECT_DELAY].max
     end
 
     # One GET with the current cursor; complete SSE events are dispatched
@@ -897,7 +930,9 @@ module MCPClient
           data_lines << line.sub(/\Adata:\s*/, '')
         elsif line.start_with?('id:')
           id = line.sub(/\Aid:\s*/, '').strip
-          state[:cursor] = id unless id.empty?
+          # Same validation as the events stream: this cursor is echoed in
+          # the Last-Event-ID header of the next resumption GET.
+          state[:cursor] = id if retainable_event_id?(id)
         elsif line.start_with?('retry:')
           raw = line.sub(/\Aretry:\s*/, '').strip
           state[:retry_ms] = raw.to_i if raw.match?(/\A\d+\z/)
@@ -1026,9 +1061,12 @@ module MCPClient
           # SSE allows multiple data lines that should be joined with newlines
           data_lines << line[5..].strip
         elsif line.start_with?('id:')
-          # Track event ID for resumability (MCP future enhancement)
+          # Track event ID for resumability (MCP future enhancement). The id
+          # is peer-controlled and gets echoed in the Last-Event-ID header, so
+          # only a bounded, header-safe value is retained; the previous valid
+          # cursor is kept when one is rejected.
           event[:id] = line[3..].strip
-          @last_event_id = event[:id]
+          @last_event_id = event[:id] if retainable_event_id?(event[:id])
         elsif line.start_with?('retry:')
           # SEP-1699: the client MUST respect the server's retry directive
           # (milliseconds) when reconnecting; zero is a valid directive.

@@ -26,6 +26,27 @@ module MCPClient
 
       private
 
+      # Whether a server-supplied SSE event id may be retained as the
+      # resumption cursor: non-empty, bounded, and safe to place in an HTTP
+      # header. Shared by every SSE parsing path (GET events stream, POST
+      # response stream, and resumed GET), since all three feed the same
+      # Last-Event-ID header.
+      # @param id [String, nil] the raw id field
+      # @return [Boolean]
+      def retainable_event_id?(id)
+        return false if id.nil? || id.empty?
+
+        if id.length > MAX_EVENT_ID_LENGTH
+          @logger.warn("Ignoring oversized SSE event id (#{id.length} chars)")
+          return false
+        end
+
+        return true if id.match?(EVENT_ID_PATTERN)
+
+        @logger.warn('Ignoring SSE event id with characters illegal in a header value')
+        false
+      end
+
       # Log HTTP response for Streamable HTTP
       # @param response [Faraday::Response] the HTTP response
       def log_response(response)
@@ -130,7 +151,9 @@ module MCPClient
       # @raise [MCPClient::Errors::ServerError] when resumption fails
       # @raise [MCPClient::Errors::TransportError] when no cursor was received
       def resume_or_fail(events, request_id, retry_ms = nil)
-        cursor = events.reverse.find { |e| e[:id] && !e[:id].empty? }&.dig(:id)
+        # Only a validated id may become a cursor: it is sent back as a
+        # Last-Event-ID header on the resumption GET.
+        cursor = events.reverse.find { |e| retainable_event_id?(e[:id]) }&.dig(:id)
         if request_id && cursor
           # Resume with THIS stream's cursor and retry directive (both are
           # per-stream), not the shared @last_event_id / @sse_retry_ms which a
@@ -204,7 +227,10 @@ module MCPClient
 
         events.each do |event|
           if event[:id] && !event[:id].empty?
-            @mutex.synchronize { @last_event_id = event[:id] }
+            # The POST SSE stream is peer-controlled like the GET one, so its
+            # ids get the same bound/charset check before being retained or
+            # echoed in a Last-Event-ID header.
+            @mutex.synchronize { @last_event_id = event[:id] } if retainable_event_id?(event[:id])
             @logger.debug("Tracking event ID for resumability: #{event[:id]}")
           end
           next unless event[:type] == 'message'
