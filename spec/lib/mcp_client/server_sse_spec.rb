@@ -466,6 +466,28 @@ RSpec.describe MCPClient::ServerSSE do
       expect(server.instance_variable_get(:@sse_results)).to be_empty
     end
 
+    it 'keeps a result whose request is still pending' do
+      # A response can land while its POST is still returning; if the stream
+      # then drops, the waiter reconnects (which calls cleanup) and must still
+      # find it. Losing it reports a timeout for work the server already did.
+      server.send(:register_pending_request, 42)
+      server.instance_variable_set(:@sse_results, { 42 => { 'ok' => true }, 'stale' => { 'x' => 1 } })
+
+      server.cleanup
+
+      results = server.instance_variable_get(:@sse_results)
+      expect(results).to eq({ 42 => { 'ok' => true } })
+    end
+
+    it 'delivers a result that arrived just before a reconnect' do
+      server.send(:register_pending_request, 7)
+      server.send(:parse_and_handle_sse_event,
+                  "event: message\ndata: #{{ jsonrpc: '2.0', id: 7, result: { 'done' => true } }.to_json}\n\n")
+      server.cleanup
+
+      expect(server.send(:check_for_result, 7)).to eq({ 'done' => true })
+    end
+
     it 'resets the SSE parse buffer so a reconnect does not inherit a partial event' do
       server.instance_variable_set(:@buffer, 'data: {"jso')
       server.cleanup

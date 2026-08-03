@@ -429,10 +429,15 @@ module MCPClient
         # partial event from the previous connection.
         @buffer = ''
 
-        # Drop undelivered results: their waiters fail with the connection,
-        # and retaining entries across reconnects would let stale peer data
-        # accumulate for the lifetime of the client.
-        @sse_results = {}
+        # Drop results nobody is waiting for, so peer-supplied state cannot
+        # accumulate across reconnects. Results for still-pending requests are
+        # KEPT: a response can arrive while its POST is still returning, and
+        # the waiter (which reconnects through ensure_sse_connection_active)
+        # is about to consume it. Discarding those reported a timeout for a
+        # tool call the server had already executed — inviting a duplicate
+        # manual retry. unregister_pending_request clears each entry when its
+        # request finishes, so nothing lingers.
+        @sse_results.select! { |id, _| @pending_request_ids.include?(id) }
 
         # Log cleanup for debugging
         @logger.debug('Cleaning up SSE connection')
