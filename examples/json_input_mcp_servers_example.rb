@@ -6,7 +6,7 @@
 # - Filesystem MCP server via STDIO
 #
 # Usage:
-#  1. Start Playwright MCP server: npx @playwright/mcp@latest --port 8931
+#  1. Start Playwright MCP server: npx @playwright/mcp@0.0.78 --port 8931
 #  2. Run this example: ruby json_input_mcp_servers_example.rb
 #
 require 'bundler/setup'
