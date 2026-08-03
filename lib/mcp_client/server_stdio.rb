@@ -160,7 +160,7 @@ module MCPClient
     # @return [void]
     def handle_line(line)
       msg = JSON.parse(line)
-      @logger.debug("Received line: #{line.chomp}")
+      @logger.debug("Received line: #{describe_jsonrpc_message(msg)}")
 
       # A JSON-parseable line that is not an object cannot be a JSON-RPC
       # message; skip it rather than raising inside the reader thread
@@ -542,8 +542,11 @@ module MCPClient
         send_error_response(request_id, -32_601, "Method not found: #{method}")
       end
     rescue StandardError => e
+      # The exception message is host-internal (file paths, connection
+      # strings, library internals): log it locally, answer the peer with a
+      # constant message, matching the SSE and Streamable HTTP transports.
       @logger.error("Error handling server request: #{e.message}")
-      send_error_response(request_id, -32_603, "Internal error: #{e.message}")
+      send_error_response(request_id, -32_603, 'Internal error')
     end
 
     # Handle a server-initiated ping request (MCP ping utility)
@@ -694,7 +697,7 @@ module MCPClient
       json = JSON.generate(message)
       @stdin.puts(json)
       @stdin.flush
-      @logger.debug("Sent message: #{json}")
+      @logger.debug("Sent message: #{describe_jsonrpc_message(message)}")
     rescue StandardError => e
       @logger.error("Error sending message: #{e.message}")
     end

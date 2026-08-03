@@ -33,7 +33,7 @@ module MCPClient
     def rpc_request(method, params = {}, timeout: nil)
       ensure_connected
 
-      with_retry do
+      with_retry(method) do
         request_id = @mutex.synchronize { @request_id += 1 }
         request = build_jsonrpc_request(method, params, request_id)
         begin
@@ -181,7 +181,7 @@ module MCPClient
     # @raise [MCPClient::Errors::TransportError] if response isn't valid JSON
     # @raise [MCPClient::Errors::ToolCallError] for other errors during request execution
     def send_jsonrpc_request(request, timeout: nil)
-      @logger.debug("Sending JSON-RPC request: #{request.to_json}")
+      @logger.debug("Sending JSON-RPC request: #{describe_jsonrpc_message(request)}")
 
       begin
         response = send_http_request(request, timeout: timeout)
@@ -471,7 +471,7 @@ module MCPClient
     # Log HTTP response (to be overridden by specific transports)
     # @param response [Faraday::Response] the HTTP response
     def log_response(response)
-      @logger.debug("Received HTTP response: #{response.status} #{response.body}")
+      @logger.debug("Received HTTP response: #{response.status} (#{describe_body_size(response.body)})")
     end
 
     # Parse HTTP response (to be implemented by specific transports)

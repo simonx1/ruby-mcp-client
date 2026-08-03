@@ -423,7 +423,7 @@ RSpec.describe MCPClient::HttpTransportBase do
         expect(calls).to eq(1)
       end
 
-      it 'retries a TransientServerError (HTTP 5xx) and can then succeed' do
+      it 'retries a TransientServerError (HTTP 5xx) on an idempotent method and can then succeed' do
         calls = 0
         allow(transport).to receive(:send_jsonrpc_request) do
           calls += 1
@@ -432,11 +432,11 @@ RSpec.describe MCPClient::HttpTransportBase do
           'ok'
         end
 
-        expect(transport.rpc_request('tools/call', {})).to eq('ok')
+        expect(transport.rpc_request('tools/list', {})).to eq('ok')
         expect(calls).to eq(3)
       end
 
-      it 'retries a transient transport (network) error and can then succeed' do
+      it 'retries a transient transport (network) error on an idempotent method and can then succeed' do
         calls = 0
         allow(transport).to receive(:send_jsonrpc_request) do
           calls += 1
@@ -445,8 +445,22 @@ RSpec.describe MCPClient::HttpTransportBase do
           'ok'
         end
 
-        expect(transport.rpc_request('tools/call', {})).to eq('ok')
+        expect(transport.rpc_request('tools/list', {})).to eq('ok')
         expect(calls).to eq(2)
+      end
+
+      it 'does not re-send a non-idempotent tools/call even for transient failures' do
+        # A 5xx or dropped connection can arrive AFTER the server received
+        # the request; re-POSTing tools/call could execute it twice.
+        calls = 0
+        allow(transport).to receive(:send_jsonrpc_request) do
+          calls += 1
+          raise MCPClient::Errors::TransientServerError, 'Server error: HTTP 503'
+        end
+
+        expect { transport.rpc_request('tools/call', {}) }
+          .to raise_error(MCPClient::Errors::TransientServerError)
+        expect(calls).to eq(1)
       end
     end
   end

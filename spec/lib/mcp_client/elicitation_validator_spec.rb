@@ -367,6 +367,48 @@ RSpec.describe MCPClient::ElicitationValidator do
         errors = described_class.validate_content({ 'version' => 'invalid' }, schema)
         expect(errors).to include(match(/must match pattern/))
       end
+
+      it 'compiles server-supplied patterns with a match timeout' do
+        # The elicitation schema comes from the remote server: an expensive
+        # expression must not be able to pin the CPU indefinitely.
+        compiled = nil
+        allow(Regexp).to receive(:new).and_wrap_original do |orig, *args, **kwargs|
+          compiled = orig.call(*args, **kwargs)
+        end
+
+        described_class.validate_content({ 'version' => 'v1.2.3' }, schema)
+
+        expect(compiled.timeout).to be > 0
+        expect(compiled.timeout).to be <= MCPClient::ElicitationValidator::PATTERN_MATCH_TIMEOUT
+      end
+
+      it 'reports an error instead of accepting the value when pattern matching times out' do
+        # Real timeout, no stubbing: an ambiguous alternation over a long
+        # input exceeds a tight budget, and the value must NOT be accepted
+        # just because the constraint could not be evaluated.
+        stub_const('MCPClient::ElicitationValidator::PATTERN_MATCH_TIMEOUT', 0.001)
+        stub_const('MCPClient::ElicitationValidator::MIN_PATTERN_MATCH_TIMEOUT', 0.0005)
+        slow_schema = {
+          'type' => 'object',
+          'properties' => { 'version' => { 'type' => 'string', 'pattern' => '\\A(a|b|ab)*\\z' } }
+        }
+
+        errors = described_class.validate_content({ 'version' => "#{'ab' * 20_000}c" }, slow_schema)
+        expect(errors).to include(match(/pattern.*budget/i))
+      end
+
+      it 'bounds TOTAL pattern time across many fields, not per field' do
+        stub_const('MCPClient::ElicitationValidator::PATTERN_MATCH_TIMEOUT', 0.3)
+        props = (1..8).to_h { |i| ["f#{i}", { 'type' => 'string', 'pattern' => '\\A(a|b|ab)*\\z' }] }
+        content = (1..8).to_h { |i| ["f#{i}", "#{'ab' * 20_000}c"] }
+
+        started = Process.clock_gettime(Process::CLOCK_MONOTONIC)
+        errors = described_class.validate_content(content, { 'type' => 'object', 'properties' => props })
+        elapsed = Process.clock_gettime(Process::CLOCK_MONOTONIC) - started
+
+        expect(elapsed).to be < 1.5
+        expect(errors).not_to be_empty
+      end
     end
 
     context 'number validation' do

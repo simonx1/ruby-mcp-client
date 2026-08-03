@@ -95,11 +95,24 @@ RSpec.describe 'Streamable HTTP resumability (SEP-1699)' do
       expect(server.send(:events_reconnect_delay, 4)).to eq(4)
     end
 
-    it 'accepts retry: 0 as a valid immediate-reconnect directive' do
+    it 'parses retry: 0 but floors the events reconnect delay to the safety minimum' do
+      # retry: 0 is a valid SSE directive (and stays an immediate-poll signal
+      # for the deadline-bounded resumption loop), but the long-lived events
+      # loop must not honor it literally: a hostile server repeatedly closing
+      # the stream with retry: 0 would otherwise drive a tight reconnect loop.
+      # Waiting LONGER than the directive stays SEP-1699 compliant ("waiting
+      # the given number of milliseconds" is a lower bound).
       server.send(:parse_and_handle_event, "retry: 0\ndata: \n")
 
       expect(server.instance_variable_get(:@sse_retry_ms)).to eq(0)
-      expect(server.send(:events_reconnect_delay, 4)).to eq(0)
+      expect(server.send(:events_reconnect_delay, 4))
+        .to eq(MCPClient::ServerStreamableHTTP::MIN_EVENTS_RECONNECT_DELAY)
+    end
+
+    it 'floors sub-minimum retry directives to the safety minimum' do
+      server.instance_variable_set(:@sse_retry_ms, 10)
+      expect(server.send(:events_reconnect_delay, 4))
+        .to eq(MCPClient::ServerStreamableHTTP::MIN_EVENTS_RECONNECT_DELAY)
     end
 
     it 'resumes with the closed stream own cursor, not the shared one' do
@@ -254,6 +267,32 @@ RSpec.describe 'Streamable HTTP resumability (SEP-1699)' do
 
       server.instance_variable_set(:@pending_stream_responses, {})
       server.send(:run_resumption_loop, 99, 'evt-1', nil)
+    end
+  end
+
+  describe 'resumption GET buffer cap' do
+    it 'aborts the GET when delimiter-free data exceeds the cap' do
+      stub_const('MCPClient::ServerStreamableHTTP::MAX_SSE_BUFFER_BYTES', 1024)
+
+      # A peer replaying delimiter-free data must not grow the resumption
+      # worker's buffer without bound: the cap aborts this GET (the
+      # deadline-bounded resumption loop handles any retry).
+      stub_request(:get, "#{base_url}#{endpoint}")
+        .with(headers: { 'Last-Event-ID' => 'evt-1' })
+        .to_return(status: 200, body: 'a' * 4096,
+                   headers: { 'Content-Type' => 'text/event-stream' })
+
+      expect(server).to receive(:enforce_sse_buffer_cap!).at_least(:once).and_call_original
+
+      state = { cursor: 'evt-1', retry_ms: nil }
+      expect { server.send(:issue_resumption_get, state) }.not_to raise_error
+    end
+
+    it 'raises through enforce_sse_buffer_cap! when the buffer exceeds the cap' do
+      stub_const('MCPClient::ServerStreamableHTTP::MAX_SSE_BUFFER_BYTES', 1024)
+
+      expect { server.send(:enforce_sse_buffer_cap!, +'a' * 2048) }
+        .to raise_error(MCPClient::Errors::ConnectionError, /buffer/i)
     end
   end
 

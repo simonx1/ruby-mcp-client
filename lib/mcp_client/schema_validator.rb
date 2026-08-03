@@ -35,6 +35,19 @@ module MCPClient
       unevaluatedProperties unevaluatedItems
     ].freeze
 
+    # Wall-clock budget for ALL pattern matching in a single validate call.
+    # Schemas come from the remote server, so an expensive expression must not
+    # be able to monopolize the calling thread.
+    #
+    # The budget is for the whole operation, not per match: a per-match limit
+    # multiplies, since the server also controls how many strings it sends
+    # (N array items under one pathological items.pattern costs N x limit).
+    PATTERN_MATCH_TIMEOUT = 1.0
+
+    # Floor for an individual match's timeout, so a nearly-exhausted budget
+    # still makes progress rather than failing every remaining pattern.
+    MIN_PATTERN_MATCH_TIMEOUT = 0.01
+
     # Keywords whose value is a single subschema to walk.
     SUBSCHEMA_KEYWORDS = %w[
       items contains additionalProperties propertyNames not if then else
@@ -85,17 +98,20 @@ module MCPClient
     # @param schema [Hash] the JSON schema
     # @param path [String] JSON-pointer-style location used in error messages
     # @return [Array<String>] human-readable validation errors (empty if valid)
-    def self.validate(data, schema, path: '#')
+    def self.validate(data, schema, path: '#', deadline: nil)
       return [] unless schema.is_a?(Hash)
+
+      # One deadline covers the entire (recursive) validation.
+      deadline ||= Process.clock_gettime(Process::CLOCK_MONOTONIC) + PATTERN_MATCH_TIMEOUT
 
       schema = schema.transform_keys(&:to_s)
       errors = []
       errors.concat(validate_type(data, schema['type'], path)) if schema.key?('type')
       errors.concat(validate_enum(data, schema, path))
       case data
-      when Hash then errors.concat(validate_object(data, schema, path))
-      when Array then errors.concat(validate_array(data, schema, path))
-      when String then errors.concat(validate_string(data, schema, path))
+      when Hash then errors.concat(validate_object(data, schema, path, deadline))
+      when Array then errors.concat(validate_array(data, schema, path, deadline))
+      when String then errors.concat(validate_string(data, schema, path, deadline))
       when Numeric then errors.concat(validate_number(data, schema, path))
       end
       errors
@@ -179,7 +195,7 @@ module MCPClient
     # @param schema [Hash] string-keyed schema
     # @param path [String] location for error messages
     # @return [Array<String>] validation errors
-    def self.validate_object(data, schema, path)
+    def self.validate_object(data, schema, path, deadline = nil)
       errors = []
       Array(schema['required']).each do |raw_name|
         name = raw_name.to_s
@@ -199,7 +215,7 @@ module MCPClient
               end
         next if key.nil?
 
-        errors.concat(validate(data[key], prop_schema, path: "#{path}/#{name}"))
+        errors.concat(validate(data[key], prop_schema, path: "#{path}/#{name}", deadline: deadline))
       end
       errors
     end
@@ -209,7 +225,7 @@ module MCPClient
     # @param schema [Hash] string-keyed schema
     # @param path [String] location for error messages
     # @return [Array<String>] validation errors
-    def self.validate_array(data, schema, path)
+    def self.validate_array(data, schema, path, deadline = nil)
       errors = []
       min_items = schema['minItems']
       max_items = schema['maxItems']
@@ -221,7 +237,9 @@ module MCPClient
       end
       items = schema['items']
       if items.is_a?(Hash)
-        data.each_with_index { |item, idx| errors.concat(validate(item, items, path: "#{path}/#{idx}")) }
+        data.each_with_index do |item, idx|
+          errors.concat(validate(item, items, path: "#{path}/#{idx}", deadline: deadline))
+        end
       end
       errors
     end
@@ -231,7 +249,7 @@ module MCPClient
     # @param schema [Hash] string-keyed schema
     # @param path [String] location for error messages
     # @return [Array<String>] validation errors
-    def self.validate_string(data, schema, path)
+    def self.validate_string(data, schema, path, deadline = nil)
       errors = []
       min_length = schema['minLength']
       max_length = schema['maxLength']
@@ -241,23 +259,49 @@ module MCPClient
       if max_length.is_a?(Numeric) && data.length > max_length
         errors << "#{path}: string is longer than maxLength #{max_length}"
       end
-      errors.concat(validate_pattern(data, schema['pattern'], path))
+      errors.concat(validate_pattern(data, schema['pattern'], path, deadline))
       errors
     end
 
     # Validate a string against a regular-expression pattern.
     # Invalid patterns are not enforced.
+    #
+    # The pattern comes from the tool's outputSchema, i.e. from the remote
+    # server, so matching runs against the validation-wide deadline: neither a
+    # single expensive expression nor many cheap-looking ones can pin the
+    # calling thread. A match that exceeds the budget is reported as a
+    # validation error rather than silently accepted — the value was never
+    # shown to satisfy the schema.
     # @param data [String] the string
     # @param pattern [Object] the pattern keyword value
     # @param path [String] location for error messages
+    # @param deadline [Float, nil] monotonic deadline for the whole validation
     # @return [Array<String>] validation errors
-    def self.validate_pattern(data, pattern, path)
+    def self.validate_pattern(data, pattern, path, deadline = nil)
       return [] unless pattern.is_a?(String)
-      return [] if data.match?(Regexp.new(pattern))
+
+      remaining = pattern_budget_remaining(deadline)
+      return ["#{path}: pattern matching budget exhausted before #{pattern.inspect}"] if remaining.zero?
+
+      return [] if data.match?(Regexp.new(pattern, timeout: remaining))
 
       ["#{path}: string does not match pattern #{pattern.inspect}"]
+    rescue Regexp::TimeoutError
+      ["#{path}: pattern #{pattern.inspect} exceeded the #{PATTERN_MATCH_TIMEOUT}s matching budget"]
     rescue RegexpError
       []
+    end
+
+    # Time left in the validation-wide pattern budget.
+    # @param deadline [Float, nil] monotonic deadline, or nil for a lone match
+    # @return [Float] seconds available for the next match; 0.0 when exhausted
+    def self.pattern_budget_remaining(deadline)
+      return PATTERN_MATCH_TIMEOUT unless deadline
+
+      remaining = deadline - Process.clock_gettime(Process::CLOCK_MONOTONIC)
+      return 0.0 if remaining <= 0
+
+      [remaining, MIN_PATTERN_MATCH_TIMEOUT].max
     end
 
     # Validate a number against inclusive/exclusive bounds.

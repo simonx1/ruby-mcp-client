@@ -12,6 +12,18 @@ module MCPClient
     module JsonRpcTransport
       include HttpTransportBase
 
+      # Default ceiling on the expanded size of a gzip-encoded response body.
+      # The peer controls the compression ratio, so without a bound a tiny
+      # compressed response ("gzip bomb") could expand to an arbitrarily large
+      # string and exhaust host memory before JSON parsing.
+      #
+      # Hosts that legitimately exchange very large payloads (e.g. base64
+      # resource blobs or audio) can raise it per server with the
+      # max_decompressed_body_bytes option, so that whether a response is
+      # accepted does not depend on the server's choice to gzip it.
+      MAX_DECOMPRESSED_BODY_BYTES = 64 * 1024 * 1024
+      DECOMPRESS_CHUNK_BYTES = 64 * 1024
+
       private
 
       # Whether a server-supplied SSE event id may be retained as the
@@ -38,7 +50,7 @@ module MCPClient
       # Log HTTP response for Streamable HTTP
       # @param response [Faraday::Response] the HTTP response
       def log_response(response)
-        @logger.debug("Received Streamable HTTP response: #{response.status} #{response.body}")
+        @logger.debug("Received Streamable HTTP response: #{response.status} (#{describe_body_size(response.body)})")
       end
 
       # Parse a Streamable HTTP JSON-RPC response (JSON or SSE format)
@@ -52,7 +64,7 @@ module MCPClient
         content_type = response.headers['content-type'] || response.headers['Content-Type'] || ''
         content_encoding = response.headers['content-encoding'] || response.headers['Content-Encoding'] || ''
 
-        body = Zlib::GzipReader.new(StringIO.new(body)).read if content_encoding.include?('gzip')
+        body = decompress_gzip(body) if content_encoding.include?('gzip')
         body = body&.strip
 
         # Determine response format based on Content-Type header per MCP 2025 spec
@@ -67,6 +79,36 @@ module MCPClient
         process_jsonrpc_response(data)
       rescue JSON::ParserError => e
         raise MCPClient::Errors::TransportError, "Invalid JSON response from server: #{e.message}"
+      end
+
+      # Incrementally decompress a gzip response body, aborting once the
+      # expanded output exceeds the configured ceiling.
+      # @param body [String] the gzip-compressed response body
+      # @return [String] the decompressed body
+      # @raise [MCPClient::Errors::ResponseTooLargeError] if the expansion limit is exceeded
+      def decompress_gzip(body)
+        limit = max_decompressed_body_bytes
+        reader = Zlib::GzipReader.new(StringIO.new(body))
+        decompressed = +''
+        while (chunk = reader.read(DECOMPRESS_CHUNK_BYTES))
+          decompressed << chunk
+          next unless decompressed.bytesize > limit
+
+          # ResponseTooLargeError (not a plain TransportError) so with_retry
+          # does not re-POST a request the server has already executed.
+          raise MCPClient::Errors::ResponseTooLargeError,
+                "Gzip response expanded beyond #{limit} bytes"
+        end
+        decompressed
+      ensure
+        reader&.close
+      end
+
+      # Configured ceiling for decompressed response bodies.
+      # @return [Integer] positive byte limit
+      def max_decompressed_body_bytes
+        configured = defined?(@max_decompressed_body_bytes) ? @max_decompressed_body_bytes : nil
+        configured || MAX_DECOMPRESSED_BODY_BYTES
       end
 
       # Parse a Server-Sent Event formatted response body.
