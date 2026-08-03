@@ -118,7 +118,7 @@ module MCPClient
       # @raise [MCPClient::Errors::ToolCallError] on tool call errors
       def rpc_request(method, params = {}, timeout: nil)
         ensure_initialized
-        with_retry do
+        with_retry(method) do
           req_id = next_id
           req = build_jsonrpc_request(method, params, req_id)
           send_request(req)

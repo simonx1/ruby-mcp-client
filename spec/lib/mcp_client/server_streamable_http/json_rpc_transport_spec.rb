@@ -269,6 +269,20 @@ RSpec.describe MCPClient::ServerStreamableHTTP::JsonRpcTransport do
         expect(result).to eq(response_data[:result])
         expect(@attempt_count).to eq(3)
       end
+
+      it 'does not retry a non-idempotent tools/call after an ambiguous failure' do
+        # A TransportError may arrive after the server received the request;
+        # re-POSTing tools/call could execute the operation twice.
+        allow(transport).to receive(:send_http_request) do
+          @attempt_count += 1
+          raise MCPClient::Errors::TransportError, 'Temporary failure'
+        end
+
+        expect { transport.rpc_request('tools/call', params) }.to raise_error(
+          MCPClient::Errors::TransportError, /Temporary failure/
+        )
+        expect(@attempt_count).to eq(1)
+      end
     end
   end
 
@@ -516,6 +530,93 @@ RSpec.describe MCPClient::ServerStreamableHTTP::JsonRpcTransport do
         result = transport.send(:parse_response, mock_response)
         expect(result).to eq({ 'data' => 'test' })
       end
+    end
+
+    context 'with a response that expands beyond the decompression limit' do
+      let(:response_body) do
+        string_io_buffer = StringIO.new
+        Zlib::GzipWriter.wrap(string_io_buffer) do |gz|
+          gz.write('0' * (10 * 1024))
+          gz.close
+        end
+        string_io_buffer.string
+      end
+
+      before do
+        stub_const('MCPClient::ServerStreamableHTTP::JsonRpcTransport::MAX_DECOMPRESSED_BODY_BYTES', 1024)
+      end
+
+      it 'raises ResponseTooLargeError instead of materializing the full body' do
+        expect { transport.send(:parse_response, mock_response) }.to raise_error(
+          MCPClient::Errors::ResponseTooLargeError,
+          /expanded beyond/
+        )
+      end
+    end
+  end
+
+  describe 'oversized gzip responses and retries' do
+    # The limit trips only after the server has already received and executed
+    # the request, so the error must NOT be retried: a re-POST of tools/call
+    # would run the operation a second time.
+    let(:bomb) do
+      buffer = StringIO.new
+      Zlib::GzipWriter.wrap(buffer) { |gz| gz.write('0' * (256 * 1024)) }
+      buffer.string
+    end
+
+    let(:server) do
+      MCPClient::ServerStreamableHTTP.new(
+        base_url: 'https://example.com', endpoint: '/rpc',
+        retries: 3, retry_backoff: 0.01, max_decompressed_body_bytes: 1024
+      )
+    end
+
+    before do
+      server.instance_variable_set(:@connection_established, true)
+      server.instance_variable_set(:@initialized, true)
+    end
+
+    after { server.cleanup }
+
+    it 'POSTs a non-idempotent tools/call exactly once' do
+      attempts = 0
+      stub_request(:post, 'https://example.com/rpc').to_return do
+        attempts += 1
+        { status: 200, body: bomb,
+          headers: { 'Content-Type' => 'application/json', 'Content-Encoding' => 'gzip' } }
+      end
+
+      expect { server.rpc_request('tools/call', { 'name' => 'send_money' }) }
+        .to raise_error(MCPClient::Errors::ResponseTooLargeError)
+      expect(attempts).to eq(1)
+    end
+
+    it 'honors a raised max_decompressed_body_bytes for a legitimately large response' do
+      big_result = { 'jsonrpc' => '2.0', 'id' => 1, 'result' => { 'blob' => 'x' * (64 * 1024) } }
+      buffer = StringIO.new
+      Zlib::GzipWriter.wrap(buffer) { |gz| gz.write(JSON.generate(big_result)) }
+
+      roomy = MCPClient::ServerStreamableHTTP.new(
+        base_url: 'https://example.com', endpoint: '/rpc',
+        retries: 0, max_decompressed_body_bytes: 1024 * 1024
+      )
+      roomy.instance_variable_set(:@connection_established, true)
+      roomy.instance_variable_set(:@initialized, true)
+
+      stub_request(:post, 'https://example.com/rpc').to_return(
+        status: 200, body: buffer.string,
+        headers: { 'Content-Type' => 'application/json', 'Content-Encoding' => 'gzip' }
+      )
+
+      expect(roomy.rpc_request('tools/list', {})['blob'].length).to eq(64 * 1024)
+      roomy.cleanup
+    end
+
+    it 'rejects a non-positive configured limit' do
+      expect do
+        MCPClient::ServerStreamableHTTP.new(base_url: 'https://example.com', max_decompressed_body_bytes: 0)
+      end.to raise_error(ArgumentError, /positive Integer/)
     end
   end
 

@@ -384,6 +384,38 @@ RSpec.describe MCPClient::ServerStdio do
     end
   end
 
+  describe 'retry idempotency' do
+    let(:server) { described_class.new(command: command, retries: 2, retry_backoff: 0.01) }
+
+    before { allow(server).to receive(:ensure_initialized) }
+
+    it 'retries an idempotent request after a transient failure' do
+      call_count = 0
+      allow(server).to receive(:send_request) do
+        call_count += 1
+        raise MCPClient::Errors::TransportError, 'stdio pipe broke'
+      end
+
+      expect { server.rpc_request('tools/list') }.to raise_error(MCPClient::Errors::TransportError)
+      expect(call_count).to eq(3)
+    end
+
+    it 'does not retry a non-idempotent tools/call after an ambiguous failure' do
+      # The child process may have consumed the request before the pipe broke;
+      # re-sending tools/call could execute the operation twice.
+      call_count = 0
+      allow(server).to receive(:send_request) do
+        call_count += 1
+        raise MCPClient::Errors::TransportError, 'stdio pipe broke'
+      end
+
+      expect { server.rpc_request('tools/call', { 'name' => 't' }) }.to raise_error(
+        MCPClient::Errors::TransportError
+      )
+      expect(call_count).to eq(1)
+    end
+  end
+
   describe 'private methods' do
     describe '#next_id' do
       it 'generates sequential IDs' do
