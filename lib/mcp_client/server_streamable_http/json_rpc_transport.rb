@@ -29,7 +29,7 @@ module MCPClient
       # Log HTTP response for Streamable HTTP
       # @param response [Faraday::Response] the HTTP response
       def log_response(response)
-        @logger.debug("Received Streamable HTTP response: #{response.status} #{response.body}")
+        @logger.debug("Received Streamable HTTP response: #{response.status} (#{describe_body_size(response.body)})")
       end
 
       # Parse a Streamable HTTP JSON-RPC response (JSON or SSE format)

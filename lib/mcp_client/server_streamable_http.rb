@@ -937,7 +937,9 @@ module MCPClient
     # Buffers partial chunks and processes complete SSE events
     # @param chunk [String] the chunk to process
     def process_event_chunk(chunk)
-      @logger.debug("Processing event chunk: #{chunk.inspect}") if @logger.level <= Logger::DEBUG
+      # Size only: the chunk is raw wire data carrying sampling prompts,
+      # elicitation content and tool results.
+      @logger.debug("Processing event chunk (#{describe_body_size(chunk)})") if @logger.level <= Logger::DEBUG
 
       @mutex.synchronize do
         # Append in place and scan only the newly arrived bytes. `+= chunk`
@@ -1114,8 +1116,11 @@ module MCPClient
         send_error_response(request_id, -32_601, "Method not found: #{method}")
       end
     rescue StandardError => e
+      # The exception message is host-internal (file paths, connection
+      # strings, library internals): log it locally, but answer the peer with
+      # a constant message so failures cannot be used to probe the host.
       @logger.error("Error handling server request: #{e.message}")
-      send_error_response(request_id, -32_603, "Internal error: #{e.message}")
+      send_error_response(request_id, -32_603, 'Internal error')
     end
 
     # Handle elicitation/create request from server (MCP 2025-11-25)
@@ -1308,7 +1313,7 @@ module MCPClient
         end
 
         if resp.success?
-          @logger.debug("Sent JSON-RPC response: #{json_body}")
+          @logger.debug("Sent JSON-RPC response: #{describe_jsonrpc_message(response)}")
         else
           @logger.warn("Failed to send JSON-RPC response: HTTP #{resp.status}")
         end

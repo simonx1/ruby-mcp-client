@@ -543,8 +543,11 @@ module MCPClient
         send_error_response(request_id, -32_601, "Method not found: #{method}")
       end
     rescue StandardError => e
+      # The exception message is host-internal (file paths, connection
+      # strings, library internals): log it locally, but answer the peer with
+      # a constant message so failures cannot be used to probe the host.
       @logger.error("Error handling server request: #{e.message}")
-      send_error_response(request_id, -32_603, "Internal error: #{e.message}")
+      send_error_response(request_id, -32_603, 'Internal error')
     end
 
     # Handle a server-initiated ping request (MCP ping utility)
@@ -741,7 +744,7 @@ module MCPClient
         req.body = json_body
       end
 
-      @logger.debug("Sent response via HTTP POST: #{json_body}")
+      @logger.debug("Sent response via HTTP POST: #{describe_jsonrpc_message(response)}")
     rescue StandardError => e
       @logger.error("Failed to send response via HTTP POST: #{e.message}")
     end
@@ -863,7 +866,9 @@ module MCPClient
     # Process an SSE chunk from the server
     # @param chunk [String] the chunk to process
     def process_sse_chunk(chunk)
-      @logger.debug("Processing SSE chunk: #{chunk.inspect}")
+      # Size only: the chunk is raw wire data carrying sampling prompts,
+      # elicitation content and tool results.
+      @logger.debug("Processing SSE chunk (#{describe_body_size(chunk)})")
 
       # Only record activity for real events
       record_activity if chunk.include?('event:')

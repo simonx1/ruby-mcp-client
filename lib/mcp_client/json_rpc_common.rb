@@ -60,6 +60,35 @@ module MCPClient
       end
     end
 
+    # A log-safe description of a JSON-RPC message: its method and id only.
+    #
+    # Params and results are deliberately omitted. tools/call arguments and
+    # tool results routinely carry credentials, personal data or customer
+    # content, and logs are frequently shipped to lower-trust destinations
+    # (aggregators, CI artifacts, support bundles) — so enabling DEBUG must
+    # not silently start recording payloads.
+    # @param message [Hash] a JSON-RPC request, notification or response
+    # @return [String] method/id summary, never payload content
+    def describe_jsonrpc_message(message)
+      return '(non-object message)' unless message.is_a?(Hash)
+
+      parts = []
+      parts << (message['method'] || message[:method] || '(response)').to_s
+      id = message['id'] || message[:id]
+      parts << "id=#{id}" if id
+      parts << 'error' if message['error'] || message[:error]
+      parts.join(' ')
+    end
+
+    # A log-safe description of a payload body: its size, never its content.
+    # @param body [String, nil] the response/request body
+    # @return [String]
+    def describe_body_size(body)
+      return 'empty body' if body.nil? || body.empty?
+
+      "#{body.bytesize} bytes"
+    end
+
     # Ping the server to keep the connection alive
     # @return [Hash] the result of the ping request
     # @raise [MCPClient::Errors::ToolCallError] if ping times out or fails

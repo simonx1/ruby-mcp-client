@@ -122,7 +122,7 @@ module MCPClient
       # @raise [MCPClient::Errors::TransportError] if response isn't valid JSON
       # @raise [MCPClient::Errors::ToolCallError] for other errors during request execution
       def send_jsonrpc_request(request, timeout: nil)
-        @logger.debug("Sending JSON-RPC request: #{request.to_json}")
+        @logger.debug("Sending JSON-RPC request: #{describe_jsonrpc_message(request)}")
         record_activity
         # Register the id BEFORE posting: the SSE stream may deliver the
         # response before the POST returns, and only responses to registered
@@ -235,7 +235,7 @@ module MCPClient
         end
 
         msg = "Received JSON-RPC response: #{response.status}"
-        msg += " #{response.body}" if response.respond_to?(:body)
+        msg += " (#{describe_body_size(response.body)})" if response.respond_to?(:body)
         @logger.debug(msg)
         response
       end

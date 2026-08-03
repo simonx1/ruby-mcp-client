@@ -66,7 +66,7 @@ module MCPClient
       # @return [void]
       # @raise [MCPClient::Errors::TransportError] on write errors
       def send_request(req)
-        @logger.debug("Sending JSONRPC request: #{req.to_json}")
+        @logger.debug("Sending JSONRPC request: #{describe_jsonrpc_message(req)}")
         @stdin.puts(req.to_json)
       rescue StandardError => e
         # A request that failed to send will never receive a response, so drop
