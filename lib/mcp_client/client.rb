@@ -866,7 +866,10 @@ module MCPClient
     # @return [MCPClient::ServerBase]
     # @raise [ArgumentError] when the target server cannot be determined
     def select_task_server(task, server_arg, operation)
-      return select_server(server_arg) if server_arg
+      # nil, not falsiness: `server: false` is an invalid selector that
+      # select_server rejects with ArgumentError, and treating it as "omitted"
+      # would silently route a read or a cancel somewhere instead of failing.
+      return select_server(server_arg) unless server_arg.nil?
       return task.server if task.is_a?(MCPClient::Task) && task.server
       return select_server(nil) if @servers.size <= 1
 

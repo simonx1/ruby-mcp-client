@@ -92,6 +92,17 @@ RSpec.describe 'Task operations server routing' do
         .to raise_error(ArgumentError, /multiple servers/i)
     end
 
+    it 'rejects an invalid falsy selector instead of routing anyway' do
+      # server: false is not "no selector" — select_server rejects it, and a
+      # dynamically-built false must not turn into a real cancel.
+      handle = MCPClient::Task.new(task_id: 'task-1', server: server_b)
+      expect(server_a).not_to receive(:rpc_request)
+      expect(server_b).not_to receive(:rpc_request)
+
+      expect { multi_client.cancel_task(handle, server: false) }.to raise_error(ArgumentError)
+      expect { single_client.get_task('task-1', server: false) }.to raise_error(ArgumentError)
+    end
+
     it 'accepts a bare task id when the server is named explicitly' do
       expect(server_b).to receive(:rpc_request)
         .with('tasks/get', { taskId: 'task-1' })
