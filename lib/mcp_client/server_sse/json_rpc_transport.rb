@@ -124,6 +124,10 @@ module MCPClient
       def send_jsonrpc_request(request, timeout: nil)
         @logger.debug("Sending JSON-RPC request: #{request.to_json}")
         record_activity
+        # Register the id BEFORE posting: the SSE stream may deliver the
+        # response before the POST returns, and only responses to registered
+        # (outstanding) requests are accepted into @sse_results.
+        register_pending_request(request['id'])
 
         begin
           response = post_json_rpc_request(request)
@@ -142,6 +146,27 @@ module MCPClient
         rescue StandardError => e
           method_name = request['method']
           raise MCPClient::Errors::ToolCallError, "Error executing request '#{method_name}': #{e.message}"
+        ensure
+          unregister_pending_request(request['id'])
+        end
+      end
+
+      # Mark a request id as awaiting its response.
+      # @param request_id [Integer, String] id of the outgoing request
+      # @return [void]
+      def register_pending_request(request_id)
+        @mutex.synchronize { @pending_request_ids.add(request_id) }
+      end
+
+      # Stop accepting responses for a request id (completed, failed or timed
+      # out) and drop any result that was never consumed — a late or duplicate
+      # response must not accumulate in @sse_results.
+      # @param request_id [Integer, String] id of the finished request
+      # @return [void]
+      def unregister_pending_request(request_id)
+        @mutex.synchronize do
+          @pending_request_ids.delete(request_id)
+          @sse_results.delete(request_id)
         end
       end
 

@@ -98,6 +98,10 @@ module MCPClient
       @tools_data = nil
       @request_id = 0
       @sse_results = {}
+      # Ids of requests a caller is actively waiting on. Only responses for
+      # these ids are stored in @sse_results — everything else on the peer
+      # controlled stream is unsolicited and discarded.
+      @pending_request_ids = Set.new
       @mutex = Monitor.new
       @buffer = +''
       # How much of @buffer has already been searched for an event terminator
@@ -434,6 +438,16 @@ module MCPClient
         # partial event from the previous connection.
         @buffer = +''
         @buffer_scanned = 0
+
+        # Drop results nobody is waiting for, so peer-supplied state cannot
+        # accumulate across reconnects. Results for still-pending requests are
+        # KEPT: a response can arrive while its POST is still returning, and
+        # the waiter (which reconnects through ensure_sse_connection_active)
+        # is about to consume it. Discarding those reported a timeout for a
+        # tool call the server had already executed — inviting a duplicate
+        # manual retry. unregister_pending_request clears each entry when its
+        # request finishes, so nothing lingers.
+        @sse_results.select! { |id, _| @pending_request_ids.include?(id) }
 
         # Log cleanup for debugging
         @logger.debug('Cleaning up SSE connection')

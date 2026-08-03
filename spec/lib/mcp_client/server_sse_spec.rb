@@ -459,6 +459,35 @@ RSpec.describe MCPClient::ServerSSE do
       expect(server.instance_variable_get(:@initialized)).to be false
     end
 
+    it 'clears stored SSE results so they cannot accumulate across reconnects' do
+      server.instance_variable_set(:@sse_results, { 'stale-1' => { 'x' => 1 } })
+      server.cleanup
+
+      expect(server.instance_variable_get(:@sse_results)).to be_empty
+    end
+
+    it 'keeps a result whose request is still pending' do
+      # A response can land while its POST is still returning; if the stream
+      # then drops, the waiter reconnects (which calls cleanup) and must still
+      # find it. Losing it reports a timeout for work the server already did.
+      server.send(:register_pending_request, 42)
+      server.instance_variable_set(:@sse_results, { 42 => { 'ok' => true }, 'stale' => { 'x' => 1 } })
+
+      server.cleanup
+
+      results = server.instance_variable_get(:@sse_results)
+      expect(results).to eq({ 42 => { 'ok' => true } })
+    end
+
+    it 'delivers a result that arrived just before a reconnect' do
+      server.send(:register_pending_request, 7)
+      server.send(:parse_and_handle_sse_event,
+                  "event: message\ndata: #{{ jsonrpc: '2.0', id: 7, result: { 'done' => true } }.to_json}\n\n")
+      server.cleanup
+
+      expect(server.send(:check_for_result, 7)).to eq({ 'done' => true })
+    end
+
     it 'resets the SSE parse buffer so a reconnect does not inherit a partial event' do
       server.instance_variable_set(:@buffer, 'data: {"jso')
       server.cleanup
@@ -1308,6 +1337,7 @@ RSpec.describe MCPClient::ServerSSE do
     end
 
     it 'handles regular error messages without raising ConnectionError' do
+      server.send(:register_pending_request, 1)
       # Create a JSON-RPC error response with a normal error
       error_data = {
         jsonrpc: '2.0',
@@ -1359,6 +1389,23 @@ RSpec.describe MCPClient::ServerSSE do
       expect(server).to receive(:record_activity).exactly(2).times
 
       server.send(:send_jsonrpc_request, request)
+    end
+
+    it 'unregisters the pending request id once the request completes' do
+      request = { 'jsonrpc' => '2.0', 'id' => 5, 'method' => 'test', 'params' => {} }
+
+      server.instance_variable_set(:@rpc_endpoint, '/rpc')
+      server.instance_variable_set(:@use_sse, false)
+
+      uri = URI.parse(base_url)
+      stub_request(:post, "#{uri.scheme}://#{uri.host}:#{uri.port}/rpc")
+        .to_return(status: 200, body: '{"result": {}}', headers: { 'Content-Type' => 'application/json' })
+
+      server.send(:send_jsonrpc_request, request)
+
+      # A late/duplicate response for id 5 must now be treated as unsolicited,
+      # so it cannot accumulate in @sse_results.
+      expect(server.instance_variable_get(:@pending_request_ids)).not_to include(5)
     end
   end
 end
