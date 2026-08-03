@@ -269,6 +269,20 @@ RSpec.describe MCPClient::ServerStreamableHTTP::JsonRpcTransport do
         expect(result).to eq(response_data[:result])
         expect(@attempt_count).to eq(3)
       end
+
+      it 'does not retry a non-idempotent tools/call after an ambiguous failure' do
+        # A TransportError may arrive after the server received the request;
+        # re-POSTing tools/call could execute the operation twice.
+        allow(transport).to receive(:send_http_request) do
+          @attempt_count += 1
+          raise MCPClient::Errors::TransportError, 'Temporary failure'
+        end
+
+        expect { transport.rpc_request('tools/call', params) }.to raise_error(
+          MCPClient::Errors::TransportError, /Temporary failure/
+        )
+        expect(@attempt_count).to eq(1)
+      end
     end
   end
 

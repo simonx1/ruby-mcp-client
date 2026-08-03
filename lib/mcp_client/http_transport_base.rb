@@ -33,7 +33,7 @@ module MCPClient
     def rpc_request(method, params = {}, timeout: nil)
       ensure_connected
 
-      with_retry do
+      with_retry(method) do
         request_id = @mutex.synchronize { @request_id += 1 }
         request = build_jsonrpc_request(method, params, request_id)
         begin
