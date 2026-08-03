@@ -96,15 +96,29 @@ def create_task_record(task_id, tool_name, arguments, ttl=None, owner_session_id
     return task
 
 
+def active_session(session_id):
+    """Return the live Session for an id, or None.
+
+    Task operations must fail closed rather than fall back to an anonymous
+    owner: with a None owner every header-less caller matches every other
+    header-less caller's tasks, which is not isolation at all.
+    """
+    if not session_id:
+        return None
+    return sessions.get(session_id)
+
+
 def task_owned_by(task, session_id):
     """Whether a task belongs to the requesting MCP session.
 
     Task IDs are handed to one session, so every task operation must be scoped
     to its owner: otherwise any connected client could poll, read the result
     of, or cancel another session's task by guessing or observing its ID.
-    Tasks created before ownership was recorded have no owner and stay
-    reachable only by a session-less caller.
+    An unidentified caller owns nothing: comparing None to None would make
+    every anonymous caller the owner of every anonymous task.
     """
+    if not session_id or not task.get("_owner_session_id"):
+        return False
     return task.get("_owner_session_id") == session_id
 
 
@@ -260,6 +274,20 @@ def handle_rpc():
         params = request_data.get('params', {})
         request_id = request_data.get('id')
         
+        # Task operations are per-session: reject anything without a live
+        # session before touching tasks_store, so a caller with no (or a
+        # stale) session id cannot reach another caller's tasks.
+        if isinstance(method, str) and method.startswith('tasks/') and not active_session(session_id):
+            response_data = {
+                "jsonrpc": "2.0", "id": request_id,
+                "error": {"code": -32600, "message": "Missing or unknown Mcp-Session-Id for task operation"}
+            }
+            return Response(
+                format_sse_event("message", response_data),
+                content_type='text/event-stream',
+                headers={'Cache-Control': 'no-cache'}
+            )
+
         # Handle different methods
         if method == 'initialize':
             # Create new session
@@ -893,6 +921,17 @@ End of sample data.""".format(datetime.now().isoformat())
                 # Task-augmented request: create a task and return a
                 # CreateTaskResult now; the result comes later via tasks/result.
                 task_aug = params.get('task')
+                if task_aug is not None and not active_session(session_id):
+                    response_data = {
+                        "jsonrpc": "2.0", "id": request_id,
+                        "error": {"code": -32600,
+                                  "message": "Missing or unknown Mcp-Session-Id for task-augmented call"}
+                    }
+                    return Response(
+                        format_sse_event("message", response_data),
+                        content_type='text/event-stream',
+                        headers={'Cache-Control': 'no-cache'}
+                    )
                 if task_aug is not None:
                     task_id = str(uuid.uuid4())
                     ttl = task_aug.get('ttl') if isinstance(task_aug, dict) else None
