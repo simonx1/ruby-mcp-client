@@ -319,14 +319,32 @@ RSpec.describe MCPClient::Auth::OAuthProvider do
         expect(provider).not_to have_received(:fetch_server_metadata)
       end
 
-      it 'allows a loopback http authorization server for development' do
+      it 'rejects a loopback authorization server advertised to a remote server' do
+        # PRM is peer-supplied, so the operator-oriented loopback exception
+        # must not apply: it would point discovery at localhost-only services.
         local_meta = MCPClient::Auth::ResourceMetadata.new(
           resource: 'https://mcp.example.com/mcp', authorization_servers: ['http://localhost:9292']
         )
         allow(provider).to receive(:fetch_resource_metadata).and_return(local_meta)
-        allow(provider).to receive(:fetch_server_metadata).and_return(server_meta(['S256']))
+        allow(provider).to receive(:fetch_server_metadata)
 
-        result = provider.send(:discover_authorization_server)
+        expect { provider.send(:discover_authorization_server) }
+          .to raise_error(MCPClient::Errors::ConnectionError, /HTTPS|loopback or private/)
+        expect(provider).not_to have_received(:fetch_server_metadata)
+      end
+
+      it 'allows a loopback authorization server when the configured server is itself local' do
+        local_provider = described_class.new(
+          server_url: 'http://localhost:9292/mcp', logger: logger,
+          storage: MCPClient::Auth::OAuthProvider::MemoryStorage.new
+        )
+        local_meta = MCPClient::Auth::ResourceMetadata.new(
+          resource: 'http://localhost:9292/mcp', authorization_servers: ['http://localhost:9292']
+        )
+        allow(local_provider).to receive(:fetch_resource_metadata).and_return(local_meta)
+        allow(local_provider).to receive(:fetch_server_metadata).and_return(server_meta(['S256']))
+
+        result = local_provider.send(:discover_authorization_server)
         expect(result.token_endpoint).to eq('https://auth.example.com/token')
       end
 
