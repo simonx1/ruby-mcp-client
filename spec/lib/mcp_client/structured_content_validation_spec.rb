@@ -59,6 +59,49 @@ RSpec.describe MCPClient::SchemaValidator do
       expect(described_class.validate('abcde', schema)).to contain_exactly(a_string_matching(/maxLength/))
     end
 
+    it 'compiles server-supplied patterns with a match timeout' do
+      # The pattern comes from the tool's outputSchema, i.e. from the remote
+      # server: an expensive expression must not be able to pin the CPU
+      # indefinitely.
+      compiled = nil
+      allow(Regexp).to receive(:new).and_wrap_original do |orig, *args, **kwargs|
+        compiled = orig.call(*args, **kwargs)
+      end
+
+      described_class.validate('abc', { 'type' => 'string', 'pattern' => '\\A[a-z]+\\z' })
+
+      expect(compiled.timeout).to be > 0
+      expect(compiled.timeout).to be <= MCPClient::SchemaValidator::PATTERN_MATCH_TIMEOUT
+    end
+
+    it 'reports an error instead of accepting the value when pattern matching times out' do
+      # Real timeout, no stubbing: an ambiguous alternation over a long input
+      # exceeds a tight budget, and the value must NOT be accepted just
+      # because the constraint could not be evaluated.
+      stub_const('MCPClient::SchemaValidator::PATTERN_MATCH_TIMEOUT', 0.001)
+      stub_const('MCPClient::SchemaValidator::MIN_PATTERN_MATCH_TIMEOUT', 0.0005)
+      schema = { 'type' => 'string', 'pattern' => '\\A(a|b|ab)*\\z' }
+
+      expect(described_class.validate("#{'ab' * 20_000}c", schema))
+        .to contain_exactly(a_string_matching(/pattern.*budget/i))
+    end
+
+    it 'bounds TOTAL pattern time across many items, not per match' do
+      # The server controls how many strings it sends as well as the pattern,
+      # so a per-match limit would multiply: N items x limit.
+      stub_const('MCPClient::SchemaValidator::PATTERN_MATCH_TIMEOUT', 0.3)
+      schema = { 'type' => 'array', 'items' => { 'type' => 'string', 'pattern' => '\\A(a|b|ab)*\\z' } }
+      data = Array.new(8) { "#{'ab' * 20_000}c" }
+
+      started = Process.clock_gettime(Process::CLOCK_MONOTONIC)
+      errors = described_class.validate(data, schema)
+      elapsed = Process.clock_gettime(Process::CLOCK_MONOTONIC) - started
+
+      # Without an aggregate budget this would take ~8 x 0.3s.
+      expect(elapsed).to be < 1.5
+      expect(errors).not_to be_empty
+    end
+
     it 'enforces string patterns' do
       schema = { 'type' => 'string', 'pattern' => '\\A[a-z]+\\z' }
       expect(described_class.validate('abc', schema)).to be_empty

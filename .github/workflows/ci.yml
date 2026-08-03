@@ -1,5 +1,10 @@
 name: CI
 
+# Third-party actions are pinned to a full commit SHA rather than a mutable
+# tag. A tag can be repointed at new code by the action's owner (or anyone who
+# compromises that account), and here it would inherit ANTHROPIC_API_KEY,
+# pull-requests: write, and OIDC-minting rights. The trailing comment records
+# the human-readable version the SHA corresponds to; bump both together.
 on:
   push:
     branches: [ main ]
@@ -14,10 +19,10 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-    - uses: actions/checkout@v4
+    - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
 
     - name: Set up Ruby
-      uses: ruby/setup-ruby@v1
+      uses: ruby/setup-ruby@95ef2b042f9d7a56d8268cba8559e2842e2ad01b # v1
       with:
         ruby-version: '4.0.6'
         bundler-cache: true
@@ -36,10 +41,10 @@ jobs:
         ruby-version: ['3.2', '3.3']
 
     steps:
-    - uses: actions/checkout@v4
+    - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
 
     - name: Set up Ruby
-      uses: ruby/setup-ruby@v1
+      uses: ruby/setup-ruby@95ef2b042f9d7a56d8268cba8559e2842e2ad01b # v1
       with:
         ruby-version: ${{ matrix.ruby-version }}
         bundler-cache: true
@@ -58,10 +63,10 @@ jobs:
       pull-requests: write
       id-token: write
     steps:
-    - uses: actions/checkout@v4
+    - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       with:
         fetch-depth: 0
-    - uses: anthropics/claude-code-action@v1
+    - uses: anthropics/claude-code-action@be7b93b1907a4abad570368f3c74b6fe3807510b # v1
       with:
         prompt: |
           REPO: ${{ github.repository }}

@@ -2,10 +2,16 @@
 # frozen_string_literal: true
 
 # MCPClient integration example using the RubyLLM gem (OpenAI provider)
-# MCP server command:
-#  npx @playwright/mcp@latest --port 8931
+# MCP server command (pin the version rather than tracking @latest):
+#  npx @playwright/mcp@0.0.78 --port 8931
+#
+# The model drives the browser unattended: every tool it selects is executed
+# with no approval step, and page content it reads can influence the next
+# call it makes. Point it at a disposable browser profile, never one holding
+# authenticated sessions.
 require 'bundler/setup'
 require_relative '../lib/mcp_client'
+require_relative 'support/example_sandbox'
 require 'ruby_llm'
 require 'json'
 require 'logger'
@@ -17,6 +23,8 @@ abort 'Please set OPENAI_API_KEY' unless api_key
 # Create an MCPClient client using the simplified connect API
 logger = Logger.new($stdout)
 logger.level = Logger::WARN
+
+ExampleSandbox.announce_auto_execution('every browser tool the Playwright MCP server exposes')
 
 # Connect using Streamable HTTP - the /mcp suffix auto-detects the transport
 mcp_client = MCPClient.connect('http://localhost:8931/mcp',

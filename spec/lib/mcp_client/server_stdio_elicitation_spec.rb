@@ -100,7 +100,7 @@ RSpec.describe MCPClient::ServerStdio, 'Elicitation (MCP 2025-06-18)' do
 
       it 'sends error response for internal error' do
         allow(server).to receive(:handle_elicitation_create).and_raise(StandardError, 'Test error')
-        expect(server).to receive(:send_error_response).with(request_id, -32_603, 'Internal error: Test error')
+        expect(server).to receive(:send_error_response).with(request_id, -32_603, 'Internal error')
         server.handle_server_request(message)
       end
     end

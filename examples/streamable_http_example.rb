@@ -30,6 +30,10 @@ abort 'Please set MCP_SERVER_URL (and optionally MCP_BEARER_TOKEN for authentica
 headers = {}
 headers['Authorization'] = "Bearer #{bearer_token}" if bearer_token
 
+# Tracks whether anything failed, so the process exit status reflects it —
+# printing an error while exiting 0 hides failures from CI and scripts.
+example_failed = false
+
 begin
   # Create client using the simplified connect API
   client = MCPClient.connect(server_url,
@@ -51,27 +55,40 @@ begin
     puts "  - #{tool.name}: #{tool.description&.split("\n")&.first || 'No description'}"
   end
 
-  # Example tool call. Prefer a tool that needs no required arguments so the demo
-  # succeeds regardless of which tools the server exposes (e.g. an arbitrary set of
-  # connected Zapier actions); fall back to describing how to call one explicitly.
-  if tools.any?
-    callable = tools.find do |tool|
+  # Example tool call. The server picks which tools exist (for Zapier, an
+  # arbitrary set of connected actions that may send mail, move money, or
+  # change records), so this demo never invokes one on its own initiative:
+  # name the tool you want with MCP_EXAMPLE_TOOL. A zero-argument tool is only
+  # suggested, not called.
+  requested_tool = ENV.fetch('MCP_EXAMPLE_TOOL', nil)
+
+  if tools.empty?
+    puts "\n⚠️  No tools available to call"
+  elsif requested_tool
+    tool = tools.find { |t| t.name == requested_tool }
+    # An explicit request must not end in a success marker when it did not
+    # run: a typo or a stale tool name has to be visible to a human and to
+    # exit-code-driven automation.
+    raise "MCP_EXAMPLE_TOOL=#{requested_tool} is not advertised by this server" unless tool
+
+    required = (tool.schema && (tool.schema['required'] || tool.schema[:required])) || []
+    unless required.empty?
+      raise "MCP_EXAMPLE_TOOL=#{requested_tool} requires arguments #{required.inspect}; " \
+            'this example only performs zero-argument calls'
+    end
+
+    puts "\n🔧 Calling tool requested via MCP_EXAMPLE_TOOL: #{tool.name}"
+    result = client.call_tool(tool.name, {})
+    puts 'Tool result:'
+    puts result.inspect
+  else
+    suggestion = tools.find do |tool|
       required = (tool.schema && (tool.schema['required'] || tool.schema[:required])) || []
       required.empty?
     end
-
-    if callable
-      puts "\n🔧 Calling tool: #{callable.name}"
-      result = client.call_tool(callable.name, {})
-      puts 'Tool result:'
-      puts result.inspect
-    else
-      puts "\nℹ️  Every advertised tool requires arguments, so no zero-arg demo call is possible."
-      puts '   Call one explicitly with its parameters, e.g.:'
-      puts "   client.call_tool('#{tools.first.name}', { ... })"
-    end
-  else
-    puts "\n⚠️  No tools available to call"
+    puts "\nℹ️  No tool was called: this example does not invoke server-advertised tools on its own."
+    puts "   Pick one explicitly, e.g. MCP_EXAMPLE_TOOL='#{(suggestion || tools.first).name}'"
+    puts "   or in code: client.call_tool('#{(suggestion || tools.first).name}', { ... })"
   end
 
   # Test server connectivity
@@ -81,14 +98,18 @@ begin
 
   puts "\n✅ Example completed successfully!"
 rescue MCPClient::Errors::ConnectionError => e
+  example_failed = true
   puts "\n❌ Connection Error: #{e.message}"
   puts 'Make sure your server URL and credentials are correct'
 rescue MCPClient::Errors::TransportError => e
+  example_failed = true
   puts "\n❌ Transport Error: #{e.message}"
   puts 'The server may not be returning valid SSE format'
 rescue MCPClient::Errors::ServerError => e
+  example_failed = true
   puts "\n❌ Server Error: #{e.message}"
 rescue StandardError => e
+  example_failed = true
   puts "\n❌ Unexpected Error: #{e.class}: #{e.message}"
 ensure
   # Clean up connections
@@ -104,3 +125,5 @@ puts '   data: {"jsonrpc":"2.0","id":1,"result":{...}}'
 puts '3. Client parses SSE format and extracts JSON data'
 puts '4. Standard JSON-RPC processing continues normally'
 puts "\nThis allows HTTP semantics with streaming response format!"
+
+exit(1) if example_failed

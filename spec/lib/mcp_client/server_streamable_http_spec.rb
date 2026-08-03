@@ -1323,6 +1323,129 @@ RSpec.describe MCPClient::ServerStreamableHTTP do
     end
   end
 
+  describe 'server-initiated response POST bounding' do
+    let(:budget) { MCPClient::ServerStreamableHTTP::MAX_CONCURRENT_RESPONSE_POSTS }
+
+    it 'releases the slot when the worker thread cannot be created' do
+      # The release lives in the thread's ensure block, so a Thread.new failure
+      # would leak the reservation; eight of those would mute this instance
+      # permanently, surviving reconnects.
+      allow(server).to receive(:start_response_post_thread).and_raise(ThreadError, 'cannot create thread')
+
+      server.send(:post_jsonrpc_response, { 'jsonrpc' => '2.0', 'id' => 1, 'result' => {} })
+
+      expect(server.instance_variable_get(:@response_post_count)).to eq(0)
+    end
+
+    it 'rate-limits saturation warnings and omits the peer-supplied id' do
+      # The peer chooses how often this path is hit, so logging every drop
+      # would swap a thread-exhaustion vector for a log-volume one.
+      server.instance_variable_set(:@response_post_count, budget)
+      logger = server.instance_variable_get(:@logger)
+      warnings = []
+      allow(logger).to receive(:warn) { |msg| warnings << msg }
+
+      20.times { |i| server.send(:post_jsonrpc_response, { 'jsonrpc' => '2.0', 'id' => "peer-#{i}", 'result' => {} }) }
+
+      # 20 drops produce a single warning; the cumulative counter is what
+      # makes the suppressed ones visible in a later one.
+      expect(warnings.size).to eq(1)
+      expect(warnings.first).not_to include('peer-')
+      expect(warnings.first).to match(/dropped so far/)
+      expect(server.instance_variable_get(:@dropped_response_posts)).to eq(20)
+    end
+
+    it 'drops a JSON-RPC response instead of spawning a thread when the budget is exhausted' do
+      # Each server-initiated request costs one blocking HTTP POST in its own
+      # thread; without a bound a peer flooding requests on the events stream
+      # could exhaust host threads.
+      server.instance_variable_set(:@response_post_count, budget)
+
+      expect(Thread).not_to receive(:new)
+      expect(server.instance_variable_get(:@logger)).to receive(:warn).with(/[Dd]ropping/)
+
+      server.send(:post_jsonrpc_response, { 'jsonrpc' => '2.0', 'id' => 9, 'result' => {} })
+    end
+
+    it 'drops a pong instead of spawning a thread when the budget is exhausted' do
+      server.instance_variable_set(:@response_post_count, budget)
+
+      expect(Thread).not_to receive(:new)
+      expect(server.instance_variable_get(:@logger)).to receive(:warn).with(/[Dd]ropping/)
+
+      server.send(:handle_ping_request, 'ping-1')
+    end
+
+    it 'releases the slot once the response POST completes' do
+      stub_request(:post, "#{base_url}#{endpoint}").to_return(status: 200, body: '')
+
+      server.send(:post_jsonrpc_response, { 'jsonrpc' => '2.0', 'id' => 3, 'result' => {} })
+
+      deadline = Time.now + 2
+      sleep 0.05 while server.instance_variable_get(:@response_post_count).positive? && Time.now < deadline
+      expect(server.instance_variable_get(:@response_post_count)).to eq(0)
+    end
+  end
+
+  describe '#process_event_chunk buffer cap' do
+    it 'raises and drops the buffer when an unterminated event exceeds the cap' do
+      stub_const('MCPClient::ServerStreamableHTTP::MAX_SSE_BUFFER_BYTES', 1024)
+
+      # A peer that withholds the blank-line terminator must not be able to
+      # grow the events-stream buffer without bound.
+      expect do
+        server.send(:process_event_chunk, "event: message\ndata: #{'a' * 2048}")
+      end.to raise_error(MCPClient::Errors::ConnectionError, /buffer/i)
+
+      expect(server.instance_variable_get(:@buffer)).to eq('')
+    end
+
+    it 'accepts complete events even when a single chunk exceeds the cap' do
+      stub_const('MCPClient::ServerStreamableHTTP::MAX_SSE_BUFFER_BYTES', 1024)
+
+      # The cap bounds UNPROCESSED bytes, not chunk size: terminated events
+      # inside an oversized chunk are extracted before the check.
+      chunk = "event: message\ndata: #{'a' * 2048}\n\n"
+      expect(server).to receive(:parse_and_handle_event).once
+
+      expect { server.send(:process_event_chunk, chunk) }.not_to raise_error
+      expect(server.instance_variable_get(:@buffer)).to eq('')
+    end
+  end
+
+  describe 'SSE buffering cost' do
+    it 'stays fast when an unterminated event arrives in many small chunks' do
+      # Capping retained bytes does not help if reaching the cap costs O(N^2)
+      # copying and rescanning.
+      chunk = 'a' * 16_384
+      started = Process.clock_gettime(Process::CLOCK_MONOTONIC)
+      512.times { server.send(:process_event_chunk, chunk.dup) }
+      elapsed = Process.clock_gettime(Process::CLOCK_MONOTONIC) - started
+
+      expect(elapsed).to be < 1.0
+      expect(server.instance_variable_get(:@buffer).bytesize).to eq(512 * 16_384)
+    end
+
+    it 'finds a terminator split across two chunks' do
+      expect(server).to receive(:parse_and_handle_event).once
+      server.send(:process_event_chunk, "event: message\r\ndata: x\r")
+      server.send(:process_event_chunk, "\n\r\n")
+    end
+
+    it 'scans the resumption buffer incrementally too' do
+      state = { cursor: 'evt-1', retry_ms: nil }
+      buffer = +''
+      started = Process.clock_gettime(Process::CLOCK_MONOTONIC)
+      512.times do
+        buffer << ('a' * 16_384)
+        server.send(:process_resumption_buffer, buffer, state)
+      end
+      elapsed = Process.clock_gettime(Process::CLOCK_MONOTONIC) - started
+
+      expect(elapsed).to be < 1.0
+    end
+  end
+
   describe 'security validation' do
     # Session ID and URL validation tests are shared with HTTP transport
     # through the HttpTransportBase module, so we just verify they work here
