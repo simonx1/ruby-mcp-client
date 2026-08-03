@@ -201,7 +201,7 @@ second_input = {
     function_declarations: google_tools
   },
   contents: [
-    { role: 'user', parts: { text: 'List all files in the sandbox directory' } },
+    { role: 'user', parts: { text: 'List all files in the directory path "./"' } },
     candidate['content'], # the assistant message containing the functionCall
     { role: 'function', parts: [function_response_part] }
   ],

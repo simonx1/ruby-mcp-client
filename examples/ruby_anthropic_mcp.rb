@@ -49,7 +49,7 @@ claude_tools = mcp_client.to_anthropic_tools
 
 # Build initial chat messages
 messages = [
-  { role: 'user', content: 'List all files in the sandbox directory' }
+  { role: 'user', content: 'List all files in the directory path "./"' }
 ]
 
 # Faraday raises on HTTP errors with only the status in the message; surface
