@@ -576,14 +576,17 @@ module MCPClient
     end
 
     # Get the current state of a task (tasks/get, MCP 2025-11-25)
-    # @param task_id [String] the ID of the task to query
+    # @param task_id [String, MCPClient::Task] the task to query; passing the
+    #   Task handle returned by #call_tool_as_task routes to its own server
     # @param server [Integer, String, Symbol, MCPClient::ServerBase, nil] server selector
     # @return [MCPClient::Task] the task with current status
+    # @raise [ArgumentError] if the server is ambiguous in a multi-server client
     # @raise [MCPClient::Errors::ServerNotFound] if no server is available
     # @raise [MCPClient::Errors::TaskNotFound] if the task does not exist
     # @raise [MCPClient::Errors::TaskError] if retrieving the task fails
     def get_task(task_id, server: nil)
-      srv = select_server(server)
+      srv = select_task_server(task_id, server, 'get_task')
+      task_id = task_identifier(task_id)
 
       begin
         result = srv.rpc_request('tasks/get', { taskId: task_id })
@@ -605,13 +608,16 @@ module MCPClient
     # identify which tool (and therefore which outputSchema) produced the
     # result, and the client keeps no task-to-tool registry. Callers who need
     # validation here can run MCPClient::SchemaValidator.validate themselves.
-    # @param task_id [String] the ID of the task
+    # @param task_id [String, MCPClient::Task] the task; passing the Task
+    #   handle returned by #call_tool_as_task routes to its own server
     # @param server [Integer, String, Symbol, MCPClient::ServerBase, nil] server selector
     # @return [Object] the underlying task result
+    # @raise [ArgumentError] if the server is ambiguous in a multi-server client
     # @raise [MCPClient::Errors::TaskNotFound] if the task does not exist
     # @raise [MCPClient::Errors::TaskError] if retrieval fails
     def get_task_result(task_id, server: nil)
-      srv = select_server(server)
+      srv = select_task_server(task_id, server, 'get_task_result')
+      task_id = task_identifier(task_id)
 
       begin
         srv.rpc_request('tasks/result', { taskId: task_id })
@@ -643,14 +649,17 @@ module MCPClient
     end
 
     # Cancel a task (tasks/cancel, MCP 2025-11-25)
-    # @param task_id [String] the ID of the task to cancel
+    # @param task_id [String, MCPClient::Task] the task to cancel; passing the
+    #   Task handle returned by #call_tool_as_task routes to its own server
     # @param server [Integer, String, Symbol, MCPClient::ServerBase, nil] server selector
     # @return [MCPClient::Task] the task with updated (cancelled) status
+    # @raise [ArgumentError] if the server is ambiguous in a multi-server client
     # @raise [MCPClient::Errors::ServerNotFound] if no server is available
     # @raise [MCPClient::Errors::TaskNotFound] if the task does not exist
     # @raise [MCPClient::Errors::TaskError] if cancellation fails (including cancelling a terminal task)
     def cancel_task(task_id, server: nil)
-      srv = select_server(server)
+      srv = select_task_server(task_id, server, 'cancel_task')
+      task_id = task_identifier(task_id)
       ensure_task_capability!(srv, 'cancel')
 
       begin
@@ -886,6 +895,40 @@ module MCPClient
         redacted = value.is_a?(Hash) ? value.transform_values { REDACTED } : REDACTED
         [key, redacted]
       end
+    end
+
+    # Resolve which server a task operation targets.
+    #
+    # Task IDs are only unique within the server that issued them, so silently
+    # defaulting to the first configured server can poll, read or cancel an
+    # unrelated task on the wrong server. Resolution order:
+    #   1. an explicit server: argument wins;
+    #   2. a Task handle carries the server that issued it;
+    #   3. a bare ID with exactly one configured server is unambiguous;
+    #   4. anything else is ambiguous and fails closed.
+    # @param task [String, MCPClient::Task] the task or its ID
+    # @param server_arg [Integer, String, Symbol, MCPClient::ServerBase, nil] explicit selector
+    # @param operation [String] calling method name, for the error message
+    # @return [MCPClient::ServerBase]
+    # @raise [ArgumentError] when the target server cannot be determined
+    def select_task_server(task, server_arg, operation)
+      # nil, not falsiness: `server: false` is an invalid selector that
+      # select_server rejects with ArgumentError, and treating it as "omitted"
+      # would silently route a read or a cancel somewhere instead of failing.
+      return select_server(server_arg) unless server_arg.nil?
+      return task.server if task.is_a?(MCPClient::Task) && task.server
+      return select_server(nil) if @servers.size <= 1
+
+      raise ArgumentError,
+            "#{operation} is ambiguous with multiple servers configured: task IDs are only unique per server. " \
+            'Pass the Task returned by call_tool_as_task, or name the server explicitly ' \
+            "(e.g. #{operation}(id, server: 'name'))."
+    end
+
+    # @param task [String, MCPClient::Task] a task or its ID
+    # @return [String] the task ID
+    def task_identifier(task)
+      task.is_a?(MCPClient::Task) ? task.task_id : task
     end
 
     # Select a server based on index, name, type, or instance
