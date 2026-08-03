@@ -7,6 +7,8 @@
 require 'bundler/setup'
 require_relative '../lib/mcp_client'
 require 'logger'
+require 'fileutils'
+require 'json'
 
 # Create an MCPClient client (stdio stub for demo)
 logger = Logger.new($stdout)
@@ -152,8 +154,34 @@ class FileTokenStorage
     {}
   end
 
+  # Access tokens, refresh tokens and client secrets end up in this file, so
+  # it must never be readable by other local users.
+  #
+  # Written as a fresh 0600 temp file in the same directory and renamed over
+  # the destination. Writing in place would be wrong on the upgrade path that
+  # matters most: a file an earlier version created as 0644 keeps that mode
+  # through open/truncate/write, so refreshed credentials would sit
+  # world-readable until the chmod lands — and stay that way if the process
+  # dies in between. rename(2) is atomic within a directory, so readers see
+  # either the old file or the new one, always at 0600.
+  #
+  # This is the minimum for a local demo. Production storage should keep
+  # credentials in an OS keychain or a secrets manager, or encrypt them at
+  # rest, rather than in a plaintext file.
   def save_data
-    File.write(@filename, JSON.pretty_generate(@data))
+    dir = File.dirname(File.expand_path(@filename))
+    temp = File.join(dir, ".#{File.basename(@filename)}.#{Process.pid}.tmp")
+    begin
+      File.open(temp, File::WRONLY | File::CREAT | File::EXCL, 0o600) do |f|
+        f.write(JSON.pretty_generate(@data))
+        f.flush
+        f.fsync
+      end
+      File.rename(temp, @filename)
+    rescue StandardError
+      FileUtils.rm_f(temp)
+      raise
+    end
   end
 end
 

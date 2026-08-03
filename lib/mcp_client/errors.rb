@@ -77,6 +77,14 @@ module MCPClient
     # sender SHOULD cancel and stop waiting, not re-send).
     class RequestTimeoutError < TransportError; end
 
+    # Raised when a response body exceeded the configured size limit (e.g. a
+    # gzip payload that expands past the decompression ceiling). A subclass of
+    # TransportError so existing rescues keep working, but deliberately
+    # excluded from automatic retries: the server already received and
+    # processed the request, so re-sending it could run a non-idempotent
+    # operation again — and would decompress the oversized body each time.
+    class ResponseTooLargeError < TransportError; end
+
     # Raised when tool parameters fail validation against the tool's input
     # schema, or (in strict mode) when a tool result's structuredContent fails
     # validation against the tool's output schema

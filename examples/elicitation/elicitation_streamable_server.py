@@ -679,8 +679,11 @@ def handle_sse_stream():
 
     def generate_sse_events():
         try:
-            # Send endpoint as first event (just the path string)
-            yield "event: endpoint\ndata: /sse\n\n"
+            # Send endpoint as first event. The session id travels in the
+            # endpoint URI so every POST identifies its own session; without
+            # it the POST handler would have to guess which stream a request
+            # belongs to. Same-origin relative URI, per MCP 2024-11-05.
+            yield f"event: endpoint\ndata: /sse?sessionId={session_id}\n\n"
 
             # Stream events from the queue (client will send initialize via
             # POST)
@@ -720,29 +723,38 @@ def handle_sse_rpc():
     try:
         data = request.get_json()
 
-        # Get session ID from header (sent by SSE client after opening stream)
-        session_id = request.headers.get('Mcp-Session-Id')
+        # Identify the session explicitly: the Mcp-Session-Id header, or the
+        # sessionId carried by the endpoint URI we advertised on the stream.
+        #
+        # There is deliberately NO "use the first active session" fallback.
+        # With several clients connected that silently bound one client's
+        # POSTs — including elicitation responses holding whatever the user
+        # typed — to another client's session, and queued the replies onto
+        # that other client's SSE stream.
+        session_id = request.headers.get('Mcp-Session-Id') or request.args.get('sessionId')
 
-        if session_id and session_id in sessions:
-            session = sessions[session_id]
-            logger.debug(f"Using existing session: {session_id}")
-        else:
-            # Fallback: find first active session or create new one
-            session = None
-            if sessions:
-                for sid, sess in sessions.items():
-                    if sess.active:
-                        session = sess
-                        session_id = sid
-                        logger.debug(f"Found active session: {session_id}")
-                        break
+        if not session_id:
+            logger.warning("Rejecting SSE POST with no session id")
+            return jsonify({
+                'jsonrpc': '2.0',
+                'id': (request.get_json(silent=True) or {}).get('id'),
+                'error': {
+                    'code': -32600,
+                    'message': 'Missing session id: POST to the endpoint URI advertised '
+                               'on the SSE stream, or send the Mcp-Session-Id header'
+                }
+            }), 400
 
-            if not session:
-                # Create new session if none exists
-                session_id = str(uuid.uuid4())
-                session = Session(session_id)
-                sessions[session_id] = session
-                logger.info(f"Created new session for SSE RPC: {session_id}")
+        session = sessions.get(session_id)
+        if not session or not session.active:
+            logger.warning(f"Rejecting SSE POST for unknown session: {session_id}")
+            return jsonify({
+                'jsonrpc': '2.0',
+                'id': (request.get_json(silent=True) or {}).get('id'),
+                'error': {'code': -32600, 'message': f'Unknown session: {session_id}'}
+            }), 404
+
+        logger.debug(f"Using session: {session_id}")
 
         # Handle the JSON-RPC request or notification
         method = data.get('method')

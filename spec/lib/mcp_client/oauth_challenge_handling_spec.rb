@@ -85,6 +85,99 @@ RSpec.describe 'OAuth challenge handling (MCP 2025-11-25)' do
       expect(provider.challenge_scope).to eq('mcp:tools mcp:resources')
     end
 
+    it 'rejects a non-HTTPS resource_metadata challenge URL without fetching it' do
+      # The challenge header is peer-controlled input: fetching an arbitrary
+      # http:// URL from it would let the server pivot this host into GET
+      # requests against internal services (SSRF). No stub is registered, so
+      # any attempted fetch would fail the test via WebMock.
+      response = instance_double(
+        Faraday::Response,
+        headers: {
+          'WWW-Authenticate' =>
+            'Bearer resource_metadata="http://169.254.169.254/latest/meta-data"'
+        }
+      )
+
+      expect { provider.handle_unauthorized_response(response) }
+        .to raise_error(MCPClient::Errors::ConnectionError, /must use HTTPS/)
+      expect(provider.instance_variable_get(:@challenge_metadata_url)).to be_nil
+    end
+
+    it 'rejects a loopback challenge URL when the configured server is remote' do
+      # The dev loopback exception exists for URLs the OPERATOR configured.
+      # Honoring it for peer-supplied input would leave the SSRF intact
+      # against the most sensitive targets of all: localhost-only services.
+      response = instance_double(
+        Faraday::Response,
+        headers: {
+          'WWW-Authenticate' =>
+            'Bearer resource_metadata="http://127.0.0.1:9292/.well-known/oauth-protected-resource"'
+        }
+      )
+
+      expect { provider.handle_unauthorized_response(response) }
+        .to raise_error(MCPClient::Errors::ConnectionError, /HTTPS|loopback or private/)
+    end
+
+    it 'rejects an https challenge URL pointing at a private address' do
+      response = instance_double(
+        Faraday::Response,
+        headers: { 'WWW-Authenticate' => 'Bearer resource_metadata="https://10.0.0.5/meta"' }
+      )
+
+      expect { provider.handle_unauthorized_response(response) }
+        .to raise_error(MCPClient::Errors::ConnectionError, /loopback or private/)
+    end
+
+    it 'still allows a loopback challenge URL when the configured server is itself local' do
+      local = described_class.new(server_url: 'http://localhost:9292/mcp')
+      stub_request(:get, 'http://localhost:9292/.well-known/oauth-protected-resource')
+        .to_return(
+          status: 200,
+          headers: { 'Content-Type' => 'application/json' },
+          body: { resource: 'http://localhost:9292/mcp',
+                  authorization_servers: ['https://auth.example.com'] }.to_json
+        )
+
+      response = instance_double(
+        Faraday::Response,
+        headers: {
+          'WWW-Authenticate' =>
+            'Bearer resource_metadata="http://localhost:9292/.well-known/oauth-protected-resource"'
+        }
+      )
+
+      expect { local.handle_unauthorized_response(response) }.not_to raise_error
+    end
+
+    it 'does not retain challenge scope from a rejected challenge' do
+      # Half-applied challenge state would let a refused challenge still
+      # influence the next authorization attempt.
+      response = instance_double(
+        Faraday::Response,
+        headers: {
+          'WWW-Authenticate' =>
+            'Bearer resource_metadata="http://169.254.169.254/meta", scope="admin"'
+        }
+      )
+
+      expect { provider.handle_unauthorized_response(response) }
+        .to raise_error(MCPClient::Errors::ConnectionError)
+      expect(provider.challenge_scope).to be_nil
+    end
+
+    it 'fails closed on later discovery instead of reusing cached metadata' do
+      response = instance_double(
+        Faraday::Response,
+        headers: { 'WWW-Authenticate' => 'Bearer resource_metadata="http://127.0.0.1/meta"' }
+      )
+      expect { provider.handle_unauthorized_response(response) }
+        .to raise_error(MCPClient::Errors::ConnectionError)
+
+      expect { provider.send(:discover_authorization_server) }
+        .to raise_error(MCPClient::Errors::ConnectionError, /loopback or private|HTTPS/)
+    end
+
     it 'captures the challenge scope even without a resource_metadata parameter' do
       response = instance_double(
         Faraday::Response,

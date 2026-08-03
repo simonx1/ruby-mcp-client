@@ -335,7 +335,10 @@ RSpec.describe 'Sampling tool use (MCP 2025-11-25, SEP-1577)' do
                            })
 
       expect(result['error']['code']).to eq(-32_603)
-      expect(result['error']['message']).to include('boom')
+      # The handler's exception message is host-internal and must not be
+      # reflected to the untrusted server; it stays in the local log.
+      expect(result['error']['message']).not_to include('boom')
+      expect(result['error']['message']).to eq('Sampling error')
     end
 
     it 'reports the no-handler fallback as -32601 (method not found), not -1' do
