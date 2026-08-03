@@ -33,6 +33,18 @@ module MCPClient
     SSE_MAX_RECONNECT_DELAY = 30   # Maximum reconnect delay in seconds
     THREAD_JOIN_TIMEOUT = 5 # Timeout for thread cleanup
 
+    # Ceiling on concurrent threads POSTing server-initiated responses
+    # (pongs, roots/sampling/elicitation replies, error responses). Each
+    # server request on the events stream costs one blocking HTTP POST in
+    # its own thread; without a bound, a peer flooding requests could
+    # accumulate threads and connections until the host is exhausted.
+    # Responses beyond the budget are dropped, with saturation logged at most
+    # once per SATURATION_LOG_INTERVAL seconds.
+    MAX_CONCURRENT_RESPONSE_POSTS = 8
+
+    # Minimum gap between "response budget saturated" warnings
+    SATURATION_LOG_INTERVAL = 5
+
     # Floor for server-supplied retry directives on the long-lived events
     # stream. The directive is peer-controlled: honoring "retry: 0" literally
     # would let a hostile server that closes every stream drive a tight
@@ -129,6 +141,10 @@ module MCPClient
       @last_event_id = nil
       @sse_retry_ms = nil
       @pending_stream_responses = {}
+      @response_post_count = 0
+      # Saturation bookkeeping for the response-POST budget
+      @dropped_response_posts = 0
+      @last_saturation_log_at = nil
       @oauth_provider = opts[:oauth_provider]
 
       # SSE events connection state
@@ -1071,26 +1087,9 @@ module MCPClient
         result: {}
       }
 
-      # Send pong response in a separate thread to avoid blocking event processing
-      Thread.new do
-        conn = http_connection
-        response = conn.post(@endpoint) do |req|
-          @headers.each { |k, v| req.headers[k] = v }
-          req.headers['Mcp-Session-Id'] = @session_id if @session_id
-          req.headers['Mcp-Protocol-Version'] = @protocol_version if @protocol_version
-          # MCP: authorization MUST be included in every HTTP request
-          @oauth_provider&.apply_authorization(req)
-          req.body = pong_response.to_json
-        end
-
-        if response.success?
-          @logger.debug("Sent pong response for ping ID: #{ping_id}") if @logger.level <= Logger::DEBUG
-        else
-          @logger.warn("Failed to send pong response: HTTP #{response.status}")
-        end
-      rescue StandardError => e
-        @logger.error("Failed to send pong response: #{e.message}")
-      end
+      # Pongs go through the same bounded response path as every other
+      # server-initiated reply, so a ping flood cannot fan out threads.
+      post_jsonrpc_response(pong_response)
     end
 
     # Handle incoming JSON-RPC request from server (MCP 2025-06-18)
@@ -1270,7 +1269,31 @@ module MCPClient
     # @return [void]
     # @private
     def post_jsonrpc_response(response)
-      # Send response in a separate thread to avoid blocking event processing
+      # Send the response in a separate thread to avoid blocking event
+      # processing, but never beyond the concurrency budget: server requests
+      # arrive at the peer's rate, and each unanswered POST would otherwise
+      # pin one thread and one connection.
+      unless acquire_response_post_slot
+        log_response_post_saturation
+        return
+      end
+
+      begin
+        start_response_post_thread(response)
+      rescue ThreadError => e
+        # Thread.new failed, so the ensure inside the block never runs and the
+        # reservation would leak. Eight such failures would silently mute this
+        # instance's replies for the rest of its life, including after
+        # reconnect (cleanup does not reset the counter).
+        release_response_post_slot
+        @logger.error("Failed to start response POST thread: #{e.message}")
+      end
+    end
+
+    # Spawn the worker that POSTs one server-initiated response.
+    # @param response [Hash] the JSON-RPC response
+    # @return [Thread]
+    def start_response_post_thread(response)
       Thread.new do
         conn = http_connection
         json_body = JSON.generate(response)
@@ -1291,7 +1314,49 @@ module MCPClient
         end
       rescue StandardError => e
         @logger.error("Failed to send JSON-RPC response: #{e.message}")
+      ensure
+        release_response_post_slot
       end
+    end
+
+    # Warn that the response-POST budget is saturated, at most once per
+    # SATURATION_LOG_INTERVAL.
+    #
+    # The peer controls how often this path is reached, so logging every
+    # rejection (at WARN, which the default logger emits) would just trade a
+    # thread-exhaustion vector for a log-volume one. The peer-supplied request
+    # id is deliberately omitted for the same reason.
+    # @return [void]
+    def log_response_post_saturation
+      now = Process.clock_gettime(Process::CLOCK_MONOTONIC)
+      dropped = @mutex.synchronize do
+        @dropped_response_posts += 1
+        next nil if @last_saturation_log_at && now - @last_saturation_log_at < SATURATION_LOG_INTERVAL
+
+        @last_saturation_log_at = now
+        @dropped_response_posts
+      end
+      return unless dropped
+
+      @logger.warn("Dropping server-initiated responses: #{MAX_CONCURRENT_RESPONSE_POSTS} " \
+                   "response POSTs already in flight (#{dropped} dropped so far)")
+    end
+
+    # Reserve one slot of the response-POST concurrency budget.
+    # @return [Boolean] whether a slot was available
+    def acquire_response_post_slot
+      @mutex.synchronize do
+        return false if @response_post_count >= MAX_CONCURRENT_RESPONSE_POSTS
+
+        @response_post_count += 1
+        true
+      end
+    end
+
+    # Release a slot reserved by acquire_response_post_slot.
+    # @return [void]
+    def release_response_post_slot
+      @mutex.synchronize { @response_post_count -= 1 }
     end
   end
 end
