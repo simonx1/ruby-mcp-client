@@ -33,6 +33,13 @@ module MCPClient
     SSE_MAX_RECONNECT_DELAY = 30   # Maximum reconnect delay in seconds
     THREAD_JOIN_TIMEOUT = 5 # Timeout for thread cleanup
 
+    # Maximum bytes an SSE parse buffer (events stream or resumption GET) may
+    # hold while waiting for an event terminator. The stream is
+    # peer-controlled: without a cap, a hostile server could withhold the
+    # blank-line delimiter forever and grow the buffer until the host runs
+    # out of memory. Generous enough for any legitimate JSON-RPC event.
+    MAX_SSE_BUFFER_BYTES = 32 * 1024 * 1024
+
     # @!attribute [r] base_url
     #   @return [String] The base URL of the MCP server
     # @!attribute [r] endpoint
@@ -119,7 +126,9 @@ module MCPClient
       # SSE events connection state
       @events_connection = nil
       @events_thread = nil
-      @buffer = '' # Buffer for partial SSE event data
+      @buffer = +'' # Buffer for partial SSE event data
+      # How much of @buffer has already been searched for an event terminator
+      @buffer_scanned = 0
       @elicitation_request_callback = nil # MCP 2025-06-18
       @roots_list_request_callback = nil # MCP 2025-06-18
       @sampling_request_callback = nil # MCP 2025-11-25
@@ -493,7 +502,8 @@ module MCPClient
         @prompts_data = nil
         @resources = nil
         @resources_data = nil
-        @buffer = ''
+        @buffer = +''
+        @buffer_scanned = 0
 
         @logger.info('Cleanup completed')
       end
@@ -816,6 +826,10 @@ module MCPClient
         req.options.on_data = proc do |chunk, _bytes|
           buffer << chunk
           process_resumption_buffer(buffer, state)
+          # A peer replaying delimiter-free data must not grow this buffer
+          # without bound: abort the GET (rescued below); the deadline-bounded
+          # resumption loop decides whether to retry with a fresh buffer.
+          enforce_sse_buffer_cap!(buffer)
         end
       end
     rescue StandardError => e
@@ -828,10 +842,16 @@ module MCPClient
     # @param state [Hash] mutable resumption state (:cursor, :retry_ms)
     # @return [void]
     def process_resumption_buffer(buffer, state)
-      while (separator = buffer.match(/\r\n\r\n|\n\n/))
+      # Same incremental scan as the events stream: without a cursor every
+      # chunk re-matched the whole accumulated buffer from byte zero.
+      scan_from = [state[:scanned].to_i - 3, 0].max
+      while (separator = buffer.match(/\r\n\r\n|\n\n/, scan_from))
         event_text = buffer.slice!(0, separator.end(0))
         handle_resumption_event(event_text, state)
+        scan_from = 0
+        state[:scanned] = 0
       end
+      state[:scanned] = buffer.length
     end
 
     # Parse one SSE event received on a resumption stream: track `id:` lines
@@ -891,17 +911,57 @@ module MCPClient
       @logger.debug("Processing event chunk: #{chunk.inspect}") if @logger.level <= Logger::DEBUG
 
       @mutex.synchronize do
-        @buffer += chunk
+        # Append in place and scan only the newly arrived bytes. `+= chunk`
+        # reallocated and copied the whole buffer per callback, and each
+        # search restarted at index 0, so an unterminated event delivered in
+        # N chunks cost O(N^2) work: capped memory, uncapped CPU.
+        @buffer << chunk
 
-        # Extract complete events (SSE format: events end with double newline)
-        while (event_end = @buffer.index("\n\n") || @buffer.index("\r\n\r\n"))
+        scan_from = [@buffer_scanned - 3, 0].max
+        while (event_end = next_buffer_event_end(scan_from))
           event_data = extract_event(event_end)
           parse_and_handle_event(event_data)
+          scan_from = 0
+          @buffer_scanned = 0
+        end
+        @buffer_scanned = @buffer.length
+
+        # Everything left is a partial event awaiting its terminator; cap how
+        # much a peer may accumulate. The raise propagates (unlike processing
+        # errors below) so the events loop drops this connection and its
+        # backoff takes over — memory stays bounded either way.
+        begin
+          enforce_sse_buffer_cap!(@buffer)
+        rescue MCPClient::Errors::ConnectionError
+          @buffer = +''
+          @buffer_scanned = 0
+          raise
         end
       end
+    rescue MCPClient::Errors::ConnectionError
+      raise
     rescue StandardError => e
       @logger.error("Error processing event chunk: #{e.message}")
       @logger.debug(e.backtrace.join("\n")) if @logger.level <= Logger::DEBUG
+    end
+
+    # Index of the earliest event terminator at or after an offset.
+    # @param offset [Integer] character offset to start searching from
+    # @return [Integer, nil] index of the terminator, or nil if none yet
+    def next_buffer_event_end(offset)
+      lf = @buffer.index("\n\n", offset)
+      crlf = @buffer.index("\r\n\r\n", offset)
+      [lf, crlf].compact.min
+    end
+
+    # @param buffer [String] a partial-event SSE buffer
+    # @raise [MCPClient::Errors::ConnectionError] when the buffer exceeds MAX_SSE_BUFFER_BYTES
+    def enforce_sse_buffer_cap!(buffer)
+      return if buffer.bytesize <= MAX_SSE_BUFFER_BYTES
+
+      raise MCPClient::Errors::ConnectionError,
+            "SSE event exceeded the maximum buffered size (#{MAX_SSE_BUFFER_BYTES} bytes) " \
+            'without a terminator'
     end
 
     # Extract a single event from the buffer
