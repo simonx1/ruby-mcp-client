@@ -33,6 +33,14 @@ module MCPClient
     SSE_MAX_RECONNECT_DELAY = 30   # Maximum reconnect delay in seconds
     THREAD_JOIN_TIMEOUT = 5 # Timeout for thread cleanup
 
+    # Floor for server-supplied retry directives on the long-lived events
+    # stream. The directive is peer-controlled: honoring "retry: 0" literally
+    # would let a hostile server that closes every stream drive a tight
+    # reconnect loop (sustained CPU/TLS/connection churn). Waiting longer
+    # than the directive stays SEP-1699 compliant — the retry field is a
+    # lower bound on the reconnect delay, not an exact schedule.
+    MIN_EVENTS_RECONNECT_DELAY = 0.1
+
     # Maximum bytes an SSE parse buffer (events stream or resumption GET) may
     # hold while waiting for an event terminator. The stream is
     # peer-controlled: without a cap, a hostile server could withhold the
@@ -746,12 +754,17 @@ module MCPClient
     end
 
     # Reconnect delay for the events stream: the server's SSE retry directive
-    # (in ms) when present, otherwise the caller's backoff value.
+    # (in ms) when present, otherwise the caller's backoff value. The
+    # peer-controlled directive is floored at MIN_EVENTS_RECONNECT_DELAY so a
+    # zero/near-zero value cannot drive a tight reconnect loop; the
+    # deadline-bounded resumption loop intentionally keeps honoring zero.
     # @param fallback_seconds [Numeric] exponential-backoff fallback
     # @return [Numeric] delay in seconds
     def events_reconnect_delay(fallback_seconds)
       retry_ms = @sse_retry_ms
-      retry_ms ? retry_ms / 1000.0 : fallback_seconds
+      return fallback_seconds unless retry_ms
+
+      [retry_ms / 1000.0, MIN_EVENTS_RECONNECT_DELAY].max
     end
 
     # Wait for a response replayed after the POST stream was closed before
