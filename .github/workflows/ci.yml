@@ -12,6 +12,28 @@ on:
     branches: [ main ]
 
 jobs:
+  # Primary suite: the project's default Ruby. Keep this in sync with
+  # .ruby-version, which is what local version managers read.
+  test-ruby-4:
+    name: Test (Ruby 4.0.6, default)
+    runs-on: ubuntu-latest
+
+    steps:
+    - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+
+    - name: Set up Ruby
+      uses: ruby/setup-ruby@95ef2b042f9d7a56d8268cba8559e2842e2ad01b # v1
+      with:
+        ruby-version: '4.0.6'
+        bundler-cache: true
+
+    - name: Run RuboCop
+      run: bundle exec rubocop
+
+    - name: Run RSpec tests
+      run: bundle exec rspec
+
+  # Compatibility floor: the oldest Rubies the gemspec still supports (>= 3.2.0).
   test:
     runs-on: ubuntu-latest
     strategy:

@@ -143,12 +143,16 @@ RSpec.describe 'Logging (MCP 2025-06-18)' do
       end
 
       it 'handles non-string data' do
+        payload = { 'key' => 'value' }
         client.send(:handle_log_message, 'server1', {
                       'level' => 'info',
-                      'data' => { 'key' => 'value' }
+                      'data' => payload
                     })
 
-        expect(test_logger).to have_received(:info).with('[server1] {"key"=>"value"}')
+        # Compare against #inspect rather than a literal: Ruby 3.4 changed
+        # Hash#inspect from {"key"=>"value"} to {"key" => "value"}, and the
+        # client just forwards whatever #inspect produces.
+        expect(test_logger).to have_received(:info).with("[server1] #{payload.inspect}")
       end
 
       it 'defaults to info level when level not specified' do
