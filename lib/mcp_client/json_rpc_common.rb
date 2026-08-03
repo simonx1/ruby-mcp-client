@@ -38,7 +38,11 @@ module MCPClient
              Errno::ETIMEDOUT, Errno::ECONNRESET, Errno::EPIPE => e
         # A timed-out request may still be executing server-side; re-sending
         # it could run a non-idempotent operation twice. Never retry those.
+        # An oversized response is the same story from the other direction:
+        # the server already ran the request, so a re-send risks a duplicate
+        # side effect (and re-does the oversized decode).
         raise if e.is_a?(MCPClient::Errors::RequestTimeoutError)
+        raise if e.is_a?(MCPClient::Errors::ResponseTooLargeError)
 
         if NON_IDEMPOTENT_METHODS.include?(method)
           @logger.debug("Not retrying non-idempotent #{method} after error: #{e.message}")
