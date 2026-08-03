@@ -1387,6 +1387,65 @@ RSpec.describe MCPClient::ServerStreamableHTTP do
     end
   end
 
+  describe '#process_event_chunk buffer cap' do
+    it 'raises and drops the buffer when an unterminated event exceeds the cap' do
+      stub_const('MCPClient::ServerStreamableHTTP::MAX_SSE_BUFFER_BYTES', 1024)
+
+      # A peer that withholds the blank-line terminator must not be able to
+      # grow the events-stream buffer without bound.
+      expect do
+        server.send(:process_event_chunk, "event: message\ndata: #{'a' * 2048}")
+      end.to raise_error(MCPClient::Errors::ConnectionError, /buffer/i)
+
+      expect(server.instance_variable_get(:@buffer)).to eq('')
+    end
+
+    it 'accepts complete events even when a single chunk exceeds the cap' do
+      stub_const('MCPClient::ServerStreamableHTTP::MAX_SSE_BUFFER_BYTES', 1024)
+
+      # The cap bounds UNPROCESSED bytes, not chunk size: terminated events
+      # inside an oversized chunk are extracted before the check.
+      chunk = "event: message\ndata: #{'a' * 2048}\n\n"
+      expect(server).to receive(:parse_and_handle_event).once
+
+      expect { server.send(:process_event_chunk, chunk) }.not_to raise_error
+      expect(server.instance_variable_get(:@buffer)).to eq('')
+    end
+  end
+
+  describe 'SSE buffering cost' do
+    it 'stays fast when an unterminated event arrives in many small chunks' do
+      # Capping retained bytes does not help if reaching the cap costs O(N^2)
+      # copying and rescanning.
+      chunk = 'a' * 16_384
+      started = Process.clock_gettime(Process::CLOCK_MONOTONIC)
+      512.times { server.send(:process_event_chunk, chunk.dup) }
+      elapsed = Process.clock_gettime(Process::CLOCK_MONOTONIC) - started
+
+      expect(elapsed).to be < 1.0
+      expect(server.instance_variable_get(:@buffer).bytesize).to eq(512 * 16_384)
+    end
+
+    it 'finds a terminator split across two chunks' do
+      expect(server).to receive(:parse_and_handle_event).once
+      server.send(:process_event_chunk, "event: message\r\ndata: x\r")
+      server.send(:process_event_chunk, "\n\r\n")
+    end
+
+    it 'scans the resumption buffer incrementally too' do
+      state = { cursor: 'evt-1', retry_ms: nil }
+      buffer = +''
+      started = Process.clock_gettime(Process::CLOCK_MONOTONIC)
+      512.times do
+        buffer << ('a' * 16_384)
+        server.send(:process_resumption_buffer, buffer, state)
+      end
+      elapsed = Process.clock_gettime(Process::CLOCK_MONOTONIC) - started
+
+      expect(elapsed).to be < 1.0
+    end
+  end
+
   describe 'security validation' do
     # Session ID and URL validation tests are shared with HTTP transport
     # through the HttpTransportBase module, so we just verify they work here
