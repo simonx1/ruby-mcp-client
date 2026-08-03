@@ -38,8 +38,12 @@ module MCPClient
     # server request on the events stream costs one blocking HTTP POST in
     # its own thread; without a bound, a peer flooding requests could
     # accumulate threads and connections until the host is exhausted.
-    # Responses beyond the budget are dropped with a warning.
+    # Responses beyond the budget are dropped, with saturation logged at most
+    # once per SATURATION_LOG_INTERVAL seconds.
     MAX_CONCURRENT_RESPONSE_POSTS = 8
+
+    # Minimum gap between "response budget saturated" warnings
+    SATURATION_LOG_INTERVAL = 5
 
     # @!attribute [r] base_url
     #   @return [String] The base URL of the MCP server
@@ -122,6 +126,9 @@ module MCPClient
       @sse_retry_ms = nil
       @pending_stream_responses = {}
       @response_post_count = 0
+      # Saturation bookkeeping for the response-POST budget
+      @dropped_response_posts = 0
+      @last_saturation_log_at = nil
       @oauth_provider = opts[:oauth_provider]
 
       # SSE events connection state
@@ -1181,12 +1188,26 @@ module MCPClient
       # arrive at the peer's rate, and each unanswered POST would otherwise
       # pin one thread and one connection.
       unless acquire_response_post_slot
-        response_id = response[:id] || response['id']
-        @logger.warn("Dropping server-initiated response #{response_id.inspect}: " \
-                     "#{MAX_CONCURRENT_RESPONSE_POSTS} response POSTs already in flight")
+        log_response_post_saturation
         return
       end
 
+      begin
+        start_response_post_thread(response)
+      rescue ThreadError => e
+        # Thread.new failed, so the ensure inside the block never runs and the
+        # reservation would leak. Eight such failures would silently mute this
+        # instance's replies for the rest of its life, including after
+        # reconnect (cleanup does not reset the counter).
+        release_response_post_slot
+        @logger.error("Failed to start response POST thread: #{e.message}")
+      end
+    end
+
+    # Spawn the worker that POSTs one server-initiated response.
+    # @param response [Hash] the JSON-RPC response
+    # @return [Thread]
+    def start_response_post_thread(response)
       Thread.new do
         conn = http_connection
         json_body = JSON.generate(response)
@@ -1210,6 +1231,29 @@ module MCPClient
       ensure
         release_response_post_slot
       end
+    end
+
+    # Warn that the response-POST budget is saturated, at most once per
+    # SATURATION_LOG_INTERVAL.
+    #
+    # The peer controls how often this path is reached, so logging every
+    # rejection (at WARN, which the default logger emits) would just trade a
+    # thread-exhaustion vector for a log-volume one. The peer-supplied request
+    # id is deliberately omitted for the same reason.
+    # @return [void]
+    def log_response_post_saturation
+      now = Process.clock_gettime(Process::CLOCK_MONOTONIC)
+      dropped = @mutex.synchronize do
+        @dropped_response_posts += 1
+        next nil if @last_saturation_log_at && now - @last_saturation_log_at < SATURATION_LOG_INTERVAL
+
+        @last_saturation_log_at = now
+        @dropped_response_posts
+      end
+      return unless dropped
+
+      @logger.warn("Dropping server-initiated responses: #{MAX_CONCURRENT_RESPONSE_POSTS} " \
+                   "response POSTs already in flight (#{dropped} dropped so far)")
     end
 
     # Reserve one slot of the response-POST concurrency budget.

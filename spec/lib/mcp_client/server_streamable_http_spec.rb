@@ -1326,6 +1326,35 @@ RSpec.describe MCPClient::ServerStreamableHTTP do
   describe 'server-initiated response POST bounding' do
     let(:budget) { MCPClient::ServerStreamableHTTP::MAX_CONCURRENT_RESPONSE_POSTS }
 
+    it 'releases the slot when the worker thread cannot be created' do
+      # The release lives in the thread's ensure block, so a Thread.new failure
+      # would leak the reservation; eight of those would mute this instance
+      # permanently, surviving reconnects.
+      allow(server).to receive(:start_response_post_thread).and_raise(ThreadError, 'cannot create thread')
+
+      server.send(:post_jsonrpc_response, { 'jsonrpc' => '2.0', 'id' => 1, 'result' => {} })
+
+      expect(server.instance_variable_get(:@response_post_count)).to eq(0)
+    end
+
+    it 'rate-limits saturation warnings and omits the peer-supplied id' do
+      # The peer chooses how often this path is hit, so logging every drop
+      # would swap a thread-exhaustion vector for a log-volume one.
+      server.instance_variable_set(:@response_post_count, budget)
+      logger = server.instance_variable_get(:@logger)
+      warnings = []
+      allow(logger).to receive(:warn) { |msg| warnings << msg }
+
+      20.times { |i| server.send(:post_jsonrpc_response, { 'jsonrpc' => '2.0', 'id' => "peer-#{i}", 'result' => {} }) }
+
+      # 20 drops produce a single warning; the cumulative counter is what
+      # makes the suppressed ones visible in a later one.
+      expect(warnings.size).to eq(1)
+      expect(warnings.first).not_to include('peer-')
+      expect(warnings.first).to match(/dropped so far/)
+      expect(server.instance_variable_get(:@dropped_response_posts)).to eq(20)
+    end
+
     it 'drops a JSON-RPC response instead of spawning a thread when the budget is exhausted' do
       # Each server-initiated request costs one blocking HTTP POST in its own
       # thread; without a bound a peer flooding requests on the events stream
