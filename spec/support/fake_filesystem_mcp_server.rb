@@ -251,12 +251,42 @@ def send_error(id, message)
   $stdout.puts({ jsonrpc: '2.0', id: id, error: { code: -32_601, message: message } }.to_json)
 end
 
+# Whether a requested path stays inside ROOT_DIR.
+#
+# Both halves matter. Comparing strings with start_with? accepts a sibling
+# whose name merely begins with the root ("/srv/root-backup" vs "/srv/root"),
+# so containment is checked per path component. And an unresolved path follows
+# a symlink straight out of the root, so both sides are resolved with realpath
+# first (falling back to the lexical path when the target does not exist).
+# @param target [Pathname] the requested path
+# @return [Boolean]
+def within_root?(target)
+  resolved = resolve_path(target)
+  root = resolve_path(ROOT_DIR)
+  return true if resolved == root
+
+  resolved.to_s.start_with?("#{root}#{File::SEPARATOR}")
+end
+
+# @param path [Pathname]
+# @return [Pathname] the symlink-resolved path, or the lexical one if absent
+def resolve_path(path)
+  Pathname.new(File.realpath(path.to_s))
+rescue Errno::ENOENT
+  # A path that does not exist yet cannot be a symlink; resolve the deepest
+  # existing ancestor so a link in the middle of the path is still followed.
+  parent = path.parent
+  return path.expand_path if parent == path
+
+  resolve_path(parent).join(path.basename)
+end
+
 # Process list_directory tool call
 def process_list_directory(id, args)
   path = args['path'] || '.'
   target = ROOT_DIR.join(path).expand_path
 
-  unless target.to_s.start_with?(ROOT_DIR.to_s)
+  unless within_root?(target)
     send_error(id, 'Access denied')
     return
   end
