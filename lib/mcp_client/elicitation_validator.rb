@@ -18,10 +18,17 @@ module MCPClient
     # Allowed string formats per MCP spec
     STRING_FORMATS = %w[email uri date date-time].freeze
 
-    # Wall-clock budget for matching one server-supplied `pattern`. The
-    # requestedSchema comes from the remote server, so an expensive
+    # Wall-clock budget for ALL pattern matching in a single validate_content
+    # call. The requestedSchema comes from the remote server, so an expensive
     # expression must not be able to monopolize the calling thread.
+    #
+    # The budget covers the whole operation, not each match: a per-match limit
+    # multiplies, since the server also controls how many fields it declares.
     PATTERN_MATCH_TIMEOUT = 1.0
+
+    # Floor for an individual match, so a nearly-exhausted budget still makes
+    # progress rather than failing every remaining field.
+    MIN_PATTERN_MATCH_TIMEOUT = 0.01
 
     # Validate that a requestedSchema conforms to MCP elicitation constraints.
     # Returns an array of error messages (empty if valid).
@@ -123,6 +130,9 @@ module MCPClient
       errors = []
       return errors unless content.is_a?(Hash) && schema.is_a?(Hash)
 
+      # One deadline covers every field's pattern in this call.
+      deadline = Process.clock_gettime(Process::CLOCK_MONOTONIC) + PATTERN_MATCH_TIMEOUT
+
       properties = schema['properties'] || {}
       required = Array(schema['required'])
 
@@ -137,7 +147,7 @@ module MCPClient
         prop = properties[field.to_s]
         next unless prop.is_a?(Hash)
 
-        errors.concat(validate_value(field.to_s, value, prop))
+        errors.concat(validate_value(field.to_s, value, prop, deadline))
       end
 
       errors
@@ -148,13 +158,13 @@ module MCPClient
     # @param value [Object] the value to validate
     # @param prop [Hash] property schema
     # @return [Array<String>] validation errors
-    def self.validate_value(field, value, prop)
+    def self.validate_value(field, value, prop, deadline = nil)
       errors = []
       type = prop['type']
 
       case type
       when 'string'
-        errors.concat(validate_string_value(field, value, prop))
+        errors.concat(validate_string_value(field, value, prop, deadline))
       when 'number', 'integer'
         errors.concat(validate_number_value(field, value, prop))
       when 'boolean'
@@ -171,7 +181,7 @@ module MCPClient
     # @param value [Object] the value
     # @param prop [Hash] property schema
     # @return [Array<String>] validation errors
-    def self.validate_string_value(field, value, prop)
+    def self.validate_string_value(field, value, prop, deadline = nil)
       errors = []
 
       unless value.is_a?(String)
@@ -188,7 +198,7 @@ module MCPClient
         errors << "Field '#{field}' must be one of: #{allowed.join(', ')}" unless allowed.include?(value)
       end
 
-      errors.concat(validate_string_pattern(field, value, prop['pattern'])) if prop['pattern']
+      errors.concat(validate_string_pattern(field, value, prop['pattern'], deadline)) if prop['pattern']
 
       if prop['minLength'] && value.length < prop['minLength']
         errors << "Field '#{field}' must be at least #{prop['minLength']} characters"
@@ -213,15 +223,30 @@ module MCPClient
     # @param value [String] the value
     # @param pattern [String] the declared pattern
     # @return [Array<String>] validation errors
-    def self.validate_string_pattern(field, value, pattern)
-      return [] if value.match?(Regexp.new(pattern, timeout: PATTERN_MATCH_TIMEOUT))
+    def self.validate_string_pattern(field, value, pattern, deadline = nil)
+      remaining = pattern_budget_remaining(deadline)
+      return ["Field '#{field}' pattern matching budget exhausted"] if remaining.zero?
+
+      return [] if value.match?(Regexp.new(pattern, timeout: remaining))
 
       ["Field '#{field}' must match pattern '#{pattern}'"]
     rescue Regexp::TimeoutError
-      ["Field '#{field}' pattern '#{pattern}' timed out after #{PATTERN_MATCH_TIMEOUT}s"]
+      ["Field '#{field}' pattern '#{pattern}' exceeded the #{PATTERN_MATCH_TIMEOUT}s matching budget"]
     rescue RegexpError
       # Skip pattern validation if the pattern is invalid
       []
+    end
+
+    # Time left in the validation-wide pattern budget.
+    # @param deadline [Float, nil] monotonic deadline, or nil for a lone match
+    # @return [Float] seconds available for the next match; 0.0 when exhausted
+    def self.pattern_budget_remaining(deadline)
+      return PATTERN_MATCH_TIMEOUT unless deadline
+
+      remaining = deadline - Process.clock_gettime(Process::CLOCK_MONOTONIC)
+      return 0.0 if remaining <= 0
+
+      [remaining, MIN_PATTERN_MATCH_TIMEOUT].max
     end
 
     # Validate a string value against the schema's format constraint.
