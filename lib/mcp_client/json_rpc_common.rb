@@ -3,6 +3,14 @@
 module MCPClient
   # Shared retry/backoff logic for JSON-RPC transports
   module JsonRpcCommon
+    # JSON-RPC methods with arbitrary side effects that MUST NOT be re-sent
+    # automatically. Even a "transient" failure (5xx, dropped connection,
+    # malformed response) can arrive AFTER the server received the request,
+    # so a retry could execute the operation twice — and JSON-RPC has no
+    # idempotency key to make the duplicate safe. Callers who want to retry
+    # such an operation must decide that explicitly.
+    NON_IDEMPOTENT_METHODS = %w[tools/call].freeze
+
     # Execute the block with retry/backoff for transient errors only.
     #
     # Retries genuinely transient failures where the request most likely did not
@@ -14,10 +22,15 @@ module MCPClient
     # server received and processed (or deterministically rejected) the request.
     # Re-sending those would silently re-execute a non-idempotent operation
     # (e.g. a tools/call), which JSON-RPC provides no way to make safe.
+    #
+    # It also never retries a NON_IDEMPOTENT_METHODS request (pass the
+    # JSON-RPC method being sent): an ambiguous failure may follow server-side
+    # receipt, so those fail fast instead of risking a duplicate execution.
+    # @param method [String, nil] the JSON-RPC method the block sends
     # @yield block to execute
     # @return [Object] result of block
     # @raise original exception if max retries exceeded or the error is not retryable
-    def with_retry
+    def with_retry(method = nil)
       attempts = 0
       begin
         yield
@@ -25,7 +38,16 @@ module MCPClient
              Errno::ETIMEDOUT, Errno::ECONNRESET, Errno::EPIPE => e
         # A timed-out request may still be executing server-side; re-sending
         # it could run a non-idempotent operation twice. Never retry those.
+        # An oversized response is the same story from the other direction:
+        # the server already ran the request, so a re-send risks a duplicate
+        # side effect (and re-does the oversized decode).
         raise if e.is_a?(MCPClient::Errors::RequestTimeoutError)
+        raise if e.is_a?(MCPClient::Errors::ResponseTooLargeError)
+
+        if NON_IDEMPOTENT_METHODS.include?(method)
+          @logger.debug("Not retrying non-idempotent #{method} after error: #{e.message}")
+          raise
+        end
 
         attempts += 1
         if attempts <= @max_retries
@@ -36,6 +58,35 @@ module MCPClient
         end
         raise
       end
+    end
+
+    # A log-safe description of a JSON-RPC message: its method and id only.
+    #
+    # Params and results are deliberately omitted. tools/call arguments and
+    # tool results routinely carry credentials, personal data or customer
+    # content, and logs are frequently shipped to lower-trust destinations
+    # (aggregators, CI artifacts, support bundles) — so enabling DEBUG must
+    # not silently start recording payloads.
+    # @param message [Hash] a JSON-RPC request, notification or response
+    # @return [String] method/id summary, never payload content
+    def describe_jsonrpc_message(message)
+      return '(non-object message)' unless message.is_a?(Hash)
+
+      parts = []
+      parts << (message['method'] || message[:method] || '(response)').to_s
+      id = message['id'] || message[:id]
+      parts << "id=#{id}" if id
+      parts << 'error' if message['error'] || message[:error]
+      parts.join(' ')
+    end
+
+    # A log-safe description of a payload body: its size, never its content.
+    # @param body [String, nil] the response/request body
+    # @return [String]
+    def describe_body_size(body)
+      return 'empty body' if body.nil? || body.empty?
+
+      "#{body.bytesize} bytes"
     end
 
     # Ping the server to keep the connection alive

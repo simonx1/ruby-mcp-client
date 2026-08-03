@@ -4,6 +4,7 @@
 # MCPClient integration example using the openai/openai-ruby gem
 require 'bundler/setup'
 require_relative '../lib/mcp_client'
+require_relative 'support/example_sandbox'
 # Both the official 'openai' gem and 'ruby-openai' are bundled and both expose
 # lib/openai.rb + OpenAI::Client; load the official gem's lib first so
 # require resolves deterministically to the gem this example targets.
@@ -20,9 +21,13 @@ abort 'Please set OPENAI_API_KEY' unless api_key
 logger = Logger.new($stdout)
 logger.level = Logger::WARN
 
-# Connect using stdio - passing an array of command arguments auto-detects stdio transport
+# Connect using stdio - passing an array of command arguments auto-detects stdio transport.
+# The server is pinned to a known version and rooted at a disposable sandbox, not
+# the checkout: the model below picks the tool calls and they run unattended.
+ExampleSandbox.announce_auto_execution("filesystem tools under #{ExampleSandbox.filesystem_root}")
 mcp_client = MCPClient.connect(
-  %W[npx -y @modelcontextprotocol/server-filesystem #{Dir.pwd}],
+  ExampleSandbox.filesystem_server_command,
+  env: ExampleSandbox.secret_free_env,
   logger: logger
 )
 
@@ -35,7 +40,7 @@ tools = mcp_client.to_openai_tools
 # Build initial chat messages
 messages = [
   { role: 'system', content: 'You can call filesystem tools.' },
-  { role: 'user', content: 'List all files in current directory' }
+  { role: 'user', content: 'List all files in the sandbox directory' }
 ]
 
 # 1) Send chat with function definitions

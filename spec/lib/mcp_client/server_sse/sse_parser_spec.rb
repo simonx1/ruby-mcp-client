@@ -22,6 +22,7 @@ RSpec.describe MCPClient::ServerSSE::SseParser do
           @notification_calls << [m, p]
         }
         @sse_results = {}
+        @pending_request_ids = Set.new
         @tools_data = nil
       end
 
@@ -64,8 +65,88 @@ RSpec.describe MCPClient::ServerSSE::SseParser do
       expect(parser.connection_established).to be true
     end
 
+    it 'accepts an absolute same-origin endpoint URI' do
+      raw = "event: endpoint\ndata: https://example.com/messages?sid=1\n\n"
+      parser.parse_and_handle_sse_event(raw)
+      expect(parser.rpc_endpoint).to eq('https://example.com/messages?sid=1')
+      expect(parser.connection_established).to be true
+    end
+
+    it 'rejects a cross-origin endpoint URI and fails the handshake' do
+      # The endpoint event is attacker-influenced input: honoring a foreign
+      # origin would redirect every JSON-RPC POST (with configured
+      # Authorization/API-key headers) to a server the caller never chose.
+      raw = "event: endpoint\ndata: https://evil.example.net/steal\n\n"
+      expect { parser.parse_and_handle_sse_event(raw) }.to raise_error(
+        MCPClient::Errors::TransportError, /origin/
+      )
+      expect(parser.rpc_endpoint).to be_nil
+      expect(parser.connection_established).to be false
+      expect(parser.instance_variable_get(:@connection_error)).to match(/origin/)
+    end
+
+    it 'rejects an endpoint URI that changes only the port' do
+      raw = "event: endpoint\ndata: https://example.com:8443/messages\n\n"
+      expect { parser.parse_and_handle_sse_event(raw) }.to raise_error(
+        MCPClient::Errors::TransportError, /origin/
+      )
+      expect(parser.rpc_endpoint).to be_nil
+    end
+
+    it 'rejects an endpoint URI that downgrades the scheme' do
+      raw = "event: endpoint\ndata: http://example.com/messages\n\n"
+      expect { parser.parse_and_handle_sse_event(raw) }.to raise_error(
+        MCPClient::Errors::TransportError, /origin/
+      )
+      expect(parser.rpc_endpoint).to be_nil
+    end
+
     it 'ignores ping events' do
       expect { parser.parse_and_handle_sse_event("event: ping\n\n") }.not_to raise_error
+    end
+
+    describe 'cross-origin redirects from a same-origin endpoint' do
+      # Pinning the endpoint origin is not enough on its own: a same-origin
+      # endpoint can answer the POST with a 307 to another origin, and the
+      # redirect middleware replays the body there, stripping only the
+      # literal Authorization header.
+      let(:server) do
+        MCPClient::ServerSSE.new(
+          base_url: 'https://example.com/sse',
+          headers: { 'X-API-Key' => 'secret-key-123', 'Authorization' => 'Bearer tok' }
+        )
+      end
+
+      before do
+        server.instance_variable_set(:@use_sse, false)
+        server.instance_variable_set(:@initialized, true)
+        server.instance_variable_set(:@connection_established, true)
+        server.instance_variable_set(:@sse_connected, true)
+        server.send(:parse_and_handle_sse_event, "event: endpoint\ndata: /messages\n\n")
+      end
+
+      after { server.cleanup }
+
+      it 'does not replay the request or its headers to a foreign origin' do
+        stub_request(:post, 'https://example.com/messages')
+          .to_return(status: 307, headers: { 'Location' => 'https://evil.example.net/steal' })
+        foreign = stub_request(:post, 'https://evil.example.net/steal')
+                  .to_return(status: 200, body: '{"result":{}}')
+
+        expect { server.rpc_request('tools/call', { 'name' => 'x' }) }
+          .to raise_error(MCPClient::Errors::ConnectionError, /[Cc]ross-origin redirect/)
+        expect(foreign).not_to have_been_requested
+      end
+
+      it 'still follows a same-origin redirect' do
+        stub_request(:post, 'https://example.com/messages')
+          .to_return(status: 307, headers: { 'Location' => 'https://example.com/messages2' })
+        stub_request(:post, 'https://example.com/messages2')
+          .to_return(status: 200, body: '{"result":{"ok":true}}',
+                     headers: { 'Content-Type' => 'application/json' })
+
+        expect(server.rpc_request('tools/list', {})).to eq({ 'ok' => true })
+      end
     end
 
     it 'calls notification callback for JSON-RPC notifications' do
@@ -79,6 +160,7 @@ RSpec.describe MCPClient::ServerSSE::SseParser do
       # A tools/list response must NOT be written into @tools_data as a side
       # effect; that would let a concurrent list_tools observe a partial page
       # mid-pagination. request_tools_list is the sole writer of @tools_data.
+      parser.instance_variable_get(:@pending_request_ids).add(7)
       response = { jsonrpc: '2.0', id: 7, result: { tools: [{ name: 'a' }], nextCursor: 'p2' } }
       raw = "event: message\ndata: #{response.to_json}\n\n"
       parser.parse_and_handle_sse_event(raw)
@@ -86,6 +168,17 @@ RSpec.describe MCPClient::ServerSSE::SseParser do
       expect(parser.instance_variable_get(:@sse_results)[7]).to eq('tools' => [{ 'name' => 'a' }],
                                                                    'nextCursor' => 'p2')
       expect(parser.instance_variable_get(:@tools_data)).to be_nil
+    end
+
+    it 'discards a response whose id matches no outstanding request' do
+      # Response events are peer-controlled: storing every id-bearing message
+      # would let a server grow @sse_results without bound by streaming
+      # unsolicited responses with fresh ids.
+      response = { jsonrpc: '2.0', id: 'unsolicited-1', result: { 'x' => 1 } }
+      raw = "event: message\ndata: #{response.to_json}\n\n"
+      parser.parse_and_handle_sse_event(raw)
+
+      expect(parser.instance_variable_get(:@sse_results)).to be_empty
     end
   end
 end

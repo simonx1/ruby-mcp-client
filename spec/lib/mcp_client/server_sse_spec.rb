@@ -459,6 +459,35 @@ RSpec.describe MCPClient::ServerSSE do
       expect(server.instance_variable_get(:@initialized)).to be false
     end
 
+    it 'clears stored SSE results so they cannot accumulate across reconnects' do
+      server.instance_variable_set(:@sse_results, { 'stale-1' => { 'x' => 1 } })
+      server.cleanup
+
+      expect(server.instance_variable_get(:@sse_results)).to be_empty
+    end
+
+    it 'keeps a result whose request is still pending' do
+      # A response can land while its POST is still returning; if the stream
+      # then drops, the waiter reconnects (which calls cleanup) and must still
+      # find it. Losing it reports a timeout for work the server already did.
+      server.send(:register_pending_request, 42)
+      server.instance_variable_set(:@sse_results, { 42 => { 'ok' => true }, 'stale' => { 'x' => 1 } })
+
+      server.cleanup
+
+      results = server.instance_variable_get(:@sse_results)
+      expect(results).to eq({ 42 => { 'ok' => true } })
+    end
+
+    it 'delivers a result that arrived just before a reconnect' do
+      server.send(:register_pending_request, 7)
+      server.send(:parse_and_handle_sse_event,
+                  "event: message\ndata: #{{ jsonrpc: '2.0', id: 7, result: { 'done' => true } }.to_json}\n\n")
+      server.cleanup
+
+      expect(server.send(:check_for_result, 7)).to eq({ 'done' => true })
+    end
+
     it 'resets the SSE parse buffer so a reconnect does not inherit a partial event' do
       server.instance_variable_set(:@buffer, 'data: {"jso')
       server.cleanup
@@ -967,6 +996,24 @@ RSpec.describe MCPClient::ServerSSE do
       expect(call_count).to eq(2) # Verify it was called twice (one fail, one success)
     end
 
+    it 'does not retry a non-idempotent tools/call after an ambiguous failure' do
+      server.instance_variable_set(:@max_retries, 2)
+      server.instance_variable_set(:@retry_backoff, 0.01)
+
+      # The failure may have arrived after the server received the request;
+      # re-sending tools/call could execute the operation twice.
+      call_count = 0
+      allow(server).to receive(:send_jsonrpc_request) do
+        call_count += 1
+        raise MCPClient::Errors::TransportError, 'Network timeout'
+      end
+
+      expect { server.rpc_request('tools/call', { name: 't' }) }.to raise_error(
+        MCPClient::Errors::TransportError, /Network timeout/
+      )
+      expect(call_count).to eq(1)
+    end
+
     it 'gives up after max retries' do
       server.instance_variable_set(:@max_retries, 1)
       server.instance_variable_set(:@retry_backoff, 0.01) # Speed up tests
@@ -1125,6 +1172,61 @@ RSpec.describe MCPClient::ServerSSE do
       server.send(:process_sse_chunk, completion_chunk)
     end
 
+    it 'raises and drops the buffer when an unterminated event exceeds the cap' do
+      stub_const('MCPClient::ServerSSE::MAX_SSE_BUFFER_BYTES', 1024)
+
+      # A peer that withholds the blank-line terminator must not be able to
+      # grow the parse buffer without bound.
+      expect do
+        server.send(:process_sse_chunk, "event: message\ndata: #{'a' * 2048}")
+      end.to raise_error(MCPClient::Errors::ConnectionError, /buffer/i)
+
+      expect(server.instance_variable_get(:@buffer)).to eq('')
+    end
+
+    it 'accepts complete events even when a single chunk exceeds the cap' do
+      stub_const('MCPClient::ServerSSE::MAX_SSE_BUFFER_BYTES', 1024)
+
+      # The cap bounds UNPROCESSED bytes, not chunk size: terminated events
+      # inside an oversized chunk are extracted before the check.
+      chunk = "event: message\ndata: #{'a' * 2048}\n\n"
+      expect(server).to receive(:parse_and_handle_sse_event).once
+
+      expect { server.send(:process_sse_chunk, chunk) }.not_to raise_error
+      expect(server.instance_variable_get(:@buffer)).to eq('')
+    end
+
+    it 'stays fast when an unterminated event arrives in many small chunks' do
+      # The peer chooses the chunking. Appending with += and rescanning the
+      # whole buffer each time is O(N^2): memory stays capped but CPU and the
+      # allocator do not.
+      chunk = 'a' * 16_384
+      started = Process.clock_gettime(Process::CLOCK_MONOTONIC)
+      512.times { server.send(:extract_complete_events, chunk.dup) }
+      elapsed = Process.clock_gettime(Process::CLOCK_MONOTONIC) - started
+
+      expect(elapsed).to be < 1.0
+      expect(server.instance_variable_get(:@buffer).bytesize).to eq(512 * 16_384)
+    end
+
+    it 'finds a terminator split across two chunks' do
+      # The incremental scan backs up by the longest delimiter minus one, so a
+      # boundary-straddling "\r\n\r\n" is not missed.
+      expect(server).to receive(:parse_and_handle_sse_event).once
+      server.send(:process_sse_chunk, "event: message\r\ndata: x\r")
+      server.send(:process_sse_chunk, "\n\r\n")
+    end
+
+    it 'records the overflow cause so waiters see why the connection failed' do
+      stub_const('MCPClient::ServerSSE::MAX_SSE_BUFFER_BYTES', 1024)
+
+      expect { server.send(:process_sse_chunk, "event: message\ndata: #{'a' * 2048}") }
+        .to raise_error(MCPClient::Errors::ConnectionError)
+
+      expect(server.instance_variable_get(:@connection_error)).to match(/maximum buffered size/)
+      expect(server.instance_variable_get(:@connection_established)).to be false
+    end
+
     it 'detects direct JSON-RPC error responses with authorization errors' do
       # Authorization error in JSON-RPC format that isn't an SSE event
       error_response = '{
@@ -1253,6 +1355,7 @@ RSpec.describe MCPClient::ServerSSE do
     end
 
     it 'handles regular error messages without raising ConnectionError' do
+      server.send(:register_pending_request, 1)
       # Create a JSON-RPC error response with a normal error
       error_data = {
         jsonrpc: '2.0',
@@ -1304,6 +1407,23 @@ RSpec.describe MCPClient::ServerSSE do
       expect(server).to receive(:record_activity).exactly(2).times
 
       server.send(:send_jsonrpc_request, request)
+    end
+
+    it 'unregisters the pending request id once the request completes' do
+      request = { 'jsonrpc' => '2.0', 'id' => 5, 'method' => 'test', 'params' => {} }
+
+      server.instance_variable_set(:@rpc_endpoint, '/rpc')
+      server.instance_variable_set(:@use_sse, false)
+
+      uri = URI.parse(base_url)
+      stub_request(:post, "#{uri.scheme}://#{uri.host}:#{uri.port}/rpc")
+        .to_return(status: 200, body: '{"result": {}}', headers: { 'Content-Type' => 'application/json' })
+
+      server.send(:send_jsonrpc_request, request)
+
+      # A late/duplicate response for id 5 must now be treated as unsolicited,
+      # so it cannot accumulate in @sse_results.
+      expect(server.instance_variable_get(:@pending_request_ids)).not_to include(5)
     end
   end
 end

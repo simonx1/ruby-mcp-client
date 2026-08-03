@@ -12,12 +12,45 @@ module MCPClient
     module JsonRpcTransport
       include HttpTransportBase
 
+      # Default ceiling on the expanded size of a gzip-encoded response body.
+      # The peer controls the compression ratio, so without a bound a tiny
+      # compressed response ("gzip bomb") could expand to an arbitrarily large
+      # string and exhaust host memory before JSON parsing.
+      #
+      # Hosts that legitimately exchange very large payloads (e.g. base64
+      # resource blobs or audio) can raise it per server with the
+      # max_decompressed_body_bytes option, so that whether a response is
+      # accepted does not depend on the server's choice to gzip it.
+      MAX_DECOMPRESSED_BODY_BYTES = 64 * 1024 * 1024
+      DECOMPRESS_CHUNK_BYTES = 64 * 1024
+
       private
+
+      # Whether a server-supplied SSE event id may be retained as the
+      # resumption cursor: non-empty, bounded, and safe to place in an HTTP
+      # header. Shared by every SSE parsing path (GET events stream, POST
+      # response stream, and resumed GET), since all three feed the same
+      # Last-Event-ID header.
+      # @param id [String, nil] the raw id field
+      # @return [Boolean]
+      def retainable_event_id?(id)
+        return false if id.nil? || id.empty?
+
+        if id.length > MAX_EVENT_ID_LENGTH
+          @logger.warn("Ignoring oversized SSE event id (#{id.length} chars)")
+          return false
+        end
+
+        return true if id.match?(EVENT_ID_PATTERN)
+
+        @logger.warn('Ignoring SSE event id with characters illegal in a header value')
+        false
+      end
 
       # Log HTTP response for Streamable HTTP
       # @param response [Faraday::Response] the HTTP response
       def log_response(response)
-        @logger.debug("Received Streamable HTTP response: #{response.status} #{response.body}")
+        @logger.debug("Received Streamable HTTP response: #{response.status} (#{describe_body_size(response.body)})")
       end
 
       # Parse a Streamable HTTP JSON-RPC response (JSON or SSE format)
@@ -31,7 +64,7 @@ module MCPClient
         content_type = response.headers['content-type'] || response.headers['Content-Type'] || ''
         content_encoding = response.headers['content-encoding'] || response.headers['Content-Encoding'] || ''
 
-        body = Zlib::GzipReader.new(StringIO.new(body)).read if content_encoding.include?('gzip')
+        body = decompress_gzip(body) if content_encoding.include?('gzip')
         body = body&.strip
 
         # Determine response format based on Content-Type header per MCP 2025 spec
@@ -46,6 +79,36 @@ module MCPClient
         process_jsonrpc_response(data)
       rescue JSON::ParserError => e
         raise MCPClient::Errors::TransportError, "Invalid JSON response from server: #{e.message}"
+      end
+
+      # Incrementally decompress a gzip response body, aborting once the
+      # expanded output exceeds the configured ceiling.
+      # @param body [String] the gzip-compressed response body
+      # @return [String] the decompressed body
+      # @raise [MCPClient::Errors::ResponseTooLargeError] if the expansion limit is exceeded
+      def decompress_gzip(body)
+        limit = max_decompressed_body_bytes
+        reader = Zlib::GzipReader.new(StringIO.new(body))
+        decompressed = +''
+        while (chunk = reader.read(DECOMPRESS_CHUNK_BYTES))
+          decompressed << chunk
+          next unless decompressed.bytesize > limit
+
+          # ResponseTooLargeError (not a plain TransportError) so with_retry
+          # does not re-POST a request the server has already executed.
+          raise MCPClient::Errors::ResponseTooLargeError,
+                "Gzip response expanded beyond #{limit} bytes"
+        end
+        decompressed
+      ensure
+        reader&.close
+      end
+
+      # Configured ceiling for decompressed response bodies.
+      # @return [Integer] positive byte limit
+      def max_decompressed_body_bytes
+        configured = defined?(@max_decompressed_body_bytes) ? @max_decompressed_body_bytes : nil
+        configured || MAX_DECOMPRESSED_BODY_BYTES
       end
 
       # Parse a Server-Sent Event formatted response body.
@@ -88,7 +151,9 @@ module MCPClient
       # @raise [MCPClient::Errors::ServerError] when resumption fails
       # @raise [MCPClient::Errors::TransportError] when no cursor was received
       def resume_or_fail(events, request_id, retry_ms = nil)
-        cursor = events.reverse.find { |e| e[:id] && !e[:id].empty? }&.dig(:id)
+        # Only a validated id may become a cursor: it is sent back as a
+        # Last-Event-ID header on the resumption GET.
+        cursor = events.reverse.find { |e| retainable_event_id?(e[:id]) }&.dig(:id)
         if request_id && cursor
           # Resume with THIS stream's cursor and retry directive (both are
           # per-stream), not the shared @last_event_id / @sse_retry_ms which a
@@ -162,7 +227,10 @@ module MCPClient
 
         events.each do |event|
           if event[:id] && !event[:id].empty?
-            @mutex.synchronize { @last_event_id = event[:id] }
+            # The POST SSE stream is peer-controlled like the GET one, so its
+            # ids get the same bound/charset check before being retained or
+            # echoed in a Last-Event-ID header.
+            @mutex.synchronize { @last_event_id = event[:id] } if retainable_event_id?(event[:id])
             @logger.debug("Tracking event ID for resumability: #{event[:id]}")
           end
           next unless event[:type] == 'message'
