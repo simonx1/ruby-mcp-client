@@ -45,9 +45,12 @@ module MCPClient
     # memory and oversized outbound headers.
     MAX_EVENT_ID_LENGTH = 1024
 
-    # Characters allowed in a retained event id: printable ASCII only, since
-    # the value becomes an HTTP header. Notably excludes CR/LF.
-    EVENT_ID_PATTERN = /\A[\x21-\x7E]+\z/
+    # Characters allowed in a retained event id: printable ASCII, since the
+    # value becomes an HTTP header value. Notably excludes CR/LF. The range
+    # starts at 0x20 because a space is legal inside a field value, and
+    # rejecting ids like "cursor 42" would silently strand resumption on a
+    # stale cursor.
+    EVENT_ID_PATTERN = /\A[\x20-\x7E]+\z/
 
     # @!attribute [r] base_url
     #   @return [String] The base URL of the MCP server
@@ -786,8 +789,11 @@ module MCPClient
       deadline = Process.clock_gettime(Process::CLOCK_MONOTONIC) + @read_timeout
       state = { cursor: cursor, retry_ms: retry_ms }
       # SEP-1699: the client MUST respect the server's retry directive before
-      # attempting to reconnect.
-      delay = resumption_delay(retry_ms)
+      # attempting to reconnect. With no directive the FIRST GET goes out
+      # immediately, as before this change: delaying it adds latency to every
+      # resumption and, on a short read_timeout, can burn the whole budget
+      # before any I/O happens.
+      delay = retry_ms ? resumption_delay(retry_ms) : 0
 
       loop do
         sleep(delay) if delay.positive?
@@ -880,7 +886,9 @@ module MCPClient
           data_lines << line.sub(/\Adata:\s*/, '')
         elsif line.start_with?('id:')
           id = line.sub(/\Aid:\s*/, '').strip
-          state[:cursor] = id unless id.empty?
+          # Same validation as the events stream: this cursor is echoed in
+          # the Last-Event-ID header of the next resumption GET.
+          state[:cursor] = id if retainable_event_id?(id)
         elsif line.start_with?('retry:')
           raw = line.sub(/\Aretry:\s*/, '').strip
           state[:retry_ms] = raw.to_i if raw.match?(/\A\d+\z/)

@@ -88,7 +88,9 @@ module MCPClient
       # @raise [MCPClient::Errors::ServerError] when resumption fails
       # @raise [MCPClient::Errors::TransportError] when no cursor was received
       def resume_or_fail(events, request_id, retry_ms = nil)
-        cursor = events.reverse.find { |e| e[:id] && !e[:id].empty? }&.dig(:id)
+        # Only a validated id may become a cursor: it is sent back as a
+        # Last-Event-ID header on the resumption GET.
+        cursor = events.reverse.find { |e| retainable_event_id?(e[:id]) }&.dig(:id)
         if request_id && cursor
           # Resume with THIS stream's cursor and retry directive (both are
           # per-stream), not the shared @last_event_id / @sse_retry_ms which a
@@ -162,7 +164,10 @@ module MCPClient
 
         events.each do |event|
           if event[:id] && !event[:id].empty?
-            @mutex.synchronize { @last_event_id = event[:id] }
+            # The POST SSE stream is peer-controlled like the GET one, so its
+            # ids get the same bound/charset check before being retained or
+            # echoed in a Last-Event-ID header.
+            @mutex.synchronize { @last_event_id = event[:id] } if retainable_event_id?(event[:id])
             @logger.debug("Tracking event ID for resumability: #{event[:id]}")
           end
           next unless event[:type] == 'message'
