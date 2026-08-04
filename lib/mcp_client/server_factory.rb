@@ -99,7 +99,10 @@ module MCPClient
         name: config[:name],
         logger: logger,
         oauth_provider: config[:oauth_provider],
-        faraday_config: config[:faraday_config]
+        faraday_config: config[:faraday_config],
+        max_decompressed_body_bytes:
+          config[:max_decompressed_body_bytes] ||
+            MCPClient::ServerStreamableHTTP::JsonRpcTransport::MAX_DECOMPRESSED_BODY_BYTES
       )
     end
 

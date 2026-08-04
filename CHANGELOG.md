@@ -1,5 +1,153 @@
 # Changelog
 
+## 2.1.0 — Hostile-Server Hardening (2026-08-04)
+
+A security pass over every transport, driven by an external scan of the 2.0.0
+codebase (50 findings: 12 medium, 38 low) and a second, adversarial review of
+each fix (PRs #188–#211). Every finding was reproduced before it was fixed and
+re-verified afterwards — including three bugs found by reviewing the release
+notes themselves against the code (#209, #210, #211).
+
+The theme: **a remote MCP server is untrusted input.** 2.0.0 was correct against
+a cooperative server but assumed good faith in places where a hostile — or merely
+compromised — peer controls the data. Nothing here changes the wire protocol, and
+the ordinary client API is unchanged; what changes is what the client accepts,
+retries, logs and reflects back.
+
+### Breaking Changes
+
+- **`tools/call` is never retried automatically** (#196). A "transient" failure
+  (HTTP 5xx, dropped connection) can arrive *after* the server executed the
+  request, so replaying it risks a duplicate side effect, and JSON-RPC has no
+  idempotency key to make that safe. `NON_IDEMPOTENT_METHODS` is excluded from
+  `with_retry` on all four transports. Idempotent methods (`tools/list`,
+  `resources/read`, `ping`, …) retry exactly as before. Hosts that relied on
+  tool calls being retried must now retry explicitly and decide for themselves
+  whether re-execution is acceptable.
+
+  This also covers **session-expiry recovery** on the HTTP transports (#209).
+  A 404 carrying an expired `Mcp-Session-Id` still starts a fresh session, but
+  the original request is only re-sent when it is idempotent; a `tools/call`
+  instead raises `ConnectionError` saying the request was not resent because it
+  may already have executed. Without this, session recovery was a second,
+  independent path around the guarantee — and it applied even with
+  `retries: 0`.
+- **Task operations refuse to guess a server** (#199). Task IDs are unique only
+  within the server that issued them, so `get_task`/`get_task_result`/
+  `cancel_task` no longer default to the first configured server. Pass the
+  `MCPClient::Task` returned by `call_tool_as_task` (it carries its own server),
+  or name the server explicitly. A bare ID still works with a single configured
+  server; with several it raises `ArgumentError` rather than acting on the wrong
+  one.
+- **Peer-facing error messages are constant** (#198). Host callback exceptions
+  are no longer interpolated into JSON-RPC error responses on any transport —
+  a handler raising with a file path or connection string used to send it to the
+  server. Peers receive `'Internal error'` / `'Sampling error'` /
+  `'Elicitation handler error'`; the detail stays in the local log. Error
+  **codes** are unchanged.
+- **Logs no longer contain payloads** (#198, #210, #211). Request params,
+  response bodies and raw SSE chunks are replaced by a method/id summary and a
+  byte count, so enabling DEBUG no longer records `tools/call` arguments, tool
+  results or elicitation content. The *error* paths are covered too, and they
+  were the leakier ones: a non-object JSON payload used to be logged with
+  `#inspect` at **WARN** (which the default logger emits, so it leaked with
+  DEBUG off), and `JSON::ParserError#message` quotes the offending token, so
+  malformed peer JSON echoed into logs and into the `Invalid JSON response from
+  server` exception on every transport. Parse failures now report position and
+  size only. Server configs are logged with credential-bearing keys redacted,
+  and peer-supplied log messages are control-character escaped and capped (a
+  server could otherwise forge log lines).
+- **Cross-origin traffic is refused on the legacy SSE transport** (#189). An
+  `endpoint` control event that changes scheme/host/port fails the handshake, and
+  redirects that leave the connection origin are refused — `faraday-follow_redirects`
+  strips only `Authorization`, so a custom API-key header and the request body
+  would otherwise reach the new origin.
+- **Peer-advertised OAuth discovery URLs must be HTTPS and non-local** (#190).
+  The `resource_metadata` URL from a 401 challenge and the `authorization_servers`
+  origin from Protected Resource Metadata are validated before any fetch. The
+  plain-HTTP loopback exception now applies only when the *configured* server is
+  itself local, so a remote server can no longer point discovery at a *literal*
+  loopback or private address. A refused challenge fails closed instead of
+  falling back to cached metadata. The check is textual: hostnames are not
+  resolved, so a public name whose DNS record points inside your network is not
+  caught — restrict egress at the network layer if that matters to you.
+- **Oversized and malformed peer data is rejected** rather than absorbed:
+  gzip bodies that expand past the limit (#188 — Streamable HTTP, the only
+  transport that requests gzip), SSE events that never terminate (#191, #192),
+  event IDs that are unbounded or illegal in an HTTP header (#200).
+
+### New Features
+
+- **`max_decompressed_body_bytes`** on the Streamable HTTP transport (#188).
+  Bounds how far a gzip response may expand (default 64 MiB) so a small
+  "gzip bomb" cannot exhaust memory. Configurable because the ceiling would
+  otherwise make a large legitimate response depend on whether the server chose
+  to compress it.
+- **`MCPClient::Errors::ResponseTooLargeError`** (#188), a `TransportError`
+  subclass that is deliberately excluded from retries: the server already ran the
+  request, so re-sending risks a duplicate side effect.
+- **Ruby 4.0.6 is the development default** (#204, #205), with a dedicated CI
+  suite. 3.2 and 3.3 remain tested and `required_ruby_version` is unchanged at
+  `>= 3.2.0`. A tracked `.ruby-version` replaces the gitignored `.tool-versions`,
+  and `BUNDLED WITH` moves to a bundler that supports Ruby 4.
+
+### Bug Fixes
+
+- Server-supplied schema `pattern` values are matched under a **whole-operation**
+  time budget (#197). A per-match limit was not a bound, because the peer also
+  chooses how many strings are matched; a timeout now fails validation rather than
+  silently accepting a value whose constraint was never evaluated.
+- Server-initiated replies (pongs, roots/sampling/elicitation, error responses)
+  no longer spawn unbounded threads (#194); the budget is released correctly when
+  thread creation fails, and saturation warnings are rate-limited so the fix does
+  not become its own log-flood vector.
+- Unsolicited SSE responses are discarded instead of accumulating in the pending
+  map, and `cleanup` no longer drops a result whose request is still pending —
+  which would have reported a timeout for a tool the server had already run (#195).
+- SSE buffers are appended and scanned incrementally (#191, #192). Capping the
+  size bounded memory but left an O(N²) copy/rescan path: an unterminated event
+  in 16 KiB chunks took 11.2s before, 0.018s now.
+- Server `retry:` directives are floored so `retry: 0` cannot drive a tight
+  reconnect loop (#193, #200), while the first resumption GET still goes out
+  immediately when no directive was given.
+- A JSON-parseable scalar or array arriving on the GET events stream no longer
+  raises inside message dispatch; it is skipped with a typed warning, matching
+  the POST response path (#210).
+
+### Examples & Tooling
+
+- Filesystem examples run against a disposable sandbox directory instead of the
+  checkout, npm servers are version-pinned, and credential-looking variables are
+  stripped from child processes (#201, #206). `streamable_http_example.rb` no
+  longer invokes an arbitrary server-advertised tool — name one with
+  `MCP_EXAMPLE_TOOL`. The OAuth storage demo writes its token file atomically
+  at `0600`.
+- The bundled example servers enforce session ownership for task operations and
+  reject session-less POSTs, and the filesystem test fixture resolves symlinks
+  and compares path components instead of string prefixes (#202).
+- GitHub Actions are pinned to commit SHAs (#203).
+
+### Migration notes
+
+- If you relied on `tools/call` being retried, retry explicitly. Treat the raised
+  error as "outcome unknown" — the server may already have executed the call.
+  This includes the session-expiry path: a tool call interrupted by an expired
+  session now raises instead of being transparently re-sent against the new one.
+- In multi-server clients, replace `client.get_task(id)` with
+  `client.get_task(task)` (the handle from `call_tool_as_task`) or add
+  `server:`. Single-server clients need no change.
+- If you parsed detail out of JSON-RPC error messages a peer sent you, or out of
+  this client's DEBUG logs, those strings are now constant/summarized. Codes and
+  local logs still carry the detail.
+- A server that advertises a cross-origin SSE `endpoint`, a plain-HTTP or loopback
+  OAuth discovery URL, or redirects RPC POSTs off-origin will now be rejected. If
+  you develop against a local stack, point the *configured* server URL at
+  localhost and the loopback exception still applies.
+- Set `max_decompressed_body_bytes:` if you legitimately exchange responses that
+  expand beyond 64 MiB.
+- Development now expects Ruby 4.0.6 (`.ruby-version`); the gem still supports
+  3.2+. Run `bundle install` after upgrading — `BUNDLED WITH` changed.
+
 ## 2.0.0 — MCP 2025-11-25 Conformance (2026-07-21)
 
 Full compliance pass against the **MCP 2025-11-25** specification: every transport,

@@ -613,6 +613,26 @@ RSpec.describe MCPClient::ServerStreamableHTTP::JsonRpcTransport do
       roomy.cleanup
     end
 
+    it 'is reachable through streamable_http_config and the server factory' do
+      # The knob is useless if the documented configuration path cannot set it.
+      config = MCPClient.streamable_http_config(
+        base_url: 'https://example.com/mcp', max_decompressed_body_bytes: 256 * 1024 * 1024
+      )
+      built = MCPClient::ServerFactory.create(config, logger: Logger.new(StringIO.new))
+
+      expect(built.instance_variable_get(:@max_decompressed_body_bytes)).to eq(256 * 1024 * 1024)
+      built.cleanup
+    end
+
+    it 'defaults to MAX_DECOMPRESSED_BODY_BYTES when the config omits it' do
+      config = MCPClient.streamable_http_config(base_url: 'https://example.com/mcp')
+      built = MCPClient::ServerFactory.create(config, logger: Logger.new(StringIO.new))
+
+      expect(built.instance_variable_get(:@max_decompressed_body_bytes))
+        .to eq(MCPClient::ServerStreamableHTTP::JsonRpcTransport::MAX_DECOMPRESSED_BODY_BYTES)
+      built.cleanup
+    end
+
     it 'rejects a non-positive configured limit' do
       expect do
         MCPClient::ServerStreamableHTTP.new(base_url: 'https://example.com', max_decompressed_body_bytes: 0)

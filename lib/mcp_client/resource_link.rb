@@ -35,7 +35,6 @@ module MCPClient
     # @param size [Integer, nil] optional size of the resource in bytes
     # @param icons [Array<Hash>, nil] optional icons for display in user interfaces (MCP 2025-11-25)
     # @param meta [Hash, nil] optional `_meta` metadata attached to the resource link (MCP 2025-11-25)
-    # rubocop:disable Metrics/ParameterLists
     def initialize(uri:, name:, description: nil, mime_type: nil, annotations: nil, title: nil, size: nil,
                    icons: nil, meta: nil)
       @uri = uri
@@ -48,7 +47,6 @@ module MCPClient
       @icons = icons
       @meta = meta
     end
-    # rubocop:enable Metrics/ParameterLists
 
     # Create a ResourceLink instance from JSON data
     # @param data [Hash] JSON data from MCP server (content item with type 'resource_link')

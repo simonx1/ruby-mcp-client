@@ -38,7 +38,6 @@ module MCPClient
     # @param task_support [String, nil] execution.taskSupport value (MCP 2025-11-25)
     # @param icons [Array<Hash>, nil] optional icons for display in user interfaces (MCP 2025-11-25)
     # @param meta [Hash, nil] optional `_meta` metadata attached to the tool (MCP 2025-11-25)
-    # rubocop:disable Metrics/ParameterLists
     def initialize(name:, description:, schema:, title: nil, output_schema: nil, annotations: nil, server: nil,
                    task_support: nil, icons: nil, meta: nil)
       @name = name
@@ -52,7 +51,6 @@ module MCPClient
       @icons = icons
       @meta = meta
     end
-    # rubocop:enable Metrics/ParameterLists
 
     # Create a Tool instance from JSON data
     # @param data [Hash] JSON data from MCP server

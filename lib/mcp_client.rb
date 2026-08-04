@@ -453,11 +453,17 @@ module MCPClient
   # @param retry_backoff [Integer] Backoff delay in seconds (default: 1)
   # @param name [String, nil] Optional name for this server
   # @param logger [Logger, nil] Optional logger for server operations
+  # @param max_decompressed_body_bytes [Integer] ceiling on how far a gzip-encoded
+  #   response may expand before it is rejected, guarding against a small highly
+  #   compressed body exhausting memory (default: 64 MiB)
   # @yieldparam faraday [Faraday::Connection] the configured connection instance for additional customization
   #   (e.g., SSL settings, custom middleware). The block is called after default configuration is applied.
   # @return [Hash] server configuration
   def self.streamable_http_config(base_url:, endpoint: '/rpc', headers: {}, read_timeout: 30, retries: 3,
-                                  retry_backoff: 1, name: nil, logger: nil, &faraday_config)
+                                  retry_backoff: 1, name: nil, logger: nil,
+                                  max_decompressed_body_bytes:
+                                    MCPClient::ServerStreamableHTTP::JsonRpcTransport::MAX_DECOMPRESSED_BODY_BYTES,
+                                  &faraday_config)
     {
       type: 'streamable_http',
       base_url: base_url,
@@ -468,6 +474,7 @@ module MCPClient
       retry_backoff: retry_backoff,
       name: name,
       logger: logger,
+      max_decompressed_body_bytes: max_decompressed_body_bytes,
       faraday_config: faraday_config
     }
   end
