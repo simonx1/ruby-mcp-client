@@ -42,7 +42,7 @@ module MCPClient
         rescue MCPClient::Errors::ConnectionError
           raise
         rescue JSON::ParserError => e
-          @logger.warn("Failed to parse JSON from event data: #{e.message}")
+          @logger.warn("Failed to parse JSON from event data: #{describe_parse_error(e, event[:data])}")
         rescue StandardError => e
           @logger.error("Error processing SSE event: #{e.message}")
         end

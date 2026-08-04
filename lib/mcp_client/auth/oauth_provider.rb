@@ -1143,7 +1143,7 @@ module MCPClient
         storage.set_token(server_url, new_token)
         new_token
       rescue JSON::ParserError => e
-        logger.warn("Invalid token refresh response: #{e.message}")
+        logger.warn("Invalid token refresh response: #{describe_parse_error(e)}")
         nil
       rescue Faraday::Error => e
         logger.warn("Network error during token refresh: #{e.message}")

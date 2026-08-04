@@ -212,7 +212,7 @@ module MCPClient
       rescue MCPClient::Errors::ConnectionError, MCPClient::Errors::TransportError, MCPClient::Errors::ServerError
         raise
       rescue JSON::ParserError => e
-        raise MCPClient::Errors::TransportError, "Invalid JSON response from server: #{e.message}"
+        raise MCPClient::Errors::TransportError, "Invalid JSON response from server: #{describe_parse_error(e)}"
       rescue Errno::ECONNREFUSED => e
         raise MCPClient::Errors::ConnectionError, "Server connection lost: #{e.message}"
       rescue StandardError => e

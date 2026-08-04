@@ -102,6 +102,51 @@ RSpec.describe 'Sensitive data in logs' do
       streamable.cleanup
     end
 
+    it 'omits payload from parser errors on every SSE receive path' do
+      # JSON::ParserError#message quotes the OFFENDING TOKEN, so the sentinel
+      # is placed first here: an earlier test passed only because its secret
+      # sat after the first invalid token.
+      streamable = MCPClient::ServerStreamableHTTP.new(base_url: 'https://example.com', endpoint: '/rpc',
+                                                       logger: logger)
+      legacy = MCPClient::ServerSSE.new(base_url: 'https://example.com/sse', logger: logger)
+
+      streamable.send(:handle_server_message, '{LEAK-GET-111 : 1}')
+      streamable.send(:parse_sse_event_data, '{LEAK-POST-222 : 1}')
+      legacy.send(:handle_message_event, { data: '{LEAK-SSE-333 : 1}' })
+
+      %w[LEAK-GET-111 LEAK-POST-222 LEAK-SSE-333].each do |sentinel|
+        expect(log_output.string).not_to include(sentinel)
+      end
+      expect(log_output.string).to include('malformed JSON')
+      streamable.cleanup
+      legacy.cleanup
+    end
+
+    it 'omits payload from the exception raised for a malformed response body' do
+      server = MCPClient::ServerHTTP.new(base_url: 'https://example.com', endpoint: '/rpc', logger: logger)
+      response = instance_double(Faraday::Response, status: 200, body: '{LEAK-HTTP-444 : 1}')
+
+      expect { server.send(:parse_response, response) }
+        .to raise_error(MCPClient::Errors::TransportError) { |e|
+              expect(e.message).not_to include('LEAK-HTTP-444')
+              expect(e.message).to include('Invalid JSON response from server')
+            }
+    end
+
+    it 'keeps the position, which is what makes a parse failure diagnosable' do
+      error = begin
+        JSON.parse('{LEAK-555 : 1}')
+      rescue JSON::ParserError => e
+        e
+      end
+      described = MCPClient::ServerHTTP.new(base_url: 'https://example.com', logger: logger)
+                                       .send(:describe_parse_error, error, '{LEAK-555 : 1}')
+
+      expect(described).not_to include('LEAK-555')
+      expect(described).to match(/line 1 column 2/)
+      expect(described).to include('bytes')
+    end
+
     it 'omits response bodies, logging only the status and size' do
       response = instance_double(Faraday::Response, status: 200, body: '{"result":{"ssn":"123-45-6789"}}')
 
