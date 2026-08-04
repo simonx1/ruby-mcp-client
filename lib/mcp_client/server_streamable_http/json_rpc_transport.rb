@@ -258,7 +258,9 @@ module MCPClient
         message = JSON.parse(json_data)
         return message if message.is_a?(Hash)
 
-        @logger.warn("Skipping non-object JSON-RPC message in SSE event: #{message.inspect}")
+        # Type only: the value is peer-controlled payload and may carry tool
+        # arguments, results or elicitation content.
+        @logger.warn("Skipping non-object JSON-RPC message in SSE event (#{message.class})")
         nil
       rescue JSON::ParserError => e
         @logger.warn("Skipping invalid JSON in SSE event: #{e.message}")

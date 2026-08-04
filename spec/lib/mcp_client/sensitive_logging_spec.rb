@@ -87,6 +87,21 @@ RSpec.describe 'Sensitive data in logs' do
       streamable.cleanup
     end
 
+    it 'omits peer payload from non-object and malformed SSE messages' do
+      # Both paths previously logged the value: a non-object JSON payload at
+      # WARN (on by default) and malformed data at DEBUG.
+      streamable = MCPClient::ServerStreamableHTTP.new(base_url: 'https://example.com', endpoint: '/rpc',
+                                                       logger: logger)
+
+      streamable.send(:handle_server_message, '"ssn-123-45-6789"')
+      streamable.send(:handle_server_message, '{not json ssn-987-65-4321}')
+
+      expect(log_output.string).not_to include('123-45-6789')
+      expect(log_output.string).not_to include('987-65-4321')
+      expect(log_output.string).to match(/non-object JSON-RPC message/)
+      streamable.cleanup
+    end
+
     it 'omits response bodies, logging only the status and size' do
       response = instance_double(Faraday::Response, status: 200, body: '{"result":{"ssn":"123-45-6789"}}')
 
