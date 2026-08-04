@@ -11,7 +11,7 @@ GIT
 PATH
   remote: .
   specs:
-    ruby-mcp-client (2.0.0)
+    ruby-mcp-client (2.1.0)
       base64 (~> 0.2)
       faraday (~> 2.0)
       faraday-follow_redirects (~> 0.3)
@@ -194,4 +194,4 @@ DEPENDENCIES
   yard (~> 0.9.34)
 
 BUNDLED WITH
-   4.0.17
+  4.0.17

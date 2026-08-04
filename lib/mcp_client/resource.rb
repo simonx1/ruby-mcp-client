@@ -36,7 +36,6 @@ module MCPClient
     # @param icons [Array<Hash>, nil] optional icons for display in user interfaces (MCP 2025-11-25)
     # @param meta [Hash, nil] optional `_meta` metadata attached to the resource (MCP 2025-11-25)
     # @param server [MCPClient::ServerBase, nil] the server this resource belongs to
-    # rubocop:disable Metrics/ParameterLists
     def initialize(uri:, name:, title: nil, description: nil, mime_type: nil, size: nil, annotations: nil,
                    icons: nil, meta: nil, server: nil)
       @uri = uri
@@ -50,7 +49,6 @@ module MCPClient
       @meta = meta
       @server = server
     end
-    # rubocop:enable Metrics/ParameterLists
 
     # Return the lastModified annotation value (ISO 8601 timestamp string)
     # @return [String, nil] the lastModified timestamp, or nil if not set

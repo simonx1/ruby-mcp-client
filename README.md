@@ -47,6 +47,10 @@ with a revision it cannot speak (supported: `2025-11-25`, `2025-06-18`,
 - **Metadata**: `icons`, `title` and `_meta` parsed on tools, prompts and resources
 - **OAuth 2.1**: PKCE (S256 required), RFC 8414/9728 discovery, dynamic registration, Client ID Metadata Documents, scope step-up challenges
 
+Transports treat the server as untrusted input — see
+[Treating the Server as Untrusted](#treating-the-server-as-untrusted) for the
+limits applied to peer-controlled data.
+
 ## Quick Connect API (Recommended)
 
 The simplest way to connect to an MCP server:
@@ -401,11 +405,48 @@ The `retries:` option controls automatic retry with exponential backoff. Only
 failures where the request most likely did **not** complete at the server are
 retried: transport/network errors and HTTP **5xx** responses. Application-level
 failures — a JSON-RPC error response or an HTTP **4xx** — are **never** retried,
-because the server already processed or rejected the request and re-sending
-would risk re-executing a non-idempotent `tools/call`. Retryable server failures
-raise `MCPClient::Errors::TransientServerError`, a subclass of
+because the server already processed or rejected the request. Retryable server
+failures raise `MCPClient::Errors::TransientServerError`, a subclass of
 `MCPClient::Errors::ServerError`, so existing `rescue ServerError` handlers are
 unaffected.
+
+**`tools/call` is never retried automatically.** Even a "transient" failure can
+arrive *after* the server executed the request, and JSON-RPC has no idempotency
+key that would make a replay safe — so a retry could run a side effect twice.
+Retry a tool call explicitly if your application knows it is safe to repeat, and
+treat the raised error as *outcome unknown* rather than *not executed*:
+
+```ruby
+begin
+  client.call_tool('send_invoice', { customer: 'acme' })
+rescue MCPClient::Errors::TransportError => e
+  # The server may or may not have sent the invoice. Check before retrying.
+end
+```
+
+The same reasoning excludes `RequestTimeoutError` and `ResponseTooLargeError`
+from retries, and applies to session recovery: if a `tools/call` comes back with
+an expired-session 404, the client starts a fresh session but does **not** re-send
+the call — it raises so you can decide. Idempotent requests are re-sent against
+the new session as before.
+
+### Response Size Limits (Streamable HTTP)
+
+A gzip-encoded response is decompressed incrementally and abandoned once it
+expands past `max_decompressed_body_bytes` (default **64 MiB**), so a small
+highly-compressed body cannot exhaust memory. Exceeding it raises
+`MCPClient::Errors::ResponseTooLargeError`.
+
+Raise the limit if you legitimately exchange very large payloads — base64
+resource blobs or audio — so that whether a response is accepted does not depend
+on the server's choice to compress it:
+
+```ruby
+MCPClient.streamable_http_config(
+  base_url: 'https://api.example.com/mcp',
+  max_decompressed_body_bytes: 256 * 1024 * 1024
+)
+```
 
 ### Faraday Customization
 
@@ -646,10 +687,45 @@ tools = client.list_tools
 result = client.call_tool('echo', { message: 'Hello!' })
 ```
 
+## Treating the Server as Untrusted
+
+A connected MCP server controls everything it sends you, and the transports are
+written on that assumption. You do not need to configure any of this — it is the
+default behaviour — but it is worth knowing what the client will refuse:
+
+| Peer-controlled input | What the client does |
+|---|---|
+| Compressed response bodies (**Streamable HTTP only** — the only transport that requests gzip) | Decompressed incrementally, abandoned past `max_decompressed_body_bytes` (64 MiB default) |
+| SSE streams | Per-connection buffer cap; events scanned incrementally, so an unterminated event costs bounded memory *and* CPU |
+| `retry:` directives | Honored, but floored so `retry: 0` cannot drive a reconnect loop |
+| SSE event IDs | Bounded length, printable ASCII only (they are echoed in `Last-Event-ID`) |
+| Legacy SSE `endpoint` events | Must stay on the connection's origin; off-origin redirects are refused, so configured credential headers never reach another host |
+| OAuth discovery URLs from a peer | Must be HTTPS, and rejected when the host is a *literal* loopback/private/link-local address (unless the configured server is itself local); a refused challenge fails closed. Hostnames are not resolved, so a public name pointing at a private address is not caught — see the note below |
+| Unsolicited JSON-RPC responses | Discarded — only IDs with an outstanding request are accepted |
+| Server-initiated requests | Replies are bounded by a concurrency budget rather than spawning unbounded threads |
+| Schema `pattern` values | Matched under a whole-operation time budget; a timeout fails validation rather than silently passing |
+| Log messages (`notifications/message`) | Control characters escaped and length-capped, so a server cannot forge log lines |
+
+**Known limit:** the OAuth check is textual. A peer can still advertise a public
+hostname whose DNS record points inside your network; catching that needs
+resolution-time filtering in the HTTP layer, which this gem does not do. If you
+run in an environment where that matters, restrict egress at the network layer.
+
+Two related defaults worth calling out because they affect *your* data rather
+than the peer's:
+
+- **Payloads are never written to logs.** At DEBUG the client logs a method/id
+  summary and a byte count, not request params, response bodies or raw SSE
+  chunks. Server configurations are logged with credential-bearing keys redacted.
+- **Host exceptions are not reflected to the server.** A raising elicitation,
+  sampling or roots handler yields a constant JSON-RPC error message; the detail
+  stays in your local log.
+
 ## Requirements
 
 - Ruby >= 3.2.0
-- No runtime dependencies
+- Runtime dependencies: `faraday` (~> 2.0) with `faraday-follow_redirects` and
+  `faraday-retry`, plus `base64` — all pulled in automatically by the gem
 
 Development uses Ruby 4.0.6 (see `.ruby-version`). CI runs the suite on 4.0.6
 plus the supported floor, 3.2 and 3.3.

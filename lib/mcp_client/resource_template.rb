@@ -34,7 +34,6 @@ module MCPClient
     # @param icons [Array<Hash>, nil] optional icons for display in user interfaces (MCP 2025-11-25)
     # @param meta [Hash, nil] optional `_meta` metadata attached to the resource template (MCP 2025-11-25)
     # @param server [MCPClient::ServerBase, nil] the server this resource template belongs to
-    # rubocop:disable Metrics/ParameterLists
     def initialize(uri_template:, name:, title: nil, description: nil, mime_type: nil, annotations: nil,
                    icons: nil, meta: nil, server: nil)
       @uri_template = uri_template
@@ -47,7 +46,6 @@ module MCPClient
       @meta = meta
       @server = server
     end
-    # rubocop:enable Metrics/ParameterLists
 
     # Create a ResourceTemplate instance from JSON data
     # @param data [Hash] JSON data from MCP server

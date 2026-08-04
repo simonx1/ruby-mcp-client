@@ -100,13 +100,11 @@ module MCPClient
       # @param tos_uri [String, nil] URL of the client terms of service
       # @param policy_uri [String, nil] URL of the client privacy policy
       # @param contacts [Array<String>, nil] List of contact emails for the client
-      # rubocop:disable Metrics/ParameterLists
       def initialize(redirect_uris:, token_endpoint_auth_method: 'none',
                      grant_types: %w[authorization_code refresh_token],
                      response_types: ['code'], scope: nil,
                      client_name: nil, client_uri: nil, logo_uri: nil,
                      tos_uri: nil, policy_uri: nil, contacts: nil)
-        # rubocop:enable Metrics/ParameterLists
         @redirect_uris = redirect_uris
         @token_endpoint_auth_method = token_endpoint_auth_method
         @grant_types = grant_types
@@ -238,11 +236,9 @@ module MCPClient
       # @param code_challenge_methods_supported [Array<String>, nil] Supported PKCE code challenge methods (RFC 8414)
       # @param client_id_metadata_document_supported [Boolean, nil] Whether the server accepts
       #   Client ID Metadata Document client IDs (MCP 2025-11-25 / SEP-991)
-      # rubocop:disable Metrics/ParameterLists
       def initialize(issuer:, authorization_endpoint:, token_endpoint:, registration_endpoint: nil,
                      scopes_supported: nil, response_types_supported: nil, grant_types_supported: nil,
                      code_challenge_methods_supported: nil, client_id_metadata_document_supported: nil)
-        # rubocop:enable Metrics/ParameterLists
         @issuer = issuer
         @authorization_endpoint = authorization_endpoint
         @token_endpoint = token_endpoint

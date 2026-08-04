@@ -35,6 +35,11 @@ Metrics/PerceivedComplexity:
 
 Metrics/ParameterLists:
   Max: 8
+  # The *_config builders are keyword-only option factories: every keyword is a
+  # documented, defaulted transport setting. Counting those against a limit
+  # meant for positional arguments would push new options into an opaque
+  # options hash, which is worse for callers.
+  CountKeywordArgs: false
 
 Metrics/ModuleLength:
   Max: 500
