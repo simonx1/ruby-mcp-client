@@ -112,6 +112,29 @@ module MCPClient
       end
     end
 
+    # Resend a request against the freshly restarted session — unless doing so
+    # could execute a side effect twice.
+    #
+    # A 404 usually means the server rejected the request outright, but it does
+    # not prove that: a session can expire after the tool ran. Automatic
+    # session recovery is worth having for idempotent methods, and would
+    # otherwise be a hole straight through the no-replay guarantee that
+    # with_retry enforces for NON_IDEMPOTENT_METHODS.
+    #
+    # Raises ConnectionError (which with_retry never retries) so no other path
+    # can turn this into a second attempt.
+    # @param request [Hash] the JSON-RPC request that hit the expired session
+    # @return [Faraday::Response] the response to the resent request
+    # @raise [MCPClient::Errors::ConnectionError] for a non-idempotent method
+    def resend_after_session_restart(request)
+      method = request['method']
+      return send_http_request(request) unless NON_IDEMPOTENT_METHODS.include?(method)
+
+      raise MCPClient::Errors::ConnectionError,
+            "Session expired during #{method}; a new session was started but the request was NOT resent " \
+            'because it may already have executed. Retry it explicitly if that is safe.'
+    end
+
     # Validate session ID format
     # Per MCP 2025-11-25, the server-assigned session ID "MUST only contain
     # visible ASCII characters (ranging from 0x21 to 0x7E)" — e.g. a UUID, a
@@ -274,14 +297,14 @@ module MCPClient
         # Recheck now that the monitor is held: another caller may already
         # have restarted the session while this one waited. If so, skip the
         # extra initialize and just resend against the fresh session.
-        return send_http_request(request) if @session_id != expired_session_id
+        return resend_after_session_restart(request) if @session_id != expired_session_id
 
         @logger.warn("Session #{@session_id} no longer valid (HTTP 404); starting a new session")
         @restarting_session = true
         @session_id = nil
         @last_event_id = nil if instance_variable_defined?(:@last_event_id)
         perform_initialize
-        send_http_request(request)
+        resend_after_session_restart(request)
       ensure
         @restarting_session = false
       end

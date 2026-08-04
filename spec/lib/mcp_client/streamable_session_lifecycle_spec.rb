@@ -149,6 +149,76 @@ RSpec.describe 'Streamable HTTP session lifecycle (MCP 2025-11-25)' do
       expect(list_requests.last.headers['Mcp-Session-Id']).to eq('sess-2')
     end
 
+    it 'restarts the session but does NOT resend a non-idempotent tools/call' do
+      # A 404 usually means the request was rejected, but it does not prove it:
+      # the session can expire after the tool ran. Resending here would be a
+      # hole straight through the no-replay guarantee.
+      init_count = 0
+      stub_request(:post, "#{base_url}#{endpoint}")
+        .with(body: hash_including('method' => 'initialize'))
+        .to_return do |_request|
+          init_count += 1
+          { status: 200, body: init_body,
+            headers: { 'Content-Type' => 'text/event-stream', 'Mcp-Session-Id' => "sess-#{init_count}" } }
+        end
+      stub_request(:post, "#{base_url}#{endpoint}")
+        .with(body: hash_including('method' => 'notifications/initialized'))
+        .to_return(status: 202, body: '')
+      stub_request(:get, "#{base_url}#{endpoint}").to_return(status: 200, body: '')
+
+      calls = []
+      stub_request(:post, "#{base_url}#{endpoint}")
+        .with(body: hash_including('method' => 'tools/call'))
+        .to_return do |request|
+          calls << request
+          { status: 404, body: 'session gone' }
+        end
+
+      server.connect
+      request = { 'jsonrpc' => '2.0', 'id' => 7, 'method' => 'tools/call',
+                  'params' => { 'name' => 'send_money' } }
+
+      expect { server.send(:send_http_request, request) }
+        .to raise_error(MCPClient::Errors::ConnectionError, /NOT resent|may already have executed/)
+
+      expect(calls.size).to eq(1)          # attempted once, never replayed
+      expect(init_count).to eq(2)          # the session WAS restarted
+    end
+
+    it 'still resends an idempotent request after a session restart' do
+      init_count = 0
+      stub_request(:post, "#{base_url}#{endpoint}")
+        .with(body: hash_including('method' => 'initialize'))
+        .to_return do |_request|
+          init_count += 1
+          { status: 200, body: init_body,
+            headers: { 'Content-Type' => 'text/event-stream', 'Mcp-Session-Id' => "sess-#{init_count}" } }
+        end
+      stub_request(:post, "#{base_url}#{endpoint}")
+        .with(body: hash_including('method' => 'notifications/initialized'))
+        .to_return(status: 202, body: '')
+      stub_request(:get, "#{base_url}#{endpoint}").to_return(status: 200, body: '')
+
+      list_requests = []
+      stub_request(:post, "#{base_url}#{endpoint}")
+        .with(body: hash_including('method' => 'tools/list'))
+        .to_return do |request|
+          list_requests << request
+          if request.headers['Mcp-Session-Id'] == 'sess-1'
+            { status: 404, body: 'session gone' }
+          else
+            { status: 200, body: tools_body, headers: { 'Content-Type' => 'text/event-stream' } }
+          end
+        end
+
+      server.connect
+      request = { 'jsonrpc' => '2.0', 'id' => 8, 'method' => 'tools/list', 'params' => {} }
+      server.send(:send_http_request, request)
+
+      expect(list_requests.size).to eq(2)  # recovery still works for reads
+      expect(list_requests.last.headers['Mcp-Session-Id']).to eq('sess-2')
+    end
+
     it 'skips re-initialization when another caller already restarted the session' do
       init_count = 0
       stub_request(:post, "#{base_url}#{endpoint}")
