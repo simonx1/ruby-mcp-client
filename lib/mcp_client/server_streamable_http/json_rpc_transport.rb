@@ -78,7 +78,7 @@ module MCPClient
 
         process_jsonrpc_response(data)
       rescue JSON::ParserError => e
-        raise MCPClient::Errors::TransportError, "Invalid JSON response from server: #{e.message}"
+        raise MCPClient::Errors::TransportError, "Invalid JSON response from server: #{describe_parse_error(e)}"
       end
 
       # Incrementally decompress a gzip response body, aborting once the
@@ -263,7 +263,7 @@ module MCPClient
         @logger.warn("Skipping non-object JSON-RPC message in SSE event (#{message.class})")
         nil
       rescue JSON::ParserError => e
-        @logger.warn("Skipping invalid JSON in SSE event: #{e.message}")
+        @logger.warn("Skipping invalid JSON in SSE event: #{describe_parse_error(e, json_data)}")
         :invalid
       end
 
