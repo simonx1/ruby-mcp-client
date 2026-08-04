@@ -80,6 +80,24 @@ module MCPClient
       parts.join(' ')
     end
 
+    # A log-safe description of a JSON parse failure.
+    #
+    # JSON::ParserError#message quotes the offending token — e.g.
+    # "expected object key, got 'SECRET-123' at line 1 column 2" — so
+    # interpolating it puts peer-controlled bytes straight into logs and
+    # exception messages. Keep the position, which is what actually helps
+    # diagnose a broken server, and drop the quoted content.
+    # @param error [JSON::ParserError] the parse failure
+    # @param payload [String, nil] the payload that failed to parse
+    # @return [String] position and size, never payload content
+    def describe_parse_error(error, payload = nil)
+      location = error.message[/at line \d+ column \d+/]
+      parts = ['malformed JSON']
+      parts << location if location
+      parts << describe_body_size(payload) if payload
+      parts.join(', ')
+    end
+
     # A log-safe description of a payload body: its size, never its content.
     # @param body [String, nil] the response/request body
     # @return [String]

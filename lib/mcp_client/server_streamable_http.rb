@@ -1101,7 +1101,7 @@ module MCPClient
       rescue JSON::ParserError => e
         # The parser message names the failure position, not the payload; the
         # payload itself stays out of the log.
-        @logger.error("Invalid JSON in server message: #{e.message} (#{describe_body_size(data)})")
+        @logger.error("Invalid JSON in server message: #{describe_parse_error(e, data)}")
       end
     end
 
