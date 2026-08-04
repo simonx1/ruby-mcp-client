@@ -1089,10 +1089,19 @@ module MCPClient
       return if data.empty?
 
       begin
-        dispatch_server_message(JSON.parse(data))
+        message = JSON.parse(data)
+        unless message.is_a?(Hash)
+          # A JSON-parseable scalar/array is not a JSON-RPC message; dispatch
+          # would raise on it. Log the type, never the value.
+          @logger.warn("Skipping non-object JSON-RPC message on the events stream (#{message.class})")
+          return
+        end
+
+        dispatch_server_message(message)
       rescue JSON::ParserError => e
-        @logger.error("Invalid JSON in server message: #{e.message}")
-        @logger.debug("Raw data: #{data.inspect}") if @logger.level <= Logger::DEBUG
+        # The parser message names the failure position, not the payload; the
+        # payload itself stays out of the log.
+        @logger.error("Invalid JSON in server message: #{e.message} (#{describe_body_size(data)})")
       end
     end
 
