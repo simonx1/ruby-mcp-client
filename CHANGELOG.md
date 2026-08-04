@@ -4,9 +4,9 @@
 
 A security pass over every transport, driven by an external scan of the 2.0.0
 codebase (50 findings: 12 medium, 38 low) and a second, adversarial review of
-each fix (PRs #188–#210). Every finding was reproduced before it was fixed and
-re-verified afterwards — including two bugs found by reviewing the release
-notes themselves against the code (#209, #210).
+each fix (PRs #188–#211). Every finding was reproduced before it was fixed and
+re-verified afterwards — including three bugs found by reviewing the release
+notes themselves against the code (#209, #210, #211).
 
 The theme: **a remote MCP server is untrusted input.** 2.0.0 was correct against
 a cooperative server but assumed good faith in places where a hostile — or merely
@@ -45,15 +45,18 @@ retries, logs and reflects back.
   server. Peers receive `'Internal error'` / `'Sampling error'` /
   `'Elicitation handler error'`; the detail stays in the local log. Error
   **codes** are unchanged.
-- **Logs no longer contain payloads** (#198, #210). Request params, response
-  bodies and raw SSE chunks are replaced by a method/id summary and a byte count,
-  so enabling DEBUG no longer records `tools/call` arguments, tool results or
-  elicitation content. The SSE *error* paths are covered too: a non-object JSON
-  payload used to be logged with `#inspect` at **WARN**, which the default
-  logger emits, so that one leaked without DEBUG being enabled at all. Server
-  configs are logged with credential-bearing keys redacted, and peer-supplied
-  log messages are control-character escaped and capped (a server could
-  otherwise forge log lines).
+- **Logs no longer contain payloads** (#198, #210, #211). Request params,
+  response bodies and raw SSE chunks are replaced by a method/id summary and a
+  byte count, so enabling DEBUG no longer records `tools/call` arguments, tool
+  results or elicitation content. The *error* paths are covered too, and they
+  were the leakier ones: a non-object JSON payload used to be logged with
+  `#inspect` at **WARN** (which the default logger emits, so it leaked with
+  DEBUG off), and `JSON::ParserError#message` quotes the offending token, so
+  malformed peer JSON echoed into logs and into the `Invalid JSON response from
+  server` exception on every transport. Parse failures now report position and
+  size only. Server configs are logged with credential-bearing keys redacted,
+  and peer-supplied log messages are control-character escaped and capped (a
+  server could otherwise forge log lines).
 - **Cross-origin traffic is refused on the legacy SSE transport** (#189). An
   `endpoint` control event that changes scheme/host/port fails the handshake, and
   redirects that leave the connection origin are refused — `faraday-follow_redirects`
