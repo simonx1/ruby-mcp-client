@@ -14,5 +14,13 @@ group :development, :test do
   gem 'webmock'
   # gem "openai", github: "openai/openai-ruby", branch: "main"
   gem 'byebug'
-  gem 'openai', github: 'openai/openai-ruby', branch: 'main'
+  # The official OpenAI SDK declares required_ruby_version >= 3.3.0, but this
+  # gem still supports 3.2 (see required_ruby_version in the gemspec) and CI
+  # tests that floor. Nothing in the suite needs it -- spec_helper's
+  # `require 'openai'` resolves to ruby-openai, which also ships lib/openai.rb
+  # -- it is only used by examples/openai_ruby_mcp.rb. So skip it on 3.2
+  # rather than letting a dev-only dependency dictate the library's floor.
+  if Gem::Version.new(RUBY_VERSION) >= Gem::Version.new('3.3')
+    gem 'openai', github: 'openai/openai-ruby', branch: 'main'
+  end
 end
