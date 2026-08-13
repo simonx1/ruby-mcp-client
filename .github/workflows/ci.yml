@@ -43,11 +43,21 @@ jobs:
     steps:
     - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
 
+    # bundler-cache implies `bundle config set --local deployment true`, which
+    # demands that the Gemfile's dependency list match Gemfile.lock exactly.
+    # On 3.2 the Gemfile deliberately resolves a smaller set — it skips the
+    # OpenAI SDK, which requires Ruby >= 3.3 and is only used by an example —
+    # so deployment mode would reject the lockfile there. That job installs
+    # uncached instead; the lockfile still pins every version it can use.
     - name: Set up Ruby
       uses: ruby/setup-ruby@95ef2b042f9d7a56d8268cba8559e2842e2ad01b # v1
       with:
         ruby-version: ${{ matrix.ruby-version }}
-        bundler-cache: true
+        bundler-cache: ${{ matrix.ruby-version != '3.2' }}
+
+    - name: Install dependencies (uncached)
+      if: matrix.ruby-version == '3.2'
+      run: bundle install --jobs 4
 
     - name: Run RuboCop
       run: bundle exec rubocop
