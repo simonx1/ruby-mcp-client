@@ -723,12 +723,12 @@ than the peer's:
 
 ## Requirements
 
-- Ruby >= 3.2.0
+- Ruby >= 3.3.0
 - Runtime dependencies: `faraday` (~> 2.0) with `faraday-follow_redirects` and
   `faraday-retry`, plus `base64` — all pulled in automatically by the gem
 
 Development uses Ruby 4.0.6 (see `.ruby-version`). CI runs the suite on 4.0.6
-plus the supported floor, 3.2 and 3.3.
+plus the supported floor, 3.3.
 
 ## License
 
