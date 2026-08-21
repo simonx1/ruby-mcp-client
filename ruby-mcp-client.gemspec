@@ -15,7 +15,7 @@ Gem::Specification.new do |spec|
   spec.license       = 'MIT'
 
   spec.files         = Dir.glob('lib/**/*.rb') + ['README.md', 'LICENSE']
-  spec.required_ruby_version = '>= 3.2.0'
+  spec.required_ruby_version = '>= 3.3.0'
   spec.require_paths = ['lib']
   # base64 is required by the OAuth/PKCE and content helpers. It became a
   # bundled (non-default) gem in Ruby 3.4, so it must be declared explicitly
