@@ -522,7 +522,7 @@ module MCPClient
 
       begin
         response = with_request_watchdog(deadline) do
-          conn.post(@endpoint) do |req|
+          post_json_rpc(conn) do |req|
             prepare_http_request(req, request, sent_session_id, timeout, capture, extra_headers)
           end
         end
@@ -758,6 +758,18 @@ module MCPClient
       jsonrpc_error_from_http_response(response, "Client error: HTTP #{status} #{error.message}".strip)
     end
 
+    # POST a JSON-RPC request; a failure before any response records the
+    # Authorization the request went out with when Faraday kept it.
+    # @param conn [Faraday::Connection]
+    # @yield [Faraday::Request]
+    # @return [Faraday::Response]
+    def post_json_rpc(conn, &)
+      conn.post(@endpoint, &)
+    rescue Faraday::Error => e
+      note_failed_request_authorization(e)
+      raise
+    end
+
     # Apply headers to the HTTP request (can be overridden by subclasses)
     # @param req [Faraday::Request] HTTP request
     # @param _request [Hash] JSON-RPC request
@@ -769,6 +781,9 @@ module MCPClient
       @logger.debug("OAuth provider present: #{@oauth_provider ? 'yes' : 'no'}")
       @oauth_provider&.apply_authorization(req)
       note_request_authorization(req.headers['Authorization'])
+      # Middleware installed through faraday_config may still change the
+      # header: the context of this attempt is known once it was sent.
+      note_request_authorization_pending if @faraday_config
 
       # MCP 2026-07-28: every POST carries MCP-Protocol-Version (matching the
       # body's _meta), Mcp-Method and, for named requests, Mcp-Name.
