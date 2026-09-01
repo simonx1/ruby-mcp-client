@@ -181,12 +181,16 @@ RSpec.describe MCPClient::SchemaValidator do
                     unevaluatedProperties unevaluatedItems]
       expect(described_class::UNSUPPORTED_KEYWORDS).to match_array(keywords)
       keywords.each do |keyword|
-        expect(described_class.unsupported_keywords({ keyword => {} })).to eq([keyword])
+        # Under a dialect that defines the keyword.
+        dialect = described_class::DIALECT_KEYWORDS.fetch(keyword, [described_class::DEFAULT_DIALECT]).first
+        expect(described_class.unsupported_keywords({ '$schema' => dialect, keyword => {} })).to eq([keyword])
       end
     end
 
     it 'detects unapplied 2020-12 assertion keywords nested in property subschemas' do
       schema = {
+        # additionalItems and the items tuple only exist before 2020-12.
+        '$schema' => 'http://json-schema.org/draft-07/schema#',
         'type' => 'object',
         'properties' => {
           'email' => { 'type' => 'string', 'format' => 'email' },

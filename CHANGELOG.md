@@ -38,6 +38,19 @@ metadata). Each feature lands in its own PR; this section accumulates them.
   2020-12, where an `items` array is invalid; an `items` array in draft-07
   and 2019-09); a present but malformed `$schema` makes the schema
   unusable; an `outputSchema` of `false` is preserved by `Tool.from_json`.
+  The keyword grammar follows the dialect (`DIALECT_KEYWORDS`): a keyword
+  the dialect does not define (`prefixItems` or `$dynamicRef` in draft-07,
+  `dependencies` or `additionalItems` in 2020-12, ...) is ignored rather
+  than shape-checked or reported, draft-07 `dependencies` accepts property
+  name arrays, draft-07 boolean `exclusiveMinimum` / `exclusiveMaximum`
+  make `minimum` / `maximum` exclusive (the other dialect's form is a
+  schema problem), a draft-07 `$ref` hides its sibling applicators at
+  preflight too, plain-name fragments (`#name`) resolve to `$anchor` /
+  `$dynamicAnchor` (2019-09, 2020-12) or `$id: "#name"` (draft-07), and an
+  external `$recursiveRef` (2019-09) makes the schema unusable like an
+  external `$dynamicRef`. `Tool#structured_output?` is true for any
+  provided `outputSchema`, the empty schema `{}` included, so such a tool's
+  successful result must carry `structuredContent`.
 - **structuredContent.** Any JSON value is accepted, including `null`:
   presence is decided by the `structuredContent` key, and the value —
   object, array, scalar or null — is validated against the output schema.
