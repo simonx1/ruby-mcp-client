@@ -1,6 +1,7 @@
 # frozen_string_literal: true
 
 require 'open3'
+require 'monitor'
 require 'json'
 require_relative 'version'
 require 'logger'
@@ -43,12 +44,6 @@ module MCPClient
     # - :legacy skip the probe and run the initialize handshake
     PROTOCOL_MODES = %i[auto modern legacy].freeze
 
-    # Default ceiling (seconds) on the server/discover probe. A legacy server
-    # answers an unknown pre-initialize request with an error almost
-    # immediately, so the probe rarely waits this long; the cap only bounds
-    # the fallback delay for a legacy server that stays silent.
-    DISCOVER_TIMEOUT = 5
-
     # Initialize a new ServerStdio instance
     # @param command [String, Array] the stdio command to launch the MCP JSON-RPC server
     #   For improved security, passing an Array is recommended to avoid shell injection issues
@@ -61,7 +56,8 @@ module MCPClient
     # @param protocol [Symbol] :auto (probe, fall back to initialize), :modern
     #   (probe, no fallback) or :legacy (initialize handshake only)
     # @param discover_timeout [Numeric, nil] seconds to wait for the
-    #   server/discover probe (default: the smaller of read_timeout and 5)
+    #   server/discover probe (default: read_timeout — a modern server that is
+    #   slow to start must not be misclassified as legacy)
     def initialize(command:, retries: 0, retry_backoff: 1, read_timeout: READ_TIMEOUT, name: nil, logger: nil, env: {},
                    protocol: :auto, discover_timeout: nil)
       super(name: name)
@@ -70,11 +66,15 @@ module MCPClient
       end
 
       @protocol_mode = protocol
-      @discover_timeout = discover_timeout || [read_timeout, DISCOVER_TIMEOUT].min
+      @discover_timeout = discover_timeout || read_timeout
       @command_array = command.is_a?(Array) ? command : nil
       @command = command.is_a?(Array) ? command.join(' ') : command
       @mutex = Mutex.new
       @cond = ConditionVariable.new
+      # Serializes process start and protocol negotiation: two threads must
+      # not each spawn the server or run the probe and the fallback on the
+      # same pipes. Reentrant because negotiation waits on @mutex inside.
+      @init_lock = Monitor.new
       @next_id = 1
       @pending = {}
       # Ids of requests awaiting a response; used to drop late/unsolicited

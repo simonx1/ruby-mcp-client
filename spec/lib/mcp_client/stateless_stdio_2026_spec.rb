@@ -167,12 +167,12 @@ RSpec.describe 'MCP 2026-07-28 stateless protocol (stdio)' do
       expect(first[META_VERSION]).to eq('2026-07-28')
     end
 
-    it 'declares roots without listChanged in modern mode (the notification was removed)' do
+    it 'declares roots with listChanged only to legacy servers (removed in 2026-07-28)' do
       transport.instance_variable_set(:@roots_list_request_callback, proc {})
       transport.protocol_version = '2025-11-25'
       expect(transport.client_capabilities['roots']).to eq({ 'listChanged' => true })
       transport.protocol_version = '2026-07-28'
-      expect(transport.client_capabilities['roots']).to eq({})
+      expect(transport.client_capabilities).not_to have_key('roots')
     end
 
     it 'declares negotiated extensions under clientCapabilities.extensions' do
@@ -504,6 +504,161 @@ RSpec.describe 'MCP 2026-07-28 stateless protocol (stdio)' do
     it 'defaults the stdio protocol mode to :auto' do
       server = MCPClient::ServerFactory.create(MCPClient.stdio_config(command: 'x'))
       expect(server.protocol_mode).to eq(:auto)
+    end
+  end
+end
+
+# Review round 2 (codex + grok): modern errors other than -32022 must not
+# fall back, roots changes must not reach a modern server even before the
+# era is known, every DiscoverResult is applied, the probe waits the full
+# read timeout, initialization is serialized, and — until the multi
+# round-trip pattern lands — modern requests do not declare capabilities
+# this client could only serve over the removed server-request channel.
+RSpec.describe 'MCP 2026-07-28 stateless protocol (stdio) — review follow-ups' do
+  def discover_result(versions: ['2026-07-28'], capabilities: { 'tools' => {} })
+    { 'resultType' => 'complete', 'supportedVersions' => versions, 'capabilities' => capabilities,
+      '_meta' => { META_SERVER_INFO => { 'name' => 'modern-server', 'version' => '9.9' } } }
+  end
+
+  def script_stdio(server, responses)
+    sent = []
+    allow(server).to receive(:connect).and_return(true)
+    allow(server).to receive(:start_reader)
+    allow(server).to receive(:start_stderr_reader)
+    server.instance_variable_set(:@stdin, double('stdin', puts: nil, flush: nil, closed?: true, close: nil))
+    allow(server).to receive(:send_request) { |req| sent << req }
+    allow(server).to receive(:wait_response) do |id, **_opts|
+      responder = responses.shift
+      raise 'no scripted response left' unless responder
+
+      response = responder.respond_to?(:call) ? responder.call(id) : responder
+      raise response if response.is_a?(Exception)
+
+      response.merge('jsonrpc' => '2.0', 'id' => id)
+    end
+    sent
+  end
+
+  let(:server) { MCPClient::ServerStdio.new(command: 'echo test', read_timeout: 1) }
+
+  it 'does not fall back to initialize on a MissingRequiredClientCapabilityError probe answer' do
+    sent = script_stdio(server, [{ 'error' => { 'code' => -32_021, 'message' => 'Missing required client capability',
+                                                'data' => { 'requiredCapabilities' => { 'elicitation' => {} } } } }])
+
+    expect { server.list_tools }.to raise_error(MCPClient::Errors::ToolCallError, /Missing required client capability/)
+    expect(sent.map { |r| r['method'] }).to eq(['server/discover'])
+    expect(server.protocol_era).to be_nil
+  end
+
+  it 'does not fall back to initialize on a HeaderMismatchError probe answer' do
+    sent = script_stdio(server, [{ 'error' => { 'code' => -32_020, 'message' => 'Header mismatch' } }])
+
+    expect { server.list_tools }.to raise_error(MCPClient::Errors::ToolCallError, /Header mismatch/)
+    expect(sent.map { |r| r['method'] }).to eq(['server/discover'])
+  end
+
+  it 'clears the tentative version when the DiscoverResult offers no mutual version' do
+    script_stdio(server, [{ 'result' => discover_result(versions: ['2099-01-01']) }])
+
+    expect { server.list_tools }.to raise_error(MCPClient::Errors::ToolCallError)
+    expect(server.protocol_era).to be_nil
+    expect(server.modern?).to be(false)
+  end
+
+  it 'never sends notifications/roots/list_changed to a modern server, even before the era is known' do
+    stdin_lines = []
+    sent = script_stdio(server, [{ 'result' => discover_result }])
+    server.instance_variable_set(:@stdin, double('stdin', flush: nil, closed?: true, close: nil).tap do |d|
+      allow(d).to receive(:puts) { |line| stdin_lines << line }
+    end)
+    server.on_roots_list_request { |_id, _params| { 'roots' => [] } }
+
+    server.rpc_notify('notifications/roots/list_changed', {})
+
+    expect(sent.map { |r| r['method'] }).to eq(['server/discover'])
+    expect(stdin_lines.map { |l| JSON.parse(l)['method'] }).not_to include('notifications/roots/list_changed')
+  end
+
+  it 'still forwards other notifications to a modern server' do
+    stdin_lines = []
+    script_stdio(server, [{ 'result' => discover_result }])
+    server.instance_variable_set(:@stdin, double('stdin', flush: nil, closed?: true, close: nil).tap do |d|
+      allow(d).to receive(:puts) { |line| stdin_lines << line }
+    end)
+
+    server.rpc_notify('notifications/cancelled', { 'requestId' => 1 })
+
+    expect(stdin_lines.map { |l| JSON.parse(l)['method'] }).to include('notifications/cancelled')
+  end
+
+  it 'applies every DiscoverResult, not only the probe' do
+    script_stdio(server, [{ 'result' => discover_result(capabilities: { 'tools' => {} }) },
+                          { 'result' => discover_result(capabilities: { 'tools' => {}, 'prompts' => {} }) }])
+
+    server.ping
+    server.rpc_request('server/discover')
+
+    expect(server.capabilities).to eq({ 'tools' => {}, 'prompts' => {} })
+  end
+
+  it 'waits the full read timeout for the probe by default' do
+    server = MCPClient::ServerStdio.new(command: 'echo test', read_timeout: 20)
+    expect(server.discover_timeout).to eq(20)
+  end
+
+  it 'serializes concurrent first requests so the probe runs once' do
+    probes = 0
+    allow(server).to receive(:connect).and_return(true)
+    allow(server).to receive(:start_reader)
+    allow(server).to receive(:start_stderr_reader)
+    server.instance_variable_set(:@stdin, double('stdin', puts: nil, flush: nil, closed?: true, close: nil))
+    allow(server).to receive(:send_request)
+    allow(server).to receive(:wait_response) do |id, **_opts|
+      probes += 1
+      sleep 0.05
+      { 'jsonrpc' => '2.0', 'id' => id, 'result' => discover_result }
+    end
+
+    threads = Array.new(4) { Thread.new { server.ping } }
+    threads.each(&:join)
+
+    expect(probes).to eq(1)
+    expect(server.protocol_era).to eq(:modern)
+  end
+
+  describe 'modern client capabilities before multi round-trip support' do
+    let(:transport) do
+      Class.new do
+        include MCPClient::JsonRpcCommon
+
+        attr_accessor :protocol_version
+
+        def initialize
+          @logger = Logger.new(StringIO.new)
+        end
+      end.new
+    end
+
+    it 'omits roots, elicitation and sampling from modern requests' do
+      transport.instance_variable_set(:@roots_list_request_callback, proc {})
+      transport.instance_variable_set(:@elicitation_request_callback, proc {})
+      transport.instance_variable_set(:@sampling_request_callback, proc {})
+      transport.protocol_version = '2025-11-25'
+      expect(transport.client_capabilities.keys).to include('roots', 'elicitation', 'sampling')
+      transport.protocol_version = '2026-07-28'
+      expect(transport.client_capabilities).to eq({})
+    end
+
+    it 'surfaces an input_required result as InputRequiredError instead of a tool result' do
+      sent = script_stdio(server, [{ 'result' => discover_result },
+                                   { 'result' => { 'resultType' => 'input_required', 'requestState' => 'blob',
+                                                   'inputRequests' => { 'k' => { 'method' => 'roots/list' } } } }])
+
+      expect { server.call_tool('t', {}) }.to raise_error(MCPClient::Errors::InputRequiredError) do |e|
+        expect(e.request_state).to eq('blob')
+        expect(e.input_requests).to eq({ 'k' => { 'method' => 'roots/list' } })
+      end
+      expect(sent.size).to eq(2)
     end
   end
 end

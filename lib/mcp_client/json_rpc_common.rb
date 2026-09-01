@@ -433,20 +433,23 @@ module MCPClient
     # @return [Hash] the capabilities object for the initialize request
     def client_capabilities
       capabilities = {}
-      if registered_callback?(:@elicitation_request_callback)
-        # Both defined elicitation modes are implemented (an empty object
-        # would mean form-only per the spec's backwards-compatibility rule).
-        capabilities['elicitation'] = { 'form' => {}, 'url' => {} }
-      end
-      if registered_callback?(:@roots_list_request_callback)
-        # notifications/roots/list_changed was removed in 2026-07-28, so the
-        # modern roots capability has no listChanged flag.
-        capabilities['roots'] = modern? ? {} : { 'listChanged' => true }
-      end
-      if registered_callback?(:@sampling_request_callback)
-        # SEP-1577: servers may only send tool-enabled sampling requests when
-        # the client declares the sampling.tools sub-capability.
-        capabilities['sampling'] = sampling_tools_supported? ? { 'tools' => {} } : {}
+      # MCP 2026-07-28 delivers roots/sampling/elicitation through the multi
+      # round-trip pattern (InputRequiredResult), not server-initiated
+      # requests. Until that pattern is implemented, modern requests declare
+      # none of these: a server MUST NOT ask for what the client did not
+      # declare, so an unfulfillable input request is never provoked.
+      unless modern?
+        if registered_callback?(:@elicitation_request_callback)
+          # Both defined elicitation modes are implemented (an empty object
+          # would mean form-only per the spec's backwards-compatibility rule).
+          capabilities['elicitation'] = { 'form' => {}, 'url' => {} }
+        end
+        capabilities['roots'] = { 'listChanged' => true } if registered_callback?(:@roots_list_request_callback)
+        if registered_callback?(:@sampling_request_callback)
+          # SEP-1577: servers may only send tool-enabled sampling requests when
+          # the client declares the sampling.tools sub-capability.
+          capabilities['sampling'] = sampling_tools_supported? ? { 'tools' => {} } : {}
+        end
       end
       capabilities['extensions'] = declared_extensions.dup unless declared_extensions.empty?
       # NOTE: we intentionally do NOT declare a client `tasks` capability. That
@@ -636,7 +639,34 @@ module MCPClient
       result = response['result']
       validate_result_type!(result)
       record_server_info(result)
+      reject_unfulfillable_input_required!(result)
       result
+    end
+
+    # Notifications the 2026-07-28 revision removed; never written to a
+    # modern server (the roots capability has no listChanged there).
+    REMOVED_MODERN_NOTIFICATIONS = %w[notifications/roots/list_changed notifications/initialized].freeze
+
+    # @param method [String] a notification method
+    # @return [Boolean] whether it must be dropped for a modern server
+    def suppressed_modern_notification?(method)
+      modern? && REMOVED_MODERN_NOTIFICATIONS.include?(method)
+    end
+
+    # An InputRequiredResult asks the client to fulfil server requests and
+    # retry. This client declares no capability a modern server could use
+    # for that yet, so such a result cannot be honoured and must not be
+    # mistaken for the operation's result.
+    # @param result [Object] a JSON-RPC result
+    # @return [void]
+    # @raise [MCPClient::Errors::InputRequiredError]
+    def reject_unfulfillable_input_required!(result)
+      return unless MCPClient::JsonRpcCommon.result_type(result) == 'input_required'
+
+      raise MCPClient::Errors::InputRequiredError.new(
+        'Server returned an input_required result (multi round-trip request) that this client cannot fulfil',
+        data: result
+      )
     end
 
     # Servers SHOULD identify themselves in every result's `_meta`

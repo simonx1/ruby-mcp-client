@@ -284,6 +284,29 @@ module MCPClient
       end
     end
 
+    # Raised when a request returns an InputRequiredResult (resultType
+    # "input_required", MCP 2026-07-28 multi round-trip requests) that this
+    # client cannot fulfil — for example because it declared no capability
+    # the server could have asked for. Exposes the server's input requests
+    # and opaque request state so a host can drive the round trip itself.
+    class InputRequiredError < ServerError
+      # @return [Hash] the InputRequests map (key => request object)
+      def input_requests
+        requests = data.is_a?(Hash) ? (data['inputRequests'] || data[:inputRequests]) : nil
+        requests.is_a?(Hash) ? requests : {}
+      end
+
+      # @return [String, nil] the opaque requestState to echo on a retry
+      def request_state
+        data.is_a?(Hash) ? (data['requestState'] || data[:requestState]) : nil
+      end
+
+      # @return [Boolean] always true: a protocol-level condition, never wrapped
+      def protocol_error?
+        true
+      end
+    end
+
     # Raised when a server result is malformed at the protocol level — e.g.
     # its `resultType` is a value this client does not recognize, which MCP
     # 2026-07-28 says MUST be considered invalid. A ServerError (not a
