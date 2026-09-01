@@ -113,7 +113,7 @@ module MCPClient
       # Get current access token (refresh if needed)
       # @return [Token, nil] Current valid access token or nil
       def access_token
-        token = storage.get_token(server_url)
+        token = stored_token
         logger.debug("OAuth access_token: retrieved token=#{token ? 'present' : 'nil'} for #{server_url}")
         return nil unless token
         # A token from another authorization server is never presented
@@ -176,7 +176,7 @@ module MCPClient
         raise ArgumentError, 'Invalid state parameter' unless stored_state == state
 
         # Get stored PKCE and client info
-        pkce = storage.get_pkce(server_url)
+        pkce = stored_pkce
         client_info = storage.get_client_info(server_url)
         raise MCPClient::Errors::ConnectionError, 'Missing PKCE or client info' unless pkce && client_info
 
@@ -201,7 +201,7 @@ module MCPClient
         token = exchange_authorization_code(server_metadata, client_info, code, pkce)
 
         # Store token
-        storage.set_token(server_url, token)
+        store_token(token)
 
         # Clean up temporary data
         storage.delete_pkce(server_url)
@@ -224,8 +224,8 @@ module MCPClient
           raise MCPClient::Errors::ConnectionError, 'Authorization error response rejected: state mismatch'
         end
 
-        pkce = storage.get_pkce(server_url)
-        cached = storage.get_server_metadata(server_url)
+        pkce = stored_pkce
+        cached = stored_server_metadata
         # Only the request's own authorization server can say whether iss is
         # expected: a cache that names another server is no guide.
         cached = nil unless pkce && cached && cached.issuer == pkce.issuer
@@ -297,7 +297,7 @@ module MCPClient
       # @return [void]
       def revoke_token_on_authorization_server_change(resource_metadata)
         advertised = Array(resource_metadata&.authorization_servers).first
-        known = storage.get_server_metadata(server_url)&.issuer
+        known = stored_server_metadata&.issuer
         return unless advertised && known && advertised != known
 
         logger.debug('The challenge names another authorization server; retiring the stored token')
@@ -565,7 +565,7 @@ module MCPClient
         # whether the challenge-advertised PRM was already fetched or only its
         # URL is pending (e.g. the initial fetch failed and must be retried).
         challenge_pending = @challenge_resource_metadata || @challenge_metadata_url
-        cached = storage.get_server_metadata(server_url) unless challenge_pending
+        cached = stored_server_metadata unless challenge_pending
         if cached
           # Validate the cached entry before use so a persisted/older cache with
           # an HTTP endpoint or without S256 is still rejected.
@@ -580,7 +580,7 @@ module MCPClient
       # @return [ServerMetadata]
       # @raise [MCPClient::Errors::ConnectionError] if discovery or validation fails
       def discover_and_cache_authorization_server
-        previous = storage.get_server_metadata(server_url)
+        previous = stored_server_metadata
 
         # RFC 9728: Protected Resource Metadata is authoritative — try it first,
         # then fall back to treating the MCP server origin as its own AS.
@@ -1061,12 +1061,9 @@ module MCPClient
 
         if portable_client?(client_info)
           # A portable id is only usable where Client ID Metadata Documents
-          # are accepted; where they are not and registration is offered,
-          # the caller registers instead.
-          if server_metadata && !server_metadata.supports_client_id_metadata_documents? &&
-             server_metadata.supports_registration?
-            return nil
-          end
+          # are accepted; elsewhere the caller registers or reports that no
+          # credentials exist.
+          return nil if server_metadata && !server_metadata.supports_client_id_metadata_documents?
           # A Client ID Metadata Document client persisted before the type
           # was recorded is migrated so later checks need no inference.
           return client_info if client_info.registration_type == 'cimd'
@@ -1107,7 +1104,7 @@ module MCPClient
       #   keeps it away from another authorization server after a restart
       def delete_token(bind_to: nil)
         # Whatever the backend manages, this token is never presented again.
-        current = storage.get_token(server_url)
+        current = stored_token
         if current.respond_to?(:access_token) && current.access_token
           (@retired_tokens ||= {})[current.access_token] =
             true
@@ -1130,6 +1127,41 @@ module MCPClient
                     'ignored while the authorization server differs from its issuer.')
       end
 
+      # Storage backends may persist plain hashes (the FileTokenStorage
+      # example does); records are normalized before any field is read.
+      # @return [ServerMetadata, nil]
+      def stored_server_metadata
+        normalize_record(storage.get_server_metadata(server_url), ServerMetadata)
+      end
+
+      # @return [PKCE, nil]
+      def stored_pkce
+        normalize_record(storage.get_pkce(server_url), PKCE)
+      end
+
+      # @return [Token, nil]
+      def stored_token
+        normalize_record(storage.get_token(server_url), Token)
+      end
+
+      # @param record [Object, Hash, nil]
+      # @param klass [Class] a record class responding to from_h
+      # @return [Object, nil]
+      def normalize_record(record, klass)
+        record.is_a?(Hash) ? klass.from_h(record) : record
+      end
+
+      # Persist a token the authorization server just issued. Opaque tokens
+      # are unique only within an issuer, so a new server may legitimately
+      # issue the same bytes as a token retired at the previous one: the
+      # fresh, issuer-bound token is never mistaken for the retired one.
+      # @param token [Token]
+      # @return [void]
+      def store_token(token)
+        @retired_tokens&.delete(token.access_token) if token.respond_to?(:access_token)
+        storage.set_token(server_url, token)
+      end
+
       # Whether a stored token belongs to the authorization server currently
       # known for this resource (an unbound legacy token is trusted).
       # @param token [Token]
@@ -1139,7 +1171,7 @@ module MCPClient
         return false if token.respond_to?(:retired?) && token.retired?
         return true unless token.respond_to?(:issuer) && token.issuer
 
-        current = storage.get_server_metadata(server_url)&.issuer
+        current = stored_server_metadata&.issuer
         current.nil? || current == token.issuer
       end
 
@@ -1526,7 +1558,7 @@ module MCPClient
           issuer: server_metadata.issuer
         )
 
-        storage.set_token(server_url, new_token)
+        store_token(new_token)
         new_token
       rescue JSON::ParserError => e
         logger.warn("Invalid token refresh response: #{describe_parse_error(e)}")

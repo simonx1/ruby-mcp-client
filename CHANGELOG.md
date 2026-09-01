@@ -48,7 +48,14 @@ metadata). Each feature lands in its own PR; this section accumulates them.
   Metadata Document client is recognized by its client id); a token that
   records no issuer is never refreshed once the authorization server
   changed, and a 401 challenge naming another authorization server retires
-  the stored token at once.
+  the stored token at once. A retired token that storage cannot delete is
+  re-stored bound to its former issuer; a metadata document naming another
+  issuer is skipped in favour of the next well-known candidate; a portable
+  client id is reused only where the authorization server advertises
+  `client_id_metadata_document_supported`; storage backends that persist
+  plain hashes (like the `FileTokenStorage` example) are read back through
+  `from_h`; and a freshly issued token is never mistaken for a retired one
+  that happened to use the same bytes.
 
 ### Tasks extension (`io.modelcontextprotocol/tasks`)
 
