@@ -65,6 +65,10 @@ jobs:
       with:
         fetch-depth: 0
     - uses: anthropics/claude-code-action@833fb0f8c9f6686b33d963a8bae0a94f4936ab2a # v1.0.211
+      env:
+        # The repo's ANTHROPIC_API_KEY is an identity-linked key; the API requires
+        # the anthropic-workspace-id header on every request for such keys.
+        ANTHROPIC_CUSTOM_HEADERS: "anthropic-workspace-id: wrkspc_01LSrT7tFuppN7RCBZqHox3v"
       with:
         prompt: |
           REPO: ${{ github.repository }}
