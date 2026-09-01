@@ -134,7 +134,8 @@ module MCPClient
       client = Client.new(
         mcp_server_configs: configs,
         logger: options[:logger],
-        sampling_handler: options[:sampling_handler]
+        sampling_handler: options[:sampling_handler],
+        extensions: options[:extensions]
       )
 
       # Connect all servers
@@ -172,7 +173,8 @@ module MCPClient
       client = Client.new(
         mcp_server_configs: [config],
         logger: options[:logger],
-        sampling_handler: options[:sampling_handler]
+        sampling_handler: options[:sampling_handler],
+        extensions: options[:extensions]
       )
       client.servers.first.connect
       client

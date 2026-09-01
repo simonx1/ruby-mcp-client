@@ -46,7 +46,8 @@ RSpec.describe 'MCP 2026-07-28 tasks extension — round 8' do
     server.instance_variable_set(:@stdin, double('stdin', puts: nil, flush: nil, closed?: true, close: nil))
     allow(server).to receive(:send_request) { |req| sent << req }
     allow(server).to receive(:wait_response) do |id, **_opts|
-      responder = responses.shift
+      # A single trailing responder answers every remaining request.
+      responder = responses.first.respond_to?(:call) && responses.size == 1 ? responses.first : responses.shift
       raise 'no scripted response left' unless responder
 
       response = responder.respond_to?(:call) ? responder.call(sent.last) : responder
@@ -102,13 +103,16 @@ RSpec.describe 'MCP 2026-07-28 tasks extension — round 8' do
 
   it 'counts input rounds per task across waits' do
     client = client_for(stdio, elicitation_handler: ->(_m, _s) { { action: 'accept', content: { 'n' => 'x' } } })
-    responses = [{ 'result' => discover_result }, tool_list, { 'result' => task_result }]
-    (MCPClient::Client::TaskSupport::MAX_TASK_INPUT_ROUNDS + 2).times do |i|
-      responses << { 'result' => detailed_task(status: 'input_required', poll_ms: 20,
-                                               'inputRequests' => { "k#{i}" => elicit_request }) }
-      responses << { 'result' => {} }
-    end
-    script_stdio(stdio, responses)
+    keys = 0
+    # Every poll asks for a new key; every update is acknowledged.
+    server = lambda { |req|
+      next { 'result' => {} } if req['method'] == 'tasks/update'
+
+      keys += 1
+      { 'result' => detailed_task(status: 'input_required', poll_ms: 20,
+                                  'inputRequests' => { "k#{keys}" => elicit_request }) }
+    }
+    script_stdio(stdio, [{ 'result' => discover_result }, tool_list, { 'result' => task_result }, server])
     task = client.call_tool_as_task('slow', {})
     # Real pacing: the first wait gets through a few rounds, then times out.
     allow(client).to receive(:sleep) { |seconds| Kernel.sleep(seconds) }

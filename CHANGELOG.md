@@ -46,6 +46,15 @@ metadata). Each feature lands in its own PR; this section accumulates them.
   `TaskError`. Task notifications (`notifications/tasks`) reach the
   client's notification listeners. On Streamable HTTP, `tasks/get`,
   `tasks/update` and `tasks/cancel` carry `Mcp-Name: <taskId>`.
+- **Waiting semantics.** The caller's timeout and the task's TTL backstop
+  are tracked separately, so a later, longer `ttlMs` extends the wait and
+  the TTL of the created task bounds polls that never come back; a poll
+  that returns after the deadline ends the wait; a `tasks/update` the
+  server rejected gives its keys back (the request is presented again),
+  while one whose acknowledgement was lost is retransmitted first. Task
+  results resolved on the streaming path are validated like `call_tool`'s.
+  `MCPClient.connect(..., extensions: [...])` forwards the option, and
+  `require 'mcp_client/client'` loads on its own.
 
 ### Cacheable results (`ttlMs` / `cacheScope`)
 
