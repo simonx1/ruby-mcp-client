@@ -399,7 +399,9 @@ module MCPClient
       {
         'jsonrpc' => '2.0',
         'method' => method,
-        'params' => params
+        # Modern notifications carry the same _meta as requests: on HTTP the
+        # MCP-Protocol-Version header must match the body.
+        'params' => with_request_meta(params)
       }
     end
 

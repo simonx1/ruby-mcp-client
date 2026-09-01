@@ -47,9 +47,15 @@ module MCPClient
         responses = messages.reject { |m| m['method'] }
         matched = responses.find { |m| request_id.nil? || m['id'] == request_id || m['id'].to_s == request_id.to_s }
         matched ||= responses.first if responses.size == 1
-        raise MCPClient::Errors::TransportError, 'No JSON-RPC response found in SSE response' unless matched
+        return matched if matched
 
-        matched
+        # The stream closed without the response: on a modern server the
+        # request is lost and must be re-issued (see rpc_request).
+        if modern?
+          raise MCPClient::Errors::ResponseStreamClosedError, 'SSE stream closed before delivering the response'
+        end
+
+        raise MCPClient::Errors::TransportError, 'No JSON-RPC response found in SSE response'
       end
 
       # @param sse_body [String] the text/event-stream body

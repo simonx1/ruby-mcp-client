@@ -126,7 +126,15 @@ module MCPClient
       def parse_sse_response(sse_body, request_id = nil)
         events, retry_ms = extract_sse_events(sse_body)
 
-        raise MCPClient::Errors::TransportError, 'No data found in SSE response' if events.empty?
+        if events.empty?
+          # An empty stream is a stream that closed before delivering the
+          # response; on a modern server that means re-issue, not resume.
+          if modern?
+            raise MCPClient::Errors::ResponseStreamClosedError, 'SSE stream closed before delivering the response'
+          end
+
+          raise MCPClient::Errors::TransportError, 'No data found in SSE response'
+        end
 
         responses, saw_invalid_json = route_sse_events(events)
         matched = select_sse_response(responses, request_id)

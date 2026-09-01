@@ -781,20 +781,24 @@ RSpec.describe 'MCP 2026-07-28 modern mode — plain HTTP transport and concurre
     server.cleanup
   end
 
-  it 'ServerHTTP raises TransportError when an SSE body carries no response' do
+  it 'ServerHTTP re-issues once and then surfaces a stream that never carries the response' do
     server = MCPClient::ServerHTTP.new(base_url: 'https://example.com', endpoint: '/mcp', retries: 0)
+    lists = 0
     stub_request(:post, url).to_return do |request|
       body = JSON.parse(request.body)
       if body['method'] == 'server/discover'
         { status: 200, body: JSON.generate('jsonrpc' => '2.0', 'id' => body['id'], 'result' => discover_result),
           headers: { 'Content-Type' => 'application/json' } }
       else
+        lists += 1
         { status: 200, body: sse('jsonrpc' => '2.0', 'method' => 'notifications/progress', 'params' => {}),
           headers: { 'Content-Type' => 'text/event-stream' } }
       end
     end
 
-    expect { server.list_tools }.to raise_error(MCPClient::Errors::TransportError, /No JSON-RPC response/)
+    expect { server.list_tools }
+      .to raise_error(MCPClient::Errors::ResponseStreamClosedError, /closed before delivering the response/)
+    expect(lists).to eq(2)
     server.cleanup
   end
 
@@ -823,5 +827,77 @@ RSpec.describe 'MCP 2026-07-28 modern mode — plain HTTP transport and concurre
       expect(server.protocol_era).to eq(:modern)
       server.cleanup
     end
+  end
+end
+
+# Review round 3 (codex): notifications carry the per-request _meta too (the
+# MCP-Protocol-Version header must match the body); every response stream
+# that ends without the response is re-issued, not only one that carried an
+# event id; a DiscoverResult with no mutual version leaves no tentative
+# version behind.
+RSpec.describe 'MCP 2026-07-28 Streamable HTTP modern mode — round 3' do
+  let(:url) { 'https://example.com/mcp' }
+
+  def discover_result(versions: ['2026-07-28'])
+    { 'resultType' => 'complete', 'supportedVersions' => versions, 'capabilities' => { 'tools' => {} } }
+  end
+
+  def json_response(id, result)
+    { status: 200, body: JSON.generate('jsonrpc' => '2.0', 'id' => id, 'result' => result),
+      headers: { 'Content-Type' => 'application/json' } }
+  end
+
+  it 'sends the protocol version in a modern notification body, matching the header' do
+    server = MCPClient::ServerStreamableHTTP.new(base_url: 'https://example.com', endpoint: '/mcp', retries: 0)
+    requests = []
+    stub_request(:post, url).to_return do |request|
+      body = JSON.parse(request.body)
+      requests << { headers: request.headers, body: body }
+      body['method'] == 'server/discover' ? json_response(body['id'], discover_result) : { status: 202, body: '' }
+    end
+
+    server.rpc_notify('com.example/custom', { 'x' => 1 })
+
+    notification = requests.find { |r| r[:body]['method'] == 'com.example/custom' }
+    expect(notification[:body]['params']['_meta']['io.modelcontextprotocol/protocolVersion']).to eq('2026-07-28')
+    expect(notification[:headers]['Mcp-Protocol-Version']).to eq('2026-07-28')
+    expect(notification[:body]['params']['x']).to eq(1)
+    server.cleanup
+  end
+
+  [MCPClient::ServerStreamableHTTP, MCPClient::ServerHTTP].each do |klass|
+    it "#{klass} re-issues an idempotent request whose SSE response stream ended empty" do
+      server = klass.new(base_url: 'https://example.com', endpoint: '/mcp', retries: 0)
+      lists = 0
+      stub_request(:post, url).to_return do |request|
+        body = JSON.parse(request.body)
+        case body['method']
+        when 'server/discover' then json_response(body['id'], discover_result)
+        when 'tools/list'
+          lists += 1
+          if lists == 1
+            { status: 200, body: ": keep-alive\n\n", headers: { 'Content-Type' => 'text/event-stream' } }
+          else
+            json_response(body['id'], { 'tools' => [] })
+          end
+        end
+      end
+
+      expect(server.list_tools).to eq([])
+      expect(lists).to eq(2)
+      server.cleanup
+    end
+  end
+
+  it 'leaves no tentative version behind when no advertised version is mutual' do
+    server = MCPClient::ServerStreamableHTTP.new(base_url: 'https://example.com', endpoint: '/mcp', retries: 0)
+    stub_request(:post, url).to_return do |request|
+      body = JSON.parse(request.body)
+      json_response(body['id'], discover_result(versions: ['2099-01-01']))
+    end
+
+    expect { server.connect }.to raise_error(MCPClient::Errors::ConnectionError, /2099-01-01/)
+    expect(server.protocol_version).to be_nil
+    expect(server.protocol_era).to be_nil
   end
 end
