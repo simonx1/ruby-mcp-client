@@ -359,6 +359,7 @@ module MCPClient
       ensure_initialized
       pages = []
       received_ats = []
+      epoch = cache_epoch
       prompts = collect_paginated('prompts') do |cursor|
         params = {}
         params['cursor'] = cursor if cursor
@@ -368,7 +369,7 @@ module MCPClient
         prompts = (result['prompts'] || []).map { |td| MCPClient::Prompt.from_json(td, server: self) }
         [prompts, result['nextCursor']]
       end
-      record_list_cache_hint('prompts/list', pages, received_ats)
+      record_list_cache_hint('prompts/list', pages, received_ats, epoch: epoch)
       prompts
     rescue MCPClient::Errors::ServerError => e
       # 2026-07-28 protocol errors carry actionable data (requiredCapabilities,
@@ -526,6 +527,7 @@ module MCPClient
       ensure_initialized
       pages = []
       received_ats = []
+      epoch = cache_epoch
       tools = collect_paginated('tools') do |cursor|
         params = {}
         params['cursor'] = cursor if cursor
@@ -535,7 +537,7 @@ module MCPClient
         tools = (result['tools'] || []).map { |td| MCPClient::Tool.from_json(td, server: self) }
         [tools, result['nextCursor']]
       end
-      record_list_cache_hint('tools/list', pages, received_ats)
+      record_list_cache_hint('tools/list', pages, received_ats, epoch: epoch)
       tools
     rescue MCPClient::Errors::ServerError => e
       # 2026-07-28 protocol errors carry actionable data (requiredCapabilities,

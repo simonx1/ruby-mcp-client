@@ -15,12 +15,15 @@ module MCPClient
       # @param stale [Object, nil] the stale cached value
       # @yield performs the fetch
       # @return [Object] the fresh value, or the stale one on a transient failure
-      def refetch_or_serve_stale(kind, stale)
+      def refetch_or_serve_stale(kind, cached)
         yield
       rescue MCPClient::Errors::TransientServerError, MCPClient::Errors::ConnectionError,
              MCPClient::Errors::TransportError => e
         # A revoked or insufficient authorization is not a transient failure:
-        # serving the stale list would hide it from the host's auth flow.
+        # serving the stale list would hide it from the host's auth flow. The
+        # stale copy is judged against the credentials the failed request
+        # went out with (they may have changed since the copy was made).
+        stale = stale_fallback_for(kind, cached, context: request_authorization_context)
         raise if stale.nil? || authorization_failure?(e)
 
         @logger.warn("Re-fetching #{kind} failed (#{e.class}); serving the stale cached list")

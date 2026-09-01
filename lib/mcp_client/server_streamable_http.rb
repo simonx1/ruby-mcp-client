@@ -234,7 +234,7 @@ module MCPClient
       begin
         ensure_connected
 
-        refetch_or_serve_stale(:tools, stale_fallback_for(:tools, cached)) { fetch_tools_list }
+        refetch_or_serve_stale(:tools, cached) { fetch_tools_list }
       rescue MCPClient::Errors::ConnectionError, MCPClient::Errors::TransportError, MCPClient::Errors::ServerError
         # Re-raise these errors directly
         raise
@@ -330,7 +330,7 @@ module MCPClient
       @mutex.synchronize { @prompts_data = nil } if cached
       begin
         ensure_connected
-        refetch_or_serve_stale(:prompts, stale_fallback_for(:prompts, cached)) { fetch_prompts_list }
+        refetch_or_serve_stale(:prompts, cached) { fetch_prompts_list }
       rescue MCPClient::Errors::ConnectionError, MCPClient::Errors::TransportError, MCPClient::Errors::ServerError
         raise
       rescue StandardError => e
@@ -390,7 +390,7 @@ module MCPClient
       begin
         ensure_connected
         unless cursor
-          return refetch_or_serve_stale(:resources, stale_fallback_for(:resources, cached)) do
+          return refetch_or_serve_stale(:resources, cached) do
             fetch_resources_list(nil)
           end
         end
@@ -618,12 +618,13 @@ module MCPClient
         @resources_result = nil
         @buffer = +''
         @buffer_scanned = 0
-        # Cached results and their hints belong to the connection (and its
-        # authorization context) that is being torn down.
-        clear_result_cache
 
         @logger.info('Cleanup completed')
       end
+      # Cached results and their hints belong to the connection (and its
+      # authorization context) that was just torn down; outside @mutex, as
+      # the cache has its own lock.
+      clear_result_cache
     end
 
     # Register a callback for elicitation requests (MCP 2025-06-18)

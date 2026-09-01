@@ -64,8 +64,12 @@ module MCPClient
     # leaves behind so the kind reads as "known and stale", not "unknown".
     # @param now [Float] monotonic time
     # @return [CachedResult]
-    def self.stale(now:)
-      new(value: nil, received_at: now, ttl_ms: 0, cache_scope: nil)
+    # @param like [CachedResult, nil] the entry being replaced: its scope and
+    #   authorization context are kept, so a stale private entry stays private
+    def self.stale(now:, like: nil)
+      entry = new(value: nil, received_at: now, ttl_ms: 0, cache_scope: like&.cache_scope)
+      entry.authorization_context = like&.authorization_context
+      entry
     end
 
     # "Servers MUST provide a ttlMs value that is >= 0"; anything else is

@@ -321,11 +321,14 @@ module MCPClient
     def request_paginated_list(method, key)
       pages = []
       received_ats = []
+      contexts = []
+      epoch = cache_epoch if respond_to?(:cache_epoch, true)
       items = collect_paginated(key) do |cursor|
         params = cursor ? { cursor: cursor } : {}
         result = rpc_request(method, params)
         pages << result
         received_ats << monotonic_now if respond_to?(:monotonic_now, true)
+        contexts << (respond_to?(:request_authorization_context, true) ? request_authorization_context : nil)
         case result
         when Hash
           [result[key] || [], result['nextCursor']]
@@ -338,7 +341,9 @@ module MCPClient
       end
       # MCP 2026-07-28 caching: every page carries its own ttlMs; the list is
       # fresh only as long as its shortest-lived page.
-      record_list_cache_hint(method, pages, received_ats) if respond_to?(:record_list_cache_hint, true)
+      if respond_to?(:record_list_cache_hint, true)
+        record_list_cache_hint(method, pages, received_ats, contexts: contexts, epoch: epoch)
+      end
       items
     end
 

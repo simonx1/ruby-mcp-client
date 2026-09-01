@@ -269,6 +269,8 @@ module MCPClient
         MCPClient::ResourceTemplate.from_json(template_data, server: self)
       end
 
+      # MCP 2026-07-28 caching: the first page's hint decides freshness.
+      record_cache_hint(:templates, result) unless cursor
       { 'resourceTemplates' => templates, 'nextCursor' => result['nextCursor'] }
     rescue MCPClient::Errors::ConnectionError, MCPClient::Errors::TransportError, MCPClient::Errors::ServerError
       raise
@@ -518,12 +520,27 @@ module MCPClient
         @prompts = nil
         @prompts_data = nil
         @resources_result = nil
-        # Cached results and their hints belong to the connection that is
-        # being torn down (MCP 2026-07-28 caching).
-        clear_result_cache
         # Don't clear auth error as we need it for reporting the correct error
         # Don't reset @consecutive_ping_failures or @reconnect_attempts as they're tracked across reconnections
       end
+      # Cached results and their hints belong to the connection that was just
+      # torn down (MCP 2026-07-28 caching); outside @mutex, as the cache has
+      # its own lock.
+      clear_result_cache
+    end
+
+    # The authorization context of this transport (MCP 2026-07-28 caching,
+    # cacheScope "private"): HTTP+SSE sends the static Authorization header
+    # it was configured with, so that header is both what the next request
+    # would carry and what the last one carried.
+    # @return [String, nil]
+    def current_authorization_context
+      @headers['Authorization'] || @headers['authorization']
+    end
+
+    # @return [String, nil]
+    def request_authorization_context
+      current_authorization_context
     end
 
     # Register a callback for elicitation requests (MCP 2025-06-18)
