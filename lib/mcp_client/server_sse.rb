@@ -211,15 +211,16 @@ module MCPClient
         params['cursor'] = cursor if cursor
         epoch = cache_epoch
         result = rpc_request('resources/list', params)
+        # MCP 2026-07-28 caching: the first page's hint decides how long the
+        # cached list may be served, counted from receipt (the list is
+        # attached once converted).
+        record_cache_hint(:resources, result, epoch: epoch) unless cursor
 
         resources = (result['resources'] || []).map do |resource_data|
           MCPClient::Resource.from_json(resource_data, server: self)
         end
 
         resources_result = { 'resources' => resources, 'nextCursor' => result['nextCursor'] }
-        # MCP 2026-07-28 caching: the first page's hint decides how long the
-        # cached list may be served.
-        record_cache_hint(:resources, result, epoch: epoch) unless cursor
 
         @mutex.synchronize do
           unless cursor
@@ -270,13 +271,14 @@ module MCPClient
       params['cursor'] = cursor if cursor
       epoch = cache_epoch
       result = rpc_request('resources/templates/list', params)
+      # MCP 2026-07-28 caching: the first page's hint decides freshness,
+      # counted from receipt.
+      record_cache_hint(:templates, result, epoch: epoch) unless cursor
 
       templates = (result['resourceTemplates'] || []).map do |template_data|
         MCPClient::ResourceTemplate.from_json(template_data, server: self)
       end
 
-      # MCP 2026-07-28 caching: the first page's hint decides freshness.
-      record_cache_hint(:templates, result, epoch: epoch) unless cursor
       { 'resourceTemplates' => templates, 'nextCursor' => result['nextCursor'] }
     rescue MCPClient::Errors::ConnectionError, MCPClient::Errors::TransportError, MCPClient::Errors::ServerError
       raise
@@ -1109,15 +1111,9 @@ module MCPClient
     end
 
     def request_prompts_list
-      @mutex.synchronize do
-        return @prompts_data.dup if @prompts_data
-      end
-
-      # Follow nextCursor across pages so the full prompt list is returned.
-      prompts = request_paginated_list('prompts/list', 'prompts')
-
-      @mutex.synchronize { @prompts_data = prompts }
-      @mutex.synchronize { @prompts_data.dup }
+      # Follow nextCursor across pages so the full prompt list is returned;
+      # the raw pages are this fetch's own (see request_tools_list).
+      request_paginated_list('prompts/list', 'prompts')
     end
 
     # Request the resources list using JSON-RPC
@@ -1125,23 +1121,11 @@ module MCPClient
     # @raise [MCPClient::Errors::ResourceReadError] if resources list retrieval fails
     # @private
     def request_resources_list
-      @mutex.synchronize do
-        return @resources_data if @resources_data
-      end
-
+      # The raw list is this fetch's own (see request_tools_list).
       result = rpc_request('resources/list')
 
-      if result && result['resources']
-        @mutex.synchronize do
-          @resources_data = result['resources']
-        end
-        return @mutex.synchronize { @resources_data.dup }
-      elsif result
-        @mutex.synchronize do
-          @resources_data = result
-        end
-        return @mutex.synchronize { @resources_data.dup }
-      end
+      return result['resources'].dup if result && result['resources']
+      return result.dup if result
 
       raise MCPClient::Errors::ResourceReadError, 'Failed to get resources list from JSON-RPC request'
     end
@@ -1151,17 +1135,11 @@ module MCPClient
     # @raise [MCPClient::Errors::ToolCallError] if tools list retrieval fails
     # @private
     def request_tools_list
-      @mutex.synchronize do
-        return @tools_data.dup if @tools_data
-      end
-
       # Follow nextCursor across pages so the full tool list is returned. The
-      # SSE parser no longer writes @tools_data per page, so this method is the
-      # sole writer and only ever caches the COMPLETE list.
-      tools = request_paginated_list('tools/list', 'tools')
-
-      @mutex.synchronize { @tools_data = tools }
-      @mutex.synchronize { @tools_data.dup }
+      # raw pages are this fetch's own: a shared copy could answer a
+      # concurrent caller under other credentials with a privately scoped
+      # list (MCP 2026-07-28 caching).
+      request_paginated_list('tools/list', 'tools')
     end
   end
 end

@@ -49,6 +49,29 @@ module MCPClient
         Thread.current[request_authorization_key] = authorization_fingerprint(authorization)
       end
 
+      # Forget the header recorded before middleware ran: until the request
+      # is sent (or its error reports the headers) the attempt's context is
+      # unknown, so no private stale copy can be served for it.
+      # @return [void]
+      def note_request_authorization_pending
+        Thread.current[request_authorization_key] = UNRECORDED_AUTHORIZATION
+      end
+
+      # A request that failed before returning a response: Faraday errors
+      # raised by its middleware keep the request headers, which name the
+      # Authorization actually sent; otherwise the context stays unknown.
+      # @param error [Exception]
+      # @return [void]
+      def note_failed_request_authorization(error)
+        return unless @faraday_config
+
+        response = error.respond_to?(:response) ? error.response : nil
+        headers = response.is_a?(Hash) ? response.dig(:request, :headers) : nil
+        return unless headers.respond_to?(:[])
+
+        note_request_authorization(headers['Authorization'] || headers['authorization'])
+      end
+
       # @return [String, nil] the Authorization header of the request this thread last sent
       def request_authorization_context
         context = Thread.current[request_authorization_key]

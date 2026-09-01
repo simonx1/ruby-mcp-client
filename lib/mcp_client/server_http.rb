@@ -657,18 +657,11 @@ module MCPClient
     # @return [Array<Hash>] the tools data
     # @raise [MCPClient::Errors::ToolCallError] if tools list retrieval fails
     def request_tools_list
-      @mutex.synchronize do
-        return @tools_data.dup if @tools_data
-      end
-
       # Follow nextCursor across pages so the full tool list is returned even
-      # when the server paginates. A list invalidated while in flight is
-      # returned but not cached.
-      generation = @mutex.synchronize { tools_generation }
-      tools = request_paginated_list('tools/list', 'tools')
-
-      @mutex.synchronize { @tools_data = tools if tools_generation == generation }
-      tools.dup
+      # when the server paginates. The raw pages are this fetch's own: a
+      # shared copy could answer a concurrent caller under other
+      # credentials with a privately scoped list (MCP 2026-07-28 caching).
+      request_paginated_list('tools/list', 'tools')
     end
   end
 end

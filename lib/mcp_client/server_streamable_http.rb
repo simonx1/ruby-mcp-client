@@ -738,56 +738,31 @@ module MCPClient
     # @return [Array<Hash>] the tools data
     # @raise [MCPClient::Errors::ToolCallError] if tools list retrieval fails
     def request_tools_list
-      @mutex.synchronize do
-        return @tools_data.dup if @tools_data
-      end
-
       # Follow nextCursor across pages so the full tool list is returned even
-      # when the server paginates. A list invalidated while in flight is
-      # returned but not cached.
-      generation = @mutex.synchronize { tools_generation }
-      tools = request_paginated_list('tools/list', 'tools')
-
-      @mutex.synchronize { @tools_data = tools if tools_generation == generation }
-      tools.dup
+      # when the server paginates. The raw pages are this fetch's own: a
+      # shared copy could answer a concurrent caller under other
+      # credentials with a privately scoped list (MCP 2026-07-28 caching).
+      request_paginated_list('tools/list', 'tools')
     end
 
     # Request the prompts list using JSON-RPC
     # @return [Array<Hash>] the prompts data
     # @raise [MCPClient::Errors::PromptGetError] if prompts list retrieval fails
     def request_prompts_list
-      @mutex.synchronize do
-        return @prompts_data.dup if @prompts_data
-      end
-
-      # Follow nextCursor across pages so the full prompt list is returned.
-      prompts = request_paginated_list('prompts/list', 'prompts')
-
-      @mutex.synchronize { @prompts_data = prompts }
-      @mutex.synchronize { @prompts_data.dup }
+      # Follow nextCursor across pages so the full prompt list is returned;
+      # the raw pages are this fetch's own (see request_tools_list).
+      request_paginated_list('prompts/list', 'prompts')
     end
 
     # Request the resources list using JSON-RPC
     # @return [Array<Hash>] the resources data
     # @raise [MCPClient::Errors::ResourceReadError] if resources list retrieval fails
     def request_resources_list
-      @mutex.synchronize do
-        return @resources_data if @resources_data
-      end
-
+      # The raw list is this fetch's own (see request_tools_list).
       result = rpc_request('resources/list')
 
-      if result.is_a?(Hash) && result['resources']
-        @mutex.synchronize do
-          @resources_data = result['resources']
-        end
-        return @mutex.synchronize { @resources_data.dup }
-      elsif result.is_a?(Array) || result
-        @mutex.synchronize do
-          @resources_data = result
-        end
-        return @mutex.synchronize { @resources_data.dup }
-      end
+      return result['resources'].dup if result.is_a?(Hash) && result['resources']
+      return result.dup if result.is_a?(Array) || result
 
       raise MCPClient::Errors::ResourceReadError, 'Failed to get resources list from JSON-RPC request'
     end

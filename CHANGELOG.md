@@ -45,7 +45,11 @@ metadata). Each feature lands in its own PR; this section accumulates them.
   `Authorization` header added by Faraday middleware (`faraday_config`) is
   part of the cache context: the header a request actually went out with is
   recorded after it was sent, and the freshness probe runs the middleware
-  stack without sending anything. `server.cache_info(:tools | :prompts |
+  stack without sending anything; a request that fails before any response
+  under such middleware has an unknown context (no private stale fallback)
+  unless the error reports the headers it went out with. Raw list pages
+  are never handed from one fetch to another, and HTTP+SSE dates resource
+  and template lists from receipt. `server.cache_info(:tools | :prompts |
   :resources | :templates | :discover)` and `cache_info(:read, uri)` expose
   `ttl_ms`, `cache_scope`, `received_at` and `fresh`.
 
