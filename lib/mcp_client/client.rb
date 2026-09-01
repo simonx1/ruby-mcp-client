@@ -1197,6 +1197,7 @@ module MCPClient
     # @raise [MCPClient::Errors::ValidationError] when required params are missing
     def validate_params!(tool, parameters)
       schema = tool.schema
+      warn_unusable_input_schema(tool)
       return unless schema.is_a?(Hash)
 
       required = schema['required'] || schema[:required]
@@ -1241,22 +1242,49 @@ module MCPClient
 
       warn_partial_schema_coverage(tool)
 
-      structured = result.key?('structuredContent') ? result['structuredContent'] : result[:structuredContent]
-      if structured.nil?
+      # MCP 2026-07-28: structuredContent "can be any JSON value (object,
+      # array, string, number, boolean, or null)", so presence is decided by
+      # the key, not by the value.
+      key = [:structuredContent, 'structuredContent'].find { |k| result.key?(k) }
+      unless key
         handle_structured_content_violation(
           "Tool '#{tool.name}' declares an output schema but its successful result carries no structuredContent " \
-          '(required by the MCP 2025-11-25 tools spec)'
+          '(required by the MCP tools spec)'
         )
         return result
       end
 
-      errors = MCPClient::SchemaValidator.validate(structured, tool.output_schema)
+      # An unusable output schema (unsupported dialect, external $ref, out of
+      # bounds) is a violation too, never a permissive pass.
+      errors = MCPClient::SchemaValidator.validate(result[key], tool.output_schema)
       unless errors.empty?
         handle_structured_content_violation(
           "Structured content for tool '#{tool.name}' does not match its output schema: #{errors.join('; ')}"
         )
       end
       result
+    end
+
+    # Warn once per tool when its inputSchema cannot be used as a JSON
+    # Schema (MCP 2026-07-28: an unsupported dialect, a network `$ref` that
+    # is never dereferenced, or a schema beyond the resource bounds). The
+    # call still goes out — the server owns argument validation — but the
+    # host learns that local parameter checks are incomplete.
+    # @param tool [MCPClient::Tool]
+    # @return [void]
+    def warn_unusable_input_schema(tool)
+      return if tool.schema.nil?
+
+      @input_schema_warnings ||= {}
+      key = [tool.server&.object_id, tool.name]
+      return if @input_schema_warnings.key?(key)
+
+      problems = MCPClient::SchemaValidator.check_schema(tool.schema)
+      @input_schema_warnings[key] = true
+      return if problems.empty?
+
+      @logger.warn("Tool '#{sanitize_peer_log_text(tool.name.to_s)}' input schema is not usable for validation: " \
+                   "#{sanitize_peer_log_text(problems.join('; '))}")
     end
 
     # Warn (in both :warn and :strict modes) when a tool's output schema uses

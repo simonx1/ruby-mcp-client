@@ -5,6 +5,33 @@
 Groundwork for the 2026-07-28 protocol revision (stateless, per-request
 metadata). Each feature lands in its own PR; this section accumulates them.
 
+### JSON Schema handling
+
+- **Dialects.** `MCPClient::SchemaValidator` treats a schema without
+  `$schema` as JSON Schema 2020-12, accepts 2020-12, 2019-09 and draft-07
+  (`SUPPORTED_DIALECTS`), and reports any other declared dialect as an
+  error ("dialect ... is not supported") instead of validating permissively.
+  `SchemaValidator.check_schema` reports why a schema is unusable; an
+  unusable `outputSchema` is a structured-content violation (warning or
+  `ValidationError` in `:strict` mode) and an unusable `inputSchema` is
+  logged once per tool.
+- **`$ref`.** References inside the schema document (`#`, `#/$defs/...`,
+  `#/definitions/...`, any JSON pointer, with `~0`/`~1` and percent
+  escapes) are resolved, recursively, with a hop limit. A `$ref` to a
+  network URI, another document, a `urn:` or `file:` is never dereferenced
+  and makes the schema unusable rather than permissive; an unresolvable
+  local `$ref` is an error too.
+- **Composition.** `allOf`, `anyOf`, `oneOf`, `not`, `if`/`then`/`else`
+  and boolean schemas are evaluated (they are no longer reported as
+  unsupported keywords). Resource bounds apply: nesting depth
+  (`MAX_SCHEMA_DEPTH`), total subschemas (`MAX_SUBSCHEMAS`), `$ref` chain
+  length (`MAX_REF_DEPTH`) and the per-validation time budget now covers
+  the whole walk.
+- **structuredContent.** Any JSON value is accepted, including `null`:
+  presence is decided by the `structuredContent` key, and the value —
+  object, array, scalar or null — is validated against the output schema.
+  The `x-mcp-header` annotation is ignored by the validator.
+
 ### Authorization (RFC 9207 issuer validation, client registration)
 
 - **Issuer validation.** `OAuthProvider#start_authorization_flow` records
