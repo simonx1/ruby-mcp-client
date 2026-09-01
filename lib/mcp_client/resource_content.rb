@@ -45,6 +45,18 @@ module MCPClient
       @meta = meta
     end
 
+    # A copy that shares nothing mutable with the original (cached contents
+    # are handed out as copies, so a caller's edits stay its own).
+    # @param source [ResourceContent]
+    # @return [void]
+    def initialize_copy(source)
+      super
+      @text = source.text.dup if source.text
+      @blob = source.blob.dup if source.blob
+      @annotations = deep_copy(source.annotations)
+      @meta = deep_copy(source.meta)
+    end
+
     # Create a ResourceContent instance from JSON data
     # @param data [Hash] JSON data from MCP server
     # @return [MCPClient::ResourceContent] resource content instance
@@ -80,6 +92,19 @@ module MCPClient
 
       require 'base64'
       Base64.decode64(@blob)
+    end
+
+    private
+
+    # @param value [Object] a JSON-like value
+    # @return [Object] an independent copy
+    def deep_copy(value)
+      case value
+      when Hash then value.to_h { |k, v| [k, deep_copy(v)] }
+      when Array then value.map { |v| deep_copy(v) }
+      when String then value.dup
+      else value
+      end
     end
   end
 end

@@ -339,8 +339,9 @@ module MCPClient
     def fetch_resources_list(cursor)
       params = {}
       params['cursor'] = cursor if cursor
+      epoch = cache_epoch
       result = rpc_request('resources/list', params)
-      record_cache_hint(:resources, result) unless cursor
+      record_cache_hint(:resources, result, epoch: epoch) unless cursor
 
       resources = (result['resources'] || []).map do |resource_data|
         MCPClient::Resource.from_json(resource_data, server: self)
@@ -426,8 +427,9 @@ module MCPClient
     def list_resource_templates(cursor: nil)
       params = {}
       params['cursor'] = cursor if cursor
+      epoch = cache_epoch
       result = rpc_request('resources/templates/list', params)
-      record_cache_hint(:templates, result) unless cursor
+      record_cache_hint(:templates, result, epoch: epoch) unless cursor
 
       templates = (result['resourceTemplates'] || []).map do |template_data|
         MCPClient::ResourceTemplate.from_json(template_data, server: self)

@@ -39,13 +39,14 @@ RSpec.describe 'MCP 2026-07-28 cacheable results' do
       entry = described_class.from_result({ 'tools' => [] }, :v, now: 1.0)
       expect(entry.hint?).to be(false)
       expect(entry.ttl_ms).to be_nil
-      expect(entry.cache_scope).to be_nil
+      # Without an explicit "public" the entry stays within its context.
+      expect(entry.cache_scope).to eq('private')
       expect(entry.fresh?(now: 1_000_000.0)).to be(true)
     end
 
-    it 'normalizes an unknown cacheScope to nil and accepts a Float ttlMs' do
+    it 'treats an unknown cacheScope as private and accepts a Float ttlMs' do
       entry = described_class.from_result({ 'ttlMs' => 1500.5, 'cacheScope' => 'shared' }, :v, now: 0.0)
-      expect(entry.cache_scope).to be_nil
+      expect(entry.cache_scope).to eq('private')
       expect(entry.fresh?(now: 1.5)).to be(true)
       expect(entry.fresh?(now: 1.6)).to be(false)
     end
@@ -570,8 +571,8 @@ RSpec.describe 'MCP 2026-07-28 cacheable results — round 3' do
     server.list_tools
     server.cleanup
 
-    expect(server.cache_info(:read, 'file:///a')).to be_nil
-    expect(server.cache_info(:tools)).to be_nil
+    expect(server.cache_info(:read, 'file:///a')).to include(fresh: false)
+    expect(server.cache_info(:tools)).to include(fresh: false)
     expect(server.read_resource('file:///a').first.text).to eq('read 2')
   ensure
     server&.cleanup
@@ -1127,5 +1128,141 @@ RSpec.describe 'MCP 2026-07-28 cacheable results — round 5' do
 
       expect(server.read_resource('file:///a').first.text).to eq('read 2')
     end
+  end
+end
+
+RSpec.describe 'MCP 2026-07-28 cacheable results — round 6' do
+  let(:url) { 'https://example.com/mcp' }
+
+  def json_response(id, result)
+    { status: 200, body: JSON.generate('jsonrpc' => '2.0', 'id' => id, 'result' => result),
+      headers: { 'Content-Type' => 'application/json' } }
+  end
+
+  def discover_result
+    { 'resultType' => 'complete', 'supportedVersions' => ['2026-07-28'],
+      'capabilities' => { 'tools' => {}, 'prompts' => {}, 'resources' => {} } }
+  end
+
+  def contents(text)
+    { 'contents' => [{ 'uri' => 'file:///a', 'text' => text }] }
+  end
+
+  def tool(name)
+    { 'name' => name, 'inputSchema' => { 'type' => 'object' } }
+  end
+
+  def script_stdio(server, responses)
+    sent = []
+    allow(server).to receive(:connect).and_return(true)
+    allow(server).to receive(:start_reader)
+    allow(server).to receive(:start_stderr_reader)
+    server.instance_variable_set(:@stdin, double('stdin', puts: nil, flush: nil, closed?: true, close: nil))
+    allow(server).to receive(:send_request) { |req| sent << req }
+    allow(server).to receive(:wait_response) do |id, **_opts|
+      responder = responses.shift
+      raise 'no scripted response left' unless responder
+
+      response = responder.respond_to?(:call) ? responder.call(sent.last) : responder
+      response.merge('jsonrpc' => '2.0', 'id' => id)
+    end
+    sent
+  end
+
+  def provider_with(token)
+    provider = instance_double(MCPClient::Auth::OAuthProvider)
+    allow(provider).to receive(:apply_authorization) { |req| req.headers['Authorization'] = "Bearer #{token[:value]}" }
+    allow(provider).to receive(:respond_to?).and_return(true)
+    provider
+  end
+
+  it 'treats a hinted result without cacheScope as private' do
+    token = { value: 'alice' }
+    lists = 0
+    stub_request(:post, url).to_return do |request|
+      body = JSON.parse(request.body)
+      if body['method'] == 'tools/list'
+        lists += 1
+        json_response(body['id'], { 'tools' => [tool(request.headers['Authorization'])], 'ttlMs' => 60_000 })
+      else
+        json_response(body['id'], discover_result)
+      end
+    end
+    server = MCPClient::ServerStreamableHTTP.new(base_url: 'https://example.com', endpoint: '/mcp', retries: 0,
+                                                 oauth_provider: provider_with(token))
+
+    expect(server.list_tools.map(&:name)).to eq(['Bearer alice'])
+    token[:value] = 'bob'
+    expect(server.list_tools.map(&:name)).to eq(['Bearer bob'])
+    expect(lists).to eq(2)
+    expect(server.cache_info(:tools)).to include(cache_scope: 'private')
+  ensure
+    server&.cleanup
+  end
+
+  it 'leaves the lists stale (not unknown) after cleanup so the client re-fetches' do
+    server = MCPClient::ServerStdio.new(command: 'echo test', read_timeout: 1)
+    script_stdio(server, [{ 'result' => discover_result },
+                          { 'result' => { 'tools' => [tool('a')], 'ttlMs' => 60_000 } },
+                          { 'result' => discover_result },
+                          { 'result' => { 'tools' => [tool('b')], 'ttlMs' => 60_000 } }])
+    allow(MCPClient::ServerFactory).to receive(:create).and_return(server)
+    client = MCPClient::Client.new(mcp_server_configs: [{ type: 'stdio', command: 'x' }])
+
+    expect(client.list_tools.map(&:name)).to eq(['a'])
+    server.cleanup
+    expect(server.cache_fresh?(:tools)).to be(false)
+    expect(server.cache_info(:tools)).to include(fresh: false)
+    expect(client.list_tools.map(&:name)).to eq(['b'])
+  end
+
+  it 'hands out independent copies of cached resource contents' do
+    server = MCPClient::ServerStdio.new(command: 'echo test', read_timeout: 1)
+    script_stdio(server, [{ 'result' => discover_result },
+                          { 'result' => { 'contents' => [{ 'uri' => 'file:///a', 'text' => 'secret',
+                                                           'annotations' => { 'audience' => ['user'] } }],
+                                          'ttlMs' => 60_000 } }])
+
+    first = server.read_resource('file:///a')
+    first.first.text << ' [redacted]'
+    first.first.annotations['audience'] << 'assistant'
+
+    second = server.read_resource('file:///a')
+    expect(second.first.text).to eq('secret')
+    expect(second.first.annotations['audience']).to eq(['user'])
+  end
+
+  it 'does not retain raw credentials in the request context' do
+    token = { value: 'alice' }
+    stub_request(:post, url).to_return do |request|
+      body = JSON.parse(request.body)
+      json_response(body['id'], body['method'] == 'tools/list' ? { 'tools' => [], 'ttlMs' => 60_000 } : discover_result)
+    end
+    server = MCPClient::ServerStreamableHTTP.new(base_url: 'https://example.com', endpoint: '/mcp', retries: 0,
+                                                 oauth_provider: provider_with(token))
+
+    server.list_tools
+
+    context = server.send(:request_authorization_context)
+    expect(context).to be_a(String)
+    expect(context).not_to include('alice')
+    expect(Thread.current.keys.map(&:to_s).grep(/mcp_client/).map { |k| Thread.current[k.to_sym].to_s })
+      .to all(satisfy { |v| !v.include?('alice') })
+  ensure
+    server&.cleanup
+  end
+
+  it 'does not store a resources/list that was invalidated while in flight' do
+    server = MCPClient::ServerStdio.new(command: 'echo test', read_timeout: 1)
+    script_stdio(server, [{ 'result' => discover_result },
+                          lambda { |_req|
+                            server.send(:invalidate_cache_for_notification, 'notifications/resources/list_changed')
+                            { 'result' => { 'resources' => [{ 'uri' => 'file:///a', 'name' => 'a' }],
+                                            'ttlMs' => 60_000 } }
+                          }])
+
+    server.list_resources
+
+    expect(server.cache_fresh?(:resources)).to be(false)
   end
 end

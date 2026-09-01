@@ -1,5 +1,7 @@
 # frozen_string_literal: true
 
+require 'digest'
+
 require_relative 'cached_result'
 
 module MCPClient
@@ -61,9 +63,15 @@ module MCPClient
     # @param result [Hash] the CacheableResult
     # @param value [Object] what the cache holds for this kind (may be nil: hint only)
     # @return [MCPClient::CachedResult]
-    def record_cache_hint(kind, result, value = nil)
-      entry = cache_entry_for(result, value, now: monotonic_now)
-      cache_entries_mutex.synchronize { cache_entries[kind] = entry }
+    # @param epoch [Integer, nil] the cache epoch captured before the request went out: a result
+    #   whose entry was invalidated meanwhile is recorded as stale, not as fresh
+    def record_cache_hint(kind, result, value = nil, epoch: nil)
+      now = monotonic_now
+      entry = cache_entry_for(result, value, now: now)
+      cache_entries_mutex.synchronize do
+        entry = MCPClient::CachedResult.stale(now: now, like: entry) if epoch && epoch != (@cache_epoch || 0)
+        cache_entries[kind] = entry
+      end
       entry
     end
 
@@ -216,10 +224,24 @@ module MCPClient
     # authorization context, is gone).
     # @return [void]
     def clear_result_cache
+      now = monotonic_now
       cache_entries_mutex.synchronize do
-        cache_entries.clear
+        # Known-and-stale, not unknown: a client-level cache built from the
+        # old connection must not read the empty entry as "fresh".
+        cache_entries.each_key { |key| cache_entries[key] = MCPClient::CachedResult.stale(now: now, like: cache_entries[key]) }
         bump_cache_epoch
       end
+    end
+
+    # A stable, non-reversible identifier of an Authorization header, so a
+    # cache entry can be bound to the credentials that produced it without
+    # keeping the credentials themselves around.
+    # @param header [String, nil]
+    # @return [String, nil]
+    def authorization_fingerprint(header)
+      return nil if header.nil?
+
+      Digest::SHA256.hexdigest(header.to_s)
     end
 
     # Forget the entries cached under `cacheScope: "private"`: they "MUST NOT
@@ -267,7 +289,7 @@ module MCPClient
     def read_resource_with_cache(uri)
       key = read_cache_key(uri)
       cached = private_entry_for_current_context(key)
-      return cached.value.dup if cached&.value && cached.fresh?(now: monotonic_now)
+      return cached.value.map(&:dup) if cached&.value && cached.fresh?(now: monotonic_now)
 
       epoch = cache_epoch
       result = yield
@@ -285,8 +307,8 @@ module MCPClient
       else
         cache_entries_mutex.synchronize { cache_entries[key] = entry if epoch == (@cache_epoch || 0) }
       end
-      # The caller gets its own array; the cached one stays untouched.
-      contents.dup
+      # The caller gets its own copies; the cached ones stay untouched.
+      contents.map(&:dup)
     end
 
     # Keep caches in step with the server's change notifications: a list
