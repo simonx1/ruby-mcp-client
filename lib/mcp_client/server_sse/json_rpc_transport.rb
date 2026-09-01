@@ -235,6 +235,11 @@ module MCPClient
             h.delete('Accept')
             h.delete('Cache-Control')
           end).each { |k, v| req.headers[k] = v }
+          # MCP 2026-07-28 caching: the result is bound to the credentials
+          # this very request carries.
+          if respond_to?(:note_request_authorization, true)
+            note_request_authorization(req.headers['Authorization'] || req.headers['authorization'])
+          end
           req.body = request.to_json
         end
 

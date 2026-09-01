@@ -162,17 +162,18 @@ module MCPClient
     # @raise [MCPClient::Errors::TransportError] if response isn't valid JSON
     # @raise [MCPClient::Errors::ToolCallError] for other errors during tool listing
     def list_tools
-      cached = cached_list_value(:tools) || @mutex.synchronize { @tools }
-      # MCP 2026-07-28 caching: a cached list is served only while fresh.
-      return cached if cached && cache_fresh?(:tools)
+      # MCP 2026-07-28 caching: a cached list is served only while fresh, and
+      # only from the entry that carries its hint.
+      cached = fresh_list_value(:tools) { @mutex.synchronize { @tools } }
+      return cached if cached
 
       # Stale: the raw page cache must go too, or the re-fetch would be
       # answered from memory.
-      @mutex.synchronize { @tools_data = nil } if cached
+      @mutex.synchronize { @tools_data = nil }
       begin
         ensure_connected
 
-        refetch_or_serve_stale(:tools, cached) { fetch_tools_list }
+        refetch_or_serve_stale(:tools, stale_list_value(:tools)) { fetch_tools_list }
       rescue MCPClient::Errors::ConnectionError, MCPClient::Errors::TransportError, MCPClient::Errors::ServerError
         # Re-raise these errors directly
         raise
@@ -253,13 +254,13 @@ module MCPClient
     # @raise [MCPClient::Errors::TransportError] if response isn't valid JSON
     # @raise [MCPClient::Errors::PromptGetError] for other errors during prompt listing
     def list_prompts
-      cached = cached_list_value(:prompts) || @mutex.synchronize { @prompts }
-      return cached if cached && cache_fresh?(:prompts)
+      cached = fresh_list_value(:prompts) { @mutex.synchronize { @prompts } }
+      return cached if cached
 
-      @mutex.synchronize { @prompts_data = nil } if cached
+      @mutex.synchronize { @prompts_data = nil }
       begin
         ensure_connected
-        refetch_or_serve_stale(:prompts, cached) { fetch_prompts_list }
+        refetch_or_serve_stale(:prompts, stale_list_value(:prompts)) { fetch_prompts_list }
       rescue MCPClient::Errors::ConnectionError, MCPClient::Errors::TransportError, MCPClient::Errors::ServerError
         raise
       rescue StandardError => e
@@ -315,13 +316,13 @@ module MCPClient
     # @return [Hash] result containing resources array and optional nextCursor
     # @raise [MCPClient::Errors::ResourceReadError] if resources list retrieval fails
     def list_resources(cursor: nil)
-      cached = cached_list_value(:resources) || @mutex.synchronize { @resources_result }
-      return cached if cached && !cursor && cache_fresh?(:resources)
+      cached = cursor ? nil : fresh_list_value(:resources) { @mutex.synchronize { @resources_result } }
+      return cached if cached
 
       begin
         ensure_connected
         unless cursor
-          return refetch_or_serve_stale(:resources, cached) do
+          return refetch_or_serve_stale(:resources, stale_list_value(:resources)) do
             fetch_resources_list(nil)
           end
         end

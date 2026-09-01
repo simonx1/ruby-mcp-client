@@ -63,10 +63,6 @@ module MCPClient
 
         name = (params['name'] || params[:name]).to_s
         tool = known_tools_for_headers.find { |t| t.name.to_s == name }
-        # The list these headers come from is the list this request goes out
-        # under: a host re-resolving the tool after the call reads that
-        # definition back instead of asking for a possibly newer one.
-        note_called_tool_definition(name, tool)
         return {} unless tool
 
         MCPClient::HeaderParams.headers_for(tool.schema, params['arguments'] || params[:arguments])
@@ -77,8 +73,7 @@ module MCPClient
       # letting it go out without the headers an intermediary may route on.
       # @return [Array<MCPClient::Tool>]
       def known_tools_for_headers
-        fresh = cache_fresh?(:tools) ? (cached_list_value(:tools) || @mutex.synchronize { @tools }) : nil
-        fresh || list_tools
+        fresh_list_value(:tools) { @mutex.synchronize { @tools } } || list_tools
       end
     end
   end
