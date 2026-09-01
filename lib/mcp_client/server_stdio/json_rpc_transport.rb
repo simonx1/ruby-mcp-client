@@ -14,12 +14,16 @@ module MCPClient
       def ensure_initialized
         return if @initialized
 
-        connect
-        start_reader
-        start_stderr_reader
-        negotiate_protocol
+        @init_lock.synchronize do
+          return if @initialized
 
-        @initialized = true
+          connect
+          start_reader
+          start_stderr_reader
+          negotiate_protocol
+
+          @initialized = true
+        end
       end
 
       # Establish the server's protocol era (MCP 2026-07-28
@@ -51,16 +55,39 @@ module MCPClient
         begin
           perform_discover
         rescue MCPClient::Errors::UnsupportedProtocolVersionError => e
+          raise unless e.modern_protocol_error?
+
           retry_discover_with_advertised_version(e)
         end
         true
-      rescue MCPClient::Errors::UnsupportedProtocolVersionError, MCPClient::Errors::InvalidResultError => e
+      rescue MCPClient::Errors::ConnectionError
+        # A DiscoverResult (or advertised list) with no mutual version: the
+        # server is modern but incompatible. Nothing was negotiated.
         @protocol_version = nil
-        raise MCPClient::Errors::ConnectionError, "Server is modern but incompatible: #{e.message}"
-      rescue MCPClient::Errors::ServerError, MCPClient::Errors::TransportError => e
-        # Not a recognized modern error: a legacy server (or one that never
-        # answered). Its message is peer-controlled but already
-        # passes through ServerError elsewhere.
+        raise
+      rescue MCPClient::Errors::ServerError => e
+        # Any recognized modern error (-32020/-32021, or -32022 with no usable
+        # version) or an invalid result identifies a modern server: surface
+        # it, never fall back to initialize.
+        if e.modern_protocol_error? || e.protocol_error?
+          @protocol_version = nil
+          raise MCPClient::Errors::ConnectionError, "Server is modern but incompatible: #{e.message}"
+        end
+
+        legacy_after_probe(e)
+        false
+      rescue MCPClient::Errors::TransportError => e
+        legacy_after_probe(e)
+        false
+      end
+
+      # Not a recognized modern error: a legacy server (or one that never
+      # answered).
+      # @param error [StandardError] the probe failure
+      # @return [void]
+      # @raise [MCPClient::Errors::ConnectionError] when protocol: :modern is configured
+      def legacy_after_probe(error)
+        e = error
         @protocol_version = nil
         if @protocol_mode == :modern
           raise MCPClient::Errors::ConnectionError,
@@ -69,7 +96,6 @@ module MCPClient
         end
 
         @logger.debug("server/discover probe failed (#{e.class}); treating the server as legacy")
-        false
       end
 
       # After UnsupportedProtocolVersionError, pick a mutually supported
@@ -81,7 +107,8 @@ module MCPClient
         unless version
           raise MCPClient::Errors::ConnectionError,
                 "Server rejected protocol version #{@protocol_version} and supports only " \
-                "#{error.supported.join(', ')}, none of which this client speaks"
+                "#{error.supported.join(', ')}, none of which this client speaks " \
+                "(modern versions supported: #{MCPClient::MODERN_PROTOCOL_VERSIONS.join(', ')})"
         end
 
         @logger.info("Server does not support #{@protocol_version}; retrying server/discover with #{version}")
@@ -220,7 +247,7 @@ module MCPClient
           method = 'server/discover'
         end
 
-        with_retry(method) do
+        result = with_retry(method) do
           send_request_and_wait(method, params, timeout)
         rescue MCPClient::Errors::UnsupportedProtocolVersionError => e
           # MCP 2026-07-28 basic/versioning: "The client SHOULD select a
@@ -235,6 +262,16 @@ module MCPClient
           @protocol_version = version
           send_request_and_wait(method, params, timeout)
         end
+        # Every DiscoverResult refreshes the negotiated state (a later
+        # heartbeat may advertise new versions or capabilities).
+        apply_discover_result(result) if method == 'server/discover' && discover_result?(result)
+        result
+      end
+
+      # @param result [Object] a JSON-RPC result
+      # @return [Boolean] whether it has the DiscoverResult shape
+      def discover_result?(result)
+        result.is_a?(Hash) && result['supportedVersions'].is_a?(Array)
       end
 
       # One request/response exchange with its own JSON-RPC id.
@@ -276,6 +313,11 @@ module MCPClient
       # @return [void]
       def rpc_notify(method, params = {})
         ensure_initialized
+        if suppressed_modern_notification?(method)
+          @logger.debug("Not sending #{method}: removed in MCP #{protocol_version}")
+          return
+        end
+
         notif = build_jsonrpc_notification(method, params)
         @stdin.puts(notif.to_json)
       end

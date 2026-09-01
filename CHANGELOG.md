@@ -38,8 +38,16 @@ metadata). Each feature lands in its own PR; this section accumulates them.
 - **Configuration.** `MCPClient.stdio_config(protocol:, discover_timeout:)`
   and `ServerStdio.new(protocol:, discover_timeout:)`: `:auto` (default,
   dual-era), `:modern` (fail instead of falling back), `:legacy` (skip the
-  probe). New readers: `protocol_version`, `protocol_era`, `modern?`,
-  `supported_versions`.
+  probe; the probe waits the full `read_timeout` by default so a slow-starting
+  modern server is not misclassified). New readers: `protocol_version`,
+  `protocol_era`, `modern?`, `supported_versions`. Initialization is
+  serialized, so concurrent first requests run the probe once.
+- **Multi round-trip requests are not provoked yet.** Modern requests declare
+  no `roots`, `sampling` or `elicitation` capability until the multi
+  round-trip pattern lands, so a compliant server never returns an
+  `input_required` result; if one does anyway it raises
+  `MCPClient::Errors::InputRequiredError` (exposing `input_requests` and
+  `request_state`) instead of being mistaken for the operation's result.
 
 ### Protocol foundations
 
