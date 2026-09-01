@@ -199,6 +199,14 @@ module MCPClient
         true
       end
 
+      # Whether a server/discover probe answered with this error identifies a
+      # modern server (a recognized modern error, or a malformed modern
+      # result). Non-error transport failures never do.
+      # @return [Boolean]
+      def modern_protocol_error_for_probe?
+        modern_protocol_error?
+      end
+
       private
 
       # A member of the error's `data` object, accepting both key spellings:
@@ -329,7 +337,12 @@ module MCPClient
     class TransientServerError < ServerError; end
 
     # Raised when there's an error in the MCP server transport
-    class TransportError < MCPError; end
+    class TransportError < MCPError
+      # @return [Boolean] a transport failure never identifies a modern server
+      def modern_protocol_error_for_probe?
+        false
+      end
+    end
 
     # Raised when a request exceeded its timeout without receiving a
     # response. A subclass of TransportError so existing rescues keep
