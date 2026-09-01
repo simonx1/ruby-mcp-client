@@ -62,6 +62,16 @@ metadata). Each feature lands in its own PR; this section accumulates them.
   authorization server is unknown (the next challenge discovers it, and the
   discovery is remembered in-process for backends that do not persist
   metadata); an error response that matches no stored state is rejected.
+  Records persisted before issuers were recorded, with no cached
+  authorization server to prove where they came from, are retired on
+  discovery (a dynamic registration and its token) rather than bound to
+  whatever discovery finds; pre-registered and portable credentials are the
+  host's configuration and are bound on first use.
+  `OAuthProvider#validate_authorization_response!(state, iss:)` checks a
+  success callback before anything is shown, and `BrowserOAuth` answers a
+  rejected callback with the error page instead of "successful"; loopback
+  redirect URIs are recognized semantically (`127.0.0.0/8`, `::1` in any
+  spelling, `localhost`) for the `application_type`.
 
 ### Tasks extension (`io.modelcontextprotocol/tasks`)
 

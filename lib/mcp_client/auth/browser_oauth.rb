@@ -191,26 +191,9 @@ module MCPClient
         params = parse_query_params(query_string || '')
         @logger.debug("Callback params: #{params.keys.join(', ')}")
 
-        # Extract OAuth parameters
-        code = params['code']
-        state = params['state']
-        error = params['error']
-        error_description = params['error_description']
-
         # Update result and signal waiting thread
         mutex.synchronize do
-          if error
-            # MCP 2026-07-28: an error response is subject to the same RFC
-            # 9207 issuer check as a success response before it is shown.
-            result[:error] = authorization_error_text(params, error_description || error)
-          elsif code && state
-            result[:code] = code
-            result[:state] = state
-            # RFC 9207 issuer identification, validated by the provider
-            result[:iss] = params['iss'] if params.key?('iss')
-          else
-            result[:error] = 'Invalid callback: missing code or state parameter'
-          end
+          record_callback(result, params)
           result[:completed] = true
 
           condition.signal
@@ -224,6 +207,44 @@ module MCPClient
         end
       ensure
         client&.close
+      end
+
+      # Store what the callback carried: the error text of an error response
+      # (after the RFC 9207 issuer check), or the code, state and iss of a
+      # success response the provider accepted. The browser is answered only
+      # after that check, so a rejected callback shows the error page, never
+      # "successful".
+      # @param result [Hash] the shared result
+      # @param params [Hash] callback parameters
+      # @return [void]
+      def record_callback(result, params)
+        code = params['code']
+        state = params['state']
+        if params['error']
+          result[:error] = authorization_error_text(params, params['error_description'] || params['error'])
+        elsif code && state
+          problem = success_callback_problem(params)
+          return result[:error] = problem if problem
+
+          result[:code] = code
+          result[:state] = state
+          # RFC 9207 issuer identification, validated again by the provider
+          result[:iss] = params['iss'] if params.key?('iss')
+        else
+          result[:error] = 'Invalid callback: missing code or state parameter'
+        end
+      end
+
+      # Why a success callback is not acceptable, or nil when it is.
+      # @param params [Hash] callback parameters
+      # @return [String, nil]
+      def success_callback_problem(params)
+        return nil unless @oauth_provider.respond_to?(:validate_authorization_response!)
+
+        @oauth_provider.validate_authorization_response!(params['state'], iss: params['iss'])
+        nil
+      rescue MCPClient::Errors::ConnectionError, ArgumentError => e
+        e.message
       end
 
       # The text to surface for an error callback: the provider validates the

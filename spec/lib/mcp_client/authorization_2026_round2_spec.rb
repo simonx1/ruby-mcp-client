@@ -175,6 +175,9 @@ RSpec.describe 'MCP 2026-07-28 authorization — round 2' do
     expect { provider.start_authorization_flow }.to raise_error(MCPClient::Errors::ConnectionError, /Pre-registered/)
 
     storage2 = MCPClient::Auth::OAuthProvider::MemoryStorage.new
+    # A dynamic registration is bound only when the authorization server it
+    # came from is known (cached alongside it); see round 7 for the rest.
+    storage2.set_server_metadata(server_url, as_meta)
     storage2.set_client_info(server_url, client_info(client_id: 'dyn', client_id_issued_at: 1_700_000_000))
     provider2 = provider_for(storage: storage2)
     stub_discovery(provider2, as_meta)
