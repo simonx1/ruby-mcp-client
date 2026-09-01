@@ -35,8 +35,12 @@ RSpec.describe 'MCP 2026-07-28 deprecations' do
                           :dynamic_client_registration)
     MCPClient::Deprecations::REGISTRY.each_value do |entry|
       expect(entry.keys).to include(:feature, :since, :reference, :migration)
-      expect(entry[:since]).to eq('2026-07-28')
     end
+    # The registry records when each feature entered the Deprecated state,
+    # not the revision that reclassified it.
+    expect(MCPClient::Deprecations::REGISTRY[:http_sse_transport][:since]).to eq('2025-03-26')
+    expect(MCPClient::Deprecations::REGISTRY[:include_context][:since]).to eq('2025-11-25')
+    expect(MCPClient::Deprecations::REGISTRY[:roots][:since]).to eq('2026-07-28')
   end
 
   it 'warns once when roots are configured' do
@@ -67,17 +71,20 @@ RSpec.describe 'MCP 2026-07-28 deprecations' do
     expect(output.string).to include('LLM provider')
   end
 
-  it 'warns when a sampling request asks for thisServer or allServers context but still serves it' do
-    handler = lambda { |_messages, _prefs, _system, _max|
-      { 'role' => 'assistant', 'content' => { 'type' => 'text', 'text' => 'ok' }, 'model' => 'm' }
-    }
-    c = client(sampling_handler: handler)
-    params = { 'messages' => [], 'maxTokens' => 5, 'includeContext' => 'allServers' }
+  %w[thisServer allServers].each do |value|
+    it "warns when a sampling request asks for #{value} context but still serves it" do
+      handler = lambda { |_messages, _prefs, _system, _max|
+        { 'role' => 'assistant', 'content' => { 'type' => 'text', 'text' => 'ok' }, 'model' => 'm' }
+      }
+      c = client(sampling_handler: handler)
+      params = { 'messages' => [], 'maxTokens' => 5, 'includeContext' => value }
 
-    result = c.send(:handle_sampling_request, 1, params)
+      result = c.send(:handle_sampling_request, 1, params)
 
-    expect(result['content']['text']).to eq('ok')
-    expect(output.string).to match(/includeContext.*allServers.*deprecated/i)
+      expect(result['content']['text']).to eq('ok')
+      expect(output.string).to include("Received: includeContext #{value}")
+      expect(MCPClient::Deprecations.emitted?(:include_context)).to be(true)
+    end
   end
 
   it 'does not mention includeContext for none or an absent field' do
@@ -100,11 +107,60 @@ RSpec.describe 'MCP 2026-07-28 deprecations' do
     expect(output.string).to include('stderr')
   end
 
-  it 'warns that the HTTP+SSE transport is deprecated' do
-    MCPClient::ServerSSE.new(base_url: 'http://localhost:1/sse', logger: logger)
+  it 'warns when the log level is set on a server directly' do
+    server = MCPClient::ServerStdio.new(command: 'echo test', logger: logger)
+    allow(server).to receive(:rpc_request).and_return({})
+    allow(server).to receive(:ensure_initialized)
+    allow(server).to receive(:modern?).and_return(true)
+
+    server.log_level = 'debug'
+
+    expect(output.string).to match(/Logging .*deprecated/)
+  end
+
+  it 'warns when a server sends a log message' do
+    server = MCPClient::ServerStdio.new(command: 'echo test', logger: logger)
+    allow(MCPClient::ServerFactory).to receive(:create).and_return(server)
+    c = MCPClient::Client.new(mcp_server_configs: [{ type: 'stdio', command: 'x' }], logger: logger)
+
+    c.send(:process_notification, server, 'notifications/message', { 'level' => 'info', 'data' => 'hello' })
+
+    expect(output.string).to match(/Logging .*deprecated/)
+  end
+
+  it 'warns that the HTTP+SSE transport is deprecated once it is connected, not when it is built' do
+    server = MCPClient::ServerSSE.new(base_url: 'http://localhost:1/sse', logger: logger)
+    expect(output.string).not_to match(/deprecated/)
+
+    # MCPClient.connect tries SSE while probing a URL that may end up on
+    # another transport: a failed attempt must not spend the notice.
+    expect { server.connect }.to raise_error(MCPClient::Errors::ConnectionError)
+    expect(MCPClient::Deprecations.emitted?(:http_sse_transport)).to be(false)
+
+    allow(server).to receive(:start_sse_thread)
+    allow(server).to receive(:wait_for_connection)
+    allow(server).to receive(:start_activity_monitor)
+    server.connect
 
     expect(output.string).to match(/HTTP\+SSE transport .*deprecated/)
     expect(output.string).to include('Streamable HTTP')
+    expect(output.string).to include('2025-03-26')
+  end
+
+  it 'does not spend the notice on a logger that drops warnings' do
+    quiet = Logger.new(output, level: Logger::ERROR)
+
+    expect(MCPClient::Deprecations.warn(:roots, quiet)).to be(false)
+    expect(MCPClient::Deprecations.emitted?(:roots)).to be(false)
+    expect(MCPClient::Deprecations.warn(:roots, logger)).to be(true)
+  end
+
+  it 'does not mark a notice emitted when the logger raises' do
+    broken = Object.new
+    def broken.warn(_message) = raise(IOError, 'closed stream')
+
+    expect { MCPClient::Deprecations.warn(:roots, broken) }.to raise_error(IOError)
+    expect(MCPClient::Deprecations.emitted?(:roots)).to be(false)
   end
 
   it 'stays silent when notices are disabled' do
@@ -154,8 +210,16 @@ RSpec.describe 'MCP 2026-07-28 deprecations' do
   end
 
   it 'never lets peer-controlled detail forge log lines' do
-    MCPClient::Deprecations.warn(:include_context, logger, detail: "allServers\nWARN forged")
+    MCPClient::Deprecations.warn(:include_context, logger, detail: "allServers\nWARN forged\u2028more")
 
     expect(output.string).not_to include("\nWARN forged")
+    expect(output.string).not_to include("\u2028")
+  end
+
+  it 'bounds the quoted detail' do
+    MCPClient::Deprecations.warn(:include_context, logger, detail: 'x' * 5000)
+
+    expect(output.string.length).to be < 1000
+    expect(output.string).to include('...')
   end
 end

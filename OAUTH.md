@@ -7,7 +7,7 @@ This implementation provides OAuth 2.1 authentication support for the Ruby MCP C
 - **OAuth 2.1 compliance** with security best practices
 - **PKCE (Proof Key for Code Exchange)** for secure authorization
 - **Automatic server discovery** via `.well-known` endpoints
-- **Dynamic client registration** when supported by servers
+- **Client ID Metadata Documents** and **pre-registered credentials**; dynamic client registration (RFC 7591) remains as a fallback but is deprecated since MCP 2026-07-28
 - **Token refresh** and automatic token management
 - **Per-authorization-server credentials and tokens** (MCP 2026-07-28): store pre-registered credentials with
   `registration_type: 'pre_registered'` **and the `issuer:` of the authorization server that issued them**
@@ -61,8 +61,9 @@ oauth_provider = MCPClient::Auth::OAuthProvider.new(
 # Start authorization flow
 auth_url = oauth_provider.start_authorization_flow
 
-# Complete flow after user authorization
-token = oauth_provider.complete_authorization_flow(code, state)
+# Complete flow after user authorization; pass the callback's iss parameter
+# so the response is checked against the authorization server (RFC 9207)
+token = oauth_provider.complete_authorization_flow(code, state, iss: iss)
 ```
 
 ## OAuth Flow Steps
@@ -106,7 +107,7 @@ The implementation follows the standard OAuth 2.1 authorization code flow with P
      keep their fail-closed reading instead. The same standard applies to a record read back from a
      storage backend that persists plain hashes: PKCE support requires an array, and a
      `scopes_supported` that is not one contributes no scopes.
-2. **Client Registration**: Automatically register OAuth client if dynamic registration is supported
+2. **Client Registration**: Use pre-registered credentials or a Client ID Metadata Document; fall back to dynamic registration (deprecated) when the authorization server offers nothing else
    - A registration response names a client only when it is a JSON object whose `client_id` is a
      non-empty string (RFC 7591 Section 3.2.1). A `201` without one registered nothing, so it raises a
      `ConnectionError` and the flow ends *before* the browser is opened, rather than sending the user

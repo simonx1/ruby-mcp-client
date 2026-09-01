@@ -16,7 +16,15 @@ metadata). Each feature lands in its own PR; this section accumulates them.
   `thisServer` / `allServers` received in a sampling request (still served)
   and OAuth Dynamic Client Registration (SEP-2577, SEP-2596, MCP PR #2858).
   Everything keeps working; `MCPClient::Deprecations.enabled = false`
-  silences the notices.
+  silences the notices. The registry records when each feature entered the
+  Deprecated state (the HTTP+SSE transport since 2025-03-26, the
+  `includeContext` values since 2025-11-25) because the deprecated features
+  registry sets their earliest removal separately; the HTTP+SSE notice is
+  logged once the transport is actually connected (so `MCPClient.connect`
+  probing a URL does not spend it), Logging warns on every entry point
+  (`log_level=` on a client or server, an incoming `notifications/message`),
+  a logger that drops warnings or raises does not consume the notice, and
+  the deprecated APIs carry YARD `@deprecated` tags.
 - **Documentation.** README documents the 2026-07-28 support (discovery
   and per-request metadata, multi round-trip requests, `x-mcp-header`,
   subscriptions, cacheable results, the tasks extension, authorization) and
