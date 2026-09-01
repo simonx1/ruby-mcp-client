@@ -144,9 +144,11 @@ module MCPClient
     # @raise [MCPClient::Errors::TransportError] if response isn't valid JSON
     # @raise [MCPClient::Errors::PromptGetError] for other errors during prompt listing
     def list_prompts
-      @mutex.synchronize do
-        return @prompts if @prompts
-      end
+      cached = @mutex.synchronize { @prompts }
+      # MCP 2026-07-28 caching: a list is served only while its hint is fresh.
+      return cached if cached && cache_fresh?(:prompts)
+
+      @mutex.synchronize { @prompts_data = nil }
 
       begin
         ensure_initialized
@@ -198,9 +200,8 @@ module MCPClient
     # @raise [MCPClient::Errors::TransportError] if response isn't valid JSON
     # @raise [MCPClient::Errors::ResourceReadError] for other errors during resource listing
     def list_resources(cursor: nil)
-      @mutex.synchronize do
-        return @resources_result if @resources_result && !cursor
-      end
+      cached = @mutex.synchronize { @resources_result }
+      return cached if cached && !cursor && cache_fresh?(:resources)
 
       begin
         ensure_initialized
@@ -214,6 +215,9 @@ module MCPClient
         end
 
         resources_result = { 'resources' => resources, 'nextCursor' => result['nextCursor'] }
+        # MCP 2026-07-28 caching: the first page's hint decides how long the
+        # cached list may be served.
+        record_cache_hint(:resources, result) unless cursor
 
         @mutex.synchronize do
           @resources_result = resources_result unless cursor
@@ -236,9 +240,7 @@ module MCPClient
     # @raise [MCPClient::Errors::ResourceReadError] for other errors during resource reading
     # @raise [MCPClient::Errors::ConnectionError] if server is disconnected
     def read_resource(uri)
-      result = require_complete_result!(rpc_request('resources/read', { uri: uri }), 'resources/read')
-      contents = result['contents'] || []
-      contents.map { |content| MCPClient::ResourceContent.from_json(content) }
+      read_resource_with_cache(uri) { rpc_request('resources/read', { uri: uri }) }
     rescue MCPClient::Errors::ServerError => e
       raise if e.protocol_error?
       raise resource_not_found_error(uri, e) if resource_not_found_response?(e)
@@ -314,9 +316,11 @@ module MCPClient
     # @raise [MCPClient::Errors::TransportError] if response isn't valid JSON
     # @raise [MCPClient::Errors::ToolCallError] for other errors during tool listing
     def list_tools
-      @mutex.synchronize do
-        return @tools if @tools
-      end
+      cached = @mutex.synchronize { @tools }
+      # MCP 2026-07-28 caching: a list is served only while its hint is fresh.
+      return cached if cached && cache_fresh?(:tools)
+
+      @mutex.synchronize { @tools_data = nil }
 
       begin
         ensure_initialized
@@ -1032,6 +1036,25 @@ module MCPClient
     # @return [Array<Hash>] the prompts data
     # @raise [MCPClient::Errors::PromptGetError] if prompts list retrieval fails
     # @private
+    # Drop a cached list so the next access re-fetches it (change
+    # notification, MCP 2026-07-28 caching).
+    # @param kind [Symbol] :tools, :prompts or :resources
+    # @return [void]
+    def invalidate_list_cache(kind)
+      @mutex.synchronize do
+        case kind
+        when :tools
+          @tools = nil
+          @tools_data = nil
+        when :prompts
+          @prompts = nil
+          @prompts_data = nil
+        when :resources
+          @resources_result = nil
+        end
+      end
+    end
+
     def request_prompts_list
       @mutex.synchronize do
         return @prompts_data.dup if @prompts_data

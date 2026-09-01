@@ -555,6 +555,9 @@ module MCPClient
 
         @tools = nil
         @tools_data = nil
+        # Cached results and their hints belong to the connection (and its
+        # authorization context) that is being torn down.
+        clear_result_cache
       end
     end
 

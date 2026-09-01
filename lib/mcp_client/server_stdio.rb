@@ -902,6 +902,8 @@ module MCPClient
       @session&.ended
       @session = nil
       @stdin = @stdout = @stderr = @wait_thread = @reader_thread = @stderr_thread = nil
+      # Cached results belong to the process that just ended.
+      clear_result_cache
       # The next request re-establishes the process and, on a modern
       # server, re-sends the subscriptions the host still holds.
       @initialized = false

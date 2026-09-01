@@ -5,6 +5,7 @@ require_relative 'json_rpc_common'
 require_relative 'called_tool_definition'
 require_relative 'auth/oauth_provider'
 require_relative 'http_transport_base/listen_stream'
+require_relative 'http_transport_base/cache_support'
 
 require_relative 'http_transport_base/param_headers'
 require_relative 'http_transport_base/request_recovery'
@@ -18,6 +19,7 @@ module MCPClient
     include ParamHeaders
     include RequestRecovery
     include ListenStream
+    include CacheSupport
 
     # Lightweight response wrapper for Faraday exception payloads (Hashes),
     # so the exception path and the default path share one challenge pipeline.
@@ -147,6 +149,7 @@ module MCPClient
           req.headers['Mcp-Protocol-Version'] = @protocol_version if @protocol_version
           # MCP: authorization MUST be included in every HTTP request
           @oauth_provider&.apply_authorization(req)
+          track_authorization_context(req.headers['Authorization'])
         end
 
         if response.success?
@@ -737,32 +740,6 @@ module MCPClient
       end
     end
 
-    # Re-fetch a list that has gone stale, or serve the stale copy when the
-    # re-fetch fails for a transient reason ("Clients MAY serve stale
-    # responses if errors occur during re-fetching").
-    # @param kind [Symbol] the list kind (for the log line)
-    # @param stale [Object, nil] the stale cached value
-    # @yield performs the fetch
-    # @return [Object] the fresh value, or the stale one on a transient failure
-    def refetch_or_serve_stale(kind, stale)
-      yield
-    rescue MCPClient::Errors::TransientServerError, MCPClient::Errors::ConnectionError,
-           MCPClient::Errors::TransportError => e
-      # A revoked or insufficient authorization is not a transient failure:
-      # serving the stale list would hide it from the host's auth flow.
-      raise if stale.nil? || authorization_failure?(e)
-
-      @logger.warn("Re-fetching #{kind} failed (#{e.class}); serving the stale cached list")
-      stale
-    end
-
-    # @param error [Exception] a failure raised by the HTTP pipeline
-    # @return [Boolean] whether it reports an authorization failure (401/403)
-    def authorization_failure?(error)
-      error.is_a?(MCPClient::Errors::InsufficientScopeError) ||
-        (error.is_a?(MCPClient::Errors::ConnectionError) && error.message.start_with?('Authorization failed'))
-    end
-
     # Exclude tool definitions whose x-mcp-header annotations violate the
     # transport constraints (MCP 2026-07-28: "Rejection means the client
     # MUST exclude the invalid tool from the result of tools/list"), logging
@@ -804,6 +781,7 @@ module MCPClient
       # Apply OAuth authorization if available
       @logger.debug("OAuth provider present: #{@oauth_provider ? 'yes' : 'no'}")
       @oauth_provider&.apply_authorization(req)
+      track_authorization_context(req.headers['Authorization'])
 
       # MCP 2026-07-28: every POST carries MCP-Protocol-Version (matching the
       # body's _meta), Mcp-Method and, for named requests, Mcp-Name.

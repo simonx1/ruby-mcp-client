@@ -497,3 +497,178 @@ RSpec.describe 'MCP 2026-07-28 cacheable results — round 2' do
     expect(server.cache_fresh?(:tools)).to be(false)
   end
 end
+
+RSpec.describe 'MCP 2026-07-28 cacheable results — round 3' do
+  let(:url) { 'https://example.com/mcp' }
+
+  def json_response(id, result)
+    { status: 200, body: JSON.generate('jsonrpc' => '2.0', 'id' => id, 'result' => result),
+      headers: { 'Content-Type' => 'application/json' } }
+  end
+
+  def discover_result
+    { 'resultType' => 'complete', 'supportedVersions' => ['2026-07-28'],
+      'capabilities' => { 'tools' => {}, 'resources' => {} } }
+  end
+
+  def script_stdio(server, responses)
+    sent = []
+    allow(server).to receive(:connect).and_return(true)
+    allow(server).to receive(:start_reader)
+    allow(server).to receive(:start_stderr_reader)
+    server.instance_variable_set(:@stdin, double('stdin', puts: nil, flush: nil, closed?: true, close: nil))
+    allow(server).to receive(:send_request) { |req| sent << req }
+    allow(server).to receive(:wait_response) do |id, **_opts|
+      responder = responses.shift
+      raise 'no scripted response left' unless responder
+
+      response = responder.respond_to?(:call) ? responder.call(sent.last) : responder
+      response.merge('jsonrpc' => '2.0', 'id' => id)
+    end
+    sent
+  end
+
+  def contents(text)
+    { 'contents' => [{ 'uri' => 'file:///a', 'text' => text }] }
+  end
+
+  it 'does not cache resources/read from a legacy server' do
+    server = MCPClient::ServerStdio.new(command: 'echo test', read_timeout: 1, protocol: :legacy)
+    script_stdio(server, [{ 'result' => { 'protocolVersion' => '2025-11-25', 'capabilities' => {},
+                                          'serverInfo' => { 'name' => 's', 'version' => '1' } } },
+                          { 'result' => contents('one') }, { 'result' => contents('two') }])
+
+    expect(server.read_resource('file:///a').first.text).to eq('one')
+    expect(server.read_resource('file:///a').first.text).to eq('two')
+  end
+
+  it 'treats a resources/read without ttlMs from a modern server as immediately stale' do
+    server = MCPClient::ServerStdio.new(command: 'echo test', read_timeout: 1)
+    script_stdio(server, [{ 'result' => discover_result },
+                          { 'result' => contents('one') }, { 'result' => contents('two') }])
+
+    expect(server.read_resource('file:///a').first.text).to eq('one')
+    expect(server.read_resource('file:///a').first.text).to eq('two')
+  end
+
+  it 'forgets cached results and hints on cleanup' do
+    reads = 0
+    stub_request(:post, url).to_return do |request|
+      body = JSON.parse(request.body)
+      result = case body['method']
+               when 'resources/read'
+                 reads += 1
+                 contents("read #{reads}").merge('ttlMs' => 60_000, 'cacheScope' => 'private')
+               when 'tools/list' then { 'tools' => [], 'ttlMs' => 60_000, 'cacheScope' => 'public' }
+               else discover_result
+               end
+      json_response(body['id'], result)
+    end
+    server = MCPClient::ServerStreamableHTTP.new(base_url: 'https://example.com', endpoint: '/mcp', retries: 0)
+
+    expect(server.read_resource('file:///a').first.text).to eq('read 1')
+    server.list_tools
+    server.cleanup
+
+    expect(server.cache_info(:read, 'file:///a')).to be_nil
+    expect(server.cache_info(:tools)).to be_nil
+    expect(server.read_resource('file:///a').first.text).to eq('read 2')
+  ensure
+    server&.cleanup
+  end
+
+  it 'drops private entries when the authorization context changes, keeping public ones' do
+    token = { value: 'alice' }
+    provider = instance_double(MCPClient::Auth::OAuthProvider)
+    allow(provider).to receive(:apply_authorization) { |req| req.headers['Authorization'] = "Bearer #{token[:value]}" }
+    allow(provider).to receive(:respond_to?).and_return(true)
+    counts = Hash.new(0)
+    stub_request(:post, url).to_return do |request|
+      body = JSON.parse(request.body)
+      counts[body['method']] += 1
+      result = case body['method']
+               when 'resources/read'
+                 contents(request.headers['Authorization']).merge('ttlMs' => 60_000, 'cacheScope' => 'private')
+               when 'tools/list' then { 'tools' => [], 'ttlMs' => 60_000, 'cacheScope' => 'public' }
+               else discover_result
+               end
+      json_response(body['id'], result)
+    end
+    server = MCPClient::ServerStreamableHTTP.new(base_url: 'https://example.com', endpoint: '/mcp', retries: 0,
+                                                 oauth_provider: provider)
+
+    expect(server.read_resource('file:///a').first.text).to eq('Bearer alice')
+    server.list_tools
+    token[:value] = 'bob'
+    expect(server.read_resource('file:///a').first.text).to eq('Bearer bob')
+    server.list_tools
+
+    expect(counts['resources/read']).to eq(2)
+    expect(counts['tools/list']).to eq(1)
+  ensure
+    server&.cleanup
+  end
+
+  it 'marks a list stale (not unknown) when its change notification arrives' do
+    server = MCPClient::ServerStdio.new(command: 'echo test', read_timeout: 1)
+    script_stdio(server, [{ 'result' => discover_result },
+                          { 'result' => { 'tools' => [], 'ttlMs' => 60_000 } },
+                          { 'result' => { 'resourceTemplates' => [], 'ttlMs' => 60_000 } }])
+    server.list_tools
+    server.list_resource_templates
+    expect(server.cache_fresh?(:tools)).to be(true)
+    expect(server.cache_fresh?(:templates)).to be(true)
+
+    server.send(:invalidate_cache_for_notification, 'notifications/tools/list_changed')
+    server.send(:invalidate_cache_for_notification, 'notifications/resources/list_changed')
+
+    expect(server.cache_fresh?(:tools)).to be(false)
+    expect(server.cache_fresh?(:templates)).to be(false)
+  end
+
+  describe 'on HTTP+SSE' do
+    let(:server) { MCPClient::ServerSSE.new(base_url: 'https://example.com/sse') }
+    let(:clock) { { now: 0.0 } }
+
+    before do
+      allow(server).to receive(:monotonic_now) { clock[:now] }
+      allow(server).to receive(:ensure_initialized)
+      server.instance_variable_set(:@protocol_version, '2025-11-25')
+    end
+
+    it 'serves lists only while fresh and re-fetches once stale' do
+      lists = 0
+      allow(server).to receive(:rpc_request).with('tools/list', anything) do
+        lists += 1
+        { 'tools' => [{ 'name' => "t#{lists}", 'inputSchema' => { 'type' => 'object' } }], 'ttlMs' => 1000 }
+      end
+
+      expect(server.list_tools.map(&:name)).to eq(['t1'])
+      expect(server.list_tools.map(&:name)).to eq(['t1'])
+      clock[:now] += 5
+      expect(server.list_tools.map(&:name)).to eq(['t2'])
+    end
+
+    it 'drops its list on the change notification and caches reads while fresh' do
+      lists = 0
+      reads = 0
+      allow(server).to receive(:rpc_request).with('prompts/list', anything) do
+        lists += 1
+        { 'prompts' => [{ 'name' => "p#{lists}" }], 'ttlMs' => 60_000 }
+      end
+      allow(server).to receive(:rpc_request).with('resources/read', anything) do
+        reads += 1
+        contents("read #{reads}").merge('ttlMs' => 60_000)
+      end
+
+      expect(server.list_prompts.map(&:name)).to eq(['p1'])
+      server.send(:invalidate_cache_for_notification, 'notifications/prompts/list_changed')
+      expect(server.list_prompts.map(&:name)).to eq(['p2'])
+
+      expect(server.read_resource('file:///a').first.text).to eq('read 1')
+      expect(server.read_resource('file:///a').first.text).to eq('read 1')
+      server.send(:invalidate_cache_for_notification, 'notifications/resources/updated', { 'uri' => 'file:///a' })
+      expect(server.read_resource('file:///a').first.text).to eq('read 2')
+    end
+  end
+end

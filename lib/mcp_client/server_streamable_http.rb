@@ -611,8 +611,12 @@ module MCPClient
         @prompts_data = nil
         @resources = nil
         @resources_data = nil
+        @resources_result = nil
         @buffer = +''
         @buffer_scanned = 0
+        # Cached results and their hints belong to the connection (and its
+        # authorization context) that is being torn down.
+        clear_result_cache
 
         @logger.info('Cleanup completed')
       end

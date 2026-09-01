@@ -11,10 +11,15 @@ module MCPClient
   module ResultCaching
     # Operation kinds with a list cache and the notification that invalidates them.
     LIST_CHANGE_NOTIFICATIONS = {
-      'notifications/tools/list_changed' => :tools,
-      'notifications/prompts/list_changed' => :prompts,
-      'notifications/resources/list_changed' => :resources
+      'notifications/tools/list_changed' => %i[tools],
+      'notifications/prompts/list_changed' => %i[prompts],
+      # resources/list_changed also covers resources/templates/list.
+      'notifications/resources/list_changed' => %i[resources templates]
     }.freeze
+
+    # Guards the lazy creation of the per-transport cache structures, which
+    # request threads and notification threads may touch first.
+    CACHE_INIT_LOCK = Mutex.new
 
     # Paginated list methods and their cache kind.
     LIST_METHOD_KINDS = {
@@ -31,12 +36,12 @@ module MCPClient
 
     # @return [Hash{Object => MCPClient::CachedResult}]
     def cache_entries
-      @cache_entries ||= {}
+      @cache_entries || CACHE_INIT_LOCK.synchronize { @cache_entries ||= {} }
     end
 
     # @return [Mutex]
     def cache_entries_mutex
-      @cache_entries_mutex ||= Mutex.new
+      @cache_entries_mutex || CACHE_INIT_LOCK.synchronize { @cache_entries_mutex ||= Mutex.new }
     end
 
     # Record the freshness hint of one result.
@@ -86,8 +91,21 @@ module MCPClient
     # @param kind [Symbol, String]
     # @return [Boolean]
     def cache_fresh?(kind)
-      entry = cache_entries_mutex.synchronize { cache_entries[kind] }
+      entry = private_entry_for_current_context(kind)
       entry.nil? || entry.fresh?(now: monotonic_now)
+    end
+
+    # The entry for a kind, after making sure a privately scoped one still
+    # belongs to the current authorization context (transports that know
+    # their context re-check it here; a changed context drops the entry).
+    # @param kind [Symbol, String]
+    # @return [MCPClient::CachedResult, nil]
+    def private_entry_for_current_context(kind)
+      entry = cache_entries_mutex.synchronize { cache_entries[kind] }
+      return entry unless entry&.cache_scope == 'private' && respond_to?(:ensure_authorization_context!, true)
+
+      ensure_authorization_context!
+      cache_entries_mutex.synchronize { cache_entries[kind] }
     end
 
     # The freshness hint recorded for an operation.
@@ -99,11 +117,32 @@ module MCPClient
       entry&.to_info(now: monotonic_now)
     end
 
-    # Forget the hint (and cached value) for a kind.
+    # Mark a kind stale: a change notification invalidates a still-fresh
+    # cache, so the kind must read as stale (not as "nothing known", which
+    # would let a concurrently snapshotted list be served) until the next
+    # fetch records a new hint.
     # @param kind [Symbol, String]
     # @return [void]
     def invalidate_cache(kind)
-      cache_entries_mutex.synchronize { cache_entries.delete(kind) }
+      stale = MCPClient::CachedResult.stale(now: monotonic_now)
+      cache_entries_mutex.synchronize { cache_entries[kind] = stale }
+    end
+
+    # Forget every cached result and hint (the connection, and with it the
+    # authorization context, is gone).
+    # @return [void]
+    def clear_result_cache
+      cache_entries_mutex.synchronize { cache_entries.clear }
+    end
+
+    # Forget the entries cached under `cacheScope: "private"`: they "MUST NOT
+    # be shared across authorization contexts" (a new access token is one).
+    # @return [void]
+    def invalidate_private_cache
+      stale = MCPClient::CachedResult.stale(now: monotonic_now)
+      cache_entries_mutex.synchronize do
+        cache_entries.each_key { |key| cache_entries[key] = stale if cache_entries[key].cache_scope == 'private' }
+      end
     end
 
     # Forget cached resources/read results: one URI, or all of them.
@@ -134,17 +173,22 @@ module MCPClient
     # @return [Array<MCPClient::ResourceContent>]
     def read_resource_with_cache(uri)
       key = read_cache_key(uri)
-      cached = cache_entries_mutex.synchronize { cache_entries[key] }
+      cached = private_entry_for_current_context(key)
       return cached.value.dup if cached&.value && cached.fresh?(now: monotonic_now)
 
       result = yield
       contents = ((result.is_a?(Hash) && result['contents']) || []).map do |content|
         MCPClient::ResourceContent.from_json(content)
       end
-      if last_result_from_round_trip?
-        invalidate_cache(key)
+      entry = MCPClient::CachedResult.from_result(result, contents, now: monotonic_now)
+      # A read is cached only on an explicit ttlMs: "if ttlMs is absent,
+      # clients SHOULD assume 0" — and reads were never cached before this
+      # revision, so a legacy server keeps that behaviour. A result reached
+      # through a multi round-trip retry MUST NOT be cached either.
+      if last_result_from_round_trip? || !entry.hint?
+        invalidate_read_cache(uri)
       else
-        record_cache_hint(key, result, contents)
+        cache_entries_mutex.synchronize { cache_entries[key] = entry }
       end
       contents
     end
@@ -156,11 +200,13 @@ module MCPClient
     # @param params [Hash, nil] notification params
     # @return [void]
     def invalidate_cache_for_notification(method, params = nil)
-      kind = LIST_CHANGE_NOTIFICATIONS[method]
-      if kind
-        invalidate_cache(kind)
-        invalidate_list_cache(kind) if respond_to?(:invalidate_list_cache, true)
-        invalidate_read_cache if kind == :resources
+      kinds = LIST_CHANGE_NOTIFICATIONS[method]
+      if kinds
+        kinds.each do |kind|
+          invalidate_cache(kind)
+          invalidate_list_cache(kind) if respond_to?(:invalidate_list_cache, true)
+          invalidate_read_cache if kind == :resources
+        end
       elsif method == 'notifications/resources/updated'
         uri = params.is_a?(Hash) ? params['uri'] : nil
         invalidate_read_cache(uri) if uri.is_a?(String)
