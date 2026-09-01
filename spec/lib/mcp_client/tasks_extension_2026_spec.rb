@@ -1104,13 +1104,16 @@ RSpec.describe 'MCP 2026-07-28 tasks extension — round 6' do
                                 ->(_req) { raise MCPClient::Errors::RequestTimeoutError, 'update timed out' },
                                 { 'result' => detailed_task(status: 'input_required',
                                                             'inputRequests' => { 'k1' => elicit_request }) },
+                                { 'result' => {} },
                                 { 'result' => detailed_task(status: 'completed', 'result' => call_result) }])
     task = client.call_tool_as_task('slow', {})
 
     expect { client.wait_for_task(task) }.to raise_error(MCPClient::Errors::TaskError)
     expect(client.wait_for_task(task)).to be_completed
     expect(handled).to eq(1)
-    expect(sent.count { |r| r['method'] == 'tasks/update' }).to eq(1)
+    # The lost update is delivered again on the next wait, without asking
+    # the handler a second time.
+    expect(sent.count { |r| r['method'] == 'tasks/update' }).to eq(2)
   end
 
   it 'sanitizes task ids and tool names in transport and creation errors' do

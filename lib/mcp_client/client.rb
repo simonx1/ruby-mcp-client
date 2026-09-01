@@ -684,7 +684,11 @@ module MCPClient
       srv = select_server(server)
       # tasks/list is gone on 2026-07-28 regardless of any extension, so the
       # era is settled before the capability gate could ask for one.
-      probe_server_era(srv)
+      begin
+        probe_server_era(srv)
+      rescue MCPClient::Errors::MCPError => e
+        raise MCPClient::Errors::TaskError, "Error listing tasks: #{e.message}"
+      end
       if modern_server?(srv)
         raise MCPClient::Errors::TaskError,
               'tasks/list does not exist on MCP 2026-07-28 servers: keep the Task handles you created'
@@ -727,7 +731,8 @@ module MCPClient
         # A terminal task cannot be cancelled (-32602); that is an error, not a
         # missing task, so keep it as a TaskError.
         if e.message.match?(/terminal/i)
-          raise MCPClient::Errors::TaskError, "Error cancelling task '#{task_id}': #{e.message}"
+          raise MCPClient::Errors::TaskError, "Error cancelling task '#{sanitize_peer_log_text(task_id.to_s)}': " \
+                                              "#{sanitize_peer_log_text(e.message)}"
         end
 
         raise task_error_from(e, task_id, 'cancelling', modern: modern_server?(srv), method: 'tasks/cancel')
@@ -1018,9 +1023,9 @@ module MCPClient
     def probe_server_era(srv)
       return if capabilities_known?(srv) || !srv.respond_to?(:ping)
 
+      # A method that no longer exists on 2026-07-28 servers must not go out
+      # on a guess: an initialization failure surfaces.
       srv.ping
-    rescue MCPClient::Errors::MCPError
-      nil
     end
 
     # @param strict [Boolean] surface an initialization failure instead of

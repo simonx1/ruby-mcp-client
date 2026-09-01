@@ -14,6 +14,9 @@ module MCPClient
       DEFAULT_TASK_POLL_INTERVAL = 1.0
       MIN_TASK_POLL_INTERVAL = 0.05
       MIN_TASK_REQUEST_TIMEOUT = 0.001
+      # The longest a single poll request may wait, whatever the TTL: a hung
+      # tasks/get must not block the wait for the task's whole lifetime.
+      MAX_TASK_REQUEST_TIMEOUT = 30.0
 
       # How many input_required rounds one wait answers before giving up:
       # a task is not a higher-trust channel than a multi round-trip request.
@@ -87,14 +90,21 @@ module MCPClient
           return task
         end
 
-        wait = { task_id: task_id, srv: srv, deadline: timeout && (monotonic_time + timeout), rounds: 0,
-                 answered: answered_task_keys(srv, task_id) }
+        wait = { task_id: task_id, srv: srv, deadline: timeout && (monotonic_time + timeout),
+                 answered: answered_task_keys(srv, task_id), last: nil }
         # The CreateTaskResult seed is not an observation: the first
         # tasks/get goes out at once, and only DetailedTasks drive the wait.
         loop do
           current = observe_task(wait)
-          # A poll that timed out is no observation: try again shortly.
-          next sleep(MIN_TASK_POLL_INTERVAL) unless current
+          # A poll that timed out is no observation: try again at the pace
+          # the server last asked for.
+          unless current
+            next sleep(wait[:last] ? task_poll_delay(wait[:last],
+                                                     wait[:deadline]) : MIN_TASK_POLL_INTERVAL)
+          end
+
+          wait[:last] = current
+          retransmit_pending_update(wait)
 
           if current.terminal?
             forget_task_keys(srv, task_id)
@@ -142,16 +152,30 @@ module MCPClient
       def answer_task_round(current, wait)
         return unless pending_task_input?(current, wait[:answered])
 
-        # The limit is checked before the handlers run and the update goes out.
-        if wait[:rounds] >= MAX_TASK_INPUT_ROUNDS
+        # The limit is per task (not per wait) and is checked before the
+        # handlers run and the update goes out.
+        state = task_state(wait[:srv], wait[:task_id])
+        if state[:rounds] >= MAX_TASK_INPUT_ROUNDS
           raise MCPClient::Errors::InputRequiredError.new(
             "Task '#{shown_task_id(wait[:task_id])}' kept requesting input after #{MAX_TASK_INPUT_ROUNDS} rounds",
             data: current.to_h
           )
         end
 
-        wait[:rounds] += 1
+        answered_keys_mutex.synchronize { state[:rounds] += 1 }
         answer_task_input_requests(current, wait[:answered], wait[:srv])
+      end
+
+      # Deliver again an update whose acknowledgement was lost, before any
+      # new input is answered (the server ignores keys it already has).
+      # @return [void]
+      def retransmit_pending_update(wait)
+        state = task_state(wait[:srv], wait[:task_id])
+        pending = answered_keys_mutex.synchronize { state[:pending_update] }
+        return unless pending
+
+        update_task(wait[:task_id], pending, server: wait[:srv])
+        answered_keys_mutex.synchronize { state[:pending_update] = nil }
       end
 
       # Whether the task lists an input request that has not been answered.
@@ -175,9 +199,16 @@ module MCPClient
       # consecutive polls") until the task is terminal or cancelled.
       # @return [Set<String>]
       def answered_task_keys(srv, task_id)
+        task_state(srv, task_id)[:answered]
+      end
+
+      # Per-task bookkeeping shared by every wait on the task: the answered
+      # keys, the input rounds spent and an update still to be delivered.
+      # @return [Hash]
+      def task_state(srv, task_id)
         answered_keys_mutex.synchronize do
-          @answered_task_keys ||= {}
-          @answered_task_keys[[srv.object_id, task_id]] ||= Set.new
+          @task_states ||= {}
+          @task_states[[srv.object_id, task_id]] ||= { answered: Set.new, rounds: 0, pending_update: nil }
         end
       end
 
@@ -194,7 +225,23 @@ module MCPClient
 
       # @return [void]
       def forget_task_keys(srv, task_id)
-        answered_keys_mutex.synchronize { @answered_task_keys&.delete([srv.object_id, task_id]) }
+        answered_keys_mutex.synchronize { @task_states&.delete([srv.object_id, task_id]) }
+      end
+
+      # Send the answers; when delivery fails at the transport level the
+      # answers are kept for retransmission by the next wait, since the
+      # server may or may not have applied them.
+      # @return [void]
+      def deliver_task_update(task_id, responses, srv)
+        update_task(task_id, responses, server: srv)
+      rescue MCPClient::Errors::TaskError => e
+        unless e.cause.is_a?(MCPClient::Errors::TransportError) || e.cause.is_a?(MCPClient::Errors::ConnectionError)
+          raise
+        end
+
+        state = task_state(srv, task_id)
+        answered_keys_mutex.synchronize { state[:pending_update] = responses }
+        raise
       end
 
       # @param task_id [Object] a peer-controlled task id
@@ -243,6 +290,8 @@ module MCPClient
         # The request never outlives the wait (a tiny positive floor keeps
         # the transport from reading 0 as "no timeout").
         remaining = deadline && [deadline - monotonic_time, MIN_TASK_REQUEST_TIMEOUT].max
+        remaining = [remaining, MAX_TASK_REQUEST_TIMEOUT].min if remaining
+        remaining ||= MAX_TASK_REQUEST_TIMEOUT
         get_task(wait[:task_id], server: wait[:srv], timeout: remaining)
       rescue MCPClient::Errors::TaskError => e
         raise unless e.cause.is_a?(MCPClient::Errors::RequestTimeoutError)
@@ -390,7 +439,7 @@ module MCPClient
           answered_keys_mutex.synchronize { answered.subtract(pending.keys) }
           raise
         end
-        update_task(task.task_id, responses, server: srv)
+        deliver_task_update(task.task_id, responses, srv)
         pending.keys
       end
 
