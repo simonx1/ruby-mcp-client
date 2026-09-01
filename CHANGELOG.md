@@ -67,6 +67,12 @@ metadata). Each feature lands in its own PR; this section accumulates them.
   `pollIntervalMs`, a completed task's `result` must be an object, the
   input-round limit is applied atomically with the key reservation, and
   `list_tasks` errors are sanitized.
+- **Per-server handles.** A `tasks/update` carries every response still
+  pending from an earlier delivery that could not be confirmed, so no answer
+  is left behind once a later update lands; a handle from another server
+  neither seeds a wait on the server named explicitly (no TTL, no pace) nor
+  colours the acknowledgement of a cancel there; symbol-keyed camelCase
+  task fields (`ttlMs:`, `pollIntervalMs:`) count as the modern shape.
 
 ### Cacheable results (`ttlMs` / `cacheScope`)
 
