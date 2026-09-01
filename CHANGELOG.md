@@ -5,6 +5,35 @@
 Groundwork for the 2026-07-28 protocol revision (stateless, per-request
 metadata). Each feature lands in its own PR; this section accumulates them.
 
+### Streamable HTTP modern mode (no sessions, request metadata headers)
+
+- **Era detection over HTTP** (Streamable HTTP "Backward Compatibility").
+  Both HTTP transports POST `server/discover` first. A `DiscoverResult`, or a
+  recognized modern JSON-RPC error in a 400 body (`UnsupportedProtocolVersion`
+  is retried with an advertised version; `HeaderMismatch` and
+  `MissingRequiredClientCapability` are surfaced), marks the server modern. A
+  404 carrying -32601 is a modern server without discovery support
+  (tolerated, capabilities unknown). Any other 4xx — or a 2xx that is not a
+  `DiscoverResult` — is a legacy server: the `initialize` handshake runs as
+  before and the verdict is cached for the transport. 401/403, 5xx and
+  timeouts propagate rather than trigger a fallback. `protocol:` and
+  `discover_timeout:` are accepted by `http_config`, `streamable_http_config`,
+  the factory and `MCPClient.connect`.
+- **Request metadata headers.** Every modern POST carries
+  `MCP-Protocol-Version` (equal to the body's `_meta`), `Mcp-Method` and, for
+  `tools/call`, `prompts/get` and `resources/read`, `Mcp-Name` (also for the
+  tasks extension's `taskId`). Values that are not header-safe use the
+  `=?base64?…?=` sentinel encoding (`encode_header_value`).
+- **No protocol-level session.** Modern connections send no
+  `Mcp-Session-Id`, open no GET event stream, send no DELETE, and never use
+  `Last-Event-ID`: a response stream that ends without the response is
+  re-issued as a new request (new id) for idempotent methods, while
+  `tools/call` raises so the host decides. Closing the stream is the
+  cancellation signal (no `notifications/cancelled` on timeout). Server-
+  initiated JSON-RPC requests on a response stream are dropped with a
+  warning; SSE comment keep-alives are ignored. `ping` maps to
+  `server/discover` and `log_level=` to the per-request `_meta` level.
+
 ### Stateless protocol on stdio (server/discover, per-request `_meta`)
 
 - **No handshake for modern servers.** On stdio the client now probes with

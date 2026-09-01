@@ -295,7 +295,9 @@ module MCPClient
     def extract_http_options(options)
       extract_common_options(options).merge({
         headers: options[:headers] || {},
-        endpoint: options[:endpoint]
+        endpoint: options[:endpoint],
+        protocol: options[:protocol],
+        discover_timeout: options[:discover_timeout]
       }.compact)
     end
 
@@ -437,7 +439,7 @@ module MCPClient
   #   (e.g., SSL settings, custom middleware). The block is called after default configuration is applied.
   # @return [Hash] server configuration
   def self.http_config(base_url:, endpoint: '/rpc', headers: {}, read_timeout: 30, retries: 3, retry_backoff: 1,
-                       name: nil, logger: nil, &faraday_config)
+                       name: nil, logger: nil, protocol: :auto, discover_timeout: nil, &faraday_config)
     {
       type: 'http',
       base_url: base_url,
@@ -448,6 +450,8 @@ module MCPClient
       retry_backoff: retry_backoff,
       name: name,
       logger: logger,
+      protocol: protocol,
+      discover_timeout: discover_timeout,
       faraday_config: faraday_config
     }
   end
@@ -472,7 +476,7 @@ module MCPClient
                                   retry_backoff: 1, name: nil, logger: nil,
                                   max_decompressed_body_bytes:
                                     MCPClient::ServerStreamableHTTP::JsonRpcTransport::MAX_DECOMPRESSED_BODY_BYTES,
-                                  &faraday_config)
+                                  protocol: :auto, discover_timeout: nil, &faraday_config)
     {
       type: 'streamable_http',
       base_url: base_url,
@@ -484,6 +488,8 @@ module MCPClient
       name: name,
       logger: logger,
       max_decompressed_body_bytes: max_decompressed_body_bytes,
+      protocol: protocol,
+      discover_timeout: discover_timeout,
       faraday_config: faraday_config
     }
   end
