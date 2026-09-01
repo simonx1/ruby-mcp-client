@@ -631,7 +631,8 @@ module MCPClient
 
         raise task_error_from(e, task_id, 'getting', modern: modern_server?(srv), method: 'tasks/get')
       rescue MCPClient::Errors::TransportError, MCPClient::Errors::ConnectionError => e
-        raise MCPClient::Errors::TaskError, "Error getting task '#{task_id}': #{e.message}"
+        raise MCPClient::Errors::TaskError, "Error getting task '#{sanitize_peer_log_text(task_id.to_s)}': " \
+                                            "#{sanitize_peer_log_text(e.message)}"
       end
     end
 
@@ -654,7 +655,9 @@ module MCPClient
     # @raise [MCPClient::Errors::TaskError] if retrieval fails
     def get_task_result(task_id, server: nil)
       srv = select_task_server(task_id, server, 'get_task_result')
-      ensure_task_capability!(srv, 'result')
+      # tasks/result must never reach a 2026-07-28 server, so the era has
+      # to be known: an initialization failure surfaces here.
+      ensure_task_capability!(srv, 'result', strict: true)
       # MCP 2026-07-28 removed tasks/result: the result is delivered inline
       # by tasks/get once the task is terminal.
       return task_outcome(wait_for_task(task_id, server: srv)) if modern_server?(srv)
@@ -729,7 +732,8 @@ module MCPClient
 
         raise task_error_from(e, task_id, 'cancelling', modern: modern_server?(srv), method: 'tasks/cancel')
       rescue MCPClient::Errors::TransportError, MCPClient::Errors::ConnectionError => e
-        raise MCPClient::Errors::TaskError, "Error cancelling task '#{task_id}': #{e.message}"
+        raise MCPClient::Errors::TaskError, "Error cancelling task '#{sanitize_peer_log_text(task_id.to_s)}': " \
+                                            "#{sanitize_peer_log_text(e.message)}"
       end
     end
 

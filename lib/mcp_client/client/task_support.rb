@@ -33,6 +33,7 @@ module MCPClient
       def update_task(task, input_responses, server: nil)
         srv = select_task_server(task, server, 'update_task')
         task_id = task_identifier(task)
+        shown = shown_task_id(task_id)
         ensure_task_capability!(srv, 'update', strict: true)
         unless modern_server?(srv)
           raise MCPClient::Errors::TaskError, 'tasks/update requires an MCP 2026-07-28 server (tasks extension)'
@@ -49,7 +50,7 @@ module MCPClient
 
           raise task_error_from(e, task_id, 'updating', modern: true, method: 'tasks/update')
         rescue MCPClient::Errors::TransportError, MCPClient::Errors::ConnectionError => e
-          raise MCPClient::Errors::TaskError, "Error updating task '#{task_id}': #{e.message}"
+          raise MCPClient::Errors::TaskError, "Error updating task '#{shown}': #{sanitize_peer_log_text(e.message)}"
         end
       end
 
@@ -81,16 +82,20 @@ module MCPClient
         # tasks/get goes out at once, and only DetailedTasks drive the wait.
         loop do
           current = observe_task(wait)
+          # A poll that timed out is no observation: try again shortly.
+          next sleep(MIN_TASK_POLL_INTERVAL) unless current
+
           if current.terminal?
             forget_task_keys(srv, task_id)
             return current
           end
 
-          answer_task_round(current, wait)
+          # The TTL backstop comes before any handler runs for the task.
           if current.ttl_elapsed?
             raise MCPClient::Errors::TaskError,
                   "Task '#{shown_task_id(task_id)}' did not reach a terminal status within its TTL (createdAt + ttlMs)"
           end
+          answer_task_round(current, wait)
 
           sleep(task_poll_delay(current, wait[:deadline]))
         end
@@ -116,6 +121,8 @@ module MCPClient
       def observe_task(wait)
         raise_if_past_deadline!(wait)
         current = poll_task(wait)
+        return nil unless current
+
         validate_terminal_task!(current) if current.terminal?
         current
       end
@@ -134,11 +141,8 @@ module MCPClient
           )
         end
 
-        answered_now = answer_task_input_requests(current, wait[:answered], wait[:srv])
-        return if answered_now.empty?
-
-        wait[:answered].merge(answered_now)
         wait[:rounds] += 1
+        answer_task_input_requests(current, wait[:answered], wait[:srv])
       end
 
       # Whether the task lists an input request that has not been answered.
@@ -154,13 +158,20 @@ module MCPClient
       # consecutive polls") until the task is terminal or cancelled.
       # @return [Set<String>]
       def answered_task_keys(srv, task_id)
-        @answered_task_keys ||= {}
-        @answered_task_keys[[srv.object_id, task_id]] ||= Set.new
+        answered_keys_mutex.synchronize do
+          @answered_task_keys ||= {}
+          @answered_task_keys[[srv.object_id, task_id]] ||= Set.new
+        end
+      end
+
+      # @return [Mutex] guards the answered-key registry (request threads share the client)
+      def answered_keys_mutex
+        @answered_keys_mutex ||= Mutex.new
       end
 
       # @return [void]
       def forget_task_keys(srv, task_id)
-        @answered_task_keys&.delete([srv.object_id, task_id])
+        answered_keys_mutex.synchronize { @answered_task_keys&.delete([srv.object_id, task_id]) }
       end
 
       # @param task_id [Object] a peer-controlled task id
@@ -177,14 +188,22 @@ module MCPClient
         raise MCPClient::Errors::TaskError, "Timed out waiting for task '#{shown_task_id(wait[:task_id])}'"
       end
 
-      # One tasks/get, bounded by what is left of the wait.
-      # @return [MCPClient::Task]
+      # One tasks/get, bounded by what is left of the wait. A request that
+      # merely timed out is not the end of the task ("Clients SHOULD continue
+      # polling until the task reaches a terminal status"): nil is returned
+      # and the caller polls again.
+      # @return [MCPClient::Task, nil]
       def poll_task(wait)
         deadline = wait[:deadline]
         # The request never outlives the wait (a tiny positive floor keeps
         # the transport from reading 0 as "no timeout").
         remaining = deadline && [deadline - monotonic_time, MIN_TASK_REQUEST_TIMEOUT].max
         get_task(wait[:task_id], server: wait[:srv], timeout: remaining)
+      rescue MCPClient::Errors::TaskError => e
+        raise unless e.cause.is_a?(MCPClient::Errors::RequestTimeoutError)
+
+        logger.debug("tasks/get for task #{shown_task_id(wait[:task_id])} timed out; polling again")
+        nil
       end
 
       # A DetailedTask MUST carry the payload its terminal status implies
@@ -230,10 +249,14 @@ module MCPClient
           # their type; anything else is a failed creation.
           raise if e.protocol_error?
 
-          raise MCPClient::Errors::TaskError, "Error creating task for tool '#{tool_name}': #{e.message}"
+          raise MCPClient::Errors::TaskError, 'Error creating task for tool ' \
+                                              "'#{sanitize_peer_log_text(tool_name.to_s)}': " \
+                                              "#{sanitize_peer_log_text(e.message)}"
         rescue MCPClient::Errors::ToolCallError, MCPClient::Errors::TransportError,
                MCPClient::Errors::ConnectionError => e
-          raise MCPClient::Errors::TaskError, "Error creating task for tool '#{tool_name}': #{e.message}"
+          raise MCPClient::Errors::TaskError, 'Error creating task for tool ' \
+                                              "'#{sanitize_peer_log_text(tool_name.to_s)}': " \
+                                              "#{sanitize_peer_log_text(e.message)}"
         end
         return created_task(result, srv) if task_result?(result)
 
@@ -309,7 +332,11 @@ module MCPClient
         pending = requests.except(*answered)
         return [] if pending.empty?
 
-        update_task(task.task_id, srv.fulfil_input_requests(pending, task.to_h), server: srv)
+        responses = srv.fulfil_input_requests(pending, task.to_h)
+        # The keys count as answered once the handlers have run: a lost
+        # acknowledgement must not present the same request again.
+        answered_keys_mutex.synchronize { answered.merge(pending.keys) }
+        update_task(task.task_id, responses, server: srv)
         pending.keys
       end
 
