@@ -52,11 +52,15 @@ module MCPClient
       #   version is mutually supported, or legacy while protocol: :modern is configured
       def probe_modern_server
         @protocol_version = MCPClient::LATEST_PROTOCOL_VERSION
+        modern_confirmed = false
         begin
           perform_discover
         rescue MCPClient::Errors::UnsupportedProtocolVersionError => e
           raise unless e.modern_protocol_error?
 
+          # A well-formed rejection settles the era: whatever the retried
+          # probe does next, this server is modern and never gets initialize.
+          modern_confirmed = true
           retry_discover_with_advertised_version(e)
         end
         true
@@ -65,18 +69,17 @@ module MCPClient
         # server is modern but incompatible. Nothing was negotiated.
         @protocol_version = nil
         raise
-      rescue MCPClient::Errors::ServerError => e
-        # Any recognized modern error (-32020/-32021, or -32022 with no usable
-        # version) or an invalid result identifies a modern server: surface
-        # it, never fall back to initialize.
-        if e.modern_protocol_error? || e.protocol_error?
+      rescue MCPClient::Errors::ServerError, MCPClient::Errors::TransportError => e
+        # A recognized modern error (-32020/-32021, or -32022 with no usable
+        # version) identifies a modern server: surface it, never fall back.
+        # Anything else — including a 2xx-style result that is not a
+        # DiscoverResult — is a legacy server, unless the era was already
+        # settled by a well-formed rejection.
+        if modern_confirmed || e.modern_protocol_error_for_probe?
           @protocol_version = nil
           raise MCPClient::Errors::ConnectionError, "Server is modern but incompatible: #{e.message}"
         end
 
-        legacy_after_probe(e)
-        false
-      rescue MCPClient::Errors::TransportError => e
         legacy_after_probe(e)
         false
       end
@@ -130,7 +133,17 @@ module MCPClient
           send_cancellation_notification(req_id)
           raise
         end
-        apply_discover_result(process_jsonrpc_response(res))
+        result = process_jsonrpc_response(res)
+        # Not a DiscoverResult at all (a permissive legacy server answering
+        # an unknown method with some result): a legacy answer, not a
+        # malformed modern one.
+        unless discover_result?(result)
+          raise MCPClient::Errors::ServerError, 'server/discover was answered without a DiscoverResult'
+        end
+
+        apply_discover_result(result)
+      rescue MCPClient::Errors::InvalidResultError => e
+        raise MCPClient::Errors::ServerError, "server/discover was answered without a DiscoverResult (#{e.message})"
       end
 
       # Handshake: send initialize request and initialized notification
@@ -248,23 +261,28 @@ module MCPClient
         end
 
         result = with_retry(method) do
-          send_request_and_wait(method, params, timeout)
-        rescue MCPClient::Errors::UnsupportedProtocolVersionError => e
-          # MCP 2026-07-28 basic/versioning: "The client SHOULD select a
-          # mutually supported version from the supported list and retry
-          # the request". The server rejected the request before processing
-          # it, so re-sending cannot duplicate a side effect.
-          version = select_protocol_version(e.supported)
-          raise unless modern? && version && version != protocol_version
+          sent_version = protocol_version
+          begin
+            send_request_and_wait(method, params, timeout)
+          rescue MCPClient::Errors::UnsupportedProtocolVersionError => e
+            # MCP 2026-07-28 basic/versioning: "The client SHOULD select a
+            # mutually supported version from the supported list and retry
+            # the request". The server rejected the request before
+            # processing it, so re-sending cannot duplicate a side effect.
+            # Compared against the version THIS request went out with: a
+            # concurrent request may already have moved the transport on.
+            version = select_protocol_version(e.supported)
+            raise unless modern? && version && version != sent_version
 
-          @logger.info("Server does not support protocol version #{protocol_version}; " \
-                       "retrying #{method} with #{version}")
-          @protocol_version = version
-          send_request_and_wait(method, params, timeout)
+            @logger.info("Server does not support protocol version #{sent_version}; " \
+                         "retrying #{method} with #{version}")
+            @protocol_version = version
+            send_request_and_wait(method, params, timeout)
+          end
         end
-        # Every DiscoverResult refreshes the negotiated state (a later
-        # heartbeat may advertise new versions or capabilities).
-        apply_discover_result(result) if method == 'server/discover' && discover_result?(result)
+        # Every server/discover answer is validated and applied: a later
+        # heartbeat may advertise new versions or capabilities.
+        result = apply_discover_result(result) if method == 'server/discover'
         result
       end
 

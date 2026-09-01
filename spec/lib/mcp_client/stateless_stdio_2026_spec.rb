@@ -365,10 +365,13 @@ RSpec.describe 'MCP 2026-07-28 stateless protocol (stdio)' do
       expect { MCPClient::ServerStdio.new(command: 'echo', protocol: :bogus) }.to raise_error(ArgumentError, /protocol/)
     end
 
-    it 'rejects a DiscoverResult without supportedVersions' do
-      script_stdio(server, [{ 'result' => { 'resultType' => 'complete', 'capabilities' => {} } }])
+    it 'treats a probe answer without supportedVersions as a legacy answer' do
+      sent = script_stdio(server, [{ 'result' => { 'resultType' => 'complete', 'capabilities' => {} } },
+                                   { 'result' => legacy_init_result }, { 'result' => {} }])
 
-      expect { server.ping }.to raise_error(MCPClient::Errors::ConnectionError, /supportedVersions/)
+      server.ping
+
+      expect(sent.map { |r| r['method'] }).to eq(%w[server/discover initialize ping])
     end
 
     it 'reports the era as unknown before the first request' do
@@ -660,5 +663,150 @@ RSpec.describe 'MCP 2026-07-28 stateless protocol (stdio) — review follow-ups'
       end
       expect(sent.size).to eq(2)
     end
+  end
+end
+
+# Review round 3 (codex): a server that answered the probe with a well-formed
+# UnsupportedProtocolVersionError is conclusively modern; every
+# server/discover answer is validated; version renegotiation compares
+# against the version a request was actually sent with; a probe answered
+# with something that is not a DiscoverResult is a legacy server.
+RSpec.describe 'MCP 2026-07-28 stateless protocol (stdio) — probe and renegotiation edges' do
+  def discover_result(versions: ['2026-07-28'], capabilities: { 'tools' => {} })
+    { 'resultType' => 'complete', 'supportedVersions' => versions, 'capabilities' => capabilities }
+  end
+
+  def script_stdio(server, responses)
+    sent = []
+    allow(server).to receive(:connect).and_return(true)
+    allow(server).to receive(:start_reader)
+    allow(server).to receive(:start_stderr_reader)
+    server.instance_variable_set(:@stdin, double('stdin', puts: nil, flush: nil, closed?: true, close: nil))
+    allow(server).to receive(:send_request) { |req| sent << req }
+    allow(server).to receive(:wait_response) do |id, **_opts|
+      responder = responses.shift
+      raise 'no scripted response left' unless responder
+
+      response = responder.respond_to?(:call) ? responder.call(sent.last) : responder
+      raise response if response.is_a?(Exception)
+
+      response.merge('jsonrpc' => '2.0', 'id' => id)
+    end
+    sent
+  end
+
+  let(:server) { MCPClient::ServerStdio.new(command: 'echo test', read_timeout: 1) }
+
+  it 'does not fall back to initialize when the retried probe fails after a well-formed -32022' do
+    stub_const('MCPClient::MODERN_PROTOCOL_VERSIONS', %w[2027-01-01 2026-07-28])
+    stub_const('MCPClient::LATEST_PROTOCOL_VERSION', '2027-01-01')
+    sent = script_stdio(server, [
+                          { 'error' => { 'code' => -32_022, 'message' => 'Unsupported protocol version',
+                                         'data' => { 'supported' => ['2026-07-28'], 'requested' => '2027-01-01' } } },
+                          { 'error' => { 'code' => -32_603, 'message' => 'Internal error' } }
+                        ])
+
+    expect { server.ping }.to raise_error(MCPClient::Errors::ConnectionError, /Internal error/)
+    expect(sent.map { |r| r['method'] }).to eq(%w[server/discover server/discover])
+  end
+
+  it 'falls back to initialize when the probe is answered with something that is not a DiscoverResult' do
+    sent = script_stdio(server, [{ 'result' => { 'resultType' => 'complete', 'capabilities' => {} } },
+                                 { 'result' => { 'protocolVersion' => '2025-11-25', 'capabilities' => {},
+                                                 'serverInfo' => { 'name' => 'legacy', 'version' => '1' } } },
+                                 { 'result' => { 'tools' => [] } }])
+
+    server.list_tools
+
+    expect(sent.map { |r| r['method'] }).to eq(%w[server/discover initialize tools/list])
+    expect(server.protocol_era).to eq(:legacy)
+  end
+
+  it 'falls back to initialize when the probe is answered with a non-object result' do
+    sent = script_stdio(server, [{ 'result' => nil },
+                                 { 'result' => { 'protocolVersion' => '2025-11-25', 'capabilities' => {} } },
+                                 { 'result' => {} }])
+
+    server.ping
+
+    expect(sent.map { |r| r['method'] }).to eq(%w[server/discover initialize ping])
+    expect(server.protocol_era).to eq(:legacy)
+  end
+
+  it 'refuses to fall back on a malformed DiscoverResult when protocol: :modern is configured' do
+    server = MCPClient::ServerStdio.new(command: 'echo test', protocol: :modern)
+    sent = script_stdio(server, [{ 'result' => { 'resultType' => 'complete', 'capabilities' => {} } }])
+
+    expect { server.ping }.to raise_error(MCPClient::Errors::ConnectionError, /legacy|initialize/i)
+    expect(sent.map { |r| r['method'] }).to eq(['server/discover'])
+  end
+
+  it 'validates every later server/discover answer' do
+    script_stdio(server, [{ 'result' => discover_result },
+                          { 'result' => { 'resultType' => 'complete', 'capabilities' => {} } }])
+
+    server.ping
+    expect { server.rpc_request('server/discover') }
+      .to raise_error(MCPClient::Errors::ConnectionError, /supportedVersions/)
+  end
+
+  it 'retries a request rejected for the version it was actually sent with, even after another request switched' do
+    stub_const('MCPClient::MODERN_PROTOCOL_VERSIONS', %w[2027-01-01 2026-07-28])
+    stub_const('MCPClient::LATEST_PROTOCOL_VERSION', '2027-01-01')
+    rejection = { 'error' => { 'code' => -32_022, 'message' => 'Unsupported protocol version',
+                               'data' => { 'supported' => ['2026-07-28'], 'requested' => '2027-01-01' } } }
+    sent = script_stdio(server, [
+                          { 'result' => discover_result(versions: ['2027-01-01']) },
+                          # The response to this request arrives after a concurrent request already
+                          # moved the transport to 2026-07-28.
+                          lambda { |_req|
+                            server.instance_variable_set(:@protocol_version, '2026-07-28')
+                            rejection
+                          },
+                          { 'result' => { 'tools' => [] } }
+                        ])
+
+    expect(server.list_tools).to eq([])
+    lists = sent.select { |r| r['method'] == 'tools/list' }
+    expect(lists.size).to eq(2)
+    expect(lists[1]['params']['_meta']['io.modelcontextprotocol/protocolVersion']).to eq('2026-07-28')
+  end
+end
+
+# Review round 3 (grok): a modern stdio client MUST NOT write JSON-RPC
+# responses — server-initiated requests (ping, elicitation, roots,
+# sampling) do not exist in 2026-07-28 and are dropped, not answered.
+RSpec.describe 'MCP 2026-07-28 stateless protocol (stdio) — server-initiated requests' do
+  let(:server) { MCPClient::ServerStdio.new(command: 'echo test') }
+
+  it 'drops server-initiated requests on a modern session instead of responding' do
+    written = []
+    server.instance_variable_set(:@protocol_version, '2026-07-28')
+    server.instance_variable_set(:@stdin, double('stdin', flush: nil).tap do |d|
+      allow(d).to receive(:puts) { |line| written << line }
+    end)
+    calls = 0
+    server.on_roots_list_request do |_id, _p|
+      calls += 1
+      { 'roots' => [] }
+    end
+
+    server.handle_line(JSON.generate('jsonrpc' => '2.0', 'id' => 'srv-1', 'method' => 'ping'))
+    server.handle_line(JSON.generate('jsonrpc' => '2.0', 'id' => 'srv-2', 'method' => 'roots/list', 'params' => {}))
+
+    expect(written).to be_empty
+    expect(calls).to eq(0)
+  end
+
+  it 'still answers server-initiated requests on a legacy session' do
+    written = []
+    server.instance_variable_set(:@protocol_version, '2025-11-25')
+    server.instance_variable_set(:@stdin, double('stdin', flush: nil).tap do |d|
+      allow(d).to receive(:puts) { |line| written << line }
+    end)
+
+    server.handle_line(JSON.generate('jsonrpc' => '2.0', 'id' => 'srv-1', 'method' => 'ping'))
+
+    expect(written.map { |l| JSON.parse(l) }).to eq([{ 'jsonrpc' => '2.0', 'id' => 'srv-1', 'result' => {} }])
   end
 end

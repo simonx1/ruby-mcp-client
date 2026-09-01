@@ -202,7 +202,14 @@ module MCPClient
 
       # Dispatch JSON-RPC requests from server (has id AND method) - MCP 2025-06-18
       if msg['method'] && msg.key?('id')
-        handle_server_request(msg)
+        if modern?
+          # MCP 2026-07-28 stdio: "The server MUST NOT write JSON-RPC requests
+          # to stdout" and "The client MUST NOT write JSON-RPC responses" —
+          # server-to-client interactions travel in InputRequiredResult.
+          @logger.warn("Ignoring server-initiated request #{msg['method']}: not permitted by MCP #{protocol_version}")
+        else
+          handle_server_request(msg)
+        end
         return
       end
 
