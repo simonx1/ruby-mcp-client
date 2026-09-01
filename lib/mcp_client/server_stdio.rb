@@ -214,11 +214,7 @@ module MCPClient
         req = { 'jsonrpc' => '2.0', 'id' => req_id, 'method' => 'prompts/list', 'params' => params }
         send_request(req)
         res = wait_response(req_id)
-        if (err = res['error'])
-          raise MCPClient::Errors::ServerError, err['message']
-        end
-
-        result = res['result'] || {}
+        result = process_jsonrpc_response(res) || {}
         prompts = (result['prompts'] || []).map { |td| MCPClient::Prompt.from_json(td, server: self) }
         [prompts, result['nextCursor']]
       end
@@ -244,11 +240,7 @@ module MCPClient
       }
       send_request(req)
       res = wait_response(req_id)
-      if (err = res['error'])
-        raise MCPClient::Errors::ServerError, err['message']
-      end
-
-      res['result']
+      process_jsonrpc_response(res)
     rescue StandardError => e
       raise MCPClient::Errors::PromptGetError, "Error calling prompt '#{prompt_name}': #{e.message}"
     end
@@ -266,11 +258,7 @@ module MCPClient
       req = { 'jsonrpc' => '2.0', 'id' => req_id, 'method' => 'resources/list', 'params' => params }
       send_request(req)
       res = wait_response(req_id)
-      if (err = res['error'])
-        raise MCPClient::Errors::ServerError, err['message']
-      end
-
-      result = res['result'] || {}
+      result = process_jsonrpc_response(res) || {}
       resources = (result['resources'] || []).map { |td| MCPClient::Resource.from_json(td, server: self) }
       { 'resources' => resources, 'nextCursor' => result['nextCursor'] }
     rescue StandardError => e
@@ -294,13 +282,13 @@ module MCPClient
       }
       send_request(req)
       res = wait_response(req_id)
-      if (err = res['error'])
-        raise MCPClient::Errors::ServerError, err['message']
-      end
-
-      result = res['result'] || {}
+      result = process_jsonrpc_response(res) || {}
       contents = result['contents'] || []
       contents.map { |content| MCPClient::ResourceContent.from_json(content) }
+    rescue MCPClient::Errors::ServerError => e
+      raise resource_not_found_error(uri, e) if MCPClient::Errors::Codes.resource_not_found_code?(e.code)
+
+      raise MCPClient::Errors::ResourceReadError, "Error reading resource '#{uri}': #{e.message}"
     rescue StandardError => e
       raise MCPClient::Errors::ResourceReadError, "Error reading resource '#{uri}': #{e.message}"
     end
@@ -318,11 +306,7 @@ module MCPClient
       req = { 'jsonrpc' => '2.0', 'id' => req_id, 'method' => 'resources/templates/list', 'params' => params }
       send_request(req)
       res = wait_response(req_id)
-      if (err = res['error'])
-        raise MCPClient::Errors::ServerError, err['message']
-      end
-
-      result = res['result'] || {}
+      result = process_jsonrpc_response(res) || {}
       templates = (result['resourceTemplates'] || []).map { |td| MCPClient::ResourceTemplate.from_json(td, server: self) }
       { 'resourceTemplates' => templates, 'nextCursor' => result['nextCursor'] }
     rescue StandardError => e
@@ -346,10 +330,7 @@ module MCPClient
       }
       send_request(req)
       res = wait_response(req_id)
-      if (err = res['error'])
-        raise MCPClient::Errors::ServerError, err['message']
-      end
-
+      process_jsonrpc_response(res)
       true
     rescue MCPClient::Errors::CapabilityError
       raise
@@ -374,10 +355,7 @@ module MCPClient
       }
       send_request(req)
       res = wait_response(req_id)
-      if (err = res['error'])
-        raise MCPClient::Errors::ServerError, err['message']
-      end
-
+      process_jsonrpc_response(res)
       true
     rescue MCPClient::Errors::CapabilityError
       raise
@@ -399,11 +377,7 @@ module MCPClient
         req = { 'jsonrpc' => '2.0', 'id' => req_id, 'method' => 'tools/list', 'params' => params }
         send_request(req)
         res = wait_response(req_id)
-        if (err = res['error'])
-          raise MCPClient::Errors::ServerError, err['message']
-        end
-
-        result = res['result'] || {}
+        result = process_jsonrpc_response(res) || {}
         tools = (result['tools'] || []).map { |td| MCPClient::Tool.from_json(td, server: self) }
         [tools, result['nextCursor']]
       end
@@ -429,11 +403,7 @@ module MCPClient
       }
       send_request(req)
       res = wait_response(req_id)
-      if (err = res['error'])
-        raise MCPClient::Errors::ServerError, err['message']
-      end
-
-      res['result']
+      process_jsonrpc_response(res)
     rescue StandardError => e
       raise MCPClient::Errors::ToolCallError, "Error calling tool '#{tool_name}': #{e.message}"
     end
@@ -458,11 +428,7 @@ module MCPClient
       }
       send_request(req)
       res = wait_response(req_id)
-      if (err = res['error'])
-        raise MCPClient::Errors::ServerError, err['message']
-      end
-
-      res.dig('result', 'completion') || { 'values' => [] }
+      (process_jsonrpc_response(res) || {})['completion'] || { 'values' => [] }
     rescue MCPClient::Errors::CapabilityError
       raise
     rescue StandardError => e
@@ -486,11 +452,7 @@ module MCPClient
       }
       send_request(req)
       res = wait_response(req_id)
-      if (err = res['error'])
-        raise MCPClient::Errors::ServerError, err['message']
-      end
-
-      res['result'] || {}
+      process_jsonrpc_response(res) || {}
     rescue MCPClient::Errors::CapabilityError
       raise
     rescue StandardError => e

@@ -199,6 +199,17 @@ module MCPClient
       @notification_callback = block
     end
 
+    # Map a resources/read error response to ResourceNotFound. MCP 2026-07-28
+    # (server/resources.mdx "Error Handling"): a missing resource is reported
+    # with -32602 (Invalid params); "for backwards compatibility, clients
+    # SHOULD also accept -32002 as a resource not found error".
+    # @param uri [String] the requested resource URI
+    # @param error [MCPClient::Errors::ServerError] the server's error response
+    # @return [MCPClient::Errors::ResourceNotFound]
+    def resource_not_found_error(uri, error)
+      MCPClient::Errors::ResourceNotFound.new("Resource '#{uri}' not found: #{error.message}")
+    end
+
     # Safety bound on the number of pages followed when auto-paginating a
     # cursor-based list operation, to protect against a server that returns
     # a nextCursor indefinitely.

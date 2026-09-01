@@ -54,8 +54,137 @@ module MCPClient
       end
     end
 
-    # Raised when the MCP server returns an error response
-    class ServerError < MCPError; end
+    # JSON-RPC error codes used by MCP (basic/index.mdx "Error Codes").
+    #
+    # MCP partitions the JSON-RPC server-error range: -32000..-32019 is
+    # implementation-defined (legacy, no meaning may be assumed beyond
+    # -32002), and -32020..-32099 is reserved for codes defined by the MCP
+    # specification itself.
+    module Codes
+      # Standard JSON-RPC 2.0 codes
+      PARSE_ERROR = -32_700
+      INVALID_REQUEST = -32_600
+      METHOD_NOT_FOUND = -32_601
+      INVALID_PARAMS = -32_602
+      INTERNAL_ERROR = -32_603
+
+      # MCP 2026-07-28 spec-defined codes (reserved sub-range)
+      HEADER_MISMATCH = -32_020
+      MISSING_REQUIRED_CLIENT_CAPABILITY = -32_021
+      UNSUPPORTED_PROTOCOL_VERSION = -32_022
+
+      # Resource not found in protocol versions 2025-11-25 and earlier;
+      # replaced by INVALID_PARAMS but still accepted from older servers.
+      LEGACY_RESOURCE_NOT_FOUND = -32_002
+
+      # Codes that identify a modern (2026-07-28+) server. Receiving one of
+      # these means the peer speaks a per-request-metadata revision, so a
+      # dual-era client must retry or correct the request rather than fall
+      # back to the initialize handshake (basic/versioning.mdx).
+      MODERN_ERROR_CODES = [HEADER_MISMATCH, MISSING_REQUIRED_CLIENT_CAPABILITY,
+                            UNSUPPORTED_PROTOCOL_VERSION].freeze
+
+      # Codes a resources/read error may carry to mean "resource not found".
+      RESOURCE_NOT_FOUND_CODES = [INVALID_PARAMS, LEGACY_RESOURCE_NOT_FOUND].freeze
+
+      # @param code [Integer, nil] a JSON-RPC error code
+      # @return [Boolean] whether it is a recognized 2026-07-28 protocol error
+      def self.modern_error_code?(code)
+        MODERN_ERROR_CODES.include?(code)
+      end
+
+      # @param code [Integer, nil] a JSON-RPC error code from resources/read
+      # @return [Boolean] whether it means the resource does not exist
+      def self.resource_not_found_code?(code)
+        RESOURCE_NOT_FOUND_CODES.include?(code)
+      end
+    end
+
+    # Raised when the MCP server returns an error response. Carries the
+    # JSON-RPC error `code` and `data` so callers can distinguish protocol
+    # errors (e.g. -32602 resource not found) without parsing the message.
+    class ServerError < MCPError
+      # @return [Integer, nil] the JSON-RPC error code, if the response carried one
+      attr_reader :code
+      # @return [Object, nil] the JSON-RPC error data member, if any
+      attr_reader :data
+
+      # @param message [String, nil] error message
+      # @param code [Integer, nil] JSON-RPC error code
+      # @param data [Object, nil] JSON-RPC error data
+      def initialize(message = nil, code: nil, data: nil)
+        super(message)
+        @code = code
+        @data = data
+      end
+
+      # Build the most specific error for a JSON-RPC error object: the typed
+      # 2026-07-28 errors for the spec-reserved codes, a plain ServerError
+      # otherwise. The message is peer-supplied and passed through as-is.
+      # @param error [Hash, nil] the JSON-RPC `error` member ('code', 'message', 'data')
+      # @return [MCPClient::Errors::ServerError]
+      def self.from_jsonrpc(error)
+        error = {} unless error.is_a?(Hash)
+        message = error['message'] || error[:message] || 'Unknown server error'
+        code = error['code'] || error[:code]
+        code = nil unless code.is_a?(Integer)
+        data = error.key?('data') ? error['data'] : error[:data]
+
+        klass = case code
+                when Codes::HEADER_MISMATCH then HeaderMismatchError
+                when Codes::MISSING_REQUIRED_CLIENT_CAPABILITY then MissingRequiredClientCapabilityError
+                when Codes::UNSUPPORTED_PROTOCOL_VERSION then UnsupportedProtocolVersionError
+                else ServerError
+                end
+        klass.new(message, code: code, data: data)
+      end
+
+      # @return [Boolean] whether this is one of the 2026-07-28 spec-defined
+      #   protocol errors (which identify a modern server)
+      def modern_protocol_error?
+        Codes.modern_error_code?(code)
+      end
+    end
+
+    # -32020 HeaderMismatch (MCP 2026-07-28, Streamable HTTP): the HTTP
+    # headers mirrored from the request body (Mcp-Method, Mcp-Name,
+    # Mcp-Param-*, MCP-Protocol-Version) are missing, malformed, or do not
+    # match the body.
+    class HeaderMismatchError < ServerError; end
+
+    # -32021 MissingRequiredClientCapability (MCP 2026-07-28): processing the
+    # request needs a capability the client did not declare in its
+    # per-request clientCapabilities.
+    class MissingRequiredClientCapabilityError < ServerError
+      # @return [Hash] the capabilities the server requires (data.requiredCapabilities)
+      def required_capabilities
+        caps = data.is_a?(Hash) ? (data['requiredCapabilities'] || data[:requiredCapabilities]) : nil
+        caps.is_a?(Hash) ? caps : {}
+      end
+    end
+
+    # -32022 UnsupportedProtocolVersion (MCP 2026-07-28): the server does not
+    # implement the protocol version the request declared. `supported` lists
+    # the versions it does implement so the client can retry with one.
+    class UnsupportedProtocolVersionError < ServerError
+      # @return [Array<String>] protocol versions the server supports (data.supported)
+      def supported
+        list = data.is_a?(Hash) ? (data['supported'] || data[:supported]) : nil
+        list.is_a?(Array) ? list.grep(String) : []
+      end
+
+      # @return [String, nil] the protocol version the request asked for (data.requested)
+      def requested
+        data.is_a?(Hash) ? (data['requested'] || data[:requested]) : nil
+      end
+    end
+
+    # Raised when a server result is malformed at the protocol level — e.g.
+    # its `resultType` is a value this client does not recognize, which MCP
+    # 2026-07-28 says MUST be considered invalid. A ServerError (not a
+    # TransportError) so it is never retried: the server processed the
+    # request and answered; re-sending would not produce a different shape.
+    class InvalidResultError < ServerError; end
 
     # Raised for a server-side failure that is plausibly transient and safe to
     # retry — chiefly HTTP 5xx responses, where the request likely did not

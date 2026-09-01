@@ -202,7 +202,9 @@ module MCPClient
     # @raise [MCPClient::Errors::ConnectionError] if the version is unsupported
     def validate_protocol_version!(result)
       version = result['protocolVersion']
-      return version if MCPClient::SUPPORTED_PROTOCOL_VERSIONS.include?(version)
+      # Only handshake-based revisions are valid here: a server answering
+      # initialize with a modern (per-request metadata) version is confused.
+      return version if MCPClient::LEGACY_PROTOCOL_VERSIONS.include?(version)
 
       begin
         cleanup if respond_to?(:cleanup)
@@ -211,7 +213,7 @@ module MCPClient
       end
       raise MCPClient::Errors::ConnectionError,
             "Server negotiated unsupported protocol version #{version.inspect} " \
-            "(supported: #{MCPClient::SUPPORTED_PROTOCOL_VERSIONS.join(', ')}); disconnecting"
+            "(supported: #{MCPClient::LEGACY_PROTOCOL_VERSIONS.join(', ')}); disconnecting"
     end
 
     # The Implementation object sent as clientInfo: the host-provided info
@@ -272,14 +274,58 @@ module MCPClient
       instance_variable_defined?(:@sampling_tools_supported) && @sampling_tools_supported
     end
 
+    # Result types defined by the core protocol (basic/index.mdx "ResultType").
+    # Extensions add more (e.g. "task"); transports widen the accepted set
+    # via #accepted_result_types once such an extension is negotiated.
+    CORE_RESULT_TYPES = %w[complete input_required].freeze
+
+    # The resultType of a result object. MCP 2026-07-28 makes the field
+    # required, but "for backward compatibility with servers implementing
+    # earlier protocol versions, which do not include resultType, clients
+    # MUST treat an absent resultType as 'complete'". Non-object results
+    # (lenient handling of older servers) are likewise complete.
+    # @param result [Object] a JSON-RPC result
+    # @return [Object] the resultType value, 'complete' when absent
+    def self.result_type(result)
+      return 'complete' unless result.is_a?(Hash)
+
+      type = result.key?('resultType') ? result['resultType'] : result[:resultType]
+      type.nil? ? 'complete' : type
+    end
+
+    # Result types this transport accepts. Overridden (widened) by transports
+    # that negotiated a result-type-adding extension.
+    # @return [Array<String>]
+    def accepted_result_types
+      CORE_RESULT_TYPES
+    end
+
     # Process JSON-RPC response
     # @param response [Hash] the parsed JSON-RPC response
     # @return [Object] the result field from the response
     # @raise [MCPClient::Errors::ServerError] if the response contains an error
+    # @raise [MCPClient::Errors::InvalidResultError] if the result's resultType is unrecognized
     def process_jsonrpc_response(response)
-      raise MCPClient::Errors::ServerError, response['error']['message'] if response['error']
+      raise MCPClient::Errors::ServerError.from_jsonrpc(response['error']) if response['error']
 
-      response['result']
+      result = response['result']
+      validate_result_type!(result)
+      result
+    end
+
+    # "A resultType of any value unrecognized by the client MUST be
+    # considered invalid" (basic/index.mdx). The value is peer-controlled, so
+    # only its class or a short prefix reaches the exception message.
+    # @param result [Object] a JSON-RPC result
+    # @return [void]
+    # @raise [MCPClient::Errors::InvalidResultError]
+    def validate_result_type!(result)
+      type = MCPClient::JsonRpcCommon.result_type(result)
+      return if accepted_result_types.include?(type)
+
+      shown = type.is_a?(String) ? type[0, 64].inspect : type.class.name
+      raise MCPClient::Errors::InvalidResultError,
+            "Invalid result: unrecognized resultType #{shown} (accepted: #{accepted_result_types.join(', ')})"
     end
   end
 end

@@ -1,5 +1,36 @@
 # Changelog
 
+## Unreleased — MCP 2026-07-28
+
+Groundwork for the 2026-07-28 protocol revision (stateless, per-request
+metadata). Each feature lands in its own PR; this section accumulates them.
+
+### Protocol foundations
+
+- **Version constants.** `MCPClient::LATEST_PROTOCOL_VERSION` (`2026-07-28`),
+  `MODERN_PROTOCOL_VERSIONS` (per-request metadata revisions) and
+  `LEGACY_PROTOCOL_VERSIONS` (initialize-handshake revisions).
+  `SUPPORTED_PROTOCOL_VERSIONS` is now their union; `PROTOCOL_VERSION` stays
+  `2025-11-25` because it is the version the legacy `initialize` request asks
+  for, and a server answering `initialize` with a modern version is rejected.
+- **Typed JSON-RPC errors.** `MCPClient::Errors::ServerError` now carries the
+  JSON-RPC `code` and `data` (`ServerError.new(msg, code:, data:)`, fully
+  backward compatible). `ServerError.from_jsonrpc(error)` builds the
+  2026-07-28 spec-defined errors: `HeaderMismatchError` (-32020),
+  `MissingRequiredClientCapabilityError` (-32021, `#required_capabilities`)
+  and `UnsupportedProtocolVersionError` (-32022, `#supported`, `#requested`).
+  `MCPClient::Errors::Codes` holds the code constants and the allocation
+  policy helpers. All four transports raise these typed errors.
+- **`resultType`.** Every result is checked: an absent field is treated as
+  `"complete"` (earlier-protocol servers), `"input_required"` passes through
+  for the multi round-trip handling that follows, and any unrecognized value
+  raises `MCPClient::Errors::InvalidResultError` (a non-retried
+  `ServerError`), as the spec requires.
+- **Resource not found.** A `resources/read` error with code `-32602`
+  (2026-07-28) or the legacy `-32002` now raises
+  `MCPClient::Errors::ResourceNotFound` on every transport instead of a
+  generic `ResourceReadError`.
+
 ## 2.1.0 — Hostile-Server Hardening (2026-08-04)
 
 A security pass over every transport, driven by an external scan of the 2.0.0

@@ -319,10 +319,9 @@ module MCPClient
       # @param error [Hash, nil] the JSON-RPC error object ('code', 'message', 'data')
       # @raise [MCPClient::Errors::ServerError] always
       def raise_sse_error_response(error)
-        error ||= {}
-        message = error['message'] || 'Unknown server error'
-        message = "#{message} (code #{error['code']})" if error['code']
-        raise MCPClient::Errors::ServerError, message
+        typed = MCPClient::Errors::ServerError.from_jsonrpc(error)
+        message = typed.code ? "#{typed.message} (code #{typed.code})" : typed.message
+        raise typed.class.new(message, code: typed.code, data: typed.data)
       end
 
       # Parse a direct (non-SSE) JSON-RPC response
