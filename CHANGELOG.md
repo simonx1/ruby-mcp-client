@@ -38,9 +38,16 @@ metadata). Each feature lands in its own PR; this section accumulates them.
   servers keep the cache-until-notification heuristic.
 - **Stale on failure.** When a re-fetch fails transiently (5xx, connection
   or transport error) the stale list is served with a warning, as the spec
-  allows. `server.cache_info(:tools | :prompts | :resources | :templates |
-  :discover)` and `cache_info(:read, uri)` expose `ttl_ms`, `cache_scope`,
-  `received_at` and `fresh`.
+  allows — the stale copy is the entry captured before the re-fetch, judged
+  by that entry's own authorization context. A fetched list attaches only to
+  the entry its own fetch recorded (a later fetch wins), each request returns
+  its own list rather than a re-read of the transport's copy, and an
+  `Authorization` header added by Faraday middleware (`faraday_config`) is
+  part of the cache context: the header a request actually went out with is
+  recorded after it was sent, and the freshness probe runs the middleware
+  stack without sending anything. `server.cache_info(:tools | :prompts |
+  :resources | :templates | :discover)` and `cache_info(:read, uri)` expose
+  `ttl_ms`, `cache_scope`, `received_at` and `fresh`.
 
 ### Subscriptions (`subscriptions/listen`)
 

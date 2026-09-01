@@ -526,6 +526,9 @@ module MCPClient
             prepare_http_request(req, request, sent_session_id, timeout, capture, extra_headers)
           end
         end
+        # MCP 2026-07-28 caching: the result is bound to the Authorization
+        # the request went out with, middleware included.
+        note_sent_authorization(response)
 
         return restart_session_and_resend(request, sent_session_id) if expired_session?(response, sent_session_id)
         # A body that stopped short of its Content-Length was cut on the way,

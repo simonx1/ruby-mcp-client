@@ -77,7 +77,7 @@ module MCPClient
         entry = MCPClient::CachedResult.stale(now: now, like: entry) if epoch && epoch != (@cache_epoch || 0)
         cache_entries[kind] = entry
       end
-      entry
+      remember_recorded_entry(kind, entry)
     end
 
     # Build the entry for one result: an absent ttlMs counts as 0 on a
@@ -133,7 +133,25 @@ module MCPClient
         combined.authorization_context = MCPClient::CachedResult::MIXED_CONTEXT if mixed
         cache_entries[kind] = combined
       end
-      combined
+      remember_recorded_entry(kind, combined)
+    end
+
+    # Stamp the entry this thread's fetch recorded with a fresh identity and
+    # remember it, so the list the same fetch converts afterwards can be
+    # attached to its own entry and to no other (the thread keeps only the
+    # bare identity, never the entry or its list).
+    # @param kind [Symbol]
+    # @param entry [MCPClient::CachedResult]
+    # @return [MCPClient::CachedResult] the entry
+    def remember_recorded_entry(kind, entry)
+      entry.fetch_token = Object.new
+      (Thread.current[recorded_entries_key] ||= {})[kind] = entry.fetch_token
+      entry
+    end
+
+    # @return [Symbol] the thread-local key of this server's recorded entries
+    def recorded_entries_key
+      :"mcp_client_recorded_entries_#{object_id}"
     end
 
     # Called by the paginated list helper with the raw page results.
@@ -186,6 +204,15 @@ module MCPClient
       cache_entries_mutex.synchronize { cache_entries[kind]&.value }
     end
 
+    # The entry whose (possibly stale) list may be served when a re-fetch
+    # fails; the entry itself, so the fallback is judged by the entry that
+    # supplied the value and not by whatever entry is installed by then.
+    # @param kind [Symbol]
+    # @return [MCPClient::CachedResult, nil]
+    def stale_list_entry(kind)
+      cache_entries_mutex.synchronize { cache_entries[kind] }
+    end
+
     # The entry for a kind, after making sure a privately scoped one still
     # belongs to the current authorization context (transports that know
     # their context re-check it here; a changed context drops the entry).
@@ -213,20 +240,28 @@ module MCPClient
       entry.authorization_context == context
     end
 
-    # Attach the list a request produced to the hint recorded for that same
-    # request, in one step, so a value and its authorization context can
-    # never come from different requests.
+    # Attach the list a request produced to the very entry that request
+    # recorded (the one this thread's fetch created, or the one passed in),
+    # so a value can never land on another request's TTL, scope or
+    # authorization context: when a later fetch has replaced the entry the
+    # value is dropped and the later fetch wins.
     # @param kind [Symbol]
     # @param value [Object] the list objects
-    # @return [void]
-    def attach_list_value(kind, value)
+    # @param entry [MCPClient::CachedResult, nil] the entry the fetch recorded
+    #   (defaults to the one recorded on this thread)
+    # @return [Boolean] whether the value was attached
+    def attach_list_value(kind, value, entry: nil)
+      token = entry ? entry.fetch_token : Thread.current[recorded_entries_key]&.delete(kind)
+      return false unless token
+
       context = respond_to?(:request_authorization_context, true) ? request_authorization_context : nil
       cache_entries_mutex.synchronize do
         entry = cache_entries[kind]
-        next unless entry
-        next if entry.cache_scope == 'private' && entry.authorization_context != context
+        return false unless entry && entry.fetch_token.equal?(token)
+        return false if entry.cache_scope == 'private' && entry.authorization_context != context
 
         entry.value = value
+        true
       end
     end
 
@@ -241,21 +276,19 @@ module MCPClient
       entry.value
     end
 
-    # The stale copy that may be served when a re-fetch fails: only a list
-    # with a known hint, and never a private entry from another
-    # authorization context (checked against the credentials the failed
-    # request actually used, when the caller knows them).
-    # @param kind [Symbol]
-    # @param cached [Object, nil] the transport's cached value for the kind
+    # The stale copy that may be served when a re-fetch fails: the value of
+    # the entry captured before the re-fetch, and only when that very entry
+    # belongs to the authorization context (checked against the credentials
+    # the failed request actually used, when the caller knows them) — an
+    # entry installed meanwhile by another request never vouches for it.
+    # @param _kind [Symbol]
+    # @param entry [MCPClient::CachedResult, nil] the entry captured before the re-fetch
     # @param context [String, nil, :current] the authorization context to check against
     # @return [Object, nil]
-    def stale_fallback_for(kind, cached, context: :current)
-      return nil unless cached
+    def stale_fallback_for(_kind, entry, context: :current)
+      return nil unless entry.is_a?(MCPClient::CachedResult) && entry.value
 
-      entry = cache_entries_mutex.synchronize { cache_entries[kind] }
-      return nil if entry.nil?
-
-      entry_in_current_context?(entry, context: context) ? cached : nil
+      entry_in_current_context?(entry, context: context) ? entry.value : nil
     end
 
     # The freshness hint recorded for an operation.
