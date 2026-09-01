@@ -48,6 +48,23 @@ module MCPClient
         Time.now >= (@expires_at - 300) # 5 minutes buffer
       end
 
+      # Issuer value marking a token that must never be presented again
+      # (retired after an authorization server change, on a storage backend
+      # that cannot delete it).
+      RETIRED_ISSUER = 'urn:mcp:retired-token'
+
+      # A copy of this token bound to an authorization server (or retired).
+      # @param issuer [String]
+      # @return [Token]
+      def with_issuer(issuer)
+        self.class.from_h(to_h.merge(issuer: issuer))
+      end
+
+      # @return [Boolean] whether the token was retired
+      def retired?
+        @issuer == RETIRED_ISSUER
+      end
+
       # Convert token to authorization header value
       # @return [String] Authorization header value
       def to_header
