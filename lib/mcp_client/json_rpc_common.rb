@@ -2,6 +2,7 @@
 
 require 'json'
 require 'zlib'
+require 'stringio'
 
 module MCPClient
   # Shared retry/backoff logic for JSON-RPC transports
@@ -307,9 +308,10 @@ module MCPClient
     # @return [Object] the resultType value, 'complete' when absent
     def self.result_type(result)
       return 'complete' unless result.is_a?(Hash)
+      return result['resultType'] if result.key?('resultType')
+      return result[:resultType] if result.key?(:resultType)
 
-      type = result.key?('resultType') ? result['resultType'] : result[:resultType]
-      type.nil? ? 'complete' : type
+      'complete'
     end
 
     # Result types this transport accepts. Overridden (widened) by transports
@@ -326,15 +328,24 @@ module MCPClient
     # @param fallback [String] message when the body carries no JSON-RPC error
     # @return [MCPClient::Errors::ServerError]
     def jsonrpc_error_from_http_response(response, fallback)
+      status = response.status
       error = jsonrpc_error_in_body(response)
-      return MCPClient::Errors::ServerError.new(fallback) unless error
+      return MCPClient::Errors::ServerError.new(fallback).tap { |e| e.http_status = status } unless error
 
       typed = MCPClient::Errors::ServerError.from_jsonrpc(error)
       typed.class.new("#{fallback}: #{typed.message}", code: typed.code, data: typed.data)
+           .tap { |e| e.http_status = status }
     end
 
+    # Ceiling on the size of an HTTP error body inspected for a JSON-RPC
+    # error. A protocol error response is a few hundred bytes; the body is
+    # peer-controlled, so anything larger is not parsed at all rather than
+    # handed to JSON.parse.
+    MAX_ERROR_BODY_BYTES = 64 * 1024
+
     # Extract a JSON-RPC error object from an HTTP error body, if there is one.
-    # Only a small, well-formed body is inspected; anything else is ignored.
+    # Only a small (MAX_ERROR_BODY_BYTES) JSON-RPC 2.0 error response is
+    # recognized; anything else is ignored.
     # @param response [Faraday::Response] the HTTP response
     # @return [Hash, nil] the JSON-RPC `error` member, or nil
     def jsonrpc_error_in_body(response)
@@ -342,17 +353,47 @@ module MCPClient
 
       body = response.body
       return nil unless body.is_a?(String) && !body.empty?
+      return nil if oversized_error_body?(body)
 
       headers = response.respond_to?(:headers) ? response.headers || {} : {}
       encoding = headers['content-encoding'] || headers['Content-Encoding'] || ''
-      body = decompress_gzip(body) if encoding.include?('gzip') && respond_to?(:decompress_gzip, true)
+      body = gunzip_bounded(body) if encoding.include?('gzip')
+      return nil if body.nil?
 
       data = JSON.parse(body)
-      error = data.is_a?(Hash) ? data['error'] : nil
+      # Only a JSON-RPC 2.0 error response counts; an arbitrary JSON body
+      # with an "error" member is not a protocol error.
+      return nil unless data.is_a?(Hash) && data['jsonrpc'] == '2.0'
+
+      error = data['error']
       error.is_a?(Hash) ? error : nil
-    rescue JSON::ParserError, Zlib::Error, MCPClient::Errors::ResponseTooLargeError => e
+    rescue JSON::ParserError, Zlib::Error => e
       @logger.debug("HTTP error body is not a JSON-RPC error: #{e.class}")
       nil
+    end
+
+    # @param body [String] an HTTP error body
+    # @return [Boolean] whether it exceeds the inspection ceiling (logged)
+    def oversized_error_body?(body)
+      return false if body.bytesize <= MAX_ERROR_BODY_BYTES
+
+      @logger.debug("Ignoring HTTP error body of #{body.bytesize} bytes (over #{MAX_ERROR_BODY_BYTES})")
+      true
+    end
+
+    # Decompress a gzip error body, giving up once the expansion passes the
+    # inspection ceiling (a compressed 4xx body is peer-controlled too).
+    # @param body [String] gzip data
+    # @return [String, nil] the decompressed body, or nil when too large
+    def gunzip_bounded(body)
+      reader = Zlib::GzipReader.new(StringIO.new(body))
+      expanded = reader.read(MAX_ERROR_BODY_BYTES + 1) || ''
+      return expanded if expanded.bytesize <= MAX_ERROR_BODY_BYTES
+
+      @logger.debug("Ignoring gzip HTTP error body expanding past #{MAX_ERROR_BODY_BYTES} bytes")
+      nil
+    ensure
+      reader&.close
     end
 
     # Process JSON-RPC response
@@ -375,8 +416,16 @@ module MCPClient
     # @return [void]
     # @raise [MCPClient::Errors::InvalidResultError]
     def validate_result_type!(result)
+      unless result.is_a?(Hash)
+        # A modern result MUST be an object. Legacy servers occasionally
+        # answered list requests with a bare array; keep tolerating that.
+        return unless modern?
+
+        raise MCPClient::Errors::InvalidResultError, "Invalid result: expected an object, got #{result.class}"
+      end
+
       type = MCPClient::JsonRpcCommon.result_type(result)
-      return if accepted_result_types.include?(type)
+      return if type.is_a?(String) && accepted_result_types.include?(type)
 
       shown = type.is_a?(String) ? type[0, 64].inspect : type.class.name
       raise MCPClient::Errors::InvalidResultError,

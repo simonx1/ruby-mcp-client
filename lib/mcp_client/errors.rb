@@ -117,6 +117,9 @@ module MCPClient
       attr_reader :code
       # @return [Object, nil] the JSON-RPC error data member, if any
       attr_reader :data
+      # @return [Integer, nil] the HTTP status the error arrived with, when it
+      #   was carried in an HTTP error response body
+      attr_accessor :http_status
 
       # @param message [String, nil] error message
       # @param code [Integer, nil] JSON-RPC error code
@@ -148,10 +151,27 @@ module MCPClient
         klass.new(message, code: code, data: data)
       end
 
-      # @return [Boolean] whether this is one of the 2026-07-28 spec-defined
-      #   protocol errors (which identify a modern server)
+      # Whether this is one of the 2026-07-28 spec-defined protocol errors,
+      # carrying the data its schema mandates. Only such a well-formed error
+      # identifies a modern server: a legacy endpoint or intermediary that
+      # happens to emit a bare -3202x code must not suppress the fallback.
+      # @return [Boolean]
       def modern_protocol_error?
-        Codes.modern_error_code?(code)
+        Codes.modern_error_code?(code) && well_formed?
+      end
+
+      # Whether the error is protocol-level (a modern spec error or an
+      # invalid result) rather than an application-level failure. Public
+      # transport methods let these propagate instead of wrapping them.
+      # @return [Boolean]
+      def protocol_error?
+        modern_protocol_error?
+      end
+
+      # Subclasses with a mandated data shape override this.
+      # @return [Boolean]
+      def well_formed?
+        true
       end
     end
 
@@ -170,6 +190,11 @@ module MCPClient
         caps = data.is_a?(Hash) ? (data['requiredCapabilities'] || data[:requiredCapabilities]) : nil
         caps.is_a?(Hash) ? caps : {}
       end
+
+      # @return [Boolean] whether data.requiredCapabilities is present, as the schema requires
+      def well_formed?
+        data.is_a?(Hash) && (data['requiredCapabilities'] || data[:requiredCapabilities]).is_a?(Hash)
+      end
     end
 
     # -32022 UnsupportedProtocolVersion (MCP 2026-07-28): the server does not
@@ -186,6 +211,11 @@ module MCPClient
       def requested
         data.is_a?(Hash) ? (data['requested'] || data[:requested]) : nil
       end
+
+      # @return [Boolean] whether data.supported is present, as the schema requires
+      def well_formed?
+        data.is_a?(Hash) && (data['supported'] || data[:supported]).is_a?(Array)
+      end
     end
 
     # Raised when a server result is malformed at the protocol level — e.g.
@@ -193,7 +223,12 @@ module MCPClient
     # 2026-07-28 says MUST be considered invalid. A ServerError (not a
     # TransportError) so it is never retried: the server processed the
     # request and answered; re-sending would not produce a different shape.
-    class InvalidResultError < ServerError; end
+    class InvalidResultError < ServerError
+      # @return [Boolean] always true: an invalid result is a protocol-level failure
+      def protocol_error?
+        true
+      end
+    end
 
     # Raised for a server-side failure that is plausibly transient and safe to
     # retry — chiefly HTTP 5xx responses, where the request likely did not

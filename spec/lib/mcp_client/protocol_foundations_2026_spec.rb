@@ -97,10 +97,11 @@ RSpec.describe 'MCP 2026-07-28 protocol foundations' do
         expect(error.message).to eq('Unsupported protocol version')
       end
 
-      it 'tolerates an UnsupportedProtocolVersionError without data' do
+      it 'tolerates an UnsupportedProtocolVersionError without data (but does not call it modern)' do
         error = described_class.from_jsonrpc('code' => -32_022, 'message' => 'nope')
         expect(error.supported).to eq([])
         expect(error.requested).to be_nil
+        expect(error.modern_protocol_error?).to be(false)
       end
 
       it 'builds a MissingRequiredClientCapabilityError exposing the required capabilities' do
@@ -137,7 +138,9 @@ RSpec.describe 'MCP 2026-07-28 protocol foundations' do
       end
 
       it 'reports whether the error is a recognized modern protocol error' do
-        expect(described_class.from_jsonrpc('code' => -32_022, 'message' => 'v').modern_protocol_error?).to be(true)
+        modern = described_class.from_jsonrpc('code' => -32_022, 'message' => 'v',
+                                              'data' => { 'supported' => ['2026-07-28'], 'requested' => 'x' })
+        expect(modern.modern_protocol_error?).to be(true)
         expect(described_class.from_jsonrpc('code' => -32_601, 'message' => 'm').modern_protocol_error?).to be(false)
       end
     end
@@ -205,6 +208,12 @@ RSpec.describe 'MCP 2026-07-28 protocol foundations' do
     it 'is lenient with non-object results from older servers' do
       expect(transport.process_jsonrpc_response({ 'id' => 1, 'result' => [] })).to eq([])
       expect(MCPClient::JsonRpcCommon.result_type([])).to eq('complete')
+    end
+
+    it 'treats -32022 without the schema-mandated data as not modern' do
+      response = { 'jsonrpc' => '2.0', 'id' => 1, 'error' => { 'code' => -32_022, 'message' => 'v' } }
+      expect { transport.process_jsonrpc_response(response) }
+        .to raise_error(MCPClient::Errors::UnsupportedProtocolVersionError) { |e| expect(e.modern_protocol_error?).to be(false) }
     end
 
     it 'InvalidResultError is a ServerError, so it is never retried as transient' do
@@ -304,7 +313,7 @@ RSpec.describe 'MCP 2026-07-28 protocol foundations' do
         { 'jsonrpc' => '2.0', 'id' => 1, 'result' => { 'resultType' => 'weird', 'tools' => [] } }
       )
 
-      expect { server.list_tools }.to raise_error(MCPClient::Errors::ToolCallError, /resultType/)
+      expect { server.list_tools }.to raise_error(MCPClient::Errors::InvalidResultError, /resultType/)
     end
   end
 
@@ -550,5 +559,232 @@ RSpec.describe 'initialize handshake against the modern era' do
 
     expect { server.send(:perform_initialize) }
       .to raise_error(MCPClient::Errors::ConnectionError, /server supports: 2026-07-28, 2027-01-01/)
+  end
+end
+
+# Second review round: only a well-formed JSON-RPC error identifies a modern
+# server; Faraday raise_error middleware must not bypass body parsing; typed
+# protocol errors survive the public wrappers; a modern result must be an
+# object with a string resultType.
+RSpec.describe 'modern error recognition is strict' do
+  it 'requires the data the schema mandates before an error counts as modern' do
+    no_data = MCPClient::Errors::ServerError.from_jsonrpc('code' => -32_022, 'message' => 'blocked')
+    expect(no_data).to be_a(MCPClient::Errors::UnsupportedProtocolVersionError)
+    expect(no_data.modern_protocol_error?).to be(false)
+
+    with_data = MCPClient::Errors::ServerError.from_jsonrpc(
+      'code' => -32_022, 'message' => 'v', 'data' => { 'supported' => ['2026-07-28'], 'requested' => 'x' }
+    )
+    expect(with_data.modern_protocol_error?).to be(true)
+
+    caps_missing = MCPClient::Errors::ServerError.from_jsonrpc('code' => -32_021, 'message' => 'm')
+    expect(caps_missing.modern_protocol_error?).to be(false)
+    caps = MCPClient::Errors::ServerError.from_jsonrpc('code' => -32_021, 'message' => 'm',
+                                                       'data' => { 'requiredCapabilities' => {} })
+    expect(caps.modern_protocol_error?).to be(true)
+
+    # HeaderMismatch carries no data in the schema.
+    expect(MCPClient::Errors::ServerError.from_jsonrpc('code' => -32_020, 'message' => 'h').modern_protocol_error?)
+      .to be(true)
+  end
+
+  it 'ignores a 400 body that is not a JSON-RPC 2.0 error response' do
+    server = MCPClient::ServerHTTP.new(base_url: 'https://example.com', endpoint: '/rpc', retries: 0)
+    stub_request(:post, 'https://example.com/rpc')
+      .to_return(status: 400, body: '{"error":{"code":-32022,"message":"blocked"}}',
+                 headers: { 'Content-Type' => 'application/json' })
+
+    expect { server.send(:send_http_request, { 'jsonrpc' => '2.0', 'id' => 1, 'method' => 'x', 'params' => {} }) }
+      .to raise_error(MCPClient::Errors::ServerError) do |e|
+        expect(e.class).to eq(MCPClient::Errors::ServerError)
+        expect(e.code).to be_nil
+      end
+  end
+end
+
+RSpec.describe 'typed errors with Faraday raise_error middleware' do
+  let(:base_url) { 'https://example.com' }
+  let(:endpoint) { '/rpc' }
+
+  def error_body(code, message, data = nil)
+    error = { 'code' => code, 'message' => message }
+    error['data'] = data if data
+    JSON.generate('jsonrpc' => '2.0', 'id' => 1, 'error' => error)
+  end
+
+  [MCPClient::ServerHTTP, MCPClient::ServerStreamableHTTP].each do |klass|
+    context "with #{klass}" do
+      let(:server) do
+        klass.new(base_url: base_url, endpoint: endpoint, retries: 0,
+                  faraday_config: ->(conn) { conn.response :raise_error })
+      end
+
+      def send_request
+        server.send(:send_http_request, { 'jsonrpc' => '2.0', 'id' => 1, 'method' => 'x', 'params' => {} })
+      end
+
+      it 'still raises the typed error for a 400 carrying -32022' do
+        stub_request(:post, "#{base_url}#{endpoint}")
+          .to_return(status: 400, body: error_body(-32_022, 'Unsupported protocol version',
+                                                   { 'supported' => ['2026-07-28'], 'requested' => 'x' }),
+                     headers: { 'Content-Type' => 'application/json' })
+
+        expect { send_request }.to raise_error(MCPClient::Errors::UnsupportedProtocolVersionError) do |e|
+          expect(e.supported).to eq(['2026-07-28'])
+          expect(e.http_status).to eq(400)
+        end
+      end
+
+      it 'still keeps the code of a 404 carrying -32601' do
+        stub_request(:post, "#{base_url}#{endpoint}")
+          .to_return(status: 404, body: error_body(-32_601, 'Method not found'),
+                     headers: { 'Content-Type' => 'application/json' })
+
+        expect { send_request }.to raise_error(MCPClient::Errors::ServerError) do |e|
+          expect(e.code).to eq(-32_601)
+          expect(e.http_status).to eq(404)
+        end
+      end
+
+      it 'raises a plain, non-retryable ServerError for a 400 without a JSON-RPC body' do
+        stub_request(:post, "#{base_url}#{endpoint}").to_return(status: 400, body: 'nope')
+
+        expect { send_request }.to raise_error(MCPClient::Errors::ServerError) do |e|
+          expect(e).not_to be_a(MCPClient::Errors::TransientServerError)
+          expect(e).not_to be_a(MCPClient::Errors::TransportError)
+          expect(e.http_status).to eq(400)
+        end
+      end
+    end
+  end
+end
+
+RSpec.describe 'typed protocol errors survive the public transport methods' do
+  let(:capability_error) do
+    MCPClient::Errors::ServerError.from_jsonrpc(
+      'code' => -32_021, 'message' => 'Missing required client capability',
+      'data' => { 'requiredCapabilities' => { 'elicitation' => {} } }
+    )
+  end
+
+  [MCPClient::ServerHTTP, MCPClient::ServerStreamableHTTP].each do |klass|
+    it "propagates them from #{klass}#call_tool, #get_prompt and #read_resource" do
+      server = klass.new(base_url: 'https://example.com')
+      allow(server).to receive(:rpc_request).and_raise(capability_error)
+
+      expect { server.call_tool('t', {}) }.to raise_error(MCPClient::Errors::MissingRequiredClientCapabilityError)
+      expect { server.get_prompt('p', {}) }.to raise_error(MCPClient::Errors::MissingRequiredClientCapabilityError)
+      expect { server.read_resource('file:///x') }.to raise_error(MCPClient::Errors::MissingRequiredClientCapabilityError)
+    end
+  end
+
+  it 'propagates them from ServerSSE#call_tool' do
+    server = MCPClient::ServerSSE.new(base_url: 'https://example.com/sse')
+    allow(server).to receive(:rpc_request).and_raise(capability_error)
+
+    expect { server.call_tool('t', {}) }.to raise_error(MCPClient::Errors::MissingRequiredClientCapabilityError)
+  end
+
+  it 'propagates them from every ServerStdio method' do
+    server = MCPClient::ServerStdio.new(command: 'echo test')
+    server.instance_variable_set(:@initialized, true)
+    server.instance_variable_set(:@capabilities, { 'completions' => {}, 'logging' => {},
+                                                   'resources' => { 'subscribe' => true } })
+    allow(server).to receive(:send_request)
+    allow(server).to receive(:wait_response).and_return(
+      { 'jsonrpc' => '2.0', 'id' => 1,
+        'error' => { 'code' => -32_021, 'message' => 'Missing required client capability',
+                     'data' => { 'requiredCapabilities' => { 'elicitation' => {} } } } }
+    )
+
+    [-> { server.call_tool('t', {}) }, -> { server.list_tools }, -> { server.get_prompt('p', {}) },
+     -> { server.list_prompts }, -> { server.list_resources }, -> { server.read_resource('file:///x') },
+     -> { server.list_resource_templates }, -> { server.subscribe_resource('file:///x') },
+     -> { server.unsubscribe_resource('file:///x') },
+     -> { server.complete(ref: { 'type' => 'ref/prompt', 'name' => 'p' }, argument: { 'name' => 'a', 'value' => '' }) },
+     -> { server.log_level = 'debug' }].each do |call|
+      expect(&call).to raise_error(MCPClient::Errors::MissingRequiredClientCapabilityError) do |e|
+        expect(e.required_capabilities).to eq({ 'elicitation' => {} })
+      end
+    end
+  end
+
+  it 'propagates InvalidResultError from the public stdio methods' do
+    server = MCPClient::ServerStdio.new(command: 'echo test')
+    server.instance_variable_set(:@initialized, true)
+    allow(server).to receive(:send_request)
+    allow(server).to receive(:wait_response).and_return(
+      { 'jsonrpc' => '2.0', 'id' => 1, 'result' => { 'resultType' => 'weird', 'tools' => [] } }
+    )
+
+    expect { server.list_tools }.to raise_error(MCPClient::Errors::InvalidResultError)
+  end
+
+  it 'exposes protocol_error? on ServerError' do
+    expect(MCPClient::Errors::ServerError.new('x', code: -32_601).protocol_error?).to be(false)
+    expect(MCPClient::Errors::InvalidResultError.new('x').protocol_error?).to be(true)
+    expect(MCPClient::Errors::HeaderMismatchError.new('x', code: -32_020).protocol_error?).to be(true)
+  end
+end
+
+RSpec.describe 'result shape validation' do
+  let(:transport) do
+    Class.new do
+      include MCPClient::JsonRpcCommon
+
+      attr_accessor :protocol_version
+
+      def initialize
+        @logger = Logger.new(StringIO.new)
+      end
+    end.new
+  end
+
+  it 'rejects an explicit null resultType in either era' do
+    expect { transport.process_jsonrpc_response({ 'id' => 1, 'result' => { 'resultType' => nil } }) }
+      .to raise_error(MCPClient::Errors::InvalidResultError)
+    expect(MCPClient::JsonRpcCommon.result_type({ 'resultType' => nil })).to be_nil
+  end
+
+  it 'rejects a missing, null or non-object result from a modern server' do
+    transport.protocol_version = '2026-07-28'
+    expect { transport.process_jsonrpc_response({ 'id' => 1 }) }
+      .to raise_error(MCPClient::Errors::InvalidResultError, /object/)
+    expect { transport.process_jsonrpc_response({ 'id' => 1, 'result' => nil }) }
+      .to raise_error(MCPClient::Errors::InvalidResultError)
+    expect { transport.process_jsonrpc_response({ 'id' => 1, 'result' => [] }) }
+      .to raise_error(MCPClient::Errors::InvalidResultError)
+  end
+
+  it 'stays lenient with non-object results from legacy servers' do
+    transport.protocol_version = '2025-11-25'
+    expect(transport.process_jsonrpc_response({ 'id' => 1, 'result' => [] })).to eq([])
+    expect(transport.process_jsonrpc_response({ 'id' => 1, 'result' => nil })).to be_nil
+  end
+end
+
+RSpec.describe 'HTTP error bodies are inspected within a bound' do
+  let(:server) { MCPClient::ServerHTTP.new(base_url: 'https://example.com', endpoint: '/rpc', retries: 0) }
+
+  def send_request
+    server.send(:send_http_request, { 'jsonrpc' => '2.0', 'id' => 1, 'method' => 'x', 'params' => {} })
+  end
+
+  it 'does not parse an oversized 4xx body' do
+    huge = "{\"jsonrpc\":\"2.0\",\"id\":1,\"error\":{\"code\":-32022,\"message\":\"#{'x' * (70 * 1024)}\"}}"
+    stub_request(:post, 'https://example.com/rpc')
+      .to_return(status: 400, body: huge, headers: { 'Content-Type' => 'application/json' })
+    expect(JSON).not_to receive(:parse)
+
+    expect { send_request }.to raise_error(MCPClient::Errors::ServerError) { |e| expect(e.code).to be_nil }
+  end
+
+  it 'gives up on a gzip 4xx body that expands past the bound' do
+    payload = "{\"jsonrpc\":\"2.0\",\"id\":1,\"error\":{\"code\":-32022,\"message\":\"#{'x' * (200 * 1024)}\"}}"
+    gz = StringIO.new.tap { |io| Zlib::GzipWriter.wrap(io) { |w| w.write(payload) } }.string
+    stub_request(:post, 'https://example.com/rpc')
+      .to_return(status: 400, body: gz, headers: { 'Content-Type' => 'application/json', 'Content-Encoding' => 'gzip' })
+
+    expect { send_request }.to raise_error(MCPClient::Errors::ServerError) { |e| expect(e.code).to be_nil }
   end
 end
