@@ -89,7 +89,11 @@ module MCPClient
 
           # Complete OAuth flow
           @logger.debug('Completing OAuth authorization flow')
-          token = @oauth_provider.complete_authorization_flow(result[:code], result[:state])
+          token = if result.key?(:iss)
+                    @oauth_provider.complete_authorization_flow(result[:code], result[:state], iss: result[:iss])
+                  else
+                    @oauth_provider.complete_authorization_flow(result[:code], result[:state])
+                  end
 
           @logger.info("\nAuthentication successful!")
           token
@@ -196,10 +200,14 @@ module MCPClient
         # Update result and signal waiting thread
         mutex.synchronize do
           if error
-            result[:error] = error_description || error
+            # MCP 2026-07-28: an error response is subject to the same RFC
+            # 9207 issuer check as a success response before it is shown.
+            result[:error] = authorization_error_text(params, error_description || error)
           elsif code && state
             result[:code] = code
             result[:state] = state
+            # RFC 9207 issuer identification, validated by the provider
+            result[:iss] = params['iss'] if params.key?('iss')
           else
             result[:error] = 'Invalid callback: missing code or state parameter'
           end
@@ -216,6 +224,19 @@ module MCPClient
         end
       ensure
         client&.close
+      end
+
+      # The text to surface for an error callback: the provider validates the
+      # response's issuer first and refuses a mismatching one.
+      # @param params [Hash] callback parameters
+      # @param fallback [String] the error text when the provider cannot validate
+      # @return [String]
+      def authorization_error_text(params, fallback)
+        return fallback unless @oauth_provider.respond_to?(:authorization_error_message)
+
+        @oauth_provider.authorization_error_message(params)
+      rescue MCPClient::Errors::ConnectionError => e
+        e.message
       end
 
       # Parse URL query parameters

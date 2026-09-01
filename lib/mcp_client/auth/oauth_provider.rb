@@ -52,14 +52,24 @@ module MCPClient
       #   skipping dynamic registration. Hosting the metadata JSON at that URL is the
       #   application's responsibility.
       # @raise [ArgumentError] if client_id_metadata_url is not an HTTPS URL with a path component
+      # OIDC application types accepted for Dynamic Client Registration.
+      APPLICATION_TYPES = %w[native web].freeze
+
+      # Loopback hosts whose redirect URIs mark a native application.
+      LOOPBACK_HOSTS = %w[localhost 127.0.0.1 ::1 [::1]].freeze
+
+      # @return [String, nil] the explicit application_type for Dynamic Client Registration
+      attr_reader :application_type
+
       def initialize(server_url:, redirect_uri: 'http://localhost:8080/callback', scope: nil, logger: nil, storage: nil,
-                     client_metadata: {}, client_id_metadata_url: nil)
+                     client_metadata: {}, client_id_metadata_url: nil, application_type: nil)
         self.server_url = server_url
         self.redirect_uri = redirect_uri
         self.scope = scope
         self.logger = logger || Logger.new($stdout, level: Logger::WARN)
         self.storage = storage || MemoryStorage.new
         self.client_id_metadata_url = client_id_metadata_url
+        self.application_type = application_type
         @extra_client_metadata = client_metadata
         @http_client = create_http_client
         # Protected resource metadata learned from a 401 WWW-Authenticate
@@ -70,6 +80,17 @@ module MCPClient
         @challenge_metadata_url = nil
         # Why a peer-advertised challenge URL was refused, if one was
         @challenge_error = nil
+      end
+
+      # @param type [String, nil] 'native', 'web' or nil (derived from the redirect URI)
+      # @raise [ArgumentError] for any other value
+      def application_type=(type)
+        type = type&.to_s
+        unless type.nil? || APPLICATION_TYPES.include?(type)
+          raise ArgumentError, "application_type must be one of #{APPLICATION_TYPES.join(', ')}: #{type.inspect}"
+        end
+
+        @application_type = type
       end
 
       # @param url [String] Server URL to normalize
@@ -118,8 +139,11 @@ module MCPClient
         # Register client if needed
         client_info = get_or_register_client(server_metadata)
 
-        # Generate PKCE parameters
-        pkce = PKCE.new
+        # Generate PKCE parameters. MCP 2026-07-28 "Authorization Response
+        # Validation": the selected authorization server's issuer is recorded
+        # in the same per-request record so the `iss` of the response can be
+        # checked against an authenticated value.
+        pkce = PKCE.new(issuer: server_metadata.issuer)
         storage.set_pkce(server_url, pkce)
 
         # Generate state parameter
@@ -133,10 +157,13 @@ module MCPClient
       # Complete OAuth authorization flow with authorization code
       # @param code [String] Authorization code from callback
       # @param state [String] State parameter from callback
+      # @param iss [String, nil] the `iss` parameter of the authorization response (RFC 9207);
+      #   validated against the issuer recorded when the flow started, before the code is sent
+      #   to any token endpoint (MCP 2026-07-28)
       # @return [Token] Access token
-      # @raise [MCPClient::Errors::ConnectionError] if token exchange fails
+      # @raise [MCPClient::Errors::ConnectionError] if the issuer check or the token exchange fails
       # @raise [ArgumentError] if state parameter doesn't match
-      def complete_authorization_flow(code, state)
+      def complete_authorization_flow(code, state, iss: nil)
         # Verify state parameter
         stored_state = storage.get_state(server_url)
         raise ArgumentError, 'Invalid state parameter' unless stored_state == state
@@ -147,6 +174,8 @@ module MCPClient
         server_metadata = discover_authorization_server
 
         raise MCPClient::Errors::ConnectionError, 'Missing PKCE or client info' unless pkce && client_info
+
+        validate_authorization_response_issuer!(iss, pkce.issuer, server_metadata)
 
         # Exchange authorization code for tokens
         token = exchange_authorization_code(server_metadata, client_info, code, pkce)
@@ -159,6 +188,20 @@ module MCPClient
         storage.delete_state(server_url)
 
         token
+      end
+
+      # The message to surface for an authorization *error* response, after
+      # the same RFC 9207 issuer check as a success response: "on mismatch
+      # the client MUST NOT act on or display error, error_description, or
+      # error_uri" (MCP 2026-07-28 "Authorization Response Validation").
+      # @param params [Hash] the callback parameters (error, error_description, iss, state, ...)
+      # @return [String] the error text to show
+      # @raise [MCPClient::Errors::ConnectionError] when the response's issuer does not check out
+      def authorization_error_message(params)
+        params = params.to_h.transform_keys(&:to_s)
+        pkce = storage.get_pkce(server_url)
+        validate_authorization_response_issuer!(params['iss'], pkce&.issuer, storage.get_server_metadata(server_url))
+        (params['error_description'] || params['error'] || 'unknown error').to_s
       end
 
       # Apply OAuth authorization to HTTP request
@@ -282,6 +325,36 @@ module MCPClient
       attr_reader :challenge_scope
 
       private
+
+      # RFC 9207 Section 2.4 as applied by MCP 2026-07-28: a present `iss`
+      # must equal the recorded issuer byte for byte (no scheme/host case
+      # folding, default-port elision, trailing-slash or percent-encoding
+      # normalization); an absent `iss` is rejected when the authorization
+      # server advertises the parameter. Without a recorded issuer nothing
+      # can be validated, so a present `iss` is rejected (fail closed).
+      # @param iss [String, nil] the response's iss parameter
+      # @param expected [String, nil] the issuer recorded when the flow started
+      # @param server_metadata [ServerMetadata, nil] the authorization server metadata
+      # @return [void]
+      # @raise [MCPClient::Errors::ConnectionError]
+      def validate_authorization_response_issuer!(iss, expected, server_metadata)
+        if iss.nil?
+          return unless server_metadata&.iss_parameter_supported?
+
+          raise MCPClient::Errors::ConnectionError,
+                'Authorization response rejected: the authorization server advertises the iss parameter ' \
+                '(authorization_response_iss_parameter_supported) but the response carries none'
+        end
+        unless expected.is_a?(String)
+          raise MCPClient::Errors::ConnectionError,
+                'Authorization response rejected: no issuer was recorded for this authorization request, ' \
+                'so its iss parameter cannot be validated'
+        end
+        return if iss.to_s == expected
+
+        raise MCPClient::Errors::ConnectionError,
+              "Authorization response rejected: issuer mismatch (expected #{expected})"
+      end
 
       # Resolve the scope for authorization/registration requests using the
       # MCP 2025-11-25 scope selection strategy: the challenge's scope
@@ -481,15 +554,21 @@ module MCPClient
       def invalidate_client_info_on_as_change(previous, current)
         return unless previous && previous.issuer != current.issuer
 
-        logger.debug('Authorization server changed; discarding client and scopes from the previous AS')
+        logger.debug('Authorization server changed; discarding the token and scopes from the previous AS')
 
-        # Prefer an explicit delete; fall back to the always-available
-        # set_client_info(nil) so custom storage backends are handled too.
-        if storage.respond_to?(:delete_client_info)
-          storage.delete_client_info(server_url)
-        else
-          storage.set_client_info(server_url, nil)
+        # Registration state is per authorization server: a token from the
+        # previous one is not valid for the new one. Credentials are kept
+        # only when bound (pre-registered, so the mismatch can be reported)
+        # or portable (Client ID Metadata Document); a dynamic or unknown
+        # registration is discarded so the next flow re-registers.
+        if storage.respond_to?(:delete_token)
+          storage.delete_token(server_url)
+        elsif storage.respond_to?(:set_token)
+          storage.set_token(server_url, nil)
         end
+        client_info = storage.get_client_info(server_url)
+        keep = client_info.respond_to?(:portable?) && (client_info.portable? || client_info.pre_registered?)
+        delete_client_info unless keep
 
         @supported_scopes = nil
       end
@@ -841,10 +920,14 @@ module MCPClient
       # @return [ClientInfo] Client information
       # @raise [MCPClient::Errors::ConnectionError] if registration fails
       def get_or_register_client(server_metadata)
-        # 1. Pre-registered or previously registered client info from storage
+        # 1. Pre-registered or previously registered client info from storage,
+        # provided it belongs to the authorization server in use.
         if (client_info = storage.get_client_info(server_url)) && !client_info.client_secret_expired?
-          logger.debug("Using cached OAuth client for #{server_url}")
-          return client_info
+          bound = client_info_for_issuer(client_info, server_metadata.issuer)
+          if bound
+            logger.debug("Using cached OAuth client for #{server_url}")
+            return bound
+          end
         end
 
         # 2. Client ID Metadata Documents (SEP-991): the HTTPS metadata URL is
@@ -860,6 +943,50 @@ module MCPClient
         else
           raise MCPClient::Errors::ConnectionError,
                 'Dynamic client registration not supported and no client credentials found'
+        end
+      end
+
+      # MCP 2026-07-28 "Authorization Server Binding": credentials are keyed
+      # by the issuer that produced them. A Client ID Metadata Document
+      # client id is portable; unbound credentials are bound to the current
+      # issuer on first use; pre-registered credentials for another issuer
+      # are an error rather than silently reused; a dynamic registration for
+      # another issuer is discarded so the caller re-registers.
+      # @param client_info [ClientInfo] the cached credentials
+      # @param issuer [String] the issuer of the authorization server in use
+      # @return [ClientInfo, nil] usable credentials, or nil when a new registration is needed
+      # @raise [MCPClient::Errors::ConnectionError] for pre-registered credentials of another issuer
+      def client_info_for_issuer(client_info, issuer)
+        return client_info unless client_info.respond_to?(:issuer)
+        return client_info if client_info.portable?
+
+        if client_info.issuer.nil?
+          bound = client_info.with_issuer(issuer)
+          storage.set_client_info(server_url, bound)
+          return bound
+        end
+        return client_info if client_info.issuer == issuer
+
+        if client_info.pre_registered?
+          raise MCPClient::Errors::ConnectionError,
+                "Pre-registered OAuth client credentials belong to authorization server #{client_info.issuer}, " \
+                "but the server now uses #{issuer}; register the client with the new authorization server"
+        end
+
+        logger.warn("Discarding the OAuth client registered with #{client_info.issuer}: " \
+                    "the authorization server is now #{issuer}")
+        delete_client_info
+        nil
+      end
+
+      # @return [void]
+      def delete_client_info
+        # Prefer an explicit delete; fall back to the always-available
+        # set_client_info(nil) so custom storage backends are handled too.
+        if storage.respond_to?(:delete_client_info)
+          storage.delete_client_info(server_url)
+        else
+          storage.set_client_info(server_url, nil)
         end
       end
 
@@ -881,7 +1008,7 @@ module MCPClient
           **@extra_client_metadata
         )
 
-        client_info = ClientInfo.new(client_id: client_id_metadata_url, metadata: metadata)
+        client_info = ClientInfo.new(client_id: client_id_metadata_url, metadata: metadata, registration_type: 'cimd')
 
         # Persist so complete_authorization_flow and token refresh can find it
         storage.set_client_info(server_url, client_info)
@@ -929,26 +1056,26 @@ module MCPClient
       # @return [ClientInfo] Registered client information
       # @raise [MCPClient::Errors::ConnectionError] if registration fails
       def register_client(server_metadata)
+        logger.warn('Dynamic Client Registration is deprecated in MCP 2026-07-28; prefer a Client ID Metadata ' \
+                    'Document (client_id_metadata_url) or pre-registered credentials')
         logger.debug("Registering OAuth client at: #{server_metadata.registration_endpoint}")
 
-        metadata = ClientMetadata.new(
-          redirect_uris: [redirect_uri],
-          token_endpoint_auth_method: 'none', # Public client
-          grant_types: %w[authorization_code refresh_token],
-          response_types: ['code'],
-          scope: resolved_scope,
-          **@extra_client_metadata
-        )
+        app_type = resolved_application_type
+        response = post_registration(server_metadata, app_type)
 
-        response = @http_client.post(server_metadata.registration_endpoint) do |req|
-          req.headers['Content-Type'] = 'application/json'
-          req.headers['Accept'] = 'application/json'
-          req.body = metadata.to_h.to_json
+        # "Clients MAY retry registration with an adjusted application_type"
+        # when an OIDC server rejects the redirect URI for the type derived
+        # here (never for one the host chose explicitly).
+        if !response.success? && application_type.nil? &&
+           registration_error(response)[:error] == 'invalid_redirect_uri'
+          alternate = app_type == 'native' ? 'web' : 'native'
+          logger.warn("Client registration rejected the redirect URI for application_type #{app_type}; " \
+                      "retrying as #{alternate}")
+          app_type = alternate
+          response = post_registration(server_metadata, app_type)
         end
 
-        unless response.success?
-          raise MCPClient::Errors::ConnectionError, "Client registration failed: HTTP #{response.status}"
-        end
+        raise_registration_failure!(response) unless response.success?
 
         data = JSON.parse(response.body)
         logger.debug("OAuth client registered successfully: #{data['client_id']}")
@@ -965,7 +1092,8 @@ module MCPClient
           logo_uri: data['logo_uri'],
           tos_uri: data['tos_uri'],
           policy_uri: data['policy_uri'],
-          contacts: data['contacts']
+          contacts: data['contacts'],
+          application_type: data['application_type'] || app_type
         )
 
         # Warn if server changed redirect_uri
@@ -983,7 +1111,10 @@ module MCPClient
           client_secret: data['client_secret'],
           client_id_issued_at: data['client_id_issued_at'],
           client_secret_expires_at: data['client_secret_expires_at'],
-          metadata: registered_metadata
+          metadata: registered_metadata,
+          # Bound to the authorization server that issued the credentials
+          issuer: server_metadata.issuer,
+          registration_type: 'dynamic'
         )
 
         # Store client info
@@ -994,6 +1125,76 @@ module MCPClient
         raise MCPClient::Errors::ConnectionError, "Invalid client registration response: #{e.message}"
       rescue Faraday::Error => e
         raise MCPClient::Errors::ConnectionError, "Network error during client registration: #{e.message}"
+      end
+
+      # One Dynamic Client Registration request.
+      # @param server_metadata [ServerMetadata]
+      # @param app_type [String] the application_type to declare
+      # @return [Faraday::Response]
+      def post_registration(server_metadata, app_type)
+        metadata = ClientMetadata.new(
+          redirect_uris: [redirect_uri],
+          token_endpoint_auth_method: 'none', # Public client
+          grant_types: %w[authorization_code refresh_token],
+          response_types: ['code'],
+          scope: resolved_scope,
+          application_type: app_type,
+          **@extra_client_metadata
+        )
+
+        @http_client.post(server_metadata.registration_endpoint) do |req|
+          req.headers['Content-Type'] = 'application/json'
+          req.headers['Accept'] = 'application/json'
+          req.body = metadata.to_h.to_json
+        end
+      end
+
+      # "When a registration request is rejected, clients SHOULD surface a
+      # meaningful error": the RFC 7591 error and description, when given.
+      # @param response [Faraday::Response] the failed registration response
+      # @raise [MCPClient::Errors::ConnectionError]
+      def raise_registration_failure!(response)
+        error = registration_error(response)
+        detail = [error[:error], error[:error_description]].compact.join(': ')
+        raise MCPClient::Errors::ConnectionError,
+              "Client registration failed: HTTP #{response.status}#{" (#{detail})" unless detail.empty?}"
+      end
+
+      # The application_type to register: the host's explicit choice, else
+      # 'native' for loopback and custom-scheme redirect URIs (desktop, CLI,
+      # mobile, locally hosted apps) and 'web' for a remote redirect URI
+      # (MCP 2026-07-28 "Application Type and Redirect URI Constraints").
+      # @return [String]
+      def resolved_application_type
+        return application_type if application_type
+
+        uri = URI.parse(redirect_uri.to_s)
+        return 'native' unless %w[http https].include?(uri.scheme.to_s.downcase)
+
+        LOOPBACK_HOSTS.include?(uri.host.to_s.downcase) ? 'native' : 'web'
+      rescue URI::InvalidURIError
+        'native'
+      end
+
+      # The RFC 7591 error of a failed registration response, sanitized for
+      # a log line or exception message.
+      # @param response [Faraday::Response]
+      # @return [Hash] :error and :error_description (nil when absent)
+      def registration_error(response)
+        body = JSON.parse(response.body.to_s)
+        return {} unless body.is_a?(Hash)
+
+        { error: safe_error_text(body['error']), error_description: safe_error_text(body['error_description']) }
+      rescue JSON::ParserError
+        {}
+      end
+
+      # @param value [Object] peer-supplied text
+      # @return [String, nil] printable, bounded text
+      def safe_error_text(value)
+        return nil unless value.is_a?(String)
+
+        value.gsub(/[[:cntrl:]]/, ' ')[0, 200]
       end
 
       # Build authorization URL

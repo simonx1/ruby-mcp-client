@@ -687,6 +687,7 @@ RSpec.describe MCPClient::Auth::OAuthProvider do
       allow(storage).to receive(:get_server_metadata).and_return(server_metadata)
       allow(storage).to receive(:set_server_metadata)
       allow(storage).to receive(:get_client_info).and_return(client_info)
+      allow(storage).to receive(:set_client_info)
       allow(storage).to receive(:set_pkce)
       allow(storage).to receive(:set_state)
     end
@@ -818,7 +819,8 @@ RSpec.describe MCPClient::Auth::OAuthProvider do
     let(:server_metadata) do
       instance_double(
         'MCPClient::Auth::ServerMetadata',
-        registration_endpoint: 'https://auth.example.com/register'
+        registration_endpoint: 'https://auth.example.com/register',
+        issuer: 'https://auth.example.com'
       )
     end
     let(:registration_response_body) do

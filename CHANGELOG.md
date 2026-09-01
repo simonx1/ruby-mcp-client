@@ -5,6 +5,34 @@
 Groundwork for the 2026-07-28 protocol revision (stateless, per-request
 metadata). Each feature lands in its own PR; this section accumulates them.
 
+### Authorization (RFC 9207 issuer validation, client registration)
+
+- **Issuer validation.** `OAuthProvider#start_authorization_flow` records
+  the selected authorization server's `issuer` with the PKCE record;
+  `complete_authorization_flow(code, state, iss:)` (and
+  `OAuthClient.complete_oauth_flow(..., iss:)`) validates the response's
+  `iss` per RFC 9207 before the code reaches any token endpoint: a present
+  `iss` must equal the recorded issuer byte for byte (no URL
+  normalization), an absent one is rejected when the server advertises
+  `authorization_response_iss_parameter_supported`, and a request without a
+  recorded issuer fails closed. `OAuthProvider#authorization_error_message`
+  applies the same check to error responses, and `BrowserOAuth` forwards
+  the callback's `iss` and refuses to display a mismatching error.
+  `ServerMetadata` parses `authorization_response_iss_parameter_supported`.
+- **Dynamic Client Registration.** Registrations carry an
+  `application_type` (`native` for loopback and custom-scheme redirect
+  URIs, `web` otherwise; `application_type:` overrides), retry once with the
+  other type when the server rejects the redirect URI for it, surface the
+  server's `error` / `error_description`, and log that DCR is deprecated in
+  favour of Client ID Metadata Documents.
+- **Authorization server binding.** `ClientInfo` gained `issuer` and
+  `registration_type` (`pre_registered`, `dynamic`, `cimd`). Credentials are
+  bound to the issuer that produced them: a dynamic registration is redone
+  for a new authorization server (and the old token dropped), pre-registered
+  credentials for another issuer raise a `ConnectionError` instead of being
+  reused, unbound credentials are adopted for the first issuer seen, and
+  Client ID Metadata Document client ids stay portable.
+
 ### Tasks extension (`io.modelcontextprotocol/tasks`)
 
 - **A cleanup no longer restarts the lifetime counters (round 39).**
