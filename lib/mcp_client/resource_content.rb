@@ -51,6 +51,10 @@ module MCPClient
     # @return [void]
     def initialize_copy(source)
       super
+      @uri = source.uri.dup if source.uri
+      @name = source.name.dup if source.name
+      @title = source.title.dup if source.title
+      @mime_type = source.mime_type.dup if source.mime_type
       @text = source.text.dup if source.text
       @blob = source.blob.dup if source.blob
       @annotations = deep_copy(source.annotations)
@@ -100,7 +104,7 @@ module MCPClient
     # @return [Object] an independent copy
     def deep_copy(value)
       case value
-      when Hash then value.to_h { |k, v| [k, deep_copy(v)] }
+      when Hash then value.to_h { |k, v| [deep_copy(k), deep_copy(v)] }
       when Array then value.map { |v| deep_copy(v) }
       when String then value.dup
       else value

@@ -77,7 +77,8 @@ module MCPClient
       # letting it go out without the headers an intermediary may route on.
       # @return [Array<MCPClient::Tool>]
       def known_tools_for_headers
-        @mutex.synchronize { @tools } || list_tools
+        fresh = cache_fresh?(:tools) ? (cached_list_value(:tools) || @mutex.synchronize { @tools }) : nil
+        fresh || list_tools
       end
     end
   end

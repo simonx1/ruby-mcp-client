@@ -125,7 +125,7 @@ module MCPClient
           combined = MCPClient::CachedResult.stale(now: now,
                                                    like: combined)
         end
-        combined.authorization_context = nil if mixed
+        combined.authorization_context = MCPClient::CachedResult::MIXED_CONTEXT if mixed
         cache_entries[kind] = combined
       end
       combined
@@ -175,9 +175,38 @@ module MCPClient
     #   (:current asks the transport which credentials it would send now)
     def entry_in_current_context?(entry, context: :current)
       return true unless entry&.cache_scope == 'private' && respond_to?(:current_authorization_context, true)
+      return false if entry.authorization_context.equal?(MCPClient::CachedResult::MIXED_CONTEXT)
 
       context = current_authorization_context if context == :current
       entry.authorization_context == context
+    end
+
+    # Attach the list a request produced to the hint recorded for that same
+    # request, in one step, so a value and its authorization context can
+    # never come from different requests.
+    # @param kind [Symbol]
+    # @param value [Object] the list objects
+    # @return [void]
+    def attach_list_value(kind, value)
+      context = respond_to?(:request_authorization_context, true) ? request_authorization_context : nil
+      cache_entries_mutex.synchronize do
+        entry = cache_entries[kind]
+        next unless entry
+        next if entry.cache_scope == 'private' && entry.authorization_context != context
+
+        entry.value = value
+      end
+    end
+
+    # The cached list for a kind, when its entry is fresh and belongs to
+    # the current authorization context.
+    # @param kind [Symbol]
+    # @return [Object, nil]
+    def cached_list_value(kind)
+      entry = private_entry_for_current_context(kind)
+      return nil unless entry&.value && entry.fresh?(now: monotonic_now)
+
+      entry.value
     end
 
     # The stale copy that may be served when a re-fetch fails: only a list
@@ -226,8 +255,10 @@ module MCPClient
     def clear_result_cache
       now = monotonic_now
       cache_entries_mutex.synchronize do
-        # Known-and-stale, not unknown: a client-level cache built from the
-        # old connection must not read the empty entry as "fresh".
+        # Lists stay known-and-stale (a client-level cache built from the old
+        # connection must not read an empty entry as "fresh"); reads are
+        # simply forgotten, they are only ever served with a value.
+        cache_entries.delete_if { |key, _| key.is_a?(String) }
         cache_entries.each_key { |key| cache_entries[key] = MCPClient::CachedResult.stale(now: now, like: cache_entries[key]) }
         bump_cache_epoch
       end

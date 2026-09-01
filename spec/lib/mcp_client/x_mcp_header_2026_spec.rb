@@ -206,7 +206,10 @@ RSpec.describe 'MCP 2026-07-28 x-mcp-header custom headers' do
         requests << { headers: request.headers, body: body }
         case body['method']
         when 'server/discover' then json_response(body['id'], discover_result)
-        when 'tools/list' then json_response(body['id'], { 'tools' => tools.respond_to?(:call) ? tools.call : tools })
+        when 'tools/list'
+          # A hinted list, so the transport keeps it between calls (MCP
+          # 2026-07-28 caching) instead of re-listing before every call.
+          json_response(body['id'], { 'tools' => tools.respond_to?(:call) ? tools.call : tools, 'ttlMs' => 60_000 })
         when 'tools/call'
           call ? call.call(body, requests) : json_response(body['id'], { 'content' => [] })
         else raise "unexpected #{body['method']}"

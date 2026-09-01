@@ -680,6 +680,8 @@ module MCPClient
         @tools_data = nil
         @tools_generation = tools_generation + 1
       end
+      # The cached entry (which carries the list too) is stale as well.
+      invalidate_cache(:tools)
     end
 
     # @return [Integer] the current tool-list generation (bump on invalidation)
@@ -711,7 +713,10 @@ module MCPClient
     # @return [Array<MCPClient::Tool>] the list to hand to the caller
     def store_tools(tools, generation)
       @mutex.synchronize do
-        return @tools = tools if tools_generation == generation
+        if tools_generation == generation
+          attach_list_value(:tools, tools)
+          return @tools = tools
+        end
 
         # Invalidated while in flight: this list is stale even if nothing
         # newer was stored yet. Hand back whatever is current (nil makes the

@@ -10,7 +10,11 @@ module MCPClient
     SCOPES = %w[public private].freeze
 
     # @return [Object] the cached value (whatever the caller stored)
-    attr_reader :value
+    attr_accessor :value
+
+    # The context of a private list whose pages were fetched under different
+    # credentials: it belongs to no context and never matches one.
+    MIXED_CONTEXT = Object.new.freeze
     # @return [Float] monotonic receipt time (seconds)
     attr_reader :received_at
     # @return [Integer, Float, nil] the server's ttlMs (nil when it sent none)
