@@ -530,3 +530,31 @@ RSpec.describe 'MCP 2026-07-28 multi round-trip requests — pacing and URL mode
     expect(sent.last['params']['requestState']).to eq('oob')
   end
 end
+
+RSpec.describe 'MCP 2026-07-28 multi round-trip requests — plain HTTP on a legacy session' do
+  it 'does not advertise roots, elicitation or sampling to a legacy server it cannot serve them on' do
+    http = MCPClient::ServerHTTP.new(base_url: 'https://example.com', endpoint: '/mcp', retries: 0)
+    http.on_elicitation_request { |_k, _p| { 'action' => 'accept' } }
+    http.on_roots_list_request { |_k, _p| { 'roots' => [] } }
+    http.on_sampling_request { |_k, _p| {} }
+    init_params = nil
+    stub_request(:post, 'https://example.com/mcp').to_return do |request|
+      body = JSON.parse(request.body)
+      case body['method']
+      when 'server/discover' then { status: 400, body: '' }
+      when 'initialize'
+        init_params = body['params']
+        { status: 200, headers: { 'Content-Type' => 'application/json' },
+          body: JSON.generate('jsonrpc' => '2.0', 'id' => body['id'],
+                              'result' => { 'protocolVersion' => '2025-11-25', 'capabilities' => {},
+                                            'serverInfo' => { 'name' => 'l', 'version' => '1' } }) }
+      else { status: 202, body: '' }
+      end
+    end
+
+    http.connect
+
+    expect(init_params['capabilities']).to eq({})
+    http.cleanup
+  end
+end

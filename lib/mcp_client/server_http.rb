@@ -476,6 +476,18 @@ module MCPClient
       @sampling_request_callback = block
     end
 
+    # This transport has no legacy server-request channel (server requests on
+    # a response stream are dropped), so on a legacy session it must not
+    # advertise roots, elicitation or sampling: the handlers above only serve
+    # the modern multi round-trip pattern.
+    # @return [Hash]
+    def client_capabilities
+      capabilities = super
+      return capabilities if modern?
+
+      capabilities.except('roots', 'elicitation', 'sampling')
+    end
+
     # Terminate the current session (if any)
     # @return [Boolean] true if termination was successful or no session exists
     def terminate_session
