@@ -20,9 +20,11 @@ module MCPClient
   # - allOf, anyOf, oneOf, not, if/then/else (composition)
   # - $ref to a location inside the same schema document (`#`, `#/$defs/x`,
   #   `#/definitions/x`, any JSON pointer, or a plain-name fragment `#name`
-  #   naming an `$anchor` / a draft-07 `$id: "#name"`), with $defs /
-  #   definitions; under draft-07 a $ref replaces its siblings, under
-  #   2019-09 and 2020-12 it applies alongside them
+  #   naming an `$anchor` / a draft-07 `$id: "#name"` of the referencing
+  #   schema's own resource — a subschema whose `$id` is a URI starts a new
+  #   resource), with $defs (2019-09, 2020-12) / definitions (draft-07);
+  #   under draft-07 a $ref replaces its siblings, under 2019-09 and 2020-12
+  #   it applies alongside them
   # - boolean schemas (true / false), at the root or as subschemas
   #
   # MCP 2026-07-28 rules honoured here:
@@ -141,7 +143,9 @@ module MCPClient
       'contentSchema' => [DEFAULT_DIALECT, DRAFT_2019_09],
       'minContains' => [DEFAULT_DIALECT, DRAFT_2019_09],
       'maxContains' => [DEFAULT_DIALECT, DRAFT_2019_09],
-      '$anchor' => [DEFAULT_DIALECT, DRAFT_2019_09]
+      '$anchor' => [DEFAULT_DIALECT, DRAFT_2019_09],
+      '$defs' => [DEFAULT_DIALECT, DRAFT_2019_09],
+      'definitions' => [DRAFT_07]
     }.freeze
 
     # Plain-name fragment syntax (JSON Schema 2020-12 Section 8.2.2).
@@ -206,36 +210,27 @@ module MCPClient
       end
 
       problems = []
-      walk_schema(root, root, 0, { count: 0, dialect: canonical_dialect(declared) }, problems)
+      counter = { count: 0, dialect: canonical_dialect(declared), walked: {}.compare_by_identity }
+      walk_schema(root, root, 0, counter, problems)
       problems.uniq
     end
 
-    # Walk every subschema position, checking bounds and references.
+    # Walk every subschema position, checking bounds and references. A
+    # schema object is walked once, however many positions or references
+    # lead to it, so a recursive schema stays within the bounds.
     # @return [void]
     def self.walk_schema(schema, root, depth, counter, problems)
-      return unless problems.empty?
-      return unless schema_value?(schema)
-
-      counter[:count] += 1
-      if counter[:count] > MAX_SUBSCHEMAS
-        problems << "schema has more than #{MAX_SUBSCHEMAS} subschemas"
-        return
-      end
-      return unless schema.is_a?(Hash)
-
-      if depth > MAX_SCHEMA_DEPTH
-        problems << "schema nesting depth exceeds #{MAX_SCHEMA_DEPTH}"
-        return
-      end
+      return unless problems.empty? && schema_value?(schema)
+      return unless admit_schema?(schema, depth, counter, problems)
 
       dialect = counter[:dialect]
-      check_ref(schema['$ref'], root, problems, dialect, counter) if schema.key?('$ref')
+      check_ref(schema, root, depth, problems, dialect, counter) if schema.key?('$ref')
       # draft-07: the $ref replaces its siblings, so the applicators next to
-      # it are never applied and are not preflighted either; $defs /
-      # definitions are a bag of reusable schemas, not applicators, and stay
-      # reachable through references.
+      # it are never applied and are not preflighted either; definitions are
+      # a bag of reusable schemas, not applicators, and stay reachable
+      # through references.
       if dialect == DRAFT_07 && schema.key?('$ref')
-        each_definition(schema) { |sub| walk_schema(sub, root, depth + 1, counter, problems) }
+        each_definition(schema, dialect) { |sub| walk_schema(sub, root, depth + 1, counter, problems) }
         return
       end
 
@@ -250,6 +245,27 @@ module MCPClient
       check_applicator_shapes(schema, dialect, problems)
       check_exclusive_bounds(schema, dialect, problems)
       each_subschema(schema, dialect) { |sub| walk_schema(sub, root, depth + 1, counter, problems) }
+    end
+
+    # Account for a schema object about to be walked: once per object, and
+    # within the subschema and nesting bounds.
+    # @return [Boolean] whether the object's keywords are to be walked
+    def self.admit_schema?(schema, depth, counter, problems)
+      return false if schema.is_a?(Hash) && counter[:walked].key?(schema)
+
+      counter[:walked][schema] = true if schema.is_a?(Hash)
+      counter[:count] += 1
+      if counter[:count] > MAX_SUBSCHEMAS
+        problems << "schema has more than #{MAX_SUBSCHEMAS} subschemas"
+        return false
+      end
+      return false unless schema.is_a?(Hash)
+
+      if depth > MAX_SCHEMA_DEPTH
+        problems << "schema nesting depth exceeds #{MAX_SCHEMA_DEPTH}"
+        return false
+      end
+      true
     end
 
     # Every applicator value must be a schema (object or boolean), an array
@@ -344,16 +360,24 @@ module MCPClient
       end
     end
 
-    # Yield the reusable schemas under $defs / definitions only.
+    # Yield the reusable schemas under the definition bag(s) the dialect
+    # defines (`$defs` in 2019-09 / 2020-12, `definitions` in draft-07; both
+    # when no dialect is given).
     # @return [void]
-    def self.each_definition(schema, &block)
+    def self.each_definition(schema, dialect = nil, &block)
       %w[$defs definitions].each do |keyword|
+        next unless keyword_known?(keyword, dialect)
+
         schema[keyword].each_value(&block) if schema[keyword].is_a?(Hash)
       end
     end
 
+    # Check the `$ref` of a schema object and preflight what it reaches: a
+    # pointer may lead into a bag the dialect does not walk (`definitions`
+    # under 2020-12), and what a reference applies must be usable too.
     # @return [void]
-    def self.check_ref(ref, root, problems, dialect, counter)
+    def self.check_ref(schema, root, depth, problems, dialect, counter)
+      ref = schema['$ref']
       unless ref.is_a?(String)
         problems << "$ref must be a string, got #{json_type(ref)}"
         return
@@ -364,7 +388,9 @@ module MCPClient
         return
       end
 
-      problem = ref_chain_problem(ref, root, dialect, counter)
+      problem = ref_chain_problem(ref, root, dialect, counter, from: schema) do |target|
+        walk_schema(target, root, depth + 1, counter, problems)
+      end
       problems << problem if problem
     end
 
@@ -380,10 +406,21 @@ module MCPClient
 
     # Follow a local reference (and the references it leads to) at
     # preflight: every hop must resolve to a schema, the chain must not
-    # cycle, and it must stay within MAX_REF_DEPTH.
+    # cycle, and it must stay within MAX_REF_DEPTH. Once the whole chain
+    # checks out, every target it reached is yielded so the caller can
+    # preflight what the reference applies.
     # @param resolver [Hash, Context] holder of the memoized anchor index
+    # @param from [Hash] the schema object holding the reference
     # @return [String, nil] the problem, if any
-    def self.ref_chain_problem(ref, root, dialect, resolver)
+    def self.ref_chain_problem(ref, root, dialect, resolver, from:, &block)
+      targets = []
+      problem = follow_ref_chain(ref, root, dialect, resolver, from) { |target| targets << target }
+      targets.each(&block) if problem.nil? && block
+      problem
+    end
+
+    # @return [String, nil] the problem, if any; each resolved target is yielded
+    def self.follow_ref_chain(ref, root, dialect, resolver, from)
       seen = []
       current = ref
       loop do
@@ -391,11 +428,14 @@ module MCPClient
         return "$ref chain #{clip(ref.inspect)} exceeds #{MAX_REF_DEPTH} hops" if seen.size >= MAX_REF_DEPTH
 
         seen << current
-        target = resolve_reference(root, current, dialect, resolver)
+        target = resolve_reference(root, current, dialect, resolver, from: from)
         return "unresolvable local $ref #{clip(current.inspect)}" if target.equal?(UNRESOLVED)
         return "$ref #{clip(current.inspect)} does not point at a schema" unless schema_value?(target)
+
+        yield target
         return nil unless target.is_a?(Hash) && target.key?('$ref')
 
+        from = target
         current = target['$ref']
         return "$ref must be a string, got #{json_type(current)}" unless current.is_a?(String)
         return "external $ref #{clip(current.inspect)} is not dereferenced" if external_ref?(current)
@@ -416,12 +456,16 @@ module MCPClient
     # top level or nested in subschemas). Property names that merely look like
     # keywords (e.g. a property called 'not') are not reported, and
     # data-carrying keywords (enum/const/default/examples) are not scanned.
+    # The scan stops at the same bounds as {.check_schema} (a schema beyond
+    # them is unusable anyway), so a huge server-supplied schema is never
+    # walked whole.
     # @param schema [Object] the JSON schema (string or symbol keys)
     # @return [Array<String>] unique unsupported keywords, in discovery order
     def self.unsupported_keywords(schema)
       found = []
       declared = dialect(schema)
-      collect_unsupported_keywords(schema, found, 0, declared && canonical_dialect(declared))
+      scan = { count: 0, dialect: declared && canonical_dialect(declared) }
+      collect_unsupported_keywords(schema, found, 0, scan)
       found.uniq
     end
 
@@ -429,14 +473,17 @@ module MCPClient
     # dialect does not define are unknown, not unsupported).
     # @param schema [Object] a (sub)schema; non-Hash values are ignored
     # @param found [Array<String>] accumulator
-    # @param dialect [String, nil] the canonical dialect
+    # @param scan [Hash] :count of subschemas seen so far and the canonical :dialect
     # @return [void]
-    def self.collect_unsupported_keywords(schema, found, depth, dialect)
+    def self.collect_unsupported_keywords(schema, found, depth, scan)
       return unless schema.is_a?(Hash) && depth <= MAX_SCHEMA_DEPTH
 
+      scan[:count] += 1
+      return if scan[:count] > MAX_SUBSCHEMAS
+
       schema = schema.transform_keys(&:to_s)
-      found.concat((schema.keys & UNSUPPORTED_KEYWORDS).select { |k| keyword_known?(k, dialect) })
-      each_subschema(schema, dialect) { |sub| collect_unsupported_keywords(sub, found, depth + 1, dialect) }
+      found.concat((schema.keys & UNSUPPORTED_KEYWORDS).select { |k| keyword_known?(k, scan[:dialect]) })
+      each_subschema(schema, scan[:dialect]) { |sub| collect_unsupported_keywords(sub, found, depth + 1, scan) }
     end
 
     # Validate data against a schema. An unusable schema (see
@@ -478,11 +525,11 @@ module MCPClient
 
       # draft-07: "$ref" replaces the schema it appears in; later drafts
       # apply it alongside the sibling keywords.
-      return validate_ref(data, schema['$ref'], path, ctx, ref_depth) if schema.key?('$ref') && ctx.dialect == DRAFT_07
+      return validate_ref(data, schema, path, ctx, ref_depth) if schema.key?('$ref') && ctx.dialect == DRAFT_07
 
       errors = []
       counted_before = ctx.errors
-      errors.concat(validate_ref(data, schema['$ref'], path, ctx, ref_depth)) if schema.key?('$ref')
+      errors.concat(validate_ref(data, schema, path, ctx, ref_depth)) if schema.key?('$ref')
       errors.concat(validate_type(data, schema['type'], path)) if schema.key?('type')
       errors.concat(validate_enum(data, schema, path))
       case data
@@ -535,9 +582,11 @@ module MCPClient
       deadline && Process.clock_gettime(Process::CLOCK_MONOTONIC) >= deadline
     end
 
-    # Apply a local $ref.
+    # Apply the local $ref of a schema object.
+    # @param schema [Hash] the schema object holding the `$ref`
     # @return [Array<String>] validation errors
-    def self.validate_ref(data, ref, path, ctx, ref_depth)
+    def self.validate_ref(data, schema, path, ctx, ref_depth)
+      ref = schema['$ref']
       if !ref.is_a?(String) || external_ref?(ref)
         return count_errors(ctx, ["#{path}: external $ref #{clip(ref.inspect)} is not dereferenced"])
       end
@@ -545,7 +594,7 @@ module MCPClient
         raise Aborted, "$ref chain exceeds #{MAX_REF_DEPTH} hops (cycle?) at #{clip(ref.inspect)}"
       end
 
-      target = resolve_reference(ctx.root, ref, ctx.dialect, ctx)
+      target = resolve_reference(ctx.root, ref, ctx.dialect, ctx, from: schema)
       return count_errors(ctx, ["#{path}: unresolvable local $ref #{clip(ref.inspect)}"]) if target.equal?(UNRESOLVED)
       unless schema_value?(target)
         return count_errors(ctx, ["#{path}: $ref #{clip(ref.inspect)} does not point at a schema"])
