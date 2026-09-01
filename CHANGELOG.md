@@ -54,7 +54,19 @@ metadata). Each feature lands in its own PR; this section accumulates them.
   while one whose acknowledgement was lost is retransmitted first. Task
   results resolved on the streaming path are validated like `call_tool`'s.
   `MCPClient.connect(..., extensions: [...])` forwards the option, and
-  `require 'mcp_client/client'` loads on its own.
+  `require 'mcp_client/client'` loads on its own. A `tasks/update` whose
+  outcome is ambiguous (timeout, transport failure, 5xx, untyped server
+  error) is not the end of the wait: the payload stays pending and goes out
+  again with the next poll, so `call_tool` survives a lost acknowledgement;
+  only a JSON-RPC rejection gives the keys back, and a confirmed update
+  (including one sent through `update_task`) drops any pending payload.
+  `tasks/update` requests are bounded like polls, the caller's deadline is
+  enforced before a late terminal task is accepted and before any new
+  handler round, a later observation with `ttlMs` null lifts the TTL
+  backstop, a timed-out first poll is paced by the created task's
+  `pollIntervalMs`, a completed task's `result` must be an object, the
+  input-round limit is applied atomically with the key reservation, and
+  `list_tasks` errors are sanitized.
 
 ### Cacheable results (`ttlMs` / `cacheScope`)
 

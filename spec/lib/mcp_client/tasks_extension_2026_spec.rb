@@ -1108,11 +1108,10 @@ RSpec.describe 'MCP 2026-07-28 tasks extension — round 6' do
                                 { 'result' => detailed_task(status: 'completed', 'result' => call_result) }])
     task = client.call_tool_as_task('slow', {})
 
-    expect { client.wait_for_task(task) }.to raise_error(MCPClient::Errors::TaskError)
     expect(client.wait_for_task(task)).to be_completed
     expect(handled).to eq(1)
-    # The lost update is delivered again on the next wait, without asking
-    # the handler a second time.
+    # The lost update is delivered again with the next poll of the same
+    # wait, without asking the handler a second time.
     expect(sent.count { |r| r['method'] == 'tasks/update' }).to eq(2)
   end
 
