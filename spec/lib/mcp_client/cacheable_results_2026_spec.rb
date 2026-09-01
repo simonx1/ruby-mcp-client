@@ -389,3 +389,111 @@ RSpec.describe 'MCP 2026-07-28 cacheable results' do
     end
   end
 end
+
+RSpec.describe 'MCP 2026-07-28 cacheable results — round 2' do
+  let(:url) { 'https://example.com/mcp' }
+
+  def json_response(id, result)
+    { status: 200, body: JSON.generate('jsonrpc' => '2.0', 'id' => id, 'result' => result),
+      headers: { 'Content-Type' => 'application/json' } }
+  end
+
+  def discover_result
+    { 'resultType' => 'complete', 'supportedVersions' => ['2026-07-28'], 'capabilities' => { 'tools' => {} } }
+  end
+
+  def tool(name)
+    { 'name' => name, 'inputSchema' => { 'type' => 'object' } }
+  end
+
+  # A stdio server driven by scripted responses (no subprocess).
+  def script_stdio(server, responses)
+    sent = []
+    allow(server).to receive(:connect).and_return(true)
+    allow(server).to receive(:start_reader)
+    allow(server).to receive(:start_stderr_reader)
+    server.instance_variable_set(:@stdin, double('stdin', puts: nil, flush: nil, closed?: true, close: nil))
+    allow(server).to receive(:send_request) { |req| sent << req }
+    allow(server).to receive(:wait_response) do |id, **_opts|
+      responder = responses.shift
+      raise 'no scripted response left' unless responder
+
+      response = responder.respond_to?(:call) ? responder.call(sent.last) : responder
+      response.merge('jsonrpc' => '2.0', 'id' => id)
+    end
+    sent
+  end
+
+  it 'does not serve a stale list when the re-fetch fails with an authorization error' do
+    server = MCPClient::ServerStreamableHTTP.new(base_url: 'https://example.com', endpoint: '/mcp', retries: 0)
+    clock = { now: 1000.0 }
+    allow(server).to receive(:monotonic_now) { clock[:now] }
+    lists = 0
+    stub_request(:post, url).to_return do |request|
+      body = JSON.parse(request.body)
+      if body['method'] == 'tools/list'
+        lists += 1
+        if lists == 1
+          json_response(body['id'], { 'tools' => [tool('t')], 'ttlMs' => 1000, 'cacheScope' => 'public' })
+        else
+          { status: 401, headers: { 'WWW-Authenticate' => 'Bearer realm="mcp"' }, body: '' }
+        end
+      else
+        json_response(body['id'], discover_result)
+      end
+    end
+
+    expect(server.list_tools.size).to eq(1)
+    clock[:now] += 5
+    expect { server.list_tools }.to raise_error(MCPClient::Errors::ConnectionError, /Authorization failed/)
+  ensure
+    server&.cleanup
+  end
+
+  it 'keeps the multi round-trip marker local to the requesting thread' do
+    server = MCPClient::ServerStdio.new(command: 'echo test', read_timeout: 1)
+    server.instance_variable_set(:@protocol_version, '2026-07-28')
+    allow(server).to receive(:sleep)
+    responses = [{ 'resultType' => 'input_required', 'requestState' => 's' }, { 'resultType' => 'complete' }]
+
+    seen_in_thread = nil
+    Thread.new do
+      server.send(:resolve_input_round_trips, 'resources/read', {}) { responses.shift }
+      seen_in_thread = server.send(:last_result_from_round_trip?)
+    end.join
+
+    expect(seen_in_thread).to be(true)
+    expect(server.send(:last_result_from_round_trip?)).to be(false)
+  end
+
+  it 'drops removed items from the client cache when a stale list is refreshed' do
+    server = MCPClient::ServerStdio.new(command: 'echo test', read_timeout: 1)
+    clock = { now: 0.0 }
+    allow(server).to receive(:monotonic_now) { clock[:now] }
+    script_stdio(server, [{ 'result' => discover_result },
+                          { 'result' => { 'tools' => [tool('a'), tool('b')], 'ttlMs' => 60_000 } },
+                          { 'result' => { 'tools' => [tool('a')], 'ttlMs' => 60_000 } }])
+    allow(MCPClient::ServerFactory).to receive(:create).and_return(server)
+    client = MCPClient::Client.new(mcp_server_configs: [{ type: 'stdio', command: 'x' }])
+
+    expect(client.list_tools.map(&:name)).to eq(%w[a b])
+    clock[:now] += 100
+    expect(client.list_tools.map(&:name)).to eq(%w[a])
+    expect(client.list_tools.map(&:name)).to eq(%w[a])
+  end
+
+  it 'expires an auto-paginated list at its earliest page expiry' do
+    server = MCPClient::ServerStdio.new(command: 'echo test', read_timeout: 1)
+    clock = { now: 0.0 }
+    allow(server).to receive(:monotonic_now) { clock[:now] }
+    script_stdio(server, [{ 'result' => discover_result },
+                          { 'result' => { 'tools' => [tool('a')], 'ttlMs' => 1000, 'nextCursor' => 'p2' } },
+                          lambda { |_req|
+                            clock[:now] = 5.0
+                            { 'result' => { 'tools' => [tool('b')], 'ttlMs' => 60_000 } }
+                          }])
+
+    expect(server.list_tools.size).to eq(2)
+    expect(server.cache_fresh?(:tools)).to be(false)
+  end
+end

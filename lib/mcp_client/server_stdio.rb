@@ -424,15 +424,17 @@ module MCPClient
     def list_prompts
       ensure_initialized
       pages = []
+      received_ats = []
       prompts = collect_paginated('prompts') do |cursor|
         params = {}
         params['cursor'] = cursor if cursor
         result = require_complete_result!(rpc_request('prompts/list', params) || {}, 'prompts/list')
         pages << result
+        received_ats << monotonic_now
         prompts = (result['prompts'] || []).map { |td| MCPClient::Prompt.from_json(td, server: self) }
         [prompts, result['nextCursor']]
       end
-      record_list_cache_hint('prompts/list', pages)
+      record_list_cache_hint('prompts/list', pages, received_ats)
       prompts
     rescue MCPClient::Errors::ServerError => e
       # 2026-07-28 protocol errors carry actionable data (requiredCapabilities,
@@ -590,15 +592,17 @@ module MCPClient
     def list_tools
       ensure_initialized
       pages = []
+      received_ats = []
       tools = collect_paginated('tools') do |cursor|
         params = {}
         params['cursor'] = cursor if cursor
         result = require_complete_result!(rpc_request('tools/list', params) || {}, 'tools/list')
         pages << result
+        received_ats << monotonic_now
         tools = (result['tools'] || []).map { |td| MCPClient::Tool.from_json(td, server: self) }
         [tools, result['nextCursor']]
       end
-      record_list_cache_hint('tools/list', pages)
+      record_list_cache_hint('tools/list', pages, received_ats)
       tools
     rescue MCPClient::Errors::ServerError => e
       # 2026-07-28 protocol errors carry actionable data (requiredCapabilities,

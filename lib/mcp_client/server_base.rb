@@ -322,10 +322,12 @@ module MCPClient
     # @raise [MCPClient::Errors::TransportError] if a page result is not a Hash or Array
     def request_paginated_list(method, key)
       pages = []
+      received_ats = []
       items = collect_paginated(key) do |cursor|
         params = cursor ? { cursor: cursor } : {}
         result = require_complete_result!(rpc_request(method, params), method)
         pages << result
+        received_ats << monotonic_now if respond_to?(:monotonic_now, true)
         case result
         when Hash
           [result[key] || [], result['nextCursor']]
@@ -338,7 +340,7 @@ module MCPClient
       end
       # MCP 2026-07-28 caching: every page carries its own ttlMs; the list is
       # fresh only as long as its shortest-lived page.
-      record_list_cache_hint(method, pages) if respond_to?(:record_list_cache_hint, true)
+      record_list_cache_hint(method, pages, received_ats) if respond_to?(:record_list_cache_hint, true)
       items
     end
 
