@@ -558,3 +558,150 @@ RSpec.describe 'MCP 2026-07-28 multi round-trip requests — plain HTTP on a leg
     http.cleanup
   end
 end
+
+# Review round 2 (grok): a URL-mode elicitation only reports consent when
+# the handler explicitly accepted; non-object input request params are
+# malformed; peer text in the client's elicitation logs is sanitized;
+# sampling through the Client and resources/read over HTTP are covered.
+RSpec.describe 'MCP 2026-07-28 multi round-trip requests — round 2' do
+  def discover_result
+    { 'resultType' => 'complete', 'supportedVersions' => ['2026-07-28'], 'capabilities' => { 'tools' => {} } }
+  end
+
+  def script_stdio(server, responses)
+    sent = []
+    allow(server).to receive(:connect).and_return(true)
+    allow(server).to receive(:start_reader)
+    allow(server).to receive(:start_stderr_reader)
+    server.instance_variable_set(:@stdin, double('stdin', puts: nil, flush: nil, closed?: true, close: nil))
+    allow(server).to receive(:send_request) { |req| sent << req }
+    allow(server).to receive(:wait_response) do |id, **_opts|
+      responder = responses.shift or raise 'no scripted response left'
+      responder.merge('jsonrpc' => '2.0', 'id' => id)
+    end
+    allow(server).to receive(:sleep)
+    sent
+  end
+
+  def url_request
+    { 'method' => 'elicitation/create',
+      'params' => { 'mode' => 'url', 'url' => 'https://mcp.example.com/connect', 'message' => 'Authorize' } }
+  end
+
+  def client_with(stdio, **options)
+    allow(MCPClient::ServerFactory).to receive(:create).and_return(stdio)
+    MCPClient::Client.new(mcp_server_configs: [{ type: 'stdio', command: 'x' }], **options)
+  end
+
+  it 'answers a URL-mode elicitation with cancel unless the handler explicitly accepts' do
+    [{ 'name' => 'x' }, 'ok', nil, false, { 'action' => 'decline' }].each do |handler_result|
+      stdio = MCPClient::ServerStdio.new(command: 'echo test', read_timeout: 1)
+      client = client_with(stdio, elicitation_handler: ->(_m, _d) { handler_result })
+      sent = script_stdio(stdio, [{ 'result' => discover_result },
+                                  { 'result' => { 'tools' => [{ 'name' => 'c', 'inputSchema' => {} }] } },
+                                  { 'result' => { 'resultType' => 'input_required', 'requestState' => 'oob',
+                                                  'inputRequests' => { 'auth' => url_request } } },
+                                  { 'result' => { 'content' => [] } }])
+
+      client.call_tool('c', {})
+
+      answer = sent.last['params']['inputResponses']['auth']
+      expected = handler_result == { 'action' => 'decline' } ? 'decline' : 'cancel'
+      expect(answer).to eq({ 'action' => expected }), "handler result #{handler_result.inspect}"
+    end
+  end
+
+  it 'accepts a URL-mode elicitation on an explicit accept or a literal true' do
+    [{ 'action' => 'accept' }, true].each do |handler_result|
+      stdio = MCPClient::ServerStdio.new(command: 'echo test', read_timeout: 1)
+      client = client_with(stdio, elicitation_handler: ->(_m, _d) { handler_result })
+      sent = script_stdio(stdio, [{ 'result' => discover_result },
+                                  { 'result' => { 'tools' => [{ 'name' => 'c', 'inputSchema' => {} }] } },
+                                  { 'result' => { 'resultType' => 'input_required', 'requestState' => 'oob',
+                                                  'inputRequests' => { 'auth' => url_request } } },
+                                  { 'result' => { 'content' => [] } }])
+
+      client.call_tool('c', {})
+
+      expect(sent.last['params']['inputResponses']['auth']).to eq({ 'action' => 'accept' })
+    end
+  end
+
+  it 'treats non-object input request params as malformed' do
+    server = MCPClient::ServerStdio.new(command: 'echo test', read_timeout: 1)
+    server.on_elicitation_request { |_k, _p| { 'action' => 'accept' } }
+    script_stdio(server, [{ 'result' => discover_result },
+                          { 'result' => { 'resultType' => 'input_required',
+                                          'inputRequests' => { 'a' => { 'method' => 'elicitation/create',
+                                                                        'params' => 'not-an-object' } } } }])
+
+    expect { server.call_tool('t', {}) }.to raise_error(MCPClient::Errors::InputRequiredError, /params/)
+  end
+
+  it 'sanitizes the peer-controlled mode and schema text in the client elicitation logs' do
+    output = StringIO.new
+    stdio = MCPClient::ServerStdio.new(command: 'echo test', read_timeout: 1)
+    client = client_with(stdio, logger: Logger.new(output), elicitation_handler: ->(_m, _d) { { 'name' => 'x' } })
+    bad_mode = { 'method' => 'elicitation/create', 'params' => { 'mode' => "form\nWARN forged", 'message' => 'm' } }
+    script_stdio(stdio, [{ 'result' => discover_result },
+                         { 'result' => { 'tools' => [{ 'name' => 'c', 'inputSchema' => {} }] } },
+                         { 'result' => { 'resultType' => 'input_required',
+                                         'inputRequests' => { 'a' => bad_mode } } }])
+
+    expect { client.call_tool('c', {}) }.to raise_error(MCPClient::Errors::InputRequiredError)
+    expect(output.string).not_to include("\nWARN forged")
+  end
+
+  it 'fulfils a sampling input request through the Client sampling handler' do
+    stdio = MCPClient::ServerStdio.new(command: 'echo test', read_timeout: 1)
+    client = client_with(stdio, sampling_handler: lambda { |messages, _prefs, _system, _max|
+      { 'role' => 'assistant',
+        'content' => { 'type' => 'text', 'text' => "echo: #{messages.first['content']['text']}" },
+        'model' => 'm', 'stopReason' => 'endTurn' }
+    })
+    sampling = { 'method' => 'sampling/createMessage',
+                 'params' => { 'messages' => [{ 'role' => 'user', 'content' => { 'type' => 'text', 'text' => 'hi' } }],
+                               'maxTokens' => 10 } }
+    sent = script_stdio(stdio, [{ 'result' => discover_result },
+                                { 'result' => { 'tools' => [{ 'name' => 'c', 'inputSchema' => {} }] } },
+                                { 'result' => { 'resultType' => 'input_required',
+                                                'inputRequests' => { 's' => sampling } } },
+                                { 'result' => { 'content' => [] } }])
+
+    client.call_tool('c', {})
+
+    expect(sent.last['params']['inputResponses']['s']['content']['text']).to eq('echo: hi')
+    expect(sent.last['params']['_meta']['io.modelcontextprotocol/clientCapabilities']).to include('sampling' => {})
+  end
+
+  it 'runs resources/read round trips over Streamable HTTP' do
+    server = MCPClient::ServerStreamableHTTP.new(base_url: 'https://example.com', endpoint: '/mcp', retries: 0)
+    server.on_elicitation_request { |_k, _p| { 'action' => 'accept', 'content' => { 'name' => 'x' } } }
+    requests = []
+    stub_request(:post, 'https://example.com/mcp').to_return do |request|
+      body = JSON.parse(request.body)
+      requests << body
+      result = case body['method']
+               when 'server/discover' then discover_result
+               when 'resources/read'
+                 if body['params'].key?('inputResponses')
+                   { 'contents' => [{ 'uri' => 'file:///r', 'text' => 'ok' }] }
+                 else
+                   { 'resultType' => 'input_required', 'requestState' => 's',
+                     'inputRequests' => { 'a' => { 'method' => 'elicitation/create',
+                                                   'params' => { 'message' => 'm',
+                                                                 'requestedSchema' => { 'type' => 'object' } } } } }
+                 end
+               end
+      { status: 200, body: JSON.generate('jsonrpc' => '2.0', 'id' => body['id'], 'result' => result),
+        headers: { 'Content-Type' => 'application/json' } }
+    end
+
+    expect(server.read_resource('file:///r').first.text).to eq('ok')
+    reads = requests.select { |r| r['method'] == 'resources/read' }
+    expect(reads.size).to eq(2)
+    expect(reads.last['params']['uri']).to eq('file:///r')
+    expect(reads.last['params']['requestState']).to eq('s')
+    server.cleanup
+  end
+end

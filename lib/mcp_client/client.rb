@@ -1289,7 +1289,7 @@ module MCPClient
       # precedes everything else — an undeclared mode is -32602 even when no
       # handler is configured.
       unless SUPPORTED_ELICITATION_MODES.include?(mode)
-        @logger.warn("Rejecting elicitation request with unsupported mode '#{mode}'")
+        @logger.warn("Rejecting elicitation request with unsupported mode '#{sanitize_peer_log_text(mode.to_s)}'")
         return jsonrpc_error_result(-32_602, "Elicitation mode '#{mode}' is not supported")
       end
 
@@ -1341,7 +1341,9 @@ module MCPClient
       # Validate schema if present
       if schema
         schema_errors = ElicitationValidator.validate_schema(schema)
-        @logger.warn("Elicitation schema validation warnings: #{schema_errors.join('; ')}") unless schema_errors.empty?
+        unless schema_errors.empty?
+          @logger.warn("Elicitation schema validation warnings: #{sanitize_peer_log_text(schema_errors.join('; '))}")
+        end
       end
 
       # Call the user-defined handler
@@ -1384,7 +1386,11 @@ module MCPClient
     # @param params [Hash] original request params (for schema validation)
     # @return [Hash] formatted response
     def format_elicitation_response(result, params)
-      response = normalize_elicitation_result(result)
+      response = if (params['mode'] || 'form') == 'url'
+                   normalize_url_elicitation_result(result)
+                 else
+                   normalize_elicitation_result(result)
+                 end
 
       # Per the ElicitResult schema, content is only present when the action
       # is accept and the mode was form; it is omitted for decline/cancel and
@@ -1407,6 +1413,24 @@ module MCPClient
       end
 
       response
+    end
+
+    # A URL-mode elicitation reports the user's consent to open the URL, so
+    # only an explicit answer counts: `true` or an ElicitResult with an
+    # `action` of accept/decline/cancel. Anything else — a bare value, a form
+    # style content hash, nil — is not consent and is answered with cancel.
+    # @param result [Object] handler result
+    # @return [Hash] normalized ElicitResult without content
+    def normalize_url_elicitation_result(result)
+      return { 'action' => 'accept' } if result == true
+
+      action = result.is_a?(Hash) ? (result['action'] || result[:action]) : nil
+      return { 'action' => action.to_s } if %w[accept decline cancel].include?(action.to_s)
+
+      unless result.nil? || result == false
+        @logger.warn('URL-mode elicitation handler gave no explicit action; answering cancel (consent is explicit)')
+      end
+      { 'action' => 'cancel' }
     end
 
     # Normalize a handler's return value into a string-keyed ElicitResult
@@ -1451,7 +1475,7 @@ module MCPClient
       action = result['action']
       return result if %w[accept decline cancel].include?(action)
 
-      @logger.warn("Unknown elicitation action '#{action}', defaulting to accept")
+      @logger.warn("Unknown elicitation action '#{sanitize_peer_log_text(action.to_s)}', defaulting to accept")
       result.merge('action' => 'accept')
     end
 

@@ -879,8 +879,10 @@ module MCPClient
     # @raise [MCPClient::Errors::InputRequiredError]
     def fulfil_input_request(key, request, result)
       shown_key = sanitize_log_text(key.to_s.inspect)
-      unless request.is_a?(Hash) && request['method'].is_a?(String)
-        raise MCPClient::Errors::InputRequiredError.new("Malformed input request #{shown_key}", data: result)
+      unless request.is_a?(Hash) && request['method'].is_a?(String) &&
+             (request['params'].nil? || request['params'].is_a?(Hash))
+        raise MCPClient::Errors::InputRequiredError.new("Malformed input request #{shown_key} (method/params)",
+                                                        data: result)
       end
 
       request_method = request['method']
