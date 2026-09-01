@@ -4,6 +4,7 @@ require 'logger'
 require 'securerandom'
 require_relative 'deep_copy'
 require_relative 'client/list_aggregation'
+require_relative 'deprecations'
 require_relative 'client/task_support'
 require_relative 'client/task_api'
 

@@ -1,6 +1,7 @@
 # frozen_string_literal: true
 
 require 'spec_helper'
+require 'webmock/rspec'
 
 # MCP 2026-07-28 placed Roots, Sampling, Logging, the HTTP+SSE transport, the
 # includeContext values thisServer / allServers and Dynamic Client
@@ -118,6 +119,38 @@ RSpec.describe 'MCP 2026-07-28 deprecations' do
     expect(MCPClient::Deprecations.warn(:roots, logger)).to be(true)
     expect(MCPClient::Deprecations.warn(:roots, logger)).to be(false)
     expect { MCPClient::Deprecations.warn(:bogus, logger) }.to raise_error(ArgumentError, /bogus/)
+  end
+
+  it 'is loaded by the standalone client entry point' do
+    script = "require 'mcp_client/client'; " \
+             'MCPClient::Client.new(mcp_server_configs: [], sampling_handler: ->(*) {}, roots: [], ' \
+             "logger: Logger.new(File::NULL)).log_level = 'debug'"
+    expect(system(RbConfig.ruby, '-Ilib', '-e', script, out: File::NULL, err: File::NULL)).to be(true)
+  end
+
+  it 'logs the Dynamic Client Registration notice once and silences it with the rest' do
+    meta = MCPClient::Auth::ServerMetadata.new(issuer: 'https://auth.example.com',
+                                               authorization_endpoint: 'https://auth.example.com/authorize',
+                                               token_endpoint: 'https://auth.example.com/token',
+                                               registration_endpoint: 'https://auth.example.com/register',
+                                               code_challenge_methods_supported: ['S256'])
+    stub_request(:post, 'https://auth.example.com/register')
+      .to_return(status: 201, headers: { 'Content-Type' => 'application/json' }, body: { client_id: 'dyn' }.to_json)
+    register = lambda do
+      provider = MCPClient::Auth::OAuthProvider.new(server_url: 'https://mcp.example.com/mcp',
+                                                    redirect_uri: 'http://localhost:8080/callback', logger: logger)
+      allow(provider).to receive(:discover_authorization_server).and_return(meta)
+      provider.start_authorization_flow
+    end
+
+    register.call
+    register.call
+    expect(output.string.scan(/Dynamic Client Registration .*deprecated/).size).to eq(1)
+
+    MCPClient::Deprecations.enabled = false
+    output.truncate(0)
+    register.call
+    expect(output.string).not_to match(/deprecated/)
   end
 
   it 'never lets peer-controlled detail forge log lines' do

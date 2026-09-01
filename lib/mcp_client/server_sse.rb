@@ -8,6 +8,7 @@ require 'logger'
 require 'faraday'
 require 'faraday/retry'
 require 'faraday/follow_redirects'
+require_relative 'deprecations'
 
 module MCPClient
   # Implementation of MCP server that communicates via Server-Sent Events (SSE)
