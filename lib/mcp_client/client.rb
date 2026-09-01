@@ -346,7 +346,10 @@ module MCPClient
         unregister_progress_callback(token) if token
       end
 
-      validate_structured_content!(tool, result)
+      # The transport may have refreshed the tool list mid-call (MCP
+      # 2026-07-28 HeaderMismatch recovery); validate against the definition
+      # the call was actually answered under.
+      validate_structured_content!(refreshed_tool(tool) || tool, result)
     end
 
     # Convert MCP tools to OpenAI function specifications
@@ -1109,6 +1112,19 @@ module MCPClient
       end
 
       matching_tools.first
+    end
+
+    # The current cached definition of a tool, when its transport refreshed
+    # the list since it was resolved; nil when unchanged or no longer listed.
+    # @param tool [MCPClient::Tool] the tool as resolved before the call
+    # @return [MCPClient::Tool, nil]
+    def refreshed_tool(tool)
+      return nil unless tool.server && @tool_cache.empty?
+
+      list_tools.find { |t| t.name == tool.name && t.server == tool.server }
+    rescue MCPClient::Errors::MCPError => e
+      @logger.debug("Could not re-resolve tool '#{tool.name}' after a refresh: #{e.message}")
+      nil
     end
 
     # Reject a plain (synchronous) call for a tool whose execution.taskSupport is

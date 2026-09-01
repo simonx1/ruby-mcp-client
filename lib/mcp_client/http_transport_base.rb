@@ -53,6 +53,7 @@ module MCPClient
         method = 'server/discover'
       end
 
+      header_refresh_done = false
       result = with_retry(method) do
         sent_version = protocol_version
         begin
@@ -71,6 +72,19 @@ module MCPClient
           @protocol_version = version
           send_request_and_parse(method, params, timeout)
         end
+      rescue MCPClient::Errors::HeaderMismatchError => e
+        # MCP 2026-07-28 "Custom Headers from Tool Parameters": after a
+        # HeaderMismatch the client SHOULD re-fetch tools/list (the tool's
+        # inputSchema may have changed its x-mcp-header annotations) and
+        # retry the original request once with the appropriate headers. The
+        # server rejected the request before executing it, so the retry
+        # cannot duplicate a side effect.
+        raise unless modern? && method == 'tools/call' && !header_refresh_done
+
+        header_refresh_done = true
+        @logger.warn("#{e.message}; refreshing tools/list and retrying tools/call once")
+        refresh_tools_cache
+        send_request_and_parse(method, params, timeout)
       rescue MCPClient::Errors::ResponseStreamClosedError => e
         # Modern Streamable HTTP has no resumption: "a broken response stream
         # loses the in-flight request; clients MUST re-issue it as a new
@@ -103,7 +117,10 @@ module MCPClient
     def send_request_and_parse(method, params, timeout)
       request_id = @mutex.synchronize { @request_id += 1 }
       request = build_jsonrpc_request(method, params, request_id)
-      send_jsonrpc_request(request, timeout: timeout)
+      # Computed before sending so a value that cannot be mirrored fails the
+      # call locally (ValidationError) rather than mid-request.
+      param_headers = modern? ? mcp_param_headers(request) : {}
+      send_jsonrpc_request(request, timeout: timeout, extra_headers: param_headers)
     rescue MCPClient::Errors::RequestTimeoutError
       # MCP lifecycle: on timeout the sender SHOULD cancel the abandoned
       # request. On modern Streamable HTTP closing the response stream IS the
@@ -498,11 +515,11 @@ module MCPClient
     # @raise [MCPClient::Errors::ConnectionError] if connection fails
     # @raise [MCPClient::Errors::TransportError] if response isn't valid JSON
     # @raise [MCPClient::Errors::ToolCallError] for other errors during request execution
-    def send_jsonrpc_request(request, timeout: nil)
+    def send_jsonrpc_request(request, timeout: nil, extra_headers: {})
       @logger.debug("Sending JSON-RPC request: #{describe_jsonrpc_message(request)}")
 
       begin
-        response = send_http_request(request, timeout: timeout)
+        response = send_http_request(request, timeout: timeout, extra_headers: extra_headers)
         parse_response(response, request)
       rescue MCPClient::Errors::ConnectionError, MCPClient::Errors::TransportError, MCPClient::Errors::ServerError
         raise
@@ -520,7 +537,7 @@ module MCPClient
     # @param request [Hash] the JSON-RPC request
     # @return [Faraday::Response] the HTTP response
     # @raise [MCPClient::Errors::ConnectionError] if connection fails
-    def send_http_request(request, timeout: nil)
+    def send_http_request(request, timeout: nil, extra_headers: {})
       conn = http_connection
       # Capture the session id this request goes out with — the value
       # apply_request_headers attaches — so a later 404 is attributed to the
@@ -532,6 +549,7 @@ module MCPClient
       begin
         response = conn.post(@endpoint) do |req|
           apply_request_headers(req, request)
+          extra_headers.each { |k, v| req.headers[k] = v }
           # Per-request timeout override (MCP lifecycle: timeouts SHOULD be
           # configurable on a per-request basis)
           req.options.timeout = timeout if timeout
@@ -665,6 +683,73 @@ module MCPClient
       return false if sent_session_id.nil?
 
       @mutex.synchronize { !@restarting_session }
+    end
+
+    # The Mcp-Param-* headers for a tools/call request (MCP 2026-07-28
+    # "Custom Headers from Tool Parameters"): the annotated arguments of the
+    # tool, looked up in this transport's tool list (fetched on demand so a
+    # call issued before tools/list still carries them).
+    # @param request [Hash] the JSON-RPC request
+    # @return [Hash{String => String}]
+    # @raise [MCPClient::Errors::ValidationError] when an annotated argument cannot be mirrored
+    def mcp_param_headers(request)
+      return {} unless request['method'] == 'tools/call'
+
+      params = request['params']
+      return {} unless params.is_a?(Hash)
+
+      name = params['name'] || params[:name]
+      tool = known_tools_for_headers.find { |t| t.name == name }
+      return {} unless tool
+
+      MCPClient::HeaderParams.headers_for(tool.schema, params['arguments'] || params[:arguments])
+    end
+
+    # The tool list used for header extraction, fetched on demand. A failed
+    # fetch is not fatal here: the call goes out without Mcp-Param headers
+    # and, if the server needs them, its HeaderMismatch triggers the
+    # refresh-and-retry path.
+    # @return [Array<MCPClient::Tool>]
+    def known_tools_for_headers
+      cached = @mutex.synchronize { @tools }
+      return cached if cached
+
+      list_tools
+    rescue MCPClient::Errors::MCPError => e
+      @logger.warn("Could not fetch tools/list for x-mcp-header extraction: #{e.message}")
+      []
+    end
+
+    # Drop the cached tool list and re-fetch it. Hosts layered above the
+    # transport (MCPClient::Client) keep their own tool cache, so the refresh
+    # is announced the way the server itself would: as a tools/list_changed
+    # notification.
+    # @return [void]
+    def refresh_tools_cache
+      @mutex.synchronize do
+        @tools = nil
+        @tools_data = nil
+      end
+      list_tools
+      @notification_callback&.call('notifications/tools/list_changed', {})
+    end
+
+    # Exclude tool definitions whose x-mcp-header annotations violate the
+    # transport constraints (MCP 2026-07-28: "Rejection means the client
+    # MUST exclude the invalid tool from the result of tools/list"), logging
+    # a warning with the tool name and the reason.
+    # @param tools_data [Array<Hash>] raw tool definitions
+    # @return [Array<Hash>] the acceptable definitions
+    def reject_invalid_header_tools(tools_data)
+      tools_data.reject do |data|
+        schema = data['inputSchema'] || data[:inputSchema] || data['schema'] || data[:schema]
+        errors = MCPClient::HeaderParams.validate_schema(schema)
+        next false if errors.empty?
+
+        name = data['name'] || data[:name]
+        @logger.warn("Rejecting tool #{name.to_s.inspect}: invalid x-mcp-header annotation: #{errors.join('; ')}")
+        true
+      end
     end
 
     # Build the ServerError for a 4xx surfaced as a Faraday::ClientError by

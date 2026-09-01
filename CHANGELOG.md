@@ -5,6 +5,27 @@
 Groundwork for the 2026-07-28 protocol revision (stateless, per-request
 metadata). Each feature lands in its own PR; this section accumulates them.
 
+### Custom headers from tool parameters (`x-mcp-header`)
+
+- **`Mcp-Param-{name}` headers.** On a modern Streamable HTTP (or plain HTTP)
+  session, arguments of tool parameters annotated with `x-mcp-header` are
+  mirrored into request headers on `tools/call`: strings as-is (Base64
+  sentinel when not header-safe), integers in decimal, booleans lowercase;
+  absent or null arguments produce no header. The tool list is fetched on
+  demand when a tool is called before `tools/list`. An argument that cannot
+  be mirrored (a float, an object, an integer outside the IEEE754 safe
+  range) fails the call locally with `ValidationError`.
+- **Invalid annotations reject the tool.** A definition whose `x-mcp-header`
+  is empty, not an HTTP field-name token, not case-insensitively unique, on a
+  non-primitive property, or not statically reachable through `properties`
+  keys alone (inside `items`, composition/conditional keywords, `$defs`, a
+  `$ref` target or at the root) is excluded from `tools/list` with a warning
+  naming the tool. `MCPClient::HeaderParams` exposes the validation and
+  extraction (`validate_schema`, `annotations`, `headers_for`).
+- **HeaderMismatch recovery.** A `-32020` rejection of `tools/call` triggers
+  one `tools/list` refresh and a single retry with recomputed headers.
+- stdio ignores the annotation entirely, as the spec allows.
+
 ### Streamable HTTP modern mode (no sessions, request metadata headers)
 
 - **Era detection over HTTP** (Streamable HTTP "Backward Compatibility").
