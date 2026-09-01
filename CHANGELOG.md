@@ -39,9 +39,16 @@ metadata). Each feature lands in its own PR; this section accumulates them.
   `client_id_issued_at`, else `pre_registered`), and Client ID Metadata
   Document client ids stay portable. Authorization server metadata whose
   `issuer` is not the identifier it was fetched for is rejected (RFC 8414
-  Section 3.3). Error responses are `state`-bound and their description is
-  sanitized; `client_metadata[:application_type]` counts as the explicit
-  application type.
+  Section 3.3, byte for byte). Error responses are `state`-bound and their
+  description is sanitized; `client_metadata[:application_type]` counts as
+  the explicit application type. The `iss` advertisement of the request's
+  authorization server is recorded with the PKCE record and decides how a
+  response without `iss` is treated; credentials stored without a binding
+  are bound to the authorization server they were stored under (a Client ID
+  Metadata Document client is recognized by its client id); a token that
+  records no issuer is never refreshed once the authorization server
+  changed, and a 401 challenge naming another authorization server retires
+  the stored token at once.
 
 ### Tasks extension (`io.modelcontextprotocol/tasks`)
 
