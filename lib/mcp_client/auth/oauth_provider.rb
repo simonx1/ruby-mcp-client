@@ -180,7 +180,7 @@ module MCPClient
 
         # Get stored PKCE and client info
         pkce = stored_pkce
-        client_info = storage.get_client_info(server_url)
+        client_info = stored_client_info
         raise MCPClient::Errors::ConnectionError, 'Missing PKCE or client info' unless pkce && client_info
 
         # The code is redeemed only at the authorization server the request
@@ -652,11 +652,19 @@ module MCPClient
         token = stored_token
         delete_token(bind_to: Token::RETIRED_ISSUER) if token.respond_to?(:issuer) && token.issuer.nil?
 
-        client_info = storage.get_client_info(server_url)
+        client_info = stored_client_info
         return unless client_info.respond_to?(:issuer) && client_info.issuer.nil?
         return if portable_client?(client_info) || resolved_registration_type(client_info) != 'dynamic'
 
         logger.debug('Discarding a dynamic OAuth client registration whose authorization server is unknown')
+        # Stamped as retired first, so a backend that cannot delete still
+        # leaves a record no authorization server matches.
+        begin
+          storage.set_client_info(server_url, client_info.with_issuer(Token::RETIRED_ISSUER,
+                                                                      registration_type: 'dynamic'))
+        rescue StandardError => e
+          logger.debug("The stale OAuth client registration could not be re-stored as retired (#{e.class})")
+        end
         delete_client_info
       end
 
@@ -680,7 +688,7 @@ module MCPClient
         # discarded so the next flow re-registers.
         @authorization_server_switched = true
         delete_token(bind_to: previous.issuer)
-        client_info = storage.get_client_info(server_url)
+        client_info = stored_client_info
         if client_info.respond_to?(:issuer) && client_info.issuer.nil? && !portable_client?(client_info)
           client_info = client_info.with_issuer(previous.issuer,
                                                 registration_type: resolved_registration_type(client_info))
@@ -1078,7 +1086,7 @@ module MCPClient
       def get_or_register_client(server_metadata)
         # 1. Pre-registered or previously registered client info from storage,
         # provided it belongs to the authorization server in use.
-        if (client_info = storage.get_client_info(server_url)) && !client_info.client_secret_expired?
+        if (client_info = stored_client_info) && !client_info.client_secret_expired?
           bound = client_info_for_issuer(client_info, server_metadata.issuer, server_metadata)
           if bound
             logger.debug("Using cached OAuth client for #{server_url}")
@@ -1189,6 +1197,11 @@ module MCPClient
       # @return [ServerMetadata, nil]
       def stored_server_metadata
         normalize_record(storage.get_server_metadata(server_url), ServerMetadata) || @discovered_server_metadata
+      end
+
+      # @return [ClientInfo, nil]
+      def stored_client_info
+        normalize_record(storage.get_client_info(server_url), ClientInfo)
       end
 
       # @return [PKCE, nil]
@@ -1618,7 +1631,7 @@ module MCPClient
         logger.debug('Refreshing access token')
 
         server_metadata = discover_authorization_server
-        client_info = storage.get_client_info(server_url)
+        client_info = stored_client_info
 
         return nil unless server_metadata && client_info
         return nil unless refresh_permitted?(token, client_info, server_metadata)
