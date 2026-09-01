@@ -71,7 +71,11 @@ metadata). Each feature lands in its own PR; this section accumulates them.
   success callback before anything is shown, and `BrowserOAuth` answers a
   rejected callback with the error page instead of "successful"; loopback
   redirect URIs are recognized semantically (`127.0.0.0/8`, `::1` in any
-  spelling, `localhost`) for the `application_type`.
+  spelling, `localhost`) for the `application_type`. A retired dynamic
+  registration is stamped as retired before it is deleted, so a backend
+  that cannot delete never lets it be adopted for the server discovery
+  finds; serialized `ClientInfo` records are read back through `from_h`
+  like every other record.
 
 ### Tasks extension (`io.modelcontextprotocol/tasks`)
 
