@@ -775,6 +775,13 @@ module MCPClient
     # Servers MAY keep asking, but an unbounded loop is a hostile server.
     MAX_INPUT_ROUND_TRIPS = 10
 
+    # Pause before retrying an InputRequiredResult that asked for nothing
+    # (requestState only — e.g. a URL-mode elicitation still in progress out
+    # of band). The client MAY retry immediately, but a tight loop would just
+    # burn the round-trip budget; doubles up to the maximum.
+    INPUT_RETRY_DELAY = 0.5
+    INPUT_RETRY_MAX_DELAY = 5
+
     # Input request methods and the transport callback that fulfils each.
     INPUT_REQUEST_HANDLERS = {
       'elicitation/create' => :@elicitation_request_callback,
@@ -800,10 +807,12 @@ module MCPClient
     def resolve_input_round_trips(method, params, _timeout = nil)
       result = yield(params)
       round_trips = 0
+      delay = INPUT_RETRY_DELAY
       while MCPClient::JsonRpcCommon.result_type(result) == 'input_required'
-        unless MRTR_METHODS.include?(method)
+        unless modern? && MRTR_METHODS.include?(method)
           raise MCPClient::Errors::InvalidResultError,
-                "Invalid result: input_required is only valid for #{MRTR_METHODS.join(', ')}, not #{method}"
+                "Invalid result: input_required is only valid for #{MRTR_METHODS.join(', ')} " \
+                "on an MCP 2026-07-28 server, not #{method} (#{protocol_version})"
         end
 
         round_trips += 1
@@ -814,7 +823,12 @@ module MCPClient
         end
 
         @logger.debug("#{method} requires input (round trip #{round_trips}); fulfilling and retrying")
-        result = yield(retry_params_for(params, result))
+        retry_params = retry_params_for(params, result)
+        unless retry_params.key?('inputResponses')
+          sleep(delay)
+          delay = [delay * 2, INPUT_RETRY_MAX_DELAY].min
+        end
+        result = yield(retry_params)
       end
       result
     end
@@ -832,8 +846,9 @@ module MCPClient
       retry_params.delete('requestState')
       retry_params.delete(:requestState)
 
-      input_requests = result['inputRequests']
-      retry_params['inputResponses'] = fulfil_input_requests(input_requests, result) unless input_requests.nil?
+      if result.key?('inputRequests')
+        retry_params['inputResponses'] = fulfil_input_requests(result['inputRequests'], result)
+      end
       state = result['requestState']
       retry_params['requestState'] = state unless state.nil?
       retry_params
@@ -863,35 +878,45 @@ module MCPClient
     # @return [Hash] the handler's result
     # @raise [MCPClient::Errors::InputRequiredError]
     def fulfil_input_request(key, request, result)
+      shown_key = sanitize_log_text(key.to_s.inspect)
       unless request.is_a?(Hash) && request['method'].is_a?(String)
-        raise MCPClient::Errors::InputRequiredError.new("Malformed input request #{key.inspect}", data: result)
+        raise MCPClient::Errors::InputRequiredError.new("Malformed input request #{shown_key}", data: result)
       end
 
       request_method = request['method']
+      shown_method = sanitize_log_text(request_method.inspect)
       handler_ivar = INPUT_REQUEST_HANDLERS[request_method]
       unless handler_ivar
         raise MCPClient::Errors::InputRequiredError.new(
-          "Unsupported input request method #{request_method.inspect} for key #{key.inspect}", data: result
+          "Unsupported input request method #{shown_method} for key #{shown_key}", data: result
         )
       end
       unless registered_callback?(handler_ivar)
         raise MCPClient::Errors::InputRequiredError.new(
-          "Server requested #{request_method} (key #{key.inspect}) but no handler is registered for it " \
+          "Server requested #{shown_method} (key #{shown_key}) but no handler is registered for it " \
           '(the capability was not declared)', data: result
         )
       end
 
-      response = instance_variable_get(handler_ivar).call(key, request['params'] || {})
+      begin
+        response = instance_variable_get(handler_ivar).call(key, request['params'] || {})
+      rescue StandardError => e
+        # The exception text is host-internal; it stays in the local log.
+        @logger.error("Handler for #{shown_method} (key #{shown_key}) raised: #{e.message}")
+        raise MCPClient::Errors::InputRequiredError.new(
+          "Handler for #{shown_method} (key #{shown_key}) failed", data: result
+        )
+      end
       unless response.is_a?(Hash)
         raise MCPClient::Errors::InputRequiredError.new(
-          "Handler for #{request_method} (key #{key.inspect}) returned #{response.class}, expected a result object",
+          "Handler for #{shown_method} (key #{shown_key}) returned #{response.class}, expected a result object",
           data: result
         )
       end
       if (error = response['error'] || response[:error])
         message = error.is_a?(Hash) ? (error['message'] || error[:message]) : error
         raise MCPClient::Errors::InputRequiredError.new(
-          "Handler for #{request_method} (key #{key.inspect}) failed: #{message}", data: result
+          "Handler for #{shown_method} (key #{shown_key}) failed: #{sanitize_log_text(message)}", data: result
         )
       end
 

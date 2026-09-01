@@ -333,3 +333,200 @@ end
 RSpec::Matchers.define :equal_string do |expected|
   match { |actual| actual.is_a?(String) && actual == expected && actual.encoding == expected.encoding }
 end
+
+# Review (codex): round-trip params survive transport-level recovery of an
+# attempt; handler exceptions become InputRequiredError; an explicit null
+# inputRequests is malformed; input_required from a legacy session is
+# rejected; the plain HTTP transport exposes the handlers.
+RSpec.describe 'MCP 2026-07-28 multi round-trip requests — review follow-ups' do
+  def discover_result
+    { 'resultType' => 'complete', 'supportedVersions' => ['2026-07-28'], 'capabilities' => { 'tools' => {} } }
+  end
+
+  def elicit_request
+    { 'method' => 'elicitation/create',
+      'params' => { 'mode' => 'form', 'message' => 'name?',
+                    'requestedSchema' => { 'type' => 'object', 'properties' => {} } } }
+  end
+
+  def script_stdio(server, responses)
+    sent = []
+    allow(server).to receive(:connect).and_return(true)
+    allow(server).to receive(:start_reader)
+    allow(server).to receive(:start_stderr_reader)
+    server.instance_variable_set(:@stdin, double('stdin', puts: nil, flush: nil, closed?: true, close: nil))
+    allow(server).to receive(:send_request) { |req| sent << req }
+    allow(server).to receive(:wait_response) do |id, **_opts|
+      responder = responses.shift
+      raise 'no scripted response left' unless responder
+
+      response = responder.respond_to?(:call) ? responder.call(sent.last) : responder
+      raise response if response.is_a?(Exception)
+
+      response.merge('jsonrpc' => '2.0', 'id' => id)
+    end
+    sent
+  end
+
+  let(:server) { MCPClient::ServerStdio.new(command: 'echo test', read_timeout: 1, retries: 1, retry_backoff: 0) }
+
+  it 'wraps a handler exception as InputRequiredError' do
+    server.on_elicitation_request { |_k, _p| raise 'boom' }
+    sent = script_stdio(server, [{ 'result' => discover_result },
+                                 { 'result' => { 'resultType' => 'input_required',
+                                                 'inputRequests' => { 'a' => elicit_request } } }])
+
+    expect { server.call_tool('t', {}) }.to raise_error(MCPClient::Errors::InputRequiredError, %r{elicitation/create})
+    expect(sent.count { |r| r['method'] == 'tools/call' }).to eq(1)
+  end
+
+  it 'treats an explicit null inputRequests as malformed' do
+    script_stdio(server, [{ 'result' => discover_result },
+                          { 'result' => { 'resultType' => 'input_required', 'inputRequests' => nil,
+                                          'requestState' => 's' } }])
+
+    expect { server.call_tool('t', {}) }.to raise_error(MCPClient::Errors::InputRequiredError, /inputRequests/)
+  end
+
+  it 'keeps the round-trip params when a retry attempt is recovered at the transport level' do
+    server.on_elicitation_request { |_k, _p| { 'action' => 'accept', 'content' => {} } }
+    sent = script_stdio(server, [{ 'result' => discover_result },
+                                 { 'result' => { 'resultType' => 'input_required', 'requestState' => 'st',
+                                                 'inputRequests' => { 'a' => elicit_request } } },
+                                 MCPClient::Errors::TransportError.new('flaky pipe'),
+                                 { 'result' => { 'tools' => [] } }])
+
+    server.rpc_request('resources/read', { 'uri' => 'file:///x' })
+
+    reads = sent.select { |r| r['method'] == 'resources/read' }
+    expect(reads.size).to eq(3)
+    expect(reads[1]['params']['requestState']).to eq('st')
+    expect(reads[2]['params']['requestState']).to eq('st')
+    expect(reads[2]['params']['inputResponses']).to eq({ 'a' => { 'action' => 'accept', 'content' => {} } })
+  end
+
+  it 'rejects input_required from a legacy session' do
+    legacy = MCPClient::ServerStdio.new(command: 'echo test', protocol: :legacy)
+    sent = script_stdio(legacy, [{ 'result' => { 'protocolVersion' => '2025-11-25', 'capabilities' => {} } },
+                                 { 'result' => { 'resultType' => 'input_required', 'requestState' => 's' } }])
+
+    expect { legacy.call_tool('t', {}) }.to raise_error(MCPClient::Errors::InvalidResultError, /input_required/)
+    expect(sent.count { |r| r['method'] == 'tools/call' }).to eq(1)
+  end
+
+  it 'exposes the handlers on the plain HTTP transport and declares the capabilities' do
+    http = MCPClient::ServerHTTP.new(base_url: 'https://example.com', endpoint: '/mcp', retries: 0)
+    expect(http).to respond_to(:on_elicitation_request, :on_roots_list_request, :on_sampling_request)
+    http.on_elicitation_request { |_k, _p| { 'action' => 'accept', 'content' => { 'name' => 'x' } } }
+    http.on_roots_list_request { |_k, _p| { 'roots' => [] } }
+    requests = []
+    stub_request(:post, 'https://example.com/mcp').to_return do |request|
+      body = JSON.parse(request.body)
+      requests << body
+      result = case body['method']
+               when 'server/discover' then discover_result
+               when 'tools/list' then { 'tools' => [] }
+               when 'tools/call'
+                 if body['params'].key?('inputResponses')
+                   { 'content' => [] }
+                 else
+                   { 'resultType' => 'input_required', 'inputRequests' => { 'a' => elicit_request } }
+                 end
+               end
+      { status: 200, body: JSON.generate('jsonrpc' => '2.0', 'id' => body['id'], 'result' => result),
+        headers: { 'Content-Type' => 'application/json' } }
+    end
+
+    expect(http.call_tool('t', {})).to eq({ 'content' => [] })
+    caps = requests.last['params']['_meta']['io.modelcontextprotocol/clientCapabilities']
+    expect(caps).to include('elicitation' => { 'form' => {}, 'url' => {} }, 'roots' => {})
+    expect(requests.last['params']['inputResponses']).to eq({ 'a' => { 'action' => 'accept',
+                                                                       'content' => { 'name' => 'x' } } })
+    http.cleanup
+  end
+
+  it 'lets MCPClient::Client wire its handlers to a plain HTTP server' do
+    http = MCPClient::ServerHTTP.new(base_url: 'https://example.com', endpoint: '/mcp', retries: 0)
+    allow(MCPClient::ServerFactory).to receive(:create).and_return(http)
+    client = MCPClient::Client.new(mcp_server_configs: [{ type: 'http', base_url: 'x' }],
+                                   elicitation_handler: ->(_m, _s) { { 'name' => 'x' } })
+    expect(http.instance_variable_get(:@elicitation_request_callback)).not_to be_nil
+    expect(http.instance_variable_get(:@roots_list_request_callback)).not_to be_nil
+    client.cleanup
+  end
+end
+
+RSpec.describe 'MCP 2026-07-28 multi round-trip requests — pacing and URL mode' do
+  def discover_result
+    { 'resultType' => 'complete', 'supportedVersions' => ['2026-07-28'], 'capabilities' => { 'tools' => {} } }
+  end
+
+  def script_stdio(server, responses)
+    sent = []
+    allow(server).to receive(:connect).and_return(true)
+    allow(server).to receive(:start_reader)
+    allow(server).to receive(:start_stderr_reader)
+    server.instance_variable_set(:@stdin, double('stdin', puts: nil, flush: nil, closed?: true, close: nil))
+    allow(server).to receive(:send_request) { |req| sent << req }
+    allow(server).to receive(:wait_response) do |id, **_opts|
+      responder = responses.shift or raise 'no scripted response left'
+      responder.merge('jsonrpc' => '2.0', 'id' => id)
+    end
+    sent
+  end
+
+  it 'paces retries of requestState-only answers with a growing delay' do
+    server = MCPClient::ServerStdio.new(command: 'echo test', read_timeout: 1)
+    delays = []
+    allow(server).to receive(:sleep) { |d| delays << d }
+    script_stdio(server, [{ 'result' => discover_result },
+                          { 'result' => { 'resultType' => 'input_required', 'requestState' => 's1' } },
+                          { 'result' => { 'resultType' => 'input_required', 'requestState' => 's2' } },
+                          { 'result' => { 'resultType' => 'input_required', 'requestState' => 's3' } },
+                          { 'result' => { 'content' => [] } }])
+
+    server.call_tool('t', {})
+
+    expect(delays).to eq([0.5, 1.0, 2.0])
+  end
+
+  it 'does not pace retries that carry fulfilled input responses' do
+    server = MCPClient::ServerStdio.new(command: 'echo test', read_timeout: 1)
+    server.on_elicitation_request { |_k, _p| { 'action' => 'accept', 'content' => {} } }
+    expect(server).not_to receive(:sleep)
+    request = { 'method' => 'elicitation/create',
+                'params' => { 'message' => 'x', 'requestedSchema' => { 'type' => 'object' } } }
+    script_stdio(server, [{ 'result' => discover_result },
+                          { 'result' => { 'resultType' => 'input_required', 'inputRequests' => { 'a' => request } } },
+                          { 'result' => { 'content' => [] } }])
+
+    server.call_tool('t', {})
+  end
+
+  it 'routes a URL-mode elicitation through the Client handler and answers with a bare accept' do
+    stdio = MCPClient::ServerStdio.new(command: 'echo test', read_timeout: 1)
+    allow(MCPClient::ServerFactory).to receive(:create).and_return(stdio)
+    seen = nil
+    client = MCPClient::Client.new(mcp_server_configs: [{ type: 'stdio', command: 'x' }],
+                                   elicitation_handler: lambda { |message, details|
+                                     seen = [message, details]
+                                     { 'action' => 'accept' }
+                                   })
+    url_request = { 'method' => 'elicitation/create',
+                    'params' => { 'mode' => 'url', 'url' => 'https://mcp.example.com/connect', 'message' => 'Authorize' } }
+    sent = script_stdio(stdio, [{ 'result' => discover_result },
+                                { 'result' => { 'tools' => [{ 'name' => 'connect',
+                                                              'inputSchema' => { 'type' => 'object' } }] } },
+                                { 'result' => { 'resultType' => 'input_required', 'requestState' => 'oob',
+                                                'inputRequests' => { 'auth' => url_request } } },
+                                { 'result' => { 'content' => [] } }])
+    allow(stdio).to receive(:sleep)
+
+    client.call_tool('connect', {})
+
+    expect(seen.first).to eq('Authorize')
+    expect(seen.last).to include('mode' => 'url', 'url' => 'https://mcp.example.com/connect')
+    expect(sent.last['params']['inputResponses']).to eq({ 'auth' => { 'action' => 'accept' } })
+    expect(sent.last['params']['requestState']).to eq('oob')
+  end
+end

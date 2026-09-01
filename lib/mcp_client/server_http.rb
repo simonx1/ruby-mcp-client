@@ -116,6 +116,9 @@ module MCPClient
       @http_conn = nil
       @session_id = nil
       @oauth_provider = opts[:oauth_provider]
+      @elicitation_request_callback = nil # MCP 2026-07-28 multi round-trip requests
+      @roots_list_request_callback = nil
+      @sampling_request_callback = nil
     end
 
     # Connect to the MCP server over HTTP
@@ -448,6 +451,29 @@ module MCPClient
       Enumerator.new do |yielder|
         yielder << call_tool(tool_name, parameters)
       end
+    end
+
+    # Register a handler for elicitation input requests (MCP 2026-07-28 multi
+    # round-trip requests; there is no server-initiated request channel on
+    # this transport, so these only serve InputRequiredResult round trips).
+    # @param block [Proc] callback that receives (key, params) and returns an ElicitResult
+    # @return [void]
+    def on_elicitation_request(&block)
+      @elicitation_request_callback = block
+    end
+
+    # Register a handler for roots/list input requests (MCP 2026-07-28).
+    # @param block [Proc] callback that receives (key, params) and returns a ListRootsResult
+    # @return [void]
+    def on_roots_list_request(&block)
+      @roots_list_request_callback = block
+    end
+
+    # Register a handler for sampling input requests (MCP 2026-07-28).
+    # @param block [Proc] callback that receives (key, params) and returns a CreateMessageResult
+    # @return [void]
+    def on_sampling_request(&block)
+      @sampling_request_callback = block
     end
 
     # Terminate the current session (if any)

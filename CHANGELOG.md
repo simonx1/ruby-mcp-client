@@ -20,6 +20,14 @@ metadata). Each feature lands in its own PR; this section accumulates them.
 - **Capabilities.** Modern requests once again declare `elicitation`
   (`form` and `url`), `roots` (without `listChanged`) and `sampling` (with
   `tools` when opted in) when the corresponding handler is registered.
+- **Recovery keeps the round trip.** Transport-level recovery of an attempt
+  (retries, version renegotiation, the HeaderMismatch refresh, a re-issued
+  stream) re-sends the attempt's own `inputResponses`/`requestState`. An
+  answer that carries only `requestState` (an out-of-band interaction still
+  in progress) is retried with a growing pause (0.5 s doubling to 5 s) rather
+  than in a tight loop. The plain HTTP transport now accepts the elicitation,
+  roots and sampling handlers so `MCPClient::Client` can serve round trips on
+  it too.
 - **Limits and errors.** More than 10 consecutive `input_required` answers,
   an input request this client cannot honour (unknown method, no handler,
   handler error) or a malformed `inputRequests` raise
