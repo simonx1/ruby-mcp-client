@@ -71,6 +71,21 @@ module MCPClient
       end
     end
 
+    # Maximum characters of peer-supplied text written to the host log.
+    MAX_PEER_LOG_TEXT_LENGTH = 4096
+
+    # Make peer-supplied text safe to write to the host log: control
+    # characters (notably newlines, which would let a server forge log
+    # entries) are escaped and the result is capped.
+    # @param text [Object] peer-supplied text
+    # @return [String] sanitized, length-bounded text
+    def sanitize_log_text(text)
+      escaped = text.to_s.gsub(/[\x00-\x1F\x7F]/) { |c| format('\\x%02X', c.ord) }
+      return escaped if escaped.length <= MAX_PEER_LOG_TEXT_LENGTH
+
+      "#{escaped[0, MAX_PEER_LOG_TEXT_LENGTH]}... (truncated from #{escaped.length} chars)"
+    end
+
     # A log-safe description of a JSON-RPC message: its method and id only.
     #
     # Params and results are deliberately omitted. tools/call arguments and

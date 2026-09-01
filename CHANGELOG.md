@@ -23,7 +23,15 @@ metadata). Each feature lands in its own PR; this section accumulates them.
   naming the tool. `MCPClient::HeaderParams` exposes the validation and
   extraction (`validate_schema`, `annotations`, `headers_for`).
 - **HeaderMismatch recovery.** A `-32020` rejection of `tools/call` triggers
-  one `tools/list` refresh and a single retry with recomputed headers.
+  one `tools/list` refresh and a single retry with recomputed headers; the
+  refresh is announced upward as a `tools/list_changed` notification so the
+  client-level cache and the in-flight structured-content validation use
+  the new definition, and a refresh that fails keeps the original rejection.
+  Transport list caches now follow `list_changed` notifications, and a
+  refresh cannot be overwritten by a stale concurrent fetch.
+- Mirroring is a MUST: a call whose tool definition cannot be fetched fails
+  rather than going out without headers. Instance data inside a schema
+  (`default`, `examples`, `enum`, `const`) is never treated as an annotation.
 - stdio ignores the annotation entirely, as the spec allows.
 
 ### Streamable HTTP modern mode (no sessions, request metadata headers)

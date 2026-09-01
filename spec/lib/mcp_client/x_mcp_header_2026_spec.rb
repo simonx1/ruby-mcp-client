@@ -439,7 +439,8 @@ RSpec.describe 'MCP 2026-07-28 x-mcp-header — review follow-ups' do
         body = JSON.parse(request.body)
         result = case body['method']
                  when 'server/discover'
-                   { 'resultType' => 'complete', 'supportedVersions' => ['2026-07-28'], 'capabilities' => { 'tools' => {} } }
+                   { 'resultType' => 'complete', 'supportedVersions' => ['2026-07-28'],
+                     'capabilities' => { 'tools' => {} } }
                  when 'tools/list'
                    { 'tools' => [{ 'name' => 'execute_sql',
                                    'inputSchema' => { 'type' => 'object',
@@ -473,5 +474,150 @@ RSpec.describe 'MCP 2026-07-28 x-mcp-header — review follow-ups' do
       expect(client.list_tools.first.schema['properties']['region']['x-mcp-header']).to eq('Zone')
       client.cleanup
     end
+  end
+end
+
+# Review (grok): mirroring is a MUST, so a call whose tool definition cannot
+# be loaded fails instead of going out without headers; the transport tool
+# cache follows list_changed notifications; a refresh failure keeps the
+# HeaderMismatch; concurrent refreshes cannot restore a stale list; peer
+# text in the new log lines is sanitized.
+RSpec.describe 'MCP 2026-07-28 x-mcp-header — hardening' do
+  let(:url) { 'https://example.com/mcp' }
+  let(:log_output) { StringIO.new }
+  let(:server) do
+    MCPClient::ServerStreamableHTTP.new(base_url: 'https://example.com', endpoint: '/mcp', retries: 0,
+                                        logger: Logger.new(log_output))
+  end
+
+  after { server.cleanup }
+
+  def json_response(id, result)
+    { status: 200, body: JSON.generate('jsonrpc' => '2.0', 'id' => id, 'result' => result),
+      headers: { 'Content-Type' => 'application/json' } }
+  end
+
+  def discover_result
+    { 'resultType' => 'complete', 'supportedVersions' => ['2026-07-28'], 'capabilities' => { 'tools' => {} } }
+  end
+
+  def tool(header)
+    { 'name' => 'execute_sql', 'inputSchema' => { 'type' => 'object',
+                                                  'properties' => { 'region' => { 'type' => 'string',
+                                                                                  'x-mcp-header' => header } } } }
+  end
+
+  def mismatch(id)
+    { status: 400, headers: { 'Content-Type' => 'application/json' },
+      body: JSON.generate('jsonrpc' => '2.0', 'id' => id,
+                          'error' => { 'code' => -32_020, 'message' => "Header mismatch\nWARN forged line" }) }
+  end
+
+  it 'fails the call when the tool list needed for header extraction cannot be fetched' do
+    requests = []
+    stub_request(:post, url).to_return do |request|
+      body = JSON.parse(request.body)
+      requests << body['method']
+      case body['method']
+      when 'server/discover' then json_response(body['id'], discover_result)
+      when 'tools/list' then { status: 503, body: '' }
+      else json_response(body['id'], { 'content' => [] })
+      end
+    end
+
+    expect { server.call_tool('execute_sql', { 'region' => 'eu' }) }.to raise_error(MCPClient::Errors::MCPError)
+    expect(requests).not_to include('tools/call')
+  end
+
+  it 'drops the transport tool cache on notifications/tools/list_changed' do
+    header = 'Region'
+    stub_request(:post, url).to_return do |request|
+      body = JSON.parse(request.body)
+      case body['method']
+      when 'server/discover' then json_response(body['id'], discover_result)
+      when 'tools/list' then json_response(body['id'], { 'tools' => [tool(header)] })
+      else json_response(body['id'], { 'content' => [] })
+      end
+    end
+
+    expect(server.list_tools.first.schema['properties']['region']['x-mcp-header']).to eq('Region')
+    header = 'Zone'
+    server.send(:dispatch_server_message, { 'jsonrpc' => '2.0', 'method' => 'notifications/tools/list_changed' })
+
+    expect(server.list_tools.first.schema['properties']['region']['x-mcp-header']).to eq('Zone')
+  end
+
+  it 'keeps the HeaderMismatch error when the refresh itself fails' do
+    lists = 0
+    stub_request(:post, url).to_return do |request|
+      body = JSON.parse(request.body)
+      case body['method']
+      when 'server/discover' then json_response(body['id'], discover_result)
+      when 'tools/list'
+        lists += 1
+        lists == 1 ? json_response(body['id'], { 'tools' => [tool('Region')] }) : { status: 503, body: '' }
+      else mismatch(body['id'])
+      end
+    end
+
+    expect { server.call_tool('execute_sql', { 'region' => 'eu' }) }
+      .to raise_error(MCPClient::Errors::HeaderMismatchError)
+  end
+
+  it 'sanitizes peer-controlled text in the refresh warning' do
+    stub_request(:post, url).to_return do |request|
+      body = JSON.parse(request.body)
+      case body['method']
+      when 'server/discover' then json_response(body['id'], discover_result)
+      when 'tools/list' then json_response(body['id'], { 'tools' => [tool('Region')] })
+      else mismatch(body['id'])
+      end
+    end
+
+    expect { server.call_tool('execute_sql', { 'region' => 'eu' }) }.to raise_error(MCPClient::Errors::HeaderMismatchError)
+    expect(log_output.string).not_to include("\nWARN forged line")
+    expect(log_output.string).to include('\\x0AWARN forged line')
+  end
+
+  it 'sanitizes property names in the rejection warning' do
+    stub_request(:post, url).to_return do |request|
+      body = JSON.parse(request.body)
+      case body['method']
+      when 'server/discover' then json_response(body['id'], discover_result)
+      else
+        json_response(body['id'], { 'tools' => [{ 'name' => 'bad', 'inputSchema' => {
+                        'type' => 'object', 'properties' => { "a\nWARN forged" => { 'type' => 'number',
+                                                                                    'x-mcp-header' => 'A' } }
+                      } }] })
+      end
+    end
+
+    server.list_tools
+
+    expect(log_output.string).not_to include("\nWARN forged")
+  end
+
+  it 'does not let a concurrent stale list_tools overwrite a refreshed tool list' do
+    header = 'Region'
+    stub_request(:post, url).to_return do |request|
+      body = JSON.parse(request.body)
+      case body['method']
+      when 'server/discover' then json_response(body['id'], discover_result)
+      when 'tools/list'
+        current = header
+        sleep 0.05 if current == 'Region' # the stale fetch is slow
+        json_response(body['id'], { 'tools' => [tool(current)] })
+      else json_response(body['id'], { 'content' => [] })
+      end
+    end
+    server.connect
+
+    stale = Thread.new { server.list_tools }
+    sleep 0.01
+    header = 'Zone'
+    server.send(:refresh_tools_cache)
+    stale.join
+
+    expect(server.list_tools.first.schema['properties']['region']['x-mcp-header']).to eq('Zone')
   end
 end
