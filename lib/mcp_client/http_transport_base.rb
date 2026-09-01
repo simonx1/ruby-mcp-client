@@ -73,17 +73,10 @@ module MCPClient
           send_request_and_parse(method, params, timeout)
         end
       rescue MCPClient::Errors::HeaderMismatchError => e
-        # MCP 2026-07-28 "Custom Headers from Tool Parameters": after a
-        # HeaderMismatch the client SHOULD re-fetch tools/list (the tool's
-        # inputSchema may have changed its x-mcp-header annotations) and
-        # retry the original request once with the appropriate headers. The
-        # server rejected the request before executing it, so the retry
-        # cannot duplicate a side effect.
         raise unless modern? && method == 'tools/call' && !header_refresh_done
 
         header_refresh_done = true
-        @logger.warn("#{e.message}; refreshing tools/list and retrying tools/call once")
-        refresh_tools_cache
+        refresh_tools_after_header_mismatch(e)
         send_request_and_parse(method, params, timeout)
       rescue MCPClient::Errors::ResponseStreamClosedError => e
         # Modern Streamable HTTP has no resumption: "a broken response stream
@@ -685,6 +678,23 @@ module MCPClient
       @mutex.synchronize { !@restarting_session }
     end
 
+    # MCP 2026-07-28 "Custom Headers from Tool Parameters": after a
+    # HeaderMismatch the client SHOULD re-fetch tools/list (the tool's
+    # inputSchema may have changed its x-mcp-header annotations) and retry
+    # the original request once with the appropriate headers. The server
+    # rejected the request before executing it, so the retry cannot
+    # duplicate a side effect. A refresh that fails re-raises the rejection:
+    # that is the actionable error.
+    # @param error [MCPClient::Errors::HeaderMismatchError] the rejection
+    # @return [void]
+    def refresh_tools_after_header_mismatch(error)
+      @logger.warn("#{sanitize_log_text(error.message)}; refreshing tools/list and retrying tools/call once")
+      refresh_tools_cache
+    rescue MCPClient::Errors::MCPError => e
+      @logger.warn("tools/list refresh after HeaderMismatch failed: #{sanitize_log_text(e.message)}")
+      raise error
+    end
+
     # The Mcp-Param-* headers for a tools/call request (MCP 2026-07-28
     # "Custom Headers from Tool Parameters"): the annotated arguments of the
     # tool, looked up in this transport's tool list (fetched on demand so a
@@ -705,19 +715,12 @@ module MCPClient
       MCPClient::HeaderParams.headers_for(tool.schema, params['arguments'] || params[:arguments])
     end
 
-    # The tool list used for header extraction, fetched on demand. A failed
-    # fetch is not fatal here: the call goes out without Mcp-Param headers
-    # and, if the server needs them, its HeaderMismatch triggers the
-    # refresh-and-retry path.
+    # The tool list used for header extraction, fetched on demand. Mirroring
+    # is a MUST, so a list that cannot be fetched fails the call rather than
+    # letting it go out without the headers an intermediary may route on.
     # @return [Array<MCPClient::Tool>]
     def known_tools_for_headers
-      cached = @mutex.synchronize { @tools }
-      return cached if cached
-
-      list_tools
-    rescue MCPClient::Errors::MCPError => e
-      @logger.warn("Could not fetch tools/list for x-mcp-header extraction: #{e.message}")
-      []
+      @mutex.synchronize { @tools } || list_tools
     end
 
     # Drop the cached tool list and re-fetch it. Hosts layered above the
@@ -726,12 +729,59 @@ module MCPClient
     # notification.
     # @return [void]
     def refresh_tools_cache
+      invalidate_tools_cache
+      list_tools
+      @notification_callback&.call('notifications/tools/list_changed', {})
+    end
+
+    # Forget the cached tool list. The generation counter lets a list fetch
+    # that was already in flight recognise that it is stale and not
+    # overwrite a fresher list.
+    # @return [void]
+    def invalidate_tools_cache
       @mutex.synchronize do
         @tools = nil
         @tools_data = nil
+        @tools_generation = tools_generation + 1
       end
-      list_tools
-      @notification_callback&.call('notifications/tools/list_changed', {})
+    end
+
+    # @return [Integer] the current tool-list generation (bump on invalidation)
+    def tools_generation
+      @tools_generation ||= 0
+    end
+
+    # Store a freshly fetched tool list unless the cache was invalidated
+    # while it was being fetched, in which case the fresher list wins.
+    # @param tools [Array<MCPClient::Tool>] the fetched list
+    # @param generation [Integer] tools_generation when the fetch started
+    # @return [Array<MCPClient::Tool>] the list to hand to the caller
+    def store_tools(tools, generation)
+      @mutex.synchronize do
+        @tools = tools if @tools.nil? || tools_generation == generation
+        @tools
+      end
+    end
+
+    # Keep the transport's list caches in step with the server's list-changed
+    # notifications, so a re-list after a change (or the HeaderMismatch
+    # refresh) really fetches the new definitions.
+    # @param method [String] a notification method
+    # @return [void]
+    def invalidate_cache_for_notification(method)
+      case method
+      when 'notifications/tools/list_changed' then invalidate_tools_cache
+      when 'notifications/prompts/list_changed'
+        @mutex.synchronize do
+          @prompts = nil
+          @prompts_data = nil
+        end
+      when 'notifications/resources/list_changed'
+        @mutex.synchronize do
+          @resources_result = nil
+          @resources_data = nil
+        end
+      end
     end
 
     # Exclude tool definitions whose x-mcp-header annotations violate the
@@ -747,7 +797,8 @@ module MCPClient
         next false if errors.empty?
 
         name = data['name'] || data[:name]
-        @logger.warn("Rejecting tool #{name.to_s.inspect}: invalid x-mcp-header annotation: #{errors.join('; ')}")
+        @logger.warn("Rejecting tool #{name.to_s.inspect}: invalid x-mcp-header annotation: " \
+                     "#{sanitize_log_text(errors.join('; '))}")
         true
       end
     end

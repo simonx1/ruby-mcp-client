@@ -231,17 +231,13 @@ module MCPClient
       begin
         ensure_connected
 
+        generation = @mutex.synchronize { tools_generation }
         tools_data = request_tools_list
         # MCP 2026-07-28: tools with invalid x-mcp-header annotations are
         # excluded from the list on this transport.
         tools_data = reject_invalid_header_tools(tools_data) if modern?
-        @mutex.synchronize do
-          @tools = tools_data.map do |tool_data|
-            MCPClient::Tool.from_json(tool_data, server: self)
-          end
-        end
-
-        @mutex.synchronize { @tools }
+        tools = tools_data.map { |tool_data| MCPClient::Tool.from_json(tool_data, server: self) }
+        store_tools(tools, generation)
       rescue MCPClient::Errors::ConnectionError, MCPClient::Errors::TransportError, MCPClient::Errors::ServerError
         # Re-raise these errors directly
         raise
@@ -1174,6 +1170,7 @@ module MCPClient
         handle_server_request(message)
       elsif message['method'] && !message.key?('id')
         # Handle server notifications (messages without id)
+        invalidate_cache_for_notification(message['method'])
         @notification_callback&.call(message['method'], message['params'])
       elsif message.key?('id')
         # A response replayed on the events stream after its POST stream was

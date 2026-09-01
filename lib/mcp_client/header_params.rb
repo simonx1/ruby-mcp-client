@@ -175,7 +175,8 @@ module MCPClient
     # @api private
     def check_annotation(node, path, reachable, errors, seen, found)
       value = node.key?(ANNOTATION) ? node[ANNOTATION] : node[ANNOTATION.to_sym]
-      where = path.empty? ? 'the schema root' : path.join('.')
+      # Property names are peer-controlled: inspect escapes control characters.
+      where = path.empty? ? 'the schema root' : path.join('.').inspect
 
       unless value.is_a?(String)
         errors << "#{ANNOTATION} at #{where} must be a string"

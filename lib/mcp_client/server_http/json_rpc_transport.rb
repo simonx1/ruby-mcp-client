@@ -94,6 +94,7 @@ module MCPClient
       # @return [void]
       def dispatch_sse_message(message)
         unless message.key?('id')
+          invalidate_cache_for_notification(message['method'])
           @notification_callback&.call(message['method'], message['params'])
           return
         end
