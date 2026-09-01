@@ -167,6 +167,9 @@ module MCPClient
         ensure_connected
 
         tools_data = request_tools_list
+        # MCP 2026-07-28: tools with invalid x-mcp-header annotations are
+        # excluded from the list on this transport.
+        tools_data = reject_invalid_header_tools(tools_data) if modern?
         @mutex.synchronize do
           @tools = tools_data.map do |tool_data|
             MCPClient::Tool.from_json(tool_data, server: self)
@@ -192,7 +195,7 @@ module MCPClient
     # @raise [MCPClient::Errors::ConnectionError] if server is disconnected
     def call_tool(tool_name, parameters)
       rpc_request('tools/call', build_named_request_params(tool_name, parameters))
-    rescue MCPClient::Errors::ConnectionError, MCPClient::Errors::TransportError
+    rescue MCPClient::Errors::ConnectionError, MCPClient::Errors::TransportError, MCPClient::Errors::ValidationError
       # Re-raise connection/transport errors directly to match test expectations
       raise
     rescue MCPClient::Errors::ServerError => e
