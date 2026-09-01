@@ -85,8 +85,10 @@ module MCPClient
         # The CreateTaskResult seed is not an observation: the first
         # tasks/get goes out at once, whatever the seed claims. Its TTL
         # still bounds a wait whose polls never come back, and its
-        # pollIntervalMs paces them.
-        if task.is_a?(MCPClient::Task)
+        # pollIntervalMs paces them — but only when the handle came from
+        # the server being polled: task ids and state are per server, so a
+        # handle from another server says nothing about this one's task.
+        if task.is_a?(MCPClient::Task) && task.server.equal?(srv)
           seed_ttl_deadline(task, wait)
           wait[:last] = task
         end
@@ -279,19 +281,24 @@ module MCPClient
       end
 
       # One tasks/update, owning the pending-payload lifecycle: the keys are
-      # answered as soon as the payload is handed to the transport; a
-      # confirmed delivery clears any pending payload (a later answer
+      # answered as soon as the payload is handed to the transport; the
+      # request carries every response still pending from an earlier
+      # ambiguous delivery (the server ignores keys it already has, so a
+      # resend is safe and no unconfirmed answer is left behind); a
+      # confirmed delivery clears the pending payload (a later answer
       # supersedes a lost one); a definite JSON-RPC rejection gives the keys
       # back and drops the payload; an ambiguous outcome (timeout, transport
       # or connection failure, 5xx, untyped server error) keeps it pending
-      # for retransmission, merged with whatever was pending already.
+      # for retransmission.
       # @param timeout [Numeric, nil] request timeout, bounded by the wait when there is one
       # @return [true]
       # @raise [MCPClient::Errors::TaskError, MCPClient::Errors::ServerError]
       def send_task_update(srv, task_id, input_responses, timeout: nil)
         shown = shown_task_id(task_id)
-        keys = input_responses.keys.map(&:to_s)
         state = task_state(srv, task_id)
+        pending = answered_keys_mutex.synchronize { state[:pending_update] }
+        input_responses = pending.merge(input_responses) if pending
+        keys = input_responses.keys.map(&:to_s)
         remember_answered_keys(srv, task_id, keys)
         begin
           srv.rpc_request('tasks/update', { taskId: task_id, inputResponses: input_responses }, timeout: timeout)
@@ -587,13 +594,14 @@ module MCPClient
       end
 
       # The handle returned by a modern tasks/cancel: an acknowledgement only
-      # (cancellation is eventually consistent), so the last known state.
+      # (cancellation is eventually consistent), so the last known state of
+      # this server's task. A handle from another server (or a bare id)
+      # knows nothing about it: the task counts as still active.
       # @return [MCPClient::Task]
       def cancelled_task_handle(task, task_id, srv)
         return task if task.is_a?(MCPClient::Task) && task.server.equal?(srv)
 
-        status = task.is_a?(MCPClient::Task) ? task.status : 'working'
-        MCPClient::Task.new(task_id: task_id, status: status, server: srv, modern: true)
+        MCPClient::Task.new(task_id: task_id, status: 'working', server: srv, modern: true)
       end
     end
   end

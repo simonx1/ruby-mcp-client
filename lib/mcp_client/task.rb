@@ -104,7 +104,7 @@ module MCPClient
     # @return [Boolean]
     def self.modern_shape?(data)
       %w[ttlMs pollIntervalMs].any? { |k| data.key?(k) } ||
-        %i[ttl_ms poll_interval_ms].any? { |k| data.key?(k) } ||
+        %i[ttlMs pollIntervalMs ttl_ms poll_interval_ms].any? { |k| data.key?(k) } ||
         extract_field(data, 'resultType') == 'task'
     end
     private_class_method :modern_shape?
