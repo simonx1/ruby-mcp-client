@@ -13,6 +13,7 @@ module MCPClient
       # turning the wait into a busy loop.
       DEFAULT_TASK_POLL_INTERVAL = 1.0
       MIN_TASK_POLL_INTERVAL = 0.05
+      MIN_TASK_REQUEST_TIMEOUT = 0.001
 
       # How many input_required rounds one wait answers before giving up:
       # a task is not a higher-trust channel than a multi round-trip request.
@@ -123,17 +124,29 @@ module MCPClient
       # rounds a task may demand.
       # @return [void]
       def answer_task_round(current, wait)
+        return unless pending_task_input?(current, wait[:answered])
+
+        # The limit is checked before the handlers run and the update goes out.
+        if wait[:rounds] >= MAX_TASK_INPUT_ROUNDS
+          raise MCPClient::Errors::InputRequiredError.new(
+            "Task '#{shown_task_id(wait[:task_id])}' kept requesting input after #{MAX_TASK_INPUT_ROUNDS} rounds",
+            data: current.to_h
+          )
+        end
+
         answered_now = answer_task_input_requests(current, wait[:answered], wait[:srv])
         return if answered_now.empty?
 
         wait[:answered].merge(answered_now)
         wait[:rounds] += 1
-        return unless wait[:rounds] > MAX_TASK_INPUT_ROUNDS
+      end
 
-        raise MCPClient::Errors::InputRequiredError.new(
-          "Task '#{shown_task_id(wait[:task_id])}' kept requesting input after #{MAX_TASK_INPUT_ROUNDS} rounds",
-          data: current.to_h
-        )
+      # Whether the task lists an input request that has not been answered.
+      # @return [Boolean]
+      def pending_task_input?(task, answered)
+        return false unless task.input_required? && task.input_requests.is_a?(Hash)
+
+        task.input_requests.keys.any? { |key| !answered.include?(key) }
       end
 
       # The inputRequests keys already answered for a task, kept across
@@ -168,7 +181,9 @@ module MCPClient
       # @return [MCPClient::Task]
       def poll_task(wait)
         deadline = wait[:deadline]
-        remaining = deadline && [deadline - monotonic_time, MIN_TASK_POLL_INTERVAL].max
+        # The request never outlives the wait (a tiny positive floor keeps
+        # the transport from reading 0 as "no timeout").
+        remaining = deadline && [deadline - monotonic_time, MIN_TASK_REQUEST_TIMEOUT].max
         get_task(wait[:task_id], server: wait[:srv], timeout: remaining)
       end
 

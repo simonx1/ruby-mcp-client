@@ -906,3 +906,107 @@ RSpec.describe 'MCP 2026-07-28 tasks extension — round 4' do
     expect(sent.count { |r| r['method'] == 'tasks/update' }).to eq(1)
   end
 end
+
+RSpec.describe 'MCP 2026-07-28 tasks extension — round 5' do
+  def discover_result(extensions: { TASKS_EXT => {} })
+    caps = { 'tools' => {} }
+    caps['extensions'] = extensions if extensions
+    { 'resultType' => 'complete', 'supportedVersions' => ['2026-07-28'], 'capabilities' => caps }
+  end
+
+  def task_result(id: 'task-1')
+    now = Time.now.utc.iso8601
+    { 'resultType' => 'task', 'taskId' => id, 'status' => 'working', 'createdAt' => now, 'lastUpdatedAt' => now,
+      'ttlMs' => 60_000, 'pollIntervalMs' => 1 }
+  end
+
+  def detailed_task(status:, id: 'task-1', **extra)
+    now = Time.now.utc.iso8601
+    { 'resultType' => 'complete', 'taskId' => id, 'status' => status, 'createdAt' => now, 'lastUpdatedAt' => now,
+      'ttlMs' => 60_000, 'pollIntervalMs' => 1 }.merge(extra)
+  end
+
+  def tool_list
+    { 'result' => { 'tools' => [{ 'name' => 'slow', 'inputSchema' => { 'type' => 'object' } }] } }
+  end
+
+  def call_result(text = 'done')
+    { 'content' => [{ 'type' => 'text', 'text' => text }], 'isError' => false }
+  end
+
+  def elicit_request
+    { 'method' => 'elicitation/create',
+      'params' => { 'mode' => 'form', 'message' => 'Name?',
+                    'requestedSchema' => { 'type' => 'object', 'properties' => { 'n' => { 'type' => 'string' } } } } }
+  end
+
+  def script_stdio(server, responses)
+    sent = []
+    allow(server).to receive(:connect).and_return(true)
+    allow(server).to receive(:start_reader)
+    allow(server).to receive(:start_stderr_reader)
+    server.instance_variable_set(:@stdin, double('stdin', puts: nil, flush: nil, closed?: true, close: nil))
+    allow(server).to receive(:send_request) { |req| sent << req }
+    allow(server).to receive(:wait_response) do |id, **_opts|
+      responder = responses.shift
+      raise 'no scripted response left' unless responder
+
+      response = responder.respond_to?(:call) ? responder.call(sent.last) : responder
+      response.merge('jsonrpc' => '2.0', 'id' => id)
+    end
+    sent
+  end
+
+  let(:stdio) { MCPClient::ServerStdio.new(command: 'echo test', read_timeout: 1) }
+
+  def client_for(server, extensions: [TASKS_EXT], **opts)
+    allow(MCPClient::ServerFactory).to receive(:create).and_return(server)
+    client = MCPClient::Client.new(mcp_server_configs: [{ type: 'stdio', command: 'x' }], extensions: extensions,
+                                   **opts)
+    allow(client).to receive(:sleep)
+    client
+  end
+
+  it 'rejects a tasks/get answer for another task or without a taskId' do
+    client = client_for(stdio)
+    script_stdio(stdio, [{ 'result' => discover_result },
+                         { 'result' => detailed_task(status: 'completed', id: 'task-2', 'result' => call_result) },
+                         { 'result' => detailed_task(status: 'completed', 'result' => call_result).tap do |t|
+                           t.delete('taskId')
+                         end }])
+
+    expect { client.wait_for_task('task-1') }.to raise_error(MCPClient::Errors::InvalidResultError, /taskId/)
+    expect { client.wait_for_task('task-1') }.to raise_error(MCPClient::Errors::InvalidResultError, /taskId/)
+  end
+
+  it 'stops before sending an input round beyond the limit' do
+    client = client_for(stdio, elicitation_handler: ->(_m, _s) { { action: 'accept', content: { 'n' => 'x' } } })
+    responses = [{ 'result' => discover_result }, tool_list, { 'result' => task_result }]
+    30.times do |i|
+      responses << { 'result' => detailed_task(status: 'input_required',
+                                               'inputRequests' => { "k#{i}" => elicit_request }) }
+      responses << { 'result' => {} }
+    end
+    sent = script_stdio(stdio, responses)
+
+    expect { client.call_tool('slow', {}) }.to raise_error(MCPClient::Errors::InputRequiredError, /round/)
+    expect(sent.count { |r| r['method'] == 'tasks/update' }).to eq(MCPClient::Client::TaskSupport::MAX_TASK_INPUT_ROUNDS)
+  end
+
+  it 'never enlarges the remaining timeout of a poll' do
+    client = client_for(stdio)
+    script_stdio(stdio, [{ 'result' => discover_result }])
+    allow(stdio).to receive(:rpc_request).and_call_original
+    allow(stdio).to receive(:rpc_request).with('tasks/get', anything, hash_including(timeout: a_value <= 0.001))
+                                         .and_return(detailed_task(status: 'completed', 'result' => call_result))
+
+    expect(client.wait_for_task('task-1', timeout: 0.001)).to be_completed
+  end
+
+  it 'reports the removal of tasks/list before asking for the extension' do
+    client = client_for(stdio, extensions: nil)
+    script_stdio(stdio, [{ 'result' => discover_result(extensions: nil) }])
+
+    expect { client.list_tasks }.to raise_error(MCPClient::Errors::TaskError, %r{tasks/list})
+  end
+end

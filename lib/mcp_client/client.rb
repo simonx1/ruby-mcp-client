@@ -617,7 +617,15 @@ module MCPClient
                  else
                    srv.rpc_request('tasks/get', { taskId: task_id })
                  end
-        MCPClient::Task.from_json(result, server: srv, detailed: true)
+        task = MCPClient::Task.from_json(result, server: srv, detailed: true)
+        # The answer must be about the task that was asked for: its state
+        # drives result delivery and tasks/update.
+        if modern_server?(srv) && task.task_id != task_id.to_s
+          raise MCPClient::Errors::InvalidResultError,
+                "Invalid tasks/get result: taskId #{sanitize_peer_log_text(task.task_id.to_s).inspect} does not " \
+                "match the requested task #{sanitize_peer_log_text(task_id.to_s).inspect}"
+        end
+        task
       rescue MCPClient::Errors::ServerError => e
         raise if e.protocol_error?
 
@@ -671,11 +679,14 @@ module MCPClient
     # @raise [MCPClient::Errors::TaskError] if listing fails
     def list_tasks(cursor: nil, server: nil)
       srv = select_server(server)
-      ensure_task_capability!(srv, 'list')
+      # tasks/list is gone on 2026-07-28 regardless of any extension, so the
+      # era is settled before the capability gate could ask for one.
+      probe_server_era(srv)
       if modern_server?(srv)
         raise MCPClient::Errors::TaskError,
               'tasks/list does not exist on MCP 2026-07-28 servers: keep the Task handles you created'
       end
+      ensure_task_capability!(srv, 'list')
 
       params = cursor ? { cursor: cursor } : {}
 
@@ -995,6 +1006,19 @@ module MCPClient
     # @param operation [String] the tasks sub-capability ('list' or 'cancel')
     # @return [void]
     # @raise [MCPClient::Errors::CapabilityError] if the negotiated set lacks the capability
+    # Make the server's protocol era known (a cheap request triggers the
+    # handshake or the server/discover probe); failures are left to the
+    # request that follows.
+    # @param srv [MCPClient::ServerBase]
+    # @return [void]
+    def probe_server_era(srv)
+      return if capabilities_known?(srv) || !srv.respond_to?(:ping)
+
+      srv.ping
+    rescue MCPClient::Errors::MCPError
+      nil
+    end
+
     # @param strict [Boolean] surface an initialization failure instead of
     #   leaving it to the request (for operations that never send one on a
     #   server whose era is unknown)
