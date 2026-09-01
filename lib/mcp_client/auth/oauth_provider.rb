@@ -116,9 +116,11 @@ module MCPClient
         token = stored_token
         logger.debug("OAuth access_token: retrieved token=#{token ? 'present' : 'nil'} for #{server_url}")
         return nil unless token
+
         # A token from another authorization server is never presented
         # (MCP 2026-07-28: registration state and tokens are per AS).
-        return nil unless token_for_current_issuer?(token)
+        token = bind_token_issuer(token)
+        return nil unless token && token_for_current_issuer?(token)
 
         # Return token if still valid
         return token unless token.expired? || token.expires_soon?
@@ -219,8 +221,10 @@ module MCPClient
       # @raise [MCPClient::Errors::ConnectionError] when the response's issuer does not check out
       def authorization_error_message(params)
         params = params.to_h.transform_keys(&:to_s)
+        # Every started flow records a state, so a response that cannot be
+        # matched to one is not this client's to act on.
         stored_state = storage.get_state(server_url)
-        if stored_state && params['state'] != stored_state
+        if stored_state.nil? || params['state'] != stored_state
           raise MCPClient::Errors::ConnectionError, 'Authorization error response rejected: state mismatch'
         end
 
@@ -597,6 +601,9 @@ module MCPClient
         invalidate_client_info_on_as_change(previous, server_metadata)
 
         storage.set_server_metadata(server_url, server_metadata)
+        # Remembered in-process as well: a backend that does not persist
+        # metadata would otherwise never know the current issuer.
+        @discovered_server_metadata = server_metadata
         @challenge_resource_metadata = nil # consumed
         @challenge_metadata_url = nil # consumed
         @challenge_error = nil
@@ -1131,7 +1138,7 @@ module MCPClient
       # example does); records are normalized before any field is read.
       # @return [ServerMetadata, nil]
       def stored_server_metadata
-        normalize_record(storage.get_server_metadata(server_url), ServerMetadata)
+        normalize_record(storage.get_server_metadata(server_url), ServerMetadata) || @discovered_server_metadata
       end
 
       # @return [PKCE, nil]
@@ -1163,16 +1170,38 @@ module MCPClient
       end
 
       # Whether a stored token belongs to the authorization server currently
-      # known for this resource (an unbound legacy token is trusted).
+      # known for this resource. While that server is unknown (no cached
+      # metadata) nothing is presented: the next challenge discovers it.
       # @param token [Token]
       # @return [Boolean]
       def token_for_current_issuer?(token)
         return false if token.respond_to?(:access_token) && @retired_tokens&.key?(token.access_token)
         return false if token.respond_to?(:retired?) && token.retired?
-        return true unless token.respond_to?(:issuer) && token.issuer
+        return true unless token.respond_to?(:issuer)
 
         current = stored_server_metadata&.issuer
-        current.nil? || current == token.issuer
+        !current.nil? && current == token.issuer
+      end
+
+      # A token persisted before issuers were recorded was obtained from the
+      # authorization server cached alongside it (a server change always
+      # retires or binds the token first), so it is bound to that server on
+      # first use; while no server is known it is not presented.
+      # @param token [Token]
+      # @return [Token, nil] the bound token, or nil when it cannot be bound yet
+      def bind_token_issuer(token)
+        return token unless token.respond_to?(:issuer) && token.issuer.nil? && token.respond_to?(:with_issuer)
+
+        current = stored_server_metadata&.issuer
+        return nil unless current
+
+        bound = token.with_issuer(current)
+        begin
+          storage.set_token(server_url, bound)
+        rescue StandardError => e
+          logger.debug("The stored OAuth token could not be re-stored with its issuer (#{e.class})")
+        end
+        bound
       end
 
       # The registration type of stored credentials, recognizing a Client
@@ -1197,11 +1226,17 @@ module MCPClient
       def delete_client_info
         # Prefer an explicit delete; fall back to the always-available
         # set_client_info(nil) so custom storage backends are handled too.
+        # A backend that refuses either must not stop the authorization
+        # server switch: the credentials stay bound to the previous issuer
+        # and are discarded again by the next flow.
         if storage.respond_to?(:delete_client_info)
           storage.delete_client_info(server_url)
         else
           storage.set_client_info(server_url, nil)
         end
+      rescue StandardError => e
+        logger.warn('The OAuth client registration for the previous authorization server could not be removed ' \
+                    "from storage (#{e.class}); implement delete_client_info(server_url) on the storage backend.")
       end
 
       # Build client information for a Client ID Metadata Document client

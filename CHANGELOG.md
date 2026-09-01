@@ -55,7 +55,13 @@ metadata). Each feature lands in its own PR; this section accumulates them.
   `client_id_metadata_document_supported`; storage backends that persist
   plain hashes (like the `FileTokenStorage` example) are read back through
   `from_h`; and a freshly issued token is never mistaken for a retired one
-  that happened to use the same bytes.
+  that happened to use the same bytes. A backend that refuses to forget a
+  dynamic client no longer stops an authorization server switch; a token
+  persisted before issuers were recorded is bound to the authorization
+  server cached alongside it on first use; no token is presented while the
+  authorization server is unknown (the next challenge discovers it, and the
+  discovery is remembered in-process for backends that do not persist
+  metadata); an error response that matches no stored state is rejected.
 
 ### Tasks extension (`io.modelcontextprotocol/tasks`)
 
