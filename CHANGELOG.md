@@ -5,6 +5,28 @@
 Groundwork for the 2026-07-28 protocol revision (stateless, per-request
 metadata). Each feature lands in its own PR; this section accumulates them.
 
+### Multi round-trip requests (InputRequiredResult)
+
+- **Server-to-client interactions on modern servers.** `tools/call`,
+  `resources/read` and `prompts/get` may now be answered with
+  `resultType: "input_required"`. The client fulfils every entry of
+  `inputRequests` through the handlers it already has — `elicitation/create`
+  via the elicitation handler, `sampling/createMessage` via the sampling
+  handler, `roots/list` from the client's roots — and retries the original
+  request as a new request (new id, same params) carrying `inputResponses`
+  keyed like the requests and the opaque `requestState` echoed verbatim
+  (omitted when the server sent none). A result without `inputRequests` is
+  retried immediately; the round trip never leaks into other requests.
+- **Capabilities.** Modern requests once again declare `elicitation`
+  (`form` and `url`), `roots` (without `listChanged`) and `sampling` (with
+  `tools` when opted in) when the corresponding handler is registered.
+- **Limits and errors.** More than 10 consecutive `input_required` answers,
+  an input request this client cannot honour (unknown method, no handler,
+  handler error) or a malformed `inputRequests` raise
+  `MCPClient::Errors::InputRequiredError` (exposing `input_requests` and
+  `request_state`) without a retry; `input_required` on any other method is
+  an `InvalidResultError`.
+
 ### Custom headers from tool parameters (`x-mcp-header`)
 
 - **`Mcp-Param-{name}` headers.** On a modern Streamable HTTP (or plain HTTP)
