@@ -445,3 +445,223 @@ RSpec.describe 'MCP 2026-07-28 tasks extension' do
     end
   end
 end
+
+RSpec.describe 'MCP 2026-07-28 tasks extension — round 2' do
+  def discover_result(extensions: { TASKS_EXT => {} })
+    caps = { 'tools' => {}, 'resources' => {} }
+    caps['extensions'] = extensions if extensions
+    { 'resultType' => 'complete', 'supportedVersions' => ['2026-07-28'], 'capabilities' => caps }
+  end
+
+  def task_result(status: 'working', id: 'task-1', created_at: Time.now.utc.iso8601, ttl_ms: 60_000,
+                  poll_ms: 1, **extra)
+    { 'resultType' => 'task', 'taskId' => id, 'status' => status, 'createdAt' => created_at,
+      'lastUpdatedAt' => created_at, 'ttlMs' => ttl_ms, 'pollIntervalMs' => poll_ms }.merge(extra)
+  end
+
+  def detailed_task(status:, id: 'task-1', created_at: Time.now.utc.iso8601, ttl_ms: 60_000, poll_ms: 1, **extra)
+    { 'resultType' => 'complete', 'taskId' => id, 'status' => status, 'createdAt' => created_at,
+      'lastUpdatedAt' => created_at, 'ttlMs' => ttl_ms, 'pollIntervalMs' => poll_ms }.merge(extra)
+  end
+
+  def tool_list
+    { 'result' => { 'tools' => [{ 'name' => 'slow', 'inputSchema' => { 'type' => 'object' } }] } }
+  end
+
+  def call_result(text = 'done')
+    { 'content' => [{ 'type' => 'text', 'text' => text }], 'isError' => false }
+  end
+
+  def script_stdio(server, responses)
+    sent = []
+    allow(server).to receive(:connect).and_return(true)
+    allow(server).to receive(:start_reader)
+    allow(server).to receive(:start_stderr_reader)
+    server.instance_variable_set(:@stdin, double('stdin', puts: nil, flush: nil, closed?: true, close: nil))
+    allow(server).to receive(:send_request) { |req| sent << req }
+    allow(server).to receive(:wait_response) do |id, **_opts|
+      responder = responses.shift
+      raise 'no scripted response left' unless responder
+
+      response = responder.respond_to?(:call) ? responder.call(sent.last) : responder
+      response.merge('jsonrpc' => '2.0', 'id' => id)
+    end
+    sent
+  end
+
+  def wire_params(request)
+    JSON.parse(request['params'].to_json).tap { |params| params.delete('_meta') }
+  end
+
+  let(:stdio) { MCPClient::ServerStdio.new(command: 'echo test', read_timeout: 1) }
+
+  def client_for(stdio, extensions: [TASKS_EXT], **opts)
+    allow(MCPClient::ServerFactory).to receive(:create).and_return(stdio)
+    client = MCPClient::Client.new(mcp_server_configs: [{ type: 'stdio', command: 'x' }],
+                                   extensions: extensions, **opts)
+    allow(client).to receive(:sleep)
+    client
+  end
+
+  it 'waits for a task by id on a client that has not talked to the server yet' do
+    client = client_for(stdio)
+    script_stdio(stdio, [{ 'result' => discover_result },
+                         { 'result' => detailed_task(status: 'completed', 'result' => call_result('late')) }])
+
+    task = client.wait_for_task('task-1')
+
+    expect(task).to be_completed
+    expect(task.result['content'].first['text']).to eq('late')
+  end
+
+  it 'never sleeps past the remaining timeout or TTL' do
+    client = client_for(stdio)
+    script_stdio(stdio, [{ 'result' => discover_result }, tool_list,
+                         { 'result' => task_result(poll_ms: 60_000) },
+                         { 'result' => detailed_task(status: 'working', poll_ms: 60_000) }])
+
+    task = client.call_tool_as_task('slow', {})
+    allow(client).to receive(:sleep) { |seconds| Kernel.sleep(seconds) }
+    expect { client.wait_for_task(task, timeout: 0.2) }.to raise_error(MCPClient::Errors::TaskError, /timed out/i)
+    expect(client).to have_received(:sleep).with(a_value <= 0.2).at_least(:once)
+    expect(client).not_to have_received(:sleep).with(a_value > 0.2)
+
+    ttl_bound = MCPClient::Task.from_json(task_result(poll_ms: 60_000, ttl_ms: 500), server: stdio)
+    expect(client.send(:task_poll_delay, ttl_bound, nil)).to be_between(0.0, 0.5)
+  end
+
+  it 'honours a long pollIntervalMs without capping it' do
+    client = client_for(stdio)
+    script_stdio(stdio, [{ 'result' => discover_result }, tool_list,
+                         { 'result' => task_result(poll_ms: 180_000, ttl_ms: nil) },
+                         { 'result' => detailed_task(status: 'completed', 'result' => call_result) }])
+
+    client.call_tool('slow', {})
+
+    expect(client).to have_received(:sleep).with(180.0)
+  end
+
+  it 'does not busy-loop on pollIntervalMs 0' do
+    client = client_for(stdio)
+    script_stdio(stdio, [{ 'result' => discover_result }, tool_list,
+                         { 'result' => task_result(poll_ms: 0, ttl_ms: nil) },
+                         { 'result' => detailed_task(status: 'completed', 'result' => call_result) }])
+
+    client.call_tool('slow', {})
+
+    expect(client).to have_received(:sleep).with(a_value >= MCPClient::Client::TaskSupport::MIN_TASK_POLL_INTERVAL)
+  end
+
+  it 'fetches the task when the creation seed claims a terminal status without its payload' do
+    client = client_for(stdio)
+    sent = script_stdio(stdio, [{ 'result' => discover_result }, tool_list,
+                                { 'result' => task_result(status: 'completed') },
+                                { 'result' => detailed_task(status: 'completed', 'result' => call_result('fetched')) }])
+
+    expect(client.call_tool('slow', {})['content'].first['text']).to eq('fetched')
+    expect(sent.count { |r| r['method'] == 'tasks/get' }).to eq(1)
+  end
+
+  it 'fetches the task when the seed says failed or input_required without details' do
+    client = client_for(stdio)
+    script_stdio(stdio, [{ 'result' => discover_result }, tool_list,
+                         { 'result' => task_result(status: 'failed') },
+                         { 'result' => detailed_task(status: 'failed', 'error' => { 'code' => -32_603,
+                                                                                    'message' => 'later' }) }])
+    expect { client.call_tool('slow', {}) }.to raise_error(MCPClient::Errors::ServerError, /later/)
+
+    other = MCPClient::ServerStdio.new(command: 'echo test', read_timeout: 1)
+    client = client_for(other)
+    script_stdio(other, [{ 'result' => discover_result }, tool_list,
+                         { 'result' => task_result(status: 'input_required') },
+                         { 'result' => detailed_task(status: 'completed', 'result' => call_result('ok')) }])
+    expect(client.call_tool('slow', {})['content'].first['text']).to eq('ok')
+  end
+
+  it 'resolves a task returned to a streaming tool call' do
+    client = client_for(stdio)
+    script_stdio(stdio, [{ 'result' => discover_result }, tool_list, { 'result' => task_result },
+                         { 'result' => detailed_task(status: 'completed', 'result' => call_result('streamed')) }])
+
+    chunks = client.call_tool_streaming('slow', {}).to_a
+
+    expect(chunks.size).to eq(1)
+    expect(chunks.first['content'].first['text']).to eq('streamed')
+  end
+
+  it 'refuses task notifications when the server did not negotiate the extension' do
+    client = client_for(stdio)
+    script_stdio(stdio, [{ 'result' => discover_result(extensions: nil) }])
+
+    expect { client.listen(notifications: { task_ids: ['task-1'] }) }
+      .to raise_error(MCPClient::Errors::CapabilityError, /tasks/)
+  end
+
+  it 'wraps creation failures on a 2026-07-28 server as TaskError' do
+    client = client_for(stdio)
+    script_stdio(stdio, [{ 'result' => discover_result }, tool_list,
+                         { 'error' => { 'code' => -32_603, 'message' => 'cannot start' } }])
+
+    expect { client.call_tool_as_task('slow', {}) }.to raise_error(MCPClient::Errors::TaskError, /cannot start/)
+  end
+
+  it 'maps -32602 on tasks/cancel and tasks/update to TaskNotFound' do
+    client = client_for(stdio)
+    script_stdio(stdio, [{ 'result' => discover_result },
+                         { 'error' => { 'code' => -32_602, 'message' => 'Invalid params' } },
+                         { 'error' => { 'code' => -32_602, 'message' => 'Invalid params' } }])
+
+    expect { client.cancel_task('gone') }.to raise_error(MCPClient::Errors::TaskNotFound)
+    expect { client.update_task('gone', {}) }.to raise_error(MCPClient::Errors::TaskNotFound)
+  end
+
+  it 'keeps locally completed tasks distinct' do
+    first = MCPClient::Task.completed_locally(call_result('a'))
+    second = MCPClient::Task.completed_locally(call_result('b'))
+
+    expect(first).not_to eq(second)
+    expect(Set.new([first, second]).size).to eq(2)
+    expect(first).to eq(first)
+  end
+
+  it 'answers sampling and roots input requests of a task through the client handlers' do
+    sampling = { 'method' => 'sampling/createMessage',
+                 'params' => { 'messages' => [{ 'role' => 'user', 'content' => { 'type' => 'text', 'text' => 'hi' } }],
+                               'maxTokens' => 10 } }
+    roots = { 'method' => 'roots/list', 'params' => {} }
+    client = client_for(stdio, roots: [{ uri: 'file:///work', name: 'work' }], sampling_handler: lambda { |_params|
+      { 'role' => 'assistant', 'content' => { 'type' => 'text', 'text' => 'yo' }, 'model' => 'm' }
+    })
+    sent = script_stdio(stdio, [{ 'result' => discover_result }, tool_list, { 'result' => task_result },
+                                { 'result' => detailed_task(status: 'input_required',
+                                                            'inputRequests' => { 's' => sampling, 'r' => roots }) },
+                                { 'result' => {} },
+                                { 'result' => detailed_task(status: 'completed', 'result' => call_result) }])
+
+    client.call_tool('slow', {})
+
+    update = wire_params(sent.find { |r| r['method'] == 'tasks/update' })
+    expect(update['inputResponses']['s']['content']['text']).to eq('yo')
+    expect(update['inputResponses']['r']['roots'].first['uri']).to eq('file:///work')
+  end
+
+  it 'routes tasks/update with Mcp-Name over Streamable HTTP' do
+    url = 'http://tasks.example/mcp'
+    seen = []
+    stub_request(:post, url).to_return do |request|
+      body = JSON.parse(request.body)
+      seen << [body['method'], request.headers['Mcp-Name']]
+      result = body['method'] == 'server/discover' ? discover_result : { 'resultType' => 'complete' }
+      { status: 200, headers: { 'Content-Type' => 'application/json' },
+        body: { jsonrpc: '2.0', id: body['id'], result: result }.to_json }
+    end
+    http = MCPClient::ServerStreamableHTTP.new(base_url: url)
+    allow(MCPClient::ServerFactory).to receive(:create).and_return(http)
+    client = MCPClient::Client.new(mcp_server_configs: [{ type: 'streamable_http', url: url }],
+                                   extensions: [TASKS_EXT])
+
+    client.update_task('task-9', { 'k' => { 'action' => 'decline' } })
+
+    expect(seen).to include(['tasks/update', 'task-9'])
+  end
+end

@@ -471,7 +471,14 @@ module MCPClient
 
       begin
         # Use the streaming API if it's available
-        server.call_tool_streaming(tool_name, parameters)
+        stream = server.call_tool_streaming(tool_name, parameters)
+        return stream unless tasks_extension? && modern_server?(server)
+
+        # MCP 2026-07-28 tasks extension: a chunk may be a task; resolve it
+        # to the call's result as #call_tool does.
+        Enumerator.new do |yielder|
+          stream.each { |chunk| yielder << complete_task_result(tool_name, server, chunk) }
+        end
       rescue MCPClient::Errors::ConnectionError => e
         # Add server identity information to the error for better context
         server_id = server.name ? "#{server.class}[#{server.name}]" : server.class.name
@@ -605,7 +612,7 @@ module MCPClient
 
       begin
         result = srv.rpc_request('tasks/get', { taskId: task_id })
-        MCPClient::Task.from_json(result, server: srv)
+        MCPClient::Task.from_json(result, server: srv, detailed: true)
       rescue MCPClient::Errors::ServerError => e
         raise if e.protocol_error?
 
@@ -704,7 +711,7 @@ module MCPClient
           raise MCPClient::Errors::TaskError, "Error cancelling task '#{task_id}': #{e.message}"
         end
 
-        raise task_error_from(e, task_id, 'cancelling')
+        raise task_error_from(e, task_id, 'cancelling', modern: modern_server?(srv))
       rescue MCPClient::Errors::TransportError, MCPClient::Errors::ConnectionError => e
         raise MCPClient::Errors::TaskError, "Error cancelling task '#{task_id}': #{e.message}"
       end
@@ -725,14 +732,20 @@ module MCPClient
     # @return [MCPClient::Subscription]
     # @raise [MCPClient::Errors::CapabilityError] if the server is not a 2026-07-28 server
     def listen(notifications:, server: nil, ack_timeout: nil, &listener)
+      srv = select_server(server)
       filter = MCPClient::Subscription.normalize_filter(notifications)
-      if filter.key?('taskIds') && !tasks_extension?
-        raise MCPClient::Errors::CapabilityError,
-              'Task notifications (taskIds) require the tasks extension: pass ' \
-              "extensions: ['#{MCPClient::JsonRpcCommon::TASKS_EXTENSION}'] to MCPClient::Client.new"
+      if filter.key?('taskIds')
+        unless tasks_extension?
+          raise MCPClient::Errors::CapabilityError,
+                'Task notifications (taskIds) require the tasks extension: pass ' \
+                "extensions: ['#{MCPClient::JsonRpcCommon::TASKS_EXTENSION}'] to MCPClient::Client.new"
+        end
+        # The server must have negotiated the extension too (it answers a
+        # taskIds filter from a non-declaring client with -32021).
+        ensure_task_capability!(srv, 'listen')
       end
 
-      select_server(server).listen(notifications: notifications, ack_timeout: ack_timeout, &listener)
+      srv.listen(notifications: notifications, ack_timeout: ack_timeout, &listener)
     end
 
     # Set the logging level on all connected servers (MCP 2025-06-18)
@@ -1545,7 +1558,7 @@ module MCPClient
     # @param params [Hash] the flat task params
     # @return [void]
     def handle_task_status_notification(server_id, params)
-      task = MCPClient::Task.from_json(params)
+      task = MCPClient::Task.from_json(params, detailed: true)
       logger.info("[#{server_id}] Task #{sanitize_peer_log_text(task.task_id.to_s)} status: #{task.status}")
     rescue StandardError => e
       logger.debug("[#{server_id}] Failed to parse task status notification: #{e.message}")
