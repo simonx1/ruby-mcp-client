@@ -696,6 +696,21 @@ module MCPClient
       end
     end
 
+    # Open a long-lived notification stream on a server (MCP 2026-07-28
+    # subscriptions/listen). The subscription's notifications also flow
+    # through the client's regular notification handling (cache
+    # invalidation, on_notification listeners).
+    # @param notifications [Hash] the SubscriptionFilter: tools_list_changed,
+    #   prompts_list_changed, resources_list_changed (booleans),
+    #   resource_subscriptions, task_ids (arrays of strings)
+    # @param server [Integer, String, Symbol, MCPClient::ServerBase, nil] server selector
+    # @yield [method, params] notifications delivered on the subscription
+    # @return [MCPClient::Subscription]
+    # @raise [MCPClient::Errors::CapabilityError] if the server is not a 2026-07-28 server
+    def listen(notifications:, server: nil, &listener)
+      select_server(server).listen(notifications: notifications, &listener)
+    end
+
     # Set the logging level on all connected servers (MCP 2025-06-18)
     # To set on a specific server, use: client.find_server('name').log_level = 'debug'
     # @param level [String] the log level ('debug', 'info', 'notice', 'warning', 'error',
@@ -791,12 +806,19 @@ module MCPClient
       when 'notifications/tasks/status'
         # MCP 2025-11-25: task status update (params are a flat Task)
         handle_task_status_notification(server_id, params)
+      when 'notifications/subscriptions/acknowledged'
+        # MCP 2026-07-28: the transport already recorded the acknowledged
+        # filter on the Subscription; log for observability.
+        logger.debug("[#{server_id}] Subscription #{params&.dig('_meta', 'io.modelcontextprotocol/subscriptionId')} " \
+                     'acknowledged')
       when 'notifications/cancelled'
         # MCP 2025-11-25 cancellation utility: the server cancelled one of its
         # own in-flight requests (sampling/elicitation). Server-request
         # dispatch is synchronous per transport, so by the time this arrives
         # the handler has usually completed; receivers MAY ignore
-        # cancellations they cannot honor — log for observability.
+        # cancellations they cannot honor — log for observability. On MCP
+        # 2026-07-28 it only ever tears down a subscriptions/listen stream,
+        # which the transport handled before this point.
         logger.debug("[#{server_id}] Server cancelled request #{params&.dig('requestId')}: " \
                      "#{params&.dig('reason') || 'no reason given'}")
       when 'notifications/progress'

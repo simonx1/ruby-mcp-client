@@ -37,6 +37,46 @@ module MCPClient
           end
 
           @initialized = true
+          reopen_subscriptions
+        end
+      end
+
+      # @return [void]
+      def ensure_session_ready
+        ensure_initialized
+      end
+
+      # Send the subscriptions/listen request for a subscription (a fresh id
+      # each time it is opened or re-opened).
+      # @param subscription [MCPClient::Subscription]
+      # @return [void]
+      def open_subscription(subscription)
+        id = next_id
+        # No caller waits on this id: the response, if any, is the server's
+        # graceful closure and is routed to the subscription itself.
+        @mutex.synchronize { @awaiting.delete(id) }
+        subscription.assign_id(id)
+        register_subscription(subscription)
+        send_request(build_jsonrpc_request('subscriptions/listen', { 'notifications' => subscription.requested }, id))
+      rescue StandardError => e
+        unregister_subscription(subscription)
+        subscription.finish(error: e.is_a?(MCPClient::Errors::MCPError) ? e : MCPClient::Errors::TransportError.new(e.message))
+        raise
+      end
+
+      # After the process was re-established, re-send subscriptions/listen
+      # for every subscription the host still holds open ("the server holds
+      # no subscription state across reconnections").
+      # @return [void]
+      def reopen_subscriptions
+        return unless modern?
+
+        pending = (@reconnecting_subscriptions || []).select(&:reconnectable?)
+        @reconnecting_subscriptions = []
+        pending.each do |subscription|
+          open_subscription(subscription)
+        rescue StandardError => e
+          @logger.warn("Could not re-establish subscription: #{e.message}")
         end
       end
 

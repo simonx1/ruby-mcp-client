@@ -418,6 +418,13 @@ module MCPClient
     def subscribe_resource(uri)
       ensure_connected
       require_capability!('resources', 'subscribe', method: 'resources/subscribe')
+      # MCP 2026-07-28 replaced resources/subscribe with a subscriptions/listen
+      # stream carrying resourceSubscriptions.
+      if modern?
+        subscribe_resource_via_listen(uri)
+        return true
+      end
+
       rpc_request('resources/subscribe', { uri: uri })
       true
     rescue MCPClient::Errors::ConnectionError, MCPClient::Errors::TransportError, MCPClient::Errors::ServerError,
@@ -434,6 +441,11 @@ module MCPClient
     def unsubscribe_resource(uri)
       ensure_connected
       require_capability!('resources', 'subscribe', method: 'resources/unsubscribe')
+      if modern?
+        unsubscribe_resource_via_listen(uri)
+        return true
+      end
+
       rpc_request('resources/unsubscribe', { uri: uri })
       true
     rescue MCPClient::Errors::ConnectionError, MCPClient::Errors::TransportError, MCPClient::Errors::ServerError,
@@ -507,6 +519,8 @@ module MCPClient
 
         @connection_established = false
         @initialized = false
+        # Subscription streams (MCP 2026-07-28) end with the connection
+        close_listen_streams
 
         @logger.debug('Cleaning up HTTP connection')
 

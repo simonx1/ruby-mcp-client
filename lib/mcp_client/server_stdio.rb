@@ -156,6 +156,8 @@ module MCPClient
         @stdout.each_line do |line|
           handle_line(line)
         end
+        # EOF without cleanup: the server exited on its own.
+        handle_server_exit if @initialized && @stdin
       rescue StandardError
         # Reader thread aborted unexpectedly
       ensure
@@ -246,13 +248,16 @@ module MCPClient
 
       # Dispatch JSON-RPC notifications (no id, has method)
       if msg['method'] && !msg.key?('id')
-        @notification_callback&.call(msg['method'], msg['params'])
+        route_notification(msg['method'], msg['params'])
         return
       end
 
       # Handle standard JSON-RPC responses (has id, no method)
       id = msg['id']
       return unless id
+      # A response to a subscriptions/listen request ends that subscription
+      # (no caller is waiting on it).
+      return if handle_subscription_response(msg)
 
       @mutex.synchronize do
         # Only retain a response that corresponds to an outstanding request.
@@ -402,6 +407,13 @@ module MCPClient
     def subscribe_resource(uri)
       ensure_initialized
       require_capability!('resources', 'subscribe', method: 'resources/subscribe')
+      # MCP 2026-07-28 replaced resources/subscribe with a subscriptions/listen
+      # stream carrying resourceSubscriptions.
+      if modern?
+        subscribe_resource_via_listen(uri)
+        return true
+      end
+
       rpc_request('resources/subscribe', { 'uri' => uri })
       true
     rescue MCPClient::Errors::CapabilityError
@@ -424,6 +436,11 @@ module MCPClient
     def unsubscribe_resource(uri)
       ensure_initialized
       require_capability!('resources', 'subscribe', method: 'resources/unsubscribe')
+      if modern?
+        unsubscribe_resource_via_listen(uri)
+        return true
+      end
+
       rpc_request('resources/unsubscribe', { 'uri' => uri })
       true
     rescue MCPClient::Errors::CapabilityError
@@ -772,6 +789,15 @@ module MCPClient
       # being dismantled on purpose: their EOF must not retire whatever
       # replaces it.
       @transport_generation += 1
+
+      # Subscriptions do not survive the process: keep the ones the host still
+      # wants so they are re-sent once the process is re-established
+      # (basic/patterns/subscriptions "Graceful Closure").
+      subscriptions_mutex.synchronize do
+        subscriptions.each_value(&:mark_reconnecting)
+        (@reconnecting_subscriptions ||= []).concat(subscriptions.values.select(&:reconnectable?))
+        subscriptions.clear
+      end
       @stdin.close unless @stdin.closed?
       terminate_server_process
       @stdout.close unless @stdout.closed?
@@ -787,6 +813,20 @@ module MCPClient
         @awaiting.clear
       end
       @stdin = @stdout = @stderr = @wait_thread = @reader_thread = @stderr_thread = nil
+      # The next request re-establishes the process and, on a modern
+      # server, re-sends the subscriptions the host still holds.
+      @initialized = false
+    end
+
+    # The server process ended on its own (its stdout reached EOF). MCP
+    # 2026-07-28 stdio "Unexpected Termination": the client SHOULD restart
+    # it; in-flight requests are lost and subscriptions must be
+    # re-established. Marking the session uninitialized makes the next
+    # request spawn a fresh process and re-open live subscriptions.
+    # @return [void]
+    def handle_server_exit
+      @logger.warn('MCP server process ended unexpectedly; it will be restarted on the next request')
+      cleanup
     end
 
     # Terminate the spawned server process per the MCP 2025-11-25 stdio
@@ -803,6 +843,24 @@ module MCPClient
 
       signal_server_process('KILL')
       @wait_thread.join(SHUTDOWN_GRACE_PERIOD)
+    end
+
+    # Cancel a subscription: on stdio there is no per-request stream to
+    # close, so the client sends notifications/cancelled referencing the
+    # subscriptions/listen request id.
+    # @param subscription [MCPClient::Subscription]
+    # @return [void]
+    def cancel_subscription(subscription)
+      unregister_subscription(subscription)
+      subscription.finish(by_client: true)
+      resource_subscriptions.delete_if { |_uri, sub| sub.equal?(subscription) }
+      return unless @stdin
+
+      notif = build_jsonrpc_notification('notifications/cancelled',
+                                         { 'requestId' => subscription.id, 'reason' => 'Client closed subscription' })
+      @stdin.puts(notif.to_json)
+    rescue StandardError => e
+      @logger.debug("Failed to send subscription cancellation: #{e.message}")
     end
 
     # Send a signal to the server process, tolerating a process that has

@@ -4,6 +4,7 @@ require 'net/http'
 require_relative 'json_rpc_common'
 require_relative 'called_tool_definition'
 require_relative 'auth/oauth_provider'
+require_relative 'http_transport_base/listen_stream'
 
 require_relative 'http_transport_base/param_headers'
 require_relative 'http_transport_base/request_recovery'
@@ -16,6 +17,7 @@ module MCPClient
     include CalledToolDefinition
     include ParamHeaders
     include RequestRecovery
+    include ListenStream
 
     # Lightweight response wrapper for Faraday exception payloads (Hashes),
     # so the exception path and the default path share one challenge pipeline.

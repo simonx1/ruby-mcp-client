@@ -5,6 +5,35 @@
 Groundwork for the 2026-07-28 protocol revision (stateless, per-request
 metadata). Each feature lands in its own PR; this section accumulates them.
 
+### Subscriptions (`subscriptions/listen`)
+
+- **Long-lived notification streams.** `server.listen(notifications:)` and
+  `Client#listen(notifications:, server:)` open a `subscriptions/listen`
+  request with a `SubscriptionFilter` (`tools_list_changed`,
+  `prompts_list_changed`, `resources_list_changed`, `resource_subscriptions`,
+  `task_ids`; snake_case or camelCase) and return an `MCPClient::Subscription`.
+  The server's `notifications/subscriptions/acknowledged` records the subset
+  it honours (`acknowledged`, `unsupported`); notifications tagged with
+  `io.modelcontextprotocol/subscriptionId` are demultiplexed to the
+  subscription's listeners and still flow through the client's regular
+  notification handling (cache invalidation, `on_notification`). A response
+  to the listen request is the server's graceful closure, a server
+  `notifications/cancelled` for the listen id a teardown; `close` cancels —
+  by closing the SSE stream on Streamable HTTP (no `notifications/cancelled`)
+  or by sending `notifications/cancelled` on stdio.
+- **Transports.** On Streamable HTTP (and plain HTTP) the listen POST runs
+  on its own thread; a stream that ends without the closing response is
+  re-opened with a new id (backoff 1 s → 30 s) while the host still wants
+  it. On stdio, subscriptions share the channel and are correlated by
+  subscription id; when the process is re-established (after `cleanup` or an
+  unexpected exit, which now marks the session for restart) every open
+  subscription is re-sent with a new id. Legacy sessions refuse `listen`
+  with a `CapabilityError`.
+- **`subscribe_resource`/`unsubscribe_resource`** map onto one listen stream
+  per URI (`resourceSubscriptions`) on modern servers, still gated on the
+  `resources.subscribe` capability; legacy servers keep
+  `resources/subscribe`.
+
 ### Multi round-trip requests (InputRequiredResult)
 
 - **Server-to-client interactions on modern servers.** `tools/call`,

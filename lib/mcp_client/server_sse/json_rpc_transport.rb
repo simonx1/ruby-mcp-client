@@ -321,6 +321,20 @@ module MCPClient
         nil
       end
 
+      # The legacy HTTP+SSE transport never negotiates a modern revision, so
+      # subscriptions/listen (which requires one) is refused by the shared
+      # implementation after this readiness check.
+      # @return [void]
+      def ensure_session_ready
+        ensure_connected if respond_to?(:ensure_connected, true)
+      end
+
+      # @param _subscription [MCPClient::Subscription]
+      # @return [void]
+      def cancel_subscription(_subscription)
+        nil
+      end
+
       # Raise a ServerError for a JSON-RPC error response received over SSE,
       # mirroring JsonRpcCommon#process_jsonrpc_response for the other transports.
       # @param error [Hash, nil] the JSON-RPC error object ('code', 'message', 'data')

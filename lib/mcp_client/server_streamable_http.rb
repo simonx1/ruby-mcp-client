@@ -448,6 +448,13 @@ module MCPClient
     def subscribe_resource(uri)
       ensure_connected
       require_capability!('resources', 'subscribe', method: 'resources/subscribe')
+      # MCP 2026-07-28 replaced resources/subscribe with a subscriptions/listen
+      # stream carrying resourceSubscriptions.
+      if modern?
+        subscribe_resource_via_listen(uri)
+        return true
+      end
+
       rpc_request('resources/subscribe', { uri: uri })
       true
     rescue MCPClient::Errors::ConnectionError, MCPClient::Errors::TransportError, MCPClient::Errors::ServerError,
@@ -464,6 +471,11 @@ module MCPClient
     def unsubscribe_resource(uri)
       ensure_connected
       require_capability!('resources', 'subscribe', method: 'resources/unsubscribe')
+      if modern?
+        unsubscribe_resource_via_listen(uri)
+        return true
+      end
+
       rpc_request('resources/unsubscribe', { uri: uri })
       true
     rescue MCPClient::Errors::ConnectionError, MCPClient::Errors::TransportError, MCPClient::Errors::ServerError,
@@ -539,6 +551,9 @@ module MCPClient
         # Mark connection as closed to stop reconnection attempts
         @connection_established = false
         @initialized = false
+
+        # Subscription streams (MCP 2026-07-28) end with the connection
+        close_listen_streams
 
         # Attempt to terminate session before cleanup
         begin
@@ -1177,8 +1192,7 @@ module MCPClient
         handle_server_request(message)
       elsif message['method'] && !message.key?('id')
         # Handle server notifications (messages without id)
-        invalidate_cache_for_notification(message['method'])
-        @notification_callback&.call(message['method'], message['params'])
+        route_notification(message['method'], message['params'])
       elsif message.key?('id')
         # A response replayed on the events stream after its POST stream was
         # closed before delivery (SEP-1699 resumption)

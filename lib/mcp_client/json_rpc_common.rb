@@ -4,10 +4,13 @@ require 'json'
 require 'zlib'
 require 'stringio'
 require_relative 'header_params'
+require_relative 'subscription_support'
 
 module MCPClient
   # Shared retry/backoff logic for JSON-RPC transports
   module JsonRpcCommon
+    include SubscriptionSupport
+
     # JSON-RPC methods with arbitrary side effects that MUST NOT be re-sent
     # automatically. Even a "transient" failure (5xx, dropped connection,
     # malformed response) can arrive AFTER the server received the request,
