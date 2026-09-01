@@ -14,10 +14,13 @@ RSpec.describe 'MCP 2026-07-28 authorization — round 2' do
   let(:logger) { Logger.new(File::NULL) }
   let(:storage) { MCPClient::Auth::OAuthProvider::MemoryStorage.new }
 
+  # Every authorization server here accepts Client ID Metadata Documents
+  # unless a test says otherwise (a portable client is reused only there).
   def as_meta(issuer: 'https://auth.example.com', **extra)
     MCPClient::Auth::ServerMetadata.new(issuer: issuer, authorization_endpoint: "#{issuer}/authorize",
                                         token_endpoint: "#{issuer}/token",
-                                        code_challenge_methods_supported: ['S256'], **extra)
+                                        code_challenge_methods_supported: ['S256'],
+                                        client_id_metadata_document_supported: true, **extra)
   end
 
   def provider_for(**opts)
