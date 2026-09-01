@@ -309,6 +309,7 @@ module MCPClient
     # @return [Hash] empty result on success
     # @raise [MCPClient::Errors::ServerError] if server returns an error
     def log_level=(level)
+      MCPClient::Deprecations.warn(:logging, @logger)
       ensure_connected
       # MCP 2026-07-28 removed logging/setLevel: the level travels per request
       # in _meta["io.modelcontextprotocol/logLevel"].

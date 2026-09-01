@@ -14,6 +14,11 @@ module MCPClient
   # Implementation of MCP server that communicates via Server-Sent Events (SSE)
   # Useful for communicating with remote MCP servers over HTTP
   #
+  # @deprecated The HTTP+SSE transport has been deprecated since MCP
+  #   2025-03-26 and is listed in the 2026-07-28 deprecated features
+  #   registry (SEP-2596; earliest removal three months after SEP-2596 is
+  #   Final). Use {MCPClient::ServerStreamableHTTP}.
+  #
   # @note Elicitation Support (MCP 2025-06-18)
   #   This transport FULLY supports server-initiated elicitation requests via bidirectional
   #   JSON-RPC. The server sends elicitation/create requests via the SSE stream, and the
@@ -88,7 +93,6 @@ module MCPClient
                    retries: 0, retry_backoff: 1, name: nil, logger: nil)
       super(name: name)
       initialize_logger(logger)
-      MCPClient::Deprecations.warn(:http_sse_transport, @logger)
       @max_retries = retries
       @retry_backoff = retry_backoff
       # Normalize base_url: preserve trailing slash if explicitly provided for SSE endpoints
@@ -426,6 +430,7 @@ module MCPClient
     # @return [Hash] empty result on success
     # @raise [MCPClient::Errors::ServerError] if server returns an error
     def log_level=(level)
+      MCPClient::Deprecations.warn(:logging, @logger)
       ensure_initialized
       require_capability!('logging', method: 'logging/setLevel')
       rpc_request('logging/setLevel', { level: level })
@@ -455,6 +460,10 @@ module MCPClient
         effective_timeout = [@read_timeout || 30, 30].min
         wait_for_connection(timeout: effective_timeout)
         start_activity_monitor
+        # The notice is about using the transport: MCPClient.connect builds
+        # (and tries) an SSE server while probing a URL that may end up on
+        # another transport, so only an established connection counts.
+        MCPClient::Deprecations.warn(:http_sse_transport, @logger)
         true
       rescue MCPClient::Errors::ConnectionError => e
         cleanup

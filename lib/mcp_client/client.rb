@@ -65,8 +65,11 @@ module MCPClient
     # @param mcp_server_configs [Array<Hash>] configurations for MCP servers
     # @param logger [Logger, nil] optional logger, defaults to STDOUT
     # @param elicitation_handler [Proc, nil] optional handler for elicitation requests (MCP 2025-06-18)
-    # @param roots [Array<MCPClient::Root, Hash>, nil] optional list of roots (MCP 2025-06-18)
-    # @param sampling_handler [Proc, nil] optional handler for sampling requests (MCP 2025-11-25)
+    # @param roots [Array<MCPClient::Root, Hash>, nil] optional list of roots (MCP 2025-06-18).
+    #   Deprecated since MCP 2026-07-28 (SEP-2577): pass directories or files through tool
+    #   parameters, resource URIs or server configuration instead.
+    # @param sampling_handler [Proc, nil] optional handler for sampling requests (MCP 2025-11-25).
+    #   Deprecated since MCP 2026-07-28 (SEP-2577): integrate directly with the LLM provider API.
     # @param sampling_supports_tools [Boolean] whether the sampling handler supports tool use
     #   (MCP 2025-11-25 / SEP-1577); declares the sampling.tools capability and forwards
     #   tools/toolChoice params to the handler instead of rejecting tool-enabled requests
@@ -434,6 +437,9 @@ module MCPClient
 
     # Set the roots for this client (MCP 2025-06-18)
     # When roots are changed, a notification is sent to all connected servers
+    # @deprecated Roots are deprecated since MCP 2026-07-28 (SEP-2577); pass
+    #   directories or files through tool parameters, resource URIs or server
+    #   configuration instead.
     # @param new_roots [Array<MCPClient::Root, Hash>] the new roots to set
     # @return [void]
     def roots=(new_roots)
@@ -610,6 +616,8 @@ module MCPClient
 
     # Set the logging level on all connected servers (MCP 2025-06-18)
     # To set on a specific server, use: client.find_server('name').log_level = 'debug'
+    # @deprecated Logging is deprecated since MCP 2026-07-28 (SEP-2577); have
+    #   the server log to stderr (stdio) or use OpenTelemetry instead.
     # @param level [String] the log level ('debug', 'info', 'notice', 'warning', 'error',
     #   'critical', 'alert', 'emergency')
     # @return [Array<Hash>] results from servers
@@ -1119,6 +1127,7 @@ module MCPClient
     end
 
     def handle_log_message(server_id, params)
+      MCPClient::Deprecations.warn(:logging, @logger)
       level = params['level'] || 'info'
       logger_name = params['logger']
       data = params['data']

@@ -353,13 +353,16 @@ server.protocol_era       # => :modern or :legacy
 
 A modern server is recognised by its answer to `server/discover`; every
 request then carries `io.modelcontextprotocol/protocolVersion`,
-`clientInfo` and `clientCapabilities` in `_meta`, and on HTTP the
+`io.modelcontextprotocol/clientInfo` and
+`io.modelcontextprotocol/clientCapabilities` in `_meta`, and on HTTP the
 `MCP-Protocol-Version`, `Mcp-Method` and `Mcp-Name` headers. Host-supplied
 metadata (a Hash or a callable evaluated per request) is merged into every
 request with `MCPClient::Client.new(request_meta: ...)`. Force an era with
 `protocol: :modern` / `protocol: :legacy` (default `:auto`) and tune the
-probe with `discover_timeout:`. `ping` maps to `server/discover` and
-`log_level=` to the per-request log level on modern servers. Typed errors
+probe with `discover_timeout:` on `MCPClient.connect`, `stdio_config`,
+`http_config` and `streamable_http_config` (or the server constructors).
+`ping` maps to `server/discover` and `log_level=` to the per-request log
+level on modern servers. Typed errors
 carry the JSON-RPC code: `MCPClient::Errors::HeaderMismatchError`
 (-32020), `MissingRequiredClientCapabilityError` (-32021) and
 `UnsupportedProtocolVersionError` (-32022).
@@ -446,22 +449,29 @@ of Client ID Metadata Documents (`client_id_metadata_url:`). See
 
 ### Deprecated features
 
-MCP 2026-07-28 places these in the Deprecated state of its feature
-lifecycle policy: they keep working for at least twelve months, but new
-integrations should not adopt them. The client logs one notice per feature
+The 2026-07-28 [deprecated features registry](https://modelcontextprotocol.io/specification/2026-07-28/deprecated)
+lists these as Deprecated under the feature lifecycle policy: they keep
+working during their deprecation window, but new integrations should not
+adopt them. Features 2026-07-28 itself deprecates stay for at least twelve
+months; the HTTP+SSE transport and the `includeContext` values were
+deprecated by earlier revisions and may be removed sooner (the registry
+gives the earliest removal of each). The client logs one notice per feature
 per process on first use, naming the suggested migration:
 
-| Feature | Migration |
-|---------|-----------|
-| Roots (`roots:`, `Client#roots=`) | Pass directories or files through tool parameters, resource URIs or server configuration |
-| Sampling (`sampling_handler:`) | Integrate directly with the LLM provider API |
-| Logging (`Client#log_level=`, `notifications/message`) | Log to stderr (stdio) or use OpenTelemetry |
-| HTTP+SSE transport (`MCPClient::ServerSSE`) | Migrate the server to Streamable HTTP |
-| `includeContext` `"thisServer"` / `"allServers"` in sampling requests | Servers omit the field or send `"none"` |
-| OAuth Dynamic Client Registration | Client ID Metadata Documents or pre-registered credentials |
+| Feature | Deprecated since | Migration |
+|---------|------------------|-----------|
+| Roots (`roots:`, `Client#roots=`) | 2026-07-28 (SEP-2577) | Pass directories or files through tool parameters, resource URIs or server configuration |
+| Sampling (`sampling_handler:`) | 2026-07-28 (SEP-2577) | Integrate directly with the LLM provider API |
+| Logging (`log_level=` on the client or a server, `notifications/message`) | 2026-07-28 (SEP-2577) | Log to stderr (stdio) or use OpenTelemetry |
+| HTTP+SSE transport (`MCPClient::ServerSSE`, warned once it is connected) | 2025-03-26 (reclassified by SEP-2596) | Migrate the server to Streamable HTTP |
+| `includeContext` `"thisServer"` / `"allServers"` in sampling requests | 2025-11-25 (reclassified by SEP-2596) | Servers omit the field or send `"none"` |
+| OAuth Dynamic Client Registration | 2026-07-28 (PR #2858) | Client ID Metadata Documents or pre-registered credentials |
 
 `MCPClient::Deprecations::REGISTRY` lists them; set
-`MCPClient::Deprecations.enabled = false` to silence the notices.
+`MCPClient::Deprecations.enabled = false` (before constructing clients) to
+silence the notices. Notices go to the logger the client or server was
+given; without one they go to the default `$stdout` logger like every other
+warning.
 
 ## MCP 2025-11-25 Features
 
@@ -1045,7 +1055,7 @@ client = MCPClient::Client.new(
 )
 ```
 
-Features: PKCE, server discovery (`.well-known`), dynamic registration, token refresh.
+Features: PKCE, server discovery (`.well-known`), RFC 9207 issuer validation, Client ID Metadata Documents, dynamic registration (deprecated fallback), token refresh.
 
 See [OAUTH.md](OAUTH.md) for full documentation.
 

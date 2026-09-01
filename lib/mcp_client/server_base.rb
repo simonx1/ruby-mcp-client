@@ -1,5 +1,7 @@
 # frozen_string_literal: true
 
+require_relative 'deprecations'
+
 module MCPClient
   # Base class for MCP servers - serves as the interface for different server implementations
   class ServerBase

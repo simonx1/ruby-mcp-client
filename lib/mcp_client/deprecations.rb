@@ -1,16 +1,21 @@
 # frozen_string_literal: true
 
 module MCPClient
-  # Deprecation notices for the features MCP 2026-07-28 placed in the
-  # Deprecated state of its feature lifecycle policy (SEP-2596): they keep
-  # working for at least the twelve-month deprecation window, but new
-  # integrations should not adopt them. The client logs one notice per
-  # feature per process, on the first use, and names the suggested migration.
+  # Deprecation notices for the features listed as Deprecated by the MCP
+  # 2026-07-28 deprecated features registry (feature lifecycle policy,
+  # SEP-2596): they keep working during their deprecation window, but new
+  # integrations should not adopt them. The earliest removal of each feature
+  # is set by the registry (https://modelcontextprotocol.io/specification/2026-07-28/deprecated);
+  # the HTTP+SSE transport and the includeContext values were deprecated by
+  # earlier revisions and may go sooner than the features 2026-07-28 itself
+  # deprecates. The client logs one notice per feature per process, on the
+  # first use, and names the suggested migration.
   #
   # Notices can be silenced with `MCPClient::Deprecations.enabled = false`.
   module Deprecations
-    # Every feature the 2026-07-28 revision lists in its deprecated features
-    # registry, keyed by the identifier passed to {.warn}.
+    # Every feature the 2026-07-28 deprecated features registry lists, keyed
+    # by the identifier passed to {.warn}. `since` is the protocol revision
+    # in which the feature entered the Deprecated state.
     REGISTRY = {
       roots: {
         feature: 'Roots',
@@ -32,14 +37,14 @@ module MCPClient
       },
       http_sse_transport: {
         feature: 'The HTTP+SSE transport',
-        since: '2026-07-28',
-        reference: 'SEP-2596 (deprecated since protocol version 2025-03-26)',
+        since: '2025-03-26',
+        reference: 'reclassified by SEP-2596 in 2026-07-28; earliest removal three months after SEP-2596 is Final',
         migration: 'migrate the server to Streamable HTTP (MCPClient::ServerStreamableHTTP)'
       },
       include_context: {
         feature: 'The includeContext values "thisServer" and "allServers"',
-        since: '2026-07-28',
-        reference: 'SEP-2596 (soft-deprecated since protocol version 2025-11-25)',
+        since: '2025-11-25',
+        reference: 'reclassified by SEP-2596 in 2026-07-28',
         migration: 'servers should omit includeContext or send "none"; the values are removed no later than Sampling'
       },
       dynamic_client_registration: {
@@ -66,22 +71,27 @@ module MCPClient
         @enabled
       end
 
-      # Log the notice for a deprecated feature once per process.
+      # Log the notice for a deprecated feature once per process. The notice
+      # counts as emitted only once the logger accepted it: a logger that
+      # drops warnings (level above WARN) or raises leaves it for a later use.
       # @param feature [Symbol] a {REGISTRY} key
       # @param logger [Logger, nil] where the notice goes (a nil logger emits nothing)
       # @param detail [String, nil] peer-supplied context quoted in the notice
       #   (control characters are escaped and the text is bounded)
       # @return [Boolean] true when a notice was written, false when it was
-      #   already emitted or notices are disabled
+      #   already emitted, notices are disabled or the logger drops warnings
       # @raise [ArgumentError] for an unknown feature
       def warn(feature, logger, detail: nil) # rubocop:disable Naming/PredicateMethod
         entry = REGISTRY[feature] or raise ArgumentError, "unknown deprecated feature: #{feature.inspect}"
         return false unless enabled? && logger
+        return false if logger.respond_to?(:warn?) && !logger.warn?
 
-        emitted = @mutex.synchronize { @emitted.add?(feature) }
-        return false unless emitted
+        @mutex.synchronize do
+          return false if @emitted.include?(feature)
 
-        logger.warn(message(entry, detail))
+          logger.warn(message(entry, detail))
+          @emitted << feature
+        end
         true
       end
 
@@ -102,14 +112,15 @@ module MCPClient
 
       # @return [String] the notice text
       def message(entry, detail)
-        text = "#{entry[:feature]} is deprecated in MCP #{entry[:since]} (#{entry[:reference]}); " \
-               "it keeps working during the deprecation window. Migration: #{entry[:migration]}."
+        text = "#{entry[:feature]} is deprecated since MCP #{entry[:since]} (#{entry[:reference]}); " \
+               "it keeps working during its deprecation window. Migration: #{entry[:migration]}."
         detail ? "#{text} Received: #{sanitize(detail)}" : text
       end
 
-      # @return [String] the detail with control characters escaped and its length bounded
+      # @return [String] the detail with control characters (and the Unicode
+      #   line and paragraph separators) escaped and its length bounded
       def sanitize(detail)
-        escaped = detail.to_s.gsub(/[[:cntrl:]]/) { |c| format('\\x%02X', c.ord) }
+        escaped = detail.to_s.gsub(/[[:cntrl:]\u0085\u2028\u2029]/) { |c| format('\\u%04X', c.ord) }
         escaped.length <= MAX_DETAIL_LENGTH ? escaped : "#{escaped[0, MAX_DETAIL_LENGTH]}..."
       end
     end
