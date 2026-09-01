@@ -134,12 +134,14 @@ module MCPClient
       @notification_listeners = []
       # Elicitation handler (MCP 2025-06-18)
       @elicitation_handler = elicitation_handler
-      # Sampling handler (MCP 2025-11-25)
+      # Sampling handler (MCP 2025-11-25; deprecated in 2026-07-28, SEP-2577)
       @sampling_handler = sampling_handler
+      MCPClient::Deprecations.warn(:sampling, @logger) if sampling_handler
       # Whether the sampling handler supports tool use (SEP-1577)
       @sampling_supports_tools = sampling_supports_tools
-      # Roots (MCP 2025-06-18)
+      # Roots (MCP 2025-06-18; deprecated in 2026-07-28, SEP-2577)
       @roots = normalize_roots(roots)
+      MCPClient::Deprecations.warn(:roots, @logger) unless @roots.empty?
       # Register default and user-defined notification handlers on each server
       @servers.each do |server|
         configure_server_identity(server, client_info, request_meta)
@@ -434,6 +436,7 @@ module MCPClient
     # @param new_roots [Array<MCPClient::Root, Hash>] the new roots to set
     # @return [void]
     def roots=(new_roots)
+      MCPClient::Deprecations.warn(:roots, @logger)
       @roots = normalize_roots(new_roots)
       # Notify servers that roots have changed
       notify_roots_changed
@@ -611,6 +614,7 @@ module MCPClient
     # @return [Array<Hash>] results from servers
     # @raise [MCPClient::Errors::ServerError] if server returns an error
     def log_level=(level)
+      MCPClient::Deprecations.warn(:logging, @logger)
       @servers.filter_map do |srv|
         # MCP lifecycle: only use capabilities that were successfully
         # negotiated — skip servers whose NEGOTIATED set lacks logging.
@@ -1880,6 +1884,12 @@ module MCPClient
         return jsonrpc_error_result(-32_602,
                                     'Invalid params: tools/toolChoice provided but the sampling.tools ' \
                                     'capability was not declared')
+      end
+
+      # SEP-2596: "thisServer" / "allServers" are deprecated (omit the field
+      # or send "none"); the request is still served as before.
+      if %w[thisServer allServers].include?(params['includeContext'])
+        MCPClient::Deprecations.warn(:include_context, @logger, detail: "includeContext #{params['includeContext']}")
       end
 
       messages = params['messages'] || []

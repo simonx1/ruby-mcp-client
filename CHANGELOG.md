@@ -5,6 +5,23 @@
 Groundwork for the 2026-07-28 protocol revision (stateless, per-request
 metadata). Each feature lands in its own PR; this section accumulates them.
 
+### Deprecations (feature lifecycle policy)
+
+- **Deprecation notices.** `MCPClient::Deprecations` names every feature
+  the 2026-07-28 revision placed in the Deprecated state (`REGISTRY`) and
+  logs one notice per feature per process on first use, with the suggested
+  migration: Roots (`roots:` / `Client#roots=`), Sampling
+  (`sampling_handler:`), Logging (`Client#log_level=`), the HTTP+SSE
+  transport (`MCPClient::ServerSSE`), the `includeContext` values
+  `thisServer` / `allServers` received in a sampling request (still served)
+  and OAuth Dynamic Client Registration (SEP-2577, SEP-2596, MCP PR #2858).
+  Everything keeps working; `MCPClient::Deprecations.enabled = false`
+  silences the notices.
+- **Documentation.** README documents the 2026-07-28 support (discovery
+  and per-request metadata, multi round-trip requests, `x-mcp-header`,
+  subscriptions, cacheable results, the tasks extension, authorization) and
+  the deprecated features with their migrations.
+
 ### JSON Schema handling
 
 - **The standard assertions are evaluated, patterns are ECMAScript, and
