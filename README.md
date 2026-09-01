@@ -83,6 +83,23 @@ result = client.call_tool('example_tool', { param: 'value' })
 client.cleanup
 ```
 
+### Optional Parallel Search MCP
+
+Users can explicitly opt in to Parallel Search MCP for web search and URL
+fetching. When its tools are used, user-provided search objectives, search
+queries, and requested URLs are sent to Parallel. The hosted endpoint requires
+no Parallel account or API key; existing gateway authentication remains
+unchanged for other MCP servers.
+
+```ruby
+client = MCPClient.connect('https://search.parallel.ai/mcp')
+client.call_tool('web_search', {
+  objective: 'Find official Ruby documentation',
+  search_queries: ['Ruby official documentation']
+})
+client.cleanup
+```
+
 **Transport Detection:**
 
 | URL Pattern | Transport |
