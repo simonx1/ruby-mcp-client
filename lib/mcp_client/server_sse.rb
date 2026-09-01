@@ -514,6 +514,13 @@ module MCPClient
         @sse_conn = nil
 
         @tools = nil
+        @tools_data = nil
+        @prompts = nil
+        @prompts_data = nil
+        @resources_result = nil
+        # Cached results and their hints belong to the connection that is
+        # being torn down (MCP 2026-07-28 caching).
+        clear_result_cache
         # Don't clear auth error as we need it for reporting the correct error
         # Don't reset @consecutive_ping_failures or @reconnect_attempts as they're tracked across reconnections
       end

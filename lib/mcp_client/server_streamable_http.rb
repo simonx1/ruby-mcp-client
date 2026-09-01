@@ -234,7 +234,7 @@ module MCPClient
       begin
         ensure_connected
 
-        refetch_or_serve_stale(:tools, cached) { fetch_tools_list }
+        refetch_or_serve_stale(:tools, stale_fallback_for(:tools, cached)) { fetch_tools_list }
       rescue MCPClient::Errors::ConnectionError, MCPClient::Errors::TransportError, MCPClient::Errors::ServerError
         # Re-raise these errors directly
         raise
@@ -330,7 +330,7 @@ module MCPClient
       @mutex.synchronize { @prompts_data = nil } if cached
       begin
         ensure_connected
-        refetch_or_serve_stale(:prompts, cached) { fetch_prompts_list }
+        refetch_or_serve_stale(:prompts, stale_fallback_for(:prompts, cached)) { fetch_prompts_list }
       rescue MCPClient::Errors::ConnectionError, MCPClient::Errors::TransportError, MCPClient::Errors::ServerError
         raise
       rescue StandardError => e
@@ -389,7 +389,11 @@ module MCPClient
 
       begin
         ensure_connected
-        return refetch_or_serve_stale(:resources, cached) { fetch_resources_list(nil) } unless cursor
+        unless cursor
+          return refetch_or_serve_stale(:resources, stale_fallback_for(:resources, cached)) do
+            fetch_resources_list(nil)
+          end
+        end
 
         fetch_resources_list(cursor)
       rescue MCPClient::Errors::ConnectionError, MCPClient::Errors::TransportError, MCPClient::Errors::ServerError
@@ -1044,6 +1048,7 @@ module MCPClient
       req.headers['Mcp-Protocol-Version'] = @protocol_version if @protocol_version
       # MCP: authorization MUST be included in every HTTP request
       @oauth_provider&.apply_authorization(req)
+      note_request_authorization(req.headers['Authorization'])
       # SEP-1699: resumption is via GET with the Last-Event-ID cursor, so the
       # server can replay messages missed since the last received event.
       last_event_id = @mutex.synchronize { @last_event_id }
@@ -1459,6 +1464,7 @@ module MCPClient
           req.headers['Mcp-Protocol-Version'] = @protocol_version if @protocol_version
           # MCP: authorization MUST be included in every HTTP request
           @oauth_provider&.apply_authorization(req)
+          note_request_authorization(req.headers['Authorization'])
           req.body = json_body
         end
 

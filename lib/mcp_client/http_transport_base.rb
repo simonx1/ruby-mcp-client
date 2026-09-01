@@ -149,7 +149,7 @@ module MCPClient
           req.headers['Mcp-Protocol-Version'] = @protocol_version if @protocol_version
           # MCP: authorization MUST be included in every HTTP request
           @oauth_provider&.apply_authorization(req)
-          track_authorization_context(req.headers['Authorization'])
+          note_request_authorization(req.headers['Authorization'])
         end
 
         if response.success?
@@ -781,7 +781,7 @@ module MCPClient
       # Apply OAuth authorization if available
       @logger.debug("OAuth provider present: #{@oauth_provider ? 'yes' : 'no'}")
       @oauth_provider&.apply_authorization(req)
-      track_authorization_context(req.headers['Authorization'])
+      note_request_authorization(req.headers['Authorization'])
 
       # MCP 2026-07-28: every POST carries MCP-Protocol-Version (matching the
       # body's _meta), Mcp-Method and, for named requests, Mcp-Name.

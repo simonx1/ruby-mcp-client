@@ -18,13 +18,25 @@ module MCPClient
     # @return [String, nil] "public", "private", or nil when absent/unknown
     attr_reader :cache_scope
 
+    # The authorization context (the Authorization header) of the request
+    # that produced a privately scoped entry; such an entry is served only
+    # in that context ("MUST NOT be shared across authorization contexts").
+    # @return [String, nil]
+    attr_accessor :authorization_context
+
     # Build an entry from a CacheableResult.
     # @param result [Hash, nil] the JSON-RPC result carrying ttlMs/cacheScope
     # @param value [Object] what to cache
     # @param now [Float] monotonic receipt time
     # @return [CachedResult]
-    def self.from_result(result, value, now:)
-      ttl = result.is_a?(Hash) && result.key?('ttlMs') ? normalize_ttl(result['ttlMs']) : nil
+    # @param assume_zero [Boolean] treat an absent ttlMs as 0 ("if ttlMs is absent, clients SHOULD
+    #   assume 0"): the rule for a 2026-07-28 server; an older server keeps the client's own heuristic
+    def self.from_result(result, value, now:, assume_zero: false)
+      ttl = if result.is_a?(Hash) && result.key?('ttlMs')
+              normalize_ttl(result['ttlMs'])
+            elsif assume_zero
+              0
+            end
       scope = result.is_a?(Hash) ? result['cacheScope'] : nil
       new(value: value, received_at: now, ttl_ms: ttl, cache_scope: SCOPES.include?(scope) ? scope : nil)
     end
