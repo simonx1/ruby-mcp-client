@@ -182,38 +182,39 @@ module MCPClient
     # @return [Boolean] true if connection was successful
     # @raise [MCPClient::Errors::ConnectionError] if connection fails
     def connect
-      return true if @mutex.synchronize { @connection_established }
+      # Serialized: concurrent first requests must not each run the probe
+      # and possibly settle on different eras (the monitor is reentrant, so
+      # the request plumbing inside may take @mutex again).
+      @mutex.synchronize do
+        return true if @connection_established
 
-      begin
-        @mutex.synchronize do
+        begin
           @connection_established = false
           @initialized = false
-        end
 
-        # Test connectivity with a simple HTTP request
-        test_connection
+          # Test connectivity with a simple HTTP request
+          test_connection
 
-        # Establish the protocol era: server/discover for a modern server, the
-        # initialize handshake for a legacy one.
-        negotiate_protocol
+          # Establish the protocol era: server/discover for a modern server,
+          # the initialize handshake for a legacy one.
+          negotiate_protocol
 
-        # Long-lived GET stream for server events: legacy only. MCP 2026-07-28
-        # removed the GET endpoint; change notifications arrive on
-        # subscriptions/listen streams instead.
-        start_events_connection unless modern?
+          # Long-lived GET stream for server events: legacy only. MCP
+          # 2026-07-28 removed the GET endpoint; change notifications arrive
+          # on subscriptions/listen streams instead.
+          start_events_connection unless modern?
 
-        @mutex.synchronize do
           @connection_established = true
           @initialized = true
-        end
 
-        true
-      rescue MCPClient::Errors::ConnectionError => e
-        cleanup
-        raise e
-      rescue StandardError => e
-        cleanup
-        raise MCPClient::Errors::ConnectionError, "Failed to connect to MCP server at #{@base_url}: #{e.message}"
+          true
+        rescue MCPClient::Errors::ConnectionError => e
+          cleanup
+          raise e
+        rescue StandardError => e
+          cleanup
+          raise MCPClient::Errors::ConnectionError, "Failed to connect to MCP server at #{@base_url}: #{e.message}"
+        end
       end
     end
 

@@ -598,3 +598,230 @@ RSpec.describe 'MCP 2026-07-28 Streamable HTTP modern mode' do
     end
   end
 end
+
+# Review round 2 (codex): every server/discover answer is applied; removed
+# notifications are suppressed once the era is negotiated; a bare -32022
+# without data and a 2xx non-DiscoverResult are legacy answers; tasks/result
+# routes on taskId too.
+RSpec.describe 'MCP 2026-07-28 Streamable HTTP modern mode — review follow-ups' do
+  let(:base_url) { 'https://example.com' }
+  let(:endpoint) { '/mcp' }
+  let(:url) { "#{base_url}#{endpoint}" }
+  let(:server) { MCPClient::ServerStreamableHTTP.new(base_url: base_url, endpoint: endpoint, retries: 0) }
+
+  after { server.cleanup }
+
+  def discover_result(capabilities: { 'tools' => {} })
+    { 'resultType' => 'complete', 'supportedVersions' => ['2026-07-28'], 'capabilities' => capabilities }
+  end
+
+  def json_response(id, result)
+    { status: 200, body: JSON.generate('jsonrpc' => '2.0', 'id' => id, 'result' => result),
+      headers: { 'Content-Type' => 'application/json' } }
+  end
+
+  def legacy_init_result
+    { 'protocolVersion' => '2025-11-25', 'capabilities' => {}, 'serverInfo' => { 'name' => 'l', 'version' => '1' } }
+  end
+
+  def stub(responders)
+    requests = []
+    stub_request(:post, url).to_return do |request|
+      body = JSON.parse(request.body)
+      requests << { headers: request.headers, body: body }
+      responder = responders.fetch(body['method']) { { status: 202, body: '' } }
+      responder.respond_to?(:call) ? responder.call(body, requests) : json_response(body['id'], responder)
+    end
+    stub_request(:get, url).to_return(status: 405, body: '')
+    requests
+  end
+
+  it 'applies every server/discover answer, including the heartbeat' do
+    stub('server/discover' => lambda do |body, requests|
+      probes = requests.count { |r| r[:body]['method'] == 'server/discover' }
+      caps = probes > 1 ? { 'tools' => {}, 'prompts' => {} } : { 'tools' => {} }
+      json_response(body['id'], discover_result(capabilities: caps))
+    end)
+
+    server.connect
+    server.ping
+
+    expect(server.capabilities).to eq({ 'tools' => {}, 'prompts' => {} })
+  end
+
+  it 'validates a later server/discover answer' do
+    stub('server/discover' => lambda do |body, requests|
+      if requests.one? { |r| r[:body]['method'] == 'server/discover' }
+        json_response(body['id'], discover_result)
+      else
+        json_response(body['id'], { 'resultType' => 'complete', 'capabilities' => {} })
+      end
+    end)
+
+    server.connect
+    expect { server.ping }.to raise_error(MCPClient::Errors::ConnectionError, /supportedVersions/)
+  end
+
+  it 'never sends notifications/roots/list_changed to a modern server, even when the notify negotiates the era' do
+    requests = stub('server/discover' => discover_result)
+
+    server.rpc_notify('notifications/roots/list_changed', {})
+
+    expect(requests.map { |r| r[:body]['method'] }).to eq(['server/discover'])
+  end
+
+  it 'falls back to initialize on a bare -32022 without the schema-mandated data' do
+    requests = stub(
+      'server/discover' => lambda do |_b, _r|
+        { status: 400, headers: { 'Content-Type' => 'application/json' },
+          body: JSON.generate('jsonrpc' => '2.0', 'id' => 1, 'error' => { 'code' => -32_022, 'message' => 'blocked' }) }
+      end,
+      'initialize' => legacy_init_result
+    )
+
+    server.connect
+
+    expect(requests.map { |r| r[:body]['method'] }).to eq(%w[server/discover initialize notifications/initialized])
+    expect(server.protocol_era).to eq(:legacy)
+  end
+
+  it 'falls back to initialize on a 2xx scalar or array result' do
+    [[], 'ok', nil].each do |answer|
+      fresh = MCPClient::ServerStreamableHTTP.new(base_url: base_url, endpoint: endpoint, retries: 0)
+      requests = stub('server/discover' => answer, 'initialize' => legacy_init_result)
+
+      fresh.connect
+
+      expect(requests.map { |r| r[:body]['method'] }).to eq(%w[server/discover initialize notifications/initialized])
+      expect(fresh.protocol_era).to eq(:legacy)
+      fresh.cleanup
+    end
+  end
+
+  it 'does not fall back when the retried probe fails after a well-formed -32022' do
+    stub_const('MCPClient::MODERN_PROTOCOL_VERSIONS', %w[2027-01-01 2026-07-28])
+    stub_const('MCPClient::LATEST_PROTOCOL_VERSION', '2027-01-01')
+    requests = stub(
+      'server/discover' => lambda do |body, _r|
+        if body['params']['_meta']['io.modelcontextprotocol/protocolVersion'] == '2027-01-01'
+          { status: 400, headers: { 'Content-Type' => 'application/json' },
+            body: JSON.generate('jsonrpc' => '2.0', 'id' => body['id'],
+                                'error' => { 'code' => -32_022, 'message' => 'Unsupported',
+                                             'data' => { 'supported' => ['2026-07-28'],
+                                                         'requested' => '2027-01-01' } }) }
+        else
+          { status: 500, body: '' }
+        end
+      end,
+      'initialize' => legacy_init_result
+    )
+
+    expect { server.connect }.to raise_error(MCPClient::Errors::ConnectionError)
+    expect(requests.map { |r| r[:body]['method'] }).to eq(%w[server/discover server/discover])
+  end
+
+  it 'routes tasks/result on taskId like the other task methods' do
+    transport = Class.new do
+      include MCPClient::JsonRpcCommon
+
+      attr_accessor :protocol_version
+
+      def initialize
+        @logger = Logger.new(StringIO.new)
+        @protocol_version = '2026-07-28'
+      end
+    end.new
+    request = transport.build_jsonrpc_request('tasks/result', { 'taskId' => 'task-1' }, 1)
+    expect(transport.modern_request_headers(request)['Mcp-Name']).to eq('task-1')
+  end
+end
+
+# Review round 2 (grok): the plain HTTP transport must advertise and accept
+# both response content types (the client MUST support application/json
+# and text/event-stream), and negotiation must be serialized.
+RSpec.describe 'MCP 2026-07-28 modern mode — plain HTTP transport and concurrency' do
+  let(:url) { 'https://example.com/mcp' }
+
+  def discover_result
+    { 'resultType' => 'complete', 'supportedVersions' => ['2026-07-28'], 'capabilities' => { 'tools' => {} } }
+  end
+
+  def sse(*messages)
+    messages.map { |m| "event: message\ndata: #{JSON.generate(m)}\n\n" }.join
+  end
+
+  it 'ServerHTTP sends Accept for both JSON and SSE and parses an SSE-framed DiscoverResult and tool result' do
+    server = MCPClient::ServerHTTP.new(base_url: 'https://example.com', endpoint: '/mcp', retries: 0)
+    notifications = []
+    server.on_notification { |method, _params| notifications << method }
+    requests = []
+    stub_request(:post, url).to_return do |request|
+      body = JSON.parse(request.body)
+      requests << { headers: request.headers, body: body }
+      case body['method']
+      when 'server/discover'
+        { status: 200, body: sse('jsonrpc' => '2.0', 'id' => body['id'], 'result' => discover_result),
+          headers: { 'Content-Type' => 'text/event-stream' } }
+      when 'tools/call'
+        { status: 200,
+          body: sse({ 'jsonrpc' => '2.0', 'method' => 'notifications/progress', 'params' => { 'progress' => 1 } },
+                    { 'jsonrpc' => '2.0', 'id' => 999, 'result' => { 'stale' => true } },
+                    { 'jsonrpc' => '2.0', 'id' => body['id'], 'result' => { 'content' => [] } }),
+          headers: { 'Content-Type' => 'text/event-stream' } }
+      else
+        { status: 200, body: JSON.generate('jsonrpc' => '2.0', 'id' => body['id'], 'result' => { 'tools' => [] }),
+          headers: { 'Content-Type' => 'application/json' } }
+      end
+    end
+
+    expect(server.call_tool('t', {})).to eq({ 'content' => [] })
+    expect(server.protocol_era).to eq(:modern)
+    expect(requests.first[:headers]['Accept']).to include('application/json').and include('text/event-stream')
+    expect(notifications).to eq(['notifications/progress'])
+    server.cleanup
+  end
+
+  it 'ServerHTTP raises TransportError when an SSE body carries no response' do
+    server = MCPClient::ServerHTTP.new(base_url: 'https://example.com', endpoint: '/mcp', retries: 0)
+    stub_request(:post, url).to_return do |request|
+      body = JSON.parse(request.body)
+      if body['method'] == 'server/discover'
+        { status: 200, body: JSON.generate('jsonrpc' => '2.0', 'id' => body['id'], 'result' => discover_result),
+          headers: { 'Content-Type' => 'application/json' } }
+      else
+        { status: 200, body: sse('jsonrpc' => '2.0', 'method' => 'notifications/progress', 'params' => {}),
+          headers: { 'Content-Type' => 'text/event-stream' } }
+      end
+    end
+
+    expect { server.list_tools }.to raise_error(MCPClient::Errors::TransportError, /No JSON-RPC response/)
+    server.cleanup
+  end
+
+  [MCPClient::ServerHTTP, MCPClient::ServerStreamableHTTP].each do |klass|
+    it "#{klass} serializes concurrent first requests so the probe runs once" do
+      server = klass.new(base_url: 'https://example.com', endpoint: '/mcp', retries: 0)
+      probes = 0
+      mutex = Mutex.new
+      stub_request(:post, url).to_return do |request|
+        body = JSON.parse(request.body)
+        if body['method'] == 'server/discover'
+          mutex.synchronize { probes += 1 }
+          sleep 0.05
+          result = discover_result
+        else
+          result = { 'tools' => [] }
+        end
+        { status: 200, body: JSON.generate('jsonrpc' => '2.0', 'id' => body['id'], 'result' => result),
+          headers: { 'Content-Type' => 'application/json' } }
+      end
+      stub_request(:get, url).to_return(status: 405, body: '')
+
+      Array.new(4) { Thread.new { server.list_tools } }.each(&:join)
+
+      expect(probes).to eq(1)
+      expect(server.protocol_era).to eq(:modern)
+      server.cleanup
+    end
+  end
+end

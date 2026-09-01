@@ -15,7 +15,9 @@ RSpec.describe 'HTTP Transport Integration', type: :integration do
       headers: headers,
       read_timeout: 10,
       retries: 1,
-      name: 'integration-test-server'
+      name: 'integration-test-server',
+      # These fixtures model a legacy (initialize-handshake) server
+      protocol: :legacy
     )
   end
 

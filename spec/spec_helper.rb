@@ -33,6 +33,15 @@ RSpec.configure do |config|
     WebMock.reset!
     WebMock.disable_net_connect!(allow_localhost: true)
 
+    # MCP 2026-07-28: every HTTP transport probes with server/discover before
+    # the legacy initialize handshake. Fixtures that model a legacy server
+    # only stub initialize, so answer the probe as a legacy endpoint would
+    # (404 without a JSON-RPC body) unless a spec registers its own stub —
+    # later stubs take precedence — and never let the probe leave the host.
+    stub_request(:post, /.*/)
+      .with(body: ->(body) { body.to_s.include?('"method":"server/discover"') })
+      .to_return(status: 404, body: '')
+
     # Clear any cached HTTP connections that might persist between tests
     Faraday::ConnectionPool.instance_variable_set(:@connections, {}) if defined?(Faraday::ConnectionPool)
   end

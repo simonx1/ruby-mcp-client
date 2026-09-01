@@ -16,7 +16,9 @@ RSpec.describe 'Session Management Integration', type: :integration do
       MCPClient::ServerHTTP.new(
         base_url: base_url,
         endpoint: endpoint,
-        headers: { 'Authorization' => 'Bearer test-token' }
+        headers: { 'Authorization' => 'Bearer test-token' },
+        # Sessions are a legacy (2025-11-25) transport feature
+        protocol: :legacy
       )
     end
 
@@ -201,7 +203,9 @@ RSpec.describe 'Session Management Integration', type: :integration do
       MCPClient::ServerStreamableHTTP.new(
         base_url: base_url,
         endpoint: endpoint,
-        headers: { 'Authorization' => 'Bearer test-token' }
+        headers: { 'Authorization' => 'Bearer test-token' },
+        # Sessions are a legacy (2025-11-25) transport feature
+        protocol: :legacy
       )
     end
 
