@@ -48,6 +48,14 @@ module MCPClient
       new(value: value, received_at: now, ttl_ms: ttl, cache_scope: scope)
     end
 
+    # An entry that is stale from the start: what a change notification
+    # leaves behind so the kind reads as "known and stale", not "unknown".
+    # @param now [Float] monotonic time
+    # @return [CachedResult]
+    def self.stale(now:)
+      new(value: nil, received_at: now, ttl_ms: 0, cache_scope: nil)
+    end
+
     # "Servers MUST provide a ttlMs value that is >= 0"; anything else is
     # treated as 0 (immediately stale).
     # @param raw [Object] the ttlMs member

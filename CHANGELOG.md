@@ -17,11 +17,17 @@ metadata). Each feature lands in its own PR; this section accumulates them.
   shortest-lived page. Legacy servers (no `ttlMs`) keep the previous
   cache-until-notification heuristic. `MCPClient::Client`'s own caches
   consult every server's freshness before serving.
-- **Reads.** `resources/read` results are cached per URI while fresh (never
-  the result of a multi round-trip retry), and dropped on
+- **Reads.** `resources/read` results that carry a `ttlMs` are cached per
+  URI while fresh (never the result of a multi round-trip retry; a read
+  without `ttlMs` — every legacy server — is not cached), and dropped on
   `notifications/resources/updated` for that URI or on
-  `notifications/resources/list_changed`; list caches drop on their
+  `notifications/resources/list_changed`; list caches (tools, prompts,
+  resources and resource templates) are marked stale by their
   `list_changed` notification regardless of TTL.
+- **Authorization context.** Entries cached with `cacheScope: "private"`
+  are dropped when the credentials the transport sends change (a refreshed
+  or different OAuth token, checked before a private entry is served), and
+  every cached result is forgotten on `cleanup` / reconnect.
 - **Stale on failure.** When a re-fetch fails transiently (5xx, connection
   or transport error) the stale list is served with a warning, as the spec
   allows. `server.cache_info(:tools | :prompts | :resources | :templates |

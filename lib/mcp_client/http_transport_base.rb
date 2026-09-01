@@ -10,6 +10,7 @@ require_relative 'http_transport_base/sse_event_scanner'
 require_relative 'http_transport_base/stream_capture'
 require_relative 'http_transport_base/era_detection'
 require_relative 'http_transport_base/listen_stream'
+require_relative 'http_transport_base/cache_support'
 
 require_relative 'http_transport_base/param_headers'
 require_relative 'http_transport_base/stream_recovery'
@@ -29,6 +30,7 @@ module MCPClient
     include RequestRecovery
     include ListCaches
     include ListenStream
+    include CacheSupport
 
     # Lightweight response wrapper for Faraday exception payloads (Hashes),
     # so the exception path and the default path share one challenge pipeline.
@@ -185,6 +187,7 @@ module MCPClient
           req.headers['Mcp-Protocol-Version'] = @protocol_version if @protocol_version
           # MCP: authorization MUST be included in every HTTP request
           @oauth_provider&.apply_authorization(req)
+          track_authorization_context(req.headers['Authorization'])
         end
 
         if response.success?
@@ -762,6 +765,7 @@ module MCPClient
       # Apply OAuth authorization if available
       @logger.debug("OAuth provider present: #{@oauth_provider ? 'yes' : 'no'}")
       @oauth_provider&.apply_authorization(req)
+      track_authorization_context(req.headers['Authorization'])
 
       # MCP 2026-07-28: every POST carries MCP-Protocol-Version (matching the
       # body's _meta), Mcp-Method and, for named requests, Mcp-Name.
