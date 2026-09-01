@@ -318,7 +318,7 @@ module MCPClient
       contents = result['contents'] || []
       contents.map { |content| MCPClient::ResourceContent.from_json(content) }
     rescue MCPClient::Errors::ServerError => e
-      raise resource_not_found_error(uri, e) if MCPClient::Errors::Codes.resource_not_found_code?(e.code)
+      raise resource_not_found_error(uri, e) if resource_not_found_response?(e)
 
       raise MCPClient::Errors::ResourceReadError, "Error reading resource '#{uri}': #{e.message}"
     rescue MCPClient::Errors::ConnectionError, MCPClient::Errors::TransportError

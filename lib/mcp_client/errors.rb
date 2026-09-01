@@ -84,7 +84,9 @@ module MCPClient
       MODERN_ERROR_CODES = [HEADER_MISMATCH, MISSING_REQUIRED_CLIENT_CAPABILITY,
                             UNSUPPORTED_PROTOCOL_VERSION].freeze
 
-      # Codes a resources/read error may carry to mean "resource not found".
+      # Codes a resources/read error may carry to mean "resource not found"
+      # on a modern (2026-07-28+) server. Legacy servers only ever used
+      # -32002; for them -32602 is plain Invalid params.
       RESOURCE_NOT_FOUND_CODES = [INVALID_PARAMS, LEGACY_RESOURCE_NOT_FOUND].freeze
 
       # @param code [Integer, nil] a JSON-RPC error code
@@ -93,10 +95,17 @@ module MCPClient
         MODERN_ERROR_CODES.include?(code)
       end
 
+      # Whether a resources/read error code means the resource does not
+      # exist. 2026-07-28 servers say -32602 (and clients SHOULD still accept
+      # the earlier -32002); a legacy session only ever meant not-found by
+      # -32002, so its -32602 stays a generic Invalid params.
       # @param code [Integer, nil] a JSON-RPC error code from resources/read
+      # @param modern [Boolean] whether the session is a modern protocol revision
       # @return [Boolean] whether it means the resource does not exist
-      def self.resource_not_found_code?(code)
-        RESOURCE_NOT_FOUND_CODES.include?(code)
+      def self.resource_not_found_code?(code, modern: true)
+        return true if code == LEGACY_RESOURCE_NOT_FOUND
+
+        modern && code == INVALID_PARAMS
       end
     end
 

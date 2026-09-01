@@ -33,6 +33,12 @@ module MCPClient
         res = wait_response(init_id)
         begin
           result = process_jsonrpc_response(res) || {}
+        rescue MCPClient::Errors::UnsupportedProtocolVersionError => e
+          # A modern-only server SHOULD name the versions it supports when
+          # rejecting initialize (basic/versioning): surface them, since a
+          # legacy-only configuration has no fall-forward path.
+          raise MCPClient::Errors::ConnectionError,
+                "Initialize failed: #{e.message} (server supports: #{e.supported.join(', ')})"
         rescue MCPClient::Errors::ServerError => e
           raise MCPClient::Errors::ConnectionError, "Initialize failed: #{e.message}"
         end

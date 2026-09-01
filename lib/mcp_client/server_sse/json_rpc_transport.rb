@@ -187,9 +187,13 @@ module MCPClient
 
           unless response.success?
             # 5xx failures are plausibly transient (retryable); 4xx and other
-            # statuses are deterministic and raise a plain (non-retryable) error.
-            error_class = (500..599).cover?(response.status) ? MCPClient::Errors::TransientServerError : MCPClient::Errors::ServerError
-            raise error_class, "Server returned error: #{response.status} #{response.reason_phrase}"
+            # statuses are deterministic and raise a plain (non-retryable)
+            # error — typed when the body carries a JSON-RPC error (MCP
+            # 2026-07-28 protocol errors ride in 400/404 bodies).
+            message = "Server returned error: #{response.status} #{response.reason_phrase}"
+            raise MCPClient::Errors::TransientServerError, message if (500..599).cover?(response.status)
+
+            raise jsonrpc_error_from_http_response(response, message)
           end
 
           response

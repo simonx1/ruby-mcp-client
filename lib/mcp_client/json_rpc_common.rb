@@ -1,5 +1,8 @@
 # frozen_string_literal: true
 
+require 'json'
+require 'zlib'
+
 module MCPClient
   # Shared retry/backoff logic for JSON-RPC transports
   module JsonRpcCommon
@@ -182,6 +185,22 @@ module MCPClient
       }
     end
 
+    # The protocol version in use with this server, once established: chosen
+    # via server/discover for a modern server or negotiated by initialize for
+    # a legacy one. nil until then.
+    # @return [String, nil]
+    def protocol_version
+      defined?(@protocol_version) ? @protocol_version : nil
+    end
+
+    # Whether this server speaks a modern (per-request metadata, no
+    # handshake) protocol revision (MCP 2026-07-28 basic/versioning
+    # "Terminology"). false until the era is established.
+    # @return [Boolean]
+    def modern?
+      MCPClient::MODERN_PROTOCOL_VERSIONS.include?(protocol_version)
+    end
+
     # Generate initialization parameters for MCP protocol
     # @return [Hash] the initialization parameters
     def initialization_params
@@ -298,6 +317,42 @@ module MCPClient
     # @return [Array<String>]
     def accepted_result_types
       CORE_RESULT_TYPES
+    end
+
+    # Build the error for a 4xx response: the typed JSON-RPC error when the
+    # body is a JSON-RPC error response (with the HTTP status prefixed to the
+    # peer's message), otherwise a plain ServerError with the fallback text.
+    # @param response [Faraday::Response] the 4xx response
+    # @param fallback [String] message when the body carries no JSON-RPC error
+    # @return [MCPClient::Errors::ServerError]
+    def jsonrpc_error_from_http_response(response, fallback)
+      error = jsonrpc_error_in_body(response)
+      return MCPClient::Errors::ServerError.new(fallback) unless error
+
+      typed = MCPClient::Errors::ServerError.from_jsonrpc(error)
+      typed.class.new("#{fallback}: #{typed.message}", code: typed.code, data: typed.data)
+    end
+
+    # Extract a JSON-RPC error object from an HTTP error body, if there is one.
+    # Only a small, well-formed body is inspected; anything else is ignored.
+    # @param response [Faraday::Response] the HTTP response
+    # @return [Hash, nil] the JSON-RPC `error` member, or nil
+    def jsonrpc_error_in_body(response)
+      return nil unless response.respond_to?(:body)
+
+      body = response.body
+      return nil unless body.is_a?(String) && !body.empty?
+
+      headers = response.respond_to?(:headers) ? response.headers || {} : {}
+      encoding = headers['content-encoding'] || headers['Content-Encoding'] || ''
+      body = decompress_gzip(body) if encoding.include?('gzip') && respond_to?(:decompress_gzip, true)
+
+      data = JSON.parse(body)
+      error = data.is_a?(Hash) ? data['error'] : nil
+      error.is_a?(Hash) ? error : nil
+    rescue JSON::ParserError, Zlib::Error, MCPClient::Errors::ResponseTooLargeError => e
+      @logger.debug("HTTP error body is not a JSON-RPC error: #{e.class}")
+      nil
     end
 
     # Process JSON-RPC response

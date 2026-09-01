@@ -322,7 +322,10 @@ RSpec.describe MCPClient::HttpTransportBase do
     before do
       allow(response).to receive(:respond_to?).with(:reason_phrase).and_return(true)
       allow(response).to receive(:respond_to?).with(:headers).and_return(true)
+      allow(response).to receive(:respond_to?).with(:body).and_return(true)
       allow(response).to receive(:reason_phrase).and_return('Test Error')
+      allow(response).to receive(:body).and_return('')
+      allow(response).to receive(:headers).and_return({})
     end
 
     describe '#handle_http_error_response' do

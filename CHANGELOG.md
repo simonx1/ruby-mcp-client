@@ -26,10 +26,19 @@ metadata). Each feature lands in its own PR; this section accumulates them.
   for the multi round-trip handling that follows, and any unrecognized value
   raises `MCPClient::Errors::InvalidResultError` (a non-retried
   `ServerError`), as the spec requires.
-- **Resource not found.** A `resources/read` error with code `-32602`
-  (2026-07-28) or the legacy `-32002` now raises
+- **Typed errors from HTTP error bodies.** 2026-07-28 servers carry their
+  protocol errors in the body of an HTTP 400 (and an unknown method as a 404
+  with -32601). The HTTP, Streamable HTTP and SSE transports now parse a
+  JSON-RPC error out of a 4xx body and raise the typed error (with the HTTP
+  status prefixed to the message and the code preserved), so a dual-era
+  client can tell a modern rejection from a legacy one. 5xx responses stay
+  `TransientServerError`.
+- **Resource not found.** A `resources/read` error with the legacy `-32002`
+  code — or `-32602` from a modern (2026-07-28) server — now raises
   `MCPClient::Errors::ResourceNotFound` on every transport instead of a
-  generic `ResourceReadError`.
+  generic `ResourceReadError`. On a legacy session `-32602` stays the
+  generic Invalid params it always was. `protocol_version` / `modern?` are
+  now readable on every transport.
 
 ## 2.1.0 — Hostile-Server Hardening (2026-08-04)
 

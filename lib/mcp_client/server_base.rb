@@ -210,6 +210,15 @@ module MCPClient
       MCPClient::Errors::ResourceNotFound.new("Resource '#{uri}' not found: #{error.message}")
     end
 
+    # Whether a resources/read error response means the resource does not
+    # exist, given this session's protocol era.
+    # @param error [MCPClient::Errors::ServerError] the server's error response
+    # @return [Boolean]
+    def resource_not_found_response?(error)
+      modern = respond_to?(:modern?) && modern?
+      MCPClient::Errors::Codes.resource_not_found_code?(error.code, modern: modern)
+    end
+
     # Safety bound on the number of pages followed when auto-paginating a
     # cursor-based list operation, to protect against a server that returns
     # a nextCursor indefinitely.

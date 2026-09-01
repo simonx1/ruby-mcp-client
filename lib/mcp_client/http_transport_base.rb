@@ -385,7 +385,11 @@ module MCPClient
       when 400..499
         # Deterministic client errors: the request was processed/rejected and
         # will not succeed on retry, so raise a plain (non-retryable) ServerError.
-        raise MCPClient::Errors::ServerError, "Client error: HTTP #{response.status}#{reason_text}"
+        # MCP 2026-07-28 carries its protocol errors in the body of a 400
+        # (HeaderMismatch, UnsupportedProtocolVersion,
+        # MissingRequiredClientCapability) and an unknown method as a 404
+        # with -32601, so a JSON-RPC error body becomes the typed error.
+        raise jsonrpc_error_from_http_response(response, "Client error: HTTP #{response.status}#{reason_text}")
       when 500..599
         # Server-side failures are plausibly transient: raise the retryable
         # subclass so with_retry can re-attempt them.
