@@ -157,7 +157,7 @@ module MCPClient
           handle_line(line)
         end
         # EOF without cleanup: the server exited on its own.
-        handle_server_exit if @initialized && @stdin
+        handle_server_exit if @initialized && @stdin && !@shutting_down
       rescue StandardError
         # Reader thread aborted unexpectedly
       ensure
@@ -789,7 +789,9 @@ module MCPClient
       # being dismantled on purpose: their EOF must not retire whatever
       # replaces it.
       @transport_generation += 1
-
+      # The reader thread will see EOF once stdin closes; that is a shutdown,
+      # not an unexpected exit.
+      @shutting_down = true
       # Subscriptions do not survive the process: keep the ones the host still
       # wants so they are re-sent once the process is re-established
       # (basic/patterns/subscriptions "Graceful Closure").
@@ -816,6 +818,7 @@ module MCPClient
       # The next request re-establishes the process and, on a modern
       # server, re-sends the subscriptions the host still holds.
       @initialized = false
+      @shutting_down = false
     end
 
     # The server process ended on its own (its stdout reached EOF). MCP
@@ -825,6 +828,8 @@ module MCPClient
     # request spawn a fresh process and re-open live subscriptions.
     # @return [void]
     def handle_server_exit
+      return if @shutting_down
+
       @logger.warn('MCP server process ended unexpectedly; it will be restarted on the next request')
       cleanup
     end

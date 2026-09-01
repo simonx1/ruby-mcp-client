@@ -390,3 +390,139 @@ RSpec.describe 'MCP 2026-07-28 subscriptions/listen' do
     end
   end
 end
+
+# Review (codex): listen streams must not be gzip-encoded (the stream is
+# parsed incrementally); a closed per-URI subscription is replaced by a
+# fresh one on the next subscribe_resource; listen rejections go through
+# the usual HTTP error/auth pipeline; a normal shutdown is not an
+# unexpected exit.
+RSpec.describe 'MCP 2026-07-28 subscriptions/listen — review follow-ups' do
+  def discover_result
+    { 'resultType' => 'complete', 'supportedVersions' => ['2026-07-28'],
+      'capabilities' => { 'resources' => { 'subscribe' => true } } }
+  end
+
+  describe 'on Streamable HTTP' do
+    let(:url) { 'https://example.com/mcp' }
+
+    def wait_until(timeout = 2)
+      deadline = Time.now + timeout
+      sleep 0.01 until yield || Time.now > deadline
+      raise 'condition not met in time' unless yield
+    end
+
+    it 'asks for an identity-encoded listen stream' do
+      server = MCPClient::ServerStreamableHTTP.new(base_url: 'https://example.com', endpoint: '/mcp', retries: 0)
+      requests = []
+      stub_request(:post, url).to_return do |request|
+        body = JSON.parse(request.body)
+        requests << { headers: request.headers, body: body }
+        if body['method'] == 'server/discover'
+          { status: 200, body: JSON.generate('jsonrpc' => '2.0', 'id' => body['id'], 'result' => discover_result),
+            headers: { 'Content-Type' => 'application/json' } }
+        else
+          { status: 200, headers: { 'Content-Type' => 'text/event-stream' },
+            body: "event: message\ndata: #{JSON.generate('jsonrpc' => '2.0', 'id' => body['id'],
+                                                         'result' => { 'resultType' => 'complete' })}\n\n" }
+        end
+      end
+
+      subscription = server.listen(notifications: { tools_list_changed: true })
+      wait_until { subscription.closed? }
+
+      listen = requests.find { |r| r[:body]['method'] == 'subscriptions/listen' }
+      expect(listen[:headers]['Accept-Encoding']).to eq('identity')
+      server.cleanup
+    end
+
+    it 'routes a rejected listen through the HTTP error pipeline even with raise_error middleware' do
+      server = MCPClient::ServerStreamableHTTP.new(base_url: 'https://example.com', endpoint: '/mcp', retries: 0,
+                                                   faraday_config: ->(c) { c.response :raise_error })
+      stub_request(:post, url).to_return do |request|
+        body = JSON.parse(request.body)
+        if body['method'] == 'server/discover'
+          { status: 200, body: JSON.generate('jsonrpc' => '2.0', 'id' => body['id'], 'result' => discover_result),
+            headers: { 'Content-Type' => 'application/json' } }
+        else
+          { status: 400, headers: { 'Content-Type' => 'application/json' },
+            body: JSON.generate('jsonrpc' => '2.0', 'id' => body['id'],
+                                'error' => { 'code' => -32_021, 'message' => 'Missing required client capability',
+                                             'data' => { 'requiredCapabilities' => {} } }) }
+        end
+      end
+
+      subscription = server.listen(notifications: { task_ids: ['t'] })
+      wait_until { subscription.closed? }
+
+      expect(subscription.error).to be_a(MCPClient::Errors::MissingRequiredClientCapabilityError)
+      server.cleanup
+    end
+
+    it 'surfaces an insufficient_scope challenge on a listen rejection' do
+      server = MCPClient::ServerStreamableHTTP.new(base_url: 'https://example.com', endpoint: '/mcp', retries: 0)
+      stub_request(:post, url).to_return do |request|
+        body = JSON.parse(request.body)
+        if body['method'] == 'server/discover'
+          { status: 200, body: JSON.generate('jsonrpc' => '2.0', 'id' => body['id'], 'result' => discover_result),
+            headers: { 'Content-Type' => 'application/json' } }
+        else
+          { status: 403, body: '',
+            headers: { 'WWW-Authenticate' => 'Bearer error="insufficient_scope", scope="subs:read"' } }
+        end
+      end
+
+      subscription = server.listen(notifications: { tools_list_changed: true })
+      wait_until { subscription.closed? }
+
+      expect(subscription.error).to be_a(MCPClient::Errors::InsufficientScopeError)
+      expect(subscription.error.scope).to eq('subs:read')
+      server.cleanup
+    end
+  end
+
+  describe 'on stdio' do
+    let(:server) { MCPClient::ServerStdio.new(command: 'echo test', read_timeout: 1) }
+    let(:written) { [] }
+
+    before do
+      allow(server).to receive(:connect).and_return(true)
+      allow(server).to receive(:start_reader)
+      allow(server).to receive(:start_stderr_reader)
+      server.instance_variable_set(:@stdin, double('stdin', flush: nil, closed?: true, close: nil).tap do |d|
+        allow(d).to receive(:puts) { |l| written << JSON.parse(l) }
+      end)
+      allow(server).to receive(:send_request) { |req| written << req }
+      allow(server).to receive(:wait_response) do |id, **_o|
+        { 'jsonrpc' => '2.0', 'id' => id, 'result' => discover_result }
+      end
+    end
+
+    it 'opens a fresh per-URI subscription after the server closed the previous one' do
+      server.subscribe_resource('file:///a')
+      first = written.find { |m| m['method'] == 'subscriptions/listen' }
+      server.handle_line("#{JSON.generate('jsonrpc' => '2.0', 'id' => first['id'],
+                                          'result' => { 'resultType' => 'complete' })}\n")
+
+      server.subscribe_resource('file:///a')
+
+      listens = written.select { |m| m['method'] == 'subscriptions/listen' }
+      expect(listens.size).to eq(2)
+      expect(listens.last['id']).not_to eq(first['id'])
+    end
+
+    it 'does not treat the EOF of a normal shutdown as an unexpected exit' do
+      output = StringIO.new
+      server.instance_variable_set(:@logger, Logger.new(output))
+      server.ping
+      stdout = StringIO.new('')
+      server.instance_variable_set(:@stdout, stdout)
+      server.instance_variable_set(:@stderr, StringIO.new(''))
+      allow(server).to receive(:start_reader).and_call_original
+      reader = server.start_reader
+      server.cleanup
+      reader.join(1)
+
+      expect(output.string).not_to include('ended unexpectedly')
+    end
+  end
+end
