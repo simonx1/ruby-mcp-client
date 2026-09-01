@@ -665,3 +665,78 @@ RSpec.describe 'MCP 2026-07-28 tasks extension — round 2' do
     expect(seen).to include(['tasks/update', 'task-9'])
   end
 end
+
+RSpec.describe 'MCP 2026-07-28 tasks extension — round 3' do
+  def discover_result
+    { 'resultType' => 'complete', 'supportedVersions' => ['2026-07-28'],
+      'capabilities' => { 'tools' => {}, 'extensions' => { TASKS_EXT => {} } } }
+  end
+
+  def detailed_task(status:, id: 'task-1', **extra)
+    now = Time.now.utc.iso8601
+    { 'resultType' => 'complete', 'taskId' => id, 'status' => status, 'createdAt' => now, 'lastUpdatedAt' => now,
+      'ttlMs' => 60_000, 'pollIntervalMs' => 1 }.merge(extra)
+  end
+
+  def call_result(text)
+    { 'content' => [{ 'type' => 'text', 'text' => text }], 'isError' => false }
+  end
+
+  def script_stdio(server, responses)
+    sent = []
+    allow(server).to receive(:connect).and_return(true)
+    allow(server).to receive(:start_reader)
+    allow(server).to receive(:start_stderr_reader)
+    server.instance_variable_set(:@stdin, double('stdin', puts: nil, flush: nil, closed?: true, close: nil))
+    allow(server).to receive(:send_request) { |req| sent << req }
+    allow(server).to receive(:wait_response) do |id, **_opts|
+      responder = responses.shift
+      raise 'no scripted response left' unless responder
+
+      response = responder.respond_to?(:call) ? responder.call(sent.last) : responder
+      response.merge('jsonrpc' => '2.0', 'id' => id)
+    end
+    sent
+  end
+
+  let(:stdio) { MCPClient::ServerStdio.new(command: 'echo test', read_timeout: 1) }
+  let(:client) do
+    allow(MCPClient::ServerFactory).to receive(:create).and_return(stdio)
+    client = MCPClient::Client.new(mcp_server_configs: [{ type: 'stdio', command: 'x' }], extensions: [TASKS_EXT])
+    allow(client).to receive(:sleep)
+    client
+  end
+
+  it 'never retries tasks/update' do
+    expect(MCPClient::JsonRpcCommon::NON_IDEMPOTENT_METHODS).to include('tasks/update')
+  end
+
+  it 'checks the deadline before polling and bounds the poll by the remaining timeout' do
+    script_stdio(stdio, [{ 'result' => discover_result }])
+    expect { client.wait_for_task('task-1', timeout: 0) }.to raise_error(MCPClient::Errors::TaskError, /timed out/i)
+
+    allow(stdio).to receive(:rpc_request).and_call_original
+    allow(stdio).to receive(:rpc_request).with('tasks/get', anything, hash_including(timeout: a_value <= 0.5))
+                                         .and_return(detailed_task(status: 'completed', 'result' => call_result('ok')))
+    expect(client.wait_for_task('task-1', timeout: 0.5).result['content'].first['text']).to eq('ok')
+  end
+
+  it 'ignores a handle from another server when the server is overridden' do
+    other = instance_double(MCPClient::ServerBase, name: 'other')
+    handle = MCPClient::Task.from_json(detailed_task(status: 'completed', 'result' => call_result('from A')),
+                                       server: other, detailed: true)
+    script_stdio(stdio, [{ 'result' => discover_result },
+                         { 'result' => detailed_task(status: 'completed', 'result' => call_result('from B')) },
+                         { 'result' => {} }])
+
+    expect(client.wait_for_task(handle, server: 0).result['content'].first['text']).to eq('from B')
+    expect(client.cancel_task(handle, server: 0).server).to equal(stdio)
+  end
+
+  it 'rejects a completed task that carries no result' do
+    script_stdio(stdio, [{ 'result' => discover_result },
+                         { 'result' => detailed_task(status: 'completed') }])
+
+    expect { client.wait_for_task('task-1') }.to raise_error(MCPClient::Errors::InvalidResultError, /result/)
+  end
+end
