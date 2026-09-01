@@ -42,6 +42,9 @@ module MCPClient
           raise ArgumentError, 'input_responses must be a Hash keyed by input request key'
         end
 
+        # Whatever the outcome (the acknowledgement is eventually consistent
+        # and may be lost), these keys count as answered for later waits.
+        remember_answered_keys(srv, task_id, input_responses.keys.map(&:to_s))
         begin
           srv.rpc_request('tasks/update', { taskId: task_id, inputResponses: input_responses })
           true
@@ -76,6 +79,14 @@ module MCPClient
           raise MCPClient::Errors::TaskError, 'wait_for_task requires an MCP 2026-07-28 server (tasks extension)'
         end
 
+        # A DetailedTask that is already terminal is final: its payload is
+        # authoritative and the server may purge it any moment.
+        if task.is_a?(MCPClient::Task) && task.detailed? && task.terminal? && task.server.equal?(srv)
+          validate_terminal_task!(task)
+          forget_task_keys(srv, task_id)
+          return task
+        end
+
         wait = { task_id: task_id, srv: srv, deadline: timeout && (monotonic_time + timeout), rounds: 0,
                  answered: answered_task_keys(srv, task_id) }
         # The CreateTaskResult seed is not an observation: the first
@@ -90,11 +101,9 @@ module MCPClient
             return current
           end
 
-          # The TTL backstop comes before any handler runs for the task.
-          if current.ttl_elapsed?
-            raise MCPClient::Errors::TaskError,
-                  "Task '#{shown_task_id(task_id)}' did not reach a terminal status within its TTL (createdAt + ttlMs)"
-          end
+          # The TTL backstop comes before any handler runs for the task, and
+          # from now on bounds every poll, even ones that time out.
+          bound_wait_by_ttl(current, wait)
           answer_task_round(current, wait)
 
           sleep(task_poll_delay(current, wait[:deadline]))
@@ -148,9 +157,17 @@ module MCPClient
       # Whether the task lists an input request that has not been answered.
       # @return [Boolean]
       def pending_task_input?(task, answered)
-        return false unless task.input_required? && task.input_requests.is_a?(Hash)
+        return false unless task.input_required?
 
-        task.input_requests.keys.any? { |key| !answered.include?(key) }
+        requests = task.input_requests
+        return false if requests.nil? && !task.detailed?
+        unless requests.is_a?(Hash)
+          raise MCPClient::Errors::InputRequiredError.new(
+            'Malformed input_required task: inputRequests is not an object', data: task.to_h
+          )
+        end
+
+        requests.keys.any? { |key| !answered.include?(key) }
       end
 
       # The inputRequests keys already answered for a task, kept across
@@ -162,6 +179,12 @@ module MCPClient
           @answered_task_keys ||= {}
           @answered_task_keys[[srv.object_id, task_id]] ||= Set.new
         end
+      end
+
+      # @return [void]
+      def remember_answered_keys(srv, task_id, keys)
+        answered = answered_task_keys(srv, task_id)
+        answered_keys_mutex.synchronize { answered.merge(keys) }
       end
 
       # @return [Mutex] guards the answered-key registry (request threads share the client)
@@ -183,9 +206,31 @@ module MCPClient
       # @return [void]
       # @raise [MCPClient::Errors::TaskError]
       def raise_if_past_deadline!(wait)
-        return unless wait[:deadline] && monotonic_time >= wait[:deadline]
+        now = monotonic_time
+        raise_ttl_elapsed!(wait) if wait[:ttl_deadline] && now >= wait[:ttl_deadline]
+        return unless wait[:deadline] && now >= wait[:deadline]
 
         raise MCPClient::Errors::TaskError, "Timed out waiting for task '#{shown_task_id(wait[:task_id])}'"
+      end
+
+      # @raise [MCPClient::Errors::TaskError]
+      def raise_ttl_elapsed!(wait)
+        raise MCPClient::Errors::TaskError,
+              "Task '#{shown_task_id(wait[:task_id])}' did not reach a terminal status within its TTL " \
+              '(createdAt + ttlMs)'
+      end
+
+      # Fold the observed TTL backstop into the wait's deadline.
+      # @return [void]
+      # @raise [MCPClient::Errors::TaskError] when the TTL already elapsed
+      def bound_wait_by_ttl(current, wait)
+        remaining = current.ttl_remaining
+        return unless remaining
+
+        raise_ttl_elapsed!(wait) if remaining <= 0
+        ttl_deadline = monotonic_time + remaining
+        wait[:ttl_deadline] = ttl_deadline
+        wait[:deadline] = [wait[:deadline], ttl_deadline].compact.min
       end
 
       # One tasks/get, bounded by what is left of the wait. A request that
@@ -329,13 +374,22 @@ module MCPClient
           )
         end
 
-        pending = requests.except(*answered)
+        # Reserve the keys before the handlers run, in one step, so two
+        # waits on the same task cannot both answer them; a handler that
+        # fails gives them back.
+        pending = answered_keys_mutex.synchronize do
+          keys = requests.except(*answered)
+          answered.merge(keys.keys)
+          keys
+        end
         return [] if pending.empty?
 
-        responses = srv.fulfil_input_requests(pending, task.to_h)
-        # The keys count as answered once the handlers have run: a lost
-        # acknowledgement must not present the same request again.
-        answered_keys_mutex.synchronize { answered.merge(pending.keys) }
+        begin
+          responses = srv.fulfil_input_requests(pending, task.to_h)
+        rescue StandardError
+          answered_keys_mutex.synchronize { answered.subtract(pending.keys) }
+          raise
+        end
         update_task(task.task_id, responses, server: srv)
         pending.keys
       end
