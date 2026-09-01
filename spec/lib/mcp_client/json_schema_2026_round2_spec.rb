@@ -132,11 +132,13 @@ RSpec.describe 'MCP 2026-07-28 JSON Schema handling — round 2' do
       expect(validator.validate({ 'p' => 'text' }, modern)).to contain_exactly(a_string_matching(%r{#/p}))
     end
 
-    it 'reports draft-specific keywords it does not evaluate' do
-      expect(validator.unsupported_keywords({ 'items' => [], 'additionalItems' => false }))
+    it 'reports draft-specific keywords it does not evaluate under the dialect that defines them' do
+      draft7 = 'http://json-schema.org/draft-07/schema#'
+      expect(validator.unsupported_keywords({ '$schema' => draft7, 'items' => [], 'additionalItems' => false }))
         .to eq(['additionalItems'])
-      expect(validator.unsupported_keywords({ 'dependencies' => {} })).to eq(['dependencies'])
-      expect(validator.unsupported_keywords({ '$recursiveRef' => '#' })).to eq(['$recursiveRef'])
+      expect(validator.unsupported_keywords({ '$schema' => draft7, 'dependencies' => {} })).to eq(['dependencies'])
+      expect(validator.unsupported_keywords({ '$schema' => validator::DRAFT_2019_09, '$recursiveRef' => '#' }))
+        .to eq(['$recursiveRef'])
     end
 
     it 'treats $dynamicRef to another document as unusable' do

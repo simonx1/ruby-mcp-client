@@ -1,6 +1,7 @@
 # frozen_string_literal: true
 
 require 'uri'
+require_relative 'schema_validator/references'
 
 module MCPClient
   # Self-contained JSON Schema validator used to check a tool call result's
@@ -18,18 +19,22 @@ module MCPClient
   # - minimum, maximum, exclusiveMinimum, exclusiveMaximum (numbers)
   # - allOf, anyOf, oneOf, not, if/then/else (composition)
   # - $ref to a location inside the same schema document (`#`, `#/$defs/x`,
-  #   `#/definitions/x`, any JSON pointer), with $defs / definitions; under
-  #   draft-07 a $ref replaces its siblings, under 2019-09 and 2020-12 it
-  #   applies alongside them
+  #   `#/definitions/x`, any JSON pointer, or a plain-name fragment `#name`
+  #   naming an `$anchor` / a draft-07 `$id: "#name"`), with $defs /
+  #   definitions; under draft-07 a $ref replaces its siblings, under
+  #   2019-09 and 2020-12 it applies alongside them
   # - boolean schemas (true / false), at the root or as subschemas
   #
   # MCP 2026-07-28 rules honoured here:
   # - a schema without `$schema` is 2020-12; the dialects in
   #   SUPPORTED_DIALECTS are accepted and any other declared dialect is an
-  #   error (not a permissive pass);
-  # - `$ref` (and `$dynamicRef`) values that do not point inside the document
-  #   (network URIs, relative documents, urn:, file:) are never dereferenced,
-  #   and a schema carrying one is rejected rather than treated as permissive;
+  #   error (not a permissive pass); the keyword grammar follows the dialect
+  #   (DIALECT_KEYWORDS): a keyword the dialect does not define is ignored,
+  #   neither shape-checked nor reported;
+  # - `$ref` (and `$dynamicRef` / `$recursiveRef`) values that do not point
+  #   inside the document (network URIs, relative documents, urn:, file:)
+  #   are never dereferenced, and a schema carrying one is rejected rather
+  #   than treated as permissive;
   # - resource bounds: schema nesting depth, total subschema count, `$ref`
   #   chain length, number of nodes visited, number of errors produced and a
   #   per-validation time budget. Hitting a bound aborts the validation with
@@ -43,6 +48,8 @@ module MCPClient
   # never silent, {.unsupported_keywords} reports which unapplied validation
   # keywords a schema uses; callers surface them as a warning.
   module SchemaValidator
+    extend References
+
     # Raised inside a validation to abandon it (time budget, resource bound).
     class Aborted < StandardError; end
 
@@ -114,8 +121,41 @@ module MCPClient
     # Keywords whose value is data, not schema: never walked, never re-keyed.
     DATA_KEYWORDS = %w[enum const default examples].freeze
 
+    # Keywords that exist only in some dialects, with the dialects that
+    # define them. A keyword absent from this table exists in every
+    # supported dialect. Under a dialect that does not define a keyword the
+    # keyword is an unknown one: ignored, never shape-checked, walked,
+    # evaluated or reported as unsupported.
+    DIALECT_KEYWORDS = {
+      'prefixItems' => [DEFAULT_DIALECT],
+      '$dynamicRef' => [DEFAULT_DIALECT],
+      '$dynamicAnchor' => [DEFAULT_DIALECT],
+      '$recursiveRef' => [DRAFT_2019_09],
+      '$recursiveAnchor' => [DRAFT_2019_09],
+      'additionalItems' => [DRAFT_2019_09, DRAFT_07],
+      'dependencies' => [DRAFT_07],
+      'dependentSchemas' => [DEFAULT_DIALECT, DRAFT_2019_09],
+      'dependentRequired' => [DEFAULT_DIALECT, DRAFT_2019_09],
+      'unevaluatedItems' => [DEFAULT_DIALECT, DRAFT_2019_09],
+      'unevaluatedProperties' => [DEFAULT_DIALECT, DRAFT_2019_09],
+      'contentSchema' => [DEFAULT_DIALECT, DRAFT_2019_09],
+      'minContains' => [DEFAULT_DIALECT, DRAFT_2019_09],
+      'maxContains' => [DEFAULT_DIALECT, DRAFT_2019_09],
+      '$anchor' => [DEFAULT_DIALECT, DRAFT_2019_09]
+    }.freeze
+
+    # Plain-name fragment syntax (JSON Schema 2020-12 Section 8.2.2).
+    ANCHOR_NAME = /\A[A-Za-z_][-A-Za-z0-9._]*\z/
+
+    # @param keyword [String]
+    # @param dialect [String, nil] a canonical dialect, or nil for "any"
+    # @return [Boolean] whether the dialect defines the keyword
+    def self.keyword_known?(keyword, dialect)
+      dialect.nil? || !DIALECT_KEYWORDS.key?(keyword) || DIALECT_KEYWORDS[keyword].include?(dialect)
+    end
+
     # Per-validation state.
-    Context = Struct.new(:root, :deadline, :dialect, :visits, :errors, :speculative, keyword_init: true)
+    Context = Struct.new(:root, :deadline, :dialect, :visits, :errors, :speculative, :anchors, keyword_init: true)
 
     # The dialect a schema declares, or the default.
     # @param schema [Object] the schema
@@ -188,21 +228,38 @@ module MCPClient
         return
       end
 
-      check_ref(schema['$ref'], root, problems) if schema.key?('$ref')
-      check_dynamic_ref(schema['$dynamicRef'], problems) if schema.key?('$dynamicRef')
-      if counter[:dialect] == DEFAULT_DIALECT && schema['items'].is_a?(Array)
+      dialect = counter[:dialect]
+      check_ref(schema['$ref'], root, problems, dialect, counter) if schema.key?('$ref')
+      # draft-07: the $ref replaces its siblings, so the applicators next to
+      # it are never applied and are not preflighted either; $defs /
+      # definitions are a bag of reusable schemas, not applicators, and stay
+      # reachable through references.
+      if dialect == DRAFT_07 && schema.key?('$ref')
+        each_definition(schema) { |sub| walk_schema(sub, root, depth + 1, counter, problems) }
+        return
+      end
+
+      %w[$dynamicRef $recursiveRef].each do |keyword|
+        next unless schema.key?(keyword) && keyword_known?(keyword, dialect)
+
+        check_dynamic_ref(keyword, schema[keyword], problems)
+      end
+      if dialect == DEFAULT_DIALECT && schema['items'].is_a?(Array)
         problems << 'items must be a schema in JSON Schema 2020-12 (positional schemas go in prefixItems)'
       end
-      check_applicator_shapes(schema, problems)
-      each_subschema(schema) { |sub| walk_schema(sub, root, depth + 1, counter, problems) }
+      check_applicator_shapes(schema, dialect, problems)
+      check_exclusive_bounds(schema, dialect, problems)
+      each_subschema(schema, dialect) { |sub| walk_schema(sub, root, depth + 1, counter, problems) }
     end
 
     # Every applicator value must be a schema (object or boolean), an array
     # of schemas or a map of schemas; anything else is not silently read as
-    # "true".
+    # "true". Keywords the dialect does not define are ignored.
     # @return [void]
-    def self.check_applicator_shapes(schema, problems)
+    def self.check_applicator_shapes(schema, dialect, problems)
       schema.each do |keyword, value|
+        next unless keyword_known?(keyword, dialect)
+
         problem = applicator_shape_problem(keyword, value)
         problems << problem if problem
       end
@@ -213,6 +270,8 @@ module MCPClient
       if SUBSCHEMA_KEYWORDS.include?(keyword)
         tuple = keyword == 'items' && all_schemas?(value)
         "#{keyword} must be a schema" unless schema_value?(value) || tuple
+      elsif keyword == 'dependencies'
+        dependencies_shape_problem(value)
       elsif SUBSCHEMA_MAP_KEYWORDS.include?(keyword) && !%w[$defs definitions].include?(keyword)
         # $defs / definitions are a bag of reusable values: an entry that is
         # not a schema only matters once a $ref points at it.
@@ -222,30 +281,82 @@ module MCPClient
       end
     end
 
+    # draft-07: each dependencies entry is a schema or an array of property
+    # names.
+    # @return [String, nil]
+    def self.dependencies_shape_problem(value)
+      return if value.is_a?(Hash) && value.each_value.all? { |v| schema_value?(v) || property_names?(v) }
+
+      'dependencies entries must be schemas or arrays of property names'
+    end
+
+    # @param value [Object]
+    # @return [Boolean] whether value is an array of property names
+    def self.property_names?(value)
+      value.is_a?(Array) && value.all?(String)
+    end
+
+    # draft-07 exclusiveMinimum / exclusiveMaximum are booleans modifying
+    # minimum / maximum; 2019-09 and 2020-12 made them numbers. The other
+    # form is not silently ignored (it would turn a bound into a pass).
+    # @return [void]
+    def self.check_exclusive_bounds(schema, dialect, problems)
+      %w[exclusiveMinimum exclusiveMaximum].each do |keyword|
+        next unless schema.key?(keyword)
+
+        value = schema[keyword]
+        if dialect == DRAFT_07
+          problems << "#{keyword} must be a boolean in draft-07" unless [true, false].include?(value)
+        elsif !value.is_a?(Numeric)
+          problems << "#{keyword} must be a number in #{dialect}"
+        end
+      end
+    end
+
     # @param values [Object]
     # @return [Boolean] whether values is an array of schemas
     def self.all_schemas?(values)
       values.is_a?(Array) && values.all? { |v| schema_value?(v) }
     end
 
-    # Yield every subschema directly under a schema object.
+    # Yield every subschema directly under a schema object (skipping the
+    # keywords the dialect does not define; nil applies no dialect).
     # @return [void]
-    def self.each_subschema(schema, &block)
+    def self.each_subschema(schema, dialect = nil, &block)
       schema.each do |keyword, value|
-        next if DATA_KEYWORDS.include?(keyword)
+        next if DATA_KEYWORDS.include?(keyword) || !keyword_known?(keyword, dialect)
 
-        if SUBSCHEMA_KEYWORDS.include?(keyword)
-          value.is_a?(Array) ? value.each(&block) : yield(value)
-        elsif SUBSCHEMA_MAP_KEYWORDS.include?(keyword) && value.is_a?(Hash)
-          value.each_value(&block)
-        elsif SUBSCHEMA_ARRAY_KEYWORDS.include?(keyword) && value.is_a?(Array)
-          value.each(&block)
-        end
+        subschemas_under(keyword, value).each(&block)
+      end
+    end
+
+    # The subschema positions one keyword holds.
+    # @return [Array<Object>]
+    def self.subschemas_under(keyword, value)
+      if SUBSCHEMA_KEYWORDS.include?(keyword)
+        value.is_a?(Array) ? value : [value]
+      elsif keyword == 'dependencies'
+        # Property-name arrays are data; only the schema entries are walked.
+        value.is_a?(Hash) ? value.values.select { |v| schema_value?(v) } : []
+      elsif SUBSCHEMA_MAP_KEYWORDS.include?(keyword)
+        value.is_a?(Hash) ? value.values : []
+      elsif SUBSCHEMA_ARRAY_KEYWORDS.include?(keyword)
+        value.is_a?(Array) ? value : []
+      else
+        []
+      end
+    end
+
+    # Yield the reusable schemas under $defs / definitions only.
+    # @return [void]
+    def self.each_definition(schema, &block)
+      %w[$defs definitions].each do |keyword|
+        schema[keyword].each_value(&block) if schema[keyword].is_a?(Hash)
       end
     end
 
     # @return [void]
-    def self.check_ref(ref, root, problems)
+    def self.check_ref(ref, root, problems, dialect, counter)
       unless ref.is_a?(String)
         problems << "$ref must be a string, got #{json_type(ref)}"
         return
@@ -256,24 +367,26 @@ module MCPClient
         return
       end
 
-      problem = ref_chain_problem(ref, root)
+      problem = ref_chain_problem(ref, root, dialect, counter)
       problems << problem if problem
     end
 
-    # A `$dynamicRef` is not evaluated, but one pointing outside the document
-    # would need a fetch, which never happens: the schema is unusable.
+    # A `$dynamicRef` / `$recursiveRef` is not evaluated, but one pointing
+    # outside the document would need a fetch, which never happens: the
+    # schema is unusable.
     # @return [void]
-    def self.check_dynamic_ref(ref, problems)
+    def self.check_dynamic_ref(keyword, ref, problems)
       return unless ref.is_a?(String) && external_ref?(ref)
 
-      problems << "external $dynamicRef #{clip(ref.inspect)} is not dereferenced"
+      problems << "external #{keyword} #{clip(ref.inspect)} is not dereferenced"
     end
 
     # Follow a local reference (and the references it leads to) at
     # preflight: every hop must resolve to a schema, the chain must not
     # cycle, and it must stay within MAX_REF_DEPTH.
+    # @param resolver [Hash, Context] holder of the memoized anchor index
     # @return [String, nil] the problem, if any
-    def self.ref_chain_problem(ref, root)
+    def self.ref_chain_problem(ref, root, dialect, resolver)
       seen = []
       current = ref
       loop do
@@ -281,7 +394,7 @@ module MCPClient
         return "$ref chain #{clip(ref.inspect)} exceeds #{MAX_REF_DEPTH} hops" if seen.size >= MAX_REF_DEPTH
 
         seen << current
-        target = resolve_pointer(root, current)
+        target = resolve_reference(root, current, dialect, resolver)
         return "unresolvable local $ref #{clip(current.inspect)}" if target.equal?(UNRESOLVED)
         return "$ref #{clip(current.inspect)} does not point at a schema" unless schema_value?(target)
         return nil unless target.is_a?(Hash) && target.key?('$ref')
@@ -298,46 +411,9 @@ module MCPClient
       value.is_a?(Hash) || value == true || value == false
     end
 
-    # A reference that does not point inside this document: an absolute URI
-    # (http, https, urn, file, ...), a relative document, or anything that
-    # is not a bare fragment. None of these is ever fetched.
-    # @param ref [String]
-    # @return [Boolean]
-    def self.external_ref?(ref)
-      !ref.start_with?('#')
-    end
-
     # Marker for a pointer that does not resolve (nil is a valid schema
     # value position, so it cannot serve as the marker).
     UNRESOLVED = Object.new.freeze
-
-    # Resolve a fragment JSON pointer (`#`, `#/$defs/x`, `#/a~1b`, with
-    # percent-encoding per RFC 6901 Section 6) within the root document.
-    # @param root [Hash] the root schema (string keys)
-    # @param ref [String] the `$ref` value
-    # @return [Object] the referenced value, or UNRESOLVED
-    def self.resolve_pointer(root, ref)
-      fragment = ref.delete_prefix('#')
-      fragment = URI.decode_uri_component(fragment) rescue fragment # rubocop:disable Style/RescueModifier
-      return root if fragment.empty?
-      return UNRESOLVED unless fragment.start_with?('/')
-
-      fragment[1..].split('/', -1).reduce(root) do |node, token|
-        key = token.gsub('~1', '/').gsub('~0', '~')
-        case node
-        when Hash
-          return UNRESOLVED unless node.key?(key)
-
-          node[key]
-        when Array
-          return UNRESOLVED unless key.match?(/\A(0|[1-9]\d*)\z/) && key.to_i < node.length
-
-          node[key.to_i]
-        else
-          return UNRESOLVED
-        end
-      end
-    end
 
     # List the unsupported JSON Schema keywords a schema uses (anywhere: at the
     # top level or nested in subschemas). Property names that merely look like
@@ -347,20 +423,23 @@ module MCPClient
     # @return [Array<String>] unique unsupported keywords, in discovery order
     def self.unsupported_keywords(schema)
       found = []
-      collect_unsupported_keywords(schema, found, 0)
+      declared = dialect(schema)
+      collect_unsupported_keywords(schema, found, 0, declared && canonical_dialect(declared))
       found.uniq
     end
 
-    # Recursively collect unsupported keywords from a schema.
+    # Recursively collect unsupported keywords from a schema (keywords the
+    # dialect does not define are unknown, not unsupported).
     # @param schema [Object] a (sub)schema; non-Hash values are ignored
     # @param found [Array<String>] accumulator
+    # @param dialect [String, nil] the canonical dialect
     # @return [void]
-    def self.collect_unsupported_keywords(schema, found, depth)
+    def self.collect_unsupported_keywords(schema, found, depth, dialect)
       return unless schema.is_a?(Hash) && depth <= MAX_SCHEMA_DEPTH
 
       schema = schema.transform_keys(&:to_s)
-      found.concat(schema.keys & UNSUPPORTED_KEYWORDS)
-      each_subschema(schema) { |sub| collect_unsupported_keywords(sub, found, depth + 1) }
+      found.concat((schema.keys & UNSUPPORTED_KEYWORDS).select { |k| keyword_known?(k, dialect) })
+      each_subschema(schema, dialect) { |sub| collect_unsupported_keywords(sub, found, depth + 1, dialect) }
     end
 
     # Validate data against a schema. An unusable schema (see
@@ -380,7 +459,7 @@ module MCPClient
       deadline ||= Process.clock_gettime(Process::CLOCK_MONOTONIC) + PATTERN_MATCH_TIMEOUT
       root = schema.is_a?(Hash) ? deep_stringify(schema) : schema
       ctx = Context.new(root: root, deadline: deadline, dialect: canonical_dialect(dialect(root)),
-                        visits: 0, errors: 0, speculative: 0)
+                        visits: 0, errors: 0, speculative: 0, anchors: nil)
       validate_node(data, root, path, ctx, 0)
     rescue Aborted => e
       ["#{path}: validation aborted: #{e.message}"]
@@ -412,7 +491,7 @@ module MCPClient
       when Hash then errors.concat(validate_object(data, schema, path, ctx, ref_depth))
       when Array then errors.concat(validate_array(data, schema, path, ctx, ref_depth))
       when String then errors.concat(validate_string(data, schema, path, ctx.deadline))
-      when Numeric then errors.concat(validate_number(data, schema, path))
+      when Numeric then errors.concat(validate_number(data, schema, path, ctx.dialect))
       end
       errors.concat(validate_composition(data, schema, path, ctx, ref_depth))
       count_errors(ctx, errors)
@@ -466,7 +545,7 @@ module MCPClient
         raise Aborted, "$ref chain exceeds #{MAX_REF_DEPTH} hops (cycle?) at #{clip(ref.inspect)}"
       end
 
-      target = resolve_pointer(ctx.root, ref)
+      target = resolve_reference(ctx.root, ref, ctx.dialect, ctx)
       return count_errors(ctx, ["#{path}: unresolvable local $ref #{clip(ref.inspect)}"]) if target.equal?(UNRESOLVED)
       unless schema_value?(target)
         return count_errors(ctx, ["#{path}: $ref #{clip(ref.inspect)} does not point at a schema"])
@@ -721,19 +800,31 @@ module MCPClient
       [remaining, MIN_PATTERN_MATCH_TIMEOUT].max
     end
 
-    # Validate a number against inclusive/exclusive bounds.
+    # Validate a number against inclusive/exclusive bounds. Under draft-07
+    # `exclusiveMinimum: true` / `exclusiveMaximum: true` make `minimum` /
+    # `maximum` exclusive; 2019-09 and 2020-12 carry the bound in the
+    # keyword itself.
     # @param data [Numeric] the number
     # @param schema [Hash] string-keyed schema
     # @param path [String] location for error messages
+    # @param dialect [String, nil] the canonical dialect
     # @return [Array<String>] validation errors
-    def self.validate_number(data, schema, path)
+    def self.validate_number(data, schema, path, dialect = nil)
       errors = []
       minimum = schema['minimum']
       maximum = schema['maximum']
       exclusive_min = schema['exclusiveMinimum']
       exclusive_max = schema['exclusiveMaximum']
-      errors << "#{path}: value #{data} is less than minimum #{minimum}" if minimum.is_a?(Numeric) && data < minimum
-      errors << "#{path}: value #{data} is greater than maximum #{maximum}" if maximum.is_a?(Numeric) && data > maximum
+      if dialect == DRAFT_07
+        exclusive_min = exclusive_min == true ? minimum : nil
+        exclusive_max = exclusive_max == true ? maximum : nil
+      end
+      if minimum.is_a?(Numeric) && data < minimum && exclusive_min.nil?
+        errors << "#{path}: value #{data} is less than minimum #{minimum}"
+      end
+      if maximum.is_a?(Numeric) && data > maximum && exclusive_max.nil?
+        errors << "#{path}: value #{data} is greater than maximum #{maximum}"
+      end
       if exclusive_min.is_a?(Numeric) && data <= exclusive_min
         errors << "#{path}: value #{data} must be greater than exclusiveMinimum #{exclusive_min}"
       end
