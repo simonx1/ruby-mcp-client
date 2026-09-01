@@ -50,9 +50,30 @@ module MCPClient
     # @param value [Object] what the cache holds for this kind (may be nil: hint only)
     # @return [MCPClient::CachedResult]
     def record_cache_hint(kind, result, value = nil)
-      entry = MCPClient::CachedResult.from_result(result, value, now: monotonic_now)
+      entry = cache_entry_for(result, value, now: monotonic_now)
       cache_entries_mutex.synchronize { cache_entries[kind] = entry }
       entry
+    end
+
+    # Build the entry for one result: an absent ttlMs counts as 0 on a
+    # 2026-07-28 server, and the entry remembers the authorization context
+    # of the request that produced it (transports that know it).
+    # @return [MCPClient::CachedResult]
+    def cache_entry_for(result, value, now:)
+      entry = MCPClient::CachedResult.from_result(result, value, now: now, assume_zero: assume_zero_ttl?)
+      bind_authorization_context(entry)
+    end
+
+    # @param entry [MCPClient::CachedResult]
+    # @return [MCPClient::CachedResult] the same entry, bound to the current request's context
+    def bind_authorization_context(entry)
+      entry.authorization_context = request_authorization_context if respond_to?(:request_authorization_context, true)
+      entry
+    end
+
+    # @return [Boolean] whether an absent ttlMs means "immediately stale" (2026-07-28 servers)
+    def assume_zero_ttl?
+      respond_to?(:modern?) && modern?
     end
 
     # Record the hint of an auto-paginated list from its pages (shortest TTL wins).
@@ -66,11 +87,12 @@ module MCPClient
       entries = page_results.each_with_index.filter_map do |result, index|
         next unless result.is_a?(Hash)
 
-        MCPClient::CachedResult.from_result(result, nil, now: (received_ats && received_ats[index]) || now)
+        MCPClient::CachedResult.from_result(result, nil, now: (received_ats && received_ats[index]) || now,
+                                                         assume_zero: assume_zero_ttl?)
       end
       return nil if entries.empty?
 
-      combined = MCPClient::CachedResult.combine(entries, value, now: now)
+      combined = bind_authorization_context(MCPClient::CachedResult.combine(entries, value, now: now))
       cache_entries_mutex.synchronize { cache_entries[kind] = combined }
       combined
     end
@@ -102,10 +124,31 @@ module MCPClient
     # @return [MCPClient::CachedResult, nil]
     def private_entry_for_current_context(kind)
       entry = cache_entries_mutex.synchronize { cache_entries[kind] }
-      return entry unless entry&.cache_scope == 'private' && respond_to?(:ensure_authorization_context!, true)
+      return entry if entry_in_current_context?(entry)
 
-      ensure_authorization_context!
-      cache_entries_mutex.synchronize { cache_entries[kind] }
+      # Another context's private entry reads as known-and-stale, never as
+      # "nothing cached" (which would count as fresh) and never as a value.
+      MCPClient::CachedResult.stale(now: monotonic_now)
+    end
+
+    # @param entry [MCPClient::CachedResult, nil]
+    # @return [Boolean] whether the entry may be served in the current authorization context
+    def entry_in_current_context?(entry)
+      return true unless entry&.cache_scope == 'private' && respond_to?(:current_authorization_context, true)
+
+      entry.authorization_context == current_authorization_context
+    end
+
+    # The stale copy that may be served when a re-fetch fails: never a
+    # private entry from another authorization context.
+    # @param kind [Symbol]
+    # @param cached [Object, nil] the transport's cached value for the kind
+    # @return [Object, nil]
+    def stale_fallback_for(kind, cached)
+      return nil unless cached
+
+      entry = cache_entries_mutex.synchronize { cache_entries[kind] }
+      entry_in_current_context?(entry) ? cached : nil
     end
 
     # The freshness hint recorded for an operation.
@@ -180,7 +223,7 @@ module MCPClient
       contents = ((result.is_a?(Hash) && result['contents']) || []).map do |content|
         MCPClient::ResourceContent.from_json(content)
       end
-      entry = MCPClient::CachedResult.from_result(result, contents, now: monotonic_now)
+      entry = cache_entry_for(result, contents, now: monotonic_now)
       # A read is cached only on an explicit ttlMs: "if ttlMs is absent,
       # clients SHOULD assume 0" — and reads were never cached before this
       # revision, so a legacy server keeps that behaviour. A result reached

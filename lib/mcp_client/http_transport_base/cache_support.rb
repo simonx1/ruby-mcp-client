@@ -27,26 +27,23 @@ module MCPClient
         stale
       end
 
-      # Notice a change of authorization context (a refreshed or different
-      # access token): privately scoped cache entries belong to the previous
-      # one and are dropped (MCP 2026-07-28 caching, cacheScope "private").
-      # @param authorization [String, nil] the Authorization header about to be sent
+      # Remember the Authorization header a request goes out with, on the
+      # thread that sends it, so the result it brings back can be bound to
+      # that context (MCP 2026-07-28 caching, cacheScope "private").
+      # @param authorization [String, nil] the Authorization header of the request
       # @return [void]
-      def track_authorization_context(authorization)
-        previous = @mutex.synchronize do
-          seen = @authorization_context
-          @authorization_context = authorization
-          seen
-        end
-        invalidate_private_cache if !previous.nil? && previous != authorization
+      def note_request_authorization(authorization)
+        Thread.current[request_authorization_key] = authorization
       end
 
-      # Re-check the authorization context without sending a request (before a
-      # privately scoped cache entry is served): the credentials the next
-      # request would carry decide whether the entry is still ours.
-      # @return [void]
-      def ensure_authorization_context!
-        track_authorization_context(current_authorization_context)
+      # @return [String, nil] the Authorization header of the request this thread last sent
+      def request_authorization_context
+        Thread.current[request_authorization_key]
+      end
+
+      # @return [Symbol] the thread-local key of this transport's request authorization
+      def request_authorization_key
+        :"mcp_client_request_authorization_#{object_id}"
       end
 
       # @return [String, nil] the Authorization header the next request would carry

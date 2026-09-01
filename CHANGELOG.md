@@ -24,10 +24,13 @@ metadata). Each feature lands in its own PR; this section accumulates them.
   `notifications/resources/list_changed`; list caches (tools, prompts,
   resources and resource templates) are marked stale by their
   `list_changed` notification regardless of TTL.
-- **Authorization context.** Entries cached with `cacheScope: "private"`
-  are dropped when the credentials the transport sends change (a refreshed
-  or different OAuth token, checked before a private entry is served), and
-  every cached result is forgotten on `cleanup` / reconnect.
+- **Authorization context.** An entry cached with `cacheScope: "private"`
+  is bound to the `Authorization` the request that produced it went out
+  with, and is served (or offered as a stale fallback) only while the
+  transport would send the same credentials; every cached result is
+  forgotten on `cleanup` / reconnect. On a 2026-07-28 server a list or page
+  without `ttlMs` counts as immediately stale, as the spec asks; legacy
+  servers keep the cache-until-notification heuristic.
 - **Stale on failure.** When a re-fetch fails transiently (5xx, connection
   or transport error) the stale list is served with a warning, as the spec
   allows. `server.cache_info(:tools | :prompts | :resources | :templates |
