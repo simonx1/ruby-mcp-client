@@ -45,13 +45,17 @@ module MCPClient
           raise ArgumentError, 'input_responses must be a Hash keyed by input request key'
         end
 
-        # Whatever the outcome (the acknowledgement is eventually consistent
-        # and may be lost), these keys count as answered for later waits.
-        remember_answered_keys(srv, task_id, input_responses.keys.map(&:to_s))
+        # An ambiguous outcome (the acknowledgement is eventually consistent
+        # and may be lost) leaves these keys answered for later waits; a
+        # definite rejection gives them back, since the server did not take
+        # the answers.
+        keys = input_responses.keys.map(&:to_s)
+        remember_answered_keys(srv, task_id, keys)
         begin
           srv.rpc_request('tasks/update', { taskId: task_id, inputResponses: input_responses })
           true
         rescue MCPClient::Errors::ServerError => e
+          release_answered_keys(srv, task_id, keys)
           raise if e.protocol_error?
 
           raise task_error_from(e, task_id, 'updating', modern: true, method: 'tasks/update')
@@ -90,33 +94,40 @@ module MCPClient
           return task
         end
 
-        wait = { task_id: task_id, srv: srv, deadline: timeout && (monotonic_time + timeout),
+        # The caller's deadline and the task's TTL backstop are kept apart:
+        # the TTL may change with every observation (the server MAY extend
+        # it) while the caller's timeout never moves.
+        wait = { task_id: task_id, srv: srv, deadline: timeout && (monotonic_time + timeout), ttl_deadline: nil,
                  answered: answered_task_keys(srv, task_id), last: nil }
         # The CreateTaskResult seed is not an observation: the first
-        # tasks/get goes out at once, and only DetailedTasks drive the wait.
+        # tasks/get goes out at once, whatever the seed claims. Its TTL
+        # still bounds a wait whose polls never come back.
+        seed_ttl_deadline(task, wait) if task.is_a?(MCPClient::Task)
         loop do
           current = observe_task(wait)
           # A poll that timed out is no observation: try again at the pace
-          # the server last asked for.
+          # the server last asked for, unless the wait is over.
           unless current
+            raise_if_past_deadline!(wait)
             next sleep(wait[:last] ? task_poll_delay(wait[:last],
-                                                     wait[:deadline]) : MIN_TASK_POLL_INTERVAL)
+                                                     wait_deadline(wait)) : MIN_TASK_POLL_INTERVAL)
           end
 
           wait[:last] = current
-          retransmit_pending_update(wait)
-
           if current.terminal?
             forget_task_keys(srv, task_id)
             return current
           end
 
           # The TTL backstop comes before any handler runs for the task, and
-          # from now on bounds every poll, even ones that time out.
+          # from now on bounds every poll, even ones that time out. A poll
+          # that came back late (transport retries) ends the wait here.
           bound_wait_by_ttl(current, wait)
+          raise_if_past_deadline!(wait)
+          retransmit_pending_update(wait)
           answer_task_round(current, wait)
 
-          sleep(task_poll_delay(current, wait[:deadline]))
+          sleep(task_poll_delay(current, wait_deadline(wait)))
         end
       end
 
@@ -208,14 +219,38 @@ module MCPClient
       def task_state(srv, task_id)
         answered_keys_mutex.synchronize do
           @task_states ||= {}
-          @task_states[[srv.object_id, task_id]] ||= { answered: Set.new, rounds: 0, pending_update: nil }
+          @task_states[[srv.object_id, task_id]] ||= { answered: Set.new, submitted: Set.new, rounds: 0,
+                                                       pending_update: nil }
         end
       end
 
+      # Record keys whose answers were handed to the transport by
+      # {#update_task}: they stay answered even if a handler that reserved
+      # them fails afterwards.
       # @return [void]
       def remember_answered_keys(srv, task_id, keys)
-        answered = answered_task_keys(srv, task_id)
-        answered_keys_mutex.synchronize { answered.merge(keys) }
+        state = task_state(srv, task_id)
+        answered_keys_mutex.synchronize do
+          state[:answered].merge(keys)
+          state[:submitted].merge(keys)
+        end
+      end
+
+      # Give back keys the server definitely did not take.
+      # @return [void]
+      def release_answered_keys(srv, task_id, keys)
+        state = task_state(srv, task_id)
+        answered_keys_mutex.synchronize do
+          state[:answered].subtract(keys)
+          state[:submitted].subtract(keys)
+        end
+      end
+
+      # The wait's effective deadline: the earlier of the caller's timeout
+      # and the latest TTL backstop.
+      # @return [Float, nil]
+      def wait_deadline(wait)
+        [wait[:deadline], wait[:ttl_deadline]].compact.min
       end
 
       # @return [Mutex] guards the answered-key registry (request threads share the client)
@@ -250,11 +285,13 @@ module MCPClient
         sanitize_peer_log_text(task_id.to_s)
       end
 
+      # The TTL backstop counts only once a poll has been tried: a seed that
+      # already looks expired is still confirmed by tasks/get.
       # @return [void]
       # @raise [MCPClient::Errors::TaskError]
       def raise_if_past_deadline!(wait)
         now = monotonic_time
-        raise_ttl_elapsed!(wait) if wait[:ttl_deadline] && now >= wait[:ttl_deadline]
+        raise_ttl_elapsed!(wait) if wait[:polled] && wait[:ttl_deadline] && now >= wait[:ttl_deadline]
         return unless wait[:deadline] && now >= wait[:deadline]
 
         raise MCPClient::Errors::TaskError, "Timed out waiting for task '#{shown_task_id(wait[:task_id])}'"
@@ -267,7 +304,16 @@ module MCPClient
               '(createdAt + ttlMs)'
       end
 
-      # Fold the observed TTL backstop into the wait's deadline.
+      # The seed's TTL backstop (see #raise_if_past_deadline! for why an
+      # expired-looking seed does not end the wait before the first poll).
+      # @return [void]
+      def seed_ttl_deadline(task, wait)
+        remaining = task.ttl_remaining
+        wait[:ttl_deadline] = monotonic_time + [remaining, 0.0].max if remaining
+      end
+
+      # Record the latest TTL backstop (createdAt + ttlMs) of the task; a
+      # later observation replaces it, so an extended TTL extends the wait.
       # @return [void]
       # @raise [MCPClient::Errors::TaskError] when the TTL already elapsed
       def bound_wait_by_ttl(current, wait)
@@ -275,9 +321,7 @@ module MCPClient
         return unless remaining
 
         raise_ttl_elapsed!(wait) if remaining <= 0
-        ttl_deadline = monotonic_time + remaining
-        wait[:ttl_deadline] = ttl_deadline
-        wait[:deadline] = [wait[:deadline], ttl_deadline].compact.min
+        wait[:ttl_deadline] = monotonic_time + remaining
       end
 
       # One tasks/get, bounded by what is left of the wait. A request that
@@ -286,7 +330,8 @@ module MCPClient
       # and the caller polls again.
       # @return [MCPClient::Task, nil]
       def poll_task(wait)
-        deadline = wait[:deadline]
+        wait[:polled] = true
+        deadline = wait_deadline(wait)
         # The request never outlives the wait (a tiny positive floor keeps
         # the transport from reading 0 as "no timeout").
         remaining = deadline && [deadline - monotonic_time, MIN_TASK_REQUEST_TIMEOUT].max
@@ -425,7 +470,8 @@ module MCPClient
 
         # Reserve the keys before the handlers run, in one step, so two
         # waits on the same task cannot both answer them; a handler that
-        # fails gives them back.
+        # fails gives them back, except those answered through #update_task
+        # in the meantime.
         pending = answered_keys_mutex.synchronize do
           keys = requests.except(*answered)
           answered.merge(keys.keys)
@@ -436,7 +482,8 @@ module MCPClient
         begin
           responses = srv.fulfil_input_requests(pending, task.to_h)
         rescue StandardError
-          answered_keys_mutex.synchronize { answered.subtract(pending.keys) }
+          submitted = task_state(srv, task.task_id)[:submitted]
+          answered_keys_mutex.synchronize { answered.subtract(pending.keys - submitted.to_a) }
           raise
         end
         deliver_task_update(task.task_id, responses, srv)

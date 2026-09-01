@@ -6,6 +6,7 @@ require_relative 'client/sampling_validation'
 require_relative 'deep_copy'
 require_relative 'client/list_aggregation'
 require_relative 'client/cache_slices'
+require_relative 'client/task_support'
 
 module MCPClient
   # MCP Client for integrating with the Model Context Protocol
@@ -513,9 +514,13 @@ module MCPClient
         return stream unless tasks_extension? && modern_server?(server)
 
         # MCP 2026-07-28 tasks extension: a chunk may be a task; resolve it
-        # to the call's result as #call_tool does.
+        # to the call's result, validated as #call_tool does.
         Enumerator.new do |yielder|
-          stream.each { |chunk| yielder << complete_task_result(tool_name, server, chunk) }
+          stream.each do |chunk|
+            next yielder << chunk unless task_result?(chunk)
+
+            yielder << validate_structured_content!(tool, complete_task_result(tool_name, server, chunk))
+          end
         end
       rescue MCPClient::Errors::ConnectionError => e
         # Add server identity information to the error for better context
@@ -709,7 +714,8 @@ module MCPClient
 
         raise task_error_from(e, task_id, 'getting result for')
       rescue MCPClient::Errors::TransportError, MCPClient::Errors::ConnectionError => e
-        raise MCPClient::Errors::TaskError, "Error getting result for task '#{task_id}': #{e.message}"
+        raise MCPClient::Errors::TaskError, "Error getting result for task '#{shown_task_id(task_id)}': " \
+                                            "#{sanitize_peer_log_text(e.message)}"
       end
     end
 
