@@ -53,9 +53,11 @@ module MCPClient
       def current_authorization_context
         return authorization_fingerprint(@headers['Authorization'] || @headers['authorization']) unless @oauth_provider
 
-        probe = HeaderProbe.new({})
+        # The probe starts from the configured headers, as a real request
+        # does: a provider without a token leaves a static header in place.
+        probe = HeaderProbe.new(@headers.to_h.dup)
         @oauth_provider.apply_authorization(probe)
-        authorization_fingerprint(probe.headers['Authorization'])
+        authorization_fingerprint(probe.headers['Authorization'] || probe.headers['authorization'])
       end
 
       # Minimal request stand-in for asking the OAuth provider which

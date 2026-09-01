@@ -342,7 +342,10 @@ RSpec.describe 'MCP 2026-07-28 cacheable results' do
       client.list_tools
       client.call_tool('t', {})
 
-      expect(counts['tools/list']).to eq(3)
+      # Two client-level lists, the tool resolution for the call, and the
+      # x-mcp-header derivation of the call itself (a stale list is never
+      # used to mirror arguments into headers).
+      expect(counts['tools/list']).to eq(4)
       client.cleanup
     end
 
@@ -571,7 +574,7 @@ RSpec.describe 'MCP 2026-07-28 cacheable results — round 3' do
     server.list_tools
     server.cleanup
 
-    expect(server.cache_info(:read, 'file:///a')).to include(fresh: false)
+    expect(server.cache_info(:read, 'file:///a')).to be_nil
     expect(server.cache_info(:tools)).to include(fresh: false)
     expect(server.read_resource('file:///a').first.text).to eq('read 2')
   ensure

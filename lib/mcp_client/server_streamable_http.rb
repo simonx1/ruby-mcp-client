@@ -224,7 +224,7 @@ module MCPClient
     # @raise [MCPClient::Errors::TransportError] if response isn't valid JSON
     # @raise [MCPClient::Errors::ToolCallError] for other errors during tool listing
     def list_tools
-      cached = @mutex.synchronize { @tools }
+      cached = cached_list_value(:tools) || @mutex.synchronize { @tools }
       # MCP 2026-07-28 caching: a cached list is served only while fresh.
       return cached if cached && cache_fresh?(:tools)
 
@@ -336,7 +336,7 @@ module MCPClient
     # @return [Array<MCPClient::Prompt>] list of available prompts
     # @raise [MCPClient::Errors::PromptGetError] if prompts list retrieval fails
     def list_prompts
-      cached = @mutex.synchronize { @prompts }
+      cached = cached_list_value(:prompts) || @mutex.synchronize { @prompts }
       return cached if cached && cache_fresh?(:prompts)
 
       @mutex.synchronize { @prompts_data = nil } if cached
@@ -357,8 +357,11 @@ module MCPClient
 
       generation = @mutex.synchronize { list_generation(:prompts) }
       prompts_data = request_prompts_list
-      prompts = prompts_data.map do |prompt_data|
-        MCPClient::Prompt.from_json(prompt_data, server: self)
+      @mutex.synchronize do
+        @prompts = prompts_data.map do |prompt_data|
+          MCPClient::Prompt.from_json(prompt_data, server: self)
+        end
+        attach_list_value(:prompts, @prompts)
       end
       # A list invalidated while in flight is returned but not cached.
       @mutex.synchronize { @prompts = prompts if list_generation(:prompts) == generation }
@@ -396,7 +399,7 @@ module MCPClient
     # @return [Hash] result containing resources array and optional nextCursor
     # @raise [MCPClient::Errors::ResourceReadError] if resources list retrieval fails
     def list_resources(cursor: nil)
-      cached = @mutex.synchronize { @resources_result }
+      cached = cached_list_value(:resources) || @mutex.synchronize { @resources_result }
       return cached if cached && !cursor && cache_fresh?(:resources)
 
       begin
@@ -434,7 +437,10 @@ module MCPClient
 
       # A list invalidated while in flight is returned but not cached.
       @mutex.synchronize do
-        @resources_result = resources_result if !cursor && list_generation(:resources) == generation
+        unless cursor
+          @resources_result = resources_result
+          attach_list_value(:resources, resources_result)
+        end
       end
 
       resources_result

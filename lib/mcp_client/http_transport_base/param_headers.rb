@@ -84,7 +84,8 @@ module MCPClient
       # @return [Array<MCPClient::Tool>]
       # @raise [MCPClient::Errors::MCPError] the list's own failure, marked NestedExchange
       def known_tools_for_headers
-        @mutex.synchronize { @tools } || list_tools
+        fresh = cache_fresh?(:tools) ? (cached_list_value(:tools) || @mutex.synchronize { @tools }) : nil
+        fresh || list_tools
       rescue StandardError => e
         e.extend(RequestRecovery::NestedExchange) unless e.frozen?
         raise
