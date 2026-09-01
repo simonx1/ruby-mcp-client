@@ -125,7 +125,7 @@ module MCPClient
     def send_request_with_version_retry(method, params, timeout)
       sent_version = protocol_version
       begin
-        send_request_and_parse(method, params, timeout)
+        exchange(method, params, timeout)
       rescue MCPClient::Errors::UnsupportedProtocolVersionError => e
         # MCP 2026-07-28 basic/versioning: select a mutually supported
         # version from the error's list and retry. The server rejected the
@@ -138,8 +138,18 @@ module MCPClient
         @logger.info("Server does not support protocol version #{sent_version}; " \
                      "retrying #{method} with #{version}")
         @protocol_version = version
-        send_request_and_parse(method, params, timeout)
+        exchange(method, params, timeout)
       end
+    end
+
+    # A logical request: one exchange, plus any multi round-trip retries the
+    # server asks for (MCP 2026-07-28), each with its own id.
+    # @param method [String] JSON-RPC method name
+    # @param params [Hash] parameters for the request
+    # @param timeout [Numeric, nil] per-request timeout override
+    # @return [Object] the final result
+    def exchange(method, params, timeout)
+      resolve_input_round_trips(method, params, timeout) { |p| send_request_and_parse(method, p, timeout) }
     end
 
     # One request/response exchange with its own JSON-RPC id.
