@@ -526,3 +526,164 @@ RSpec.describe 'MCP 2026-07-28 subscriptions/listen — review follow-ups' do
     end
   end
 end
+
+# Review round 2 (grok): a JSON-framed answer to a listen request is a
+# closing response, not a dropped stream; a client-closed subscription is
+# never reopened by a racing reconnect; a listen stream only closes its own
+# subscription; resource_subscriptions is guarded; unsupported reports the
+# resource URIs the server declined; peer text in client logs is sanitized;
+# the stream buffer is scanned incrementally.
+RSpec.describe 'MCP 2026-07-28 subscriptions/listen — round 2' do
+  def discover_result
+    { 'resultType' => 'complete', 'supportedVersions' => ['2026-07-28'],
+      'capabilities' => { 'resources' => { 'subscribe' => true } } }
+  end
+
+  def wait_until(timeout = 2)
+    deadline = Time.now + timeout
+    sleep 0.01 until yield || Time.now > deadline
+    raise 'condition not met in time' unless yield
+  end
+
+  describe 'on Streamable HTTP' do
+    let(:url) { 'https://example.com/mcp' }
+    let(:server) { MCPClient::ServerStreamableHTTP.new(base_url: 'https://example.com', endpoint: '/mcp', retries: 0) }
+
+    after { server.cleanup }
+
+    def stub_discover_then(&listen)
+      requests = []
+      stub_request(:post, url).to_return do |request|
+        body = JSON.parse(request.body)
+        requests << body
+        if body['method'] == 'server/discover'
+          { status: 200, body: JSON.generate('jsonrpc' => '2.0', 'id' => body['id'], 'result' => discover_result),
+            headers: { 'Content-Type' => 'application/json' } }
+        else
+          listen.call(body)
+        end
+      end
+      requests
+    end
+
+    it 'treats a JSON-framed response to the listen request as the closing response' do
+      stub_const('MCPClient::HttpTransportBase::ListenStream::LISTEN_RECONNECT_DELAY', 0.01)
+      requests = stub_discover_then do |body|
+        { status: 200, headers: { 'Content-Type' => 'application/json' },
+          body: JSON.generate('jsonrpc' => '2.0', 'id' => body['id'], 'result' => { 'resultType' => 'complete' }) }
+      end
+
+      subscription = server.listen(notifications: { tools_list_changed: true })
+      wait_until { subscription.closed? }
+      sleep 0.05
+
+      expect(subscription).to be_closed_gracefully
+      expect(requests.count { |r| r['method'] == 'subscriptions/listen' }).to eq(1)
+    end
+
+    it 'treats a JSON-framed error to the listen request as a failed subscription' do
+      stub_discover_then do |body|
+        { status: 200, headers: { 'Content-Type' => 'application/json' },
+          body: JSON.generate('jsonrpc' => '2.0', 'id' => body['id'],
+                              'error' => { 'code' => -32_602, 'message' => 'bad filter' }) }
+      end
+
+      subscription = server.listen(notifications: { tools_list_changed: true })
+      wait_until { subscription.closed? }
+
+      expect(subscription.error).to be_a(MCPClient::Errors::ServerError)
+      expect(subscription.error.code).to eq(-32_602)
+    end
+
+    it 'closes only its own subscription when a stream carries a response for another id' do
+      other = nil
+      stub_discover_then do |body|
+        if other && body['id'] != other.id
+          { status: 200, headers: { 'Content-Type' => 'text/event-stream' },
+            body: "event: message\ndata: #{JSON.generate('jsonrpc' => '2.0', 'id' => other.id,
+                                                         'result' => { 'resultType' => 'complete' })}\n\n" \
+                  "event: message\ndata: #{JSON.generate('jsonrpc' => '2.0', 'id' => body['id'],
+                                                         'result' => { 'resultType' => 'complete' })}\n\n" }
+        else
+          { status: 200, headers: { 'Content-Type' => 'text/event-stream' },
+            body: "event: message\ndata: #{JSON.generate('jsonrpc' => '2.0',
+                                                         'method' => 'notifications/subscriptions/acknowledged',
+                                                         'params' => { '_meta' => { SUB_ID_META => body['id'] },
+                                                                       'notifications' => {} })}\n\n" }
+        end
+      end
+      stub_const('MCPClient::HttpTransportBase::ListenStream::LISTEN_RECONNECT_DELAY', 5)
+      other = server.listen(notifications: { prompts_list_changed: true })
+      wait_until { other.acknowledged }
+
+      victim = server.listen(notifications: { tools_list_changed: true })
+      wait_until { victim.closed? }
+
+      expect(victim).to be_closed_gracefully
+      expect(other.closed?).to be(false)
+    end
+  end
+
+  describe MCPClient::Subscription do
+    let(:server) { instance_double(MCPClient::ServerStdio) }
+
+    it 'does not reopen a subscription the client closed, even if a reconnect assigns a new id' do
+      subscription = described_class.new(server: server, requested: { 'toolsListChanged' => true })
+      subscription.assign_id(1)
+      allow(server).to receive(:cancel_subscription) { |s| s.finish(by_client: true) }
+      subscription.close
+
+      subscription.assign_id(2)
+
+      expect(subscription.state).to eq(:closed)
+      expect(subscription).not_to be_reconnectable
+    end
+
+    it 'reports the resource URIs the server declined as unsupported' do
+      subscription = described_class.new(server: server,
+                                         requested: { 'resourceSubscriptions' => ['file:///a', 'file:///b'],
+                                                      'promptsListChanged' => true })
+      subscription.assign_id(1)
+      subscription.acknowledge({ 'resourceSubscriptions' => ['file:///a'] })
+
+      expect(subscription.unsupported).to eq(['promptsListChanged'])
+      expect(subscription.unacknowledged_resource_uris).to eq(['file:///b'])
+    end
+  end
+
+  describe 'client logging' do
+    it 'sanitizes the subscription id and reason from server notifications' do
+      output = StringIO.new
+      stdio = MCPClient::ServerStdio.new(command: 'echo test')
+      allow(MCPClient::ServerFactory).to receive(:create).and_return(stdio)
+      client = MCPClient::Client.new(mcp_server_configs: [{ type: 'stdio', command: 'x' }], logger: Logger.new(output))
+      client.logger.level = Logger::DEBUG
+
+      stdio.instance_variable_get(:@notification_callback).call(
+        'notifications/subscriptions/acknowledged',
+        { '_meta' => { SUB_ID_META => "1\nWARN forged" }, 'notifications' => {} }
+      )
+      stdio.instance_variable_get(:@notification_callback).call(
+        'notifications/cancelled', { 'requestId' => 1, 'reason' => "bye\nWARN forged" }
+      )
+
+      expect(output.string).not_to include("\nWARN forged")
+    end
+  end
+
+  describe 'listen stream buffering' do
+    it 'scans the buffer incrementally and enforces the cap on unterminated events' do
+      server = MCPClient::ServerStreamableHTTP.new(base_url: 'https://example.com', endpoint: '/mcp', retries: 0)
+      subscription = MCPClient::Subscription.new(server: server, requested: {})
+      subscription.assign_id(9)
+      buffer = +''
+      state = { scanned: 0 }
+      expect(server).to receive(:match_event_terminator).at_most(3).times.and_call_original
+      3.times { server.send(:consume_listen_events, buffer << ('x' * 10), subscription, state) }
+
+      stub_const('MCPClient::HttpTransportBase::ListenStream::LISTEN_MAX_BUFFER_BYTES', 8)
+      expect { server.send(:enforce_listen_buffer_cap!, buffer) }.to raise_error(MCPClient::Errors::ConnectionError)
+      server.cleanup
+    end
+  end
+end

@@ -149,16 +149,18 @@ module MCPClient
     # @param uri [String] the resource URI
     # @return [MCPClient::Subscription]
     def subscribe_resource_via_listen(uri)
-      existing = resource_subscriptions[uri]
+      existing = subscriptions_mutex.synchronize { resource_subscriptions[uri] }
       return existing if existing && !existing.closed?
 
-      resource_subscriptions[uri] = listen(notifications: { 'resourceSubscriptions' => [uri] })
+      subscription = listen(notifications: { 'resourceSubscriptions' => [uri] })
+      subscriptions_mutex.synchronize { resource_subscriptions[uri] = subscription }
+      subscription
     end
 
     # @param uri [String] the resource URI
     # @return [MCPClient::Subscription, nil] the subscription that was closed, if any
     def unsubscribe_resource_via_listen(uri)
-      subscription = resource_subscriptions.delete(uri)
+      subscription = subscriptions_mutex.synchronize { resource_subscriptions.delete(uri) }
       subscription&.close
       subscription
     end
