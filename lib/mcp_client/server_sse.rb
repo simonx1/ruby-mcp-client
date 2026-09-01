@@ -429,6 +429,8 @@ module MCPClient
     #   'critical', 'alert', 'emergency')
     # @return [Hash] empty result on success
     # @raise [MCPClient::Errors::ServerError] if server returns an error
+    # @deprecated Logging is deprecated since MCP 2026-07-28 (SEP-2577); have
+    #   the server log to stderr (stdio) or use OpenTelemetry instead.
     def log_level=(level)
       MCPClient::Deprecations.warn(:logging, @logger)
       ensure_initialized

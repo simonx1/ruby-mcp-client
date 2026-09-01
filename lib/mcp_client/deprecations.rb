@@ -73,26 +73,30 @@ module MCPClient
 
       # Log the notice for a deprecated feature once per process. The notice
       # counts as emitted only once the logger accepted it: a logger that
-      # drops warnings (level above WARN) or raises leaves it for a later use.
+      # drops warnings (level above WARN) or raises leaves it for a later
+      # use. Never raises for a logger failure: the deprecated feature keeps
+      # working whatever the log does (feature lifecycle policy). The slot is
+      # reserved under the lock and the logger is called outside it.
       # @param feature [Symbol] a {REGISTRY} key
       # @param logger [Logger, nil] where the notice goes (a nil logger emits nothing)
       # @param detail [String, nil] peer-supplied context quoted in the notice
       #   (control characters are escaped and the text is bounded)
       # @return [Boolean] true when a notice was written, false when it was
-      #   already emitted, notices are disabled or the logger drops warnings
+      #   already emitted, notices are disabled, the logger drops warnings or failed
       # @raise [ArgumentError] for an unknown feature
-      def warn(feature, logger, detail: nil) # rubocop:disable Naming/PredicateMethod
+      def warn(feature, logger, detail: nil)
         entry = REGISTRY[feature] or raise ArgumentError, "unknown deprecated feature: #{feature.inspect}"
         return false unless enabled? && logger
-        return false if logger.respond_to?(:warn?) && !logger.warn?
+        return false if logger.is_a?(::Logger) && logger.level > ::Logger::WARN
+        return false unless @mutex.synchronize { @emitted.add?(feature) }
 
-        @mutex.synchronize do
-          return false if @emitted.include?(feature)
-
+        begin
           logger.warn(message(entry, detail))
-          @emitted << feature
+          true
+        rescue StandardError
+          @mutex.synchronize { @emitted.delete(feature) }
+          false
         end
-        true
       end
 
       # @param feature [Symbol] a {REGISTRY} key
