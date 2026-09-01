@@ -693,7 +693,7 @@ module MCPClient
       begin
         probe_server_era(srv)
       rescue MCPClient::Errors::MCPError => e
-        raise MCPClient::Errors::TaskError, "Error listing tasks: #{e.message}"
+        raise MCPClient::Errors::TaskError, "Error listing tasks: #{sanitize_peer_log_text(e.message)}"
       end
       if modern_server?(srv)
         raise MCPClient::Errors::TaskError,
@@ -708,7 +708,7 @@ module MCPClient
         tasks = (result['tasks'] || []).map { |t| MCPClient::Task.from_json(t, server: srv) }
         { tasks: tasks, next_cursor: result['nextCursor'] }
       rescue MCPClient::Errors::ServerError, MCPClient::Errors::TransportError, MCPClient::Errors::ConnectionError => e
-        raise MCPClient::Errors::TaskError, "Error listing tasks: #{e.message}"
+        raise MCPClient::Errors::TaskError, "Error listing tasks: #{sanitize_peer_log_text(e.message)}"
       end
     end
 

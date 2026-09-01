@@ -94,7 +94,8 @@ RSpec.describe 'MCP 2026-07-28 tasks extension — round 8' do
                                 { 'result' => detailed_task(status: 'completed', 'result' => call_result) }])
     task = client.call_tool_as_task('slow', {})
 
-    expect { client.wait_for_task(task) }.to raise_error(MCPClient::Errors::TaskError)
+    # The lost update is not the end of the wait: it goes out again with
+    # the next poll (round 10).
     expect(client.wait_for_task(task)).to be_completed
     updates = sent.select { |r| r['method'] == 'tasks/update' }
     expect(updates.size).to eq(2)

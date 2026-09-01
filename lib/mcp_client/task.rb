@@ -161,12 +161,13 @@ module MCPClient
       @detailed
     end
 
-    # Whether the terminal payload the status implies is present: a result
-    # for completed, an error for failed (cancelled needs none).
+    # Whether the terminal payload the status implies is present and well
+    # formed: a result object (a CallToolResult) for completed, an error
+    # object for failed (cancelled needs none).
     # @return [Boolean]
     def payload_present?
       case @status
-      when 'completed' then !@result.nil?
+      when 'completed' then @result.is_a?(Hash)
       when 'failed' then @error.is_a?(Hash)
       else terminal?
       end

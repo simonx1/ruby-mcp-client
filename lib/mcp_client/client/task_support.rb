@@ -36,7 +36,6 @@ module MCPClient
       def update_task(task, input_responses, server: nil)
         srv = select_task_server(task, server, 'update_task')
         task_id = task_identifier(task)
-        shown = shown_task_id(task_id)
         ensure_task_capability!(srv, 'update', strict: true)
         unless modern_server?(srv)
           raise MCPClient::Errors::TaskError, 'tasks/update requires an MCP 2026-07-28 server (tasks extension)'
@@ -45,23 +44,7 @@ module MCPClient
           raise ArgumentError, 'input_responses must be a Hash keyed by input request key'
         end
 
-        # An ambiguous outcome (the acknowledgement is eventually consistent
-        # and may be lost) leaves these keys answered for later waits; a
-        # definite rejection gives them back, since the server did not take
-        # the answers.
-        keys = input_responses.keys.map(&:to_s)
-        remember_answered_keys(srv, task_id, keys)
-        begin
-          srv.rpc_request('tasks/update', { taskId: task_id, inputResponses: input_responses })
-          true
-        rescue MCPClient::Errors::ServerError => e
-          release_answered_keys(srv, task_id, keys)
-          raise if e.protocol_error?
-
-          raise task_error_from(e, task_id, 'updating', modern: true, method: 'tasks/update')
-        rescue MCPClient::Errors::TransportError, MCPClient::Errors::ConnectionError => e
-          raise MCPClient::Errors::TaskError, "Error updating task '#{shown}': #{sanitize_peer_log_text(e.message)}"
-        end
+        send_task_update(srv, task_id, input_responses)
       end
 
       # Wait for a task to reach a terminal status (MCP 2026-07-28 tasks
@@ -101,8 +84,12 @@ module MCPClient
                  answered: answered_task_keys(srv, task_id), last: nil }
         # The CreateTaskResult seed is not an observation: the first
         # tasks/get goes out at once, whatever the seed claims. Its TTL
-        # still bounds a wait whose polls never come back.
-        seed_ttl_deadline(task, wait) if task.is_a?(MCPClient::Task)
+        # still bounds a wait whose polls never come back, and its
+        # pollIntervalMs paces them.
+        if task.is_a?(MCPClient::Task)
+          seed_ttl_deadline(task, wait)
+          wait[:last] = task
+        end
         loop do
           current = observe_task(wait)
           # A poll that timed out is no observation: try again at the pace
@@ -115,6 +102,10 @@ module MCPClient
 
           wait[:last] = current
           if current.terminal?
+            # A terminal task that came back after the caller's deadline
+            # (transport retries) does not rescue a timed-out wait; the TTL
+            # backstop is moot once the task is terminal.
+            raise_if_past_caller_deadline!(wait)
             forget_task_keys(srv, task_id)
             return current
           end
@@ -125,6 +116,9 @@ module MCPClient
           bound_wait_by_ttl(current, wait)
           raise_if_past_deadline!(wait)
           retransmit_pending_update(wait)
+          # No new handler round once the wait is over, whatever the
+          # retransmission took.
+          raise_if_past_deadline!(wait)
           answer_task_round(current, wait)
 
           sleep(task_poll_delay(current, wait_deadline(wait)))
@@ -158,35 +152,32 @@ module MCPClient
       end
 
       # Answer this poll's outstanding input requests, bounding how many
-      # rounds a task may demand.
+      # rounds a task may demand (the limit is per task, not per wait, and
+      # is applied with the key reservation, see #answer_task_input_requests).
       # @return [void]
       def answer_task_round(current, wait)
         return unless pending_task_input?(current, wait[:answered])
 
-        # The limit is per task (not per wait) and is checked before the
-        # handlers run and the update goes out.
-        state = task_state(wait[:srv], wait[:task_id])
-        if state[:rounds] >= MAX_TASK_INPUT_ROUNDS
-          raise MCPClient::Errors::InputRequiredError.new(
-            "Task '#{shown_task_id(wait[:task_id])}' kept requesting input after #{MAX_TASK_INPUT_ROUNDS} rounds",
-            data: current.to_h
-          )
-        end
-
-        answered_keys_mutex.synchronize { state[:rounds] += 1 }
-        answer_task_input_requests(current, wait[:answered], wait[:srv])
+        answer_task_input_requests(current, wait[:answered], wait[:srv], wait)
       end
 
       # Deliver again an update whose acknowledgement was lost, before any
-      # new input is answered (the server ignores keys it already has).
+      # new input is answered (the server ignores keys it already has). An
+      # outcome that is ambiguous again keeps the payload pending and the
+      # wait polling; a definite rejection surfaces (its keys were given
+      # back, so the next wait presents the requests again).
       # @return [void]
       def retransmit_pending_update(wait)
         state = task_state(wait[:srv], wait[:task_id])
         pending = answered_keys_mutex.synchronize { state[:pending_update] }
         return unless pending
 
-        update_task(wait[:task_id], pending, server: wait[:srv])
-        answered_keys_mutex.synchronize { state[:pending_update] = nil }
+        send_task_update(wait[:srv], wait[:task_id], pending, timeout: request_timeout(wait_deadline(wait)))
+      rescue MCPClient::Errors::TaskError => e
+        raise unless ambiguous_update_failure?(e)
+
+        logger.debug("tasks/update for task #{shown_task_id(wait[:task_id])} could not be confirmed; " \
+                     'it is sent again on the next poll')
       end
 
       # Whether the task lists an input request that has not been answered.
@@ -236,6 +227,16 @@ module MCPClient
         end
       end
 
+      # Whether a tasks/update failure means the server definitely did not
+      # take the answers: a JSON-RPC error with a code from the server
+      # itself. A 5xx, a closed response stream or any untyped server error
+      # is ambiguous (the update may have been applied).
+      # @param error [MCPClient::Errors::ServerError]
+      # @return [Boolean]
+      def definite_rejection?(error)
+        error.code.is_a?(Integer) && !error.is_a?(MCPClient::Errors::TransientServerError)
+      end
+
       # Give back keys the server definitely did not take.
       # @return [void]
       def release_answered_keys(srv, task_id, keys)
@@ -263,20 +264,82 @@ module MCPClient
         answered_keys_mutex.synchronize { @task_states&.delete([srv.object_id, task_id]) }
       end
 
-      # Send the answers; when delivery fails at the transport level the
-      # answers are kept for retransmission by the next wait, since the
-      # server may or may not have applied them.
+      # Send the answers a handler produced. An ambiguous delivery (the
+      # server may or may not have applied it) is not the end of the wait:
+      # the payload stays pending and goes out again with the next poll,
+      # like a lost tasks/get. A definite rejection surfaces.
       # @return [void]
-      def deliver_task_update(task_id, responses, srv)
-        update_task(task_id, responses, server: srv)
+      def deliver_task_update(task_id, responses, srv, wait)
+        send_task_update(srv, task_id, responses, timeout: request_timeout(wait_deadline(wait)))
       rescue MCPClient::Errors::TaskError => e
-        unless e.cause.is_a?(MCPClient::Errors::TransportError) || e.cause.is_a?(MCPClient::Errors::ConnectionError)
-          raise
-        end
+        raise unless ambiguous_update_failure?(e)
 
+        logger.debug("tasks/update for task #{shown_task_id(task_id)} could not be confirmed; " \
+                     'it is sent again on the next poll')
+      end
+
+      # One tasks/update, owning the pending-payload lifecycle: the keys are
+      # answered as soon as the payload is handed to the transport; a
+      # confirmed delivery clears any pending payload (a later answer
+      # supersedes a lost one); a definite JSON-RPC rejection gives the keys
+      # back and drops the payload; an ambiguous outcome (timeout, transport
+      # or connection failure, 5xx, untyped server error) keeps it pending
+      # for retransmission, merged with whatever was pending already.
+      # @param timeout [Numeric, nil] request timeout, bounded by the wait when there is one
+      # @return [true]
+      # @raise [MCPClient::Errors::TaskError, MCPClient::Errors::ServerError]
+      def send_task_update(srv, task_id, input_responses, timeout: nil)
+        shown = shown_task_id(task_id)
+        keys = input_responses.keys.map(&:to_s)
         state = task_state(srv, task_id)
-        answered_keys_mutex.synchronize { state[:pending_update] = responses }
-        raise
+        remember_answered_keys(srv, task_id, keys)
+        begin
+          srv.rpc_request('tasks/update', { taskId: task_id, inputResponses: input_responses }, timeout: timeout)
+          answered_keys_mutex.synchronize { state[:pending_update] = nil }
+          true
+        rescue MCPClient::Errors::ServerError => e
+          if definite_rejection?(e)
+            release_answered_keys(srv, task_id, keys)
+            answered_keys_mutex.synchronize { state[:pending_update] = nil }
+          else
+            keep_pending_update(state, input_responses)
+          end
+          raise if e.protocol_error?
+
+          raise task_error_from(e, task_id, 'updating', modern: true, method: 'tasks/update')
+        rescue MCPClient::Errors::TransportError, MCPClient::Errors::ConnectionError => e
+          keep_pending_update(state, input_responses)
+          raise MCPClient::Errors::TaskError, "Error updating task '#{shown}': #{sanitize_peer_log_text(e.message)}"
+        end
+      end
+
+      # @return [void]
+      def keep_pending_update(state, input_responses)
+        answered_keys_mutex.synchronize do
+          state[:pending_update] = (state[:pending_update] || {}).merge(input_responses)
+        end
+      end
+
+      # Whether a failed tasks/update may still have been applied.
+      # @param error [MCPClient::Errors::TaskError]
+      # @return [Boolean]
+      def ambiguous_update_failure?(error)
+        cause = error.cause
+        return true if cause.is_a?(MCPClient::Errors::TransportError) || cause.is_a?(MCPClient::Errors::ConnectionError)
+
+        cause.is_a?(MCPClient::Errors::ServerError) && !definite_rejection?(cause)
+      end
+
+      # The timeout for a request that must not outlive the wait: what is
+      # left of it (a tiny positive floor keeps the transport from reading 0
+      # as "no timeout"), capped so a hung request never blocks the wait
+      # for the task's whole lifetime.
+      # @param deadline [Float, nil] monotonic deadline of the wait
+      # @return [Float]
+      def request_timeout(deadline)
+        remaining = deadline && [deadline - monotonic_time, MIN_TASK_REQUEST_TIMEOUT].max
+        remaining = [remaining, MAX_TASK_REQUEST_TIMEOUT].min if remaining
+        remaining || MAX_TASK_REQUEST_TIMEOUT
       end
 
       # @param task_id [Object] a peer-controlled task id
@@ -290,9 +353,16 @@ module MCPClient
       # @return [void]
       # @raise [MCPClient::Errors::TaskError]
       def raise_if_past_deadline!(wait)
-        now = monotonic_time
-        raise_ttl_elapsed!(wait) if wait[:polled] && wait[:ttl_deadline] && now >= wait[:ttl_deadline]
-        return unless wait[:deadline] && now >= wait[:deadline]
+        raise_ttl_elapsed!(wait) if wait[:polled] && wait[:ttl_deadline] && monotonic_time >= wait[:ttl_deadline]
+        raise_if_past_caller_deadline!(wait)
+      end
+
+      # The caller's timeout never moves and is enforced whatever the task
+      # did in the meantime.
+      # @return [void]
+      # @raise [MCPClient::Errors::TaskError]
+      def raise_if_past_caller_deadline!(wait)
+        return unless wait[:deadline] && monotonic_time >= wait[:deadline]
 
         raise MCPClient::Errors::TaskError, "Timed out waiting for task '#{shown_task_id(wait[:task_id])}'"
       end
@@ -312,16 +382,16 @@ module MCPClient
         wait[:ttl_deadline] = monotonic_time + [remaining, 0.0].max if remaining
       end
 
-      # Record the latest TTL backstop (createdAt + ttlMs) of the task; a
-      # later observation replaces it, so an extended TTL extends the wait.
+      # Record the latest TTL backstop (createdAt + ttlMs) of the task; every
+      # observation replaces it ("ttlMs MAY change over the lifetime of a
+      # task"), so an extended TTL extends the wait and a task made
+      # unlimited (ttlMs null) has no backstop any more.
       # @return [void]
       # @raise [MCPClient::Errors::TaskError] when the TTL already elapsed
       def bound_wait_by_ttl(current, wait)
         remaining = current.ttl_remaining
-        return unless remaining
-
-        raise_ttl_elapsed!(wait) if remaining <= 0
-        wait[:ttl_deadline] = monotonic_time + remaining
+        raise_ttl_elapsed!(wait) if remaining && remaining <= 0
+        wait[:ttl_deadline] = remaining && (monotonic_time + remaining)
       end
 
       # One tasks/get, bounded by what is left of the wait. A request that
@@ -331,13 +401,7 @@ module MCPClient
       # @return [MCPClient::Task, nil]
       def poll_task(wait)
         wait[:polled] = true
-        deadline = wait_deadline(wait)
-        # The request never outlives the wait (a tiny positive floor keeps
-        # the transport from reading 0 as "no timeout").
-        remaining = deadline && [deadline - monotonic_time, MIN_TASK_REQUEST_TIMEOUT].max
-        remaining = [remaining, MAX_TASK_REQUEST_TIMEOUT].min if remaining
-        remaining ||= MAX_TASK_REQUEST_TIMEOUT
-        get_task(wait[:task_id], server: wait[:srv], timeout: remaining)
+        get_task(wait[:task_id], server: wait[:srv], timeout: request_timeout(wait_deadline(wait)))
       rescue MCPClient::Errors::TaskError => e
         raise unless e.cause.is_a?(MCPClient::Errors::RequestTimeoutError)
 
@@ -353,9 +417,10 @@ module MCPClient
       def validate_terminal_task!(task)
         return if task.payload_present?
 
-        missing = task.failed? ? 'error' : 'result'
-        raise MCPClient::Errors::InvalidResultError,
-              "Invalid task: status #{task.status} without the #{missing} field"
+        field = task.failed? ? 'error' : 'result'
+        present = task.failed? ? !task.error.nil? : !task.result.nil?
+        problem = present ? "with a #{field} that is not an object" : "without the #{field} field"
+        raise MCPClient::Errors::InvalidResultError, "Invalid task: status #{task.status} #{problem}"
       end
 
       # Enforce the MCP 2026-07-28 tasks extension gate: this client must have
@@ -454,7 +519,7 @@ module MCPClient
       # been answered yet (keys are unique over a task's lifetime, so a key
       # seen again on a later poll is the same request).
       # @return [Array<String>] the keys answered now
-      def answer_task_input_requests(task, answered, srv)
+      def answer_task_input_requests(task, answered, srv, wait = {})
         return [] unless task.input_required?
 
         requests = task.input_requests
@@ -468,12 +533,23 @@ module MCPClient
           )
         end
 
-        # Reserve the keys before the handlers run, in one step, so two
-        # waits on the same task cannot both answer them; a handler that
-        # fails gives them back, except those answered through #update_task
-        # in the meantime.
+        # Reserve the keys before the handlers run, in one step with the
+        # per-task round limit, so two waits on the same task cannot both
+        # answer them nor spend the budget twice on one snapshot; a handler
+        # that fails gives the keys back, except those answered through
+        # #update_task in the meantime.
+        state = task_state(srv, task.task_id)
         pending = answered_keys_mutex.synchronize do
           keys = requests.except(*answered)
+          next keys if keys.empty?
+          if state[:rounds] >= MAX_TASK_INPUT_ROUNDS
+            raise MCPClient::Errors::InputRequiredError.new(
+              "Task '#{shown_task_id(task.task_id)}' kept requesting input after #{MAX_TASK_INPUT_ROUNDS} rounds",
+              data: task.to_h
+            )
+          end
+
+          state[:rounds] += 1
           answered.merge(keys.keys)
           keys
         end
@@ -486,7 +562,7 @@ module MCPClient
           answered_keys_mutex.synchronize { answered.subtract(pending.keys - submitted.to_a) }
           raise
         end
-        deliver_task_update(task.task_id, responses, srv)
+        deliver_task_update(task.task_id, responses, srv, wait)
         pending.keys
       end
 
