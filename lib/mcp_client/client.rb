@@ -144,7 +144,9 @@ module MCPClient
       connection_errors = []
 
       servers.each do |server|
-        server.list_prompts.each do |prompt|
+        server_prompts = server.list_prompts
+        drop_cached_entries(@prompt_cache, server)
+        server_prompts.each do |prompt|
           cache_key = cache_key_for(server, prompt.name)
           @prompt_cache[cache_key] = prompt
           prompts << prompt
@@ -239,6 +241,7 @@ module MCPClient
       servers.each do |server|
         result = server.list_resources
         resource_list = result['resources'] || []
+        drop_cached_entries(@resource_cache, server)
 
         resource_list.each do |resource|
           cache_key = cache_key_for(server, resource.uri)
@@ -289,7 +292,11 @@ module MCPClient
       connection_errors = []
 
       servers.each do |server|
-        server.list_tools.each do |tool|
+        server_tools = server.list_tools
+        # Replace this server's slice: an item the refreshed list no longer
+        # carries must not linger from the previous fetch.
+        drop_cached_entries(@tool_cache, server)
+        server_tools.each do |tool|
           cache_key = cache_key_for(server, tool.name)
           @tool_cache[cache_key] = tool
           tools << tool
@@ -1333,6 +1340,15 @@ module MCPClient
       logger.info("[#{server_id}] Task #{task.task_id} status: #{task.status}")
     rescue StandardError => e
       logger.debug("[#{server_id}] Failed to parse task status notification: #{e.message}")
+    end
+
+    # Remove one server's entries from a client-level cache.
+    # @param cache [Hash] the cache keyed by #cache_key_for
+    # @param server [MCPClient::ServerBase]
+    # @return [void]
+    def drop_cached_entries(cache, server)
+      prefix = "#{server.object_id}:"
+      cache.delete_if { |key, _| key.start_with?(prefix) }
     end
 
     # Generate a cache key for server-specific items

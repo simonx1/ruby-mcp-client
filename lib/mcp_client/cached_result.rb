@@ -37,7 +37,9 @@ module MCPClient
     # @return [CachedResult]
     def self.combine(entries, value, now:)
       hinted = entries.select(&:hint?)
-      ttl = hinted.map(&:ttl_ms).min
+      # Each page expires at its own received_at + ttlMs; the combined entry
+      # (received now) lives until the earliest of those.
+      ttl = hinted.map { |e| [e.ttl_ms - ((now - e.received_at) * 1000.0), 0].max }.min
       scope = if entries.any? { |e| e.cache_scope == 'private' }
                 'private'
               else

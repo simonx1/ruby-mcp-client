@@ -748,10 +748,19 @@ module MCPClient
       yield
     rescue MCPClient::Errors::TransientServerError, MCPClient::Errors::ConnectionError,
            MCPClient::Errors::TransportError => e
-      raise unless stale
+      # A revoked or insufficient authorization is not a transient failure:
+      # serving the stale list would hide it from the host's auth flow.
+      raise if stale.nil? || authorization_failure?(e)
 
       @logger.warn("Re-fetching #{kind} failed (#{e.class}); serving the stale cached list")
       stale
+    end
+
+    # @param error [Exception] a failure raised by the HTTP pipeline
+    # @return [Boolean] whether it reports an authorization failure (401/403)
+    def authorization_failure?(error)
+      error.is_a?(MCPClient::Errors::InsufficientScopeError) ||
+        (error.is_a?(MCPClient::Errors::ConnectionError) && error.message.start_with?('Authorization failed'))
     end
 
     # Exclude tool definitions whose x-mcp-header annotations violate the

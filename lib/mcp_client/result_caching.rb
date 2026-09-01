@@ -55,9 +55,14 @@ module MCPClient
     # @param page_results [Array<Hash>] the per-page results
     # @param value [Object] what the cache holds (may be nil)
     # @return [MCPClient::CachedResult, nil]
-    def record_paginated_cache_hint(kind, page_results, value = nil)
+    # @param received_ats [Array<Float>, nil] each page's monotonic receipt time (defaults to now)
+    def record_paginated_cache_hint(kind, page_results, value = nil, received_ats: nil)
       now = monotonic_now
-      entries = page_results.grep(Hash).map { |r| MCPClient::CachedResult.from_result(r, nil, now: now) }
+      entries = page_results.each_with_index.filter_map do |result, index|
+        next unless result.is_a?(Hash)
+
+        MCPClient::CachedResult.from_result(result, nil, now: (received_ats && received_ats[index]) || now)
+      end
       return nil if entries.empty?
 
       combined = MCPClient::CachedResult.combine(entries, value, now: now)
@@ -69,9 +74,10 @@ module MCPClient
     # @param method [String] the list method
     # @param page_results [Array<Hash>]
     # @return [void]
-    def record_list_cache_hint(method, page_results)
+    # @param received_ats [Array<Float>, nil] each page's monotonic receipt time
+    def record_list_cache_hint(method, page_results, received_ats = nil)
       kind = LIST_METHOD_KINDS[method]
-      record_paginated_cache_hint(kind, page_results) if kind
+      record_paginated_cache_hint(kind, page_results, received_ats: received_ats) if kind
     end
 
     # Whether the cached response for a kind may still be served. No entry
@@ -141,11 +147,6 @@ module MCPClient
         record_cache_hint(key, result, contents)
       end
       contents
-    end
-
-    # @return [Boolean] whether the last resolved request went through a multi round-trip retry
-    def last_result_from_round_trip?
-      defined?(@last_result_from_round_trip) && @last_result_from_round_trip == true
     end
 
     # Keep caches in step with the server's change notifications: a list

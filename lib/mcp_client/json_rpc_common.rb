@@ -877,8 +877,28 @@ module MCPClient
         end
         result = yield(retry_params)
       end
-      @last_result_from_round_trip = round_trips.positive?
+      mark_round_trip_result(round_trips.positive?)
       result
+    end
+
+    # Whether the request this thread last resolved went through a multi
+    # round-trip retry. The marker is thread-local: a transport serves
+    # concurrent requests, and a result that depended on input responses
+    # MUST NOT be cached even if another request completed meanwhile.
+    # @return [Boolean]
+    def last_result_from_round_trip?
+      Thread.current[round_trip_marker_key] == true
+    end
+
+    # @param flag [Boolean]
+    # @return [void]
+    def mark_round_trip_result(flag)
+      Thread.current[round_trip_marker_key] = flag
+    end
+
+    # @return [Symbol] the thread-local key of this transport's round-trip marker
+    def round_trip_marker_key
+      :"mcp_client_round_trip_#{object_id}"
     end
 
     # The params for a multi round-trip retry: the original params plus the
