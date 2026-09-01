@@ -38,9 +38,11 @@ module MCPClient
     # @param result [Hash, nil] the final result (2026-07-28 DetailedTask, completed)
     # @param error [Hash, nil] the JSON-RPC error (2026-07-28 DetailedTask, failed)
     # @param modern [Boolean] whether the task uses the 2026-07-28 field names (ttlMs, pollIntervalMs)
+    # @param detailed [Boolean] whether this is a DetailedTask (tasks/get, notifications/tasks) whose
+    #   result / error / inputRequests are authoritative, as opposed to a creation seed
     def initialize(task_id:, status: 'working', status_message: nil, created_at: nil,
                    last_updated_at: nil, ttl: nil, poll_interval: nil, server: nil,
-                   input_requests: nil, result: nil, error: nil, modern: false)
+                   input_requests: nil, result: nil, error: nil, modern: false, detailed: false)
       validate_status!(status)
       @task_id = task_id
       @status = status
@@ -54,6 +56,7 @@ module MCPClient
       @result = result
       @error = error
       @modern = modern
+      @detailed = detailed
     end
 
     # Build a Task from a flat Task hash. This is the shape of GetTaskResult,
@@ -61,8 +64,9 @@ module MCPClient
     # notifications/tasks/status notification.
     # @param json [Hash] the flat task hash
     # @param server [MCPClient::ServerBase, nil] optional server reference
+    # @param detailed [Boolean] whether the hash is a DetailedTask (see #detailed?)
     # @return [Task]
-    def self.from_json(json, server: nil)
+    def self.from_json(json, server: nil, detailed: false)
       data = json || {}
       modern = modern_shape?(data)
       new(
@@ -81,6 +85,7 @@ module MCPClient
         result: extract_field(data, 'result'),
         error: extract_field(data, 'error'),
         modern: modern,
+        detailed: detailed,
         server: server
       )
     end
@@ -91,7 +96,7 @@ module MCPClient
     # @param server [MCPClient::ServerBase, nil]
     # @return [Task] a completed task carrying the result
     def self.completed_locally(result, server: nil)
-      new(task_id: nil, status: 'completed', result: result, server: server, modern: true)
+      new(task_id: nil, status: 'completed', result: result, server: server, modern: true, detailed: true)
     end
 
     # Whether a task hash uses the 2026-07-28 field names.
@@ -146,6 +151,37 @@ module MCPClient
     # @return [Boolean]
     def modern?
       @modern
+    end
+
+    # Whether the task came from tasks/get or notifications/tasks (a
+    # DetailedTask, whose result, error and inputRequests are authoritative)
+    # rather than from the CreateTaskResult seed, which carries none of them.
+    # @return [Boolean]
+    def detailed?
+      @detailed
+    end
+
+    # Whether the terminal payload the status implies is present: a result
+    # for completed, an error for failed (cancelled needs none).
+    # @return [Boolean]
+    def payload_present?
+      case @status
+      when 'completed' then !@result.nil?
+      when 'failed' then @error.is_a?(Hash)
+      else terminal?
+      end
+    end
+
+    # Seconds left before the TTL backstop (createdAt + ttlMs), nil when
+    # unknown or unlimited.
+    # @param now [Time]
+    # @return [Float, nil]
+    def ttl_remaining(now: Time.now)
+      return nil unless @ttl.is_a?(Numeric) && @created_at.is_a?(String)
+
+      (Time.iso8601(@created_at) + (@ttl / 1000.0)) - now
+    rescue ArgumentError
+      nil
     end
 
     # Whether this task exists on the server (has an id) as opposed to a
@@ -217,6 +253,8 @@ module MCPClient
     # Check equality
     def ==(other)
       return false unless other.is_a?(Task)
+      # A locally completed task has no server-side identity: only itself.
+      return equal?(other) if task_id.nil?
 
       task_id == other.task_id && status == other.status
     end
@@ -224,6 +262,8 @@ module MCPClient
     alias eql? ==
 
     def hash
+      return object_id.hash if task_id.nil?
+
       [task_id, status].hash
     end
 

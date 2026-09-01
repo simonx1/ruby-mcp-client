@@ -9,9 +9,10 @@ module MCPClient
     module TaskSupport
       # Seconds to wait before the next tasks/get when the server gave no
       # pollIntervalMs ("Clients SHOULD respect the pollIntervalMs provided
-      # in responses"), and the longest wait honoured.
+      # in responses"), and the floor that keeps a pollIntervalMs of 0 from
+      # turning the wait into a busy loop.
       DEFAULT_TASK_POLL_INTERVAL = 1.0
-      MAX_TASK_POLL_INTERVAL = 60.0
+      MIN_TASK_POLL_INTERVAL = 0.05
 
       # Answer the outstanding input requests of a task (tasks/update, MCP
       # 2026-07-28 tasks extension). The acknowledgement is eventually
@@ -64,6 +65,7 @@ module MCPClient
 
         srv = select_task_server(task, server, 'wait_for_task')
         task_id = task_identifier(task)
+        ensure_task_capability!(srv, 'get')
         unless modern_server?(srv)
           raise MCPClient::Errors::TaskError, 'wait_for_task requires an MCP 2026-07-28 server (tasks extension)'
         end
@@ -73,6 +75,11 @@ module MCPClient
         current = task.is_a?(MCPClient::Task) ? task : nil
         loop do
           current ||= get_task(task_id, server: srv)
+          # A creation seed (CreateTaskResult) carries no result, error or
+          # inputRequests: a terminal status there is confirmed by tasks/get.
+          if current.terminal? && !current.detailed? && !current.payload_present?
+            current = get_task(task_id, server: srv)
+          end
           return current if current.terminal?
 
           answered.concat(answer_task_input_requests(current, answered, srv))
@@ -84,7 +91,7 @@ module MCPClient
             raise MCPClient::Errors::TaskError, "Timed out waiting for task '#{task_id}'"
           end
 
-          sleep(task_poll_delay(current))
+          sleep(task_poll_delay(current, deadline))
           current = nil
         end
       end
@@ -123,7 +130,14 @@ module MCPClient
         ensure_tasks_extension!(srv)
         result = begin
           srv.call_tool(tool_name, parameters)
-        rescue MCPClient::Errors::ConnectionError => e
+        rescue MCPClient::Errors::ServerError => e
+          # Protocol errors (HeaderMismatch, missing capability, ...) keep
+          # their type; anything else is a failed creation.
+          raise if e.protocol_error?
+
+          raise MCPClient::Errors::TaskError, "Error creating task for tool '#{tool_name}': #{e.message}"
+        rescue MCPClient::Errors::ToolCallError, MCPClient::Errors::TransportError,
+               MCPClient::Errors::ConnectionError => e
           raise MCPClient::Errors::TaskError, "Error creating task for tool '#{tool_name}': #{e.message}"
         end
         return MCPClient::Task.from_create_result(result, server: srv) if task_result?(result)
@@ -173,6 +187,10 @@ module MCPClient
         return [] unless task.input_required?
 
         requests = task.input_requests
+        # A creation seed says input_required without listing the requests;
+        # the next tasks/get carries them.
+        return [] if requests.nil? && !task.detailed?
+
         unless requests.is_a?(Hash)
           raise MCPClient::Errors::InputRequiredError.new(
             'Malformed input_required task: inputRequests is not an object', data: task.to_h
@@ -186,13 +204,19 @@ module MCPClient
         pending.keys
       end
 
+      # The wait before the next tasks/get: the server's pollIntervalMs
+      # (never capped, never below MIN_TASK_POLL_INTERVAL), clamped to what
+      # is left of the caller's timeout and of the task's TTL so neither can
+      # be overshot by a whole polling interval.
       # @param task [MCPClient::Task]
-      # @return [Float] seconds to wait before the next tasks/get
-      def task_poll_delay(task)
+      # @param deadline [Float, nil] monotonic deadline of the wait
+      # @return [Float] seconds
+      def task_poll_delay(task, deadline)
         interval = task.poll_interval_ms
-        return DEFAULT_TASK_POLL_INTERVAL unless interval.is_a?(Numeric) && interval >= 0
-
-        [interval / 1000.0, MAX_TASK_POLL_INTERVAL].min
+        delay = interval.is_a?(Numeric) && interval >= 0 ? interval / 1000.0 : DEFAULT_TASK_POLL_INTERVAL
+        delay = [delay, MIN_TASK_POLL_INTERVAL].max
+        remaining = [deadline && (deadline - monotonic_time), task.ttl_remaining].compact.min
+        remaining ? delay.clamp(0.0, [remaining, 0.0].max) : delay
       end
 
       # @return [Float] a monotonic clock reading in seconds
