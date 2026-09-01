@@ -140,6 +140,9 @@ module MCPClient
         state = { finished: nil }
         response = listen_connection.post(@endpoint) do |req|
           apply_request_headers(req, request)
+          # The stream is parsed incrementally as it arrives; a compressed
+          # body could not be. Ask for it uncompressed.
+          req.headers['Accept-Encoding'] = 'identity'
           req.body = request.to_json
           req.options.on_data = proc do |chunk, _bytes|
             next if state[:finished]
@@ -157,6 +160,20 @@ module MCPClient
       rescue Faraday::TimeoutError, Faraday::ConnectionFailed, Net::ReadTimeout, IOError => e
         @logger.debug("Subscription #{subscription.id} stream dropped: #{e.class}")
         :dropped
+      rescue Faraday::ClientError => e
+        # raise_error middleware configured by the host: same pipeline as a
+        # plain error response.
+        normalized = normalize_error_response(e.response)
+        if normalized
+          # With on_data streaming the middleware sees an empty body; the
+          # bytes went to the buffer.
+          body = normalized.body.to_s
+          fail_subscription_from_response(subscription, normalized, body.empty? ? buffer : body)
+        else
+          unregister_subscription(subscription)
+          subscription.finish(gracefully: false, error: MCPClient::Errors::TransportError.new(e.message))
+        end
+        :closed
       rescue MCPClient::Errors::MCPError => e
         unregister_subscription(subscription)
         subscription.finish(gracefully: false, error: e)
@@ -172,16 +189,29 @@ module MCPClient
       # @return [void]
       def fail_subscription_from_response(subscription, response, body)
         normalized = NormalizedResponse.new(response.status, response.headers || {}, body)
-        error = if [401, 403].include?(response.status)
-                  MCPClient::Errors::ConnectionError.new("Authorization failed: HTTP #{response.status}")
-                elsif (500..599).cover?(response.status)
-                  MCPClient::Errors::TransientServerError.new("Server error: HTTP #{response.status}")
-                else
-                  jsonrpc_error_from_http_response(normalized, "Client error: HTTP #{response.status}")
-                end
+        error = listen_rejection_error(normalized)
         @logger.warn("subscriptions/listen #{subscription.id} rejected: #{sanitize_log_text(error.message)}")
         unregister_subscription(subscription)
         subscription.finish(gracefully: false, error: error)
+      end
+
+      # The error for a non-2xx listen response, through the same pipeline
+      # as any other request: 401/403 feed the OAuth challenge handling
+      # (insufficient_scope surfaces as InsufficientScopeError), 5xx is
+      # transient, other 4xx carry the (possibly typed) JSON-RPC error.
+      # @param response [NormalizedResponse]
+      # @return [MCPClient::Errors::MCPError]
+      def listen_rejection_error(response)
+        if [401, 403].include?(response.status)
+          process_authorization_challenge(response)
+          raise_authorization_error(response)
+        elsif (500..599).cover?(response.status)
+          MCPClient::Errors::TransientServerError.new("Server error: HTTP #{response.status}")
+        else
+          jsonrpc_error_from_http_response(response, "Client error: HTTP #{response.status}")
+        end
+      rescue MCPClient::Errors::MCPError => e
+        e
       end
 
       # Consume the complete SSE events in the buffer: notifications are

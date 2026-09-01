@@ -149,7 +149,10 @@ module MCPClient
     # @param uri [String] the resource URI
     # @return [MCPClient::Subscription]
     def subscribe_resource_via_listen(uri)
-      resource_subscriptions[uri] ||= listen(notifications: { 'resourceSubscriptions' => [uri] })
+      existing = resource_subscriptions[uri]
+      return existing if existing && !existing.closed?
+
+      resource_subscriptions[uri] = listen(notifications: { 'resourceSubscriptions' => [uri] })
     end
 
     # @param uri [String] the resource URI
