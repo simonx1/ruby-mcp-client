@@ -7,6 +7,12 @@ RSpec.describe MCPClient::Auth::OAuthProvider do
   let(:redirect_uri) { 'http://localhost:8080/callback' }
   let(:logger) { instance_double('Logger') }
   let(:storage) { instance_double('MCPClient::Auth::OAuthProvider::MemoryStorage') }
+  let(:known_server_metadata) do
+    MCPClient::Auth::ServerMetadata.new(issuer: 'https://auth.example.com',
+                                        authorization_endpoint: 'https://auth.example.com/authorize',
+                                        token_endpoint: 'https://auth.example.com/token',
+                                        code_challenge_methods_supported: ['S256'])
+  end
 
   subject(:oauth_provider) do
     described_class.new(
@@ -519,10 +525,13 @@ RSpec.describe MCPClient::Auth::OAuthProvider do
 
       before do
         allow(storage).to receive(:get_token).with(server_url).and_return(token)
+        # MCP 2026-07-28: a token is presented only for the known authorization server
+        allow(storage).to receive(:get_server_metadata).with(server_url).and_return(known_server_metadata)
+        allow(storage).to receive(:set_token)
       end
 
       it 'returns the token' do
-        expect(oauth_provider.access_token).to eq(token)
+        expect(oauth_provider.access_token.access_token).to eq(token.access_token)
       end
     end
 
@@ -540,12 +549,15 @@ RSpec.describe MCPClient::Auth::OAuthProvider do
 
       before do
         allow(storage).to receive(:get_token).with(server_url).and_return(expired_token)
-        allow(oauth_provider).to receive(:refresh_token).with(expired_token).and_return(nil)
+        allow(storage).to receive(:get_server_metadata).with(server_url).and_return(known_server_metadata)
+        allow(storage).to receive(:set_token)
+        allow(oauth_provider).to receive(:refresh_token).and_return(nil)
       end
 
       it 'attempts to refresh the token' do
         oauth_provider.access_token
-        expect(oauth_provider).to have_received(:refresh_token).with(expired_token)
+        expect(oauth_provider).to have_received(:refresh_token)
+          .with(an_object_having_attributes(access_token: 'expired_token', refresh_token: 'refresh123'))
       end
     end
   end
