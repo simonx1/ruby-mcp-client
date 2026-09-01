@@ -937,3 +937,195 @@ RSpec.describe 'MCP 2026-07-28 cacheable results — round 4' do
     end
   end
 end
+
+RSpec.describe 'MCP 2026-07-28 cacheable results — round 5' do
+  let(:url) { 'https://example.com/mcp' }
+
+  def json_response(id, result)
+    { status: 200, body: JSON.generate('jsonrpc' => '2.0', 'id' => id, 'result' => result),
+      headers: { 'Content-Type' => 'application/json' } }
+  end
+
+  def discover_result
+    { 'resultType' => 'complete', 'supportedVersions' => ['2026-07-28'],
+      'capabilities' => { 'tools' => {}, 'prompts' => {}, 'resources' => {} } }
+  end
+
+  def contents(text)
+    { 'contents' => [{ 'uri' => 'file:///a', 'text' => text }] }
+  end
+
+  def tool(name)
+    { 'name' => name, 'inputSchema' => { 'type' => 'object' } }
+  end
+
+  def script_stdio(server, responses)
+    sent = []
+    allow(server).to receive(:connect).and_return(true)
+    allow(server).to receive(:start_reader)
+    allow(server).to receive(:start_stderr_reader)
+    server.instance_variable_set(:@stdin, double('stdin', puts: nil, flush: nil, closed?: true, close: nil))
+    allow(server).to receive(:send_request) { |req| sent << req }
+    allow(server).to receive(:wait_response) do |id, **_opts|
+      responder = responses.shift
+      raise 'no scripted response left' unless responder
+
+      response = responder.respond_to?(:call) ? responder.call(sent.last) : responder
+      response.merge('jsonrpc' => '2.0', 'id' => id)
+    end
+    sent
+  end
+
+  # An OAuth provider whose token is taken from a script, one entry per
+  # apply_authorization call (the last entry repeats).
+  def scripted_provider(tokens)
+    provider = instance_double(MCPClient::Auth::OAuthProvider)
+    allow(provider).to receive(:apply_authorization) do |req|
+      token = tokens.size > 1 ? tokens.shift : tokens.first
+      req.headers['Authorization'] = "Bearer #{token}" if token
+    end
+    allow(provider).to receive(:respond_to?).and_return(true)
+    provider
+  end
+
+  def streamable(provider = nil)
+    MCPClient::ServerStreamableHTTP.new(base_url: 'https://example.com', endpoint: '/mcp', retries: 0,
+                                        oauth_provider: provider)
+  end
+
+  it 'drops a read whose cache entry was invalidated while the request was in flight' do
+    server = MCPClient::ServerStdio.new(command: 'echo test', read_timeout: 1)
+    script_stdio(server, [{ 'result' => discover_result },
+                          lambda { |_req|
+                            server.send(:invalidate_cache_for_notification, 'notifications/resources/updated',
+                                        { 'uri' => 'file:///a' })
+                            { 'result' => contents('stale').merge('ttlMs' => 60_000) }
+                          },
+                          { 'result' => contents('fresh').merge('ttlMs' => 60_000) }])
+
+    expect(server.read_resource('file:///a').first.text).to eq('stale')
+    expect(server.read_resource('file:///a').first.text).to eq('fresh')
+  end
+
+  it 'returns a copy of the freshly read contents, not the cached array' do
+    server = MCPClient::ServerStdio.new(command: 'echo test', read_timeout: 1)
+    script_stdio(server, [{ 'result' => discover_result }, { 'result' => contents('one').merge('ttlMs' => 60_000) }])
+
+    first = server.read_resource('file:///a')
+    first.clear
+
+    expect(server.read_resource('file:///a').size).to eq(1)
+  end
+
+  it 'revalidates the stale candidate against the credentials the failed re-fetch used' do
+    # alice: first list; alice: the pre-fetch probe; bob: the re-fetch itself
+    provider = scripted_provider(%w[alice alice bob])
+    lists = 0
+    stub_request(:post, url).to_return do |request|
+      body = JSON.parse(request.body)
+      if body['method'] == 'tools/list'
+        lists += 1
+        next { status: 503, body: '' } if request.headers['Authorization'] == 'Bearer bob'
+
+        json_response(body['id'], { 'tools' => [tool('alice-tool')], 'ttlMs' => 0, 'cacheScope' => 'private' })
+      else
+        json_response(body['id'], discover_result)
+      end
+    end
+    server = streamable(provider)
+
+    expect(server.list_tools.map(&:name)).to eq(['alice-tool'])
+    expect { server.list_tools }.to raise_error(MCPClient::Errors::MCPError)
+  ensure
+    server&.cleanup
+  end
+
+  it 'keeps the scope and context on a stale placeholder so a change notification cannot unlock a fallback' do
+    token = { value: 'alice' }
+    provider = instance_double(MCPClient::Auth::OAuthProvider)
+    allow(provider).to receive(:apply_authorization) { |req| req.headers['Authorization'] = "Bearer #{token[:value]}" }
+    allow(provider).to receive(:respond_to?).and_return(true)
+    stub_request(:post, url).to_return do |request|
+      body = JSON.parse(request.body)
+      result = if body['method'] == 'tools/list'
+                 { 'tools' => [tool('alice-tool')], 'ttlMs' => 60_000, 'cacheScope' => 'private' }
+               else
+                 discover_result
+               end
+      json_response(body['id'], result)
+    end
+    server = streamable(provider)
+    expect(server.list_tools.map(&:name)).to eq(['alice-tool'])
+    token[:value] = 'bob'
+    # Bob's re-fetch goes out, sees the change notification land, then fails.
+    allow(server).to receive(:fetch_tools_list) do
+      server.send(:note_request_authorization, 'Bearer bob')
+      server.send(:invalidate_cache_for_notification, 'notifications/tools/list_changed')
+      raise MCPClient::Errors::TransientServerError, 'HTTP 503'
+    end
+
+    expect { server.list_tools }.to raise_error(MCPClient::Errors::TransientServerError)
+  ensure
+    server&.cleanup
+  end
+
+  it 'expires a private list whose pages were fetched under different credentials' do
+    # discover, page 1, page 2 (bob), then bob's re-fetches
+    provider = scripted_provider(%w[alice alice bob bob])
+    lists = 0
+    stub_request(:post, url).to_return do |request|
+      body = JSON.parse(request.body)
+      if body['method'] == 'tools/list'
+        lists += 1
+        page = if body.dig('params',
+                           'cursor')
+                 { 'tools' => [tool('b')] }
+               else
+                 { 'tools' => [tool('a')], 'nextCursor' => 'p2' }
+               end
+        json_response(body['id'], page.merge('ttlMs' => 60_000, 'cacheScope' => 'private'))
+      else
+        json_response(body['id'], discover_result)
+      end
+    end
+    server = streamable(provider)
+
+    expect(server.list_tools.size).to eq(2)
+    expect(server.cache_fresh?(:tools)).to be(false)
+  ensure
+    server&.cleanup
+  end
+
+  describe 'on HTTP+SSE' do
+    let(:server) do
+      MCPClient::ServerSSE.new(base_url: 'https://example.com/sse', headers: { 'Authorization' => 'Bearer alice' })
+    end
+
+    before do
+      allow(server).to receive(:ensure_initialized)
+      server.instance_variable_set(:@protocol_version, '2025-11-25')
+    end
+
+    it 'records the resource templates hint' do
+      allow(server).to receive(:rpc_request).with('resources/templates/list', anything)
+                                            .and_return({ 'resourceTemplates' => [], 'ttlMs' => 60_000 })
+
+      server.list_resource_templates
+
+      expect(server.cache_info(:templates)).to include(ttl_ms: 60_000, fresh: true)
+    end
+
+    it 'does not serve a private entry after the Authorization header changes' do
+      reads = 0
+      allow(server).to receive(:rpc_request).with('resources/read', anything) do
+        reads += 1
+        contents("read #{reads}").merge('ttlMs' => 60_000, 'cacheScope' => 'private')
+      end
+
+      expect(server.read_resource('file:///a').first.text).to eq('read 1')
+      server.instance_variable_get(:@headers)['Authorization'] = 'Bearer bob'
+
+      expect(server.read_resource('file:///a').first.text).to eq('read 2')
+    end
+  end
+end
