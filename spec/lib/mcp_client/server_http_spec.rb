@@ -90,7 +90,7 @@ RSpec.describe MCPClient::ServerHTTP do
     it 'merges custom headers with default headers' do
       actual_headers = server.instance_variable_get(:@headers)
       expect(actual_headers).to include('Content-Type' => 'application/json')
-      expect(actual_headers).to include('Accept' => 'application/json')
+      expect(actual_headers).to include('Accept' => 'application/json, text/event-stream')
       expect(actual_headers).to include('Authorization' => 'Bearer token123')
     end
 
@@ -120,7 +120,7 @@ RSpec.describe MCPClient::ServerHTTP do
         .with(
           headers: {
             'Content-Type' => 'application/json',
-            'Accept' => 'application/json',
+            'Accept' => 'application/json, text/event-stream',
             'Authorization' => 'Bearer token123'
           },
           body: hash_including(method: 'initialize')

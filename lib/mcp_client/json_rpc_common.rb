@@ -689,7 +689,8 @@ module MCPClient
       'resources/read' => 'uri',
       'tasks/get' => 'taskId',
       'tasks/update' => 'taskId',
-      'tasks/cancel' => 'taskId'
+      'tasks/cancel' => 'taskId',
+      'tasks/result' => 'taskId'
     }.freeze
 
     # Encode a parameter value for an MCP request header (Mcp-Name,
