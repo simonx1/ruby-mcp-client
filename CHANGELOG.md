@@ -21,12 +21,18 @@ metadata). Each feature lands in its own PR; this section accumulates them.
   network URI, another document, a `urn:` or `file:` is never dereferenced
   and makes the schema unusable rather than permissive; an unresolvable
   local `$ref` is an error too.
-- **Composition.** `allOf`, `anyOf`, `oneOf`, `not`, `if`/`then`/`else`
-  and boolean schemas are evaluated (they are no longer reported as
-  unsupported keywords). Resource bounds apply: nesting depth
-  (`MAX_SCHEMA_DEPTH`), total subschemas (`MAX_SUBSCHEMAS`), `$ref` chain
-  length (`MAX_REF_DEPTH`) and the per-validation time budget now covers
-  the whole walk.
+- **Composition.** `allOf`, `anyOf`, `oneOf`, `not`, `if`/`then`/`else`,
+  `prefixItems` (2020-12) / tuple-form `items` (draft-07, 2019-09) and
+  boolean schemas (root or nested) are evaluated (they are no longer
+  reported as unsupported keywords); under draft-07 a `$ref` replaces its
+  siblings. Resource bounds apply: nesting depth (`MAX_SCHEMA_DEPTH`),
+  total subschemas (`MAX_SUBSCHEMAS`, boolean subschemas included), `$ref`
+  chain length (`MAX_REF_DEPTH`, checked at preflight too), nodes visited
+  (`MAX_NODE_VISITS`), errors produced (`MAX_ERRORS`) and the
+  per-validation time budget; hitting a bound aborts the validation with
+  a single error, never with a pass, even under `not` or `oneOf`. Values
+  quoted in messages are clipped, and the client sanitizes and bounds the
+  violation text it logs or raises.
 - **structuredContent.** Any JSON value is accepted, including `null`:
   presence is decided by the `structuredContent` key, and the value —
   object, array, scalar or null — is validated against the output schema.

@@ -15,6 +15,10 @@ module MCPClient
     include MCPClient::Client::TaskSupport
     include MCPClient::Client::TaskApi
 
+    # Ceiling on the schema-violation text that reaches a log line or an
+    # exception (the validator already bounds its error count).
+    MAX_VIOLATION_TEXT = 4000
+
     # Elicitation modes implemented by this client (MCP 2025-11-25).
     # Requests with a mode outside this set are rejected with -32602.
     SUPPORTED_ELICITATION_MODES = %w[form url].freeze
@@ -1258,8 +1262,11 @@ module MCPClient
       # bounds) is a violation too, never a permissive pass.
       errors = MCPClient::SchemaValidator.validate(result[key], tool.output_schema)
       unless errors.empty?
+        # Schema and data text is peer-controlled: it is sanitized and
+        # bounded before it reaches a log line or an exception.
         handle_structured_content_violation(
-          "Structured content for tool '#{tool.name}' does not match its output schema: #{errors.join('; ')}"
+          "Structured content for tool '#{sanitize_peer_log_text(tool.name.to_s)}' does not match its output " \
+          "schema: #{sanitize_peer_log_text(errors.join('; '))[0, MAX_VIOLATION_TEXT]}"
         )
       end
       result
@@ -1275,12 +1282,15 @@ module MCPClient
     def warn_unusable_input_schema(tool)
       return if tool.schema.nil?
 
+      # Keyed by the schema itself as well, so a refreshed tool definition
+      # (list_changed, cache expiry, HeaderMismatch recovery) is re-checked.
       @input_schema_warnings ||= {}
       key = [tool.server&.object_id, tool.name]
-      return if @input_schema_warnings.key?(key)
+      identity = tool.schema.hash
+      return if @input_schema_warnings[key] == identity
 
       problems = MCPClient::SchemaValidator.check_schema(tool.schema)
-      @input_schema_warnings[key] = true
+      @input_schema_warnings[key] = identity
       return if problems.empty?
 
       @logger.warn("Tool '#{sanitize_peer_log_text(tool.name.to_s)}' input schema is not usable for validation: " \

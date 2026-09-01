@@ -183,7 +183,11 @@ module MCPClient
     # Check if the tool supports structured outputs (MCP 2025-06-18)
     # @return [Boolean] true if the tool has an output schema defined
     def structured_output?
-      !@output_schema.nil? && !@output_schema.empty?
+      return false if @output_schema.nil?
+      # A boolean schema (true: any value; false: none) is a schema too.
+      return true unless @output_schema.respond_to?(:empty?)
+
+      !@output_schema.empty?
     end
 
     # Whether task-augmented execution is allowed for this tool (MCP 2025-11-25).
