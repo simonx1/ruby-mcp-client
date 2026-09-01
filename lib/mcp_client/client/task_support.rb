@@ -70,28 +70,21 @@ module MCPClient
           raise MCPClient::Errors::TaskError, 'wait_for_task requires an MCP 2026-07-28 server (tasks extension)'
         end
 
-        deadline = timeout && (monotonic_time + timeout)
-        answered = []
-        current = task.is_a?(MCPClient::Task) ? task : nil
+        wait = { task_id: task_id, srv: srv, deadline: timeout && (monotonic_time + timeout), answered: [] }
+        # The handle's own state is a starting point only when it came from
+        # the server being polled.
+        current = task if task.is_a?(MCPClient::Task) && (task.server.nil? || task.server.equal?(srv))
         loop do
-          current ||= get_task(task_id, server: srv)
-          # A creation seed (CreateTaskResult) carries no result, error or
-          # inputRequests: a terminal status there is confirmed by tasks/get.
-          if current.terminal? && !current.detailed? && !current.payload_present?
-            current = get_task(task_id, server: srv)
-          end
+          current = observe_task(current, wait)
           return current if current.terminal?
 
-          answered.concat(answer_task_input_requests(current, answered, srv))
+          wait[:answered].concat(answer_task_input_requests(current, wait[:answered], srv))
           if current.ttl_elapsed?
             raise MCPClient::Errors::TaskError,
                   "Task '#{task_id}' did not reach a terminal status within its TTL (createdAt + ttlMs)"
           end
-          if deadline && monotonic_time >= deadline
-            raise MCPClient::Errors::TaskError, "Timed out waiting for task '#{task_id}'"
-          end
 
-          sleep(task_poll_delay(current, deadline))
+          sleep(task_poll_delay(current, wait[:deadline]))
           current = nil
         end
       end
@@ -104,6 +97,51 @@ module MCPClient
       end
 
       private
+
+      # The task state to act on for this iteration: the seed when it is
+      # still usable, else a fresh tasks/get; a seed that claims a terminal
+      # or input_required status without its payload is confirmed by
+      # tasks/get, and a terminal DetailedTask must carry its payload.
+      # @param current [MCPClient::Task, nil]
+      # @param wait [Hash] task_id, srv, deadline
+      # @return [MCPClient::Task]
+      # @raise [MCPClient::Errors::TaskError] once the deadline has passed
+      def observe_task(current, wait)
+        raise_if_past_deadline!(wait)
+        current ||= poll_task(wait)
+        current = poll_task(wait) if current.terminal? && !current.detailed? && !current.payload_present?
+        validate_terminal_task!(current) if current.terminal?
+        current
+      end
+
+      # @return [void]
+      # @raise [MCPClient::Errors::TaskError]
+      def raise_if_past_deadline!(wait)
+        return unless wait[:deadline] && monotonic_time >= wait[:deadline]
+
+        raise MCPClient::Errors::TaskError, "Timed out waiting for task '#{wait[:task_id]}'"
+      end
+
+      # One tasks/get, bounded by what is left of the wait.
+      # @return [MCPClient::Task]
+      def poll_task(wait)
+        deadline = wait[:deadline]
+        remaining = deadline && [deadline - monotonic_time, MIN_TASK_POLL_INTERVAL].max
+        get_task(wait[:task_id], server: wait[:srv], timeout: remaining)
+      end
+
+      # A DetailedTask MUST carry the payload its terminal status implies
+      # (the result of a completed task, the JSON-RPC error of a failed one).
+      # @param task [MCPClient::Task] a detailed terminal task
+      # @return [void]
+      # @raise [MCPClient::Errors::InvalidResultError]
+      def validate_terminal_task!(task)
+        return if task.payload_present?
+
+        missing = task.failed? ? 'error' : 'result'
+        raise MCPClient::Errors::InvalidResultError,
+              "Invalid task: status #{task.status} without the #{missing} field"
+      end
 
       # Enforce the MCP 2026-07-28 tasks extension gate: this client must have
       # declared it and the server must have negotiated it.
@@ -228,9 +266,10 @@ module MCPClient
       # (cancellation is eventually consistent), so the last known state.
       # @return [MCPClient::Task]
       def cancelled_task_handle(task, task_id, srv)
-        return task if task.is_a?(MCPClient::Task)
+        return task if task.is_a?(MCPClient::Task) && task.server.equal?(srv)
 
-        MCPClient::Task.new(task_id: task_id, status: 'working', server: srv, modern: true)
+        status = task.is_a?(MCPClient::Task) ? task.status : 'working'
+        MCPClient::Task.new(task_id: task_id, status: status, server: srv, modern: true)
       end
     end
   end

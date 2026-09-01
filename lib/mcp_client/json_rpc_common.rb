@@ -29,7 +29,9 @@ module MCPClient
     # so a retry could execute the operation twice — and JSON-RPC has no
     # idempotency key to make the duplicate safe. Callers who want to retry
     # such an operation must decide that explicitly.
-    NON_IDEMPOTENT_METHODS = %w[tools/call].freeze
+    # tasks/update (MCP 2026-07-28 tasks extension) delivers one-shot input
+    # responses: a replay could advance a task twice.
+    NON_IDEMPOTENT_METHODS = %w[tools/call tasks/update].freeze
 
     # Execute the block with retry/backoff for transient errors only.
     #

@@ -605,13 +605,18 @@ module MCPClient
     # @raise [MCPClient::Errors::ServerNotFound] if no server is available
     # @raise [MCPClient::Errors::TaskNotFound] if the task does not exist
     # @raise [MCPClient::Errors::TaskError] if retrieving the task fails
-    def get_task(task_id, server: nil)
+    # @param timeout [Numeric, nil] request timeout in seconds (the transport default when nil)
+    def get_task(task_id, server: nil, timeout: nil)
       srv = select_task_server(task_id, server, 'get_task')
       task_id = task_identifier(task_id)
       ensure_task_capability!(srv, 'get')
 
       begin
-        result = srv.rpc_request('tasks/get', { taskId: task_id })
+        result = if timeout
+                   srv.rpc_request('tasks/get', { taskId: task_id }, timeout: timeout)
+                 else
+                   srv.rpc_request('tasks/get', { taskId: task_id })
+                 end
         MCPClient::Task.from_json(result, server: srv, detailed: true)
       rescue MCPClient::Errors::ServerError => e
         raise if e.protocol_error?
