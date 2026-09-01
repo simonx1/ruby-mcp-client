@@ -810,7 +810,8 @@ RSpec.describe 'MCP 2026-07-28 tasks extension — round 4' do
   it 'polls immediately after creation instead of trusting the seed for TTL or pacing' do
     client = client_for(stdio)
     script_stdio(stdio, [{ 'result' => discover_result }, tool_list,
-                         { 'result' => task_result(poll_ms: 180_000, ttl_ms: 1000, created_at: '2000-01-01T00:00:00Z') },
+                         { 'result' => task_result(poll_ms: 180_000, ttl_ms: 1000,
+                                                   created_at: '2000-01-01T00:00:00Z') },
                          { 'result' => detailed_task(status: 'completed', 'result' => call_result('quick')) }])
 
     expect(client.call_tool('slow', {})['content'].first['text']).to eq('quick')
