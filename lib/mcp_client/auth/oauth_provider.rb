@@ -69,8 +69,11 @@ module MCPClient
         self.logger = logger || Logger.new($stdout, level: Logger::WARN)
         self.storage = storage || MemoryStorage.new
         self.client_id_metadata_url = client_id_metadata_url
-        self.application_type = application_type
-        @extra_client_metadata = client_metadata
+        # An application_type given through client_metadata is the host's
+        # explicit choice too; it never silently overrides the derived type.
+        extra = (client_metadata || {}).transform_keys(&:to_sym)
+        self.application_type = application_type || extra[:application_type]
+        @extra_client_metadata = extra.except(:application_type)
         @http_client = create_http_client
         # Protected resource metadata learned from a 401 WWW-Authenticate
         # challenge, reused by discovery so a challenge-advertised metadata URL
@@ -113,6 +116,9 @@ module MCPClient
         token = storage.get_token(server_url)
         logger.debug("OAuth access_token: retrieved token=#{token ? 'present' : 'nil'} for #{server_url}")
         return nil unless token
+        # A token from another authorization server is never presented
+        # (MCP 2026-07-28: registration state and tokens are per AS).
+        return nil unless token_for_current_issuer?(token)
 
         # Return token if still valid
         return token unless token.expired? || token.expires_soon?
@@ -171,10 +177,23 @@ module MCPClient
         # Get stored PKCE and client info
         pkce = storage.get_pkce(server_url)
         client_info = storage.get_client_info(server_url)
-        server_metadata = discover_authorization_server
-
         raise MCPClient::Errors::ConnectionError, 'Missing PKCE or client info' unless pkce && client_info
 
+        # The code is redeemed only at the authorization server the request
+        # was sent to: the issuer recorded with the PKCE record (RFC 9207
+        # mix-up protection). A different server discovered since — a 401
+        # challenge pointing elsewhere — ends this flow instead.
+        unless pkce.issuer.is_a?(String)
+          raise MCPClient::Errors::ConnectionError,
+                'Authorization response rejected: no issuer was recorded for this authorization request, ' \
+                'so it cannot be bound to an authorization server; restart the authorization'
+        end
+        server_metadata = discover_authorization_server
+        unless server_metadata.issuer == pkce.issuer
+          raise MCPClient::Errors::ConnectionError,
+                'Authorization response rejected: the authorization server changed during the flow ' \
+                "(recorded #{pkce.issuer}); restart the authorization"
+        end
         validate_authorization_response_issuer!(iss, pkce.issuer, server_metadata)
 
         # Exchange authorization code for tokens
@@ -199,9 +218,14 @@ module MCPClient
       # @raise [MCPClient::Errors::ConnectionError] when the response's issuer does not check out
       def authorization_error_message(params)
         params = params.to_h.transform_keys(&:to_s)
+        stored_state = storage.get_state(server_url)
+        if stored_state && params['state'] != stored_state
+          raise MCPClient::Errors::ConnectionError, 'Authorization error response rejected: state mismatch'
+        end
+
         pkce = storage.get_pkce(server_url)
         validate_authorization_response_issuer!(params['iss'], pkce&.issuer, storage.get_server_metadata(server_url))
-        (params['error_description'] || params['error'] || 'unknown error').to_s
+        safe_error_text((params['error_description'] || params['error'] || 'unknown error').to_s).strip
       end
 
       # Apply OAuth authorization to HTTP request
@@ -338,17 +362,17 @@ module MCPClient
       # @return [void]
       # @raise [MCPClient::Errors::ConnectionError]
       def validate_authorization_response_issuer!(iss, expected, server_metadata)
+        unless expected.is_a?(String)
+          raise MCPClient::Errors::ConnectionError,
+                'Authorization response rejected: no issuer was recorded for this authorization request, ' \
+                'so it cannot be bound to an authorization server; restart the authorization'
+        end
         if iss.nil?
           return unless server_metadata&.iss_parameter_supported?
 
           raise MCPClient::Errors::ConnectionError,
                 'Authorization response rejected: the authorization server advertises the iss parameter ' \
                 '(authorization_response_iss_parameter_supported) but the response carries none'
-        end
-        unless expected.is_a?(String)
-          raise MCPClient::Errors::ConnectionError,
-                'Authorization response rejected: no issuer was recorded for this authorization request, ' \
-                'so its iss parameter cannot be validated'
         end
         return if iss.to_s == expected
 
@@ -561,11 +585,7 @@ module MCPClient
         # only when bound (pre-registered, so the mismatch can be reported)
         # or portable (Client ID Metadata Document); a dynamic or unknown
         # registration is discarded so the next flow re-registers.
-        if storage.respond_to?(:delete_token)
-          storage.delete_token(server_url)
-        elsif storage.respond_to?(:set_token)
-          storage.set_token(server_url, nil)
-        end
+        delete_token
         client_info = storage.get_client_info(server_url)
         keep = client_info.respond_to?(:portable?) && (client_info.portable? || client_info.pre_registered?)
         delete_client_info unless keep
@@ -608,7 +628,8 @@ module MCPClient
         validate_peer_advertised_url!(auth_server_url,
                                       'authorization server (advertised by protected resource metadata)')
 
-        server_metadata = fetch_first_server_metadata(authorization_server_metadata_urls(auth_server_url))
+        server_metadata = fetch_first_server_metadata(authorization_server_metadata_urls(auth_server_url),
+                                                      auth_server_url)
         unless server_metadata
           raise MCPClient::Errors::ConnectionError,
                 "Authorization server advertised by protected resource metadata (#{auth_server_url}) " \
@@ -642,7 +663,7 @@ module MCPClient
       # @return [ServerMetadata, nil]
       def discover_via_direct_authorization_server
         origin = origin_of(URI.parse(server_url))
-        fetch_first_server_metadata(authorization_server_metadata_urls(origin))
+        fetch_first_server_metadata(authorization_server_metadata_urls(origin), origin)
       end
 
       # Fetch the first Protected Resource Metadata document that resolves.
@@ -667,12 +688,34 @@ module MCPClient
       # genuine alternatives, so any failing candidate is skipped to try the next.
       # @param urls [Array<String>] candidate URLs
       # @return [ServerMetadata, nil]
-      def fetch_first_server_metadata(urls)
+      # @param urls [Array<String>] well-known candidates
+      # @param issuer [String] the issuer identifier the candidates were built from
+      def fetch_first_server_metadata(urls, issuer)
         urls.each do |url|
           md = try_fetch_server_metadata(url)
-          return md if md
+          next unless md
+
+          validate_metadata_issuer!(md, issuer)
+          return md
         end
         nil
+      end
+
+      # RFC 8414 Section 3.3 / OpenID Connect Discovery 4.3 (MCP 2026-07-28
+      # "Authorization Server Metadata Discovery"): "the issuer value in the
+      # document MUST be identical to the issuer identifier used to construct
+      # the well-known URL. If they differ, the client MUST NOT use the
+      # metadata." The issuer is the trust anchor of the RFC 9207 check, so a
+      # document naming another issuer is rejected outright.
+      # @param metadata [ServerMetadata]
+      # @param issuer [String]
+      # @raise [MCPClient::Errors::ConnectionError]
+      def validate_metadata_issuer!(metadata, issuer)
+        return if metadata.issuer.to_s.chomp('/') == issuer.to_s.chomp('/')
+
+        raise MCPClient::Errors::ConnectionError,
+              "Authorization server metadata rejected: its issuer #{metadata.issuer.inspect} is not the " \
+              "identifier it was fetched for (#{issuer})"
       end
 
       # Non-raising server-metadata fetch used while iterating candidates.
@@ -976,7 +1019,36 @@ module MCPClient
         logger.warn("Discarding the OAuth client registered with #{client_info.issuer}: " \
                     "the authorization server is now #{issuer}")
         delete_client_info
+        delete_token
         nil
+      end
+
+      # Forget the stored token (the authorization server it came from is no
+      # longer the one in use). Storage backends may implement the optional
+      # delete_token(server_url); otherwise set_token(server_url, nil) is
+      # attempted, and a backend that accepts neither is reported.
+      # @return [void]
+      def delete_token
+        if storage.respond_to?(:delete_token)
+          storage.delete_token(server_url)
+        else
+          storage.set_token(server_url, nil)
+        end
+      rescue StandardError => e
+        logger.warn('The OAuth token for the previous authorization server could not be removed from storage ' \
+                    "(#{e.class}); implement delete_token(server_url) on the storage backend. The token is " \
+                    'ignored while the authorization server differs from its issuer.')
+      end
+
+      # Whether a stored token belongs to the authorization server currently
+      # known for this resource (an unbound legacy token is trusted).
+      # @param token [Token]
+      # @return [Boolean]
+      def token_for_current_issuer?(token)
+        return true unless token.respond_to?(:issuer) && token.issuer
+
+        current = storage.get_server_metadata(server_url)&.issuer
+        current.nil? || current == token.issuer
       end
 
       # @return [void]
@@ -1288,7 +1360,8 @@ module MCPClient
           token_type: data['token_type'] || 'Bearer',
           expires_in: data['expires_in'],
           scope: data['scope'],
-          refresh_token: data['refresh_token']
+          refresh_token: data['refresh_token'],
+          issuer: server_metadata.issuer
         )
       rescue JSON::ParserError => e
         raise MCPClient::Errors::ConnectionError, "Invalid token response: #{e.message}"
@@ -1308,6 +1381,7 @@ module MCPClient
         client_info = storage.get_client_info(server_url)
 
         return nil unless server_metadata && client_info
+        return nil unless refresh_permitted?(token, client_info, server_metadata)
 
         params = {
           grant_type: 'refresh_token',
@@ -1338,7 +1412,8 @@ module MCPClient
           token_type: data['token_type'] || 'Bearer',
           expires_in: data['expires_in'],
           scope: data['scope'],
-          refresh_token: data['refresh_token'] || token.refresh_token
+          refresh_token: data['refresh_token'] || token.refresh_token,
+          issuer: server_metadata.issuer
         )
 
         storage.set_token(server_url, new_token)
@@ -1349,6 +1424,23 @@ module MCPClient
       rescue Faraday::Error => e
         logger.warn("Network error during token refresh: #{e.message}")
         nil
+      end
+
+      # A refresh token (and a client secret) is only ever presented to the
+      # authorization server that issued it (MCP 2026-07-28: registration
+      # state and tokens are per authorization server).
+      # @return [Boolean]
+      def refresh_permitted?(token, client_info, server_metadata)
+        if token.respond_to?(:issuer) && token.issuer && token.issuer != server_metadata.issuer
+          logger.warn('Not refreshing the token: the authorization server changed since it was issued')
+          return false
+        end
+        if client_info.respond_to?(:issuer) && client_info.issuer && !client_info.portable? &&
+           client_info.issuer != server_metadata.issuer
+          logger.warn('Not refreshing the token: the client credentials belong to another authorization server')
+          return false
+        end
+        true
       end
 
       # Extract redirect_uri mismatch details from an OAuth error response
