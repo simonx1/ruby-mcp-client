@@ -108,9 +108,11 @@ module MCPClient
       # Forget a cached prompt or resource list. Like the tool cache, each keeps
       # a generation counter so a fetch that was already in flight when the
       # list changed recognises that it is stale and does not put it back.
-      # @param kind [Symbol] :prompts or :resources
+      # @param kind [Symbol] :tools, :prompts or :resources
       # @return [void]
       def invalidate_list_cache(kind)
+        return invalidate_tools_cache if kind == :tools
+
         @mutex.synchronize do
           case kind
           when :prompts
@@ -133,6 +135,23 @@ module MCPClient
       # @return [Hash{Symbol => Integer}] generation per list cache
       def list_generations
         @list_generations ||= Hash.new(0)
+      end
+
+      # Re-fetch a list that has gone stale, or serve the stale copy when the
+      # re-fetch fails for a transient reason ("Clients MAY serve stale
+      # responses if errors occur during re-fetching").
+      # @param kind [Symbol] the list kind (for the log line)
+      # @param stale [Object, nil] the stale cached value
+      # @yield performs the fetch
+      # @return [Object] the fresh value, or the stale one on a transient failure
+      def refetch_or_serve_stale(kind, stale)
+        yield
+      rescue MCPClient::Errors::TransientServerError, MCPClient::Errors::ConnectionError,
+             MCPClient::Errors::TransportError => e
+        raise unless stale
+
+        @logger.warn("Re-fetching #{kind} failed (#{e.class}); serving the stale cached list")
+        stale
       end
 
       # Exclude tool definitions whose x-mcp-header annotations violate the

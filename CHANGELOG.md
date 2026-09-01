@@ -5,6 +5,29 @@
 Groundwork for the 2026-07-28 protocol revision (stateless, per-request
 metadata). Each feature lands in its own PR; this section accumulates them.
 
+### Cacheable results (`ttlMs` / `cacheScope`)
+
+- **Freshness hints honoured.** `server/discover`, `tools/list`,
+  `prompts/list`, `resources/list`, `resources/templates/list` and
+  `resources/read` results carry `ttlMs` and `cacheScope`
+  (`MCPClient::CachedResult`). Cached lists are served only while fresh
+  (`now < received + ttlMs`; `0` means re-fetch on every access, a negative
+  or malformed value counts as `0`) and re-fetched on access once stale —
+  never in the background. An auto-paginated list is as fresh as its
+  shortest-lived page. Legacy servers (no `ttlMs`) keep the previous
+  cache-until-notification heuristic. `MCPClient::Client`'s own caches
+  consult every server's freshness before serving.
+- **Reads.** `resources/read` results are cached per URI while fresh (never
+  the result of a multi round-trip retry), and dropped on
+  `notifications/resources/updated` for that URI or on
+  `notifications/resources/list_changed`; list caches drop on their
+  `list_changed` notification regardless of TTL.
+- **Stale on failure.** When a re-fetch fails transiently (5xx, connection
+  or transport error) the stale list is served with a warning, as the spec
+  allows. `server.cache_info(:tools | :prompts | :resources | :templates |
+  :discover)` and `cache_info(:read, uri)` expose `ttl_ms`, `cache_scope`,
+  `received_at` and `fresh`.
+
 ### Subscriptions (`subscriptions/listen`)
 
 - **Long-lived notification streams.** `server.listen(notifications:)` and

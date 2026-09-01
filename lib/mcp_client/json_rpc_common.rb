@@ -9,6 +9,7 @@ require_relative 'json_rpc_common/error_bodies'
 require_relative 'json_rpc_common/input_waits'
 require_relative 'subscription_support'
 require_relative 'input_round_trips'
+require_relative 'result_caching'
 
 module MCPClient
   # Shared retry/backoff logic for JSON-RPC transports
@@ -18,6 +19,7 @@ module MCPClient
     include InputWaits
     include SubscriptionSupport
     include InputRoundTrips
+    include ResultCaching
 
     # JSON-RPC methods with arbitrary side effects that MUST NOT be re-sent
     # automatically. Even a "transient" failure (5xx, dropped connection,
@@ -497,6 +499,7 @@ module MCPClient
       @protocol_version = version
       @supported_versions = versions
       @last_discover_result = result
+      record_cache_hint(:discover, result)
       @capabilities = capabilities || {}
       @instructions = result['instructions']
       info = meta && meta[META_SERVER_INFO]
@@ -947,6 +950,7 @@ module MCPClient
         end
         result = yield(retry_params)
       end
+      @last_result_from_round_trip = round_trips.positive?
       result
     rescue MCPClient::Errors::InputRequiredError => e
       # Every failure of the round trip hands the continuation back: the
