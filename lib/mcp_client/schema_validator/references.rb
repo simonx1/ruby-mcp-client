@@ -28,6 +28,10 @@ module MCPClient
       def resolve_reference(root, ref, dialect, resolver)
         fragment = ref.delete_prefix('#')
         return resolve_pointer(root, ref) if fragment.empty? || fragment.start_with?('/', '%2F', '%2f')
+
+        # A plain-name fragment is percent-decoded like a pointer fragment
+        # (RFC 3986 Section 2.1): "#foo%2Dbar" names the anchor "foo-bar".
+        fragment = URI.decode_uri_component(fragment) rescue fragment # rubocop:disable Style/RescueModifier
         return UNRESOLVED unless fragment.match?(ANCHOR_NAME)
 
         resolver[:anchors] ||= anchor_index(root, dialect)

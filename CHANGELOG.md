@@ -42,9 +42,12 @@ metadata). Each feature lands in its own PR; this section accumulates them.
   the dialect does not define (`prefixItems` or `$dynamicRef` in draft-07,
   `dependencies` or `additionalItems` in 2020-12, ...) is ignored rather
   than shape-checked or reported, draft-07 `dependencies` accepts property
-  name arrays, draft-07 boolean `exclusiveMinimum` / `exclusiveMaximum`
-  make `minimum` / `maximum` exclusive (the other dialect's form is a
-  schema problem), a draft-07 `$ref` hides its sibling applicators at
+  name arrays, `exclusiveMinimum` / `exclusiveMaximum` are numbers in
+  every supported dialect (draft-07 included; the draft-04 boolean form is
+  a schema problem) and are applied independently of `minimum` /
+  `maximum`, each validation error counts once toward `MAX_ERRORS`,
+  percent-encoded plain-name fragments are decoded before the anchor
+  lookup, a draft-07 `$ref` hides its sibling applicators at
   preflight too, plain-name fragments (`#name`) resolve to `$anchor` /
   `$dynamicAnchor` (2019-09, 2020-12) or `$id: "#name"` (draft-07), and an
   external `$recursiveRef` (2019-09) makes the schema unusable like an
