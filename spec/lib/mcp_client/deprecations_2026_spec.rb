@@ -108,14 +108,25 @@ RSpec.describe 'MCP 2026-07-28 deprecations' do
   end
 
   it 'warns when the log level is set on a server directly' do
-    server = MCPClient::ServerStdio.new(command: 'echo test', logger: logger)
-    allow(server).to receive(:rpc_request).and_return({})
-    allow(server).to receive(:ensure_initialized)
-    allow(server).to receive(:modern?).and_return(true)
+    servers = [
+      MCPClient::ServerStdio.new(command: 'echo test', logger: logger),
+      MCPClient::ServerHTTP.new(base_url: 'http://localhost:1', logger: logger),
+      MCPClient::ServerStreamableHTTP.new(base_url: 'http://localhost:1', logger: logger),
+      MCPClient::ServerSSE.new(base_url: 'http://localhost:1/sse', logger: logger)
+    ]
+    servers.each do |server|
+      MCPClient::Deprecations.reset!
+      output.truncate(0)
+      allow(server).to receive(:rpc_request).and_return({})
+      allow(server).to receive(:ensure_initialized) if server.respond_to?(:ensure_initialized, true)
+      allow(server).to receive(:ensure_connected) if server.respond_to?(:ensure_connected, true)
+      allow(server).to receive(:modern?).and_return(true)
+      allow(server).to receive(:require_capability!) if server.respond_to?(:require_capability!, true)
 
-    server.log_level = 'debug'
+      server.log_level = 'debug'
 
-    expect(output.string).to match(/Logging .*deprecated/)
+      expect(output.string).to match(/Logging .*deprecated/), server.class.name
+    end
   end
 
   it 'warns when a server sends a log message' do
@@ -155,18 +166,67 @@ RSpec.describe 'MCP 2026-07-28 deprecations' do
     expect(MCPClient::Deprecations.warn(:roots, logger)).to be(true)
   end
 
-  it 'does not mark a notice emitted when the logger raises' do
+  it 'swallows a logger failure and leaves the notice for a later use' do
     broken = Object.new
     def broken.warn(_message) = raise(IOError, 'closed stream')
 
-    expect { MCPClient::Deprecations.warn(:roots, broken) }.to raise_error(IOError)
+    expect(MCPClient::Deprecations.warn(:roots, broken)).to be(false)
     expect(MCPClient::Deprecations.emitted?(:roots)).to be(false)
+    expect(MCPClient::Deprecations.warn(:roots, logger)).to be(true)
+  end
+
+  it 'keeps serving deprecated features when the logger fails' do
+    broken = Logger.new(StringIO.new)
+    def broken.warn(*) = raise(IOError, 'closed stream')
+    handler = lambda { |_messages, _prefs, _system, _max|
+      { 'role' => 'assistant', 'content' => { 'type' => 'text', 'text' => 'ok' }, 'model' => 'm' }
+    }
+    c = MCPClient::Client.new(mcp_server_configs: [], logger: broken, sampling_handler: handler, roots: roots)
+    params = { 'messages' => [], 'maxTokens' => 5, 'includeContext' => 'thisServer' }
+    expect(c.send(:handle_sampling_request, 1, params)['content']['text']).to eq('ok')
+    expect { c.log_level = 'debug' }.not_to raise_error
+
+    server = MCPClient::ServerSSE.new(base_url: 'http://localhost:1/sse', logger: broken)
+    allow(server).to receive(:start_sse_thread)
+    allow(server).to receive(:wait_for_connection)
+    allow(server).to receive(:start_activity_monitor)
+    expect(server.connect).to be(true)
+  end
+
+  it 'does not call warn? on a strict Logger double' do
+    strict = instance_double(Logger, warn: nil)
+
+    expect(MCPClient::Deprecations.warn(:roots, strict)).to be(true)
+  end
+
+  it 'logs outside its lock so a logger may consult the registry' do
+    logger.formatter = proc { |severity, _time, _prog, msg| "#{severity} #{MCPClient::Deprecations.emitted?(:logging)} #{msg}\n" }
+
+    expect(MCPClient::Deprecations.warn(:roots, logger)).to be(true)
+    expect(output.string).to match(/Roots .*deprecated/)
+  end
+
+  it 'emits each notice exactly once under concurrent first uses' do
+    threads = Array.new(8) do
+      Thread.new do
+        MCPClient::Deprecations.warn(:roots, logger)
+        MCPClient::Deprecations.warn(:logging, logger)
+      end
+    end
+    threads.each(&:join)
+
+    expect(output.string.scan(/Roots .*deprecated/).size).to eq(1)
+    expect(output.string.scan(/Logging .*deprecated/).size).to eq(1)
   end
 
   it 'stays silent when notices are disabled' do
     MCPClient::Deprecations.enabled = false
-    client(roots: roots, sampling_handler: ->(_m, _p, _s, _t) { {} })
-    MCPClient::ServerSSE.new(base_url: 'http://localhost:1/sse', logger: logger)
+    client(roots: roots, sampling_handler: ->(_m, _p, _s, _t) { {} }).log_level = 'debug'
+    server = MCPClient::ServerSSE.new(base_url: 'http://localhost:1/sse', logger: logger)
+    allow(server).to receive(:start_sse_thread)
+    allow(server).to receive(:wait_for_connection)
+    allow(server).to receive(:start_activity_monitor)
+    server.connect
 
     expect(output.string).not_to match(/deprecated/)
   end
