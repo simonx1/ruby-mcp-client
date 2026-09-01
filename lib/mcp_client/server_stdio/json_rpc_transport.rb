@@ -31,13 +31,14 @@ module MCPClient
         init_req = build_jsonrpc_request('initialize', initialization_params, init_id)
         send_request(init_req)
         res = wait_response(init_id)
-        if (err = res['error'])
-          raise MCPClient::Errors::ConnectionError, "Initialize failed: #{err['message']}"
+        begin
+          result = process_jsonrpc_response(res) || {}
+        rescue MCPClient::Errors::ServerError => e
+          raise MCPClient::Errors::ConnectionError, "Initialize failed: #{e.message}"
         end
 
         # Store negotiated protocol version, server info and capabilities.
         # Disconnects if the server negotiated a version we cannot speak.
-        result = res['result'] || {}
         @protocol_version = validate_protocol_version!(result)
         @server_info = result['serverInfo']
         @capabilities = result['capabilities']

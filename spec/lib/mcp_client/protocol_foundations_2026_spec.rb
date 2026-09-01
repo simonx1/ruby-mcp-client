@@ -322,3 +322,40 @@ RSpec.describe 'MCP 2026-07-28 protocol foundations' do
     end
   end
 end
+
+# Every response path validates resultType, not only rpc_request: the SSE
+# transport delivers stored results through check_for_result, and the stdio
+# initialize handshake reads its result directly.
+RSpec.describe 'resultType validation on every transport response path' do
+  it 'rejects an unrecognized resultType delivered through the SSE result store' do
+    server = MCPClient::ServerSSE.new(base_url: 'https://example.com/sse')
+    server.instance_variable_get(:@mutex).synchronize do
+      server.instance_variable_get(:@sse_results)[7] = { 'resultType' => 'bogus', 'tools' => [] }
+    end
+
+    expect { server.send(:check_for_result, 7) }.to raise_error(MCPClient::Errors::InvalidResultError)
+  end
+
+  it 'rejects an unrecognized resultType on the stdio initialize result' do
+    server = MCPClient::ServerStdio.new(command: 'echo test')
+    allow(server).to receive(:next_id).and_return(1)
+    allow(server).to receive(:send_request)
+    allow(server).to receive(:wait_response).and_return(
+      { 'result' => { 'resultType' => 'bogus', 'protocolVersion' => '2025-11-25', 'capabilities' => {} } }
+    )
+
+    expect { server.send(:perform_initialize) }.to raise_error(MCPClient::Errors::ConnectionError, /resultType/)
+  end
+
+  it 'reports a stdio initialize error response as a ConnectionError carrying the message' do
+    server = MCPClient::ServerStdio.new(command: 'echo test')
+    allow(server).to receive(:next_id).and_return(1)
+    allow(server).to receive(:send_request)
+    allow(server).to receive(:wait_response).and_return(
+      { 'error' => { 'code' => -32_602, 'message' => 'bad init' } }
+    )
+
+    expect { server.send(:perform_initialize) }
+      .to raise_error(MCPClient::Errors::ConnectionError, /Initialize failed: bad init/)
+  end
+end

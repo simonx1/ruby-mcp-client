@@ -308,6 +308,9 @@ module MCPClient
           # the Symbol :error key; deliver them to the caller as ServerError
           # (MCP lifecycle "Error Handling") instead of timing out.
           raise_sse_error_response(result[:error]) if result.is_a?(Hash) && result.key?(:error)
+          # Same resultType invariant as process_jsonrpc_response on the
+          # other transports: an unrecognized value is an invalid response.
+          validate_result_type!(result)
           return result
         end
 
