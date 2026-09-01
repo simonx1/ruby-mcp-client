@@ -299,6 +299,11 @@ module MCPClient
         retry_discover_with_advertised_version(e)
       end
       true
+    rescue MCPClient::Errors::ConnectionError
+      # A DiscoverResult (or advertised list) with no mutual version, or an
+      # authorization failure: nothing was negotiated.
+      @protocol_version = nil
+      raise
     rescue MCPClient::Errors::TransientServerError, MCPClient::Errors::RequestTimeoutError => e
       @protocol_version = nil
       raise modern_probe_failure(e) if modern_confirmed
