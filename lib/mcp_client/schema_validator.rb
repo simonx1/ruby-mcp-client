@@ -79,7 +79,7 @@ module MCPClient
     UNSUPPORTED_KEYWORDS = %w[
       $dynamicRef $recursiveRef
       additionalProperties patternProperties propertyNames dependentSchemas dependencies
-      additionalItems contains minContains maxContains uniqueItems
+      additionalItems contains minContains maxContains uniqueItems contentSchema
       multipleOf format dependentRequired minProperties maxProperties
       unevaluatedProperties unevaluatedItems
     ].freeze
@@ -102,7 +102,7 @@ module MCPClient
     # an array of positional subschemas in draft-07 / 2019-09).
     SUBSCHEMA_KEYWORDS = %w[
       items contains additionalProperties additionalItems propertyNames not if then else
-      unevaluatedItems unevaluatedProperties
+      unevaluatedItems unevaluatedProperties contentSchema
     ].freeze
 
     # Keywords whose value is a map of name => subschema.
@@ -115,7 +115,7 @@ module MCPClient
     DATA_KEYWORDS = %w[enum const default examples].freeze
 
     # Per-validation state.
-    Context = Struct.new(:root, :deadline, :dialect, :visits, :errors, keyword_init: true)
+    Context = Struct.new(:root, :deadline, :dialect, :visits, :errors, :speculative, keyword_init: true)
 
     # The dialect a schema declares, or the default.
     # @param schema [Object] the schema
@@ -193,7 +193,39 @@ module MCPClient
       if counter[:dialect] == DEFAULT_DIALECT && schema['items'].is_a?(Array)
         problems << 'items must be a schema in JSON Schema 2020-12 (positional schemas go in prefixItems)'
       end
+      check_applicator_shapes(schema, problems)
       each_subschema(schema) { |sub| walk_schema(sub, root, depth + 1, counter, problems) }
+    end
+
+    # Every applicator value must be a schema (object or boolean), an array
+    # of schemas or a map of schemas; anything else is not silently read as
+    # "true".
+    # @return [void]
+    def self.check_applicator_shapes(schema, problems)
+      schema.each do |keyword, value|
+        problem = applicator_shape_problem(keyword, value)
+        problems << problem if problem
+      end
+    end
+
+    # @return [String, nil] why an applicator value is malformed
+    def self.applicator_shape_problem(keyword, value)
+      if SUBSCHEMA_KEYWORDS.include?(keyword)
+        tuple = keyword == 'items' && all_schemas?(value)
+        "#{keyword} must be a schema" unless schema_value?(value) || tuple
+      elsif SUBSCHEMA_MAP_KEYWORDS.include?(keyword) && !%w[$defs definitions].include?(keyword)
+        # $defs / definitions are a bag of reusable values: an entry that is
+        # not a schema only matters once a $ref points at it.
+        "#{keyword} must be an object of schemas" unless value.is_a?(Hash) && all_schemas?(value.values)
+      elsif SUBSCHEMA_ARRAY_KEYWORDS.include?(keyword)
+        "#{keyword} must be an array of schemas" unless all_schemas?(value)
+      end
+    end
+
+    # @param values [Object]
+    # @return [Boolean] whether values is an array of schemas
+    def self.all_schemas?(values)
+      values.is_a?(Array) && values.all? { |v| schema_value?(v) }
     end
 
     # Yield every subschema directly under a schema object.
@@ -348,7 +380,7 @@ module MCPClient
       deadline ||= Process.clock_gettime(Process::CLOCK_MONOTONIC) + PATTERN_MATCH_TIMEOUT
       root = schema.is_a?(Hash) ? deep_stringify(schema) : schema
       ctx = Context.new(root: root, deadline: deadline, dialect: canonical_dialect(dialect(root)),
-                        visits: 0, errors: 0)
+                        visits: 0, errors: 0, speculative: 0)
       validate_node(data, root, path, ctx, 0)
     rescue Aborted => e
       ["#{path}: validation aborted: #{e.message}"]
@@ -363,13 +395,10 @@ module MCPClient
     # @return [Array<String>] validation errors
     # @raise [Aborted] when a bound is hit
     def self.validate_node(data, schema, path, ctx, ref_depth)
+      count_visit(ctx)
       return [] if schema == true
       return count_errors(ctx, ["#{path}: schema false accepts no value"]) if schema == false
       return [] unless schema.is_a?(Hash)
-
-      ctx.visits += 1
-      raise Aborted, "more than #{MAX_NODE_VISITS} schema nodes visited" if ctx.visits > MAX_NODE_VISITS
-      raise Aborted, 'validation time budget exhausted' if budget_exhausted?(ctx.deadline)
 
       # draft-07: "$ref" replaces the schema it appears in; later drafts
       # apply it alongside the sibling keywords.
@@ -394,16 +423,28 @@ module MCPClient
     # whole validation still propagate.
     # @return [Object] the block's value
     def self.speculative(ctx)
-      before = ctx.errors
+      ctx.speculative += 1
       yield
     ensure
-      ctx.errors = before
+      ctx.speculative -= 1
     end
 
-    # Account for produced errors against MAX_ERRORS.
+    # Account for one node visit (boolean schemas included, so a huge array
+    # under `items: true` still runs into the bounds).
+    # @raise [Aborted]
+    def self.count_visit(ctx)
+      ctx.visits += 1
+      raise Aborted, "more than #{MAX_NODE_VISITS} schema nodes visited" if ctx.visits > MAX_NODE_VISITS
+      raise Aborted, 'validation time budget exhausted' if budget_exhausted?(ctx.deadline)
+    end
+
+    # Account for produced errors against MAX_ERRORS. Errors inside a
+    # speculative branch are a verdict, not output, and do not count.
     # @return [Array<String>] the errors
     # @raise [Aborted]
     def self.count_errors(ctx, errors)
+      return errors if ctx.speculative.positive?
+
       ctx.errors += errors.size
       raise Aborted, "more than #{MAX_ERRORS} validation errors (output truncated)" if ctx.errors > MAX_ERRORS
 
@@ -541,10 +582,10 @@ module MCPClient
     def self.validate_enum(data, schema, path)
       errors = []
       if schema['enum'].is_a?(Array) && !schema['enum'].include?(data)
-        errors << "#{path}: value #{clip(data.inspect)} is not in enum #{clip(schema['enum'].inspect)}"
+        errors << "#{path}: value #{clip_value(data)} is not in enum #{clip_value(schema['enum'])}"
       end
       if schema.key?('const') && schema['const'] != data
-        errors << "#{path}: value #{clip(data.inspect)} does not equal const #{clip(schema['const'].inspect)}"
+        errors << "#{path}: value #{clip_value(data)} does not equal const #{clip_value(schema['const'])}"
       end
       errors
     end
@@ -729,6 +770,19 @@ module MCPClient
     def self.clip(text)
       text = text.to_s
       text.length > MAX_VALUE_INSPECT ? "#{text[0, MAX_VALUE_INSPECT]}..." : text
+    end
+
+    # A short rendering of a value for a message that never inspects a
+    # large value whole.
+    # @param value [Object]
+    # @return [String]
+    def self.clip_value(value)
+      case value
+      when String then clip(value[0, MAX_VALUE_INSPECT].inspect)
+      when Array then "array(#{value.length} items)"
+      when Hash then "object(#{value.length} keys)"
+      else clip(value.inspect)
+      end
     end
   end
 end

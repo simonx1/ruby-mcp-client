@@ -1252,8 +1252,8 @@ module MCPClient
       key = [:structuredContent, 'structuredContent'].find { |k| result.key?(k) }
       unless key
         handle_structured_content_violation(
-          "Tool '#{tool.name}' declares an output schema but its successful result carries no structuredContent " \
-          '(required by the MCP tools spec)'
+          "Tool '#{sanitize_peer_log_text(tool.name.to_s)}' declares an output schema but its successful result " \
+          'carries no structuredContent (required by the MCP tools spec)'
         )
         return result
       end
@@ -1307,7 +1307,8 @@ module MCPClient
       return if unsupported.empty?
 
       @logger.warn(
-        "Structured content check for tool '#{tool.name}': validation is partial: schema uses unsupported " \
+        "Structured content check for tool '#{sanitize_peer_log_text(tool.name.to_s)}': validation is partial: " \
+        'schema uses unsupported ' \
         "keywords: #{unsupported.join(', ')} (full JSON Schema 2020-12 evaluation is not implemented, so " \
         'conforming-looking data may still violate the schema)'
       )
