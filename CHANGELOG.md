@@ -38,6 +38,15 @@ metadata). Each feature lands in its own PR; this section accumulates them.
   2020-12, where an `items` array is invalid; an `items` array in draft-07
   and 2019-09); a present but malformed `$schema` makes the schema
   unusable; an `outputSchema` of `false` is preserved by `Tool.from_json`.
+  Plain-name fragments are scoped to their schema resource (a subschema
+  whose `$id` is a URI starts a new resource; `#name` never crosses into or
+  out of an embedded resource), a draft-07 `$id` is a plain name only when
+  it is a pure fragment, keywords beside a draft-07 `$ref` contribute no
+  anchors, `$defs` belongs to 2019-09 / 2020-12 and `definitions` to
+  draft-07 (the other bag is unknown to the dialect and not walked, though
+  JSON pointers into it still resolve and what a `$ref` reaches is
+  preflighted), and the unsupported-keyword scan stops at the subschema
+  bound and runs once per tool output schema.
   The keyword grammar follows the dialect (`DIALECT_KEYWORDS`): a keyword
   the dialect does not define (`prefixItems` or `$dynamicRef` in draft-07,
   `dependencies` or `additionalItems` in 2020-12, ...) is ignored rather

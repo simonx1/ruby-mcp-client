@@ -1299,11 +1299,18 @@ module MCPClient
 
     # Warn (in both :warn and :strict modes) when a tool's output schema uses
     # JSON Schema keywords the built-in validator cannot evaluate, so partial
-    # coverage is never silent.
+    # coverage is never silent. The schema is scanned once per definition
+    # (keyed like {#warn_unusable_input_schema}), not on every result.
     # @param tool [MCPClient::Tool] the tool whose output schema is being used
     # @return [void]
     def warn_partial_schema_coverage(tool)
+      @output_schema_coverage ||= {}
+      key = [tool.server&.object_id, tool.name]
+      identity = tool.output_schema.hash
+      return if @output_schema_coverage[key] == identity
+
       unsupported = MCPClient::SchemaValidator.unsupported_keywords(tool.output_schema)
+      @output_schema_coverage[key] = identity
       return if unsupported.empty?
 
       @logger.warn(

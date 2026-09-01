@@ -8,6 +8,12 @@ module MCPClient
     # and plain-name fragments naming an anchor. Nothing here ever fetches:
     # a reference outside the document is reported as external. Extended
     # into SchemaValidator, so the methods are its own.
+    #
+    # Plain names are scoped to their schema resource (JSON Schema 2020-12
+    # Core Sections 8.2.1 and 8.2.2): a subschema whose `$id` is a URI
+    # starts a new resource, and `#name` names an anchor of the resource the
+    # referencing schema belongs to — never one of an embedded resource, and
+    # never one of the enclosing document from inside an embedded resource.
     module References
       # A reference that does not point inside this document: an absolute URI
       # (http, https, urn, file, ...), a relative document, or anything that
@@ -19,13 +25,14 @@ module MCPClient
       end
 
       # Resolve a local reference: a JSON pointer fragment, or a plain-name
-      # fragment naming an anchor.
+      # fragment naming an anchor of the referencing schema's resource.
       # @param root [Hash] the root schema (string keys)
       # @param ref [String] the `$ref` value
       # @param dialect [String, nil] the canonical dialect
       # @param resolver [Hash, Context] holder of the memoized anchor index
+      # @param from [Hash, nil] the schema object holding the reference
       # @return [Object] the referenced value, or UNRESOLVED
-      def resolve_reference(root, ref, dialect, resolver)
+      def resolve_reference(root, ref, dialect, resolver, from: nil)
         fragment = ref.delete_prefix('#')
         return resolve_pointer(root, ref) if fragment.empty? || fragment.start_with?('/', '%2F', '%2f')
 
@@ -34,37 +41,79 @@ module MCPClient
         fragment = URI.decode_uri_component(fragment) rescue fragment # rubocop:disable Style/RescueModifier
         return UNRESOLVED unless fragment.match?(ANCHOR_NAME)
 
-        resolver[:anchors] ||= anchor_index(root, dialect)
-        resolver[:anchors].fetch(fragment, UNRESOLVED)
+        index = (resolver[:anchors] ||= anchor_index(root, dialect))
+        resource = (from && index[:resources][from]) || root
+        index[:anchors].fetch(resource, {}).fetch(fragment, UNRESOLVED)
       end
 
-      # Every plain-name anchor in the document: `$anchor` (and
-      # `$dynamicAnchor`) in 2019-09 / 2020-12, `$id: "#name"` in draft-07.
-      # The walk is bounded like the preflight walk.
-      # @return [Hash{String => Object}] name => subschema (first occurrence)
+      # Every plain-name anchor in the document, per schema resource:
+      # `$anchor` (and `$dynamicAnchor`) in 2019-09 / 2020-12, `$id: "#name"`
+      # in draft-07. The walk is bounded like the preflight walk. Both
+      # definition bags are walked whatever the dialect: they are reachable
+      # through JSON pointers, and an anchor's resource is lexical.
+      # @return [Hash] :resources (schema object => its resource root, by
+      #   identity) and :anchors (resource root => name => subschema, first
+      #   occurrence, by identity)
       def anchor_index(root, dialect)
-        anchors = {}
-        pending = [[root, 0]]
+        index = { resources: {}.compare_by_identity, anchors: {}.compare_by_identity }
+        pending = [[root, root, 0]]
         visited = 0
         until pending.empty? || visited >= MAX_SUBSCHEMAS
-          schema, depth = pending.shift
+          schema, resource, depth = pending.shift
           next unless schema.is_a?(Hash) && depth <= MAX_SCHEMA_DEPTH
 
           visited += 1
-          anchor_names(schema, dialect).each { |name| anchors[name] ||= schema }
-          each_subschema(schema, dialect) { |sub| pending << [sub, depth + 1] }
+          # draft-07: everything beside a $ref is ignored, identifiers
+          # included; only the definitions bag stays reachable.
+          if dialect == DRAFT_07 && schema.key?('$ref')
+            index[:resources][schema] = resource
+            each_definition(schema, nil) { |sub| pending << [sub, resource, depth + 1] }
+            next
+          end
+
+          resource = schema if resource_start?(schema)
+          index[:resources][schema] = resource
+          names = (index[:anchors][resource] ||= {})
+          anchor_names(schema, dialect).each { |name| names[name] ||= schema }
+          each_subschema(schema, dialect) { |sub| pending << [sub, resource, depth + 1] }
+          each_foreign_definition(schema, dialect) { |sub| pending << [sub, resource, depth + 1] }
         end
-        anchors
+        index
+      end
+
+      # Whether a schema object starts a new schema resource: its `$id` is a
+      # URI rather than a bare fragment (a draft-07 `$id: "#name"` is a
+      # plain-name identifier, not a base).
+      # @param schema [Hash]
+      # @return [Boolean]
+      def resource_start?(schema)
+        id = schema['$id']
+        id.is_a?(String) && !id.empty? && !id.start_with?('#')
       end
 
       # @return [Array<String>] the plain names a schema object declares
       def anchor_names(schema, dialect)
         names = if dialect == DRAFT_07
-                  [schema['$id'].is_a?(String) ? schema['$id'].delete_prefix('#') : nil]
+                  # draft-07 Core Section 8.2.3: only an $id that is exactly a
+                  # fragment is a plain-name identifier.
+                  id = schema['$id']
+                  [id.is_a?(String) && id.start_with?('#') ? id.delete_prefix('#') : nil]
                 else
                   %w[$anchor $dynamicAnchor].map { |k| schema[k] if keyword_known?(k, dialect) }
                 end
         names.select { |name| name.is_a?(String) && name.match?(ANCHOR_NAME) }
+      end
+
+      # Yield the definitions held in the bag the dialect does not define
+      # (`definitions` under 2019-09 / 2020-12, `$defs` under draft-07):
+      # unknown to the dialect, but pointer-addressable all the same.
+      # @return [void]
+      def each_foreign_definition(schema, dialect, &block)
+        %w[$defs definitions].each do |keyword|
+          next if keyword_known?(keyword, dialect)
+
+          schema[keyword].each_value(&block) if schema[keyword].is_a?(Hash)
+        end
       end
 
       # Resolve a fragment JSON pointer (`#`, `#/$defs/x`, `#/a~1b`, with
