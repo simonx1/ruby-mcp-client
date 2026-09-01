@@ -45,7 +45,7 @@ puts '  - Client sends responses via HTTP POST'
 puts
 
 # Define an elicitation handler that prompts the user for input
-# rubocop:disable Metrics/BlockLength
+# rubocop:disable-next Metrics/BlockLength
 elicitation_handler = lambda do |message, requested_schema|
   puts "\n#{'━' * 80}"
   puts '📡 SERVER REQUEST (via Streamable HTTP):'
@@ -117,7 +117,6 @@ elicitation_handler = lambda do |message, requested_schema|
     { 'action' => 'decline' }
   end
 end
-# rubocop:enable Metrics/BlockLength
 
 # Server configuration
 # Update these if your server runs on a different host/port

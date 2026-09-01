@@ -27,7 +27,7 @@ puts '=' * 80
 puts
 
 # Define an elicitation handler that prompts the user for input
-# rubocop:disable Metrics/BlockLength
+# rubocop:disable-next Metrics/BlockLength
 elicitation_handler = lambda do |message, requested_schema|
   puts "\n#{'─' * 80}"
   puts '📋 SERVER REQUESTS INPUT:'
@@ -91,7 +91,6 @@ elicitation_handler = lambda do |message, requested_schema|
     { 'action' => 'decline' }
   end
 end
-# rubocop:enable Metrics/BlockLength
 
 # Initialize MCP client with elicitation handler
 client = MCPClient::Client.new(
