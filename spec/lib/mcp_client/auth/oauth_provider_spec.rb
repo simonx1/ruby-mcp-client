@@ -342,7 +342,12 @@ RSpec.describe MCPClient::Auth::OAuthProvider do
           resource: 'http://localhost:9292/mcp', authorization_servers: ['http://localhost:9292']
         )
         allow(local_provider).to receive(:fetch_resource_metadata).and_return(local_meta)
-        allow(local_provider).to receive(:fetch_server_metadata).and_return(server_meta(['S256']))
+        # RFC 8414: the metadata issuer must be the identifier it was fetched for.
+        local_as = MCPClient::Auth::ServerMetadata.new(
+          issuer: 'http://localhost:9292', authorization_endpoint: 'https://auth.example.com/authorize',
+          token_endpoint: 'https://auth.example.com/token', code_challenge_methods_supported: ['S256']
+        )
+        allow(local_provider).to receive(:fetch_server_metadata).and_return(local_as)
 
         result = local_provider.send(:discover_authorization_server)
         expect(result.token_endpoint).to eq('https://auth.example.com/token')
@@ -351,7 +356,13 @@ RSpec.describe MCPClient::Auth::OAuthProvider do
       it 'falls back to direct AS discovery when no PRM document exists (404)' do
         # fetch_resource_metadata returns nil for a genuine 404 (absent candidate)
         allow(provider).to receive(:fetch_resource_metadata).and_return(nil)
-        allow(provider).to receive(:fetch_server_metadata).and_return(server_meta(['S256']))
+        # Direct discovery treats the MCP server origin as the issuer, so the
+        # document must name that origin (RFC 8414 Section 3.3).
+        origin_as = MCPClient::Auth::ServerMetadata.new(
+          issuer: 'https://mcp.example.com', authorization_endpoint: 'https://auth.example.com/authorize',
+          token_endpoint: 'https://auth.example.com/token', code_challenge_methods_supported: ['S256']
+        )
+        allow(provider).to receive(:fetch_server_metadata).and_return(origin_as)
 
         result = provider.send(:discover_authorization_server)
         expect(result.token_endpoint).to eq('https://auth.example.com/token')
@@ -720,6 +731,7 @@ RSpec.describe MCPClient::Auth::OAuthProvider do
     let(:server_metadata) do
       instance_double(
         'MCPClient::Auth::ServerMetadata',
+        issuer: 'https://auth.example.com',
         token_endpoint: 'https://tropic-dev.us.auth0.com/oauth/token'
       )
     end

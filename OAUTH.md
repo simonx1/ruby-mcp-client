@@ -140,6 +140,14 @@ class DatabaseTokenStorage
   # get_server_metadata, set_server_metadata
   # get_pkce, set_pkce, delete_pkce
   # get_state, set_state, delete_state
+
+  # Optional (MCP 2026-07-28): called when the authorization server behind
+  # a resource changes, since a token from the previous one must not be
+  # reused. Without it, set_token(server_url, nil) is attempted; a backend
+  # that accepts neither is logged and the token is ignored instead.
+  def delete_token(server_url)
+    # Remove the stored token
+  end
 end
 
 # Use custom storage

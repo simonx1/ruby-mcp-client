@@ -12,18 +12,22 @@ module MCPClient
   module Auth
     # OAuth token model representing access/refresh tokens
     class Token
-      attr_reader :access_token, :token_type, :expires_in, :scope, :refresh_token, :expires_at
+      attr_reader :access_token, :token_type, :expires_in, :scope, :refresh_token, :expires_at, :issuer
 
       # @param access_token [String] The access token
       # @param token_type [String] Token type (default: "Bearer")
       # @param expires_in [Integer, nil] Token lifetime in seconds
       # @param scope [String, nil] Token scope
       # @param refresh_token [String, nil] Refresh token for renewal
-      def initialize(access_token:, token_type: 'Bearer', expires_in: nil, scope: nil, refresh_token: nil)
+      # @param issuer [String, nil] issuer identifier of the authorization server that issued the token
+      #   (MCP 2026-07-28: tokens are per authorization server and never presented to another)
+      def initialize(access_token:, token_type: 'Bearer', expires_in: nil, scope: nil, refresh_token: nil,
+                     issuer: nil)
         @access_token = access_token
         @token_type = token_type
         @expires_in = expires_in
         @scope = scope
+        @issuer = issuer
         @refresh_token = refresh_token
         @expires_at = expires_in ? Time.now + expires_in : nil
       end
@@ -59,8 +63,9 @@ module MCPClient
           expires_in: @expires_in,
           scope: @scope,
           refresh_token: @refresh_token,
-          expires_at: @expires_at&.iso8601
-        }
+          expires_at: @expires_at&.iso8601,
+          issuer: @issuer
+        }.compact
       end
 
       # Create token from hash
@@ -72,7 +77,8 @@ module MCPClient
           token_type: data[:token_type] || data['token_type'] || 'Bearer',
           expires_in: data[:expires_in] || data['expires_in'],
           scope: data[:scope] || data['scope'],
-          refresh_token: data[:refresh_token] || data['refresh_token']
+          refresh_token: data[:refresh_token] || data['refresh_token'],
+          issuer: data[:issuer] || data['issuer']
         )
 
         # Set expires_at if provided
@@ -184,16 +190,25 @@ module MCPClient
 
       # @return [Boolean] whether these are pre-registered (static) credentials
       def pre_registered?
-        @registration_type == 'pre_registered'
+        effective_registration_type == 'pre_registered'
+      end
+
+      # The registration type, inferred for credentials persisted before the
+      # field existed: a client_id_issued_at is what a Dynamic Client
+      # Registration response carries, anything else was pre-registered.
+      # @return [String]
+      def effective_registration_type
+        @registration_type || (@client_id_issued_at ? 'dynamic' : 'pre_registered')
       end
 
       # A copy bound to an authorization server.
       # @param issuer [String] the issuer identifier
+      # @param registration_type [String] the type to record (defaults to the effective type)
       # @return [ClientInfo]
-      def with_issuer(issuer)
+      def with_issuer(issuer, registration_type: effective_registration_type)
         self.class.new(client_id: @client_id, metadata: @metadata, client_secret: @client_secret,
                        client_id_issued_at: @client_id_issued_at, client_secret_expires_at: @client_secret_expires_at,
-                       issuer: issuer, registration_type: @registration_type)
+                       issuer: issuer, registration_type: registration_type)
       end
 
       # Check if client secret is expired

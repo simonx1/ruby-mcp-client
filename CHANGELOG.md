@@ -26,12 +26,22 @@ metadata). Each feature lands in its own PR; this section accumulates them.
   server's `error` / `error_description`, and log that DCR is deprecated in
   favour of Client ID Metadata Documents.
 - **Authorization server binding.** `ClientInfo` gained `issuer` and
-  `registration_type` (`pre_registered`, `dynamic`, `cimd`). Credentials are
-  bound to the issuer that produced them: a dynamic registration is redone
-  for a new authorization server (and the old token dropped), pre-registered
-  credentials for another issuer raise a `ConnectionError` instead of being
-  reused, unbound credentials are adopted for the first issuer seen, and
-  Client ID Metadata Document client ids stay portable.
+  `registration_type` (`pre_registered`, `dynamic`, `cimd`); `Token` gained
+  `issuer`. Credentials and tokens are bound to the issuer that produced
+  them: the code is redeemed only at the authorization server recorded for
+  the request (a server change mid-flow ends the flow), a token or refresh
+  token is never presented to another authorization server, a dynamic
+  registration is redone for a new authorization server (and the old token
+  dropped through the optional `delete_token` storage method, see
+  OAUTH.md), pre-registered credentials for another issuer raise a
+  `ConnectionError` instead of being reused, credentials persisted before
+  these fields existed are bound on first use (as `dynamic` when they carry
+  `client_id_issued_at`, else `pre_registered`), and Client ID Metadata
+  Document client ids stay portable. Authorization server metadata whose
+  `issuer` is not the identifier it was fetched for is rejected (RFC 8414
+  Section 3.3). Error responses are `state`-bound and their description is
+  sanitized; `client_metadata[:application_type]` counts as the explicit
+  application type.
 
 ### Tasks extension (`io.modelcontextprotocol/tasks`)
 
