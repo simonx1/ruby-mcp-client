@@ -1010,3 +1010,142 @@ RSpec.describe 'MCP 2026-07-28 tasks extension — round 5' do
     expect { client.list_tasks }.to raise_error(MCPClient::Errors::TaskError, %r{tasks/list})
   end
 end
+
+RSpec.describe 'MCP 2026-07-28 tasks extension — round 6' do
+  def discover_result
+    { 'resultType' => 'complete', 'supportedVersions' => ['2026-07-28'],
+      'capabilities' => { 'tools' => {}, 'extensions' => { TASKS_EXT => {} } } }
+  end
+
+  def task_result(id: 'task-1')
+    now = Time.now.utc.iso8601
+    { 'resultType' => 'task', 'taskId' => id, 'status' => 'working', 'createdAt' => now, 'lastUpdatedAt' => now,
+      'ttlMs' => 60_000, 'pollIntervalMs' => 1 }
+  end
+
+  def detailed_task(status:, id: 'task-1', created_at: Time.now.utc.iso8601, ttl_ms: 60_000, **extra)
+    { 'resultType' => 'complete', 'taskId' => id, 'status' => status, 'createdAt' => created_at,
+      'lastUpdatedAt' => created_at, 'ttlMs' => ttl_ms, 'pollIntervalMs' => 1 }.merge(extra)
+  end
+
+  def tool_list(name = 'slow')
+    { 'result' => { 'tools' => [{ 'name' => name, 'inputSchema' => { 'type' => 'object' } }] } }
+  end
+
+  def call_result(text = 'done')
+    { 'content' => [{ 'type' => 'text', 'text' => text }], 'isError' => false }
+  end
+
+  def elicit_request
+    { 'method' => 'elicitation/create',
+      'params' => { 'mode' => 'form', 'message' => 'Name?',
+                    'requestedSchema' => { 'type' => 'object', 'properties' => { 'n' => { 'type' => 'string' } } } } }
+  end
+
+  def script_stdio(server, responses)
+    sent = []
+    allow(server).to receive(:connect).and_return(true)
+    allow(server).to receive(:start_reader)
+    allow(server).to receive(:start_stderr_reader)
+    server.instance_variable_set(:@stdin, double('stdin', puts: nil, flush: nil, closed?: true, close: nil))
+    allow(server).to receive(:send_request) { |req| sent << req }
+    allow(server).to receive(:wait_response) do |id, **_opts|
+      responder = responses.shift
+      raise 'no scripted response left' unless responder
+
+      response = responder.respond_to?(:call) ? responder.call(sent.last) : responder
+      response.merge('jsonrpc' => '2.0', 'id' => id)
+    end
+    sent
+  end
+
+  let(:stdio) { MCPClient::ServerStdio.new(command: 'echo test', read_timeout: 1) }
+
+  def client_for(server, **opts)
+    allow(MCPClient::ServerFactory).to receive(:create).and_return(server)
+    client = MCPClient::Client.new(mcp_server_configs: [{ type: 'stdio', command: 'x' }], extensions: [TASKS_EXT],
+                                   **opts)
+    allow(client).to receive(:sleep)
+    client
+  end
+
+  it 'keeps polling after a tasks/get request timeout' do
+    client = client_for(stdio)
+    script_stdio(stdio, [{ 'result' => discover_result }, tool_list, { 'result' => task_result },
+                         ->(_req) { raise MCPClient::Errors::RequestTimeoutError, 'tasks/get timed out' },
+                         { 'result' => detailed_task(status: 'completed', 'result' => call_result('late')) }])
+
+    expect(client.call_tool('slow', {})['content'].first['text']).to eq('late')
+  end
+
+  it 'applies the TTL backstop before answering input requests' do
+    handled = 0
+    client = client_for(stdio, elicitation_handler: lambda { |_m, _s|
+      handled += 1
+      { action: 'accept', content: {} }
+    })
+    script_stdio(stdio, [{ 'result' => discover_result }, tool_list, { 'result' => task_result },
+                         { 'result' => detailed_task(status: 'input_required', created_at: '2000-01-01T00:00:00Z',
+                                                     ttl_ms: 1000, 'inputRequests' => { 'k1' => elicit_request }) }])
+
+    expect { client.call_tool('slow', {}) }.to raise_error(MCPClient::Errors::TaskError, /TTL/)
+    expect(handled).to eq(0)
+  end
+
+  it 'remembers an answered key even when the update acknowledgement is lost' do
+    handled = 0
+    client = client_for(stdio, elicitation_handler: lambda { |_m, _s|
+      handled += 1
+      { action: 'accept', content: { 'n' => 'x' } }
+    })
+    sent = script_stdio(stdio, [{ 'result' => discover_result }, tool_list, { 'result' => task_result },
+                                { 'result' => detailed_task(status: 'input_required',
+                                                            'inputRequests' => { 'k1' => elicit_request }) },
+                                ->(_req) { raise MCPClient::Errors::RequestTimeoutError, 'update timed out' },
+                                { 'result' => detailed_task(status: 'input_required',
+                                                            'inputRequests' => { 'k1' => elicit_request }) },
+                                { 'result' => detailed_task(status: 'completed', 'result' => call_result) }])
+    task = client.call_tool_as_task('slow', {})
+
+    expect { client.wait_for_task(task) }.to raise_error(MCPClient::Errors::TaskError)
+    expect(client.wait_for_task(task)).to be_completed
+    expect(handled).to eq(1)
+    expect(sent.count { |r| r['method'] == 'tasks/update' }).to eq(1)
+  end
+
+  it 'sanitizes task ids and tool names in transport and creation errors' do
+    client = client_for(stdio)
+    forged = { 'result' => { 'tools' => [{ 'name' => "slow\nWARN forged", 'inputSchema' => { 'type' => 'object' } }],
+                             'ttlMs' => 60_000 } }
+    script_stdio(stdio, [{ 'result' => discover_result }, forged])
+    client.list_tools
+    allow(stdio).to receive(:rpc_request).and_call_original
+    %w[tasks/get tasks/update tools/call].each do |method|
+      allow(stdio).to receive(:rpc_request).with(method, any_args)
+                                           .and_raise(MCPClient::Errors::TransportError, "broken pipe\nWARN forged")
+    end
+
+    expect { client.get_task("task\nWARN forged") }.to raise_error(MCPClient::Errors::TaskError) { |e|
+      expect(e.message).not_to include("\nWARN forged")
+    }
+    expect { client.update_task("task\nWARN forged", {}) }.to raise_error(MCPClient::Errors::TaskError) { |e|
+      expect(e.message).not_to include("\nWARN forged")
+    }
+    expect { client.call_tool_as_task("slow\nWARN forged", {}) }.to raise_error(MCPClient::Errors::TaskError) { |e|
+      expect(e.message).not_to include("\nWARN forged")
+    }
+  end
+
+  it 'surfaces an initialization failure from get_task_result instead of sending tasks/result' do
+    client = client_for(stdio)
+    allow(stdio).to receive(:ping).and_raise(MCPClient::Errors::ConnectionError, 'server down')
+    allow(stdio).to receive(:rpc_request).and_raise('tasks/result must not be sent')
+
+    expect { client.get_task_result('task-1') }.to raise_error(MCPClient::Errors::ConnectionError, /server down/)
+  end
+
+  it 'guards the answered-key registry with a mutex' do
+    client = client_for(stdio)
+    expect(client.send(:answered_keys_mutex)).to be_a(Mutex)
+  end
+end
