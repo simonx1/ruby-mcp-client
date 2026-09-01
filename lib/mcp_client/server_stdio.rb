@@ -436,6 +436,7 @@ module MCPClient
         [prompts, result['nextCursor']]
       end
       record_list_cache_hint('prompts/list', pages, received_ats, epoch: epoch)
+      attach_list_value(:prompts, prompts)
       prompts
     rescue MCPClient::Errors::ServerError => e
       # 2026-07-28 protocol errors carry actionable data (requiredCapabilities,
@@ -479,7 +480,9 @@ module MCPClient
       result = require_complete_result!(rpc_request('resources/list', params) || {}, 'resources/list')
       record_cache_hint(:resources, result, epoch: epoch) unless cursor
       resources = (result['resources'] || []).map { |td| MCPClient::Resource.from_json(td, server: self) }
-      { 'resources' => resources, 'nextCursor' => result['nextCursor'] }
+      resources_result = { 'resources' => resources, 'nextCursor' => result['nextCursor'] }
+      attach_list_value(:resources, resources_result) unless cursor
+      resources_result
     rescue MCPClient::Errors::ServerError => e
       # 2026-07-28 protocol errors carry actionable data (requiredCapabilities,
       # supported versions); keep them intact instead of wrapping.
@@ -607,6 +610,7 @@ module MCPClient
         [tools, result['nextCursor']]
       end
       record_list_cache_hint('tools/list', pages, received_ats, epoch: epoch)
+      attach_list_value(:tools, tools)
       tools
     rescue MCPClient::Errors::ServerError => e
       # 2026-07-28 protocol errors carry actionable data (requiredCapabilities,

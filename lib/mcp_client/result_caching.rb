@@ -23,6 +23,11 @@ module MCPClient
     # request threads and notification threads may touch first.
     CACHE_INIT_LOCK = Mutex.new
 
+    # Kinds whose cached list lives in the entry itself: a hint recorded for
+    # one of them without its list (the list is still being converted, or
+    # its conversion failed) is not a cache that may be served.
+    LIST_VALUE_KINDS = %i[tools prompts resources].freeze
+
     # Paginated list methods and their cache kind.
     LIST_METHOD_KINDS = {
       'tools/list' => :tools,
@@ -152,7 +157,33 @@ module MCPClient
     # @return [Boolean]
     def cache_fresh?(kind)
       entry = private_entry_for_current_context(kind)
-      entry.nil? || entry.fresh?(now: monotonic_now)
+      return true if entry.nil?
+      return false if LIST_VALUE_KINDS.include?(kind) && entry.value.nil?
+
+      entry.fresh?(now: monotonic_now)
+    end
+
+    # The list a transport may serve for a kind without fetching: the value
+    # of a fresh entry in the current authorization context. With no entry
+    # at all (nothing recorded yet) the transport's own copy, given by the
+    # block, stands in; a hint without a value never lets that copy through.
+    # @param kind [Symbol]
+    # @yield the transport's own copy of the list
+    # @return [Object, nil]
+    def fresh_list_value(kind)
+      entry = private_entry_for_current_context(kind)
+      return (block_given? ? yield : nil) if entry.nil?
+      return nil unless entry.value && entry.fresh?(now: monotonic_now)
+
+      entry.value
+    end
+
+    # The list recorded for a kind whatever its freshness: the candidate for
+    # serving stale when a re-fetch fails ({#stale_fallback_for} decides).
+    # @param kind [Symbol]
+    # @return [Object, nil]
+    def stale_list_value(kind)
+      cache_entries_mutex.synchronize { cache_entries[kind]&.value }
     end
 
     # The entry for a kind, after making sure a privately scoped one still
@@ -171,8 +202,9 @@ module MCPClient
 
     # @param entry [MCPClient::CachedResult, nil]
     # @return [Boolean] whether the entry may be served in the current authorization context
-    # @param context [String, nil, :current] the authorization context to check against
-    #   (:current asks the transport which credentials it would send now)
+    # @param context [String, nil, :current, :unknown] the authorization context to check against
+    #   (:current asks the transport which credentials it would send now; :unknown means the
+    #   credentials are not known, so no private entry matches)
     def entry_in_current_context?(entry, context: :current)
       return true unless entry&.cache_scope == 'private' && respond_to?(:current_authorization_context, true)
       return false if entry.authorization_context.equal?(MCPClient::CachedResult::MIXED_CONTEXT)
@@ -324,10 +356,15 @@ module MCPClient
 
       epoch = cache_epoch
       result = yield
-      contents = ((result.is_a?(Hash) && result['contents']) || []).map do |content|
-        MCPClient::ResourceContent.from_json(content)
+      # The TTL runs from receipt, not from the end of the conversion below.
+      received_at = monotonic_now
+      unless result.is_a?(Hash)
+        raise MCPClient::Errors::TransportError,
+              "Invalid resources/read response: expected an object, got #{result.class}"
       end
-      entry = cache_entry_for(result, contents, now: monotonic_now)
+
+      contents = (result['contents'] || []).map { |content| MCPClient::ResourceContent.from_json(content) }
+      entry = cache_entry_for(result, contents, now: received_at)
       # A read is cached only on an explicit ttlMs: "if ttlMs is absent,
       # clients SHOULD assume 0" — and reads were never cached before this
       # revision, so a legacy server keeps that behaviour. A result reached

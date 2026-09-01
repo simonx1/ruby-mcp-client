@@ -6,6 +6,11 @@ module MCPClient
     # a stale list on transient re-fetch failures, and keeping privately
     # scoped cache entries within their authorization context.
     module CacheSupport
+      # Thread-local marker meaning "this attempt has not applied its
+      # headers yet": a failure before that point leaves the credentials of
+      # the attempt unknown, so no private stale copy may be served for it.
+      UNRECORDED_AUTHORIZATION = :unrecorded
+
       private
 
       # Re-fetch a list that has gone stale, or serve the stale copy when the
@@ -16,14 +21,19 @@ module MCPClient
       # @yield performs the fetch
       # @return [Object] the fresh value, or the stale one on a transient failure
       def refetch_or_serve_stale(kind, cached)
+        # The marker of the previous request on this thread must not stand
+        # in for an attempt that fails before it applies its own headers.
+        Thread.current[request_authorization_key] = UNRECORDED_AUTHORIZATION
         yield
       rescue MCPClient::Errors::TransientServerError, MCPClient::Errors::ConnectionError,
              MCPClient::Errors::TransportError => e
         # A revoked or insufficient authorization is not a transient failure:
         # serving the stale list would hide it from the host's auth flow. The
         # stale copy is judged against the credentials the failed request
-        # went out with (they may have changed since the copy was made).
-        stale = stale_fallback_for(kind, cached, context: request_authorization_context)
+        # went out with (they may have changed since the copy was made); an
+        # attempt that never got that far has no private fallback.
+        context = request_authorization_recorded? ? request_authorization_context : :unknown
+        stale = stale_fallback_for(kind, cached, context: context)
         raise if stale.nil? || authorization_failure?(e)
 
         @logger.warn("Re-fetching #{kind} failed (#{e.class}); serving the stale cached list")
@@ -41,7 +51,13 @@ module MCPClient
 
       # @return [String, nil] the Authorization header of the request this thread last sent
       def request_authorization_context
-        Thread.current[request_authorization_key]
+        context = Thread.current[request_authorization_key]
+        context == UNRECORDED_AUTHORIZATION ? nil : context
+      end
+
+      # @return [Boolean] whether the current attempt on this thread applied its headers
+      def request_authorization_recorded?
+        Thread.current[request_authorization_key] != UNRECORDED_AUTHORIZATION
       end
 
       # @return [Symbol] the thread-local key of this transport's request authorization

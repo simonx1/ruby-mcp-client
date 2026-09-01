@@ -144,9 +144,10 @@ module MCPClient
     # @raise [MCPClient::Errors::TransportError] if response isn't valid JSON
     # @raise [MCPClient::Errors::PromptGetError] for other errors during prompt listing
     def list_prompts
-      cached = @mutex.synchronize { @prompts }
-      # MCP 2026-07-28 caching: a list is served only while its hint is fresh.
-      return cached if cached && cache_fresh?(:prompts)
+      # MCP 2026-07-28 caching: a list is served only while its hint is
+      # fresh, and only from the entry that carries the hint.
+      cached = fresh_list_value(:prompts) { @mutex.synchronize { @prompts } }
+      return cached if cached
 
       @mutex.synchronize { @prompts_data = nil }
 
@@ -158,6 +159,7 @@ module MCPClient
           @prompts = prompts_data.map do |prompt_data|
             MCPClient::Prompt.from_json(prompt_data, server: self)
           end
+          attach_list_value(:prompts, @prompts)
         end
 
         @mutex.synchronize { @prompts }
@@ -200,8 +202,8 @@ module MCPClient
     # @raise [MCPClient::Errors::TransportError] if response isn't valid JSON
     # @raise [MCPClient::Errors::ResourceReadError] for other errors during resource listing
     def list_resources(cursor: nil)
-      cached = @mutex.synchronize { @resources_result }
-      return cached if cached && !cursor && cache_fresh?(:resources)
+      cached = cursor ? nil : fresh_list_value(:resources) { @mutex.synchronize { @resources_result } }
+      return cached if cached
 
       begin
         ensure_initialized
@@ -221,7 +223,10 @@ module MCPClient
         record_cache_hint(:resources, result, epoch: epoch) unless cursor
 
         @mutex.synchronize do
-          @resources_result = resources_result unless cursor
+          unless cursor
+            @resources_result = resources_result
+            attach_list_value(:resources, resources_result)
+          end
         end
 
         resources_result
@@ -320,9 +325,10 @@ module MCPClient
     # @raise [MCPClient::Errors::TransportError] if response isn't valid JSON
     # @raise [MCPClient::Errors::ToolCallError] for other errors during tool listing
     def list_tools
-      cached = @mutex.synchronize { @tools }
-      # MCP 2026-07-28 caching: a list is served only while its hint is fresh.
-      return cached if cached && cache_fresh?(:tools)
+      # MCP 2026-07-28 caching: a list is served only while its hint is
+      # fresh, and only from the entry that carries the hint.
+      cached = fresh_list_value(:tools) { @mutex.synchronize { @tools } }
+      return cached if cached
 
       @mutex.synchronize { @tools_data = nil }
 
@@ -334,6 +340,7 @@ module MCPClient
           @tools = tools_data.map do |tool_data|
             MCPClient::Tool.from_json(tool_data, server: self)
           end
+          attach_list_value(:tools, @tools)
         end
 
         @mutex.synchronize { @tools }

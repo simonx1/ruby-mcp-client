@@ -27,8 +27,13 @@ metadata). Each feature lands in its own PR; this section accumulates them.
 - **Authorization context.** An entry cached with `cacheScope: "private"`
   is bound to the `Authorization` the request that produced it went out
   with, and is served (or offered as a stale fallback) only while the
-  transport would send the same credentials; every cached result is
-  forgotten on `cleanup` / reconnect. On a 2026-07-28 server a list or page
+  transport would send the same credentials (on HTTP+SSE, the credentials
+  of the JSON-RPC POST that fetched it); a cached list is served only from
+  the entry that carries its hint, never from a copy left over from an
+  earlier request, and a re-fetch that fails before it applies its own
+  credentials has no private stale fallback; every cached result is
+  forgotten on `cleanup` / reconnect. A `resources/read` result that is not
+  an object is rejected, and a read's TTL runs from its receipt. On a 2026-07-28 server a list or page
   without `ttlMs` counts as immediately stale, as the spec asks; legacy
   servers keep the cache-until-notification heuristic.
 - **Stale on failure.** When a re-fetch fails transiently (5xx, connection
