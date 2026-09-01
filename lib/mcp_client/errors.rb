@@ -352,6 +352,14 @@ module MCPClient
     # sender SHOULD cancel and stop waiting, not re-send).
     class RequestTimeoutError < TransportError; end
 
+    # Raised on the modern (2026-07-28) Streamable HTTP transport when an SSE
+    # response stream ends before delivering the JSON-RPC response. There is
+    # no resumption: "a broken response stream loses the in-flight request;
+    # clients MUST re-issue it as a new request with a new request ID". The
+    # transport re-issues idempotent requests itself and surfaces this for
+    # tools/call, which may already have executed.
+    class ResponseStreamClosedError < TransportError; end
+
     # Raised when a response body exceeded the configured size limit (e.g. a
     # gzip payload that expands past the decompression ceiling). A subclass of
     # TransportError so existing rescues keep working, but deliberately

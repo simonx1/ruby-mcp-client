@@ -151,6 +151,13 @@ module MCPClient
       # @raise [MCPClient::Errors::ServerError] when resumption fails
       # @raise [MCPClient::Errors::TransportError] when no cursor was received
       def resume_or_fail(events, request_id, retry_ms = nil)
+        # MCP 2026-07-28 removed SSE resumability: the in-flight request is
+        # lost and must be re-issued as a new request (see rpc_request).
+        if modern?
+          raise MCPClient::Errors::ResponseStreamClosedError,
+                'SSE stream closed before delivering the response'
+        end
+
         # Only a validated id may become a cursor: it is sent back as a
         # Last-Event-ID header on the resumption GET.
         cursor = events.reverse.find { |e| retainable_event_id?(e[:id]) }&.dig(:id)
@@ -226,7 +233,7 @@ module MCPClient
         saw_invalid_json = false
 
         events.each do |event|
-          if event[:id] && !event[:id].empty?
+          if event[:id] && !event[:id].empty? && !modern?
             # The POST SSE stream is peer-controlled like the GET one, so its
             # ids get the same bound/charset check before being retained or
             # echoed in a Last-Event-ID header.

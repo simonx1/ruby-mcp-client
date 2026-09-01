@@ -100,6 +100,7 @@ module MCPClient
                                       })
 
       @read_timeout = opts[:read_timeout]
+      configure_protocol_mode(opts[:protocol], opts[:discover_timeout])
       @faraday_config = opts[:faraday_config]
       @tools = nil
       @tools_data = nil
@@ -127,8 +128,9 @@ module MCPClient
         # Test connectivity with a simple HTTP request
         test_connection
 
-        # Perform MCP initialization handshake
-        perform_initialize
+        # Establish the protocol era: server/discover for a modern server, the
+        # initialize handshake for a legacy one.
+        negotiate_protocol
 
         @mutex.synchronize do
           @connection_established = true
@@ -201,6 +203,10 @@ module MCPClient
     # Override apply_request_headers to add session and protocol version headers
     def apply_request_headers(req, request)
       super
+
+      # Modern servers have no session; the base class added the 2026-07-28
+      # request metadata headers.
+      return if modern?
 
       # Add session and protocol version headers for non-initialize requests
       return unless request['method'] != 'initialize'
@@ -367,10 +373,17 @@ module MCPClient
     # @raise [MCPClient::Errors::ServerError] if server returns an error
     def log_level=(level)
       ensure_connected
+      # MCP 2026-07-28 removed logging/setLevel: the level travels per request
+      # in _meta["io.modelcontextprotocol/logLevel"].
+      if modern?
+        @log_level = validate_log_level!(level)
+        return
+      end
+
       require_capability!('logging', method: 'logging/setLevel')
       rpc_request('logging/setLevel', { level: level })
     rescue MCPClient::Errors::ConnectionError, MCPClient::Errors::TransportError,
-           MCPClient::Errors::CapabilityError
+           MCPClient::Errors::CapabilityError, ArgumentError
       raise
     rescue StandardError => e
       raise MCPClient::Errors::ServerError, "Error setting log level: #{e.message}"
@@ -502,7 +515,9 @@ module MCPClient
         name: nil,
         logger: nil,
         oauth_provider: nil,
-        faraday_config: nil
+        faraday_config: nil,
+        protocol: :auto,
+        discover_timeout: nil
       }
     end
 

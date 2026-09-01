@@ -672,6 +672,66 @@ module MCPClient
       reader&.close
     end
 
+    # Header value that may travel as-is: visible ASCII (0x21-0x7E), with
+    # spaces and tabs allowed only in the interior (RFC 9110 field values;
+    # MCP 2026-07-28 Streamable HTTP "Value Encoding").
+    HEADER_SAFE_VALUE = /\A[\x21-\x7E](?:[\x20-\x7E\t]*[\x21-\x7E])?\z/
+    # The Base64 sentinel format; a plain value matching it must itself be
+    # encoded to avoid ambiguity.
+    HEADER_BASE64_SENTINEL = /\A=\?base64\?.*\?=\z/m
+
+    # Which request field mirrors into the Mcp-Name header (MCP 2026-07-28
+    # Streamable HTTP "Standard Request Headers"; the tasks extension adds
+    # taskId routing for its methods).
+    NAME_HEADER_SOURCES = {
+      'tools/call' => 'name',
+      'prompts/get' => 'name',
+      'resources/read' => 'uri',
+      'tasks/get' => 'taskId',
+      'tasks/update' => 'taskId',
+      'tasks/cancel' => 'taskId'
+    }.freeze
+
+    # Encode a parameter value for an MCP request header (Mcp-Name,
+    # Mcp-Param-*): strings as-is when header-safe, integers in decimal,
+    # booleans lowercase; anything not safely representable — non-ASCII,
+    # control characters, leading/trailing whitespace, an empty string, or a
+    # value that looks like the sentinel — as `=?base64?<b64 of UTF-8>?=`.
+    # @param value [String, Integer, true, false] the parameter value
+    # @return [String] the header value
+    def encode_header_value(value)
+      text = value.to_s
+      return text if text.match?(HEADER_SAFE_VALUE) && !text.match?(HEADER_BASE64_SENTINEL)
+
+      "=?base64?#{[text.encode('UTF-8')].pack('m0')}?="
+    end
+
+    # The HTTP headers a modern (2026-07-28) request must carry: the protocol
+    # version (matching the body's _meta), the method, and for named
+    # requests the name/URI (MCP 2026-07-28 Streamable HTTP "Request
+    # Metadata").
+    # @param request [Hash] the JSON-RPC request (String keys)
+    # @return [Hash{String => String}] header name => value
+    def modern_request_headers(request)
+      headers = { 'MCP-Protocol-Version' => protocol_version, 'Mcp-Method' => request['method'].to_s }
+      name = mcp_name_header_value(request)
+      headers['Mcp-Name'] = name if name
+      headers
+    end
+
+    # @param request [Hash] the JSON-RPC request
+    # @return [String, nil] the encoded Mcp-Name value, or nil when the method has none
+    def mcp_name_header_value(request)
+      key = NAME_HEADER_SOURCES[request['method']]
+      params = request['params']
+      return nil unless key && params.is_a?(Hash)
+
+      value = params.key?(key) ? params[key] : params[key.to_sym]
+      return nil if value.nil?
+
+      encode_header_value(value)
+    end
+
     # Process JSON-RPC response
     # @param response [Hash] the parsed JSON-RPC response
     # @return [Object] the result field from the response

@@ -143,6 +143,7 @@ module MCPClient
                                       })
 
       @read_timeout = opts[:read_timeout]
+      configure_protocol_mode(opts[:protocol], opts[:discover_timeout])
       @faraday_config = opts[:faraday_config]
       @max_decompressed_body_bytes = validate_decompression_limit(opts[:max_decompressed_body_bytes])
       @tools = nil
@@ -192,11 +193,14 @@ module MCPClient
         # Test connectivity with a simple HTTP request
         test_connection
 
-        # Perform MCP initialization handshake
-        perform_initialize
+        # Establish the protocol era: server/discover for a modern server, the
+        # initialize handshake for a legacy one.
+        negotiate_protocol
 
-        # Start long-lived GET connection for server events
-        start_events_connection
+        # Long-lived GET stream for server events: legacy only. MCP 2026-07-28
+        # removed the GET endpoint; change notifications arrive on
+        # subscriptions/listen streams instead.
+        start_events_connection unless modern?
 
         @mutex.synchronize do
           @connection_established = true
@@ -303,10 +307,17 @@ module MCPClient
     # @raise [MCPClient::Errors::ServerError] if server returns an error
     def log_level=(level)
       ensure_connected
+      # MCP 2026-07-28 removed logging/setLevel: the level travels per request
+      # in _meta["io.modelcontextprotocol/logLevel"].
+      if modern?
+        @log_level = validate_log_level!(level)
+        return
+      end
+
       require_capability!('logging', method: 'logging/setLevel')
       rpc_request('logging/setLevel', { level: level })
     rescue MCPClient::Errors::ConnectionError, MCPClient::Errors::TransportError,
-           MCPClient::Errors::CapabilityError
+           MCPClient::Errors::CapabilityError, ArgumentError
       raise
     rescue StandardError => e
       raise MCPClient::Errors::ServerError, "Error setting log level: #{e.message}"
@@ -472,6 +483,10 @@ module MCPClient
     def apply_request_headers(req, request)
       super
 
+      # Modern servers have no session; the base class added the 2026-07-28
+      # request metadata headers.
+      return if modern?
+
       # Add session and protocol version headers for non-initialize requests
       return unless request['method'] != 'initialize'
 
@@ -627,7 +642,9 @@ module MCPClient
         logger: nil,
         oauth_provider: nil,
         faraday_config: nil,
-        max_decompressed_body_bytes: JsonRpcTransport::MAX_DECOMPRESSED_BODY_BYTES
+        max_decompressed_body_bytes: JsonRpcTransport::MAX_DECOMPRESSED_BODY_BYTES,
+        protocol: :auto,
+        discover_timeout: nil
       }
     end
 
@@ -1127,6 +1144,16 @@ module MCPClient
     # interleaved on a POST SSE response stream.
     # @param message [Hash] the parsed JSON-RPC message
     def dispatch_server_message(message)
+      if modern? && message['method'] && message.key?('id')
+        # MCP 2026-07-28: "The server MUST NOT send independent JSON-RPC
+        # requests on this stream" — server-to-client interactions are
+        # embedded in InputRequiredResult. There is no response channel
+        # either (clients MUST NOT POST responses), so the request is dropped.
+        @logger.warn("Ignoring server-initiated request #{message['method']} on a response stream: " \
+                     'not permitted by MCP 2026-07-28')
+        return
+      end
+
       # Handle ping requests from server (keepalive mechanism)
       if message['method'] == 'ping' && message.key?('id')
         handle_ping_request(message['id'])

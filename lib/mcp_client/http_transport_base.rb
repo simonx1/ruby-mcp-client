@@ -31,20 +31,61 @@ module MCPClient
     # @raise [MCPClient::Errors::TransportError] if response isn't valid JSON
     # @raise [MCPClient::Errors::ToolCallError] for other errors during request execution
     def rpc_request(method, params = {}, timeout: nil)
+      freshly_probed = !@mutex.synchronize { @connection_established }
       ensure_connected
+      if method == 'ping' && modern?
+        # `ping` was removed in MCP 2026-07-28; the mandatory server/discover
+        # request is the modern heartbeat, and the probe that just established
+        # the connection already was one.
+        return @last_discover_result if freshly_probed && @last_discover_result
+
+        method = 'server/discover'
+      end
 
       with_retry(method) do
-        request_id = @mutex.synchronize { @request_id += 1 }
-        request = build_jsonrpc_request(method, params, request_id)
-        begin
-          send_jsonrpc_request(request, timeout: timeout)
-        rescue MCPClient::Errors::RequestTimeoutError
-          # MCP lifecycle: on timeout the sender SHOULD issue a cancellation
-          # notification for the abandoned request and stop waiting.
-          send_cancellation_notification(request_id) if cancellable_request?(method, params)
-          raise
+        send_request_and_parse(method, params, timeout)
+      rescue MCPClient::Errors::UnsupportedProtocolVersionError => e
+        # MCP 2026-07-28 basic/versioning: select a mutually supported version
+        # from the error's list and retry. The server rejected the request
+        # before processing it, so a re-send cannot duplicate a side effect.
+        version = select_protocol_version(e.supported)
+        raise unless modern? && version && version != protocol_version
+
+        @logger.info("Server does not support protocol version #{protocol_version}; " \
+                     "retrying #{method} with #{version}")
+        @protocol_version = version
+        send_request_and_parse(method, params, timeout)
+      rescue MCPClient::Errors::ResponseStreamClosedError => e
+        # Modern Streamable HTTP has no resumption: a broken response stream
+        # loses the request and the client MUST re-issue it with a new id.
+        # tools/call is the exception this library keeps: the server may
+        # already have executed it, so the host decides whether to retry.
+        if NON_IDEMPOTENT_METHODS.include?(method)
+          raise MCPClient::Errors::ServerError,
+                "#{e.message}; #{method} was not re-issued because it may already have executed"
         end
+
+        @logger.warn("#{e.message}; re-issuing #{method} as a new request")
+        send_request_and_parse(method, params, timeout)
       end
+    end
+
+    # One request/response exchange with its own JSON-RPC id.
+    # @param method [String] JSON-RPC method name
+    # @param params [Hash] parameters for the request
+    # @param timeout [Numeric, nil] per-request timeout override
+    # @return [Object] result from the JSON-RPC response
+    def send_request_and_parse(method, params, timeout)
+      request_id = @mutex.synchronize { @request_id += 1 }
+      request = build_jsonrpc_request(method, params, request_id)
+      send_jsonrpc_request(request, timeout: timeout)
+    rescue MCPClient::Errors::RequestTimeoutError
+      # MCP lifecycle: on timeout the sender SHOULD cancel the abandoned
+      # request. On modern Streamable HTTP closing the response stream IS the
+      # cancellation signal and no notifications/cancelled is expected; legacy
+      # servers still get the notification.
+      send_cancellation_notification(request_id) if !modern? && cancellable_request?(method, params)
+      raise
     end
 
     # Best-effort notifications/cancelled for a request the client stopped
@@ -174,7 +215,155 @@ module MCPClient
       false
     end
 
+    # How the server's protocol era is established (MCP 2026-07-28 Streamable
+    # HTTP "Backward Compatibility"): :auto attempts a modern request first
+    # and falls back to the initialize handshake on a legacy rejection,
+    # :modern never falls back, :legacy never probes.
+    PROTOCOL_MODES = %i[auto modern legacy].freeze
+
+    # @return [Symbol] the configured protocol mode (:auto, :modern or :legacy)
+    attr_reader :protocol_mode
+
+    # @return [Numeric] seconds allowed for the server/discover probe
+    attr_reader :discover_timeout
+
     private
+
+    # Validate and store the protocol-mode options shared by the HTTP transports.
+    # @param protocol [Symbol] :auto, :modern or :legacy
+    # @param discover_timeout [Numeric, nil] probe timeout (default: read_timeout)
+    # @return [void]
+    # @raise [ArgumentError] on an unknown mode
+    def configure_protocol_mode(protocol, discover_timeout)
+      unless PROTOCOL_MODES.include?(protocol)
+        raise ArgumentError, "protocol must be one of #{PROTOCOL_MODES.inspect}, got #{protocol.inspect}"
+      end
+
+      @protocol_mode = protocol
+      @discover_timeout = discover_timeout || @read_timeout
+      @legacy_confirmed = false
+    end
+
+    # Establish the server's protocol era: probe with a modern request unless
+    # configured legacy-only (or the server was already found to be legacy),
+    # and fall back to the initialize handshake when the probe shows a legacy
+    # server. The era is cached for the life of this transport.
+    # @return [void]
+    # @raise [MCPClient::Errors::ConnectionError] if no era can be established
+    def negotiate_protocol
+      return perform_initialize if @protocol_mode == :legacy || (@protocol_mode == :auto && @legacy_confirmed)
+      return if probe_modern_server
+
+      perform_initialize
+    end
+
+    # Send the modern server/discover probe. Outcomes (MCP 2026-07-28
+    # Streamable HTTP "Backward Compatibility"): a DiscoverResult is modern;
+    # a recognized modern JSON-RPC error in a 400 body is modern too
+    # (UnsupportedProtocolVersion is retried with an advertised version,
+    # HeaderMismatch / MissingRequiredClientCapability are surfaced); a 404
+    # carrying -32601 is a modern server that violates the "MUST implement
+    # server/discover" rule, tolerated with unknown capabilities; any other
+    # 4xx (or a 2xx carrying a non-modern JSON-RPC error) is a legacy server.
+    # Authorization failures, 5xx and timeouts propagate: none of them says
+    # anything about the era.
+    # @return [Boolean] true when the server is modern and a version was selected
+    # @raise [MCPClient::Errors::ConnectionError] if the server is modern but the
+    #   probe failed, or legacy while protocol: :modern is configured
+    def probe_modern_server
+      @protocol_version = MCPClient::LATEST_PROTOCOL_VERSION
+      begin
+        perform_discover
+      rescue MCPClient::Errors::UnsupportedProtocolVersionError => e
+        retry_discover_with_advertised_version(e)
+      end
+      true
+    rescue MCPClient::Errors::TransientServerError, MCPClient::Errors::RequestTimeoutError
+      @protocol_version = nil
+      raise
+    rescue MCPClient::Errors::ServerError => e
+      raise modern_probe_failure(e) if e.modern_protocol_error? || e.is_a?(MCPClient::Errors::InvalidResultError)
+
+      if e.code == MCPClient::Errors::Codes::METHOD_NOT_FOUND && e.http_status == 404
+        accept_modern_server_without_discover(e)
+        return true
+      end
+
+      treat_probe_failure_as_legacy(e)
+      false
+    rescue MCPClient::Errors::TransportError => e
+      treat_probe_failure_as_legacy(e)
+      false
+    end
+
+    # After UnsupportedProtocolVersionError, pick a mutually supported version
+    # from the error's advertised list and re-issue the probe.
+    # @param error [MCPClient::Errors::UnsupportedProtocolVersionError]
+    # @return [void]
+    def retry_discover_with_advertised_version(error)
+      version = select_protocol_version(error.supported)
+      unless version
+        raise MCPClient::Errors::ConnectionError,
+              "Server rejected protocol version #{@protocol_version} and supports only " \
+              "#{error.supported.join(', ')}, none of which this client speaks"
+      end
+
+      @logger.info("Server does not support #{@protocol_version}; retrying server/discover with #{version}")
+      @protocol_version = version
+      perform_discover
+    end
+
+    # @param error [MCPClient::Errors::ServerError] a modern-era probe failure
+    # @return [MCPClient::Errors::ConnectionError]
+    def modern_probe_failure(error)
+      @protocol_version = nil
+      MCPClient::Errors::ConnectionError.new("Server is modern but incompatible: #{error.message}")
+    end
+
+    # A 404 with -32601 is how a modern server reports an unknown method;
+    # server/discover is mandatory, so this is a non-conforming modern
+    # server. Continue with the requested version and no known capabilities.
+    # @param error [MCPClient::Errors::ServerError] the -32601 error
+    # @return [void]
+    def accept_modern_server_without_discover(error)
+      @logger.warn("Server answered server/discover with 404 -32601 (#{error.message}); treating it as a " \
+                   'modern MCP server without discovery support (capabilities unknown)')
+      @supported_versions = [@protocol_version]
+      @capabilities = {}
+      @last_discover_result = nil
+    end
+
+    # Record that the server is legacy (the era is cached for this transport).
+    # @param error [StandardError] the non-modern probe failure
+    # @return [void]
+    # @raise [MCPClient::Errors::ConnectionError] when protocol: :modern is configured
+    def treat_probe_failure_as_legacy(error)
+      @protocol_version = nil
+      if @protocol_mode == :modern
+        raise MCPClient::Errors::ConnectionError,
+              "Server did not answer server/discover as a modern MCP server (#{error.message}); it is most likely " \
+              'a legacy server expecting the initialize handshake. Use protocol: :auto or :legacy to allow that.'
+      end
+
+      @logger.debug("server/discover probe failed (#{error.class}); treating the server as legacy")
+      @legacy_confirmed = true
+    end
+
+    # Send server/discover and apply the DiscoverResult.
+    # @return [Hash] the DiscoverResult
+    def perform_discover
+      request_id = @mutex.synchronize { @request_id += 1 }
+      request = build_jsonrpc_request('server/discover', {}, request_id)
+      result = send_jsonrpc_request(request, timeout: @discover_timeout)
+      # A 2xx that is not a DiscoverResult (e.g. a permissive legacy endpoint
+      # answering any method) is not a modern answer: let the probe treat it
+      # as legacy rather than fail on a malformed modern result.
+      unless result.is_a?(Hash) && result['supportedVersions'].is_a?(Array)
+        raise MCPClient::Errors::ServerError, 'server/discover was answered without a DiscoverResult'
+      end
+
+      apply_discover_result(result)
+    end
 
     # Perform JSON-RPC initialize handshake with the MCP server
     # @return [void]
@@ -342,13 +531,17 @@ module MCPClient
     # Apply headers to the HTTP request (can be overridden by subclasses)
     # @param req [Faraday::Request] HTTP request
     # @param _request [Hash] JSON-RPC request
-    def apply_request_headers(req, _request)
+    def apply_request_headers(req, request)
       # Apply all headers including custom ones
       @headers.each { |k, v| req.headers[k] = v }
 
       # Apply OAuth authorization if available
       @logger.debug("OAuth provider present: #{@oauth_provider ? 'yes' : 'no'}")
       @oauth_provider&.apply_authorization(req)
+
+      # MCP 2026-07-28: every POST carries MCP-Protocol-Version (matching the
+      # body's _meta), Mcp-Method and, for named requests, Mcp-Name.
+      modern_request_headers(request).each { |k, v| req.headers[k] = v } if modern?
     end
 
     # Handle successful HTTP response (can be overridden by subclasses)
