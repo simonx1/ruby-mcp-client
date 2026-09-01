@@ -32,7 +32,12 @@ metadata). Each feature lands in its own PR; this section accumulates them.
   per-validation time budget; hitting a bound aborts the validation with
   a single error, never with a pass, even under `not` or `oneOf`. Values
   quoted in messages are clipped, and the client sanitizes and bounds the
-  violation text it logs or raises.
+  violation text it logs or raises. Errors inside `anyOf` / `oneOf` /
+  `not` / `if` candidates are only a verdict and do not count toward the
+  error bound; positional keywords follow the dialect (`prefixItems` in
+  2020-12, where an `items` array is invalid; an `items` array in draft-07
+  and 2019-09); a present but malformed `$schema` makes the schema
+  unusable; an `outputSchema` of `false` is preserved by `Tool.from_json`.
 - **structuredContent.** Any JSON value is accepted, including `null`:
   presence is decided by the `structuredContent` key, and the value —
   object, array, scalar or null — is validated against the output schema.
