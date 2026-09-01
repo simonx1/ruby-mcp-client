@@ -196,7 +196,7 @@ module MCPClient
     # @return [void]
     def route_notification(method, params)
       handle_subscription_control(method, params)
-      invalidate_cache_for_notification(method) if respond_to?(:invalidate_cache_for_notification, true)
+      invalidate_cache_for_notification(method, params)
       # The host's caches go with the transport's, on their own hook rather
       # than on the host callback below: that callback is deliberately last —
       # it is the step that may block — and a client whose invalidation rode on

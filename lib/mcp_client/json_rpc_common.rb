@@ -5,11 +5,13 @@ require 'zlib'
 require 'stringio'
 require_relative 'header_params'
 require_relative 'subscription_support'
+require_relative 'result_caching'
 
 module MCPClient
   # Shared retry/backoff logic for JSON-RPC transports
   module JsonRpcCommon
     include SubscriptionSupport
+    include ResultCaching
 
     # JSON-RPC methods with arbitrary side effects that MUST NOT be re-sent
     # automatically. Even a "transient" failure (5xx, dropped connection,
@@ -422,6 +424,7 @@ module MCPClient
       @protocol_version = version
       @supported_versions = versions
       @last_discover_result = result
+      record_cache_hint(:discover, result)
       @capabilities = result['capabilities'].is_a?(Hash) ? result['capabilities'] : {}
       @instructions = result['instructions']
       info = result.dig('_meta', META_SERVER_INFO)
@@ -874,6 +877,7 @@ module MCPClient
         end
         result = yield(retry_params)
       end
+      @last_result_from_round_trip = round_trips.positive?
       result
     end
 

@@ -138,7 +138,7 @@ module MCPClient
     # @raise [MCPClient::Errors::ConnectionError] on authorization failures
     # @raise [MCPClient::Errors::PromptGetError] if no prompts could be retrieved from any server
     def list_prompts(cache: true)
-      return @prompt_cache.values if cache && !@prompt_cache.empty?
+      return @prompt_cache.values if cache && !@prompt_cache.empty? && caches_fresh?(:prompts)
 
       prompts = []
       connection_errors = []
@@ -229,7 +229,9 @@ module MCPClient
       end
 
       # Use cache if available and no cursor
-      return { 'resources' => @resource_cache.values, 'nextCursor' => nil } if cache && !@resource_cache.empty?
+      if cache && !@resource_cache.empty? && caches_fresh?(:resources)
+        return { 'resources' => @resource_cache.values, 'nextCursor' => nil }
+      end
 
       resources = []
       connection_errors = []
@@ -281,7 +283,7 @@ module MCPClient
     # @raise [MCPClient::Errors::ConnectionError] on authorization failures
     # @raise [MCPClient::Errors::ToolCallError] if no tools could be retrieved from any server
     def list_tools(cache: true)
-      return @tool_cache.values if cache && !@tool_cache.empty?
+      return @tool_cache.values if cache && !@tool_cache.empty? && caches_fresh?(:tools)
 
       tools = []
       connection_errors = []
@@ -748,6 +750,14 @@ module MCPClient
       # legacy servers, per-request _meta on modern ones)
       server.client_info = client_info if client_info && server.respond_to?(:client_info=)
       server.request_meta = request_meta if request_meta && server.respond_to?(:request_meta=)
+    end
+
+    # Whether every server's cached list of a kind is still fresh (MCP
+    # 2026-07-28 caching: a stale list is re-fetched on access).
+    # @param kind [Symbol] :tools, :prompts or :resources
+    # @return [Boolean]
+    def caches_fresh?(kind)
+      servers.all? { |server| !server.respond_to?(:cache_fresh?) || server.cache_fresh?(kind) }
     end
 
     # Whether the server's negotiated capability set is available yet.

@@ -319,9 +319,11 @@ module MCPClient
     # @return [Array<Hash>] all raw item hashes collected across pages
     # @raise [MCPClient::Errors::TransportError] if a page result is not a Hash or Array
     def request_paginated_list(method, key)
-      collect_paginated(key) do |cursor|
+      pages = []
+      items = collect_paginated(key) do |cursor|
         params = cursor ? { cursor: cursor } : {}
         result = rpc_request(method, params)
+        pages << result
         case result
         when Hash
           [result[key] || [], result['nextCursor']]
@@ -332,6 +334,19 @@ module MCPClient
                 "Invalid #{method} response: expected an object or array, got #{result.class}"
         end
       end
+      # MCP 2026-07-28 caching: every page carries its own ttlMs; the list is
+      # fresh only as long as its shortest-lived page.
+      record_list_cache_hint(method, pages) if respond_to?(:record_list_cache_hint, true)
+      items
+    end
+
+    # Whether a cached list of the given kind may still be served (MCP
+    # 2026-07-28 caching); transports without freshness hints keep caching
+    # until a change notification.
+    # @param _kind [Symbol]
+    # @return [Boolean]
+    def cache_fresh?(_kind)
+      true
     end
 
     # Initialize logger with proper formatter handling

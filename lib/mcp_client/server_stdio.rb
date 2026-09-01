@@ -357,13 +357,17 @@ module MCPClient
     # @raise [MCPClient::Errors::PromptGetError] for other errors during prompt listing
     def list_prompts
       ensure_initialized
-      collect_paginated('prompts') do |cursor|
+      pages = []
+      prompts = collect_paginated('prompts') do |cursor|
         params = {}
         params['cursor'] = cursor if cursor
         result = rpc_request('prompts/list', params) || {}
+        pages << result
         prompts = (result['prompts'] || []).map { |td| MCPClient::Prompt.from_json(td, server: self) }
         [prompts, result['nextCursor']]
       end
+      record_list_cache_hint('prompts/list', pages)
+      prompts
     rescue MCPClient::Errors::ServerError => e
       # 2026-07-28 protocol errors carry actionable data (requiredCapabilities,
       # supported versions); keep them intact instead of wrapping.
@@ -403,6 +407,7 @@ module MCPClient
       params = {}
       params['cursor'] = cursor if cursor
       result = rpc_request('resources/list', params) || {}
+      record_cache_hint(:resources, result) unless cursor
       resources = (result['resources'] || []).map { |td| MCPClient::Resource.from_json(td, server: self) }
       { 'resources' => resources, 'nextCursor' => result['nextCursor'] }
     rescue MCPClient::Errors::ServerError => e
@@ -422,10 +427,7 @@ module MCPClient
     # @raise [MCPClient::Errors::ResourceReadError] for other errors during resource reading
     def read_resource(uri)
       ensure_initialized
-      result = require_complete_result!(rpc_request('resources/read', { 'uri' => uri }) || {},
-                                        'resources/read')
-      contents = result['contents'] || []
-      contents.map { |content| MCPClient::ResourceContent.from_json(content) }
+      read_resource_with_cache(uri) { rpc_request('resources/read', { 'uri' => uri }) || {} }
     rescue MCPClient::Errors::ServerError => e
       raise if e.protocol_error?
       raise resource_not_found_error(uri, e) if resource_not_found_response?(e)
@@ -445,6 +447,7 @@ module MCPClient
       params = {}
       params['cursor'] = cursor if cursor
       result = rpc_request('resources/templates/list', params) || {}
+      record_cache_hint(:templates, result) unless cursor
       templates = (result['resourceTemplates'] || []).map { |td| MCPClient::ResourceTemplate.from_json(td, server: self) }
       { 'resourceTemplates' => templates, 'nextCursor' => result['nextCursor'] }
     rescue MCPClient::Errors::ServerError => e
@@ -519,13 +522,17 @@ module MCPClient
     # @raise [MCPClient::Errors::ToolCallError] for other errors during tool listing
     def list_tools
       ensure_initialized
-      collect_paginated('tools') do |cursor|
+      pages = []
+      tools = collect_paginated('tools') do |cursor|
         params = {}
         params['cursor'] = cursor if cursor
         result = rpc_request('tools/list', params) || {}
+        pages << result
         tools = (result['tools'] || []).map { |td| MCPClient::Tool.from_json(td, server: self) }
         [tools, result['nextCursor']]
       end
+      record_list_cache_hint('tools/list', pages)
+      tools
     rescue MCPClient::Errors::ServerError => e
       # 2026-07-28 protocol errors carry actionable data (requiredCapabilities,
       # supported versions); keep them intact instead of wrapping.

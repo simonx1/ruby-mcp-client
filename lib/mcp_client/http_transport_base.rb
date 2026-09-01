@@ -717,25 +717,41 @@ module MCPClient
       end
     end
 
-    # Keep the transport's list caches in step with the server's list-changed
-    # notifications, so a re-list after a change (or the HeaderMismatch
-    # refresh) really fetches the new definitions.
-    # @param method [String] a notification method
+    # Drop the transport's cached list of a kind, so a re-list after a change
+    # (or the HeaderMismatch refresh) really fetches the new definitions.
+    # @param kind [Symbol] :tools, :prompts or :resources
     # @return [void]
-    def invalidate_cache_for_notification(method)
-      case method
-      when 'notifications/tools/list_changed' then invalidate_tools_cache
-      when 'notifications/prompts/list_changed'
+    def invalidate_list_cache(kind)
+      case kind
+      when :tools then invalidate_tools_cache
+      when :prompts
         @mutex.synchronize do
           @prompts = nil
           @prompts_data = nil
         end
-      when 'notifications/resources/list_changed'
+      when :resources
         @mutex.synchronize do
           @resources_result = nil
           @resources_data = nil
         end
       end
+    end
+
+    # Re-fetch a list that has gone stale, or serve the stale copy when the
+    # re-fetch fails for a transient reason ("Clients MAY serve stale
+    # responses if errors occur during re-fetching").
+    # @param kind [Symbol] the list kind (for the log line)
+    # @param stale [Object, nil] the stale cached value
+    # @yield performs the fetch
+    # @return [Object] the fresh value, or the stale one on a transient failure
+    def refetch_or_serve_stale(kind, stale)
+      yield
+    rescue MCPClient::Errors::TransientServerError, MCPClient::Errors::ConnectionError,
+           MCPClient::Errors::TransportError => e
+      raise unless stale
+
+      @logger.warn("Re-fetching #{kind} failed (#{e.class}); serving the stale cached list")
+      stale
     end
 
     # Exclude tool definitions whose x-mcp-header annotations violate the

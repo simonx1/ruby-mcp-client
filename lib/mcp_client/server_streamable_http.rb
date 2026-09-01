@@ -224,14 +224,17 @@ module MCPClient
     # @raise [MCPClient::Errors::TransportError] if response isn't valid JSON
     # @raise [MCPClient::Errors::ToolCallError] for other errors during tool listing
     def list_tools
-      @mutex.synchronize do
-        return @tools if @tools
-      end
+      cached = @mutex.synchronize { @tools }
+      # MCP 2026-07-28 caching: a cached list is served only while fresh.
+      return cached if cached && cache_fresh?(:tools)
 
+      # Stale: the raw page cache must go too, or the re-fetch would be
+      # answered from memory.
+      @mutex.synchronize { @tools_data = nil } if cached
       begin
         ensure_connected
 
-        fetch_tools_list
+        refetch_or_serve_stale(:tools, cached) { fetch_tools_list }
       rescue MCPClient::Errors::ConnectionError, MCPClient::Errors::TransportError, MCPClient::Errors::ServerError
         # Re-raise these errors directly
         raise
@@ -321,27 +324,38 @@ module MCPClient
     # @return [Array<MCPClient::Prompt>] list of available prompts
     # @raise [MCPClient::Errors::PromptGetError] if prompts list retrieval fails
     def list_prompts
-      @mutex.synchronize do
-        return @prompts if @prompts
-      end
+      cached = @mutex.synchronize { @prompts }
+      return cached if cached && cache_fresh?(:prompts)
 
+      @mutex.synchronize { @prompts_data = nil } if cached
       begin
         ensure_connected
-
-        prompts_data = request_prompts_list
-        @mutex.synchronize do
-          @prompts = prompts_data.map do |prompt_data|
-            MCPClient::Prompt.from_json(prompt_data, server: self)
-          end
-        end
-
-        @mutex.synchronize { @prompts }
+        refetch_or_serve_stale(:prompts, cached) { fetch_prompts_list }
       rescue MCPClient::Errors::ConnectionError, MCPClient::Errors::TransportError, MCPClient::Errors::ServerError
-        # Re-raise these errors directly
         raise
       rescue StandardError => e
         raise MCPClient::Errors::PromptGetError, "Error listing prompts: #{e.message}"
       end
+    end
+
+    # Fetch and cache the prompt list.
+    # @return [Array<MCPClient::Prompt>]
+    def fetch_prompts_list
+      ensure_connected
+
+      prompts_data = request_prompts_list
+      @mutex.synchronize do
+        @prompts = prompts_data.map do |prompt_data|
+          MCPClient::Prompt.from_json(prompt_data, server: self)
+        end
+      end
+
+      @mutex.synchronize { @prompts }
+    rescue MCPClient::Errors::ConnectionError, MCPClient::Errors::TransportError, MCPClient::Errors::ServerError
+      # Re-raise these errors directly
+      raise
+    rescue StandardError => e
+      raise MCPClient::Errors::PromptGetError, "Error listing prompts: #{e.message}"
     end
 
     # Get a prompt with the given parameters
@@ -370,34 +384,46 @@ module MCPClient
     # @return [Hash] result containing resources array and optional nextCursor
     # @raise [MCPClient::Errors::ResourceReadError] if resources list retrieval fails
     def list_resources(cursor: nil)
-      @mutex.synchronize do
-        return @resources_result if @resources_result && !cursor
-      end
+      cached = @mutex.synchronize { @resources_result }
+      return cached if cached && !cursor && cache_fresh?(:resources)
 
       begin
         ensure_connected
+        return refetch_or_serve_stale(:resources, cached) { fetch_resources_list(nil) } unless cursor
 
-        params = {}
-        params['cursor'] = cursor if cursor
-        result = rpc_request('resources/list', params)
-
-        resources = (result['resources'] || []).map do |resource_data|
-          MCPClient::Resource.from_json(resource_data, server: self)
-        end
-
-        resources_result = { 'resources' => resources, 'nextCursor' => result['nextCursor'] }
-
-        @mutex.synchronize do
-          @resources_result = resources_result unless cursor
-        end
-
-        resources_result
+        fetch_resources_list(cursor)
       rescue MCPClient::Errors::ConnectionError, MCPClient::Errors::TransportError, MCPClient::Errors::ServerError
-        # Re-raise these errors directly
         raise
       rescue StandardError => e
         raise MCPClient::Errors::ResourceReadError, "Error listing resources: #{e.message}"
       end
+    end
+
+    # Fetch one page of resources/list, caching the first page.
+    # @param cursor [String, nil]
+    # @return [Hash]
+    def fetch_resources_list(cursor)
+      params = {}
+      params['cursor'] = cursor if cursor
+      result = rpc_request('resources/list', params)
+      record_cache_hint(:resources, result) unless cursor
+
+      resources = (result['resources'] || []).map do |resource_data|
+        MCPClient::Resource.from_json(resource_data, server: self)
+      end
+
+      resources_result = { 'resources' => resources, 'nextCursor' => result['nextCursor'] }
+
+      @mutex.synchronize do
+        @resources_result = resources_result unless cursor
+      end
+
+      resources_result
+    rescue MCPClient::Errors::ConnectionError, MCPClient::Errors::TransportError, MCPClient::Errors::ServerError
+      # Re-raise these errors directly
+      raise
+    rescue StandardError => e
+      raise MCPClient::Errors::ResourceReadError, "Error listing resources: #{e.message}"
     end
 
     # Read a resource by its URI
@@ -405,9 +431,7 @@ module MCPClient
     # @return [Array<MCPClient::ResourceContent>] array of resource contents
     # @raise [MCPClient::Errors::ResourceReadError] if resource reading fails
     def read_resource(uri)
-      result = require_complete_result!(rpc_request('resources/read', { uri: uri }), 'resources/read')
-      contents = result['contents'] || []
-      contents.map { |content| MCPClient::ResourceContent.from_json(content) }
+      read_resource_with_cache(uri) { rpc_request('resources/read', { uri: uri }) }
     rescue MCPClient::Errors::ServerError => e
       raise if e.protocol_error?
       raise resource_not_found_error(uri, e) if resource_not_found_response?(e)
@@ -429,6 +453,7 @@ module MCPClient
       params = {}
       params['cursor'] = cursor if cursor
       result = rpc_request('resources/templates/list', params)
+      record_cache_hint(:templates, result) unless cursor
 
       templates = (result['resourceTemplates'] || []).map do |template_data|
         MCPClient::ResourceTemplate.from_json(template_data, server: self)
