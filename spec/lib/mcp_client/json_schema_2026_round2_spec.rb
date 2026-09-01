@@ -147,9 +147,9 @@ RSpec.describe 'MCP 2026-07-28 JSON Schema handling — round 2' do
 
   describe 'JSON pointers' do
     it 'keeps literal plus signs and rejects indexes with leading zeros' do
-      schema = { '$defs' => { 'a+b' => { 'type' => 'integer' } }, 'items' => [{ 'type' => 'string' }],
-                 'properties' => { 'p' => { '$ref' => '#/$defs/a+b' }, 'q' => { '$ref' => '#/items/00' } } }
-      expect(validator.check_schema(schema)).to contain_exactly(a_string_matching(%r{unresolvable.*#/items/00}))
+      schema = { '$defs' => { 'a+b' => { 'type' => 'integer' } }, 'prefixItems' => [{ 'type' => 'string' }],
+                 'properties' => { 'p' => { '$ref' => '#/$defs/a+b' }, 'q' => { '$ref' => '#/prefixItems/00' } } }
+      expect(validator.check_schema(schema)).to contain_exactly(a_string_matching(%r{unresolvable.*#/prefixItems/00}))
       expect(validator.validate({ 'p' => 'x' }, { '$defs' => { 'a+b' => { 'type' => 'integer' } },
                                                   'properties' => { 'p' => { '$ref' => '#/$defs/a+b' } } }))
         .to contain_exactly(a_string_matching(%r{#/p: expected type integer}))

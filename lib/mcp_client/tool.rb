@@ -64,7 +64,9 @@ module MCPClient
       # Some servers (Playwright MCP CLI) use 'inputSchema' instead of 'schema'
       # Handle both string and symbol keys
       schema = data['inputSchema'] || data[:inputSchema] || data['schema'] || data[:schema]
-      output_schema = data['outputSchema'] || data[:outputSchema]
+      # By key presence: a boolean false schema is a schema (one that
+      # accepts nothing), not an absent one.
+      output_schema = data.key?('outputSchema') ? data['outputSchema'] : data[:outputSchema]
       annotations = data['annotations'] || data[:annotations]
       title = data['title'] || data[:title]
       execution = data['execution'] || data[:execution]

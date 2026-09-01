@@ -122,9 +122,11 @@ module MCPClient
     # @return [String] the `$schema` value (without a trailing `#`), or DEFAULT_DIALECT
     def self.dialect(schema)
       return DEFAULT_DIALECT unless schema.is_a?(Hash)
+      return DEFAULT_DIALECT unless schema.key?('$schema') || schema.key?(:$schema)
 
-      declared = schema['$schema'] || schema[:$schema]
-      return DEFAULT_DIALECT unless declared.is_a?(String) && !declared.empty?
+      declared = schema.key?('$schema') ? schema['$schema'] : schema[:$schema]
+      # A declaration that is present but unusable is not the default.
+      return nil unless declared.is_a?(String) && !declared.empty?
 
       declared.sub(/#\z/, '')
     end
@@ -157,13 +159,14 @@ module MCPClient
 
       root = deep_stringify(schema)
       declared = dialect(root)
+      return ['$schema must be a non-empty string naming the dialect'] if declared.nil?
       unless supported_dialect?(declared)
         return ["schema dialect #{clip(declared.inspect)} is not supported " \
                 "(supported: #{SUPPORTED_DIALECTS.join(', ')})"]
       end
 
       problems = []
-      walk_schema(root, root, 0, { count: 0 }, problems)
+      walk_schema(root, root, 0, { count: 0, dialect: canonical_dialect(declared) }, problems)
       problems.uniq
     end
 
@@ -187,6 +190,9 @@ module MCPClient
 
       check_ref(schema['$ref'], root, problems) if schema.key?('$ref')
       check_dynamic_ref(schema['$dynamicRef'], problems) if schema.key?('$dynamicRef')
+      if counter[:dialect] == DEFAULT_DIALECT && schema['items'].is_a?(Array)
+        problems << 'items must be a schema in JSON Schema 2020-12 (positional schemas go in prefixItems)'
+      end
       each_subschema(schema) { |sub| walk_schema(sub, root, depth + 1, counter, problems) }
     end
 
@@ -383,6 +389,17 @@ module MCPClient
       count_errors(ctx, errors)
     end
 
+    # Run a branch whose errors are only a verdict (anyOf/oneOf candidates,
+    # not, if): they never count toward MAX_ERRORS. Bounds that abort the
+    # whole validation still propagate.
+    # @return [Object] the block's value
+    def self.speculative(ctx)
+      before = ctx.errors
+      yield
+    ensure
+      ctx.errors = before
+    end
+
     # Account for produced errors against MAX_ERRORS.
     # @return [Array<String>] the errors
     # @raise [Aborted]
@@ -428,14 +445,18 @@ module MCPClient
         end
       end
       if schema['anyOf'].is_a?(Array) &&
-         schema['anyOf'].none? { |sub| validate_node(data, sub, path, ctx, ref_depth).empty? }
+         schema['anyOf'].none? { |sub| speculative(ctx) { validate_node(data, sub, path, ctx, ref_depth).empty? } }
         errors << "#{path}: does not satisfy any schema in anyOf"
       end
       if schema['oneOf'].is_a?(Array)
-        matches = schema['oneOf'].count { |sub| validate_node(data, sub, path, ctx, ref_depth).empty? }
+        matches = schema['oneOf'].count do |sub|
+          speculative(ctx) do
+            validate_node(data, sub, path, ctx, ref_depth).empty?
+          end
+        end
         errors << "#{path}: satisfies #{matches} schemas in oneOf, expected exactly one" unless matches == 1
       end
-      if schema.key?('not') && validate_node(data, schema['not'], path, ctx, ref_depth).empty?
+      if schema.key?('not') && speculative(ctx) { validate_node(data, schema['not'], path, ctx, ref_depth).empty? }
         errors << "#{path}: value satisfies the schema in not"
       end
       errors.concat(validate_conditional(data, schema, path, ctx, ref_depth))
@@ -447,7 +468,7 @@ module MCPClient
     def self.validate_conditional(data, schema, path, ctx, ref_depth)
       return [] unless schema.key?('if')
 
-      branch = validate_node(data, schema['if'], path, ctx, ref_depth).empty? ? 'then' : 'else'
+      branch = speculative(ctx) { validate_node(data, schema['if'], path, ctx, ref_depth).empty? } ? 'then' : 'else'
       return [] unless schema.key?(branch)
 
       validate_node(data, schema[branch], path, ctx, ref_depth)
@@ -577,8 +598,14 @@ module MCPClient
         errors << "#{path}: expected at most #{max_items} items, got #{data.length}"
       end
       items = schema['items']
-      positional = schema['prefixItems'].is_a?(Array) ? schema['prefixItems'] : []
-      positional = items if items.is_a?(Array)
+      # 2020-12 puts positional schemas in prefixItems (items must be a
+      # schema); draft-07 and 2019-09 put them in an items array and know no
+      # prefixItems.
+      positional = if ctx.dialect == DEFAULT_DIALECT
+                     schema['prefixItems'].is_a?(Array) ? schema['prefixItems'] : []
+                   else
+                     items.is_a?(Array) ? items : []
+                   end
       data.each_with_index do |item, idx|
         item_schema = if idx < positional.length
                         positional[idx]
