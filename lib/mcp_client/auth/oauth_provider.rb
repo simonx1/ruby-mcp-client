@@ -149,7 +149,8 @@ module MCPClient
         # Validation": the selected authorization server's issuer is recorded
         # in the same per-request record so the `iss` of the response can be
         # checked against an authenticated value.
-        pkce = PKCE.new(issuer: server_metadata.issuer)
+        pkce = PKCE.new(issuer: server_metadata.issuer,
+                        iss_parameter_supported: server_metadata.iss_parameter_supported?)
         storage.set_pkce(server_url, pkce)
 
         # Generate state parameter
@@ -192,9 +193,9 @@ module MCPClient
         unless server_metadata.issuer == pkce.issuer
           raise MCPClient::Errors::ConnectionError,
                 'Authorization response rejected: the authorization server changed during the flow ' \
-                "(recorded #{pkce.issuer}); restart the authorization"
+                "(recorded #{safe_error_text(pkce.issuer)}); restart the authorization"
         end
-        validate_authorization_response_issuer!(iss, pkce.issuer, server_metadata)
+        validate_authorization_response_issuer!(iss, pkce.issuer, iss_parameter_supported_for?(pkce, server_metadata))
 
         # Exchange authorization code for tokens
         token = exchange_authorization_code(server_metadata, client_info, code, pkce)
@@ -224,7 +225,11 @@ module MCPClient
         end
 
         pkce = storage.get_pkce(server_url)
-        validate_authorization_response_issuer!(params['iss'], pkce&.issuer, storage.get_server_metadata(server_url))
+        cached = storage.get_server_metadata(server_url)
+        # Only the request's own authorization server can say whether iss is
+        # expected: a cache that names another server is no guide.
+        cached = nil unless pkce && cached && cached.issuer == pkce.issuer
+        validate_authorization_response_issuer!(params['iss'], pkce&.issuer, iss_parameter_supported_for?(pkce, cached))
         safe_error_text((params['error_description'] || params['error'] || 'unknown error').to_s).strip
       end
 
@@ -281,7 +286,23 @@ module MCPClient
         # Reuse this challenge-advertised metadata during the subsequent OAuth
         # flow instead of re-deriving (and possibly missing) the well-known URL.
         @challenge_resource_metadata = metadata
+        revoke_token_on_authorization_server_change(metadata)
         metadata
+      end
+
+      # A challenge naming another authorization server than the one the
+      # stored token came from retires that token at once: it is never
+      # presented again, whatever the storage backend can do.
+      # @param resource_metadata [ResourceMetadata]
+      # @return [void]
+      def revoke_token_on_authorization_server_change(resource_metadata)
+        advertised = Array(resource_metadata&.authorization_servers).first
+        known = storage.get_server_metadata(server_url)&.issuer
+        return unless advertised && known && advertised != known
+
+        logger.debug('The challenge names another authorization server; retiring the stored token')
+        @authorization_server_switched = true
+        delete_token
       end
 
       # Extract the protected-resource-metadata URL from a WWW-Authenticate header.
@@ -361,14 +382,15 @@ module MCPClient
       # @param server_metadata [ServerMetadata, nil] the authorization server metadata
       # @return [void]
       # @raise [MCPClient::Errors::ConnectionError]
-      def validate_authorization_response_issuer!(iss, expected, server_metadata)
+      # @param supported [Boolean] whether the request's authorization server advertises iss
+      def validate_authorization_response_issuer!(iss, expected, supported)
         unless expected.is_a?(String)
           raise MCPClient::Errors::ConnectionError,
                 'Authorization response rejected: no issuer was recorded for this authorization request, ' \
                 'so it cannot be bound to an authorization server; restart the authorization'
         end
         if iss.nil?
-          return unless server_metadata&.iss_parameter_supported?
+          return unless supported
 
           raise MCPClient::Errors::ConnectionError,
                 'Authorization response rejected: the authorization server advertises the iss parameter ' \
@@ -377,7 +399,19 @@ module MCPClient
         return if iss.to_s == expected
 
         raise MCPClient::Errors::ConnectionError,
-              "Authorization response rejected: issuer mismatch (expected #{expected})"
+              "Authorization response rejected: issuer mismatch (expected #{safe_error_text(expected)})"
+      end
+
+      # Whether the authorization server of a request advertised the iss
+      # response parameter: recorded with the PKCE record; for a record
+      # persisted before that field existed, the metadata of the same
+      # issuer decides.
+      # @return [Boolean]
+      def iss_parameter_supported_for?(pkce, server_metadata)
+        recorded = pkce&.iss_parameter_supported
+        return recorded == true unless recorded.nil?
+
+        server_metadata&.iss_parameter_supported? == true
       end
 
       # Resolve the scope for authorization/registration requests using the
@@ -581,13 +615,21 @@ module MCPClient
         logger.debug('Authorization server changed; discarding the token and scopes from the previous AS')
 
         # Registration state is per authorization server: a token from the
-        # previous one is not valid for the new one. Credentials are kept
-        # only when bound (pre-registered, so the mismatch can be reported)
-        # or portable (Client ID Metadata Document); a dynamic or unknown
-        # registration is discarded so the next flow re-registers.
+        # previous one is not valid for the new one. Credentials stored
+        # without a binding belonged to the previous server, so they are
+        # bound to it first; then they are kept only when bound
+        # (pre-registered, so the mismatch can be reported) or portable
+        # (Client ID Metadata Document), and a dynamic registration is
+        # discarded so the next flow re-registers.
+        @authorization_server_switched = true
         delete_token
         client_info = storage.get_client_info(server_url)
-        keep = client_info.respond_to?(:portable?) && (client_info.portable? || client_info.pre_registered?)
+        if client_info.respond_to?(:issuer) && client_info.issuer.nil? && !portable_client?(client_info)
+          client_info = client_info.with_issuer(previous.issuer,
+                                                registration_type: resolved_registration_type(client_info))
+          storage.set_client_info(server_url, client_info)
+        end
+        keep = client_info.respond_to?(:portable?) && (portable_client?(client_info) || client_info.pre_registered?)
         delete_client_info unless keep
 
         @supported_scopes = nil
@@ -711,11 +753,13 @@ module MCPClient
       # @param issuer [String]
       # @raise [MCPClient::Errors::ConnectionError]
       def validate_metadata_issuer!(metadata, issuer)
-        return if metadata.issuer.to_s.chomp('/') == issuer.to_s.chomp('/')
+        # Byte-for-byte (RFC 8414 Section 4): no case folding, no slash or
+        # port normalization.
+        return if metadata.issuer.is_a?(String) && metadata.issuer == issuer.to_s
 
         raise MCPClient::Errors::ConnectionError,
-              "Authorization server metadata rejected: its issuer #{metadata.issuer.inspect} is not the " \
-              "identifier it was fetched for (#{issuer})"
+              "Authorization server metadata rejected: its issuer #{safe_error_text(metadata.issuer.to_s).inspect} " \
+              "is not the identifier it was fetched for (#{safe_error_text(issuer.to_s)})"
       end
 
       # Non-raising server-metadata fetch used while iterating candidates.
@@ -1001,10 +1045,19 @@ module MCPClient
       # @raise [MCPClient::Errors::ConnectionError] for pre-registered credentials of another issuer
       def client_info_for_issuer(client_info, issuer)
         return client_info unless client_info.respond_to?(:issuer)
-        return client_info if client_info.portable?
+
+        if portable_client?(client_info)
+          # A Client ID Metadata Document client persisted before the type
+          # was recorded is migrated so later checks need no inference.
+          return client_info if client_info.registration_type == 'cimd'
+
+          migrated = client_info.with_issuer(client_info.issuer, registration_type: 'cimd')
+          storage.set_client_info(server_url, migrated)
+          return migrated
+        end
 
         if client_info.issuer.nil?
-          bound = client_info.with_issuer(issuer)
+          bound = client_info.with_issuer(issuer, registration_type: resolved_registration_type(client_info))
           storage.set_client_info(server_url, bound)
           return bound
         end
@@ -1029,6 +1082,12 @@ module MCPClient
       # attempted, and a backend that accepts neither is reported.
       # @return [void]
       def delete_token
+        # Whatever the backend manages, this token is never presented again.
+        current = storage.get_token(server_url)
+        if current.respond_to?(:access_token) && current.access_token
+          (@retired_tokens ||= {})[current.access_token] =
+            true
+        end
         if storage.respond_to?(:delete_token)
           storage.delete_token(server_url)
         else
@@ -1045,10 +1104,29 @@ module MCPClient
       # @param token [Token]
       # @return [Boolean]
       def token_for_current_issuer?(token)
+        return false if token.respond_to?(:access_token) && @retired_tokens&.key?(token.access_token)
         return true unless token.respond_to?(:issuer) && token.issuer
 
         current = storage.get_server_metadata(server_url)&.issuer
         current.nil? || current == token.issuer
+      end
+
+      # The registration type of stored credentials, recognizing a Client
+      # ID Metadata Document client persisted before the type was recorded
+      # by its client id (the configured metadata URL).
+      # @param client_info [ClientInfo]
+      # @return [String]
+      def resolved_registration_type(client_info)
+        return client_info.registration_type if client_info.registration_type
+        return 'cimd' if client_id_metadata_url && client_info.client_id == client_id_metadata_url
+
+        client_info.effective_registration_type
+      end
+
+      # @param client_info [ClientInfo]
+      # @return [Boolean] whether the client id is portable across authorization servers
+      def portable_client?(client_info)
+        resolved_registration_type(client_info) == 'cimd'
       end
 
       # @return [void]
@@ -1431,8 +1509,15 @@ module MCPClient
       # state and tokens are per authorization server).
       # @return [Boolean]
       def refresh_permitted?(token, client_info, server_metadata)
-        if token.respond_to?(:issuer) && token.issuer && token.issuer != server_metadata.issuer
+        issuer = token.respond_to?(:issuer) ? token.issuer : nil
+        if issuer && issuer != server_metadata.issuer
           logger.warn('Not refreshing the token: the authorization server changed since it was issued')
+          return false
+        end
+        # A token that does not say where it came from is not refreshed once
+        # the authorization server is known to have changed.
+        if issuer.nil? && @authorization_server_switched
+          logger.warn('Not refreshing the token: it records no issuer and the authorization server changed')
           return false
         end
         if client_info.respond_to?(:issuer) && client_info.issuer && !client_info.portable? &&

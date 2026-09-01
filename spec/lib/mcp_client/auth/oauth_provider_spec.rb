@@ -590,6 +590,7 @@ RSpec.describe MCPClient::Auth::OAuthProvider do
       let(:www_authenticate) { 'Bearer resource="https://example.com/.well-known/oauth-protected-resource"' }
 
       before do
+        allow(storage).to receive(:get_server_metadata).and_return(nil)
         allow(response).to receive(:headers).and_return('WWW-Authenticate' => www_authenticate)
         allow(oauth_provider).to receive(:fetch_resource_metadata).and_return(
           MCPClient::Auth::ResourceMetadata.new(

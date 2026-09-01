@@ -425,7 +425,7 @@ module MCPClient
 
     # PKCE (Proof Key for Code Exchange) helper
     class PKCE
-      attr_reader :code_verifier, :code_challenge, :code_challenge_method, :issuer
+      attr_reader :code_verifier, :code_challenge, :code_challenge_method, :issuer, :iss_parameter_supported
 
       # Generate PKCE parameters
       # @param code_verifier [String, nil] Existing code verifier (for deserialization)
@@ -433,11 +433,16 @@ module MCPClient
       # @param code_challenge_method [String] Challenge method (default: 'S256')
       # @param issuer [String, nil] the selected authorization server's issuer, recorded with this
       #   per-request record for RFC 9207 validation of the authorization response (MCP 2026-07-28)
-      def initialize(code_verifier: nil, code_challenge: nil, code_challenge_method: nil, issuer: nil)
+      # @param iss_parameter_supported [Boolean, nil] whether that authorization server advertised
+      #   authorization_response_iss_parameter_supported, recorded with the request so the response
+      #   is judged by the server the request went to
+      def initialize(code_verifier: nil, code_challenge: nil, code_challenge_method: nil, issuer: nil,
+                     iss_parameter_supported: nil)
         @code_verifier = code_verifier || generate_code_verifier
         @code_challenge = code_challenge || generate_code_challenge(@code_verifier)
         @code_challenge_method = code_challenge_method || 'S256'
         @issuer = issuer
+        @iss_parameter_supported = iss_parameter_supported
       end
 
       # Convert to hash for serialization
@@ -449,6 +454,7 @@ module MCPClient
           code_challenge_method: @code_challenge_method
         }
         hash[:issuer] = @issuer if @issuer
+        hash[:iss_parameter_supported] = @iss_parameter_supported unless @iss_parameter_supported.nil?
         hash
       end
 
@@ -464,11 +470,17 @@ module MCPClient
         challenge = data[:code_challenge] || data['code_challenge']
         method = data[:code_challenge_method] || data['code_challenge_method']
         issuer = data[:issuer] || data['issuer']
+        supported = if data.key?(:iss_parameter_supported)
+                      data[:iss_parameter_supported]
+                    else
+                      data['iss_parameter_supported']
+                    end
 
         raise ArgumentError, 'Missing code_verifier' unless verifier
         raise ArgumentError, 'Missing code_challenge' unless challenge
 
-        new(code_verifier: verifier, code_challenge: challenge, code_challenge_method: method, issuer: issuer)
+        new(code_verifier: verifier, code_challenge: challenge, code_challenge_method: method, issuer: issuer,
+            iss_parameter_supported: supported)
       end
 
       private
