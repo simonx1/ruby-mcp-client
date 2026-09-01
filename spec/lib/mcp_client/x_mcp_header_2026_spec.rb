@@ -621,3 +621,150 @@ RSpec.describe 'MCP 2026-07-28 x-mcp-header — hardening' do
     expect(server.list_tools.first.schema['properties']['region']['x-mcp-header']).to eq('Zone')
   end
 end
+
+# Review round 2 (grok): a stale in-flight list must not repopulate an
+# invalidated cache even when it is empty; JSON integers may arrive as
+# Floats with a zero fraction; a call for a tool the list does not carry
+# still cannot go out without headers it would need; the annotated
+# property's type may be given as a single-element array; the client-level
+# re-resolution after a refresh is keyed on the transport's list
+# generation, not on cache emptiness; more schema keywords are walked.
+RSpec.describe 'MCP 2026-07-28 x-mcp-header — round 2' do
+  describe MCPClient::HeaderParams do
+    it 'encodes an integral Float as a decimal integer and rejects a fractional one' do
+      input = { 'type' => 'object', 'properties' => { 'n' => { 'type' => 'integer', 'x-mcp-header' => 'N' } } }
+      expect(described_class.headers_for(input, { 'n' => 42.0 })).to eq({ 'Mcp-Param-N' => '42' })
+      expect { described_class.headers_for(input, { 'n' => 42.5 }) }
+        .to raise_error(MCPClient::Errors::ValidationError, /primitive|integer/)
+    end
+
+    it 'accepts a single-element type array naming a primitive type' do
+      input = { 'type' => 'object', 'properties' => { 'n' => { 'type' => ['integer'], 'x-mcp-header' => 'N' } } }
+      expect(described_class.validate_schema(input)).to eq([])
+    end
+
+    it 'walks contentSchema and draft-07 dependencies for misplaced annotations' do
+      bad = { 'type' => 'string', 'x-mcp-header' => 'A' }
+      expect(described_class.validate_schema({ 'type' => 'object',
+                                               'properties' => { 'a' => { 'type' => 'string',
+                                                                          'contentSchema' => bad } } }))
+        .not_to be_empty
+      expect(described_class.validate_schema({ 'type' => 'object', 'dependencies' => { 'k' => bad } })).not_to be_empty
+    end
+  end
+
+  describe 'transport behaviour' do
+    let(:url) { 'https://example.com/mcp' }
+    let(:log_output) { StringIO.new }
+    let(:server) do
+      MCPClient::ServerStreamableHTTP.new(base_url: 'https://example.com', endpoint: '/mcp', retries: 0,
+                                          logger: Logger.new(log_output))
+    end
+
+    after { server.cleanup }
+
+    def json_response(id, result)
+      { status: 200, body: JSON.generate('jsonrpc' => '2.0', 'id' => id, 'result' => result),
+        headers: { 'Content-Type' => 'application/json' } }
+    end
+
+    def discover_result
+      { 'resultType' => 'complete', 'supportedVersions' => ['2026-07-28'], 'capabilities' => { 'tools' => {} } }
+    end
+
+    def tool(header)
+      { 'name' => 'execute_sql', 'inputSchema' => { 'type' => 'object',
+                                                    'properties' => { 'region' => { 'type' => 'string',
+                                                                                    'x-mcp-header' => header } } } }
+    end
+
+    it 'discards a stale in-flight list even when the cache was emptied meanwhile' do
+      header = 'Region'
+      stub_request(:post, url).to_return do |request|
+        body = JSON.parse(request.body)
+        case body['method']
+        when 'server/discover' then json_response(body['id'], discover_result)
+        when 'tools/list'
+          current = header
+          sleep 0.05 if current == 'Region'
+          json_response(body['id'], { 'tools' => [tool(current)] })
+        else json_response(body['id'], { 'content' => [] })
+        end
+      end
+      server.connect
+
+      stale = Thread.new { server.list_tools }
+      sleep 0.01
+      header = 'Zone'
+      server.send(:invalidate_tools_cache) # e.g. notifications/tools/list_changed arrived
+      stale.join
+
+      expect(server.list_tools.first.schema['properties']['region']['x-mcp-header']).to eq('Zone')
+    end
+
+    it 'caps a huge rejected tool name in the warning' do
+      stub_request(:post, url).to_return do |request|
+        body = JSON.parse(request.body)
+        case body['method']
+        when 'server/discover' then json_response(body['id'], discover_result)
+        else
+          json_response(body['id'], { 'tools' => [{ 'name' => 'x' * 10_000, 'inputSchema' => {
+                          'type' => 'object', 'properties' => { 'a' => { 'type' => 'number', 'x-mcp-header' => 'A' } }
+                        } }] })
+        end
+      end
+
+      server.list_tools
+
+      expect(log_output.string.length).to be < 6_000
+    end
+  end
+
+  describe 'client-level re-resolution after a refresh' do
+    let(:url) { 'https://example.com/mcp' }
+
+    it 'validates against the refreshed definition even if a listener refilled the client cache' do
+      output = { 'type' => 'object', 'properties' => { 'ok' => { 'type' => 'boolean' } }, 'required' => ['ok'] }
+      stub_request(:post, url).to_return do |request|
+        body = JSON.parse(request.body)
+        result = case body['method']
+                 when 'server/discover'
+                   { 'resultType' => 'complete', 'supportedVersions' => ['2026-07-28'],
+                     'capabilities' => { 'tools' => {} } }
+                 when 'tools/list'
+                   { 'tools' => [{ 'name' => 't', 'inputSchema' => { 'type' => 'object' },
+                                   'outputSchema' => output }] }
+                 when 'tools/call'
+                   if request.headers['Mcp-Param-Zone']
+                     { 'content' => [], 'structuredContent' => { 'rows' => 1 } }
+                   else
+                     output = { 'type' => 'object', 'properties' => { 'rows' => { 'type' => 'integer' } },
+                                'required' => ['rows'] }
+                     next { status: 400, headers: { 'Content-Type' => 'application/json' },
+                            body: JSON.generate('jsonrpc' => '2.0', 'id' => body['id'],
+                                                'error' => { 'code' => -32_020, 'message' => 'Header mismatch' }) }
+                   end
+                 end
+        { status: 200, body: JSON.generate('jsonrpc' => '2.0', 'id' => body['id'], 'result' => result),
+          headers: { 'Content-Type' => 'application/json' } }
+      end
+      client = MCPClient::Client.new(
+        mcp_server_configs: [MCPClient.streamable_http_config(base_url: 'https://example.com', endpoint: '/mcp',
+                                                              retries: 0)],
+        validate_structured_content: :strict
+      )
+      # A host listener that eagerly re-lists on every list change refills the client cache mid-call.
+      client.on_notification { |_srv, method, _p| client.list_tools if method == 'notifications/tools/list_changed' }
+      # The refreshed definition also gains the annotation; the first list lacks it so the call is rejected once.
+      allow(MCPClient::HeaderParams).to receive(:headers_for).and_wrap_original do |m, schema, args|
+        refreshed = client.list_tools.first.output_schema['required'] == ['rows']
+        m.call(schema, args).merge(refreshed ? { 'Mcp-Param-Zone' => 'z' } : {})
+      end
+
+      result = client.call_tool('t', {})
+
+      expect(result['structuredContent']).to eq({ 'rows' => 1 })
+      client.cleanup
+    end
+  end
+end

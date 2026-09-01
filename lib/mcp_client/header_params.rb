@@ -94,6 +94,8 @@ module MCPClient
     # @return [String]
     # @raise [MCPClient::Errors::ValidationError]
     def encode_value(value, path)
+      # JSON has no integer type: a schema integer may be parsed as 42.0.
+      value = value.to_i if value.is_a?(Float) && value.finite? && value == value.floor
       case value
       when Integer
         unless value.between?(SAFE_INTEGER_MIN, SAFE_INTEGER_MAX)
@@ -124,9 +126,10 @@ module MCPClient
 
     # JSON Schema 2020-12 keywords whose value is one subschema.
     SCHEMA_KEYWORDS = %w[additionalProperties items contains not if then else propertyNames
-                         unevaluatedProperties unevaluatedItems additionalItems].freeze
-    # Keywords whose value is a map of subschemas.
-    SCHEMA_MAP_KEYWORDS = %w[properties patternProperties $defs definitions dependentSchemas].freeze
+                         unevaluatedProperties unevaluatedItems additionalItems contentSchema].freeze
+    # Keywords whose value is a map of subschemas (draft-07 `dependencies`
+    # may hold schemas too).
+    SCHEMA_MAP_KEYWORDS = %w[properties patternProperties $defs definitions dependentSchemas dependencies].freeze
     # Keywords whose value is an array of subschemas.
     SCHEMA_ARRAY_KEYWORDS = %w[allOf anyOf oneOf prefixItems].freeze
 
@@ -167,6 +170,15 @@ module MCPClient
       end
     end
 
+    # Whether a property schema declares exactly one of the primitive types
+    # (a single-element type array names the same type as the bare string).
+    # @api private
+    def primitive_type?(node)
+      type = node.key?('type') ? node['type'] : node[:type]
+      type = type.first if type.is_a?(Array) && type.size == 1
+      type.is_a?(String) && PRIMITIVE_TYPES.include?(type)
+    end
+
     # @api private
     def annotated?(node)
       node.key?(ANNOTATION) || node.key?(ANNOTATION.to_sym)
@@ -190,8 +202,7 @@ module MCPClient
         errors << "#{ANNOTATION} at #{where} is not statically reachable via properties keys from the schema root"
       end
 
-      type = node.key?('type') ? node['type'] : node[:type]
-      unless type.is_a?(String) && PRIMITIVE_TYPES.include?(type)
+      unless primitive_type?(node)
         errors << "#{ANNOTATION} at #{where} must be on a primitive property (integer, string or boolean)"
       end
 
