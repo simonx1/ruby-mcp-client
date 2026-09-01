@@ -176,7 +176,7 @@ RSpec.describe MCPClient::SchemaValidator do
     it 'detects every keyword in the unsupported list' do
       keywords = %w[$dynamicRef $recursiveRef
                     additionalProperties patternProperties propertyNames dependentSchemas dependencies
-                    additionalItems contains minContains maxContains uniqueItems
+                    additionalItems contains minContains maxContains uniqueItems contentSchema
                     multipleOf format dependentRequired minProperties maxProperties
                     unevaluatedProperties unevaluatedItems]
       expect(described_class::UNSUPPORTED_KEYWORDS).to match_array(keywords)
