@@ -38,7 +38,9 @@ module MCPClient
         read_timeout: config[:read_timeout] || MCPClient::ServerStdio::READ_TIMEOUT,
         name: config[:name],
         logger: logger,
-        env: config[:env] || {}
+        env: config[:env] || {},
+        protocol: config[:protocol] || :auto,
+        discover_timeout: config[:discover_timeout]
       )
     end
 

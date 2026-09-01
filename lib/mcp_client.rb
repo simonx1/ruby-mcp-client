@@ -310,7 +310,9 @@ module MCPClient
     # Extract stdio transport specific options
     def extract_stdio_options(options)
       extract_common_options(options).merge({
-        env: options[:env] || {}
+        env: options[:env] || {},
+        protocol: options[:protocol],
+        discover_timeout: options[:discover_timeout]
       }.compact)
     end
 
@@ -379,14 +381,21 @@ module MCPClient
   # @param command [String, Array<String>] command to execute
   # @param name [String, nil] optional name for this server
   # @param logger [Logger, nil] optional logger for server operations
+  # @param env [Hash] environment variables for the subprocess
+  # @param protocol [Symbol] how to establish the server's MCP era: :auto (probe
+  #   with server/discover, fall back to the initialize handshake), :modern
+  #   (2026-07-28+ only) or :legacy (initialize handshake only)
+  # @param discover_timeout [Numeric, nil] seconds to wait for the server/discover probe
   # @return [Hash] server configuration
-  def self.stdio_config(command:, name: nil, logger: nil, env: {})
+  def self.stdio_config(command:, name: nil, logger: nil, env: {}, protocol: :auto, discover_timeout: nil)
     {
       type: 'stdio',
       command: command,
       name: name,
       logger: logger,
-      env: env || {}
+      env: env || {},
+      protocol: protocol,
+      discover_timeout: discover_timeout
     }
   end
 

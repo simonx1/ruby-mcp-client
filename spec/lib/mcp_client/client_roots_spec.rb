@@ -11,6 +11,8 @@ RSpec.describe MCPClient::Client, 'Roots (MCP 2025-06-18)' do
     allow(mock_server).to receive(:respond_to?).with(:on_elicitation_request).and_return(true)
     allow(mock_server).to receive(:respond_to?).with(:on_roots_list_request).and_return(true)
     allow(mock_server).to receive(:respond_to?).with(:on_sampling_request).and_return(true)
+    allow(mock_server).to receive(:respond_to?).with(:modern?).and_return(true)
+    allow(mock_server).to receive(:modern?).and_return(false)
     allow(mock_server).to receive(:on_elicitation_request)
     allow(mock_server).to receive(:on_roots_list_request)
     allow(mock_server).to receive(:on_sampling_request)

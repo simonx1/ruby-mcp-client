@@ -5,6 +5,42 @@
 Groundwork for the 2026-07-28 protocol revision (stateless, per-request
 metadata). Each feature lands in its own PR; this section accumulates them.
 
+### Stateless protocol on stdio (server/discover, per-request `_meta`)
+
+- **No handshake for modern servers.** On stdio the client now probes with
+  `server/discover` first (basic/transports/stdio "Backward Compatibility").
+  A `DiscoverResult` makes the server *modern*: the client picks the newest
+  mutually supported version from `supportedVersions`, records the server's
+  capabilities, instructions and `_meta` `serverInfo`, and never sends
+  `initialize`. An `UnsupportedProtocolVersionError` also identifies a modern
+  server — the probe is retried with an advertised version and the client
+  never falls back. Any other error, or a timeout, means a *legacy* server and
+  the `initialize` handshake runs as before. The era is cached for the life
+  of the process.
+- **Per-request metadata.** Every request to a modern server carries
+  `io.modelcontextprotocol/protocolVersion`, `clientInfo` and
+  `clientCapabilities` in `_meta` (with `extensions` once declared via
+  `declare_extension`). Host-supplied `_meta` keys (`progressToken`,
+  OpenTelemetry `traceparent`/`tracestate`/`baggage`, vendor keys) are
+  preserved; the reserved protocol keys cannot be overridden. Legacy traffic
+  is byte-for-byte unchanged. `Client.new(request_meta:)` (a Hash or a
+  callable evaluated per request) merges default metadata into every request
+  on every transport; `server.send_client_info = false` drops `clientInfo`.
+- **Inline version retry.** A modern server answering any request with
+  `UnsupportedProtocolVersionError` makes the client switch to a mutually
+  supported version from `data.supported` and re-send once (new id).
+- **Removed methods mapped.** Against a modern server `ping` maps to
+  `server/discover` (answered from the probe on a fresh connection),
+  `log_level=` stores the level and sends it as
+  `_meta["io.modelcontextprotocol/logLevel"]` on subsequent requests instead
+  of calling `logging/setLevel`, and `notifications/roots/list_changed` is
+  no longer sent (the modern `roots` capability has no `listChanged`).
+- **Configuration.** `MCPClient.stdio_config(protocol:, discover_timeout:)`
+  and `ServerStdio.new(protocol:, discover_timeout:)`: `:auto` (default,
+  dual-era), `:modern` (fail instead of falling back), `:legacy` (skip the
+  probe). New readers: `protocol_version`, `protocol_era`, `modern?`,
+  `supported_versions`.
+
 ### Protocol foundations
 
 - **Version constants.** `MCPClient::LATEST_PROTOCOL_VERSION` (`2026-07-28`),
