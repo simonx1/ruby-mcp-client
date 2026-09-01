@@ -3,6 +3,7 @@
 require 'faraday'
 require 'json'
 require 'uri'
+require 'ipaddr'
 require_relative '../auth'
 
 module MCPClient
@@ -210,6 +211,32 @@ module MCPClient
         storage.delete_state(server_url)
 
         token
+      end
+
+      # Check a success response before anything is shown or exchanged: the
+      # state must be the one of the pending flow and the response's `iss`
+      # must identify the authorization server the request went to (RFC
+      # 9207). {#complete_authorization_flow} repeats the check before the
+      # token exchange; a browser callback uses this to answer correctly.
+      # @param state [String, nil] the callback's state parameter
+      # @param iss [String, nil] the callback's iss parameter
+      # @return [void]
+      # @raise [MCPClient::Errors::ConnectionError] when the response is not this flow's or the issuer fails
+      def validate_authorization_response!(state, iss: nil)
+        stored_state = storage.get_state(server_url)
+        unless stored_state && stored_state == state
+          raise MCPClient::Errors::ConnectionError, 'Authorization response rejected: state mismatch'
+        end
+
+        pkce = stored_pkce
+        unless pkce.respond_to?(:issuer) && pkce.issuer.is_a?(String)
+          raise MCPClient::Errors::ConnectionError,
+                'Authorization response rejected: no issuer was recorded for this authorization request'
+        end
+
+        cached = stored_server_metadata
+        cached = nil unless cached && cached.issuer == pkce.issuer
+        validate_authorization_response_issuer!(iss, pkce.issuer, iss_parameter_supported_for?(pkce, cached))
       end
 
       # The message to surface for an authorization *error* response, after
@@ -598,7 +625,11 @@ module MCPClient
         # Validate BEFORE caching so invalid metadata is never persisted.
         validate_server_metadata!(server_metadata)
 
-        invalidate_client_info_on_as_change(previous, server_metadata)
+        if previous
+          invalidate_client_info_on_as_change(previous, server_metadata)
+        else
+          retire_records_without_issuer
+        end
 
         storage.set_server_metadata(server_url, server_metadata)
         # Remembered in-process as well: a backend that does not persist
@@ -608,6 +639,25 @@ module MCPClient
         @challenge_metadata_url = nil # consumed
         @challenge_error = nil
         server_metadata
+      end
+
+      # Records persisted before issuers were recorded, with no cached
+      # authorization server to prove where they came from, cannot be bound
+      # to whatever discovery finds now: a dynamic registration (with its
+      # secret) and a token are retired so the flow re-registers and
+      # re-authorizes. Pre-registered and portable credentials are the
+      # host's own configuration and are bound on first use.
+      # @return [void]
+      def retire_records_without_issuer
+        token = stored_token
+        delete_token(bind_to: Token::RETIRED_ISSUER) if token.respond_to?(:issuer) && token.issuer.nil?
+
+        client_info = storage.get_client_info(server_url)
+        return unless client_info.respond_to?(:issuer) && client_info.issuer.nil?
+        return if portable_client?(client_info) || resolved_registration_type(client_info) != 'dynamic'
+
+        logger.debug('Discarding a dynamic OAuth client registration whose authorization server is unknown')
+        delete_client_info
       end
 
       # When a 401 challenge changes the authorization server, per-AS state cached
@@ -1420,9 +1470,22 @@ module MCPClient
         uri = URI.parse(redirect_uri.to_s)
         return 'native' unless %w[http https].include?(uri.scheme.to_s.downcase)
 
-        LOOPBACK_HOSTS.include?(uri.host.to_s.downcase) ? 'native' : 'web'
+        loopback_host?(uri.host) ? 'native' : 'web'
       rescue URI::InvalidURIError
         'native'
+      end
+
+      # Whether a redirect URI host is a loopback interface: localhost or any
+      # loopback address (127.0.0.0/8, ::1, in any spelling).
+      # @param host [String, nil]
+      # @return [Boolean]
+      def loopback_host?(host)
+        host = host.to_s.downcase.delete_prefix('[').delete_suffix(']')
+        return true if LOOPBACK_HOSTS.include?(host)
+
+        IPAddr.new(host).loopback?
+      rescue ArgumentError # IPAddr::Error included
+        false
       end
 
       # The RFC 7591 error of a failed registration response, sanitized for
