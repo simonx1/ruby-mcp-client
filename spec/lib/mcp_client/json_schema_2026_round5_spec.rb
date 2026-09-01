@@ -6,7 +6,7 @@ require 'spec_helper'
 # grammar follows the dialect (draft-07 dependencies, keywords unknown to a
 # dialect are ignored), a draft-07 $ref hides its siblings at preflight
 # too, plain-name fragments resolve to anchors, an empty outputSchema is a
-# schema, draft-07 boolean exclusive bounds apply, and an external
+# schema, exclusive bounds are numbers under draft-07 too, and an external
 # $recursiveRef makes a 2019-09 schema unusable.
 RSpec.describe 'MCP 2026-07-28 JSON Schema handling — round 5' do
   let(:validator) { MCPClient::SchemaValidator }
@@ -92,18 +92,18 @@ RSpec.describe 'MCP 2026-07-28 JSON Schema handling — round 5' do
   end
 
   describe 'draft-07 exclusive bounds' do
-    it 'applies boolean exclusiveMinimum / exclusiveMaximum to minimum / maximum' do
-      min = { '$schema' => draft7, 'type' => 'number', 'minimum' => 5, 'exclusiveMinimum' => true }
-      max = { '$schema' => draft7, 'type' => 'number', 'maximum' => 10, 'exclusiveMaximum' => true }
+    it 'applies numeric exclusiveMinimum / exclusiveMaximum (draft-07 validation Sections 6.2.3 and 6.2.5)' do
+      min = { '$schema' => draft7, 'type' => 'number', 'exclusiveMinimum' => 5 }
+      max = { '$schema' => draft7, 'type' => 'number', 'exclusiveMaximum' => 10 }
       expect(validator.validate(5, min)).to contain_exactly(a_string_matching(/greater than/))
       expect(validator.validate(6, min)).to be_empty
       expect(validator.validate(10, max)).to contain_exactly(a_string_matching(/less than/))
       expect(validator.validate(9, max)).to be_empty
     end
 
-    it 'rejects the form the dialect does not define' do
-      expect(validator.check_schema({ '$schema' => draft7, 'exclusiveMinimum' => 5 }))
-        .to contain_exactly(a_string_matching(/exclusiveMinimum.*boolean/))
+    it 'rejects the draft-04 boolean form' do
+      expect(validator.check_schema({ '$schema' => draft7, 'exclusiveMinimum' => true }))
+        .to contain_exactly(a_string_matching(/exclusiveMinimum.*number/))
       expect(validator.check_schema({ 'exclusiveMaximum' => true }))
         .to contain_exactly(a_string_matching(/exclusiveMaximum.*number/))
     end

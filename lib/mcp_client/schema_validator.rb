@@ -296,20 +296,17 @@ module MCPClient
       value.is_a?(Array) && value.all?(String)
     end
 
-    # draft-07 exclusiveMinimum / exclusiveMaximum are booleans modifying
-    # minimum / maximum; 2019-09 and 2020-12 made them numbers. The other
-    # form is not silently ignored (it would turn a bound into a pass).
+    # exclusiveMinimum / exclusiveMaximum are numbers in every supported
+    # dialect (draft-07 validation Sections 6.2.3 and 6.2.5, kept by 2019-09
+    # and 2020-12); the boolean modifier form belongs to draft-04, which is
+    # not supported, and is not silently ignored (it would turn a bound
+    # into a pass).
     # @return [void]
-    def self.check_exclusive_bounds(schema, dialect, problems)
+    def self.check_exclusive_bounds(schema, _dialect, problems)
       %w[exclusiveMinimum exclusiveMaximum].each do |keyword|
-        next unless schema.key?(keyword)
+        next if !schema.key?(keyword) || schema[keyword].is_a?(Numeric)
 
-        value = schema[keyword]
-        if dialect == DRAFT_07
-          problems << "#{keyword} must be a boolean in draft-07" unless [true, false].include?(value)
-        elsif !value.is_a?(Numeric)
-          problems << "#{keyword} must be a number in #{dialect}"
-        end
+        problems << "#{keyword} must be a number (the draft-04 boolean form is not supported)"
       end
     end
 
@@ -484,6 +481,7 @@ module MCPClient
       return validate_ref(data, schema['$ref'], path, ctx, ref_depth) if schema.key?('$ref') && ctx.dialect == DRAFT_07
 
       errors = []
+      counted_before = ctx.errors
       errors.concat(validate_ref(data, schema['$ref'], path, ctx, ref_depth)) if schema.key?('$ref')
       errors.concat(validate_type(data, schema['type'], path)) if schema.key?('type')
       errors.concat(validate_enum(data, schema, path))
@@ -494,7 +492,9 @@ module MCPClient
       when Numeric then errors.concat(validate_number(data, schema, path, ctx.dialect))
       end
       errors.concat(validate_composition(data, schema, path, ctx, ref_depth))
-      count_errors(ctx, errors)
+      # Errors raised by nested nodes were counted when they were produced;
+      # only this node's own errors are new.
+      count_errors(ctx, errors, already_counted: ctx.errors - counted_before)
     end
 
     # Run a branch whose errors are only a verdict (anyOf/oneOf candidates,
@@ -521,10 +521,10 @@ module MCPClient
     # speculative branch are a verdict, not output, and do not count.
     # @return [Array<String>] the errors
     # @raise [Aborted]
-    def self.count_errors(ctx, errors)
+    def self.count_errors(ctx, errors, already_counted: 0)
       return errors if ctx.speculative.positive?
 
-      ctx.errors += errors.size
+      ctx.errors += errors.size - already_counted
       raise Aborted, "more than #{MAX_ERRORS} validation errors (output truncated)" if ctx.errors > MAX_ERRORS
 
       errors
@@ -800,31 +800,22 @@ module MCPClient
       [remaining, MIN_PATTERN_MATCH_TIMEOUT].max
     end
 
-    # Validate a number against inclusive/exclusive bounds. Under draft-07
-    # `exclusiveMinimum: true` / `exclusiveMaximum: true` make `minimum` /
-    # `maximum` exclusive; 2019-09 and 2020-12 carry the bound in the
-    # keyword itself.
+    # Validate a number against its bounds. `minimum` / `maximum` and
+    # `exclusiveMinimum` / `exclusiveMaximum` are four independent numeric
+    # assertions in every supported dialect (draft-07 validation Sections
+    # 6.2.2-6.2.5); each present one is applied.
     # @param data [Numeric] the number
     # @param schema [Hash] string-keyed schema
     # @param path [String] location for error messages
-    # @param dialect [String, nil] the canonical dialect
     # @return [Array<String>] validation errors
-    def self.validate_number(data, schema, path, dialect = nil)
+    def self.validate_number(data, schema, path, _dialect = nil)
       errors = []
       minimum = schema['minimum']
       maximum = schema['maximum']
       exclusive_min = schema['exclusiveMinimum']
       exclusive_max = schema['exclusiveMaximum']
-      if dialect == DRAFT_07
-        exclusive_min = exclusive_min == true ? minimum : nil
-        exclusive_max = exclusive_max == true ? maximum : nil
-      end
-      if minimum.is_a?(Numeric) && data < minimum && exclusive_min.nil?
-        errors << "#{path}: value #{data} is less than minimum #{minimum}"
-      end
-      if maximum.is_a?(Numeric) && data > maximum && exclusive_max.nil?
-        errors << "#{path}: value #{data} is greater than maximum #{maximum}"
-      end
+      errors << "#{path}: value #{data} is less than minimum #{minimum}" if minimum.is_a?(Numeric) && data < minimum
+      errors << "#{path}: value #{data} is greater than maximum #{maximum}" if maximum.is_a?(Numeric) && data > maximum
       if exclusive_min.is_a?(Numeric) && data <= exclusive_min
         errors << "#{path}: value #{data} must be greater than exclusiveMinimum #{exclusive_min}"
       end
