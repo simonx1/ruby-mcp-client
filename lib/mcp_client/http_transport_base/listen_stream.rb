@@ -8,6 +8,9 @@ module MCPClient
     # the cancellation signal; an abrupt drop is re-opened with a new id
     # while the host still wants the subscription.
     module ListenStream
+      # Raised inside the streaming read to abandon a stream the host closed.
+      class ListenStreamClosed < StandardError; end
+
       # Delay before re-opening a subscriptions/listen stream that ended
       # without the server's closing response (doubles up to the maximum).
       LISTEN_RECONNECT_DELAY = 1
@@ -48,7 +51,7 @@ module MCPClient
       def cancel_subscription(subscription)
         subscription.finish(by_client: true)
         unregister_subscription(subscription)
-        resource_subscriptions.delete_if { |_uri, sub| sub.equal?(subscription) }
+        subscriptions_mutex.synchronize { resource_subscriptions.delete_if { |_uri, sub| sub.equal?(subscription) } }
         thread = listen_threads_mutex.synchronize { listen_threads.delete(subscription) }
         return unless thread && thread != Thread.current
 
@@ -113,6 +116,8 @@ module MCPClient
           delay = [delay * 2, LISTEN_MAX_RECONNECT_DELAY].min
           unregister_subscription(subscription)
           subscription.assign_id(next_request_id)
+          break unless subscription.reconnectable?
+
           register_subscription(subscription)
         end
         # The subscription may still be marked open after an unrecoverable drop.
@@ -137,7 +142,7 @@ module MCPClient
         request = build_jsonrpc_request('subscriptions/listen', { 'notifications' => subscription.requested },
                                         subscription.id)
         buffer = +''
-        state = { finished: nil }
+        state = { finished: nil, scanned: 0 }
         response = listen_connection.post(@endpoint) do |req|
           apply_request_headers(req, request)
           # The stream is parsed incrementally as it arrives; a compressed
@@ -145,17 +150,22 @@ module MCPClient
           req.headers['Accept-Encoding'] = 'identity'
           req.body = request.to_json
           req.options.on_data = proc do |chunk, _bytes|
+            # Closing the response stream is the cancellation signal: stop
+            # reading as soon as the host closed the subscription.
+            raise ListenStreamClosed if subscription.closed_by_client?
             next if state[:finished]
 
             buffer << chunk
-            state[:finished] = consume_listen_events(buffer, subscription)
+            state[:finished] = consume_listen_events(buffer, subscription, state)
             enforce_listen_buffer_cap!(buffer)
           end
         end
         return :closed if state[:finished]
-        return :dropped if response.success?
+        return listen_stream_ended(subscription, response, buffer) if response.success?
 
         fail_subscription_from_response(subscription, response, buffer)
+        :closed
+      rescue ListenStreamClosed
         :closed
       rescue Faraday::TimeoutError, Faraday::ConnectionFailed, Net::ReadTimeout, IOError => e
         @logger.debug("Subscription #{subscription.id} stream dropped: #{e.class}")
@@ -182,6 +192,22 @@ module MCPClient
         unregister_subscription(subscription)
         subscription.finish(gracefully: false, error: MCPClient::Errors::TransportError.new(e.message))
         :closed
+      end
+
+      # A 2xx listen response that ended without an SSE-framed closing
+      # response. The server MAY answer with a single JSON object instead of
+      # a stream: a JSON-RPC response for this listen id is then the closing
+      # response (or the rejection). Anything else is a dropped stream.
+      # @return [Symbol] :closed or :dropped
+      def listen_stream_ended(subscription, response, buffer)
+        headers = response.headers || {}
+        content_type = (headers['content-type'] || headers['Content-Type']).to_s
+        return :dropped unless content_type.include?('application/json') || buffer.lstrip.start_with?('{')
+
+        message = parse_listen_message(buffer.strip)
+        return :closed if message&.key?('id') && handle_listen_message(message, subscription) == :closed
+
+        :dropped
       end
 
       # A non-2xx answer to subscriptions/listen: 401/403 are authorization
@@ -221,10 +247,11 @@ module MCPClient
       # @param buffer [String] mutable stream buffer
       # @param subscription [MCPClient::Subscription]
       # @return [Symbol, nil] :closed once the subscription ended
-      def consume_listen_events(buffer, subscription)
+      def consume_listen_events(buffer, subscription, state = { scanned: 0 })
         finished = nil
-        while (separator = buffer.match(/\r\n\r\n|\n\n/))
+        while (separator = match_event_terminator(buffer, [state[:scanned].to_i - 3, 0].max))
           event = buffer.slice!(0, separator.end(0))
+          state[:scanned] = 0
           data = event.lines.map(&:chomp).select { |l| l.start_with?('data:') }.map { |l| l.sub(/\Adata:\s*/, '') }
           next if data.empty?
 
@@ -233,7 +260,17 @@ module MCPClient
 
           finished ||= handle_listen_message(message, subscription)
         end
+        # Only the bytes that arrive next are searched next time, so an
+        # unterminated event delivered in many chunks stays linear.
+        state[:scanned] = buffer.bytesize
         finished
+      end
+
+      # @param buffer [String] the stream buffer
+      # @param from [Integer] offset to search from
+      # @return [MatchData, nil] the next event terminator
+      def match_event_terminator(buffer, from)
+        buffer.match(/\r\n\r\n|\n\n/, from)
       end
 
       # @param message [Hash] a JSON-RPC message from the listen stream
@@ -247,8 +284,15 @@ module MCPClient
             route_notification(message['method'], message['params'])
           end
           return :closed if subscription.closed?
-        elsif message.key?('id') && handle_subscription_response(message)
-          return :closed
+        elsif message.key?('id')
+          # A listen stream is scoped to its own request: a response for any
+          # other id on it is not this subscription's business.
+          unless message['id'].to_s == subscription.id.to_s
+            @logger.warn("Ignoring a response for request #{sanitize_log_text(message['id'].to_s)} " \
+                         "on the stream of subscription #{subscription.id}")
+            return nil
+          end
+          return :closed if handle_subscription_response(message)
         end
         nil
       end

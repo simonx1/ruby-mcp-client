@@ -809,8 +809,8 @@ module MCPClient
       when 'notifications/subscriptions/acknowledged'
         # MCP 2026-07-28: the transport already recorded the acknowledged
         # filter on the Subscription; log for observability.
-        logger.debug("[#{server_id}] Subscription #{params&.dig('_meta', 'io.modelcontextprotocol/subscriptionId')} " \
-                     'acknowledged')
+        sub_id = params&.dig('_meta', 'io.modelcontextprotocol/subscriptionId')
+        logger.debug("[#{server_id}] Subscription #{sanitize_peer_log_text(sub_id.to_s)} acknowledged")
       when 'notifications/cancelled'
         # MCP 2025-11-25 cancellation utility: the server cancelled one of its
         # own in-flight requests (sampling/elicitation). Server-request
@@ -819,8 +819,9 @@ module MCPClient
         # cancellations they cannot honor — log for observability. On MCP
         # 2026-07-28 it only ever tears down a subscriptions/listen stream,
         # which the transport handled before this point.
-        logger.debug("[#{server_id}] Server cancelled request #{params&.dig('requestId')}: " \
-                     "#{params&.dig('reason') || 'no reason given'}")
+        request_id = sanitize_peer_log_text(params&.dig('requestId').to_s)
+        reason = sanitize_peer_log_text((params&.dig('reason') || 'no reason given').to_s)
+        logger.debug("[#{server_id}] Server cancelled request #{request_id}: #{reason}")
       when 'notifications/progress'
         handle_progress_notification(server_id, params)
       else

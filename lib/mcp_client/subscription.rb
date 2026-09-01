@@ -118,13 +118,27 @@ module MCPClient
       @mutex.synchronize { @closed_by_client }
     end
 
-    # Requested notification types the server did not agree to honour.
+    # Requested notification types the server did not agree to honour
+    # (a resource subscription counts as unsupported when none of its URIs
+    # was acknowledged; see {#unacknowledged_resource_uris} for a partial
+    # acknowledgment).
     # @return [Array<String>] empty until acknowledged
     def unsupported
       ack = @mutex.synchronize { @acknowledged }
       return [] unless ack
 
       @requested.keys - ack.keys
+    end
+
+    # Requested resource URIs the server did not agree to watch.
+    # @return [Array<String>] empty until acknowledged
+    def unacknowledged_resource_uris
+      ack = @mutex.synchronize { @acknowledged }
+      return [] unless ack
+
+      wanted = Array(@requested['resourceSubscriptions'])
+      granted = ack['resourceSubscriptions'].is_a?(Array) ? ack['resourceSubscriptions'] : []
+      wanted - granted
     end
 
     # Cancel the subscription: the transport closes the stream (HTTP) or
@@ -143,8 +157,10 @@ module MCPClient
     def assign_id(id)
       @mutex.synchronize do
         @id = id
-        @state = :pending
         @acknowledged = nil
+        # A subscription the host closed stays closed, whatever a racing
+        # reconnect does.
+        @state = :pending unless @state == :closed
       end
     end
 

@@ -858,7 +858,7 @@ module MCPClient
     def cancel_subscription(subscription)
       unregister_subscription(subscription)
       subscription.finish(by_client: true)
-      resource_subscriptions.delete_if { |_uri, sub| sub.equal?(subscription) }
+      subscriptions_mutex.synchronize { resource_subscriptions.delete_if { |_uri, sub| sub.equal?(subscription) } }
       return unless @stdin
 
       notif = build_jsonrpc_notification('notifications/cancelled',
