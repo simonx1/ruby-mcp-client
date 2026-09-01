@@ -36,7 +36,7 @@ module MCPClient
       # @param authorization [String, nil] the Authorization header of the request
       # @return [void]
       def note_request_authorization(authorization)
-        Thread.current[request_authorization_key] = authorization
+        Thread.current[request_authorization_key] = authorization_fingerprint(authorization)
       end
 
       # @return [String, nil] the Authorization header of the request this thread last sent
@@ -51,11 +51,11 @@ module MCPClient
 
       # @return [String, nil] the Authorization header the next request would carry
       def current_authorization_context
-        return @headers['Authorization'] || @headers['authorization'] unless @oauth_provider
+        return authorization_fingerprint(@headers['Authorization'] || @headers['authorization']) unless @oauth_provider
 
         probe = HeaderProbe.new({})
         @oauth_provider.apply_authorization(probe)
-        probe.headers['Authorization']
+        authorization_fingerprint(probe.headers['Authorization'])
       end
 
       # Minimal request stand-in for asking the OAuth provider which

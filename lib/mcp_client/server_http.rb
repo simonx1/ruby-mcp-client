@@ -338,8 +338,9 @@ module MCPClient
       params = {}
       params['cursor'] = cursor if cursor
       generation = @mutex.synchronize { list_generation(:resources) }
+      epoch = cache_epoch
       result = require_complete_result!(rpc_request('resources/list', params), 'resources/list')
-      record_cache_hint(:resources, result) unless cursor
+      record_cache_hint(:resources, result, epoch: epoch) unless cursor
 
       resources = (result['resources'] || []).map do |resource_data|
         MCPClient::Resource.from_json(resource_data, server: self)
@@ -438,9 +439,9 @@ module MCPClient
     def list_resource_templates(cursor: nil)
       params = {}
       params['cursor'] = cursor if cursor
-      result = require_complete_result!(rpc_request('resources/templates/list', params),
-                                        'resources/templates/list')
-      record_cache_hint(:templates, result) unless cursor
+      epoch = cache_epoch
+      result = require_complete_result!(rpc_request('resources/templates/list', params), 'resources/templates/list')
+      record_cache_hint(:templates, result, epoch: epoch) unless cursor
 
       templates = (result['resourceTemplates'] || []).map do |template_data|
         MCPClient::ResourceTemplate.from_json(template_data, server: self)

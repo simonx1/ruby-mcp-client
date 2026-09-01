@@ -208,6 +208,7 @@ module MCPClient
 
         params = {}
         params['cursor'] = cursor if cursor
+        epoch = cache_epoch
         result = require_complete_result!(rpc_request('resources/list', params), 'resources/list')
 
         resources = (result['resources'] || []).map do |resource_data|
@@ -217,7 +218,7 @@ module MCPClient
         resources_result = { 'resources' => resources, 'nextCursor' => result['nextCursor'] }
         # MCP 2026-07-28 caching: the first page's hint decides how long the
         # cached list may be served.
-        record_cache_hint(:resources, result) unless cursor
+        record_cache_hint(:resources, result, epoch: epoch) unless cursor
 
         @mutex.synchronize do
           @resources_result = resources_result unless cursor
@@ -263,15 +264,15 @@ module MCPClient
       ensure_initialized
       params = {}
       params['cursor'] = cursor if cursor
-      result = require_complete_result!(rpc_request('resources/templates/list', params),
-                                        'resources/templates/list')
+      epoch = cache_epoch
+      result = require_complete_result!(rpc_request('resources/templates/list', params), 'resources/templates/list')
 
       templates = (result['resourceTemplates'] || []).map do |template_data|
         MCPClient::ResourceTemplate.from_json(template_data, server: self)
       end
 
       # MCP 2026-07-28 caching: the first page's hint decides freshness.
-      record_cache_hint(:templates, result) unless cursor
+      record_cache_hint(:templates, result, epoch: epoch) unless cursor
       { 'resourceTemplates' => templates, 'nextCursor' => result['nextCursor'] }
     rescue MCPClient::Errors::ConnectionError, MCPClient::Errors::TransportError, MCPClient::Errors::ServerError
       raise
@@ -548,7 +549,7 @@ module MCPClient
     # would carry and what the last one carried.
     # @return [String, nil]
     def current_authorization_context
-      @headers['Authorization'] || @headers['authorization']
+      authorization_fingerprint(@headers['Authorization'] || @headers['authorization'])
     end
 
     # @return [String, nil]

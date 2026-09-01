@@ -37,8 +37,11 @@ module MCPClient
             elsif assume_zero
               0
             end
+      # Cross-context reuse needs an explicit "public": an absent or unknown
+      # cacheScope keeps the entry within the authorization context that
+      # produced it.
       scope = result.is_a?(Hash) ? result['cacheScope'] : nil
-      new(value: value, received_at: now, ttl_ms: ttl, cache_scope: SCOPES.include?(scope) ? scope : nil)
+      new(value: value, received_at: now, ttl_ms: ttl, cache_scope: SCOPES.include?(scope) ? scope : 'private')
     end
 
     # Combine the hints of several pages of one list into one entry: the
