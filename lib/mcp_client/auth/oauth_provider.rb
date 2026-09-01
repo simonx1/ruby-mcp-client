@@ -302,7 +302,7 @@ module MCPClient
 
         logger.debug('The challenge names another authorization server; retiring the stored token')
         @authorization_server_switched = true
-        delete_token
+        delete_token(bind_to: Token::RETIRED_ISSUER)
       end
 
       # Extract the protected-resource-metadata URL from a WWW-Authenticate header.
@@ -622,7 +622,7 @@ module MCPClient
         # (Client ID Metadata Document), and a dynamic registration is
         # discarded so the next flow re-registers.
         @authorization_server_switched = true
-        delete_token
+        delete_token(bind_to: previous.issuer)
         client_info = storage.get_client_info(server_url)
         if client_info.respond_to?(:issuer) && client_info.issuer.nil? && !portable_client?(client_info)
           client_info = client_info.with_issuer(previous.issuer,
@@ -733,13 +733,25 @@ module MCPClient
       # @param urls [Array<String>] well-known candidates
       # @param issuer [String] the issuer identifier the candidates were built from
       def fetch_first_server_metadata(urls, issuer)
+        rejected = nil
         urls.each do |url|
           md = try_fetch_server_metadata(url)
           next unless md
 
-          validate_metadata_issuer!(md, issuer)
+          begin
+            validate_metadata_issuer!(md, issuer)
+          rescue MCPClient::Errors::ConnectionError => e
+            # Not this candidate: the next well-known location may hold the
+            # document for the issuer actually asked for.
+            logger.debug("Authorization server metadata candidate rejected (#{url}): #{e.message}")
+            rejected = e
+            next
+          end
           return md
         end
+        # Only mismatching documents were found: say so rather than "nothing".
+        raise rejected if rejected
+
         nil
       end
 
@@ -1010,7 +1022,7 @@ module MCPClient
         # 1. Pre-registered or previously registered client info from storage,
         # provided it belongs to the authorization server in use.
         if (client_info = storage.get_client_info(server_url)) && !client_info.client_secret_expired?
-          bound = client_info_for_issuer(client_info, server_metadata.issuer)
+          bound = client_info_for_issuer(client_info, server_metadata.issuer, server_metadata)
           if bound
             logger.debug("Using cached OAuth client for #{server_url}")
             return bound
@@ -1043,10 +1055,18 @@ module MCPClient
       # @param issuer [String] the issuer of the authorization server in use
       # @return [ClientInfo, nil] usable credentials, or nil when a new registration is needed
       # @raise [MCPClient::Errors::ConnectionError] for pre-registered credentials of another issuer
-      def client_info_for_issuer(client_info, issuer)
+      # @param server_metadata [ServerMetadata, nil] the authorization server in use
+      def client_info_for_issuer(client_info, issuer, server_metadata = nil)
         return client_info unless client_info.respond_to?(:issuer)
 
         if portable_client?(client_info)
+          # A portable id is only usable where Client ID Metadata Documents
+          # are accepted; where they are not and registration is offered,
+          # the caller registers instead.
+          if server_metadata && !server_metadata.supports_client_id_metadata_documents? &&
+             server_metadata.supports_registration?
+            return nil
+          end
           # A Client ID Metadata Document client persisted before the type
           # was recorded is migrated so later checks need no inference.
           return client_info if client_info.registration_type == 'cimd'
@@ -1065,14 +1085,15 @@ module MCPClient
 
         if client_info.pre_registered?
           raise MCPClient::Errors::ConnectionError,
-                "Pre-registered OAuth client credentials belong to authorization server #{client_info.issuer}, " \
-                "but the server now uses #{issuer}; register the client with the new authorization server"
+                'Pre-registered OAuth client credentials belong to authorization server ' \
+                "#{safe_error_text(client_info.issuer)}, but the server now uses #{safe_error_text(issuer)}; " \
+                'register the client with the new authorization server'
         end
 
-        logger.warn("Discarding the OAuth client registered with #{client_info.issuer}: " \
-                    "the authorization server is now #{issuer}")
+        logger.warn("Discarding the OAuth client registered with #{safe_error_text(client_info.issuer)}: " \
+                    "the authorization server is now #{safe_error_text(issuer)}")
         delete_client_info
-        delete_token
+        delete_token(bind_to: client_info.issuer)
         nil
       end
 
@@ -1081,12 +1102,22 @@ module MCPClient
       # delete_token(server_url); otherwise set_token(server_url, nil) is
       # attempted, and a backend that accepts neither is reported.
       # @return [void]
-      def delete_token
+      # @param bind_to [String, nil] the issuer the token belonged to (or Token::RETIRED_ISSUER): a token
+      #   that records no issuer is first re-stored bound to it, so a backend that cannot delete still
+      #   keeps it away from another authorization server after a restart
+      def delete_token(bind_to: nil)
         # Whatever the backend manages, this token is never presented again.
         current = storage.get_token(server_url)
         if current.respond_to?(:access_token) && current.access_token
           (@retired_tokens ||= {})[current.access_token] =
             true
+        end
+        if bind_to && current.respond_to?(:with_issuer) && (current.issuer.nil? || bind_to == Token::RETIRED_ISSUER)
+          begin
+            storage.set_token(server_url, current.with_issuer(bind_to))
+          rescue StandardError => e
+            logger.debug("Could not bind the retired token to its issuer in storage: #{e.class}")
+          end
         end
         if storage.respond_to?(:delete_token)
           storage.delete_token(server_url)
@@ -1105,6 +1136,7 @@ module MCPClient
       # @return [Boolean]
       def token_for_current_issuer?(token)
         return false if token.respond_to?(:access_token) && @retired_tokens&.key?(token.access_token)
+        return false if token.respond_to?(:retired?) && token.retired?
         return true unless token.respond_to?(:issuer) && token.issuer
 
         current = storage.get_server_metadata(server_url)&.issuer
