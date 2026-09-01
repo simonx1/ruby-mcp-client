@@ -621,7 +621,7 @@ module MCPClient
       rescue MCPClient::Errors::ServerError => e
         raise if e.protocol_error?
 
-        raise task_error_from(e, task_id, 'getting', modern: modern_server?(srv))
+        raise task_error_from(e, task_id, 'getting', modern: modern_server?(srv), method: 'tasks/get')
       rescue MCPClient::Errors::TransportError, MCPClient::Errors::ConnectionError => e
         raise MCPClient::Errors::TaskError, "Error getting task '#{task_id}': #{e.message}"
       end
@@ -716,7 +716,7 @@ module MCPClient
           raise MCPClient::Errors::TaskError, "Error cancelling task '#{task_id}': #{e.message}"
         end
 
-        raise task_error_from(e, task_id, 'cancelling', modern: modern_server?(srv))
+        raise task_error_from(e, task_id, 'cancelling', modern: modern_server?(srv), method: 'tasks/cancel')
       rescue MCPClient::Errors::TransportError, MCPClient::Errors::ConnectionError => e
         raise MCPClient::Errors::TaskError, "Error cancelling task '#{task_id}': #{e.message}"
       end
@@ -995,13 +995,17 @@ module MCPClient
     # @param operation [String] the tasks sub-capability ('list' or 'cancel')
     # @return [void]
     # @raise [MCPClient::Errors::CapabilityError] if the negotiated set lacks the capability
-    def ensure_task_capability!(srv, operation)
+    # @param strict [Boolean] surface an initialization failure instead of
+    #   leaving it to the request (for operations that never send one on a
+    #   server whose era is unknown)
+    def ensure_task_capability!(srv, operation, strict: false)
       if !capabilities_known?(srv) && srv.respond_to?(:ping)
         begin
           srv.ping
         rescue MCPClient::Errors::MCPError
           # Initialization failed; fall through and let the task request
           # itself surface the failure via the normal error path.
+          raise if strict
         end
       end
 
@@ -1320,7 +1324,14 @@ module MCPClient
     # @param task [String, MCPClient::Task] a task or its ID
     # @return [String] the task ID
     def task_identifier(task)
-      task.is_a?(MCPClient::Task) ? task.task_id : task
+      return task unless task.is_a?(MCPClient::Task)
+
+      unless task.remote?
+        raise MCPClient::Errors::TaskError,
+              'The task was completed locally (the server answered synchronously); there is nothing to fetch, ' \
+              'update or cancel'
+      end
+      task.task_id
     end
 
     # Select a server based on index, name, type, or instance
@@ -1549,12 +1560,16 @@ module MCPClient
     # @param action [String] a verb phrase for the error message (e.g. 'getting')
     # @return [MCPClient::Errors::TaskNotFound, MCPClient::Errors::TaskError]
     # @param modern [Boolean] MCP 2026-07-28: an invalid/nonexistent taskId is -32602
-    def task_error_from(error, task_id, action, modern: false)
+    # @param method [String, nil] the request that failed: on 2026-07-28 servers -32602 always means an
+    #   unknown task for tasks/get, while tasks/update and tasks/cancel may use it for bad params too
+    def task_error_from(error, task_id, action, modern: false, method: nil)
+      shown = sanitize_peer_log_text(task_id.to_s)
       not_found = error.message.match?(/not found|unknown task|expired/i) ||
-                  (modern && error.respond_to?(:code) && error.code == MCPClient::Errors::Codes::INVALID_PARAMS)
-      return MCPClient::Errors::TaskNotFound.new("Task '#{task_id}' not found") if not_found
+                  (modern && error.respond_to?(:code) && error.code == MCPClient::Errors::Codes::INVALID_PARAMS &&
+                   (method == 'tasks/get' || !error.message.match?(/inputResponses|params/i)))
+      return MCPClient::Errors::TaskNotFound.new("Task '#{shown}' not found") if not_found
 
-      MCPClient::Errors::TaskError.new("Error #{action} task '#{task_id}': #{error.message}")
+      MCPClient::Errors::TaskError.new("Error #{action} task '#{shown}': #{sanitize_peer_log_text(error.message)}")
     end
 
     # Handle a notifications/tasks/status notification (MCP 2025-11-25).

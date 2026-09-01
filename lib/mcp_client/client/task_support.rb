@@ -14,6 +14,10 @@ module MCPClient
       DEFAULT_TASK_POLL_INTERVAL = 1.0
       MIN_TASK_POLL_INTERVAL = 0.05
 
+      # How many input_required rounds one wait answers before giving up:
+      # a task is not a higher-trust channel than a multi round-trip request.
+      MAX_TASK_INPUT_ROUNDS = 10
+
       # Answer the outstanding input requests of a task (tasks/update, MCP
       # 2026-07-28 tasks extension). The acknowledgement is eventually
       # consistent: keep observing the task (#get_task / #wait_for_task) until
@@ -28,7 +32,7 @@ module MCPClient
       def update_task(task, input_responses, server: nil)
         srv = select_task_server(task, server, 'update_task')
         task_id = task_identifier(task)
-        ensure_task_capability!(srv, 'update')
+        ensure_task_capability!(srv, 'update', strict: true)
         unless modern_server?(srv)
           raise MCPClient::Errors::TaskError, 'tasks/update requires an MCP 2026-07-28 server (tasks extension)'
         end
@@ -42,7 +46,7 @@ module MCPClient
         rescue MCPClient::Errors::ServerError => e
           raise if e.protocol_error?
 
-          raise task_error_from(e, task_id, 'updating', modern: true)
+          raise task_error_from(e, task_id, 'updating', modern: true, method: 'tasks/update')
         rescue MCPClient::Errors::TransportError, MCPClient::Errors::ConnectionError => e
           raise MCPClient::Errors::TaskError, "Error updating task '#{task_id}': #{e.message}"
         end
@@ -65,27 +69,29 @@ module MCPClient
 
         srv = select_task_server(task, server, 'wait_for_task')
         task_id = task_identifier(task)
-        ensure_task_capability!(srv, 'get')
+        ensure_task_capability!(srv, 'get', strict: true)
         unless modern_server?(srv)
           raise MCPClient::Errors::TaskError, 'wait_for_task requires an MCP 2026-07-28 server (tasks extension)'
         end
 
-        wait = { task_id: task_id, srv: srv, deadline: timeout && (monotonic_time + timeout), answered: [] }
-        # The handle's own state is a starting point only when it came from
-        # the server being polled.
-        current = task if task.is_a?(MCPClient::Task) && (task.server.nil? || task.server.equal?(srv))
+        wait = { task_id: task_id, srv: srv, deadline: timeout && (monotonic_time + timeout), rounds: 0,
+                 answered: answered_task_keys(srv, task_id) }
+        # The CreateTaskResult seed is not an observation: the first
+        # tasks/get goes out at once, and only DetailedTasks drive the wait.
         loop do
-          current = observe_task(current, wait)
-          return current if current.terminal?
+          current = observe_task(wait)
+          if current.terminal?
+            forget_task_keys(srv, task_id)
+            return current
+          end
 
-          wait[:answered].concat(answer_task_input_requests(current, wait[:answered], srv))
+          answer_task_round(current, wait)
           if current.ttl_elapsed?
             raise MCPClient::Errors::TaskError,
-                  "Task '#{task_id}' did not reach a terminal status within its TTL (createdAt + ttlMs)"
+                  "Task '#{shown_task_id(task_id)}' did not reach a terminal status within its TTL (createdAt + ttlMs)"
           end
 
           sleep(task_poll_delay(current, wait[:deadline]))
-          current = nil
         end
       end
 
@@ -106,12 +112,48 @@ module MCPClient
       # @param wait [Hash] task_id, srv, deadline
       # @return [MCPClient::Task]
       # @raise [MCPClient::Errors::TaskError] once the deadline has passed
-      def observe_task(current, wait)
+      def observe_task(wait)
         raise_if_past_deadline!(wait)
-        current ||= poll_task(wait)
-        current = poll_task(wait) if current.terminal? && !current.detailed? && !current.payload_present?
+        current = poll_task(wait)
         validate_terminal_task!(current) if current.terminal?
         current
+      end
+
+      # Answer this poll's outstanding input requests, bounding how many
+      # rounds a task may demand.
+      # @return [void]
+      def answer_task_round(current, wait)
+        answered_now = answer_task_input_requests(current, wait[:answered], wait[:srv])
+        return if answered_now.empty?
+
+        wait[:answered].merge(answered_now)
+        wait[:rounds] += 1
+        return unless wait[:rounds] > MAX_TASK_INPUT_ROUNDS
+
+        raise MCPClient::Errors::InputRequiredError.new(
+          "Task '#{shown_task_id(wait[:task_id])}' kept requesting input after #{MAX_TASK_INPUT_ROUNDS} rounds",
+          data: current.to_h
+        )
+      end
+
+      # The inputRequests keys already answered for a task, kept across
+      # waits ("Clients SHOULD deduplicate inputRequests keys across
+      # consecutive polls") until the task is terminal or cancelled.
+      # @return [Set<String>]
+      def answered_task_keys(srv, task_id)
+        @answered_task_keys ||= {}
+        @answered_task_keys[[srv.object_id, task_id]] ||= Set.new
+      end
+
+      # @return [void]
+      def forget_task_keys(srv, task_id)
+        @answered_task_keys&.delete([srv.object_id, task_id])
+      end
+
+      # @param task_id [Object] a peer-controlled task id
+      # @return [String] safe for a log line or exception message
+      def shown_task_id(task_id)
+        sanitize_peer_log_text(task_id.to_s)
       end
 
       # @return [void]
@@ -119,7 +161,7 @@ module MCPClient
       def raise_if_past_deadline!(wait)
         return unless wait[:deadline] && monotonic_time >= wait[:deadline]
 
-        raise MCPClient::Errors::TaskError, "Timed out waiting for task '#{wait[:task_id]}'"
+        raise MCPClient::Errors::TaskError, "Timed out waiting for task '#{shown_task_id(wait[:task_id])}'"
       end
 
       # One tasks/get, bounded by what is left of the wait.
@@ -178,9 +220,21 @@ module MCPClient
                MCPClient::Errors::ConnectionError => e
           raise MCPClient::Errors::TaskError, "Error creating task for tool '#{tool_name}': #{e.message}"
         end
-        return MCPClient::Task.from_create_result(result, server: srv) if task_result?(result)
+        return created_task(result, srv) if task_result?(result)
 
         MCPClient::Task.completed_locally(result, server: srv)
+      end
+
+      # The handle for a CreateTaskResult, which MUST carry a taskId.
+      # @return [MCPClient::Task]
+      # @raise [MCPClient::Errors::InvalidResultError]
+      def created_task(result, srv)
+        task = MCPClient::Task.from_create_result(result, server: srv)
+        unless task.task_id.is_a?(String)
+          raise MCPClient::Errors::InvalidResultError, 'Invalid CreateTaskResult: no taskId'
+        end
+
+        task
       end
 
       # @param result [Object] a JSON-RPC result
@@ -195,9 +249,9 @@ module MCPClient
       def complete_task_result(tool_name, server, result)
         return result unless task_result?(result)
 
-        task = MCPClient::Task.from_create_result(result, server: server)
-        logger.info("tools/call '#{tool_name}' was accepted as task #{sanitize_peer_log_text(task.task_id.to_s)}; " \
-                    'waiting for it to finish')
+        task = created_task(result, server)
+        logger.info("tools/call '#{sanitize_peer_log_text(tool_name.to_s)}' was accepted as task " \
+                    "#{shown_task_id(task.task_id)}; waiting for it to finish")
         task_outcome(wait_for_task(task))
       end
 
@@ -210,10 +264,12 @@ module MCPClient
         case task.status
         when 'completed' then task.result
         when 'failed'
-          error = task.error.is_a?(Hash) ? task.error : { 'message' => task.status_message || 'Task failed' }
+          error = task.error.is_a?(Hash) ? task.error : {}
+          error = error.merge('message' => sanitize_peer_log_text((error['message'] || task.status_message ||
+                                                                  'Task failed').to_s))
           raise MCPClient::Errors::ServerError.from_jsonrpc(error)
         else
-          raise MCPClient::Errors::TaskError, "Task '#{task.task_id}' ended #{task.status}"
+          raise MCPClient::Errors::TaskError, "Task '#{shown_task_id(task.task_id)}' ended #{task.status}"
         end
       end
 

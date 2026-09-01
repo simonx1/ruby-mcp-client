@@ -228,8 +228,10 @@ RSpec.describe 'MCP 2026-07-28 tasks extension' do
       gets = sent.select { |r| r['method'] == 'tasks/get' }
       expect(gets.size).to eq(2)
       expect(gets.map { |r| wire_params(r)['taskId'] }).to all(eq('task-1'))
-      expect(client).to have_received(:sleep).with(0.25).ordered
-      expect(client).to have_received(:sleep).with(0.5).ordered
+      # The first poll goes out at once; the server's pollIntervalMs paces
+      # the polls that follow an observed non-terminal status.
+      expect(client).to have_received(:sleep).with(0.5).once
+      expect(client).not_to have_received(:sleep).with(0.25)
     end
 
     it 'raises the JSON-RPC error of a failed task' do
@@ -534,6 +536,7 @@ RSpec.describe 'MCP 2026-07-28 tasks extension — round 2' do
     client = client_for(stdio)
     script_stdio(stdio, [{ 'result' => discover_result }, tool_list,
                          { 'result' => task_result(poll_ms: 180_000, ttl_ms: nil) },
+                         { 'result' => detailed_task(status: 'working', poll_ms: 180_000, ttl_ms: nil) },
                          { 'result' => detailed_task(status: 'completed', 'result' => call_result) }])
 
     client.call_tool('slow', {})
@@ -545,6 +548,7 @@ RSpec.describe 'MCP 2026-07-28 tasks extension — round 2' do
     client = client_for(stdio)
     script_stdio(stdio, [{ 'result' => discover_result }, tool_list,
                          { 'result' => task_result(poll_ms: 0, ttl_ms: nil) },
+                         { 'result' => detailed_task(status: 'working', poll_ms: 0, ttl_ms: nil) },
                          { 'result' => detailed_task(status: 'completed', 'result' => call_result) }])
 
     client.call_tool('slow', {})
@@ -608,8 +612,8 @@ RSpec.describe 'MCP 2026-07-28 tasks extension — round 2' do
   it 'maps -32602 on tasks/cancel and tasks/update to TaskNotFound' do
     client = client_for(stdio)
     script_stdio(stdio, [{ 'result' => discover_result },
-                         { 'error' => { 'code' => -32_602, 'message' => 'Invalid params' } },
-                         { 'error' => { 'code' => -32_602, 'message' => 'Invalid params' } }])
+                         { 'error' => { 'code' => -32_602, 'message' => 'No such task' } },
+                         { 'error' => { 'code' => -32_602, 'message' => 'No such task' } }])
 
     expect { client.cancel_task('gone') }.to raise_error(MCPClient::Errors::TaskNotFound)
     expect { client.update_task('gone', {}) }.to raise_error(MCPClient::Errors::TaskNotFound)
@@ -738,5 +742,166 @@ RSpec.describe 'MCP 2026-07-28 tasks extension — round 3' do
                          { 'result' => detailed_task(status: 'completed') }])
 
     expect { client.wait_for_task('task-1') }.to raise_error(MCPClient::Errors::InvalidResultError, /result/)
+  end
+end
+
+RSpec.describe 'MCP 2026-07-28 tasks extension — round 4' do
+  def discover_result
+    { 'resultType' => 'complete', 'supportedVersions' => ['2026-07-28'],
+      'capabilities' => { 'tools' => {}, 'extensions' => { TASKS_EXT => {} } } }
+  end
+
+  def task_result(status: 'working', id: 'task-1', poll_ms: 1, ttl_ms: 60_000, created_at: Time.now.utc.iso8601,
+                  **extra)
+    { 'resultType' => 'task', 'taskId' => id, 'status' => status, 'createdAt' => created_at,
+      'lastUpdatedAt' => created_at, 'ttlMs' => ttl_ms, 'pollIntervalMs' => poll_ms }.merge(extra)
+  end
+
+  def detailed_task(status:, id: 'task-1', poll_ms: 1, **extra)
+    now = Time.now.utc.iso8601
+    { 'resultType' => 'complete', 'taskId' => id, 'status' => status, 'createdAt' => now, 'lastUpdatedAt' => now,
+      'ttlMs' => 60_000, 'pollIntervalMs' => poll_ms }.merge(extra)
+  end
+
+  def tool_list(name = 'slow')
+    { 'result' => { 'tools' => [{ 'name' => name, 'inputSchema' => { 'type' => 'object' } }] } }
+  end
+
+  def call_result(text = 'done')
+    { 'content' => [{ 'type' => 'text', 'text' => text }], 'isError' => false }
+  end
+
+  def elicit_request
+    { 'method' => 'elicitation/create',
+      'params' => { 'mode' => 'form', 'message' => 'Name?',
+                    'requestedSchema' => { 'type' => 'object', 'properties' => { 'n' => { 'type' => 'string' } } } } }
+  end
+
+  def script_stdio(server, responses)
+    sent = []
+    allow(server).to receive(:connect).and_return(true)
+    allow(server).to receive(:start_reader)
+    allow(server).to receive(:start_stderr_reader)
+    server.instance_variable_set(:@stdin, double('stdin', puts: nil, flush: nil, closed?: true, close: nil))
+    allow(server).to receive(:send_request) { |req| sent << req }
+    allow(server).to receive(:wait_response) do |id, **_opts|
+      responder = responses.shift
+      raise 'no scripted response left' unless responder
+
+      response = responder.respond_to?(:call) ? responder.call(sent.last) : responder
+      response.merge('jsonrpc' => '2.0', 'id' => id)
+    end
+    sent
+  end
+
+  let(:output) { StringIO.new }
+  let(:stdio) { MCPClient::ServerStdio.new(command: 'echo test', read_timeout: 1) }
+
+  def client_for(server, **opts)
+    allow(MCPClient::ServerFactory).to receive(:create).and_return(server)
+    logger = Logger.new(output)
+    logger.level = Logger::INFO
+    client = MCPClient::Client.new(mcp_server_configs: [{ type: 'stdio', command: 'x' }], extensions: [TASKS_EXT],
+                                   logger: logger, **opts)
+    allow(client).to receive(:sleep)
+    client
+  end
+
+  it 'polls immediately after creation instead of trusting the seed for TTL or pacing' do
+    client = client_for(stdio)
+    script_stdio(stdio, [{ 'result' => discover_result }, tool_list,
+                         { 'result' => task_result(poll_ms: 180_000, ttl_ms: 1000, created_at: '2000-01-01T00:00:00Z') },
+                         { 'result' => detailed_task(status: 'completed', 'result' => call_result('quick')) }])
+
+    expect(client.call_tool('slow', {})['content'].first['text']).to eq('quick')
+    expect(client).not_to have_received(:sleep)
+  end
+
+  it 'confirms a cancelled seed with tasks/get' do
+    client = client_for(stdio)
+    script_stdio(stdio, [{ 'result' => discover_result }, tool_list, { 'result' => task_result(status: 'cancelled') },
+                         { 'result' => detailed_task(status: 'completed', 'result' => call_result('finished')) }])
+
+    expect(client.call_tool('slow', {})['content'].first['text']).to eq('finished')
+  end
+
+  it 'rejects a CreateTaskResult without a taskId' do
+    client = client_for(stdio)
+    script_stdio(stdio, [{ 'result' => discover_result }, tool_list,
+                         { 'result' => task_result.tap { |t| t.delete('taskId') } }])
+
+    expect { client.call_tool('slow', {}) }.to raise_error(MCPClient::Errors::InvalidResultError, /taskId/)
+  end
+
+  it 'refuses lifecycle requests for a locally completed task' do
+    client = client_for(stdio)
+    script_stdio(stdio, [{ 'result' => discover_result }, tool_list, { 'result' => call_result('sync') }])
+    local = client.call_tool_as_task('slow', {})
+
+    expect { client.get_task(local) }.to raise_error(MCPClient::Errors::TaskError, /locally/)
+    expect { client.cancel_task(local) }.to raise_error(MCPClient::Errors::TaskError, /locally/)
+    expect { client.update_task(local, {}) }.to raise_error(MCPClient::Errors::TaskError, /locally/)
+  end
+
+  it 'maps -32602 to TaskNotFound only when it is about the task, not about the params' do
+    client = client_for(stdio)
+    script_stdio(stdio, [{ 'result' => discover_result },
+                         { 'error' => { 'code' => -32_602,
+                                        'message' => 'Invalid params: inputResponses must be an object' } },
+                         { 'error' => { 'code' => -32_602, 'message' => 'Unknown task' } },
+                         { 'error' => { 'code' => -32_602, 'message' => 'Invalid params' } }])
+
+    expect { client.update_task('live', { 'k' => 'x' }) }.to raise_error(MCPClient::Errors::TaskError)
+    expect { client.update_task('gone', {}) }.to raise_error(MCPClient::Errors::TaskNotFound)
+    expect { client.get_task('gone') }.to raise_error(MCPClient::Errors::TaskNotFound)
+  end
+
+  it 'surfaces an initialization failure instead of a protocol-era error' do
+    client = client_for(stdio)
+    allow(stdio).to receive(:ping).and_raise(MCPClient::Errors::ConnectionError, 'server down')
+
+    expect { client.wait_for_task('task-1') }.to raise_error(MCPClient::Errors::ConnectionError, /server down/)
+    expect { client.update_task('task-1', {}) }.to raise_error(MCPClient::Errors::ConnectionError, /server down/)
+  end
+
+  it 'sanitizes peer-controlled tool names and task ids in logs and errors' do
+    client = client_for(stdio)
+    script_stdio(stdio, [{ 'result' => discover_result }, tool_list("slow\nWARN forged"),
+                         { 'result' => task_result(id: "task\nWARN forged-id") },
+                         { 'result' => detailed_task(status: 'cancelled', id: "task\nWARN forged-id") }])
+
+    expect { client.call_tool("slow\nWARN forged", {}) }.to raise_error(MCPClient::Errors::TaskError) { |e|
+      expect(e.message).not_to include("\nWARN forged")
+    }
+    expect(output.string).not_to include("\nWARN forged")
+  end
+
+  it 'bounds the number of input rounds a task may demand' do
+    client = client_for(stdio, elicitation_handler: ->(_m, _s) { { action: 'accept', content: { 'n' => 'x' } } })
+    responses = [{ 'result' => discover_result }, tool_list, { 'result' => task_result }]
+    30.times do |i|
+      responses << { 'result' => detailed_task(status: 'input_required',
+                                               'inputRequests' => { "k#{i}" => elicit_request }) }
+      responses << { 'result' => {} }
+    end
+    script_stdio(stdio, responses)
+
+    expect { client.call_tool('slow', {}) }.to raise_error(MCPClient::Errors::InputRequiredError, /round/)
+  end
+
+  it 'remembers answered input request keys across waits for the same task' do
+    client = client_for(stdio, elicitation_handler: ->(_m, _s) { { action: 'accept', content: { 'n' => 'x' } } })
+    sent = script_stdio(stdio, [{ 'result' => discover_result }, tool_list, { 'result' => task_result },
+                                { 'result' => detailed_task(status: 'input_required',
+                                                            'inputRequests' => { 'k1' => elicit_request }) },
+                                { 'result' => {} },
+                                { 'result' => detailed_task(status: 'input_required',
+                                                            'inputRequests' => { 'k1' => elicit_request }) },
+                                { 'result' => detailed_task(status: 'completed', 'result' => call_result) }])
+    task = client.call_tool_as_task('slow', {})
+
+    expect { client.wait_for_task(task, timeout: 0) }.to raise_error(MCPClient::Errors::TaskError, /timed out/i)
+    expect(client.wait_for_task(task)).to be_completed
+    expect(sent.count { |r| r['method'] == 'tasks/update' }).to eq(1)
   end
 end
