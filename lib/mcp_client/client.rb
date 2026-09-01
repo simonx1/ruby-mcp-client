@@ -333,6 +333,7 @@ module MCPClient
       # request _meta and route matching notifications/progress to the
       # caller's callback while the request is active.
       parameters, token = setup_progress_tracking(parameters, progress)
+      generation_before = tools_generation_of(server)
 
       result = begin
         server.call_tool(tool_name, parameters)
@@ -349,7 +350,8 @@ module MCPClient
       # The transport may have refreshed the tool list mid-call (MCP
       # 2026-07-28 HeaderMismatch recovery); validate against the definition
       # the call was actually answered under.
-      validate_structured_content!(refreshed_tool(tool) || tool, result)
+      tool = refreshed_tool(tool) || tool if tools_generation_of(server) != generation_before
+      validate_structured_content!(tool, result)
     end
 
     # Convert MCP tools to OpenAI function specifications
@@ -1114,16 +1116,21 @@ module MCPClient
       matching_tools.first
     end
 
-    # The current cached definition of a tool, when its transport refreshed
-    # the list since it was resolved; nil when unchanged or no longer listed.
+    # @param server [MCPClient::ServerBase] a transport
+    # @return [Integer, nil] its tool-list generation, when it tracks one
+    def tools_generation_of(server)
+      server.respond_to?(:tools_generation) ? server.tools_generation : nil
+    end
+
+    # The transport's current definition of a tool after it refreshed its
+    # list mid-call; nil when the tool is no longer listed.
     # @param tool [MCPClient::Tool] the tool as resolved before the call
     # @return [MCPClient::Tool, nil]
     def refreshed_tool(tool)
-      return nil unless tool.server && @tool_cache.empty?
-
-      list_tools.find { |t| t.name == tool.name && t.server == tool.server }
+      tool.server.list_tools.find { |t| t.name == tool.name }
     rescue MCPClient::Errors::MCPError => e
-      @logger.debug("Could not re-resolve tool '#{tool.name}' after a refresh: #{e.message}")
+      @logger.debug("Could not re-resolve tool #{sanitize_peer_log_text(tool.name.to_s)} after a refresh: " \
+                    "#{sanitize_peer_log_text(e.message)}")
       nil
     end
 

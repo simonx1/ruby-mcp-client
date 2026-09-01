@@ -231,13 +231,7 @@ module MCPClient
       begin
         ensure_connected
 
-        generation = @mutex.synchronize { tools_generation }
-        tools_data = request_tools_list
-        # MCP 2026-07-28: tools with invalid x-mcp-header annotations are
-        # excluded from the list on this transport.
-        tools_data = reject_invalid_header_tools(tools_data) if modern?
-        tools = tools_data.map { |tool_data| MCPClient::Tool.from_json(tool_data, server: self) }
-        store_tools(tools, generation)
+        fetch_tools_list
       rescue MCPClient::Errors::ConnectionError, MCPClient::Errors::TransportError, MCPClient::Errors::ServerError
         # Re-raise these errors directly
         raise
@@ -693,11 +687,13 @@ module MCPClient
       end
 
       # Follow nextCursor across pages so the full tool list is returned even
-      # when the server paginates.
+      # when the server paginates. A list invalidated while in flight is
+      # returned but not cached.
+      generation = @mutex.synchronize { tools_generation }
       tools = request_paginated_list('tools/list', 'tools')
 
-      @mutex.synchronize { @tools_data = tools }
-      @mutex.synchronize { @tools_data.dup }
+      @mutex.synchronize { @tools_data = tools if tools_generation == generation }
+      tools.dup
     end
 
     # Request the prompts list using JSON-RPC
