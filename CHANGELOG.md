@@ -5,6 +5,42 @@
 Groundwork for the 2026-07-28 protocol revision (stateless, per-request
 metadata). Each feature lands in its own PR; this section accumulates them.
 
+### Tasks extension (`io.modelcontextprotocol/tasks`)
+
+- **Opt-in extension.** `MCPClient::Client.new(extensions:
+  ['io.modelcontextprotocol/tasks'])` (or a `identifier => settings` Hash)
+  declares extensions in every request's `clientCapabilities`;
+  `Client#tasks_extension?` reports it. Transports accept `resultType
+  "task"` only once the extension is declared, only from a 2026-07-28
+  server, and only for `tools/call` — anywhere else it is an
+  `InvalidResultError`.
+- **Transparent tasks.** When a server answers `tools/call` with a
+  `CreateTaskResult`, `Client#call_tool` polls `tasks/get` at the server's
+  `pollIntervalMs` (capped at 60 s), answers `input_required` states
+  through `tasks/update` with the registered elicitation / sampling / roots
+  handlers (each `inputRequests` key answered once across polls), and
+  returns the final result — or raises the failed task's JSON-RPC error
+  (`ServerError` with its code) / `TaskError` for a cancelled task. The
+  `createdAt + ttlMs` backstop ends the wait with a `TaskError`.
+- **Task lifecycle API.** `call_tool_as_task` returns the `MCPClient::Task`
+  handle (a locally completed task when the server answered
+  synchronously); `get_task` returns the DetailedTask (`input_requests`,
+  `result`, `error`); `wait_for_task(task, timeout:)` waits for a terminal
+  task; `update_task(task, input_responses)` sends `tasks/update`;
+  `cancel_task` sends `tasks/cancel` (an acknowledgement — cancellation is
+  eventually consistent); `get_task_result` waits and returns the result.
+  `list_tasks` raises on a 2026-07-28 server (`tasks/list` was removed).
+  `MCPClient::Task` gained `ttl_ms`, `poll_interval_ms`, `completed?`,
+  `failed?`, `cancelled?`, `remote?` and `ttl_elapsed?`.
+- **Gates and errors.** Task requests require both the client declaration
+  and the server's `capabilities.extensions` entry (`CapabilityError`
+  otherwise); `-32602` on `tasks/get` maps to `TaskNotFound`, `-32021`
+  propagates as `MissingRequiredClientCapabilityError`. Task notifications
+  (`notifications/tasks`, via `listen(notifications: { task_ids: [...] })`)
+  reach the client's notification listeners; requesting them without the
+  extension is a `CapabilityError`. On Streamable HTTP, `tasks/get`,
+  `tasks/update` and `tasks/cancel` carry `Mcp-Name: <taskId>`.
+
 ### Cacheable results (`ttlMs` / `cacheScope`)
 
 - **A result is bound to its own exchange, not to a request the response phase

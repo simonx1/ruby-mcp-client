@@ -670,6 +670,21 @@ module MCPClient
     # the others were introduced with the discriminator itself.
     LEGACY_RESULT_TYPES = %w[complete].freeze
 
+    # The MCP 2026-07-28 tasks extension (extensions/tasks): once declared in
+    # the per-request clientCapabilities, a server MAY answer a supported
+    # request with a CreateTaskResult (resultType "task").
+    TASKS_EXTENSION = 'io.modelcontextprotocol/tasks'
+
+    # Requests the tasks extension allows a CreateTaskResult for. "A client
+    # that receives CreateTaskResult in response to an unsupported request
+    # type MUST interpret this as an invalid response".
+    TASK_METHODS = %w[tools/call].freeze
+
+    # @return [Boolean] whether the host declared the tasks extension
+    def tasks_extension_declared?
+      declared_extensions.key?(TASKS_EXTENSION)
+    end
+
     # The resultType of a result object. MCP 2026-07-28 makes the field
     # required, but "for backward compatibility with servers implementing
     # earlier protocol versions, which do not include resultType, clients
@@ -689,11 +704,14 @@ module MCPClient
     # that negotiated a result-type-adding extension.
     # @return [Array<String>]
     def accepted_result_types
-      # input_required names the multi round-trip pattern, which exists only
-      # in modern revisions: a handshake-era server answering with it is
-      # malformed, and treating it as valid would let a wrapper flatten an
-      # unfinished result into an empty successful one.
-      modern? ? CORE_RESULT_TYPES : LEGACY_RESULT_TYPES
+      # input_required (multi round-trip requests) exists only in modern
+      # revisions; a legacy server answering with it is malformed. "task" is
+      # only ever valid once this client declared the tasks extension: "A
+      # server MUST NOT return CreateTaskResult to a client that did not
+      # include the extension capability on its request".
+      return LEGACY_RESULT_TYPES unless modern?
+
+      tasks_extension_declared? ? CORE_RESULT_TYPES + ['task'] : CORE_RESULT_TYPES
     end
 
     # Build the error for a 4xx response: the typed JSON-RPC error when the
@@ -917,7 +935,23 @@ module MCPClient
         result = yield(retry_params)
       end
       mark_round_trip_result(round_trips.positive?)
+      reject_task_result_on_unsupported_method!(method, result)
       result
+    end
+
+    # A CreateTaskResult is only a valid answer to the request types the
+    # tasks extension covers (TASK_METHODS); anywhere else it is an invalid
+    # response (extensions/tasks "Capability Negotiation").
+    # @param method [String] the JSON-RPC method
+    # @param result [Object] the final result
+    # @return [void]
+    # @raise [MCPClient::Errors::InvalidResultError]
+    def reject_task_result_on_unsupported_method!(method, result)
+      return unless MCPClient::JsonRpcCommon.result_type(result) == 'task'
+      return if TASK_METHODS.include?(method)
+
+      raise MCPClient::Errors::InvalidResultError,
+            "Invalid result: resultType \"task\" is only valid for #{TASK_METHODS.join(', ')}, not #{method}"
     end
 
     # The params for a multi round-trip retry: the original params plus the

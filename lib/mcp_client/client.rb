@@ -10,6 +10,7 @@ module MCPClient
   # This is the main entry point for using MCP tools
   class Client
     include ListAggregation
+    include MCPClient::Client::TaskSupport
 
     # Elicitation modes implemented by this client (MCP 2025-11-25).
     # Requests with a mode outside this set are rejected with -32602.
@@ -71,15 +72,19 @@ module MCPClient
     #   (a Hash, or a callable returning one, evaluated per request) — e.g. OpenTelemetry
     #   trace context (`traceparent`, `tracestate`, `baggage`, MCP 2026-07-28) or
     #   vendor-prefixed keys. Reserved protocol keys cannot be set this way.
+    # @param extensions [Array<String>, Hash{String => Hash}, nil] MCP 2026-07-28 extensions to declare
+    #   in every request's clientCapabilities (identifier, or identifier => settings), e.g.
+    #   `['io.modelcontextprotocol/tasks']` to let servers answer tools/call with a task
     def initialize(mcp_server_configs: [], logger: nil, elicitation_handler: nil, roots: nil, sampling_handler: nil,
                    sampling_supports_tools: false, client_info: nil, validate_structured_content: :warn,
-                   request_meta: nil)
+                   request_meta: nil, extensions: nil)
       unless STRUCTURED_CONTENT_MODES.include?(validate_structured_content)
         raise ArgumentError, "validate_structured_content must be one of #{STRUCTURED_CONTENT_MODES.inspect}, " \
                              "got #{validate_structured_content.inspect}"
       end
 
       @validate_structured_content = validate_structured_content
+      @extensions = normalize_extensions(extensions)
       # Preserve a caller-supplied logger's formatter (only tag progname), and
       # install the default formatter solely on a logger we create ourselves.
       # Overwriting the formatter of an application's logger would silently
@@ -314,6 +319,11 @@ module MCPClient
           # registration filters out stale post-completion notifications.
           unregister_progress_callback(token) if token
         end
+
+        # MCP 2026-07-28 tasks extension: the server may have turned the call
+        # into a task; drive it to its final result so the contract of this
+        # method does not change.
+        result = complete_task_result(tool_name, server, result)
 
         # MCP 2026-07-28 HeaderMismatch recovery re-derives a call's
         # Mcp-Param-* headers from a refreshed tools/list, so the attempt that
@@ -550,6 +560,7 @@ module MCPClient
 
       srv = tool.server
       raise MCPClient::Errors::ServerNotFound, "No server found for tool '#{tool_name}'" unless srv
+      return call_tool_as_modern_task(tool_name, parameters, srv) if modern_server?(srv)
 
       unless server_supports_task_tool_call?(srv)
         raise MCPClient::Errors::TaskError,
@@ -590,12 +601,15 @@ module MCPClient
     def get_task(task_id, server: nil)
       srv = select_task_server(task_id, server, 'get_task')
       task_id = task_identifier(task_id)
+      ensure_task_capability!(srv, 'get')
 
       begin
         result = srv.rpc_request('tasks/get', { taskId: task_id })
         MCPClient::Task.from_json(result, server: srv)
       rescue MCPClient::Errors::ServerError => e
-        raise task_error_from(e, task_id, 'getting')
+        raise if e.protocol_error?
+
+        raise task_error_from(e, task_id, 'getting', modern: modern_server?(srv))
       rescue MCPClient::Errors::TransportError, MCPClient::Errors::ConnectionError => e
         raise MCPClient::Errors::TaskError, "Error getting task '#{task_id}': #{e.message}"
       end
@@ -620,11 +634,18 @@ module MCPClient
     # @raise [MCPClient::Errors::TaskError] if retrieval fails
     def get_task_result(task_id, server: nil)
       srv = select_task_server(task_id, server, 'get_task_result')
+      ensure_task_capability!(srv, 'result')
+      # MCP 2026-07-28 removed tasks/result: the result is delivered inline
+      # by tasks/get once the task is terminal.
+      return task_outcome(wait_for_task(task_id, server: srv)) if modern_server?(srv)
+
       task_id = task_identifier(task_id)
 
       begin
         srv.rpc_request('tasks/result', { taskId: task_id })
       rescue MCPClient::Errors::ServerError => e
+        raise if e.protocol_error?
+
         raise task_error_from(e, task_id, 'getting result for')
       rescue MCPClient::Errors::TransportError, MCPClient::Errors::ConnectionError => e
         raise MCPClient::Errors::TaskError, "Error getting result for task '#{task_id}': #{e.message}"
@@ -639,6 +660,10 @@ module MCPClient
     def list_tasks(cursor: nil, server: nil)
       srv = select_server(server)
       ensure_task_capability!(srv, 'list')
+      if modern_server?(srv)
+        raise MCPClient::Errors::TaskError,
+              'tasks/list does not exist on MCP 2026-07-28 servers: keep the Task handles you created'
+      end
 
       params = cursor ? { cursor: cursor } : {}
 
@@ -662,13 +687,17 @@ module MCPClient
     # @raise [MCPClient::Errors::TaskError] if cancellation fails (including cancelling a terminal task)
     def cancel_task(task_id, server: nil)
       srv = select_task_server(task_id, server, 'cancel_task')
+      task = task_id
       task_id = task_identifier(task_id)
       ensure_task_capability!(srv, 'cancel')
 
       begin
         result = srv.rpc_request('tasks/cancel', { taskId: task_id })
+        return cancelled_task_handle(task, task_id, srv) if modern_server?(srv)
+
         MCPClient::Task.from_json(result, server: srv)
       rescue MCPClient::Errors::ServerError => e
+        raise if e.protocol_error?
         # A terminal task cannot be cancelled (-32602); that is an error, not a
         # missing task, so keep it as a TaskError.
         if e.message.match?(/terminal/i)
@@ -696,6 +725,13 @@ module MCPClient
     # @return [MCPClient::Subscription]
     # @raise [MCPClient::Errors::CapabilityError] if the server is not a 2026-07-28 server
     def listen(notifications:, server: nil, ack_timeout: nil, &listener)
+      filter = MCPClient::Subscription.normalize_filter(notifications)
+      if filter.key?('taskIds') && !tasks_extension?
+        raise MCPClient::Errors::CapabilityError,
+              'Task notifications (taskIds) require the tasks extension: pass ' \
+              "extensions: ['#{MCPClient::JsonRpcCommon::TASKS_EXTENSION}'] to MCPClient::Client.new"
+      end
+
       select_server(server).listen(notifications: notifications, ack_timeout: ack_timeout, &listener)
     end
 
@@ -733,6 +769,28 @@ module MCPClient
       # legacy servers, per-request _meta on modern ones)
       server.client_info = client_info if client_info && server.respond_to?(:client_info=)
       server.request_meta = request_meta if request_meta && server.respond_to?(:request_meta=)
+      return if @extensions.empty? || !server.respond_to?(:declare_extension)
+
+      @extensions.each { |identifier, settings| server.declare_extension(identifier, settings) }
+    end
+
+    # @param extensions [Array, Hash, nil] the extensions option
+    # @return [Hash{String => Hash}] identifier => settings
+    def normalize_extensions(extensions)
+      case extensions
+      when nil then {}
+      when Hash then extensions.to_h { |identifier, settings| [identifier.to_s, settings || {}] }
+      when Array then extensions.to_h { |identifier| [identifier.to_s, {}] }
+      else
+        raise ArgumentError, 'extensions must be an Array of identifiers or a Hash of identifier => settings, ' \
+                             "got #{extensions.class}"
+      end
+    end
+
+    # @param srv [MCPClient::ServerBase]
+    # @return [Boolean] whether the server negotiated an MCP 2026-07-28 revision
+    def modern_server?(srv)
+      srv.respond_to?(:modern?) && srv.modern?
     end
 
     # Whether every server's cached list of a kind is still fresh (MCP
@@ -929,6 +987,11 @@ module MCPClient
         end
       end
 
+      # MCP 2026-07-28: tasks are the io.modelcontextprotocol/tasks extension.
+      return ensure_tasks_extension!(srv) if modern_server?(srv)
+      # Legacy tasks/get and tasks/result need only the tasks capability the
+      # request itself is gated on server-side.
+      return unless %w[list cancel].include?(operation)
       return if !capabilities_known?(srv) || srv.capability?('tasks', operation)
 
       raise MCPClient::Errors::CapabilityError,
@@ -1059,8 +1122,10 @@ module MCPClient
       when 'notifications/message'
         # MCP 2025-06-18: Handle logging messages from server
         handle_log_message(server_id, params)
-      when 'notifications/tasks/status'
-        # MCP 2025-11-25: task status update (params are a flat Task)
+      when 'notifications/tasks/status', 'notifications/tasks'
+        # MCP 2025-11-25: task status update (params are a flat Task);
+        # MCP 2026-07-28 tasks extension: notifications/tasks carries a
+        # DetailedTask (only ever on a subscriptions/listen stream).
         handle_task_status_notification(server_id, params)
       when 'notifications/subscriptions/acknowledged'
         # MCP 2026-07-28: the transport already recorded the acknowledged
@@ -1433,7 +1498,11 @@ module MCPClient
       # Tasks Tool-Level Negotiation rule 1: without tasks.requests.tools.call
       # in the server capabilities, taskSupport is disregarded entirely and
       # the tool is invoked as a plain call.
-      return unless tool.task_required? && server_supports_task_tool_call?(tool.server)
+      return unless tool.task_required?
+      # MCP 2026-07-28: the server alone decides whether a call becomes a
+      # task, and Client#call_tool drives that task to its result.
+      return if modern_server?(tool.server)
+      return unless server_supports_task_tool_call?(tool.server)
 
       raise MCPClient::Errors::ToolCallError,
             "Tool '#{tool_name}' requires task-augmented execution; call it with call_tool_as_task instead"
@@ -1444,6 +1513,8 @@ module MCPClient
     # @param srv [MCPClient::ServerBase] the server
     # @return [Boolean]
     def server_supports_task_tool_call?(srv)
+      return srv.capability?('extensions', MCPClient::JsonRpcCommon::TASKS_EXTENSION) if modern_server?(srv)
+
       caps = srv.respond_to?(:capabilities) ? srv.capabilities : nil
       return false unless caps.is_a?(Hash)
 
@@ -1459,10 +1530,11 @@ module MCPClient
     # @param task_id [String] the task id
     # @param action [String] a verb phrase for the error message (e.g. 'getting')
     # @return [MCPClient::Errors::TaskNotFound, MCPClient::Errors::TaskError]
-    def task_error_from(error, task_id, action)
-      if error.message.match?(/not found|unknown task|expired/i)
-        return MCPClient::Errors::TaskNotFound.new("Task '#{task_id}' not found")
-      end
+    # @param modern [Boolean] MCP 2026-07-28: an invalid/nonexistent taskId is -32602
+    def task_error_from(error, task_id, action, modern: false)
+      not_found = error.message.match?(/not found|unknown task|expired/i) ||
+                  (modern && error.respond_to?(:code) && error.code == MCPClient::Errors::Codes::INVALID_PARAMS)
+      return MCPClient::Errors::TaskNotFound.new("Task '#{task_id}' not found") if not_found
 
       MCPClient::Errors::TaskError.new("Error #{action} task '#{task_id}': #{error.message}")
     end
@@ -1474,7 +1546,7 @@ module MCPClient
     # @return [void]
     def handle_task_status_notification(server_id, params)
       task = MCPClient::Task.from_json(params)
-      logger.info("[#{server_id}] Task #{task.task_id} status: #{task.status}")
+      logger.info("[#{server_id}] Task #{sanitize_peer_log_text(task.task_id.to_s)} status: #{task.status}")
     rescue StandardError => e
       logger.debug("[#{server_id}] Failed to parse task status notification: #{e.message}")
     end
