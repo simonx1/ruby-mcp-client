@@ -186,6 +186,26 @@ module MCPClient
       end
     end
 
+    # Open a long-lived notification stream (MCP 2026-07-28 subscriptions/listen).
+    # @param notifications [Hash] the SubscriptionFilter (tools_list_changed,
+    #   prompts_list_changed, resources_list_changed, resource_subscriptions,
+    #   task_ids — snake_case or camelCase)
+    # @yield [method, params] notifications delivered on the subscription
+    # @return [MCPClient::Subscription]
+    def listen(notifications:, &listener)
+      raise NotImplementedError, 'Subclasses must implement listen'
+    end
+
+    # Cancel a subscription opened with {#listen}.
+    # @param subscription [MCPClient::Subscription]
+    # @return [void]
+    def cancel_subscription(subscription)
+      raise NotImplementedError, 'Subclasses must implement cancel_subscription'
+    end
+
+    # @return [Logger] the transport logger
+    attr_reader :logger
+
     # Ping the MCP server to check connectivity (zero-parameter heartbeat call)
     # @return [Object] result from the ping request
     def ping

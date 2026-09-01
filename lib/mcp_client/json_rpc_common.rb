@@ -7,6 +7,7 @@ require_relative 'header_params'
 require_relative 'json_rpc_common/envelopes'
 require_relative 'json_rpc_common/error_bodies'
 require_relative 'json_rpc_common/input_waits'
+require_relative 'subscription_support'
 
 module MCPClient
   # Shared retry/backoff logic for JSON-RPC transports
@@ -14,6 +15,7 @@ module MCPClient
     include Envelopes
     include ErrorBodies
     include InputWaits
+    include SubscriptionSupport
 
     # JSON-RPC methods with arbitrary side effects that MUST NOT be re-sent
     # automatically. Even a "transient" failure (5xx, dropped connection,
