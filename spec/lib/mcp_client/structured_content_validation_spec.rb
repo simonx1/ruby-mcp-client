@@ -174,9 +174,9 @@ RSpec.describe MCPClient::SchemaValidator do
     end
 
     it 'detects every keyword in the unsupported list' do
-      keywords = %w[$dynamicRef
-                    additionalProperties patternProperties propertyNames dependentSchemas
-                    prefixItems contains minContains maxContains uniqueItems
+      keywords = %w[$dynamicRef $recursiveRef
+                    additionalProperties patternProperties propertyNames dependentSchemas dependencies
+                    additionalItems contains minContains maxContains uniqueItems
                     multipleOf format dependentRequired minProperties maxProperties
                     unevaluatedProperties unevaluatedItems]
       expect(described_class::UNSUPPORTED_KEYWORDS).to match_array(keywords)
@@ -192,12 +192,12 @@ RSpec.describe MCPClient::SchemaValidator do
           'email' => { 'type' => 'string', 'format' => 'email' },
           'count' => { 'type' => 'integer', 'multipleOf' => 5 },
           'tags' => { 'type' => 'array', 'uniqueItems' => true, 'contains' => { 'type' => 'string' } },
-          'pair' => { 'type' => 'array', 'prefixItems' => [{ 'type' => 'string' }] },
+          'pair' => { 'type' => 'array', 'items' => [{ 'type' => 'string' }], 'additionalItems' => false },
           'names' => { 'type' => 'object', 'propertyNames' => { 'pattern' => '^a' } }
         }
       }
       expect(described_class.unsupported_keywords(schema)).to contain_exactly(
-        'format', 'multipleOf', 'uniqueItems', 'contains', 'prefixItems', 'propertyNames'
+        'format', 'multipleOf', 'uniqueItems', 'contains', 'additionalItems', 'propertyNames'
       )
     end
 

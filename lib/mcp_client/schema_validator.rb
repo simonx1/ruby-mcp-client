@@ -12,64 +12,74 @@ module MCPClient
   # Supported keywords:
   # - type (single value or array of values), enum, const
   # - properties, required (objects)
-  # - items, minItems, maxItems (arrays)
+  # - items, prefixItems (2020-12) / tuple-form items (draft-07, 2019-09),
+  #   minItems, maxItems (arrays)
   # - minLength, maxLength, pattern (strings)
   # - minimum, maximum, exclusiveMinimum, exclusiveMaximum (numbers)
   # - allOf, anyOf, oneOf, not, if/then/else (composition)
   # - $ref to a location inside the same schema document (`#`, `#/$defs/x`,
-  #   `#/definitions/x`, any JSON pointer), with $defs / definitions
-  # - boolean schemas (true / false)
+  #   `#/definitions/x`, any JSON pointer), with $defs / definitions; under
+  #   draft-07 a $ref replaces its siblings, under 2019-09 and 2020-12 it
+  #   applies alongside them
+  # - boolean schemas (true / false), at the root or as subschemas
   #
   # MCP 2026-07-28 rules honoured here:
   # - a schema without `$schema` is 2020-12; the dialects in
   #   SUPPORTED_DIALECTS are accepted and any other declared dialect is an
   #   error (not a permissive pass);
-  # - `$ref` values that do not point inside the document (network URIs,
-  #   relative documents, urn:, file:) are never dereferenced, and a schema
-  #   carrying one is rejected rather than treated as permissive;
+  # - `$ref` (and `$dynamicRef`) values that do not point inside the document
+  #   (network URIs, relative documents, urn:, file:) are never dereferenced,
+  #   and a schema carrying one is rejected rather than treated as permissive;
   # - resource bounds: schema nesting depth, total subschema count, `$ref`
-  #   chain length and a per-validation time budget.
+  #   chain length, number of nodes visited, number of errors produced and a
+  #   per-validation time budget. Hitting a bound aborts the validation with
+  #   one error: an aborted validation never reads as a pass.
   #
-  # The rest of the 2020-12 vocabulary (additionalProperties, format
-  # assertions, unevaluated*, ...) is out of scope: unrecognized keywords are
-  # ignored rather than misapplied, so validation is best-effort — it may
-  # accept data a full validator would reject, but it does not reject data
-  # that conforms to the schema. So that this gap is never silent,
-  # {.unsupported_keywords} reports which unapplied validation keywords a
-  # schema uses; callers surface them as a warning.
+  # The rest of the vocabulary (additionalProperties, format assertions,
+  # unevaluated*, additionalItems, dependencies, ...) is out of scope:
+  # unrecognized keywords are ignored rather than misapplied, so validation is
+  # best-effort — it may accept data a full validator would reject, but it
+  # does not reject data that conforms to the schema. So that this gap is
+  # never silent, {.unsupported_keywords} reports which unapplied validation
+  # keywords a schema uses; callers surface them as a warning.
   module SchemaValidator
+    # Raised inside a validation to abandon it (time budget, resource bound).
+    class Aborted < StandardError; end
+
     # The default dialect (basic "JSON Schema Usage": "When a schema does not
     # include a $schema field, it defaults to JSON Schema 2020-12").
     DEFAULT_DIALECT = 'https://json-schema.org/draft/2020-12/schema'
+    DRAFT_2019_09 = 'https://json-schema.org/draft/2019-09/schema'
+    DRAFT_07 = 'http://json-schema.org/draft-07/schema'
 
-    # Dialects this validator accepts: the keywords it evaluates have the
-    # same meaning in all three. Any other declared dialect is reported as
-    # unsupported ("MUST handle unsupported dialects gracefully by returning
-    # an appropriate error indicating the dialect is not supported").
-    SUPPORTED_DIALECTS = [
-      DEFAULT_DIALECT,
-      'https://json-schema.org/draft/2019-09/schema',
-      'http://json-schema.org/draft-07/schema'
-    ].freeze
+    # Dialects this validator accepts. Any other declared dialect is
+    # reported as unsupported ("MUST handle unsupported dialects gracefully
+    # by returning an appropriate error indicating the dialect is not
+    # supported").
+    SUPPORTED_DIALECTS = [DEFAULT_DIALECT, DRAFT_2019_09, DRAFT_07].freeze
 
     # Resource bounds ("Composition-Keyword Resource Use": implementations
     # SHOULD apply a maximum schema depth, a cap on the total number of
     # subschemas, or a per-validation time budget). A schema comes from the
-    # remote server, so all three apply.
+    # remote server, so all of them apply.
     MAX_SCHEMA_DEPTH = 64
     MAX_SUBSCHEMAS = 2000
     MAX_REF_DEPTH = 32
+    MAX_NODE_VISITS = 100_000
+    MAX_ERRORS = 100
+    MAX_VALUE_INSPECT = 64
 
-    # JSON Schema 2020-12 keywords that affect validation but that this
-    # validator does not evaluate: assertion keywords (multipleOf,
-    # uniqueItems, contains bounds, property-count bounds, dependentRequired),
-    # the remaining applicators, and format (asserted by full validators in
-    # format-assertion mode). Their presence means validation is partial:
-    # data may pass here that a full validator would reject.
+    # JSON Schema keywords that affect validation but that this validator
+    # does not evaluate: assertion keywords (multipleOf, uniqueItems,
+    # contains bounds, property-count bounds, dependentRequired), the
+    # remaining applicators, draft-specific keywords, and format (asserted by
+    # full validators in format-assertion mode). Their presence means
+    # validation is partial: data may pass here that a full validator would
+    # reject.
     UNSUPPORTED_KEYWORDS = %w[
-      $dynamicRef
-      additionalProperties patternProperties propertyNames dependentSchemas
-      prefixItems contains minContains maxContains uniqueItems
+      $dynamicRef $recursiveRef
+      additionalProperties patternProperties propertyNames dependentSchemas dependencies
+      additionalItems contains minContains maxContains uniqueItems
       multipleOf format dependentRequired minProperties maxProperties
       unevaluatedProperties unevaluatedItems
     ].freeze
@@ -88,21 +98,24 @@ module MCPClient
     # still makes progress rather than failing every remaining pattern.
     MIN_PATTERN_MATCH_TIMEOUT = 0.01
 
-    # Keywords whose value is a single subschema to walk.
+    # Keywords whose value is a single subschema to walk (or, for `items`,
+    # an array of positional subschemas in draft-07 / 2019-09).
     SUBSCHEMA_KEYWORDS = %w[
-      items contains additionalProperties propertyNames not if then else
+      items contains additionalProperties additionalItems propertyNames not if then else
       unevaluatedItems unevaluatedProperties
     ].freeze
 
     # Keywords whose value is a map of name => subschema.
-    SUBSCHEMA_MAP_KEYWORDS = %w[properties patternProperties $defs definitions dependentSchemas].freeze
+    SUBSCHEMA_MAP_KEYWORDS = %w[properties patternProperties $defs definitions dependentSchemas dependencies].freeze
 
     # Keywords whose value is an array of subschemas.
     SUBSCHEMA_ARRAY_KEYWORDS = %w[allOf anyOf oneOf prefixItems].freeze
 
-    # Per-validation state: the root document ($ref targets), the deadline
-    # and the number of $ref hops taken on the current path.
-    Context = Struct.new(:root, :deadline, keyword_init: true)
+    # Keywords whose value is data, not schema: never walked, never re-keyed.
+    DATA_KEYWORDS = %w[enum const default examples].freeze
+
+    # Per-validation state.
+    Context = Struct.new(:root, :deadline, :dialect, :visits, :errors, keyword_init: true)
 
     # The dialect a schema declares, or the default.
     # @param schema [Object] the schema
@@ -116,29 +129,37 @@ module MCPClient
       declared.sub(/#\z/, '')
     end
 
-    # Whether a declared dialect is one this validator evaluates. The
-    # scheme is not significant (both http and https forms circulate).
+    # The supported dialect a declared URI stands for (scheme-insensitive),
+    # or nil.
+    # @param uri [String]
+    # @return [String, nil]
+    def self.canonical_dialect(uri)
+      canonical = uri.sub(/#\z/, '').sub(%r{\Ahttps?://}, '')
+      SUPPORTED_DIALECTS.find { |d| d.sub(%r{\Ahttps?://}, '') == canonical }
+    end
+
     # @param uri [String]
     # @return [Boolean]
     def self.supported_dialect?(uri)
-      canonical = uri.sub(/#\z/, '').sub(%r{\Ahttps?://}, '')
-      SUPPORTED_DIALECTS.any? { |d| d.sub(%r{\Ahttps?://}, '') == canonical }
+      !canonical_dialect(uri).nil?
     end
 
-    # Check that a schema can be used at all: it is an object, its dialect
-    # is supported, it stays within the resource bounds, and every `$ref`
-    # resolves inside the document (a network or otherwise external `$ref`
-    # is never dereferenced and makes the schema unusable rather than
-    # permissive).
+    # Check that a schema can be used at all: it is an object or a boolean,
+    # its dialect is supported, it stays within the resource bounds, and
+    # every `$ref` resolves inside the document to a schema (a network or
+    # otherwise external reference is never dereferenced and makes the
+    # schema unusable rather than permissive).
     # @param schema [Object] the schema (string or symbol keys)
     # @return [Array<String>] problems (empty when the schema is usable)
     def self.check_schema(schema)
-      return ["schema must be an object, got #{json_type(schema)}"] unless schema.is_a?(Hash)
+      return [] if [true, false].include?(schema)
+      return ["schema must be an object or a boolean, got #{json_type(schema)}"] unless schema.is_a?(Hash)
 
       root = deep_stringify(schema)
       declared = dialect(root)
       unless supported_dialect?(declared)
-        return ["schema dialect #{declared.inspect} is not supported (supported: #{SUPPORTED_DIALECTS.join(', ')})"]
+        return ["schema dialect #{clip(declared.inspect)} is not supported " \
+                "(supported: #{SUPPORTED_DIALECTS.join(', ')})"]
       end
 
       problems = []
@@ -149,27 +170,38 @@ module MCPClient
     # Walk every subschema position, checking bounds and references.
     # @return [void]
     def self.walk_schema(schema, root, depth, counter, problems)
-      return unless schema.is_a?(Hash)
       return unless problems.empty?
+      return unless schema_value?(schema)
 
-      if depth > MAX_SCHEMA_DEPTH
-        problems << "schema nesting depth exceeds #{MAX_SCHEMA_DEPTH}"
-        return
-      end
       counter[:count] += 1
       if counter[:count] > MAX_SUBSCHEMAS
         problems << "schema has more than #{MAX_SUBSCHEMAS} subschemas"
         return
       end
+      return unless schema.is_a?(Hash)
+
+      if depth > MAX_SCHEMA_DEPTH
+        problems << "schema nesting depth exceeds #{MAX_SCHEMA_DEPTH}"
+        return
+      end
 
       check_ref(schema['$ref'], root, problems) if schema.key?('$ref')
+      check_dynamic_ref(schema['$dynamicRef'], problems) if schema.key?('$dynamicRef')
+      each_subschema(schema) { |sub| walk_schema(sub, root, depth + 1, counter, problems) }
+    end
+
+    # Yield every subschema directly under a schema object.
+    # @return [void]
+    def self.each_subschema(schema, &block)
       schema.each do |keyword, value|
+        next if DATA_KEYWORDS.include?(keyword)
+
         if SUBSCHEMA_KEYWORDS.include?(keyword)
-          walk_schema(value, root, depth + 1, counter, problems)
+          value.is_a?(Array) ? value.each(&block) : yield(value)
         elsif SUBSCHEMA_MAP_KEYWORDS.include?(keyword) && value.is_a?(Hash)
-          value.each_value { |subschema| walk_schema(subschema, root, depth + 1, counter, problems) }
+          value.each_value(&block)
         elsif SUBSCHEMA_ARRAY_KEYWORDS.include?(keyword) && value.is_a?(Array)
-          value.each { |subschema| walk_schema(subschema, root, depth + 1, counter, problems) }
+          value.each(&block)
         end
       end
     end
@@ -181,11 +213,51 @@ module MCPClient
         return
       end
       if external_ref?(ref)
-        problems << "external $ref #{ref.inspect} is not dereferenced (only references inside the schema " \
+        problems << "external $ref #{clip(ref.inspect)} is not dereferenced (only references inside the schema " \
                     'document are resolved; network $ref resolution is disabled)'
-      elsif resolve_pointer(root, ref).equal?(UNRESOLVED)
-        problems << "unresolvable local $ref #{ref.inspect}"
+        return
       end
+
+      problem = ref_chain_problem(ref, root)
+      problems << problem if problem
+    end
+
+    # A `$dynamicRef` is not evaluated, but one pointing outside the document
+    # would need a fetch, which never happens: the schema is unusable.
+    # @return [void]
+    def self.check_dynamic_ref(ref, problems)
+      return unless ref.is_a?(String) && external_ref?(ref)
+
+      problems << "external $dynamicRef #{clip(ref.inspect)} is not dereferenced"
+    end
+
+    # Follow a local reference (and the references it leads to) at
+    # preflight: every hop must resolve to a schema, the chain must not
+    # cycle, and it must stay within MAX_REF_DEPTH.
+    # @return [String, nil] the problem, if any
+    def self.ref_chain_problem(ref, root)
+      seen = []
+      current = ref
+      loop do
+        return "$ref chain #{clip(ref.inspect)} cycles" if seen.include?(current)
+        return "$ref chain #{clip(ref.inspect)} exceeds #{MAX_REF_DEPTH} hops" if seen.size >= MAX_REF_DEPTH
+
+        seen << current
+        target = resolve_pointer(root, current)
+        return "unresolvable local $ref #{clip(current.inspect)}" if target.equal?(UNRESOLVED)
+        return "$ref #{clip(current.inspect)} does not point at a schema" unless schema_value?(target)
+        return nil unless target.is_a?(Hash) && target.key?('$ref')
+
+        current = target['$ref']
+        return "$ref must be a string, got #{json_type(current)}" unless current.is_a?(String)
+        return "external $ref #{clip(current.inspect)} is not dereferenced" if external_ref?(current)
+      end
+    end
+
+    # @param value [Object]
+    # @return [Boolean] whether the value is a schema (object or boolean)
+    def self.schema_value?(value)
+      value.is_a?(Hash) || value == true || value == false
     end
 
     # A reference that does not point inside this document: an absolute URI
@@ -202,13 +274,13 @@ module MCPClient
     UNRESOLVED = Object.new.freeze
 
     # Resolve a fragment JSON pointer (`#`, `#/$defs/x`, `#/a~1b`, with
-    # percent-encoding) within the root document.
+    # percent-encoding per RFC 6901 Section 6) within the root document.
     # @param root [Hash] the root schema (string keys)
     # @param ref [String] the `$ref` value
     # @return [Object] the referenced value, or UNRESOLVED
     def self.resolve_pointer(root, ref)
       fragment = ref.delete_prefix('#')
-      fragment = URI.decode_www_form_component(fragment) rescue fragment # rubocop:disable Style/RescueModifier
+      fragment = URI.decode_uri_component(fragment) rescue fragment # rubocop:disable Style/RescueModifier
       return root if fragment.empty?
       return UNRESOLVED unless fragment.start_with?('/')
 
@@ -220,7 +292,7 @@ module MCPClient
 
           node[key]
         when Array
-          return UNRESOLVED unless key.match?(/\A\d+\z/) && key.to_i < node.length
+          return UNRESOLVED unless key.match?(/\A(0|[1-9]\d*)\z/) && key.to_i < node.length
 
           node[key.to_i]
         else
@@ -237,7 +309,7 @@ module MCPClient
     # @return [Array<String>] unique unsupported keywords, in discovery order
     def self.unsupported_keywords(schema)
       found = []
-      collect_unsupported_keywords(schema, found)
+      collect_unsupported_keywords(schema, found, 0)
       found.uniq
     end
 
@@ -245,27 +317,20 @@ module MCPClient
     # @param schema [Object] a (sub)schema; non-Hash values are ignored
     # @param found [Array<String>] accumulator
     # @return [void]
-    def self.collect_unsupported_keywords(schema, found)
-      return unless schema.is_a?(Hash)
+    def self.collect_unsupported_keywords(schema, found, depth)
+      return unless schema.is_a?(Hash) && depth <= MAX_SCHEMA_DEPTH
 
       schema = schema.transform_keys(&:to_s)
       found.concat(schema.keys & UNSUPPORTED_KEYWORDS)
-      schema.each do |keyword, value|
-        if SUBSCHEMA_KEYWORDS.include?(keyword)
-          collect_unsupported_keywords(value, found)
-        elsif SUBSCHEMA_MAP_KEYWORDS.include?(keyword) && value.is_a?(Hash)
-          value.each_value { |subschema| collect_unsupported_keywords(subschema, found) }
-        elsif SUBSCHEMA_ARRAY_KEYWORDS.include?(keyword) && value.is_a?(Array)
-          value.each { |subschema| collect_unsupported_keywords(subschema, found) }
-        end
-      end
+      each_subschema(schema) { |sub| collect_unsupported_keywords(sub, found, depth + 1) }
     end
 
     # Validate data against a schema. An unusable schema (see
-    # {.check_schema}) is reported as validation errors, never as a pass.
+    # {.check_schema}) is reported as validation errors, never as a pass,
+    # and so is a validation that hit a resource bound.
     # Schema and data hashes may use string or symbol keys.
     # @param data [Object] the value to validate
-    # @param schema [Hash] the JSON schema
+    # @param schema [Hash, Boolean] the JSON schema
     # @param path [String] JSON-pointer-style location used in error messages
     # @param deadline [Float, nil] monotonic deadline for the whole validation
     # @return [Array<String>] human-readable validation errors (empty if valid)
@@ -275,8 +340,12 @@ module MCPClient
 
       # One deadline covers the entire (recursive) validation.
       deadline ||= Process.clock_gettime(Process::CLOCK_MONOTONIC) + PATTERN_MATCH_TIMEOUT
-      root = deep_stringify(schema)
-      validate_node(data, root, path, Context.new(root: root, deadline: deadline), 0)
+      root = schema.is_a?(Hash) ? deep_stringify(schema) : schema
+      ctx = Context.new(root: root, deadline: deadline, dialect: canonical_dialect(dialect(root)),
+                        visits: 0, errors: 0)
+      validate_node(data, root, path, ctx, 0)
+    rescue Aborted => e
+      ["#{path}: validation aborted: #{e.message}"]
     end
 
     # Validate one value against one (sub)schema.
@@ -286,11 +355,19 @@ module MCPClient
     # @param ctx [Context] the validation context
     # @param ref_depth [Integer] $ref hops taken to reach this schema
     # @return [Array<String>] validation errors
+    # @raise [Aborted] when a bound is hit
     def self.validate_node(data, schema, path, ctx, ref_depth)
       return [] if schema == true
-      return ["#{path}: schema false accepts no value"] if schema == false
+      return count_errors(ctx, ["#{path}: schema false accepts no value"]) if schema == false
       return [] unless schema.is_a?(Hash)
-      return ["#{path}: validation time budget exhausted"] if pattern_budget_remaining(ctx.deadline).zero?
+
+      ctx.visits += 1
+      raise Aborted, "more than #{MAX_NODE_VISITS} schema nodes visited" if ctx.visits > MAX_NODE_VISITS
+      raise Aborted, 'validation time budget exhausted' if budget_exhausted?(ctx.deadline)
+
+      # draft-07: "$ref" replaces the schema it appears in; later drafts
+      # apply it alongside the sibling keywords.
+      return validate_ref(data, schema['$ref'], path, ctx, ref_depth) if schema.key?('$ref') && ctx.dialect == DRAFT_07
 
       errors = []
       errors.concat(validate_ref(data, schema['$ref'], path, ctx, ref_depth)) if schema.key?('$ref')
@@ -303,19 +380,39 @@ module MCPClient
       when Numeric then errors.concat(validate_number(data, schema, path))
       end
       errors.concat(validate_composition(data, schema, path, ctx, ref_depth))
+      count_errors(ctx, errors)
+    end
+
+    # Account for produced errors against MAX_ERRORS.
+    # @return [Array<String>] the errors
+    # @raise [Aborted]
+    def self.count_errors(ctx, errors)
+      ctx.errors += errors.size
+      raise Aborted, "more than #{MAX_ERRORS} validation errors (output truncated)" if ctx.errors > MAX_ERRORS
+
       errors
     end
 
-    # Apply a local $ref (2020-12: alongside the sibling keywords).
+    # @return [Boolean] whether the validation-wide deadline has passed
+    def self.budget_exhausted?(deadline)
+      deadline && Process.clock_gettime(Process::CLOCK_MONOTONIC) >= deadline
+    end
+
+    # Apply a local $ref.
     # @return [Array<String>] validation errors
     def self.validate_ref(data, ref, path, ctx, ref_depth)
-      return ["#{path}: external $ref #{ref.inspect} is not dereferenced"] if !ref.is_a?(String) || external_ref?(ref)
+      if !ref.is_a?(String) || external_ref?(ref)
+        return count_errors(ctx, ["#{path}: external $ref #{clip(ref.inspect)} is not dereferenced"])
+      end
       if ref_depth >= MAX_REF_DEPTH
-        return ["#{path}: $ref chain exceeds #{MAX_REF_DEPTH} hops (cycle?) at #{ref.inspect}"]
+        raise Aborted, "$ref chain exceeds #{MAX_REF_DEPTH} hops (cycle?) at #{clip(ref.inspect)}"
       end
 
       target = resolve_pointer(ctx.root, ref)
-      return ["#{path}: unresolvable local $ref #{ref.inspect}"] if target.equal?(UNRESOLVED)
+      return count_errors(ctx, ["#{path}: unresolvable local $ref #{clip(ref.inspect)}"]) if target.equal?(UNRESOLVED)
+      unless schema_value?(target)
+        return count_errors(ctx, ["#{path}: $ref #{clip(ref.inspect)} does not point at a schema"])
+      end
 
       validate_node(data, target, path, ctx, ref_depth + 1)
     end
@@ -327,7 +424,7 @@ module MCPClient
       if schema['allOf'].is_a?(Array)
         schema['allOf'].each_with_index do |sub, idx|
           sub_errors = validate_node(data, sub, path, ctx, ref_depth)
-          errors << "#{path}: does not satisfy allOf/#{idx} (#{sub_errors.join('; ')})" unless sub_errors.empty?
+          errors << "#{path}: does not satisfy allOf/#{idx} (#{clip(sub_errors.first.to_s)})" unless sub_errors.empty?
         end
       end
       if schema['anyOf'].is_a?(Array) &&
@@ -365,7 +462,7 @@ module MCPClient
       types = (type.is_a?(Array) ? type : [type]).map(&:to_s)
       return [] if types.any? { |t| type_match?(t, data) }
 
-      ["#{path}: expected type #{types.join(' or ')}, got #{json_type(data)}"]
+      ["#{path}: expected type #{clip(types.join(' or '))}, got #{json_type(data)}"]
     end
 
     # Whether a value matches a JSON Schema type name.
@@ -413,7 +510,9 @@ module MCPClient
       end
     end
 
-    # Validate enum/const membership.
+    # Validate enum/const membership. Symbol- and string-keyed objects are
+    # compared as given on both sides (the schema's data values are never
+    # re-keyed).
     # @param data [Object] the value
     # @param schema [Hash] string-keyed schema
     # @param path [String] location for error messages
@@ -421,10 +520,10 @@ module MCPClient
     def self.validate_enum(data, schema, path)
       errors = []
       if schema['enum'].is_a?(Array) && !schema['enum'].include?(data)
-        errors << "#{path}: value #{data.inspect} is not in enum #{schema['enum'].inspect}"
+        errors << "#{path}: value #{clip(data.inspect)} is not in enum #{clip(schema['enum'].inspect)}"
       end
       if schema.key?('const') && schema['const'] != data
-        errors << "#{path}: value #{data.inspect} does not equal const #{schema['const'].inspect}"
+        errors << "#{path}: value #{clip(data.inspect)} does not equal const #{clip(schema['const'].inspect)}"
       end
       errors
     end
@@ -438,13 +537,13 @@ module MCPClient
       errors = []
       Array(schema['required']).each do |raw_name|
         name = raw_name.to_s
-        errors << "#{path}: missing required property '#{name}'" unless data.key?(name) || data.key?(name.to_sym)
+        errors << "#{path}: missing required property '#{clip(name)}'" unless data.key?(name) || data.key?(name.to_sym)
       end
       properties = schema['properties']
       return errors unless properties.is_a?(Hash)
 
       properties.each do |raw_name, prop_schema|
-        next unless prop_schema.is_a?(Hash) || [true, false].include?(prop_schema)
+        next unless schema_value?(prop_schema)
 
         name = raw_name.to_s
         key = if data.key?(name)
@@ -459,7 +558,10 @@ module MCPClient
       errors
     end
 
-    # Validate an array against items/minItems/maxItems.
+    # Validate an array against items/prefixItems/minItems/maxItems.
+    # 2020-12 puts positional schemas in `prefixItems` and the rest under
+    # `items`; draft-07 and 2019-09 put positional schemas in an `items`
+    # array. Both forms are honoured.
     # @param data [Array] the array
     # @param schema [Hash] string-keyed schema
     # @param path [String] location for error messages
@@ -475,10 +577,17 @@ module MCPClient
         errors << "#{path}: expected at most #{max_items} items, got #{data.length}"
       end
       items = schema['items']
-      if items.is_a?(Hash) || [true, false].include?(items)
-        data.each_with_index do |item, idx|
-          errors.concat(validate_node(item, items, "#{path}/#{idx}", ctx, ref_depth))
-        end
+      positional = schema['prefixItems'].is_a?(Array) ? schema['prefixItems'] : []
+      positional = items if items.is_a?(Array)
+      data.each_with_index do |item, idx|
+        item_schema = if idx < positional.length
+                        positional[idx]
+                      elsif !items.is_a?(Array)
+                        items
+                      end
+        next unless schema_value?(item_schema)
+
+        errors.concat(validate_node(item, item_schema, "#{path}/#{idx}", ctx, ref_depth))
       end
       errors
     end
@@ -508,25 +617,26 @@ module MCPClient
     # The pattern comes from the tool's outputSchema, i.e. from the remote
     # server, so matching runs against the validation-wide deadline: neither a
     # single expensive expression nor many cheap-looking ones can pin the
-    # calling thread. A match that exceeds the budget is reported as a
-    # validation error rather than silently accepted — the value was never
-    # shown to satisfy the schema.
+    # calling thread. A match that exceeds the budget aborts the validation
+    # rather than silently accepting the value — the value was never shown
+    # to satisfy the schema.
     # @param data [String] the string
     # @param pattern [Object] the pattern keyword value
     # @param path [String] location for error messages
     # @param deadline [Float, nil] monotonic deadline for the whole validation
     # @return [Array<String>] validation errors
+    # @raise [Aborted] when the budget is exhausted
     def self.validate_pattern(data, pattern, path, deadline = nil)
       return [] unless pattern.is_a?(String)
 
       remaining = pattern_budget_remaining(deadline)
-      return ["#{path}: pattern matching budget exhausted before #{pattern.inspect}"] if remaining.zero?
+      raise Aborted, "validation time budget exhausted before pattern #{clip(pattern.inspect)}" if remaining.zero?
 
       return [] if data.match?(Regexp.new(pattern, timeout: remaining))
 
-      ["#{path}: string does not match pattern #{pattern.inspect}"]
+      ["#{path}: string does not match pattern #{clip(pattern.inspect)}"]
     rescue Regexp::TimeoutError
-      ["#{path}: pattern #{pattern.inspect} exceeded the #{PATTERN_MATCH_TIMEOUT}s matching budget"]
+      raise Aborted, "pattern #{clip(pattern.inspect)} exceeded the #{PATTERN_MATCH_TIMEOUT}s matching budget"
     rescue RegexpError
       []
     end
@@ -565,17 +675,33 @@ module MCPClient
       errors
     end
 
-    # A copy of the schema with every Hash key as a String, so keyword
-    # lookups and JSON pointers see one key form. Values (enum members,
-    # const, defaults) are left as they are.
+    # A copy of the schema with every structural Hash key as a String, so
+    # keyword lookups and JSON pointers see one key form. Data-carrying
+    # keywords (enum, const, default, examples) are left exactly as given,
+    # and the walk stops at the nesting bound.
     # @param node [Object]
+    # @param depth [Integer]
     # @return [Object]
-    def self.deep_stringify(node)
+    def self.deep_stringify(node, depth = 0)
+      return node if depth > MAX_SCHEMA_DEPTH + 1
+
       case node
-      when Hash then node.to_h { |key, value| [key.to_s, deep_stringify(value)] }
-      when Array then node.map { |value| deep_stringify(value) }
+      when Hash
+        node.to_h do |key, value|
+          name = key.to_s
+          [name, DATA_KEYWORDS.include?(name) ? value : deep_stringify(value, depth + 1)]
+        end
+      when Array then node.map { |value| deep_stringify(value, depth + 1) }
       else node
       end
+    end
+
+    # Bound a piece of peer-derived text destined for a message.
+    # @param text [String]
+    # @return [String]
+    def self.clip(text)
+      text = text.to_s
+      text.length > MAX_VALUE_INSPECT ? "#{text[0, MAX_VALUE_INSPECT]}..." : text
     end
   end
 end
