@@ -18,66 +18,76 @@ module MCPClient
 
       private
 
-      # One with_retry attempt: the request itself plus the two 2026-07-28
-      # recoveries it may need.
+      # One attempt of a request with the transport-level recoveries that
+      # re-send the same params: version renegotiation, HeaderMismatch refresh
+      # and a response stream that closed without the response.
       #
       # Both re-sends `retry` the same guarded block rather than running inside
-      # their own rescue clause, so either recovery's re-send is still covered by
-      # the other — a HeaderMismatch retry whose stream closes is re-issued, and
-      # a re-issue that is rejected for its headers still refreshes tools/list.
-      # Each recovery fires at most once, so the pair is bounded at three sends.
+      # their own rescue clause, so either recovery's re-send is still covered
+      # by the other — a HeaderMismatch retry whose stream closes is re-issued,
+      # and a re-issue that is rejected for its headers still refreshes
+      # tools/list. Each recovery fires at most once, so the pair is bounded at
+      # three sends.
       #
-      # Both flags are scoped to this attempt, which is all a tools/call ever
-      # gets — with_retry refuses to re-attempt a NON_IDEMPOTENT_METHODS
-      # request — and gives an idempotent method one re-issue per attempt.
+      # The refresh is spent once for the whole logical request: the caller's
+      # flag rides in, and the block marks it. A re-issue is scoped to the
+      # attempt, which is all a tools/call ever gets — with_retry refuses to
+      # re-attempt a NON_IDEMPOTENT_METHODS request.
       #
-      # The deadline is the caller's, shared by every send this attempt makes:
-      # a recovery replaces the request, it does not buy it more time.
+      # The deadline is this attempt's, shared by every send it makes: a
+      # recovery replaces the request, it does not buy it more time.
       # @param method [String] JSON-RPC method name
-      # @param params [Hash] parameters for the request
+      # @param params [Hash] parameters for this attempt (may carry inputResponses)
       # @param timeout [Numeric, nil] per-request timeout override
-      # @param deadline [Float, nil] monotonic instant this attempt must finish by
-      # @return [Object] result from the JSON-RPC response
-      def send_with_recovery(method, params, timeout, deadline = nil)
-        stream_reissued = false
-        header_refreshed = false
-        begin
-          send_request_with_version_retry(method, params, timeout, deadline)
-        rescue MCPClient::Errors::HeaderMismatchError => e
-          # A rejection that escaped host code reached from this response -- a
-          # listener's own tools/call -- rejects that request, not this one.
-          # This one the server has already executed, and re-sending it on
-          # someone else's error would execute it twice.
-          raise if e.is_a?(NestedExchange)
-          raise unless modern? && method == 'tools/call' && !header_refreshed
+      # @param header_refresh_done [Boolean] whether the one HeaderMismatch refresh was spent
+      # @yield marks the HeaderMismatch refresh as spent
+      # @return [Object] the attempt's result
+      def attempt_request(method, params, timeout, header_refresh_done)
+        with_retry(method) do
+          # One budget for this request and every replacement it may need: the
+          # maximum timeout the spec asks for holds "regardless of progress",
+          # and neither a lost stream nor a rejected header set is progress.
+          # A continuation is a request of its own and gets its own budget --
+          # the wait before it is bounded separately (see InputWaits).
+          budget = timeout || @read_timeout
+          deadline = budget && (monotonic_now + budget)
+          stream_reissued = false
+          header_refreshed = header_refresh_done
+          begin
+            send_request_with_version_retry(method, params, timeout, deadline)
+          rescue MCPClient::Errors::HeaderMismatchError => e
+            # A rejection that escaped host code reached from this response --
+            # a listener's own tools/call -- rejects that request, not this
+            # one. This one the server has already executed, and re-sending it
+            # on someone else's error would execute it twice.
+            raise if e.is_a?(NestedExchange)
+            raise unless modern? && method == 'tools/call' && !header_refreshed
 
-          header_refreshed = true
-          refresh_tools_after_header_mismatch(e)
-          retry
-        rescue MCPClient::Errors::ResponseStreamClosedError => e
-          # Modern Streamable HTTP has no resumption: "a broken response stream
-          # loses the in-flight request; clients MUST re-issue it as a new
-          # request with a new request ID" (2026-07-28 changelog, major change
-          # 9). The rule has no exception for tools/call, and this revision
-          # makes closing the response stream itself the cancellation signal —
-          # the server MUST treat the broken stream as a cancellation and stop
-          # work — so the re-issue is the behaviour the protocol expects rather
-          # than a blind replay. Exactly one re-issue happens, for every method:
-          # this flag bounds the attempt, and with_retry never re-attempts a
-          # ResponseStreamClosedError, so a second broken stream surfaces
-          # instead of looping.
-          #
-          # A stream that closed between (or inside) SSE events reaches here
-          # from the parser; one that died at the socket reaches here from
-          # connection_failure_error. Both are the same loss.
-          #
-          # A stream a listener's own request lost is that request's to
-          # re-issue, and it already did: this exchange still has its response.
-          raise if stream_reissued || e.is_a?(NestedExchange)
+            header_refreshed = true
+            yield
+            refresh_tools_after_header_mismatch(e)
+            retry
+          rescue MCPClient::Errors::ResponseStreamClosedError => e
+            # Modern Streamable HTTP has no resumption: "a broken response
+            # stream loses the in-flight request; clients MUST re-issue it as a
+            # new request with a new request ID" (2026-07-28 changelog, major
+            # change 9). The rule has no exception for tools/call, and this
+            # revision makes closing the response stream itself the
+            # cancellation signal — the server MUST treat the broken stream as
+            # a cancellation and stop work — so the re-issue is the behaviour
+            # the protocol expects rather than a blind replay.
+            #
+            # A stream that closed between (or inside) SSE events reaches here
+            # from the parser; one that died at the socket reaches here from
+            # connection_failure_error. Both are the same loss. A stream a
+            # listener's own request lost is that request's to re-issue, and it
+            # already did: this exchange still has its response.
+            raise if stream_reissued || e.is_a?(NestedExchange)
 
-          stream_reissued = true
-          @logger.warn("#{e.message}; re-issuing #{method} as a new request")
-          retry
+            stream_reissued = true
+            @logger.warn("#{e.message}; re-issuing #{method} as a new request")
+            retry
+          end
         end
       end
 
