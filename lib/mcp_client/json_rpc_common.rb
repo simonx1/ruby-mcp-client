@@ -170,8 +170,202 @@ module MCPClient
         'jsonrpc' => '2.0',
         'id' => id,
         'method' => method,
-        'params' => params
+        'params' => with_request_meta(params)
       }
+    end
+
+    # Reserved `_meta` keys (MCP 2026-07-28 basic/index "_meta").
+    META_PROTOCOL_VERSION = 'io.modelcontextprotocol/protocolVersion'
+    META_CLIENT_INFO = 'io.modelcontextprotocol/clientInfo'
+    META_CLIENT_CAPABILITIES = 'io.modelcontextprotocol/clientCapabilities'
+    META_LOG_LEVEL = 'io.modelcontextprotocol/logLevel'
+    META_SERVER_INFO = 'io.modelcontextprotocol/serverInfo'
+    META_SUBSCRIPTION_ID = 'io.modelcontextprotocol/subscriptionId'
+
+    # Per-request protocol fields the client owns. A host-supplied `_meta`
+    # may carry anything else (progressToken, trace context, vendor keys),
+    # but these are always set from the transport's own state so the body
+    # can never disagree with what the transport negotiated (on HTTP the
+    # MCP-Protocol-Version header must match the body).
+    PROTECTED_META_KEYS = [META_PROTOCOL_VERSION, META_CLIENT_INFO, META_CLIENT_CAPABILITIES].freeze
+
+    # Log levels defined by the logging utility (RFC 5424 severities).
+    LOG_LEVELS = %w[debug info notice warning error critical alert emergency].freeze
+
+    # Extension identifiers follow the `_meta` key naming rules with a
+    # mandatory prefix: dotted labels, a slash, then a name.
+    EXTENSION_ID_PATTERN = %r{\A(?:[A-Za-z](?:[A-Za-z0-9-]*[A-Za-z0-9])?\.)*[A-Za-z](?:[A-Za-z0-9-]*[A-Za-z0-9])?/
+                              [A-Za-z0-9](?:[A-Za-z0-9._-]*[A-Za-z0-9])?\z}x
+
+    # The protocol version in use with this server: selected via
+    # server/discover (modern) or negotiated by initialize (legacy). nil
+    # until the first request establishes it.
+    # @return [String, nil]
+    def protocol_version
+      defined?(@protocol_version) ? @protocol_version : nil
+    end
+
+    # Whether this server speaks a modern (per-request metadata, no
+    # handshake) protocol revision (basic/versioning "Terminology").
+    # @return [Boolean]
+    def modern?
+      MCPClient::MODERN_PROTOCOL_VERSIONS.include?(protocol_version)
+    end
+
+    # @return [Symbol, nil] :modern, :legacy, or nil before the era is known
+    def protocol_era
+      return nil if protocol_version.nil?
+
+      modern? ? :modern : :legacy
+    end
+
+    # Protocol versions a modern server advertised in its DiscoverResult.
+    # @return [Array<String>, nil]
+    def supported_versions
+      defined?(@supported_versions) ? @supported_versions : nil
+    end
+
+    # Pick the newest modern version this client speaks from a server's
+    # advertised list (DiscoverResult.supportedVersions or
+    # UnsupportedProtocolVersionError.data.supported).
+    # @param supported [Array<String>, nil] versions the server supports
+    # @return [String, nil] the chosen version, nil when none is mutual
+    def select_protocol_version(supported)
+      return nil unless supported.is_a?(Array)
+
+      MCPClient::MODERN_PROTOCOL_VERSIONS.find { |version| supported.include?(version) }
+    end
+
+    # Host-supplied metadata merged into every request's `_meta`: a Hash, or
+    # a callable returning one, evaluated per request. Intended for
+    # OpenTelemetry trace context (`traceparent`, `tracestate`, `baggage`)
+    # and vendor-prefixed keys. Reserved protocol fields cannot be
+    # overridden through it.
+    # @return [Hash, #call, nil]
+    attr_accessor :request_meta
+
+    # Whether to identify this client on every request via
+    # `io.modelcontextprotocol/clientInfo` (MCP 2026-07-28: clients SHOULD,
+    # "unless specifically configured not to do so").
+    # @param value [Boolean]
+    attr_writer :send_client_info
+
+    # @return [Boolean] whether clientInfo is sent (default true)
+    def send_client_info?
+      !(defined?(@send_client_info) && @send_client_info == false)
+    end
+
+    # Declare support for an MCP extension (basic/versioning "Extension
+    # Negotiation"): advertised under `clientCapabilities.extensions` on
+    # every modern request.
+    # @param identifier [String] the extension id, e.g. 'io.modelcontextprotocol/tasks'
+    # @param settings [Hash] per-extension settings ({} = support, no settings)
+    # @return [void]
+    # @raise [ArgumentError] if the identifier lacks the mandatory prefix
+    def declare_extension(identifier, settings = {})
+      unless identifier.is_a?(String) && identifier.match?(EXTENSION_ID_PATTERN)
+        raise ArgumentError, "Extension identifier #{identifier.inspect} must have a dotted prefix and a slash " \
+                             '(e.g. io.modelcontextprotocol/tasks)'
+      end
+
+      @declared_extensions ||= {}
+      @declared_extensions[identifier] = settings || {}
+    end
+
+    # @return [Hash] declared extension id => settings
+    def declared_extensions
+      defined?(@declared_extensions) && @declared_extensions ? @declared_extensions : {}
+    end
+
+    # Attach request-level `_meta` to a params object: the host's
+    # request_meta defaults first, then any per-request `_meta` the caller
+    # supplied (which wins over the defaults), then — for a modern server —
+    # the reserved protocol fields, which always win. Params are returned
+    # untouched when there is nothing to add, so legacy traffic is unchanged.
+    # @param params [Hash, nil] request params (String or Symbol keys)
+    # @return [Hash, nil] params with `_meta` merged under the String key
+    def with_request_meta(params)
+      defaults = host_request_meta
+      return params if defaults.empty? && !modern?
+
+      params = params.is_a?(Hash) ? params.dup : {}
+      supplied = params.delete('_meta')
+      symbol_meta = params.delete(:_meta)
+      supplied = symbol_meta if supplied.nil?
+      supplied = supplied.is_a?(Hash) ? supplied.transform_keys(&:to_s) : {}
+
+      meta = defaults.merge(supplied)
+      if modern?
+        meta[META_LOG_LEVEL] = @log_level if defined?(@log_level) && @log_level && !meta.key?(META_LOG_LEVEL)
+        meta.merge!(required_request_meta)
+      end
+      params['_meta'] = meta
+      params
+    end
+
+    # The reserved per-request protocol fields for a modern server
+    # (basic/index "Per-request protocol fields").
+    # @return [Hash]
+    def required_request_meta
+      meta = { META_PROTOCOL_VERSION => protocol_version }
+      meta[META_CLIENT_INFO] = client_info_payload if send_client_info?
+      meta[META_CLIENT_CAPABILITIES] = client_capabilities
+      meta
+    end
+
+    # Evaluate the host's request_meta for one request, dropping any
+    # reserved protocol keys it tries to set.
+    # @return [Hash] String-keyed metadata (possibly empty)
+    def host_request_meta
+      source = request_meta
+      source = source.call if source.respond_to?(:call)
+      return {} unless source.is_a?(Hash)
+
+      source.transform_keys(&:to_s).except(*PROTECTED_META_KEYS)
+    end
+
+    # Apply a DiscoverResult (server/discover): choose the protocol version
+    # for subsequent requests and record the server's capabilities,
+    # identity and instructions.
+    # @param result [Hash] the DiscoverResult
+    # @return [Hash] the result
+    # @raise [MCPClient::Errors::ConnectionError] if the result is malformed or no version is mutual
+    def apply_discover_result(result)
+      unless result.is_a?(Hash)
+        raise MCPClient::Errors::ConnectionError, "Server returned an invalid server/discover result (#{result.class})"
+      end
+
+      versions = result['supportedVersions']
+      unless versions.is_a?(Array) && versions.all?(String)
+        raise MCPClient::Errors::ConnectionError, 'server/discover result has no supportedVersions list'
+      end
+
+      version = select_protocol_version(versions)
+      unless version
+        raise MCPClient::Errors::ConnectionError,
+              "Server supports protocol versions #{versions.join(', ')}, none of which this client speaks " \
+              "(modern versions supported: #{MCPClient::MODERN_PROTOCOL_VERSIONS.join(', ')})"
+      end
+
+      @protocol_version = version
+      @supported_versions = versions
+      @last_discover_result = result
+      @capabilities = result['capabilities'].is_a?(Hash) ? result['capabilities'] : {}
+      @instructions = result['instructions']
+      info = result.dig('_meta', META_SERVER_INFO)
+      @server_info = info if info.is_a?(Hash)
+      result
+    end
+
+    # Validate a log level name (logging utility levels).
+    # @param level [String, Symbol] the level
+    # @return [String] the normalized level
+    # @raise [ArgumentError] if it is not a defined level
+    def validate_log_level!(level)
+      name = level.to_s
+      return name if LOG_LEVELS.include?(name)
+
+      raise ArgumentError, "Unknown log level #{level.inspect}; expected one of #{LOG_LEVELS.join(', ')}"
     end
 
     # Build a JSON-RPC notification object (no response expected)
@@ -259,12 +453,17 @@ module MCPClient
         # would mean form-only per the spec's backwards-compatibility rule).
         capabilities['elicitation'] = { 'form' => {}, 'url' => {} }
       end
-      capabilities['roots'] = { 'listChanged' => true } if registered_callback?(:@roots_list_request_callback)
+      if registered_callback?(:@roots_list_request_callback)
+        # notifications/roots/list_changed was removed in 2026-07-28, so the
+        # modern roots capability has no listChanged flag.
+        capabilities['roots'] = modern? ? {} : { 'listChanged' => true }
+      end
       if registered_callback?(:@sampling_request_callback)
         # SEP-1577: servers may only send tool-enabled sampling requests when
         # the client declares the sampling.tools sub-capability.
         capabilities['sampling'] = sampling_tools_supported? ? { 'tools' => {} } : {}
       end
+      capabilities['extensions'] = declared_extensions.dup unless declared_extensions.empty?
       # NOTE: we intentionally do NOT declare a client `tasks` capability. That
       # capability marks the client as a RECEIVER of task-augmented
       # sampling/elicitation requests, which is not implemented here — this
@@ -451,7 +650,20 @@ module MCPClient
 
       result = response['result']
       validate_result_type!(result)
+      record_server_info(result)
       result
+    end
+
+    # Servers SHOULD identify themselves in every result's `_meta`
+    # (`io.modelcontextprotocol/serverInfo`, MCP 2026-07-28); keep the latest
+    # self-reported identity for display and logging.
+    # @param result [Object] a JSON-RPC result
+    # @return [void]
+    def record_server_info(result)
+      return unless result.is_a?(Hash)
+
+      info = result['_meta'].is_a?(Hash) ? result['_meta'][META_SERVER_INFO] : nil
+      @server_info = info if info.is_a?(Hash)
     end
 
     # "A resultType of any value unrecognized by the client MUST be

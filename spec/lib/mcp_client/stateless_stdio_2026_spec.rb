@@ -1,0 +1,509 @@
+# frozen_string_literal: true
+
+require 'spec_helper'
+
+# MCP 2026-07-28 stateless protocol on stdio (basic/index "Statelessness",
+# basic/versioning, basic/transports/stdio "Backward Compatibility",
+# server/discover):
+# - no initialize handshake; every request carries protocolVersion,
+#   clientInfo and clientCapabilities in _meta
+# - server/discover probes the server's era; a DiscoverResult or a recognized
+#   modern error means modern, anything else (or a timeout) means legacy and
+#   the client falls back to the initialize handshake
+# - UnsupportedProtocolVersionError makes the client retry with a mutually
+#   supported version rather than fall back
+# - ping, logging/setLevel and notifications/roots/list_changed are gone in
+#   modern mode: ping maps to server/discover, the log level travels in
+#   _meta, and roots changes are not announced
+META_VERSION = 'io.modelcontextprotocol/protocolVersion'
+META_CLIENT_INFO = 'io.modelcontextprotocol/clientInfo'
+META_CLIENT_CAPS = 'io.modelcontextprotocol/clientCapabilities'
+META_LOG_LEVEL = 'io.modelcontextprotocol/logLevel'
+META_SERVER_INFO = 'io.modelcontextprotocol/serverInfo'
+
+RSpec.describe 'MCP 2026-07-28 stateless protocol (stdio)' do
+  def discover_result(versions: ['2026-07-28'], capabilities: { 'tools' => {} }, extra: {})
+    { 'resultType' => 'complete', 'supportedVersions' => versions, 'capabilities' => capabilities,
+      '_meta' => { META_SERVER_INFO => { 'name' => 'modern-server', 'version' => '9.9' } },
+      'instructions' => 'be nice', 'ttlMs' => 60_000, 'cacheScope' => 'public' }.merge(extra)
+  end
+
+  def legacy_init_result
+    { 'protocolVersion' => '2025-11-25', 'capabilities' => { 'tools' => {} },
+      'serverInfo' => { 'name' => 'legacy-server', 'version' => '1.0' } }
+  end
+
+  # Drive a ServerStdio without a real subprocess: the process spawn and the
+  # reader threads are stubbed, requests are captured, and responses are
+  # served from a queue keyed by request order (or by a block).
+  def script_stdio(server, responses)
+    sent = []
+    allow(server).to receive(:connect).and_return(true)
+    allow(server).to receive(:start_reader)
+    allow(server).to receive(:start_stderr_reader)
+    stdin = double('stdin', puts: nil, flush: nil, closed?: true, close: nil)
+    server.instance_variable_set(:@stdin, stdin)
+    allow(server).to receive(:send_request) { |req| sent << req }
+    allow(server).to receive(:wait_response) do |id, **_opts|
+      responder = responses.shift
+      raise 'no scripted response left' unless responder
+
+      response = responder.respond_to?(:call) ? responder.call(id) : responder
+      raise response if response.is_a?(Exception)
+
+      response.merge('jsonrpc' => '2.0', 'id' => id)
+    end
+    sent
+  end
+
+  describe 'per-request _meta (JsonRpcCommon)' do
+    let(:transport) do
+      Class.new do
+        include MCPClient::JsonRpcCommon
+
+        attr_accessor :protocol_version
+
+        def initialize
+          @logger = Logger.new(StringIO.new)
+        end
+      end.new
+    end
+
+    it 'leaves params untouched for a legacy server' do
+      transport.protocol_version = '2025-11-25'
+      params = { name: 'echo', arguments: { a: 1 } }
+      request = transport.build_jsonrpc_request('tools/call', params, 1)
+      expect(request['params']).to eq(params)
+    end
+
+    it 'adds protocolVersion, clientInfo and clientCapabilities for a modern server' do
+      transport.protocol_version = '2026-07-28'
+      request = transport.build_jsonrpc_request('tools/list', {}, 1)
+      meta = request['params']['_meta']
+      expect(meta[META_VERSION]).to eq('2026-07-28')
+      expect(meta[META_CLIENT_INFO]).to eq({ 'name' => 'ruby-mcp-client', 'version' => MCPClient::VERSION })
+      expect(meta[META_CLIENT_CAPS]).to eq({})
+    end
+
+    it 'injects _meta even when params are nil' do
+      transport.protocol_version = '2026-07-28'
+      request = transport.build_jsonrpc_request('server/discover', nil, 1)
+      expect(request['params']['_meta'][META_VERSION]).to eq('2026-07-28')
+    end
+
+    it 'preserves host-supplied _meta keys such as progressToken and trace context' do
+      transport.protocol_version = '2026-07-28'
+      params = { name: 'echo', '_meta' => { 'progressToken' => 'p1', 'traceparent' => '00-abc-def-01' } }
+      meta = transport.build_jsonrpc_request('tools/call', params, 1)['params']['_meta']
+      expect(meta['progressToken']).to eq('p1')
+      expect(meta['traceparent']).to eq('00-abc-def-01')
+      expect(meta[META_VERSION]).to eq('2026-07-28')
+    end
+
+    it 'accepts a symbol-keyed _meta and normalizes to the string key' do
+      transport.protocol_version = '2026-07-28'
+      params = { name: 'echo', _meta: { progressToken: 'p1' } }
+      request_params = transport.build_jsonrpc_request('tools/call', params, 1)['params']
+      expect(request_params.key?(:_meta)).to be(false)
+      expect(request_params['_meta']['progressToken']).to eq('p1')
+      expect(request_params['_meta'][META_VERSION]).to eq('2026-07-28')
+    end
+
+    it 'does not let host _meta override the required protocol fields' do
+      transport.protocol_version = '2026-07-28'
+      params = { '_meta' => { META_VERSION => '1900-01-01', META_CLIENT_CAPS => { 'roots' => {} } } }
+      meta = transport.build_jsonrpc_request('tools/list', params, 1)['params']['_meta']
+      expect(meta[META_VERSION]).to eq('2026-07-28')
+      expect(meta[META_CLIENT_CAPS]).to eq({})
+    end
+
+    it 'omits clientInfo when the host configured it off' do
+      transport.protocol_version = '2026-07-28'
+      transport.send_client_info = false
+      meta = transport.build_jsonrpc_request('tools/list', {}, 1)['params']['_meta']
+      expect(meta).not_to have_key(META_CLIENT_INFO)
+      expect(meta[META_VERSION]).to eq('2026-07-28')
+    end
+
+    it 'includes the per-request log level once set' do
+      transport.protocol_version = '2026-07-28'
+      transport.instance_variable_set(:@log_level, 'warning')
+      meta = transport.build_jsonrpc_request('tools/list', {}, 1)['params']['_meta']
+      expect(meta[META_LOG_LEVEL]).to eq('warning')
+    end
+
+    it 'lets a host-supplied per-request logLevel win over the default' do
+      transport.protocol_version = '2026-07-28'
+      transport.instance_variable_set(:@log_level, 'warning')
+      params = { '_meta' => { META_LOG_LEVEL => 'debug' } }
+      meta = transport.build_jsonrpc_request('tools/list', params, 1)['params']['_meta']
+      expect(meta[META_LOG_LEVEL]).to eq('debug')
+    end
+
+    it 'merges host request_meta (Hash) into every request in both eras' do
+      transport.request_meta = { 'traceparent' => '00-1-2-01', 'baggage' => 'k=v' }
+      transport.protocol_version = '2025-11-25'
+      legacy_meta = transport.build_jsonrpc_request('tools/list', {}, 1)['params']['_meta']
+      expect(legacy_meta).to eq({ 'traceparent' => '00-1-2-01', 'baggage' => 'k=v' })
+      expect(legacy_meta).not_to have_key(META_VERSION)
+
+      transport.protocol_version = '2026-07-28'
+      modern_meta = transport.build_jsonrpc_request('tools/list', {}, 1)['params']['_meta']
+      expect(modern_meta['traceparent']).to eq('00-1-2-01')
+      expect(modern_meta[META_VERSION]).to eq('2026-07-28')
+    end
+
+    it 'calls a request_meta proc per request and cannot override required fields' do
+      calls = 0
+      transport.request_meta = lambda do
+        calls += 1
+        { 'tracestate' => "n=#{calls}", META_VERSION => 'evil' }
+      end
+      transport.protocol_version = '2026-07-28'
+      first = transport.build_jsonrpc_request('tools/list', {}, 1)['params']['_meta']
+      second = transport.build_jsonrpc_request('tools/list', {}, 2)['params']['_meta']
+      expect(first['tracestate']).to eq('n=1')
+      expect(second['tracestate']).to eq('n=2')
+      expect(first[META_VERSION]).to eq('2026-07-28')
+    end
+
+    it 'declares roots without listChanged in modern mode (the notification was removed)' do
+      transport.instance_variable_set(:@roots_list_request_callback, proc {})
+      transport.protocol_version = '2025-11-25'
+      expect(transport.client_capabilities['roots']).to eq({ 'listChanged' => true })
+      transport.protocol_version = '2026-07-28'
+      expect(transport.client_capabilities['roots']).to eq({})
+    end
+
+    it 'declares negotiated extensions under clientCapabilities.extensions' do
+      transport.protocol_version = '2026-07-28'
+      transport.declare_extension('io.modelcontextprotocol/tasks')
+      transport.declare_extension('com.example/ui', { 'mimeTypes' => ['text/html'] })
+      caps = transport.build_jsonrpc_request('tools/list', {}, 1)['params']['_meta'][META_CLIENT_CAPS]
+      expect(caps['extensions']).to eq({ 'io.modelcontextprotocol/tasks' => {},
+                                         'com.example/ui' => { 'mimeTypes' => ['text/html'] } })
+    end
+
+    it 'rejects extension identifiers without the mandatory prefix' do
+      expect { transport.declare_extension('tasks') }.to raise_error(ArgumentError, /prefix/)
+    end
+
+    it 'reports the era from the protocol version' do
+      transport.protocol_version = nil
+      expect(transport.modern?).to be(false)
+      transport.protocol_version = '2025-11-25'
+      expect(transport.modern?).to be(false)
+      transport.protocol_version = '2026-07-28'
+      expect(transport.modern?).to be(true)
+    end
+
+    it 'selects the newest mutually supported modern version' do
+      stub_const('MCPClient::MODERN_PROTOCOL_VERSIONS', %w[2027-01-01 2026-07-28])
+      expect(transport.select_protocol_version(%w[2026-07-28 2025-11-25])).to eq('2026-07-28')
+      expect(transport.select_protocol_version(%w[2026-07-28 2027-01-01])).to eq('2027-01-01')
+      expect(transport.select_protocol_version(%w[2025-11-25])).to be_nil
+      expect(transport.select_protocol_version(nil)).to be_nil
+    end
+  end
+
+  describe 'server/discover probe on stdio' do
+    let(:server) { MCPClient::ServerStdio.new(command: 'echo test', read_timeout: 1) }
+
+    it 'goes modern when the server returns a DiscoverResult' do
+      sent = script_stdio(server, [{ 'result' => discover_result }, { 'result' => { 'tools' => [] } }])
+
+      server.list_tools
+
+      expect(sent.map { |r| r['method'] }).to eq(%w[server/discover tools/list])
+      expect(server.protocol_era).to eq(:modern)
+      expect(server.protocol_version).to eq('2026-07-28')
+      expect(server.capabilities).to eq({ 'tools' => {} })
+      expect(server.server_info).to eq({ 'name' => 'modern-server', 'version' => '9.9' })
+      expect(server.instructions).to eq('be nice')
+      expect(server.supported_versions).to eq(['2026-07-28'])
+    end
+
+    it 'declares the version, identity and capabilities on the probe itself' do
+      sent = script_stdio(server, [{ 'result' => discover_result }])
+
+      server.ping
+
+      probe = sent.first
+      expect(probe['method']).to eq('server/discover')
+      expect(probe['params']['_meta'][META_VERSION]).to eq(MCPClient::LATEST_PROTOCOL_VERSION)
+      expect(probe['params']['_meta'][META_CLIENT_INFO]['name']).to eq('ruby-mcp-client')
+      expect(probe['params']['_meta']).to have_key(META_CLIENT_CAPS)
+    end
+
+    it 'carries the required _meta on every subsequent request and never sends initialize' do
+      sent = script_stdio(server, [{ 'result' => discover_result }, { 'result' => { 'tools' => [] } },
+                                   { 'result' => { 'content' => [] } }])
+
+      server.list_tools
+      server.call_tool('echo', { 'x' => 1 })
+
+      expect(sent.map { |r| r['method'] }).not_to include('initialize', 'notifications/initialized')
+      sent.each do |req|
+        expect(req['params']['_meta'][META_VERSION]).to eq('2026-07-28')
+        expect(req['params']['_meta'][META_CLIENT_CAPS]).to be_a(Hash)
+      end
+      expect(sent.last['params']['name']).to eq('echo')
+      expect(sent.last['params']['arguments']).to eq({ 'x' => 1 })
+    end
+
+    it 'picks the newest version this client speaks from supportedVersions' do
+      stub_const('MCPClient::MODERN_PROTOCOL_VERSIONS', %w[2027-01-01 2026-07-28])
+      stub_const('MCPClient::LATEST_PROTOCOL_VERSION', '2027-01-01')
+      sent = script_stdio(server, [{ 'result' => discover_result(versions: %w[2026-07-28 2025-11-25]) },
+                                   { 'result' => { 'tools' => [] } }])
+
+      server.list_tools
+
+      expect(sent.first['params']['_meta'][META_VERSION]).to eq('2027-01-01')
+      expect(server.protocol_version).to eq('2026-07-28')
+      expect(sent.last['params']['_meta'][META_VERSION]).to eq('2026-07-28')
+    end
+
+    it 'fails without falling back when no supported version is mutually supported' do
+      sent = script_stdio(server, [{ 'result' => discover_result(versions: ['2099-01-01']) }])
+
+      expect { server.list_tools }.to raise_error(MCPClient::Errors::ToolCallError, /2099-01-01/)
+      expect(sent.map { |r| r['method'] }).to eq(['server/discover'])
+    end
+
+    it 'treats UnsupportedProtocolVersionError as a modern server and retries with an advertised version' do
+      stub_const('MCPClient::MODERN_PROTOCOL_VERSIONS', %w[2027-01-01 2026-07-28])
+      stub_const('MCPClient::LATEST_PROTOCOL_VERSION', '2027-01-01')
+      sent = script_stdio(server, [
+                            { 'error' => { 'code' => -32_022, 'message' => 'Unsupported protocol version',
+                                           'data' => { 'supported' => ['2026-07-28'], 'requested' => '2027-01-01' } } },
+                            { 'result' => discover_result },
+                            { 'result' => { 'tools' => [] } }
+                          ])
+
+      server.list_tools
+
+      expect(sent.map { |r| r['method'] }).to eq(%w[server/discover server/discover tools/list])
+      expect(sent[0]['params']['_meta'][META_VERSION]).to eq('2027-01-01')
+      expect(sent[1]['params']['_meta'][META_VERSION]).to eq('2026-07-28')
+      expect(sent[0]['id']).not_to eq(sent[1]['id'])
+      expect(server.protocol_era).to eq(:modern)
+    end
+
+    it 'does not fall back to initialize when the advertised versions are all unknown' do
+      sent = script_stdio(server, [
+                            { 'error' => { 'code' => -32_022, 'message' => 'Unsupported protocol version',
+                                           'data' => { 'supported' => ['2099-01-01'], 'requested' => '2026-07-28' } } }
+                          ])
+
+      expect { server.list_tools }.to raise_error(MCPClient::Errors::ToolCallError, /2099-01-01/)
+      expect(sent.map { |r| r['method'] }).to eq(['server/discover'])
+    end
+
+    it 'falls back to the initialize handshake on any other error' do
+      sent = script_stdio(server, [{ 'error' => { 'code' => -32_601, 'message' => 'Method not found' } },
+                                   { 'result' => legacy_init_result },
+                                   { 'result' => { 'tools' => [] } }])
+
+      server.list_tools
+
+      expect(sent.map { |r| r['method'] }).to eq(%w[server/discover initialize tools/list])
+      expect(server.protocol_era).to eq(:legacy)
+      expect(server.protocol_version).to eq('2025-11-25')
+      expect(sent.last['params']).not_to have_key('_meta')
+      expect(server.server_info).to eq({ 'name' => 'legacy-server', 'version' => '1.0' })
+    end
+
+    it 'falls back to initialize when the probe times out' do
+      sent = script_stdio(server, [MCPClient::Errors::RequestTimeoutError.new('timeout'),
+                                   { 'result' => legacy_init_result },
+                                   { 'result' => { 'tools' => [] } }])
+
+      server.list_tools
+
+      expect(sent.map { |r| r['method'] }).to eq(%w[server/discover initialize tools/list])
+      expect(server.protocol_era).to eq(:legacy)
+    end
+
+    it 'waits at most discover_timeout for the probe' do
+      server = MCPClient::ServerStdio.new(command: 'echo test', read_timeout: 30, discover_timeout: 2)
+      timeouts = []
+      allow(server).to receive(:connect).and_return(true)
+      allow(server).to receive(:start_reader)
+      allow(server).to receive(:start_stderr_reader)
+      server.instance_variable_set(:@stdin, double('stdin', puts: nil, flush: nil))
+      allow(server).to receive(:send_request)
+      allow(server).to receive(:wait_response) do |id, timeout: nil|
+        timeouts << timeout
+        { 'jsonrpc' => '2.0', 'id' => id, 'result' => discover_result }
+      end
+
+      server.ping
+
+      expect(timeouts.first).to eq(2)
+    end
+
+    it 'skips the probe entirely when protocol: :legacy is configured' do
+      server = MCPClient::ServerStdio.new(command: 'echo test', protocol: :legacy)
+      sent = script_stdio(server, [{ 'result' => legacy_init_result }, { 'result' => { 'tools' => [] } }])
+
+      server.list_tools
+
+      expect(sent.map { |r| r['method'] }).to eq(%w[initialize tools/list])
+      expect(server.protocol_era).to eq(:legacy)
+    end
+
+    it 'surfaces an actionable error instead of falling back when protocol: :modern is configured' do
+      server = MCPClient::ServerStdio.new(command: 'echo test', protocol: :modern)
+      sent = script_stdio(server, [{ 'error' => { 'code' => -32_601, 'message' => 'Method not found' } }])
+
+      expect { server.list_tools }.to raise_error(MCPClient::Errors::ToolCallError, /legacy|initialize/i)
+      expect(sent.map { |r| r['method'] }).to eq(['server/discover'])
+    end
+
+    it 'rejects an unknown protocol mode' do
+      expect { MCPClient::ServerStdio.new(command: 'echo', protocol: :bogus) }.to raise_error(ArgumentError, /protocol/)
+    end
+
+    it 'rejects a DiscoverResult without supportedVersions' do
+      script_stdio(server, [{ 'result' => { 'resultType' => 'complete', 'capabilities' => {} } }])
+
+      expect { server.ping }.to raise_error(MCPClient::Errors::ConnectionError, /supportedVersions/)
+    end
+
+    it 'reports the era as unknown before the first request' do
+      expect(server.protocol_era).to be_nil
+      expect(server.protocol_version).to be_nil
+    end
+  end
+
+  describe 'modern-mode behaviour on stdio' do
+    let(:server) { MCPClient::ServerStdio.new(command: 'echo test', read_timeout: 1) }
+
+    it 'maps ping to server/discover (ping was removed from the protocol)' do
+      sent = script_stdio(server, [{ 'result' => discover_result }, { 'result' => discover_result }])
+
+      server.ping
+      result = server.ping
+
+      expect(sent.map { |r| r['method'] }).to eq(%w[server/discover server/discover])
+      expect(result['supportedVersions']).to eq(['2026-07-28'])
+    end
+
+    it 'sets the log level per request via _meta instead of logging/setLevel' do
+      sent = script_stdio(server, [{ 'result' => discover_result(capabilities: { 'logging' => {} }) },
+                                   { 'result' => { 'tools' => [] } }])
+
+      server.log_level = 'debug'
+      server.list_tools
+
+      expect(sent.map { |r| r['method'] }).to eq(%w[server/discover tools/list])
+      expect(sent.last['params']['_meta'][META_LOG_LEVEL]).to eq('debug')
+    end
+
+    it 'rejects an unknown log level locally' do
+      script_stdio(server, [{ 'result' => discover_result }])
+      expect { server.log_level = 'loud' }.to raise_error(ArgumentError, /log level/i)
+    end
+
+    it 'still sends logging/setLevel to a legacy server' do
+      sent = script_stdio(server, [{ 'error' => { 'code' => -32_601, 'message' => 'nope' } },
+                                   { 'result' => legacy_init_result.merge('capabilities' => { 'logging' => {} }) },
+                                   { 'result' => {} }])
+
+      server.log_level = 'debug'
+
+      expect(sent.map { |r| r['method'] }).to eq(%w[server/discover initialize logging/setLevel])
+    end
+
+    it 'retries a request once with an advertised version after an inline UnsupportedProtocolVersionError' do
+      stub_const('MCPClient::MODERN_PROTOCOL_VERSIONS', %w[2027-01-01 2026-07-28])
+      stub_const('MCPClient::LATEST_PROTOCOL_VERSION', '2027-01-01')
+      sent = script_stdio(server, [
+                            { 'result' => discover_result(versions: %w[2027-01-01]) },
+                            { 'error' => { 'code' => -32_022, 'message' => 'Unsupported protocol version',
+                                           'data' => { 'supported' => ['2026-07-28'], 'requested' => '2027-01-01' } } },
+                            { 'result' => { 'tools' => [] } }
+                          ])
+
+      server.list_tools
+
+      expect(sent.map { |r| r['method'] }).to eq(%w[server/discover tools/list tools/list])
+      expect(sent[1]['params']['_meta'][META_VERSION]).to eq('2027-01-01')
+      expect(sent[2]['params']['_meta'][META_VERSION]).to eq('2026-07-28')
+      expect(sent[1]['id']).not_to eq(sent[2]['id'])
+      expect(server.protocol_version).to eq('2026-07-28')
+    end
+
+    it 'raises the UnsupportedProtocolVersionError when no advertised version is usable' do
+      script_stdio(server, [
+                     { 'result' => discover_result },
+                     { 'error' => { 'code' => -32_022, 'message' => 'Unsupported protocol version',
+                                    'data' => { 'supported' => ['2099-01-01'], 'requested' => '2026-07-28' } } }
+                   ])
+
+      expect { server.rpc_request('tools/list') }.to raise_error(MCPClient::Errors::UnsupportedProtocolVersionError)
+    end
+
+    it 'refreshes serverInfo from a result _meta' do
+      renamed = { META_SERVER_INFO => { 'name' => 'renamed', 'version' => '2' } }
+      script_stdio(server, [{ 'result' => discover_result },
+                            { 'result' => { 'tools' => [], '_meta' => renamed } }])
+
+      server.list_tools
+
+      expect(server.server_info).to eq({ 'name' => 'renamed', 'version' => '2' })
+    end
+
+    it 'still sends notifications/cancelled when a request times out (stdio cancellation)' do
+      stdin_lines = []
+      sent = script_stdio(server, [{ 'result' => discover_result },
+                                   MCPClient::Errors::RequestTimeoutError.new('Timeout waiting')])
+      server.instance_variable_set(:@stdin, double('stdin', flush: nil).tap do |d|
+        allow(d).to receive(:puts) { |line| stdin_lines << line }
+      end)
+
+      expect { server.rpc_request('tools/list') }.to raise_error(MCPClient::Errors::RequestTimeoutError)
+
+      cancelled = stdin_lines.map { |l| JSON.parse(l) }.find { |m| m['method'] == 'notifications/cancelled' }
+      expect(cancelled['params']['requestId']).to eq(sent.last['id'])
+    end
+  end
+
+  describe 'client-level behaviour with a modern server' do
+    it 'does not send notifications/roots/list_changed to modern servers' do
+      modern = MCPClient::ServerStdio.new(command: 'echo modern')
+      legacy = MCPClient::ServerStdio.new(command: 'echo legacy')
+      modern.instance_variable_set(:@protocol_version, '2026-07-28')
+      legacy.instance_variable_set(:@protocol_version, '2025-11-25')
+      allow(MCPClient::ServerFactory).to receive(:create).and_return(modern, legacy)
+      client = MCPClient::Client.new(mcp_server_configs: [{ type: 'stdio', command: 'a' },
+                                                          { type: 'stdio', command: 'b' }])
+      expect(modern).not_to receive(:rpc_notify)
+      expect(legacy).to receive(:rpc_notify).with('notifications/roots/list_changed', {})
+
+      client.roots = [{ 'uri' => 'file:///tmp', 'name' => 'tmp' }]
+    end
+
+    it 'passes request_meta from the client to every server' do
+      meta = { 'traceparent' => '00-abc-def-01' }
+      client = MCPClient::Client.new(mcp_server_configs: [{ type: 'stdio', command: 'a' }], request_meta: meta)
+      expect(client.servers.first.request_meta).to eq(meta)
+    end
+
+    it 'builds stdio configs with the protocol mode and discover timeout' do
+      config = MCPClient.stdio_config(command: 'x', protocol: :modern, discover_timeout: 3)
+      expect(config[:protocol]).to eq(:modern)
+      expect(config[:discover_timeout]).to eq(3)
+
+      server = MCPClient::ServerFactory.create(config)
+      expect(server.protocol_mode).to eq(:modern)
+      expect(server.discover_timeout).to eq(3)
+    end
+
+    it 'defaults the stdio protocol mode to :auto' do
+      server = MCPClient::ServerFactory.create(MCPClient.stdio_config(command: 'x'))
+      expect(server.protocol_mode).to eq(:auto)
+    end
+  end
+end
