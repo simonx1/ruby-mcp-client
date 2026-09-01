@@ -197,21 +197,6 @@ module MCPClient
     EXTENSION_ID_PATTERN = %r{\A(?:[A-Za-z](?:[A-Za-z0-9-]*[A-Za-z0-9])?\.)*[A-Za-z](?:[A-Za-z0-9-]*[A-Za-z0-9])?/
                               [A-Za-z0-9](?:[A-Za-z0-9._-]*[A-Za-z0-9])?\z}x
 
-    # The protocol version in use with this server: selected via
-    # server/discover (modern) or negotiated by initialize (legacy). nil
-    # until the first request establishes it.
-    # @return [String, nil]
-    def protocol_version
-      defined?(@protocol_version) ? @protocol_version : nil
-    end
-
-    # Whether this server speaks a modern (per-request metadata, no
-    # handshake) protocol revision (basic/versioning "Terminology").
-    # @return [Boolean]
-    def modern?
-      MCPClient::MODERN_PROTOCOL_VERSIONS.include?(protocol_version)
-    end
-
     # @return [Symbol, nil] :modern, :legacy, or nil before the era is known
     def protocol_era
       return nil if protocol_version.nil?
