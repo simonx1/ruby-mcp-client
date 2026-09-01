@@ -34,6 +34,12 @@ module MCPClient
                                       'capability was not declared')
         end
 
+        # SEP-2596: "thisServer" / "allServers" are deprecated (omit the field
+        # or send "none"); the request is still served as before.
+        if %w[thisServer allServers].include?(params['includeContext'])
+          MCPClient::Deprecations.warn(:include_context, @logger, detail: "includeContext #{params['includeContext']}")
+        end
+
         messages = params['messages'] || []
         # Both parties SHOULD validate message content (sampling.mdx
         # "Security Considerations"): the role, the content, a user message of

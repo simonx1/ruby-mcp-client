@@ -87,6 +87,7 @@ module MCPClient
                    retries: 0, retry_backoff: 1, name: nil, logger: nil)
       super(name: name)
       initialize_logger(logger)
+      MCPClient::Deprecations.warn(:http_sse_transport, @logger)
       @max_retries = retries
       @retry_backoff = retry_backoff
       # Normalize base_url: preserve trailing slash if explicitly provided for SSE endpoints
