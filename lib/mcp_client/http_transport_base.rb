@@ -536,6 +536,9 @@ module MCPClient
           end
           req.body = request.to_json
         end
+        # MCP 2026-07-28 caching: the result is bound to the Authorization
+        # the request went out with, middleware included.
+        note_sent_authorization(response)
 
         # MCP 2025-11-25 session management: HTTP 404 for a request carrying
         # Mcp-Session-Id means the session expired — the client MUST start a
@@ -719,9 +722,9 @@ module MCPClient
         end
 
         # Invalidated while in flight: this list is stale even if nothing
-        # newer was stored yet. Hand back whatever is current (nil makes the
-        # caller fetch again).
-        @tools
+        # newer was stored yet, and whatever is current may be another
+        # request's list — nil makes the caller fetch again.
+        nil
       end
     end
 

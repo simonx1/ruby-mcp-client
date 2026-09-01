@@ -235,7 +235,7 @@ module MCPClient
       begin
         ensure_connected
 
-        refetch_or_serve_stale(:tools, stale_list_value(:tools)) { fetch_tools_list }
+        refetch_or_serve_stale(:tools, stale_list_entry(:tools)) { fetch_tools_list }
       rescue MCPClient::Errors::ConnectionError, MCPClient::Errors::TransportError, MCPClient::Errors::ServerError
         # Re-raise these errors directly
         raise
@@ -331,7 +331,7 @@ module MCPClient
       @mutex.synchronize { @prompts_data = nil }
       begin
         ensure_connected
-        refetch_or_serve_stale(:prompts, stale_list_value(:prompts)) { fetch_prompts_list }
+        refetch_or_serve_stale(:prompts, stale_list_entry(:prompts)) { fetch_prompts_list }
       rescue MCPClient::Errors::ConnectionError, MCPClient::Errors::TransportError, MCPClient::Errors::ServerError
         raise
       rescue StandardError => e
@@ -344,15 +344,15 @@ module MCPClient
     def fetch_prompts_list
       ensure_connected
 
-      prompts_data = request_prompts_list
+      prompts = request_prompts_list.map { |prompt_data| MCPClient::Prompt.from_json(prompt_data, server: self) }
       @mutex.synchronize do
-        @prompts = prompts_data.map do |prompt_data|
-          MCPClient::Prompt.from_json(prompt_data, server: self)
-        end
-        attach_list_value(:prompts, @prompts)
+        @prompts = prompts
+        attach_list_value(:prompts, prompts)
       end
 
-      @mutex.synchronize { @prompts }
+      # This request's own list, never a re-read of @prompts (another
+      # request may have stored its list in between).
+      prompts
     rescue MCPClient::Errors::ConnectionError, MCPClient::Errors::TransportError, MCPClient::Errors::ServerError
       # Re-raise these errors directly
       raise
@@ -392,7 +392,7 @@ module MCPClient
       begin
         ensure_connected
         unless cursor
-          return refetch_or_serve_stale(:resources, stale_list_value(:resources)) do
+          return refetch_or_serve_stale(:resources, stale_list_entry(:resources)) do
             fetch_resources_list(nil)
           end
         end

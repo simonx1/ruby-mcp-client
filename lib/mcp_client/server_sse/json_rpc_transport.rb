@@ -242,6 +242,7 @@ module MCPClient
           end
           req.body = request.to_json
         end
+        note_sent_authorization(response) if respond_to?(:note_sent_authorization, true)
 
         msg = "Received JSON-RPC response: #{response.status}"
         msg += " (#{describe_body_size(response.body)})" if response.respond_to?(:body)

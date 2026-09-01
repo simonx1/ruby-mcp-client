@@ -28,6 +28,11 @@ module MCPClient
     # @return [String, nil]
     attr_accessor :authorization_context
 
+    # Identity of the fetch that recorded this entry: the list that fetch
+    # converts afterwards attaches to this entry and to no other.
+    # @return [Object, nil]
+    attr_accessor :fetch_token
+
     # Build an entry from a CacheableResult.
     # @param result [Hash, nil] the JSON-RPC result carrying ttlMs/cacheScope
     # @param value [Object] what to cache

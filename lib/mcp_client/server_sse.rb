@@ -154,15 +154,14 @@ module MCPClient
       begin
         ensure_initialized
 
-        prompts_data = request_prompts_list
+        prompts = request_prompts_list.map { |prompt_data| MCPClient::Prompt.from_json(prompt_data, server: self) }
         @mutex.synchronize do
-          @prompts = prompts_data.map do |prompt_data|
-            MCPClient::Prompt.from_json(prompt_data, server: self)
-          end
-          attach_list_value(:prompts, @prompts)
+          @prompts = prompts
+          attach_list_value(:prompts, prompts)
         end
 
-        @mutex.synchronize { @prompts }
+        # This request's own list, never a re-read of @prompts.
+        prompts
       rescue MCPClient::Errors::ConnectionError, MCPClient::Errors::TransportError, MCPClient::Errors::ServerError
         # Re-raise these errors directly
         raise
@@ -335,15 +334,14 @@ module MCPClient
       begin
         ensure_initialized
 
-        tools_data = request_tools_list
+        tools = request_tools_list.map { |tool_data| MCPClient::Tool.from_json(tool_data, server: self) }
         @mutex.synchronize do
-          @tools = tools_data.map do |tool_data|
-            MCPClient::Tool.from_json(tool_data, server: self)
-          end
-          attach_list_value(:tools, @tools)
+          @tools = tools
+          attach_list_value(:tools, tools)
         end
 
-        @mutex.synchronize { @tools }
+        # This request's own list, never a re-read of @tools.
+        tools
       rescue MCPClient::Errors::ConnectionError, MCPClient::Errors::TransportError, MCPClient::Errors::ServerError
         # Re-raise these errors directly
         raise
@@ -560,6 +558,16 @@ module MCPClient
     # @return [void]
     def note_request_authorization(authorization)
       Thread.current[:"mcp_client_request_authorization_#{object_id}"] = authorization_fingerprint(authorization)
+    end
+
+    # Remember the Authorization a request actually carried once it was sent.
+    # @param response [Faraday::Response, nil]
+    # @return [void]
+    def note_sent_authorization(response)
+      env = response.respond_to?(:env) ? response.env : nil
+      return unless env.respond_to?(:request_headers) && env.request_headers
+
+      note_request_authorization(env.request_headers['Authorization'] || env.request_headers['authorization'])
     end
 
     # Register a callback for elicitation requests (MCP 2025-06-18)
