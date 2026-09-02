@@ -994,13 +994,20 @@ RSpec.describe 'MCP 2026-07-28 tasks extension — round 5' do
   end
 
   it 'never enlarges the remaining timeout of a poll' do
-    client = client_for(stdio)
-    script_stdio(stdio, [{ 'result' => discover_result }])
-    allow(stdio).to receive(:rpc_request).and_call_original
-    allow(stdio).to receive(:rpc_request).with('tasks/get', anything, hash_including(timeout: a_value <= 0.001))
-                                         .and_return(detailed_task(status: 'completed', 'result' => call_result))
+    # A transport whose own read timeout — like MAX_TASK_REQUEST_TIMEOUT —
+    # is far above the caller's budget: the poll must ask for what is left
+    # of the budget and nothing wider. The wait's clock is frozen so the
+    # assertion is about that arithmetic, not about how much wall clock a
+    # loaded suite has taken by the time the poll goes out.
+    server = MCPClient::ServerStdio.new(command: 'echo test', read_timeout: 30)
+    client = client_for(server)
+    script_stdio(server, [{ 'result' => discover_result }])
+    allow(client).to receive(:monotonic_time).and_return(0.0)
+    allow(server).to receive(:rpc_request).and_call_original
+    allow(server).to receive(:rpc_request).with('tasks/get', anything, hash_including(timeout: a_value <= 2.0))
+                                          .and_return(detailed_task(status: 'completed', 'result' => call_result))
 
-    expect(client.wait_for_task('task-1', timeout: 0.001)).to be_completed
+    expect(client.wait_for_task('task-1', timeout: 2.0)).to be_completed
   end
 
   it 'reports the removal of tasks/list before asking for the extension' do

@@ -88,47 +88,89 @@ RSpec.describe 'MCP 2026-07-28 tasks extension — round 22' do
     }
   end
 
-  it 'does not spend an input round on a handler that timed out' do
-    slow = true
-    handled = 0
-    client = client_for(stdio, elicitation_handler: lambda { |_m, _s|
-      handled += 1
-      Kernel.sleep(0.3) if slow
+  # A handler that blocks until this example lets it finish: `entered` says
+  # it started, `release` lets it return. It replaces a handler that slept
+  # for a fixed time, so nothing here depends on a wall-clock margin holding
+  # under a loaded suite.
+  def blocking_handler(entered, release, blocking)
+    lambda { |_m, _s|
+      if blocking.value
+        entered << true
+        release.pop
+      end
       { action: 'accept', content: { 'n' => 'x' } }
+    }
+  end
+
+  # Block until the handler the wait abandoned has actually started: the
+  # thread outlives the wait, so it always gets there.
+  def await_start(entered)
+    raise 'the abandoned handler never started' if entered.pop(timeout: 5).nil?
+  end
+
+  # Block until another thread has made the state transition, rather than
+  # assuming a fixed delay was enough for it.
+  def wait_until(timeout: 5)
+    deadline = Process.clock_gettime(Process::CLOCK_MONOTONIC) + timeout
+    until yield
+      raise 'timed out waiting for the abandoned handler to release its keys' if
+        Process.clock_gettime(Process::CLOCK_MONOTONIC) > deadline
+
+      Kernel.sleep(0.005)
+    end
+  end
+
+  it 'does not spend an input round on a handler that timed out' do
+    blocking = Struct.new(:value).new(true)
+    entered = Queue.new
+    release = Queue.new
+    handled = 0
+    inner = blocking_handler(entered, release, blocking)
+    client = client_for(stdio, elicitation_handler: lambda { |message, schema|
+      handled += 1
+      inner.call(message, schema)
     })
     script_stdio(stdio, [{ 'result' => discover_result }, tool_list, { 'result' => task_result }, sticky_task_server])
     task = client.call_tool_as_task('slow', {})
 
     (MCPClient::Client::TaskSupport::MAX_TASK_INPUT_ROUNDS + 2).times do
-      expect { client.wait_for_task(task, timeout: 0.05) }.to raise_error(MCPClient::Errors::TaskError, /timed out/i)
-      Kernel.sleep(0.35) # the abandoned handler finishes
+      expect { client.wait_for_task(task, timeout: 0.3) }.to raise_error(MCPClient::Errors::TaskError, /timed out/i)
+      await_start(entered)
+      release << true # the abandoned handler finishes
+      wait_until { client.send(:answered_task_keys, stdio, 'task-1').empty? }
     end
     expect(client.send(:task_state, stdio, 'task-1')[:rounds]).to eq(0)
 
-    slow = false
+    blocking.value = false
     expect(client.wait_for_task(task)).to be_completed
     expect(handled).to eq(MCPClient::Client::TaskSupport::MAX_TASK_INPUT_ROUNDS + 3)
   end
 
   it 'does not present a key again while its abandoned handler is still running' do
+    blocking = Struct.new(:value).new(true)
+    entered = Queue.new
+    release = Queue.new
     handled = 0
-    client = client_for(stdio, elicitation_handler: lambda { |_m, _s|
+    inner = blocking_handler(entered, release, blocking)
+    client = client_for(stdio, elicitation_handler: lambda { |message, schema|
       handled += 1
-      Kernel.sleep(0.5)
-      { action: 'accept', content: { 'n' => 'x' } }
+      inner.call(message, schema)
     })
     script_stdio(stdio, [{ 'result' => discover_result }, tool_list, { 'result' => task_result }, sticky_task_server])
     task = client.call_tool_as_task('slow', {})
 
-    expect { client.wait_for_task(task, timeout: 0.05) }.to raise_error(MCPClient::Errors::TaskError, /timed out/i)
+    expect { client.wait_for_task(task, timeout: 0.3) }.to raise_error(MCPClient::Errors::TaskError, /timed out/i)
+    await_start(entered)
     # The first presentation is still running: the retry polls, it does not ask again.
     expect { client.wait_for_task(task, timeout: 0.1) }.to raise_error(MCPClient::Errors::TaskError, /timed out/i)
     expect(handled).to eq(1)
     expect(client.send(:answered_task_keys, stdio, 'task-1')).to include('k1')
 
-    Kernel.sleep(0.6) # the abandoned handler finished; its answer was dropped
+    release << true # the abandoned handler finishes; its answer is dropped
+    wait_until { client.send(:answered_task_keys, stdio, 'task-1').empty? }
     expect(client.send(:answered_task_keys, stdio, 'task-1')).to be_empty
 
+    blocking.value = false
     expect(client.wait_for_task(task)).to be_completed
     expect(handled).to eq(2)
   end

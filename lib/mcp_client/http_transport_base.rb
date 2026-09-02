@@ -142,6 +142,12 @@ module MCPClient
     def terminate_session
       return true unless @session_id
 
+      # The session is over from here whatever the DELETE answers (every
+      # outcome below clears the id), and it ends without a #cleanup: the
+      # epoch moves so nothing keyed by it — the tasks extension's task ids,
+      # answered and pending input keys — outlives it into the session the
+      # next request establishes, which may reuse those very ids.
+      bump_session_epoch
       conn = http_connection
 
       begin
@@ -225,6 +231,18 @@ module MCPClient
     attr_reader :discover_timeout
 
     private
+
+    # Store the session id a handshake established. A handshake that lands a
+    # different id on a live session replaced it — the 404 recovery is only
+    # one way there, and none of them goes through #cleanup — so the epoch
+    # moves with it: task ids and input keys are per session and reusable,
+    # and nothing the previous one recorded may colour the next.
+    # @param session_id [String] the validated id the server assigned
+    # @return [void]
+    def capture_session_id(session_id)
+      bump_session_epoch if @session_id && @session_id != session_id
+      @session_id = session_id
+    end
 
     # Validate and store the protocol-mode options shared by the HTTP transports.
     # @param protocol [Symbol] :auto, :modern or :legacy
