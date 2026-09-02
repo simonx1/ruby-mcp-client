@@ -469,7 +469,9 @@ module MCPClient
       result = rpc_request('resources/templates/list', params) || {}
       record_cache_hint(:templates, result, epoch: epoch) unless cursor
       templates = (result['resourceTemplates'] || []).map { |td| MCPClient::ResourceTemplate.from_json(td, server: self) }
-      { 'resourceTemplates' => templates, 'nextCursor' => result['nextCursor'] }
+      templates_result = { 'resourceTemplates' => templates, 'nextCursor' => result['nextCursor'] }
+      attach_list_value(:templates, templates_result) unless cursor
+      templates_result
     rescue MCPClient::Errors::ServerError => e
       # 2026-07-28 protocol errors carry actionable data (requiredCapabilities,
       # supported versions); keep them intact instead of wrapping.

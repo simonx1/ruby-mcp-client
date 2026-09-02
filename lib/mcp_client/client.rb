@@ -434,6 +434,9 @@ module MCPClient
         @tool_cache.clear
         @prompt_cache.clear
         @resource_cache.clear
+        # A slice's tag goes with the slice: a leftover tag must not vouch
+        # for a server whose slice a later, partial refill never rebuilt.
+        @cache_params.clear
       end
     end
 
@@ -838,8 +841,11 @@ module MCPClient
         _fingerprint, token = @cache_params[kind][server]
         current = server.send(:cache_entry_token, kind)
         next current.nil? if token == MCPClient::ResultCaching::LEGACY_ENTRY
+        next false unless !token.nil? && !current.nil? && current.equal?(token)
 
-        !token.nil? && !current.nil? && current.equal?(token)
+        # The verdict may be old by the time the copy is made: the entry's
+        # own hint is re-read here (transport cache lock only).
+        !server.respond_to?(:cache_entry_fresh?, true) || server.send(:cache_entry_fresh?, kind)
       end
     end
 
@@ -1017,18 +1023,21 @@ module MCPClient
         @cache_mutex.synchronize do
           @cache_version += 1
           @tool_cache.clear
+          @cache_params.delete(:tools)
         end
       when 'notifications/prompts/list_changed'
         logger.warn("[#{server_id}] Prompt list has changed, clearing prompt cache")
         @cache_mutex.synchronize do
           @cache_version += 1
           @prompt_cache.clear
+          @cache_params.delete(:prompts)
         end
       when 'notifications/resources/list_changed'
         logger.warn("[#{server_id}] Resource list has changed, clearing resource cache")
         @cache_mutex.synchronize do
           @cache_version += 1
           @resource_cache.clear
+          @cache_params.delete(:resources)
         end
       end
     end

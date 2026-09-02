@@ -265,20 +265,30 @@ module MCPClient
     # @raise [MCPClient::Errors::ServerError] if server returns an error
     # @raise [MCPClient::Errors::ResourceReadError] for other errors during resource template listing
     def list_resource_templates(cursor: nil)
+      cached = cursor ? nil : fresh_list_value(:templates) { @mutex.synchronize { @templates_result } }
+      return cached if cached
+
       ensure_initialized
       params = {}
       params['cursor'] = cursor if cursor
       epoch = cache_epoch(:templates)
       result = rpc_request('resources/templates/list', params)
       # MCP 2026-07-28 caching: the first page's hint decides freshness,
-      # counted from receipt.
+      # counted from receipt (the list is attached once converted).
       record_cache_hint(:templates, result, epoch: epoch) unless cursor
 
       templates = (result['resourceTemplates'] || []).map do |template_data|
         MCPClient::ResourceTemplate.from_json(template_data, server: self)
       end
+      templates_result = { 'resourceTemplates' => templates, 'nextCursor' => result['nextCursor'] }
 
-      { 'resourceTemplates' => templates, 'nextCursor' => result['nextCursor'] }
+      @mutex.synchronize do
+        unless cursor
+          @templates_result = attach_list_value(:templates, templates_result) ? templates_result : nil
+        end
+      end
+
+      templates_result
     rescue MCPClient::Errors::ConnectionError, MCPClient::Errors::TransportError, MCPClient::Errors::ServerError
       raise
     rescue StandardError => e

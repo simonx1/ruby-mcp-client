@@ -459,9 +459,31 @@ module MCPClient
     # @return [Hash] result containing resourceTemplates array and optional nextCursor
     # @raise [MCPClient::Errors::ResourceReadError] for other errors during resource template listing
     def list_resource_templates(cursor: nil)
+      cached = cursor ? nil : fresh_list_value(:templates) { @mutex.synchronize { @templates_result } }
+      return cached if cached
+
+      begin
+        ensure_connected
+        unless cursor
+          return refetch_or_serve_stale(:templates, stale_list_entry(:templates)) do
+            fetch_templates_list(nil)
+          end
+        end
+
+        fetch_templates_list(cursor)
+      rescue MCPClient::Errors::ConnectionError, MCPClient::Errors::TransportError, MCPClient::Errors::ServerError
+        raise
+      rescue StandardError => e
+        raise MCPClient::Errors::ResourceReadError, "Error listing resource templates: #{e.message}"
+      end
+    end
+
+    # Fetch one page of resources/templates/list, caching the first page.
+    # @param cursor [String, nil]
+    # @return [Hash]
+    def fetch_templates_list(cursor)
       params = {}
       params['cursor'] = cursor if cursor
-      ensure_connected
       epoch = cache_epoch(:templates)
       result = rpc_request('resources/templates/list', params)
       record_cache_hint(:templates, result, epoch: epoch) unless cursor
@@ -469,12 +491,15 @@ module MCPClient
       templates = (result['resourceTemplates'] || []).map do |template_data|
         MCPClient::ResourceTemplate.from_json(template_data, server: self)
       end
+      templates_result = { 'resourceTemplates' => templates, 'nextCursor' => result['nextCursor'] }
 
-      { 'resourceTemplates' => templates, 'nextCursor' => result['nextCursor'] }
-    rescue MCPClient::Errors::ConnectionError, MCPClient::Errors::TransportError, MCPClient::Errors::ServerError
-      raise
-    rescue StandardError => e
-      raise MCPClient::Errors::ResourceReadError, "Error listing resource templates: #{e.message}"
+      @mutex.synchronize do
+        unless cursor
+          @templates_result = attach_list_value(:templates, templates_result) ? templates_result : nil
+        end
+      end
+
+      templates_result
     end
 
     # Subscribe to resource updates

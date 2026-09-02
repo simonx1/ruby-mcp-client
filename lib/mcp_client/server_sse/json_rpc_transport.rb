@@ -137,9 +137,9 @@ module MCPClient
             # Dated by check_for_result from the stream's arrival time.
             wait_for_sse_result(request, timeout: timeout)
           else
-            result = parse_direct_response(response)
+            # Dated from receipt, before the body is decoded.
             note_response_received_at if respond_to?(:note_response_received_at, true)
-            result
+            parse_direct_response(response)
           end
         rescue MCPClient::Errors::ConnectionError, MCPClient::Errors::TransportError, MCPClient::Errors::ServerError
           raise

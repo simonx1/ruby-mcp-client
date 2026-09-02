@@ -17,6 +17,15 @@ metadata). Each feature lands in its own PR; this section accumulates them.
   no longer makes every private entry look foreign; a queued stdio line or
   SSE event is dated from its arrival, before it is decoded.
 
+- **Templates, receipt times and copies (round 23).** Resource template
+  lists are cached like the other lists on every transport (served while
+  fresh, copied, served stale on a failed re-fetch on HTTP); a direct
+  (non-SSE) response is dated before it is parsed; resource contents are
+  copied iteratively; the client-level list caches forget a server's tag
+  with its slice (`clear_cache`, `list_changed`), so a partial refill
+  never serves a snapshot that omits a live server, and the freshness of
+  every slice's entry is re-read under the cache lock right before a copy
+  is handed out.
 - **Snapshots and stale fallbacks never outlive cleanup (round 22).** A
   client-level snapshot is served only while every slice still comes from
   the transport entry it was recorded against (re-checked under the cache
