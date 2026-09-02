@@ -17,8 +17,10 @@ module MCPClient
       # its verdict is only partial. Annotations (`format`, `contentSchema`)
       # and assertions of another instance type decide nothing and leave the
       # verdict whole.
+      # @param deadline [Float, nil] monotonic deadline the checks run under
+      #   (the coverage checks match server-controlled patterns)
       # @return [Boolean]
-      def partial_keywords?(schema, dialect, data)
+      def partial_keywords?(schema, dialect, data, deadline = nil)
         applicable = UNSUPPORTED_ASSERTIONS_ANY_TYPE +
                      UNSUPPORTED_ASSERTIONS_BY_TYPE.select { |type, _| data.is_a?(type) }.values.flatten
         # draft-07 `format` asserts (Validation Section 7.2); the validator
@@ -26,7 +28,7 @@ module MCPClient
         # undecided there, while 2019-09 / 2020-12 only annotate.
         applicable += ['format'] if dialect == DRAFT_07 && data.is_a?(String)
         (schema.keys & applicable).any? do |keyword|
-          keyword_known?(keyword, dialect) && effective_assertion?(schema, keyword, data, dialect)
+          keyword_known?(keyword, dialect) && effective_assertion?(schema, keyword, data, dialect, deadline)
         end
       end
 
@@ -45,14 +47,14 @@ module MCPClient
       # (additionalProperties true, uniqueItems false, minProperties 0, an
       # empty dependency map) decides nothing.
       # @return [Boolean]
-      def effective_assertion?(schema, keyword, data, dialect = nil)
+      def effective_assertion?(schema, keyword, data, dialect = nil, deadline = nil)
         value = schema[keyword]
         case keyword
         when 'contains', 'minContains', 'maxContains', 'additionalItems', 'unevaluatedItems', 'uniqueItems'
           effective_array_assertion?(schema, keyword, value, data, dialect)
         when 'additionalProperties', 'unevaluatedProperties', 'propertyNames', 'minProperties', 'maxProperties',
              'dependentRequired', 'dependentSchemas', 'dependencies', 'patternProperties'
-          effective_object_assertion?(schema, keyword, value, data, dialect)
+          effective_object_assertion?(schema, keyword, value, data, dialect, deadline)
         when 'multipleOf' then value.is_a?(Numeric) && data.is_a?(Numeric)
         else true
         end
@@ -119,29 +121,42 @@ module MCPClient
       # The object assertions whose effect depends on the instance's
       # properties.
       # @return [Boolean]
-      def effective_object_assertion?(schema, keyword, value, data, dialect = nil)
+      def effective_object_assertion?(schema, keyword, value, data, dialect = nil, deadline = nil)
         return false unless data.is_a?(Hash)
 
         case keyword
         when 'additionalProperties', 'unevaluatedProperties'
-          ![true, {}].include?(value) && uncovered_property?(schema, keyword, data, dialect)
+          ![true, {}].include?(value) && uncovered_property?(schema, keyword, data, dialect, deadline)
         when 'propertyNames' then ![true, {}].include?(value) && !data.empty?
         when 'minProperties' then value.is_a?(Numeric) && data.size < value
         when 'maxProperties' then value.is_a?(Numeric) && data.size > value
-        when 'patternProperties' then effective_pattern_properties?(value, data)
+        when 'patternProperties' then effective_pattern_properties?(value, data, deadline)
         else
-          value.is_a?(Hash) && value.any? { |trigger, dep| data.key?(trigger.to_s) && dependency_can_fail?(dep) }
+          # An instance may carry either key form, so a trigger is present
+          # when either form is (like `required` and `properties`).
+          value.is_a?(Hash) &&
+            value.any? { |trigger, dep| property_present?(data, trigger) && dependency_can_fail?(dep) }
         end
+      end
+
+      # @param data [Hash] the instance
+      # @param name [Object] the property name a schema keyword names
+      # @return [Boolean] whether the instance carries the property in either
+      #   key form
+      def property_present?(data, name)
+        name = name.to_s
+        data.key?(name) || data.key?(name.to_sym)
       end
 
       # `patternProperties` asserts only through a pattern some property
       # name matches whose schema is not a tautology.
       # @return [Boolean]
-      def effective_pattern_properties?(value, data)
+      def effective_pattern_properties?(value, data, deadline = nil)
         return false unless value.is_a?(Hash) && data.is_a?(Hash)
 
         value.any? do |pattern, sub|
-          ![true, {}].include?(sub) && data.each_key.any? { |name| pattern_matches?(pattern.to_s, name.to_s) }
+          ![true, {}].include?(sub) &&
+            data.each_key.any? { |name| pattern_matches?(pattern.to_s, name.to_s, deadline) }
         end
       end
 
@@ -159,7 +174,7 @@ module MCPClient
       # pattern is covered (an unreadable pattern is assumed to match
       # nothing, keeping the branch undecided).
       # @return [Boolean]
-      def uncovered_property?(schema, keyword, data, dialect)
+      def uncovered_property?(schema, keyword, data, dialect, deadline = nil)
         return false if keyword == 'unevaluatedProperties' && schema.key?('additionalProperties') &&
                         keyword_known?('additionalProperties', dialect)
 
@@ -169,13 +184,25 @@ module MCPClient
           name = name.to_s
           next false if named.include?(name)
 
-          patterns.none? { |pattern| pattern_matches?(pattern, name) }
+          patterns.none? { |pattern| pattern_matches?(pattern, name, deadline) }
         end
       end
 
+      # Match a server-supplied pattern against a property name. Both come
+      # from the peer, so — exactly like {.validate_pattern} — the match runs
+      # under the validation-wide deadline: a backtracking expression here
+      # decides only whether a branch is undecided, and must not be able to
+      # hold the calling thread for it.
+      # @param deadline [Float, nil] monotonic deadline for the whole validation
       # @return [Boolean]
-      def pattern_matches?(pattern, name)
-        Regexp.new(pattern).match?(name)
+      # @raise [Aborted] when the budget is exhausted
+      def pattern_matches?(pattern, name, deadline = nil)
+        remaining = pattern_budget_remaining(deadline)
+        raise Aborted, "validation time budget exhausted before pattern #{clip(pattern.inspect)}" if remaining.zero?
+
+        Regexp.new(pattern, timeout: remaining).match?(name)
+      rescue Regexp::TimeoutError
+        raise Aborted, "pattern #{clip(pattern.inspect)} exceeded the #{PATTERN_MATCH_TIMEOUT}s matching budget"
       rescue RegexpError, TypeError
         false
       end

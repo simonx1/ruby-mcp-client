@@ -57,31 +57,31 @@ module MCPClient
 
       # A schema a pointer reaches outside every indexed position (inside
       # `default`, another data keyword or a vendor member) is still part of
-      # the resource it was reached from: it is indexed on arrival, so a
-      # `$ref` written in it resolves within that resource, and a document
-      # given with symbol keys is normalized there like everywhere else
-      # (data values are kept as given for equality; a target resolved as a
-      # schema gets one string-keyed copy, memoized by identity).
+      # the resource it was reached from: it (and what it holds) is indexed
+      # on arrival, so a `$ref` written anywhere in it resolves within that
+      # resource and its nested schemas follow the dialect it adopts, and
+      # the document it holds is normalized like everywhere else (data
+      # values are kept as given for equality; a target resolved as a schema
+      # gets one string-keyed copy, memoized by identity).
       # @return [Object] the target (or its normalized copy)
       def adopt_reached_target(target, resource, index)
         return target unless target.is_a?(Hash)
-
-        if target.each_key.any? { |key| !key.is_a?(String) }
-          # Copied under the same structural budget as the root document: a
-          # data keyword may not hide an unbounded map behind a pointer.
-          copies = (index[:normalized] ||= {}.compare_by_identity)
-          index[:budget] ||= { objects: 0, deadline: nil }
-          target = copies[target] ||= deep_stringify(target, 0, index[:budget])
-        end
+        # An indexed position was already walked, charged and attributed.
         return target if index[:resources].key?(target)
 
-        inherited = index[:dialects][resource]
-        if resource_root?(target, inherited)
-          index[:resources][target] = target
-          index[:dialects][target] = embedded_dialect(target, inherited) || inherited
-        else
-          index[:resources][target] = resource
-        end
+        # Copied under the same structural budget as the root document,
+        # whatever key form it arrived in (over the wire every key is a
+        # string): a data keyword may not hide an unbounded map behind a
+        # pointer.
+        copies = (index[:normalized] ||= {}.compare_by_identity)
+        index[:budget] ||= { objects: 0, deadline: nil }
+        target = copies[target] ||= deep_stringify(target, 0, index[:budget])
+        return target if index[:resources].key?(target)
+
+        # The adopted target is indexed like any schema position, so its own
+        # `$id` / `$schema` and the positions below it are seen: within the
+        # bounds the index already runs under.
+        index_positions(index, [[target, resource, 0, index[:dialects][resource], true]])
         target
       end
 
@@ -103,12 +103,21 @@ module MCPClient
       #   :duplicates (names declared more than once within one resource)
       def anchor_index(root, dialect)
         index = { resources: {}.compare_by_identity, anchors: {}.compare_by_identity,
-                  dialects: {}.compare_by_identity, duplicates: [] }
+                  dialects: {}.compare_by_identity, duplicates: [], visited: 0, truncated: false }
         index[:dialects][root] = dialect
-        pending = [[root, root, 0, dialect, true]]
-        visited = 0
-        index[:truncated] = false
-        until pending.empty? || visited >= MAX_SUBSCHEMAS
+        index_positions(index, [[root, root, 0, dialect, true]])
+        index
+      end
+
+      # Index every schema position reachable from the pending seeds, within
+      # the visit and depth bounds the whole index runs under (an adopted
+      # pointer target is seeded here too, so it shares them).
+      # @param index [Hash] the index being built
+      # @param pending [Array<Array>] seeds: schema, resource, depth,
+      #   dialect, whether the position may declare names
+      # @return [void]
+      def index_positions(index, pending)
+        until pending.empty? || index[:visited] >= MAX_SUBSCHEMAS
           schema, resource, depth, dialect, named = pending.shift
           next unless schema.is_a?(Hash)
           next if index[:resources].key?(schema)
@@ -117,7 +126,7 @@ module MCPClient
           # would otherwise resolve under guesses.
           (index[:truncated] = true) && next if depth > MAX_SCHEMA_DEPTH
 
-          visited += 1
+          index[:visited] += 1
           if resource_root?(schema, dialect)
             # A resource is a schema wherever it sits: one reached through
             # a bag the dialect does not walk names its own anchors, though
@@ -138,7 +147,6 @@ module MCPClient
         # Objects left unindexed at the bound would resolve and validate
         # under guesses; the index says so and the schema is unusable.
         index[:truncated] ||= pending.any? { |schema, *| schema.is_a?(Hash) && !index[:resources].key?(schema) }
-        index
       end
 
       # Record the plain names a schema object declares for its resource; a

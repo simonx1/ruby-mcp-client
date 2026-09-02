@@ -7,6 +7,21 @@ metadata). Each feature lands in its own PR; this section accumulates them.
 
 ### JSON Schema handling
 
+- **Bounded coverage matching and adopted targets (round 21).** The pattern
+  matching behind the `patternProperties` / `additionalProperties` /
+  `unevaluatedProperties` coverage checks runs under the validation
+  deadline and the same regexp timeout as `pattern`, so a backtracking
+  expression cannot hold the calling thread. Every schema a pointer adopts
+  from a data or vendor keyword is charged against
+  `MAX_STRUCTURAL_OBJECTS` — string keys included, which is what arrives
+  over the wire — and its reachable positions are indexed within the
+  existing bounds, so a nested `$ref` such as `#/default/$defs/i` resolves
+  and the schemas inside an adopted resource keep its dialect. Dependency
+  triggers are looked up in both key forms. An explicit
+  `"outputSchema": null` in `tools/list` is a declaration, not an absent
+  field: the client still requires `structuredContent` and reports the null
+  schema as unusable, like any other invalid schema root.
+
 - **Inert assertions and unvisited positions (round 20).** Under `not` /
   `oneOf` / `if`, `contains` of `true` / `{}` on an array that already
   holds the items `minContains` requires, `unevaluatedItems` once such a
