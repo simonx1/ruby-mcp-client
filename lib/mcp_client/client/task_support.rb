@@ -1,5 +1,8 @@
 # frozen_string_literal: true
 
+require_relative '../task'
+require_relative '../errors'
+
 module MCPClient
   class Client
     # MCP 2026-07-28 tasks extension (io.modelcontextprotocol/tasks) support
