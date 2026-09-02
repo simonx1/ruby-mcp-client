@@ -190,7 +190,11 @@ module MCPClient
           req.url(@endpoint)
           headers.each { |k, v| req.headers[k] = v }
           req.headers['Content-Type'] = 'application/json'
-          req.body = JSON.generate('jsonrpc' => '2.0', 'id' => 0, 'method' => method, 'params' => params)
+          probe = { 'jsonrpc' => '2.0', 'id' => 0, 'method' => method, 'params' => params }
+          req.body = JSON.generate(probe)
+          # The routing headers a real modern POST carries, so middleware
+          # that authenticates by them answers as it would for the request.
+          modern_request_headers(probe).each { |k, v| req.headers[k] = v } if modern?
         end
         env = request.to_env(conn)
         conn.builder.handlers.each do |handler|

@@ -83,7 +83,7 @@ RSpec.describe 'MCP 2026-07-28 cacheable results — round 11' do
       server = streamable(headers: { 'Authorization' => 'Bearer alice' }, faraday_config: ->(f) { f.use opaque })
       expect(server.list_tools.map(&:name)).to eq(['alice-tool'])
 
-      expect(server.send(:current_authorization_context)).to be_nil.or eq(:unknown)
+      expect(server.send(:current_authorization_context)).to eq(:unknown)
       # A private entry cannot be matched to an unknown context: re-fetch.
       expect(server.list_tools.map(&:name)).to eq(['alice-tool'])
       expect(requests.size).to eq(2)

@@ -7,6 +7,18 @@ metadata). Each feature lands in its own PR; this section accumulates them.
 
 ### Cacheable results (`ttlMs` / `cacheScope`)
 
+- **Round 13.** An uncacheable `resources/read` (a multi round-trip retry,
+  no `ttlMs`, `ttlMs` 0, stale on arrival) is not stored and drops the
+  per-URI slot only when it still holds the entry that read set out to
+  replace — another context's private entry, or one a later fetch
+  installed meanwhile, stays. The freshness probe carries the routing
+  headers a real modern POST carries (`MCP-Protocol-Version`,
+  `Mcp-Method`, `Mcp-Name`), so host middleware that authenticates by them
+  answers as for the request. Cached tools, prompts and resources lists
+  are handed out as copies (`MCPClient::DeepCopy`, mixed into `Tool`,
+  `Prompt`, `Resource` and `ResourceTemplate`): a caller cannot change the
+  cache or the `x-mcp-header` derivation through what it received.
+
 - **Freshness hints honoured.** `server/discover`, `tools/list`,
   `prompts/list`, `resources/list`, `resources/templates/list` and
   `resources/read` results carry `ttlMs` and `cacheScope`

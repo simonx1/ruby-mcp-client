@@ -1,8 +1,12 @@
 # frozen_string_literal: true
 
+require_relative 'deep_copy'
+
 module MCPClient
   # Representation of an MCP tool
   class Tool
+    include MCPClient::DeepCopy
+
     # @!attribute [r] name
     #   @return [String] the name of the tool
     # @!attribute [r] title

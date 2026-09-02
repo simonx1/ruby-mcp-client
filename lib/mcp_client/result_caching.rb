@@ -207,7 +207,7 @@ module MCPClient
       return (block_given? ? yield : nil) if entry.nil?
       return nil unless entry.value && entry.fresh?(now: monotonic_now)
 
-      entry.value
+      MCPClient::DeepCopy.copy(entry.value)
     end
 
     # The list recorded for a kind whatever its freshness: the candidate for
@@ -276,7 +276,9 @@ module MCPClient
         return false unless entry && entry.fetch_token.equal?(token)
         return false if entry.cache_scope == 'private' && entry.authorization_context != context
 
-        entry.value = value
+        # The cache keeps its own copy: what the fetch returns to its caller
+        # may be changed freely.
+        entry.value = MCPClient::DeepCopy.copy(value)
         true
       end
     end
@@ -304,7 +306,7 @@ module MCPClient
     def stale_fallback_for(kind, entry, context: :current)
       return nil unless entry.is_a?(MCPClient::CachedResult) && entry.value
 
-      entry_in_current_context?(entry, context: context, kind: kind) ? entry.value : nil
+      entry_in_current_context?(entry, context: context, kind: kind) ? MCPClient::DeepCopy.copy(entry.value) : nil
     end
 
     # The freshness hint recorded for an operation.
@@ -420,16 +422,31 @@ module MCPClient
       # result that is stale on arrival would only take up memory. A result
       # reached through a multi round-trip retry MUST NOT be cached either,
       # nor one whose entry was invalidated while the request was in flight.
+      store_read_entry(key, entry, replacing: cached, epoch: epoch, now: received_at)
+      # The caller gets its own copies; the cached ones stay untouched.
+      contents.map(&:dup)
+    end
+
+    # Store a read's entry, or drop the slot it replaces. An uncacheable
+    # result is not stored, and the slot is dropped only when it still holds
+    # the entry the read set out to replace (its own context's, seen when it
+    # started): another context's private entry, or one a later fetch
+    # installed meanwhile, stays.
+    # @param key [String] the read cache key
+    # @param entry [MCPClient::CachedResult] the read's entry
+    # @param replacing [MCPClient::CachedResult, nil] the entry seen when the read started
+    # @param epoch [Integer] the cache epoch when the read started
+    # @param now [Float] the receipt time
+    # @return [void]
+    def store_read_entry(key, entry, replacing:, epoch:, now:)
       cache_entries_mutex.synchronize do
-        if last_result_from_round_trip? || !entry.hint? || !entry.fresh?(now: received_at)
-          cache_entries.delete(key)
+        if last_result_from_round_trip? || !entry.hint? || !entry.fresh?(now: now)
+          cache_entries.delete(key) if replacing && cache_entries[key].equal?(replacing)
         elsif epoch == (@cache_epoch || 0)
-          prune_read_entries(now: received_at)
+          prune_read_entries(now: now)
           cache_entries[key] = entry
         end
       end
-      # The caller gets its own copies; the cached ones stay untouched.
-      contents.map(&:dup)
     end
 
     # Drop expired reads and, past {MAX_CACHED_READS}, the oldest ones, so
