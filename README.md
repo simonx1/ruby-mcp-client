@@ -157,7 +157,13 @@ without the URI closes the subscription instead of leaving the resource
 reported as watched while nothing watches it — including one that arrives in
 the window between the acknowledgment `subscribe_resource` waited for and the
 URI being mapped to the stream, which is checked once more with the mapping in
-place before the call answers.
+place before the call answers. A stream already mapped to the URI is reused
+only while the server's word on that URI stands: one whose replacement request
+is in flight — after its HTTP connection dropped, or the stdio process it was
+on restarted — is waited for rather than reported as a watch, because that
+request is a new listen the server holds no state for and may reject or
+acknowledge without the URI. Only a stream the server is actively honouring
+counts as a live watch.
 
 On a 2026-07-28 server a host can also open a stream of its own with
 `server.listen(notifications: { tools_list_changed: true }) { |method, params| … }`
@@ -175,26 +181,36 @@ most queued, so a stream watching several resources or tasks never loses the
 only queued update for a quiet one to make room for a busy one. Every MCP
 notification is a "look again" signal about state the host re-reads for itself,
 so a later notice of the same thing carries what the dropped one said, while
-the only notice of another thing carries what nothing else would. A single
-notification larger than the whole byte budget is still delivered, alone, and
-is not charged against the budget it exceeds by itself — otherwise the queue
-would stay over budget for as long as it held that payload and the next notice
-of anything else would evict it. Only one payload is ever exempt, so what the
-queue retains stays within the budget plus one peer-sized payload.
+the only notice of another thing carries what nothing else would. Two rules hold
+this together: every queued notification is charged exactly what it retains,
+and every eviction gives up an entry whose removal relieves the pressure that
+caused it — the byte budget considers only the entries charged against it, the
+count ceiling considers them all — so overflow always makes progress and no
+signal is spent on pressure that discarding it cannot relieve. A notification
+larger than the whole byte budget is not charged against it: it is held in a
+slot of its own, and there is only ever one such slot, so it is neither lost
+for being large nor able to displace anything else, and what the queue retains
+stays within the budget plus one peer-sized payload.
 `pending_notifications` / `pending_notification_bytes` /
 `dropped_notifications` report how far behind a listener fell. Caches are
 dropped *before* a notification reaches the listeners, so a listener reacting
 to a `list_changed` notification by calling `list_tools` (or the prompt or
 resource equivalents) always re-fetches rather than reading the entry the
 notification just invalidated; an `on_notification` callback that raises is
-logged and stops neither the invalidation nor the delivery. The requested
+logged and stops neither the invalidation nor the delivery, and one that edits
+the payload it is handed can neither drop nor redirect it — the subscription a
+notification belongs to is resolved before the callback sees it. The requested
 filter is copied and frozen when the subscription is created, so a caller that
 keeps and mutates the array it passed cannot change the request that goes out
 (Streamable HTTP builds it on the stream's own thread) or what a reconnect asks
 for. `unsupported` names the requested fields the acknowledgment did not really
 grant, read from its values rather than its keys: a `resourceSubscriptions`
 echoed with none of the requested URIs, or a flag acknowledged as `false`,
-counts as unsupported. `active?` answers false while a dropped stream
+counts as unsupported. `acknowledged` is a frozen copy of what the server
+granted, arrays and strings included: the notification it arrives in is handed
+to `on_notification` and to the subscription's listeners, and host code editing
+it in place must not be able to rewrite the subscription's own record of the
+watch. `active?` answers false while a dropped stream
 waits to re-open, and a closing response the client cannot recognize (an unknown
 `resultType`, a missing or scalar result) fails the subscription instead of
 closing it gracefully. On Streamable HTTP closing the SSE response stream *is*
@@ -206,14 +222,21 @@ closed. On stdio a server process that exits on its own is restarted at once
 while subscriptions are open, since a host that is only waiting for
 notifications never makes the request that would otherwise restart it, and the
 subscriptions are re-sent on the new process; if it cannot be restarted, or if
-the restarted process stays up for less than
-`MCPClient::ServerStdio::SUBSCRIPTION_RESTART_MIN_INTERVAL` — counted from the
-moment its handshake was answered, so a server whose start-up alone takes
-longer than that and which then exits is not respawned for ever, and counted
-per session even when one restart begins while the previous one is still
-finishing — they end with that error rather than waiting for ever. A restarted
-process that negotiates a pre-2026-07-28 version cannot carry them either, and
-ends them with a `CapabilityError` rather than leaving them `:reconnecting`.
+the process they were last re-sent to died less than
+`MCPClient::ServerStdio::SUBSCRIPTION_RESTART_MIN_INTERVAL` after receiving
+them, they end with that error rather than waiting for ever. That interval runs
+from the moment that process received them, not from the moment a restart was
+attempted, so a server whose start-up alone takes longer is not credited with
+its own handshake and respawned for ever; both moments are recorded on the
+record of the process itself, and the question is asked in the one place the
+subscriptions are handed over, so the bound holds however a host request and
+the reader's own restart interleave — whichever of them re-establishes the
+process. A restarted process that negotiates a pre-2026-07-28 version cannot
+carry them either, and ends them with a `CapabilityError` rather than leaving
+them `:reconnecting`. A listen write that fails after the process is gone
+leaves the subscription to the restart that is already queued to re-send it,
+and one that fails after a newer stream replaced it raises only if that newer
+stream has itself failed.
 
 ## MCP 2025-11-25 Features
 

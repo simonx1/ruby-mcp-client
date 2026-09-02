@@ -58,10 +58,12 @@ module MCPClient
     #
     # This changes when overflow starts, not what it discards: whichever
     # ceiling the arriving notification would breach, the entry that goes is
-    # still chosen by identity. A single notification larger than the whole
-    # budget is still delivered, alone — the queue empties for it — so the
-    # retained total is at worst one peer-sized payload rather than
-    # {MAX_PENDING_NOTIFICATIONS} of them, and no signal is lost to its size.
+    # still chosen by identity, and only ever an entry whose removal relieves
+    # the breach. A notification larger than the whole budget is not charged
+    # against it and is held in a slot of its own, of which there is only ever
+    # one — so the retained total is the budget plus at worst one peer-sized
+    # payload rather than {MAX_PENDING_NOTIFICATIONS} of them, and no signal
+    # is lost to its size or displaced by one.
     MAX_PENDING_NOTIFICATION_BYTES = 8 * 1024 * 1024
 
     # The states {#wait_until_settled} waits for: the server has answered the
@@ -179,6 +181,13 @@ module MCPClient
       @mutex.synchronize { @state == :closed }
     end
 
+    # @return [Boolean] whether it is waiting for a transport to re-establish
+    #   it — the stream dropped, or the stdio process it was on exited, and
+    #   the transport that noticed has queued it for the next session
+    def reconnecting?
+      @mutex.synchronize { @state == :reconnecting }
+    end
+
     # @return [Boolean] whether the server ended it with a response to the listen request
     def closed_gracefully?
       @mutex.synchronize { @closed_gracefully }
@@ -214,6 +223,51 @@ module MCPClient
       wanted = Array(@requested['resourceSubscriptions'])
       granted = ack['resourceSubscriptions'].is_a?(Array) ? ack['resourceSubscriptions'] : []
       wanted - granted
+    end
+
+    # Whether this stream is, right now, an active acknowledged watch of a
+    # resource: the server granted that URI and the stream it granted it on is
+    # the one still running.
+    #
+    # Being open is not enough, which is what a `subscribe_resource` looking
+    # for a stream to reuse has to know: a stream between listen attempts is
+    # serving nothing, and the request that replaces it is a new one the
+    # server holds no state for — it may be rejected, or acknowledged more
+    # narrowly.
+    # @param uri [String] the resource URI
+    # @return [Boolean]
+    def watching_resource?(uri)
+      @mutex.synchronize { @state == :active && acknowledges_resource?(uri) }
+    end
+
+    # Block until the server's word on this URI stands, and report what it is.
+    #
+    # The word that stands is the acknowledgment of the listen request the
+    # subscription is *currently* on: a re-open clears it (see {#with_open_id})
+    # because the server holds no subscription state across one and has to
+    # grant the filter again, while a connection that merely dropped leaves
+    # the last answer standing until the client asks again. So this waits when
+    # a request is in flight with nothing granted yet — the case that used to
+    # read as success, since a subscription with no acknowledgment has no
+    # unacknowledged URIs either — and answers at once when the server has
+    # already spoken.
+    # @param uri [String] the resource URI
+    # @param timeout [Numeric] seconds to wait for an answer
+    # @return [Symbol] :watching, :not_watching (answered without the URI),
+    #   :closed, or :timeout
+    def await_resource_watch(uri, timeout)
+      deadline = Process.clock_gettime(Process::CLOCK_MONOTONIC) + timeout
+      @mutex.synchronize do
+        loop do
+          return :closed if @state == :closed
+          return acknowledges_resource?(uri) ? :watching : :not_watching if @acknowledged
+
+          remaining = deadline - Process.clock_gettime(Process::CLOCK_MONOTONIC)
+          return :timeout if remaining <= 0
+
+          @settled.wait(@mutex, remaining)
+        end
+      end
     end
 
     # Block until the server has settled the subscription: acknowledged it,
@@ -289,15 +343,40 @@ module MCPClient
       @mutex.synchronize { @id == id }
     end
 
+    # Record what the server agreed to honour.
+    #
+    # The filter is copied and frozen through and through, arrays and strings
+    # included. The hash it arrives in is the peer's, parsed from the
+    # acknowledgment notification, and that same hash is handed to the host's
+    # `on_notification` callback and to this subscription's own listeners — so
+    # host code that edits it in place would otherwise be rewriting this
+    # subscription's record of what the server granted. Adding a URI the
+    # acknowledgment left out is enough to make a waiting `subscribe_resource`
+    # report a watch that does not exist.
+    # @param filter [Hash, nil] the acknowledged SubscriptionFilter
+    # @return [void]
     # @api private
     def acknowledge(filter)
+      detached = Subscription.deep_frozen_copy(filter.is_a?(Hash) ? filter : {})
       @mutex.synchronize do
         return if @state == :closed
 
-        @acknowledged = filter.is_a?(Hash) ? filter : {}
+        @acknowledged = detached
         @state = :active
         @answered = true
         @settled.broadcast
+      end
+    end
+
+    # A detached, deeply frozen copy of a parsed JSON value.
+    # @param value [Object]
+    # @return [Object] frozen, sharing nothing mutable with the original
+    def self.deep_frozen_copy(value)
+      case value
+      when Hash then value.to_h { |key, item| [deep_frozen_copy(key), deep_frozen_copy(item)] }.freeze
+      when Array then value.map { |item| deep_frozen_copy(item) }.freeze
+      when String then value.dup.freeze
+      else value
       end
     end
 
@@ -365,6 +444,15 @@ module MCPClient
       end
 
       wanted == false || granted == true
+    end
+
+    # Whether the acknowledgment that stands names this URI. Called with the
+    # lock held.
+    # @param uri [String] the resource URI
+    # @return [Boolean]
+    def acknowledges_resource?(uri)
+      granted = @acknowledged.is_a?(Hash) ? @acknowledged['resourceSubscriptions'] : nil
+      granted.is_a?(Array) && granted.include?(uri)
     end
 
     # The answer {#wait_until_settled} reports. Settling is one-way: once the
