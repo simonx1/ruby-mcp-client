@@ -6,7 +6,10 @@ module MCPClient
     # in-flight input keys, the rounds spent and the pending update of each
     # task, all keyed by the server session they belong to. Task ids are per
     # session and reusable, so every entry dies with its session — and every
-    # request that names a task carries the session it is about. Mixed into
+    # request that names a task carries the session it is about. Inside one
+    # session an id is reusable too: every CreateTaskResult starts a fresh
+    # lifetime under it (see {#start_task_lifetime}), and a wait, a hold or an
+    # answer of one lifetime never reaches another. Mixed into
     # {MCPClient::Client} through {TaskSupport}.
     module TaskRegistry
       private
@@ -29,15 +32,111 @@ module MCPClient
       # @return [Hash]
       def task_state_locked(srv, task_id, epoch)
         @task_states ||= {}
-        key = [srv.object_id, epoch, task_id]
-        # A previous session of this server is over: its state (answered
-        # keys, pending answers) is dropped, not left behind.
-        @task_states.delete_if { |other, _| other[0] == key[0] && other[1] < key[1] }
-        # The state carries its own registry key, so a request that captured
-        # it can drop exactly what it was working on (see #forget_task_keys)
-        # and never a later lifetime of the same task id.
-        @task_states[key] ||= { key: key, answered: Set.new, submitted: Set.new, rounds: 0,
-                                pending_update: nil, update_mutex: Mutex.new }
+        lookup = [srv.object_id, epoch, task_id]
+        drop_ended_session_state(lookup)
+        @task_states[lookup] ||= new_task_state(lookup)
+      end
+
+      # A task's bookkeeping, stamped with the lifetime of its id (see
+      # {#start_task_lifetime}). The state carries both keys: `lookup`, under
+      # which the live task of an id is found, so a request that captured the
+      # state can drop exactly what it was working on (see #forget_task_keys)
+      # and never a later lifetime of the same id; and `key`, which names the
+      # lifetime itself and under which the in-flight holds of a running
+      # handler live, so two lifetimes of one id never share them.
+      # @param lookup [Array] server, session epoch and task id
+      # @return [Hash] (callers hold answered_keys_mutex)
+      def new_task_state(lookup)
+        generation = task_lifetime(lookup)
+        { key: [*lookup, generation], lookup: lookup, generation: generation, answered: Set.new,
+          submitted: Set.new, rounds: 0, pending_update: nil, update_mutex: Mutex.new }
+      end
+
+      # A previous session of this server is over: its state (answered keys,
+      # pending answers) and the id lifetimes counted in it are dropped, not
+      # left behind — the epoch alone already separates them from the next
+      # session's.
+      # @return [void] (callers hold answered_keys_mutex)
+      def drop_ended_session_state(lookup)
+        @task_states.delete_if { |other, _| other[0] == lookup[0] && other[1] < lookup[1] }
+        @task_lifetimes&.delete_if { |other, _| other[0] == lookup[0] && other[1] < lookup[1] }
+      end
+
+      # How many times the server has already handed this task id out inside
+      # this session; 0 for an id no reuse was ever seen for.
+      # @param lookup [Array] server, session epoch and task id
+      # @return [Integer] (callers hold answered_keys_mutex)
+      def task_lifetime(lookup)
+        @task_lifetimes&.fetch(lookup, nil) || 0
+      end
+
+      # Begin the lifetime a CreateTaskResult just created. A task id is
+      # unique within a session, so a server that answers with an id whose
+      # previous task is still on this client's books has ended that task and
+      # started another: the bookkeeping of the previous lifetime is dropped
+      # and the id's generation moves, which gives the new task an answered
+      # set, an in-flight registry entry and a pending update entirely of its
+      # own. Without the move, an input key a handler of the previous task is
+      # still presenting would be suppressed as already in flight on the new
+      # one, and that handler's answer would be delivered to the new task.
+      #
+      # Only an id whose previous lifetime is still around is counted: for
+      # every well-behaved server (and for the first task under any id) there
+      # is nothing to separate, so nothing is recorded.
+      # @return [void]
+      def start_task_lifetime(srv, task_id, epoch)
+        answered_keys_mutex.synchronize do
+          lookup = [srv.object_id, epoch, task_id]
+          previous = @task_states&.delete(lookup)
+          next unless previous || presenting_earlier_lifetime?(lookup)
+
+          (@task_lifetimes ||= {})[lookup] = task_lifetime(lookup) + 1
+        end
+      end
+
+      # Whether a handler is still presenting the input keys of some lifetime
+      # of this task id (an abandoned handler outlives its state).
+      # @return [Boolean] (callers hold answered_keys_mutex)
+      def presenting_earlier_lifetime?(lookup)
+        return false unless @in_flight_keys
+
+        @in_flight_keys.any? { |key, held| key.first(3) == lookup && !held.empty? }
+      end
+
+      # The lifetime a task id has now in a given session.
+      # @return [Integer]
+      def current_task_lifetime(srv, task_id, epoch)
+        answered_keys_mutex.synchronize { task_lifetime([srv.object_id, epoch, task_id]) }
+      end
+
+      # Refuse a request whose task handle names a task the server has since
+      # replaced. A task id is unique within a session, so a fresh
+      # CreateTaskResult under it ended the task the handle was built for: the
+      # request must not be sent for the task that answers to the id now. A
+      # bare id, a handle from another server, and a handle that never came
+      # from a creation all name whatever the id means now and are let
+      # through, exactly as before.
+      # @param task [Object] what the caller named the task with
+      # @param epoch [Integer, nil] the session the request is pinned to
+      # @param operation [String] for the error message ('updating', 'waiting for')
+      # @return [void]
+      # @raise [MCPClient::Errors::TaskError] if the handle's task was replaced
+      def check_handle_lifetime!(task, srv, epoch, operation)
+        return unless task.is_a?(MCPClient::Task) && task.server.equal?(srv) && task.task_generation
+        return if current_task_lifetime(srv, task.task_id, epoch) == task.task_generation
+
+        raise MCPClient::Errors::TaskError,
+              "Error #{operation} task '#{shown_task_id(task.task_id)}': the server has created a new task with " \
+              'this id since, so the task this handle names was replaced and is gone'
+      end
+
+      # Whether the bookkeeping a request was built from is still what its
+      # task id names: a CreateTaskResult that handed the id out again since
+      # started a different task, and the request belongs to the previous one.
+      # @param state [Hash] the bookkeeping the request captured
+      # @return [Boolean]
+      def task_lifetime_current?(state)
+        answered_keys_mutex.synchronize { task_lifetime(state[:lookup]) == state[:generation] }
       end
 
       # Forget every task's bookkeeping (the client is being cleaned up).
@@ -47,6 +146,7 @@ module MCPClient
           @task_states = nil
           @in_flight_keys = nil
           @task_session_epochs = nil
+          @task_lifetimes = nil
         end
       end
 
@@ -108,9 +208,17 @@ module MCPClient
         answered_keys_mutex.synchronize { current_session_epoch(srv) }
       end
 
-      # @return [Array] the registry key of a task's state
-      def task_state_key(srv, task_id)
+      # @return [Array] where a task id's live bookkeeping is found in the
+      #   session live at this call (callers hold answered_keys_mutex)
+      def task_state_lookup(srv, task_id)
         [srv.object_id, current_session_epoch(srv), task_id]
+      end
+
+      # @return [Array] the registry key of the current lifetime of a task id,
+      #   under which its in-flight holds live (callers hold answered_keys_mutex)
+      def task_state_key(srv, task_id)
+        lookup = task_state_lookup(srv, task_id)
+        [*lookup, task_lifetime(lookup)]
       end
 
       # @return [Mutex] guards the answered-key registry (request threads share the client)
@@ -132,12 +240,12 @@ module MCPClient
       def forget_task_keys(srv, task_id, state: nil, epoch: nil)
         answered_keys_mutex.synchronize do
           unless state
-            @task_states&.delete(epoch.nil? ? task_state_key(srv, task_id) : [srv.object_id, epoch, task_id])
+            @task_states&.delete(epoch.nil? ? task_state_lookup(srv, task_id) : [srv.object_id, epoch, task_id])
             next
           end
-          next unless @task_states && @task_states[state[:key]].equal?(state)
+          next unless @task_states && @task_states[state[:lookup]].equal?(state)
 
-          @task_states.delete(state[:key])
+          @task_states.delete(state[:lookup])
         end
       end
 
@@ -149,9 +257,9 @@ module MCPClient
       # A read allocates nothing; the reservation that holds keys asks for
       # the set to be created and receives its registry key with it.
       # @param key [Array, nil] the registry key to use; without one the
-      #   current session's is resolved (a caller working on the state a wait
-      #   captured passes that state's key, so a restart cannot move its
-      #   reservation to the replacement session)
+      #   current lifetime's is resolved (a caller working on the state a wait
+      #   captured passes that state's key, so neither a restart nor a task id
+      #   handed out again can move its reservation to what replaced it)
       # @return [Set<String>, Array(Set<String>, Array)] (callers hold answered_keys_mutex)
       def in_flight_task_keys(srv, task_id, create: false, key: nil)
         key ||= task_state_key(srv, task_id)

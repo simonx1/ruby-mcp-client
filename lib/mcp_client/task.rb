@@ -20,7 +20,7 @@ module MCPClient
     TERMINAL_STATUSES = %w[completed failed cancelled].freeze
 
     attr_reader :task_id, :status, :status_message, :created_at, :last_updated_at, :ttl, :poll_interval, :server,
-                :input_requests, :result, :error, :session_epoch
+                :input_requests, :result, :error, :session_epoch, :task_generation
 
     # 2026-07-28 names of the retention and polling hints (milliseconds).
     alias ttl_ms ttl
@@ -46,10 +46,13 @@ module MCPClient
     # @param session_epoch [Integer, nil] the server session this handle is about: the session the
     #   request that produced it was pinned to, which is not necessarily the one that is live by the
     #   time the handle is built (nil: sampled from the server, for a handle built outside a request)
+    # @param task_generation [Integer, nil] which task under this id the handle names, for a handle
+    #   built from a CreateTaskResult: a task id is unique within a session, so a later creation
+    #   under the same id ends this task (nil: a handle that names whatever the id means now)
     def initialize(task_id:, status: 'working', status_message: nil, created_at: nil,
                    last_updated_at: nil, ttl: nil, poll_interval: nil, server: nil,
                    input_requests: nil, result: nil, error: nil, modern: false, detailed: false,
-                   ttl_reported: nil, session_epoch: nil)
+                   ttl_reported: nil, session_epoch: nil, task_generation: nil)
       validate_status!(status)
       @task_id = task_id
       @status = status
@@ -73,6 +76,9 @@ module MCPClient
       # stamp a handle built from an answer of the session that has just
       # ended with the session that replaced it, whose task-1 is another task.
       @session_epoch = session_epoch || (server.respond_to?(:session_epoch) ? server.session_epoch : nil)
+      # Which task under this (reusable) id the handle names; see the tasks
+      # extension's per-creation lifetime in {MCPClient::Client::TaskRegistry}.
+      @task_generation = task_generation
       @input_requests = input_requests
       @result = result
       @error = error
@@ -88,10 +94,12 @@ module MCPClient
     # @param detailed [Boolean] whether the hash is a DetailedTask (see #detailed?)
     # @param session_epoch [Integer, nil] the server session the request that
     #   returned this hash was pinned to (see #initialize)
+    # @param task_generation [Integer, nil] which task under this id the hash
+    #   describes, for a CreateTaskResult (see #initialize)
     # @return [Task]
     # @raise [MCPClient::Errors::InvalidResultError] when the peer data is not
     #   an object or names a status that is not a task status
-    def self.from_json(json, server: nil, detailed: false, session_epoch: nil)
+    def self.from_json(json, server: nil, detailed: false, session_epoch: nil, task_generation: nil)
       raise MCPClient::Errors::InvalidResultError, 'Invalid task: not an object' unless json.is_a?(Hash)
 
       data = json
@@ -116,7 +124,8 @@ module MCPClient
         modern: modern,
         detailed: detailed,
         server: server,
-        session_epoch: session_epoch
+        session_epoch: session_epoch,
+        task_generation: task_generation
       )
     rescue ArgumentError => e
       raise MCPClient::Errors::InvalidResultError, "Invalid task: #{e.message}"

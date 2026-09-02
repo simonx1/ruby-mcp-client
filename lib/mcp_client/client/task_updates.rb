@@ -194,6 +194,15 @@ module MCPClient
                                strict_session: false)
         keys = input_responses.keys.map(&:to_s)
         begin
+          # Checked before the session is established, since it needs nothing
+          # from the wire: a task id the server handed out again names a task
+          # of its own, and these answers were built for the previous one.
+          unless task_lifetime_current?(state)
+            logger.warn("Task #{shown}: the server created a new task with this id before the answers were " \
+                        'sent; they are discarded')
+            drop_ended_session_update(state, lock, keys)
+            return ended_session_update_result(shown, strict_session, replaced: true)
+          end
           unless task_update_session_current?(srv, shown, epoch)
             drop_ended_session_update(state, lock, keys)
             return ended_session_update_result(shown, strict_session)
@@ -231,10 +240,18 @@ module MCPClient
       # next, so the drop is not an error for it; a caller that asked for
       # this very delivery is told that nothing was sent, rather than being
       # left to believe the server has the answers.
+      # @param replaced [Boolean] the task id was handed out again rather than
+      #   the session having ended
       # @return [true]
       # @raise [MCPClient::Errors::TaskError] for a direct #update_task
-      def ended_session_update_result(shown, strict_session)
+      def ended_session_update_result(shown, strict_session, replaced: false)
         return true unless strict_session
+
+        if replaced
+          raise MCPClient::Errors::TaskError,
+                "Error updating task '#{shown}': the server created a new task with this id before the answers " \
+                'were sent, so they were discarded (they belong to the task it replaced)'
+        end
 
         raise MCPClient::Errors::TaskError,
               "Error updating task '#{shown}': the server session the answers belong to ended before they were " \

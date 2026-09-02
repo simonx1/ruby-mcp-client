@@ -92,6 +92,7 @@ module MCPClient
         # (the wait passes the session it polls in itself). A bare id names
         # what the session live at this call knows, and is pinned to it.
         epoch ||= handle_session_epoch(task_id, srv, 'getting') || invocation_session_epoch(srv)
+        check_handle_lifetime!(task_id, srv, epoch, 'getting')
         task_id = task_identifier(task_id)
         ensure_task_capability!(srv, 'get')
 
@@ -171,6 +172,7 @@ module MCPClient
         # in: the request is pinned to that session and refused once it has
         # ended, where the reused id would hand back another task's result.
         epoch = handle_session_epoch(task_id, srv, 'getting result for') || invocation_session_epoch(srv)
+        check_handle_lifetime!(task_id, srv, epoch, 'getting result for')
         task_id = task_identifier(task_id)
 
         begin
@@ -241,6 +243,7 @@ module MCPClient
         # the replacement session named with the same id. A bare id cancels
         # what the session live at this call knows, and nothing else.
         epoch = handle_session_epoch(task, srv, 'cancelling') || invocation_session_epoch(srv)
+        check_handle_lifetime!(task, srv, epoch, 'cancelling')
 
         begin
           result = task_rpc(srv, 'tasks/cancel', { taskId: task_id }, epoch: epoch)
