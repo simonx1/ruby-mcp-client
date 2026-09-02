@@ -167,7 +167,7 @@ module MCPClient
     # @return [Boolean]
     def payload_present?
       case @status
-      when 'completed' then @result.is_a?(Hash)
+      when 'completed' then self.class.complete_result_object?(@result)
       when 'failed' then jsonrpc_error_object?(@error)
       else terminal?
       end
@@ -180,6 +180,18 @@ module MCPClient
     # @return [Boolean]
     def jsonrpc_error_object?(error)
       self.class.jsonrpc_error_object?(error)
+    end
+
+    # A completed task's result is the final result of the original request
+    # (a CallToolResult): an object that is a complete result, so a
+    # resultType it carries must be "complete" (or absent).
+    # @param result [Object]
+    # @return [Boolean]
+    def self.complete_result_object?(result)
+      return false unless result.is_a?(Hash)
+
+      type = result['resultType'] || result[:resultType]
+      type.nil? || type == 'complete'
     end
 
     # @param error [Object]

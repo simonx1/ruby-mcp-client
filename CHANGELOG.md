@@ -14,6 +14,15 @@ metadata). Each feature lands in its own PR; this section accumulates them.
   explicit `ttlMs` null does; `Client#get_task` also requires the payload a
   status implies (`completed` ⇒ an object `result`, `failed` ⇒ a JSON-RPC
   error object, `input_required` ⇒ an `inputRequests` object).
+- **Waits and lookups (round 17).** The caller's `timeout:` bounds the
+  whole `wait_for_task`, capability probe (initialization, discovery)
+  included; a task request never outlives the transport's configured
+  `read_timeout` (`ServerBase#read_timeout`); `get_task` forgets a task's
+  bookkeeping when it returns a terminal task or reports it gone; a
+  completed task's nested result must be a complete result (a
+  `resultType` other than `"complete"` is an `InvalidResultError`); a
+  `CreateTaskResult` must carry the whole Task shape (status, parseable
+  timestamps, a `ttlMs` key).
 - **Retransmissions and sessions (round 14).** A retransmitted
   `tasks/update` carries only what is still pending once the task's update
   lock is held, so an answer a concurrent, confirmed update superseded is

@@ -632,11 +632,16 @@ module MCPClient
                 "Invalid tasks/get result: taskId #{sanitize_peer_log_text(task.task_id.to_s).inspect} does not " \
                 "match the requested task #{sanitize_peer_log_text(task_id.to_s).inspect}"
         end
+        # A terminal task is done with its input bookkeeping (answered keys,
+        # pending answers): a reused id must never inherit it.
+        forget_task_keys(srv, task_id) if task.terminal?
         task
       rescue MCPClient::Errors::ServerError => e
         raise if e.protocol_error?
 
-        raise task_error_from(e, task_id, 'getting', modern: modern_server?(srv), method: 'tasks/get')
+        error = task_error_from(e, task_id, 'getting', modern: modern_server?(srv), method: 'tasks/get')
+        forget_task_keys(srv, task_id) if error.is_a?(MCPClient::Errors::TaskNotFound)
+        raise error
       rescue MCPClient::Errors::TransportError, MCPClient::Errors::ConnectionError => e
         raise MCPClient::Errors::TaskError, "Error getting task '#{sanitize_peer_log_text(task_id.to_s)}': " \
                                             "#{sanitize_peer_log_text(e.message)}"
