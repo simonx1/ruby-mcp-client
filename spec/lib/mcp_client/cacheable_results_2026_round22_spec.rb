@@ -71,6 +71,31 @@ RSpec.describe 'MCP 2026-07-28 cacheable results — round 22' do
     expect(client.list_tools.map(&:name)).to eq(['tool-2'])
   end
 
+  it 'copies a very deep peer schema through the client cache without overflowing the stack' do
+    # JSON parsing bounds what arrives over the wire; a schema built by the
+    # host (or a future transport) reaches the cache copies all the same.
+    server = streamable
+    allow(MCPClient::ServerFactory).to receive(:create).and_return(server)
+    client = MCPClient::Client.new(mcp_server_configs: [{ type: 'streamable_http', base_url: 'https://example.com' }])
+    deep = { 'type' => 'object' }
+    100_000.times { |i| deep = i.even? ? { 'properties' => { 'p' => deep } } : { 'items' => [deep] } }
+    tool = MCPClient::Tool.new(name: 'deep', description: 'd', schema: deep, server: server)
+
+    copies = nil
+    expect { copies = client.send(:cached_copies, { 'deep' => tool }) }.not_to raise_error
+    copied = copies.first.schema
+    expect(copied).not_to equal(deep)
+    # Walked iteratively too: comparing the documents whole would recurse.
+    depth = 0
+    node = copied
+    while node.is_a?(Hash) || node.is_a?(Array)
+      depth += 1
+      node = node.is_a?(Hash) ? node.values.first : node.first
+    end
+    expect(depth).to be > 100_000
+    expect(node).to eq('object')
+  end
+
   it 'does not serve a stale list that cleanup forgot while the re-fetch was in flight' do
     counts = Hash.new(0)
     server = streamable

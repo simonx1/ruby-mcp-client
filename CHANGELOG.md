@@ -24,7 +24,9 @@ metadata). Each feature lands in its own PR; this section accumulates them.
   `Client#cleanup` clears the client caches; a stale list served on a
   failed re-fetch must still be the entry in the slot — an entry a cleanup
   replaced while the re-fetch was in flight is forgotten (its value is
-  dropped too).
+  dropped too). `MCPClient::DeepCopy` copies iteratively, so a peer
+  schema nested deeper than the Ruby stack allows cannot crash a client
+  cache hit.
 - **Cleanup placeholders and slice identity (round 19).** Clearing the
   cache installs a stale placeholder for every list kind, recorded or
   not, and a transport keeps a fetched list only when its hint was
