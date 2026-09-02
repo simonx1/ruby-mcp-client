@@ -56,7 +56,23 @@ metadata). Each feature lands in its own PR; this section accumulates them.
   `roots=` call or an answer carrying a root all warn. The deprecated
   keyword arguments name the earliest removal next to their SEP too:
   `Client.new`'s `roots:` and `sampling_handler:`, and the
-  `sampling_handler` option of `MCPClient.connect`.
+  `sampling_handler` option of `MCPClient.connect`. The transport-level
+  registrations carry the same mark: `on_roots_list_request` and
+  `on_sampling_request` on `ServerStdio`, `ServerSSE`, `ServerHTTP` and
+  `ServerStreamableHTTP` are tagged `@deprecated` with SEP-2577 and the
+  earliest removal, so a host that drives a transport directly meets the
+  deprecation in the YARD rather than in the first runtime notice — and the
+  Roots tag says what round 7 made true, that registering a handler is not
+  itself use and only an answer carrying a root adopts the feature.
+- **HTTP+SSE marked where it is offered.** SEP-2596 puts the HTTP+SSE
+  transport on the only short clock in the registry (three months after
+  SEP-2596 reaches Final), so every place that presents it as an ordinary
+  transport choice now says so and points at Streamable HTTP: the README
+  Overview, the Quick Connect example (which now leads with Streamable
+  HTTP) and the transport-detection table, and, in YARD, the `/sse` and
+  `transport:` entries of `MCPClient.connect`, its SSE `@example`, and
+  `MCPClient.sse_config`, which gains a `@deprecated` tag pointing at
+  `MCPClient.streamable_http_config`.
 - **Documentation.** README documents the 2026-07-28 support (discovery
   and per-request metadata, multi round-trip requests, `x-mcp-header`,
   subscriptions, cacheable results, the tasks extension, authorization) and

@@ -46,7 +46,11 @@ module MCPClient
   # Simplified connection API - auto-detects transport and returns connected client
   #
   # @param target [String, Array<String>] URL(s) or command for connection
-  #   - URLs ending in /sse -> SSE transport
+  #   - URLs ending in /sse -> SSE transport. The HTTP+SSE transport has been
+  #     deprecated since MCP 2025-03-26 and is listed in the 2026-07-28
+  #     deprecated features registry (SEP-2596); earliest removal is three
+  #     months after SEP-2596 reaches Final. New integrations should use
+  #     Streamable HTTP.
   #   - URLs ending in /mcp -> Streamable HTTP transport
   #   - stdio://command or Array commands -> stdio transport
   #   - Commands starting with npx, node, python, ruby, etc. -> stdio transport
@@ -61,7 +65,9 @@ module MCPClient
   # - env [Hash] Environment variables for stdio
   # - ping [Integer] Ping interval for SSE (default: 10)
   # - endpoint [String] JSON-RPC endpoint path (default: '/rpc')
-  # - transport [Symbol] Force transport type (:stdio, :sse, :http, :streamable_http)
+  # - transport [Symbol] Force transport type (:stdio, :sse, :http, :streamable_http).
+  #   :sse forces the deprecated HTTP+SSE transport (SEP-2596); prefer
+  #   :streamable_http.
   # - sampling_handler [Proc] Handler for sampling requests. Deprecated since MCP
   #   2026-07-28 (SEP-2577); earliest removal is the first revision released on or
   #   after 2027-07-28. Integrate directly with the LLM provider API instead.
@@ -70,11 +76,11 @@ module MCPClient
   # @raise [MCPClient::Errors::ConnectionError] if connection fails
   # @raise [MCPClient::Errors::TransportDetectionError] if transport cannot be determined
   #
-  # @example Connect to SSE server
-  #   client = MCPClient.connect('http://localhost:8000/sse')
-  #
   # @example Connect to Streamable HTTP server
   #   client = MCPClient.connect('http://localhost:8000/mcp')
+  #
+  # @example Connect to SSE server (deprecated transport; prefer Streamable HTTP)
+  #   client = MCPClient.connect('http://localhost:8000/sse')
   #
   # @example Connect with options
   #   client = MCPClient.connect('http://api.example.com/mcp',
@@ -445,6 +451,11 @@ module MCPClient
   end
 
   # Create a standard server configuration for SSE
+  #
+  # @deprecated The HTTP+SSE transport has been deprecated since MCP 2025-03-26
+  #   and is listed in the 2026-07-28 deprecated features registry (SEP-2596);
+  #   earliest removal is three months after SEP-2596 reaches Final. Use
+  #   {MCPClient.streamable_http_config} and {MCPClient::ServerStreamableHTTP}.
   # @param base_url [String] base URL for the server
   # @param headers [Hash] HTTP headers to include in requests
   # @param read_timeout [Integer] read timeout in seconds (default: 30)
