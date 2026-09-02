@@ -15,6 +15,11 @@ metadata). Each feature lands in its own PR; this section accumulates them.
   (`format`, `contentSchema`) and assertions of another instance type
   decide nothing, so a branch settled by its evaluated keywords is a full
   verdict (`ANNOTATION_KEYWORDS`, `UNSUPPORTED_ASSERTIONS_BY_TYPE`).
+- **Definite verdicts (round 13).** A branch that fails on an evaluated
+  assertion leaves no uncertainty behind, `anyOf` passes as soon as any
+  branch definitely passes (whatever the order of an undecided one), and
+  `oneOf` fails as soon as two branches definitely pass; uncertainty only
+  counts where it could still change the outcome.
 
 - **Dialects.** `MCPClient::SchemaValidator` treats a schema without
   `$schema` as JSON Schema 2020-12, accepts 2020-12, 2019-09 and draft-07

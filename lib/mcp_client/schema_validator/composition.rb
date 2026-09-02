@@ -28,14 +28,30 @@ module MCPClient
       # supported assertion rejected the value, :pass when every assertion
       # was evaluated and accepted it, :undecided when it was accepted only
       # as far as the validator could evaluate. Non-monotonic compositions
-      # (not, oneOf, if) never treat :undecided as a match.
+      # (not, oneOf, if) never treat :undecided as a match. A definite
+      # verdict leaves no uncertainty behind: what a failing branch could not
+      # evaluate does not matter once it failed.
       # @return [Symbol]
       def verdict(data, sub, path, ctx, ref_depth)
         before = ctx.undecided
         passed = speculative(ctx) { validate_node(data, sub, path, ctx, ref_depth).empty? }
-        return :fail unless passed
+        unless passed
+          ctx.undecided = before
+          return :fail
+        end
 
         ctx.undecided == before ? :pass : :undecided
+      end
+
+      # The verdicts of every branch. Uncertainty is kept only when it can
+      # change the outcome: once the composition is decided the count is
+      # restored to what it was before the branches ran.
+      # @return [Array<Symbol>]
+      def branch_verdicts(data, subs, path, ctx, ref_depth, decided:)
+        before = ctx.undecided
+        verdicts = subs.map { |sub| verdict(data, sub, path, ctx, ref_depth) }
+        ctx.undecided = before if decided.call(verdicts)
+        verdicts
       end
 
       # allOf / anyOf / oneOf / not / if-then-else.
@@ -48,16 +64,20 @@ module MCPClient
             errors << "#{path}: does not satisfy allOf/#{idx} (#{clip(sub_errors.first.to_s)})" unless sub_errors.empty?
           end
         end
-        # anyOf is monotonic: a partial pass is the permissive direction.
-        if schema['anyOf'].is_a?(Array) &&
-           schema['anyOf'].all? { |sub| verdict(data, sub, path, ctx, ref_depth) == :fail }
-          errors << "#{path}: does not satisfy any schema in anyOf"
+        # anyOf is monotonic: a definite pass decides it whatever the other
+        # branches, and only undecided branches leave it undecided.
+        if schema['anyOf'].is_a?(Array)
+          verdicts = branch_verdicts(data, schema['anyOf'], path, ctx, ref_depth,
+                                     decided: ->(vs) { vs.include?(:pass) || vs.all?(:fail) })
+          errors << "#{path}: does not satisfy any schema in anyOf" if verdicts.all?(:fail)
         end
         if schema['oneOf'].is_a?(Array)
-          verdicts = schema['oneOf'].map { |sub| verdict(data, sub, path, ctx, ref_depth) }
+          # Two definite passes decide it; with an undecided branch and at
+          # most one pass, "exactly one" cannot be told either way.
+          verdicts = branch_verdicts(data, schema['oneOf'], path, ctx, ref_depth,
+                                     decided: ->(vs) { vs.count(:pass) > 1 || vs.none?(:undecided) })
           matches = verdicts.count(:pass)
-          # With an undecided branch "exactly one" cannot be told either way.
-          if verdicts.none?(:undecided) && matches != 1
+          if matches > 1 || (verdicts.none?(:undecided) && matches != 1)
             errors << "#{path}: satisfies #{matches} schemas in oneOf, expected exactly one"
           end
         end
