@@ -81,8 +81,12 @@ The implementation follows the standard OAuth 2.1 authorization code flow with P
 2. **Client Registration**: Automatically register OAuth client if dynamic registration is supported
 3. **Authorization**: Redirect user to authorization server with PKCE parameters
 4. **Token Exchange**: Exchange authorization code for access token using PKCE verifier
+   - A `200` response that carries no `access_token` is a protocol error (RFC 6749 Section 5.1), not a
+     credential: the exchange raises a `ConnectionError` and nothing is stored.
 5. **Token Usage**: Include access token in MCP requests via `Authorization` header
 6. **Token Refresh**: Automatically refresh tokens when they expire
+   - A refresh response without an `access_token` is a failed refresh: the still-valid token stays in
+     storage and keeps being presented rather than being replaced by a bare `Bearer `.
 
 ## Configuration Options
 
@@ -137,7 +141,10 @@ class DatabaseTokenStorage
   end
 
   def set_client_info(server_url, client_info)
-    # Store client info
+    # Store client info. A nil client_info means "forget it": remove the
+    # record rather than serializing nil, for the same reason as set_token
+    # (a record without a client_id reads back as no client at all, and the
+    # next flow registers a new one).
   end
 
   # Implement other required methods:
@@ -151,6 +158,13 @@ class DatabaseTokenStorage
   # that accepts neither is logged and the token is ignored instead.
   def delete_token(server_url)
     # Remove the stored token
+  end
+
+  # Optional (MCP 2026-07-28): called when a dynamic registration made with
+  # the previous authorization server is discarded. Without it,
+  # set_client_info(server_url, nil) is attempted.
+  def delete_client_info(server_url)
+    # Remove the stored client registration
   end
 end
 

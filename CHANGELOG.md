@@ -203,7 +203,24 @@ metadata). Each feature lands in its own PR; this section accumulates them.
   writes `nil.to_h`) is no token: it is never presented as a bare
   `Bearer ` bound to the current authorization server. The
   `FileTokenStorage` example and the storage documentation remove the
-  record for a `nil` token instead of serializing it.
+  record for a `nil` token instead of serializing it. A `200` from the
+  token endpoint that carries no `access_token` (or an empty one) is now a
+  protocol error rather than a credential, as RFC 6749 Section 5.1
+  requires: the code exchange raises a `ConnectionError` instead of storing
+  an empty token and reporting success, and a refresh fails — keeping the
+  still-valid token it was about to replace — instead of overwriting it
+  with bytes that would go out as a bare `Bearer `; `access_token` and
+  `apply_authorization` apply the same check to whatever they are about to
+  present. `authorization_error_message` now makes the checks the success
+  path makes before it displays anything, so the `error_description` of
+  authorization server A is withheld once an outstanding, refused or
+  server-changing 401 challenge — or shared storage — moved the flow to B,
+  instead of being shown for a callback the completion rejects. And a
+  stored client record without a `client_id` (what a hash-persisting
+  backend reads back after the `set_client_info(server_url, nil)` fallback
+  deleted an issuer-less dynamic client) is no client at all: a new dynamic
+  registration is made instead of an authorization request with an empty
+  `client_id`.
 
 ### Tasks extension (`io.modelcontextprotocol/tasks`)
 

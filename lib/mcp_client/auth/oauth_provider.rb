@@ -139,7 +139,7 @@ module MCPClient
         # Refresh early when possible; a still-valid token is presented when
         # the refresh (or the discovery it needs) cannot run right now.
         refreshed = refresh_if_possible(token)
-        return refreshed if refreshed
+        return refreshed if token_bytes?(refreshed)
         # The discovery a refresh ran may have retired this very token.
         return nil if token.expired? || retired_token?(token) || !token_for_current_issuer?(token)
 
@@ -300,20 +300,7 @@ module MCPClient
         end
 
         cached = stored_server_metadata
-        # A challenge received meanwhile — refused, still to be fetched, or
-        # naming another authorization server — or cached metadata for
-        # another server ends this flow here, not after a success page.
-        if @challenge_error || (@challenge_metadata_url && @challenge_resource_metadata.nil?)
-          raise MCPClient::Errors::ConnectionError,
-                'Authorization response rejected: a challenge received during the flow must be resolved first; ' \
-                'restart the authorization'
-        end
-        advertised = Array(@challenge_resource_metadata&.authorization_servers).first
-        if (advertised && advertised != pkce.issuer) || (cached && cached.issuer != pkce.issuer)
-          raise MCPClient::Errors::ConnectionError,
-                'Authorization response rejected: the authorization server changed during the flow; ' \
-                'restart the authorization'
-        end
+        ensure_authorization_server_unchanged!(pkce, cached)
         ensure_client_for_request!(stored_client_info, pkce)
         validate_authorization_response_issuer!(iss, pkce.issuer, iss_advertised_for_response?(pkce, cached))
       end
@@ -336,6 +323,12 @@ module MCPClient
 
         pkce = stored_pkce
         cached = stored_server_metadata
+        # The same checks the success path makes: an error response of
+        # authorization server A is not displayed once a challenge received
+        # during the flow — or shared storage — moved the flow to B. Without a
+        # recorded issuer there is nothing to compare, and the issuer check
+        # below rejects the response outright.
+        ensure_authorization_server_unchanged!(pkce, cached) if pkce.respond_to?(:issuer) && pkce.issuer.is_a?(String)
         # Only the request's own authorization server can say whether iss is
         # expected: a cache that names another server is no guide.
         cached = nil unless pkce && cached && cached.issuer == pkce.issuer
@@ -349,7 +342,9 @@ module MCPClient
       def apply_authorization(request)
         token = access_token
         logger.debug("OAuth apply_authorization: token=#{token ? 'present' : 'nil'}")
-        return unless token
+        # A record without access token bytes is never presented: a bare
+        # "Bearer " is not a credential (RFC 6749 Section 5.1).
+        return unless token_bytes?(token)
 
         logger.debug("OAuth applying authorization header: #{token.to_header[0..20]}...")
         request.headers['Authorization'] = token.to_header
@@ -360,6 +355,31 @@ module MCPClient
       attr_reader :challenge_scope
 
       private
+
+      # A challenge received during the flow — refused, still to be fetched,
+      # or naming another authorization server — or cached metadata for
+      # another server ends the flow here. Applied to a success response and,
+      # equally, to an error response: "the client MUST NOT act on or display
+      # error, error_description, or error_uri" is worth nothing if the text
+      # of authorization server A is shown after the flow moved to B.
+      # @param pkce [PKCE] the record of the authorization request
+      # @param cached [ServerMetadata, nil] the metadata currently in storage, if any
+      # @return [void]
+      # @raise [MCPClient::Errors::ConnectionError]
+      def ensure_authorization_server_unchanged!(pkce, cached)
+        if @challenge_error || (@challenge_metadata_url && @challenge_resource_metadata.nil?)
+          raise MCPClient::Errors::ConnectionError,
+                'Authorization response rejected: a challenge received during the flow must be resolved first; ' \
+                'restart the authorization'
+        end
+
+        advertised = Array(@challenge_resource_metadata&.authorization_servers).first
+        return unless (advertised && advertised != pkce.issuer) || (cached && cached.issuer != pkce.issuer)
+
+        raise MCPClient::Errors::ConnectionError,
+              'Authorization response rejected: the authorization server changed during the flow; ' \
+              'restart the authorization'
+      end
 
       # RFC 9207 Section 2.4 as applied by MCP 2026-07-28: a present `iss`
       # must equal the recorded issuer byte for byte (no scheme/host case
@@ -1209,7 +1229,16 @@ module MCPClient
 
       # @return [ClientInfo, nil]
       def stored_client_info
-        normalize_record(storage.get_client_info(server_url), ClientInfo)
+        client_info = normalize_record(storage.get_client_info(server_url), ClientInfo)
+        # A backend without delete_client_info is asked to store nil, and one
+        # that persists plain hashes writes `nil.to_h` — `{}`. Read back that
+        # is a record without a client id, which would be bound to the current
+        # issuer and reused instead of registering, making an authorization
+        # request with an empty client_id. It is not a client: it is the
+        # absence storage meant to express.
+        return nil if client_info.respond_to?(:client_id) && client_info.client_id.to_s.empty?
+
+        client_info
       end
 
       # @return [PKCE, nil]
@@ -1225,9 +1254,26 @@ module MCPClient
         # record without token bytes, whose header would be a bare "Bearer "
         # attributed to whatever authorization server is current now. It is
         # not a token: it is the absence storage meant to express.
-        return nil if token.respond_to?(:access_token) && token.access_token.to_s.empty?
+        return nil if token.respond_to?(:access_token) && !token_bytes?(token)
 
         token
+      end
+
+      # RFC 6749 Section 5.1 makes access_token REQUIRED in a successful token
+      # response, so a record without those bytes is never a credential: its
+      # header would be a bare "Bearer ", attributed to whatever authorization
+      # server is current. Checked wherever a token is read, issued or applied.
+      # @param token [Object, nil] a token record
+      # @return [Boolean] whether it carries access token bytes
+      def token_bytes?(token)
+        token.respond_to?(:access_token) && !token.access_token.to_s.empty?
+      end
+
+      # The same question about a parsed token endpoint response body.
+      # @param data [Hash] the parsed JSON body
+      # @return [Boolean]
+      def issued_access_token?(data)
+        !data['access_token'].to_s.empty?
       end
 
       # @param record [Object, Hash, nil]
@@ -1669,6 +1715,14 @@ module MCPClient
         end
 
         data = JSON.parse(response.body)
+        # RFC 6749 Section 5.1: access_token is REQUIRED in a successful
+        # response. A 200 without it is a protocol error, not a credential:
+        # storing it would report success and then present a bare "Bearer ".
+        unless issued_access_token?(data)
+          raise MCPClient::Errors::ConnectionError,
+                'Token exchange failed: the token response carries no access_token (RFC 6749 Section 5.1)'
+        end
+
         Token.new(
           access_token: data['access_token'],
           token_type: data['token_type'] || 'Bearer',
@@ -1721,6 +1775,14 @@ module MCPClient
         end
 
         data = JSON.parse(response.body)
+        # A refresh response without access_token bytes (RFC 6749 Section 5.1)
+        # is a failed refresh: the still-valid token stays in storage rather
+        # than being overwritten with bytes that would go out as "Bearer ".
+        unless issued_access_token?(data)
+          logger.warn('Token refresh failed: the response carries no access_token; keeping the stored token')
+          return nil
+        end
+
         new_token = Token.new(
           access_token: data['access_token'],
           token_type: data['token_type'] || 'Bearer',
