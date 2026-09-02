@@ -270,21 +270,27 @@ module MCPClient
     # The stream already mapped to this URI, once the server's word on it
     # stands — or nil when there is none to reuse.
     #
-    # A mapped stream is not a watch merely for being open. After an HTTP
-    # connection drops or a stdio process restarts, the request that replaces
-    # it is a new listen the server holds no state for: it may be rejected, or
+    # A mapped stream is not a watch merely for being open, and it is not one
+    # merely for having been granted the URI once. After an HTTP connection
+    # drops or a stdio process restarts, the request that replaces it is a new
+    # listen the server holds no state for: it may be rejected, or
     # acknowledged without this URI, and until it is answered nothing has been
     # granted. Reporting success from that state — which used to happen for
-    # every handle that was not closed — tells the subscriber about a watch
-    # nobody has made yet. So a replacement in flight is waited for, and a
-    # stream that is answered without the URI stops being this URI's stream.
+    # every handle that was not closed, and then for every handle whose old
+    # acknowledgment was still on record, so for the whole of an HTTP backoff
+    # or a stdio handshake — tells the subscriber about a watch nobody has
+    # made yet. So this asks whether the server is watching the URI *now*
+    # ({MCPClient::Subscription#await_live_resource_watch}), waiting out a
+    # stream that is between listen attempts rather than reading what the last
+    # one was granted, and a stream that comes back without the URI stops
+    # being this URI's stream.
     # @param uri [String] the resource URI
     # @return [MCPClient::Subscription, nil]
     def settled_resource_subscription(uri)
       mapped = subscriptions_mutex.synchronize { resource_subscriptions[uri] }
       return nil unless mapped
       return mapped if mapped.watching_resource?(uri)
-      return mapped if mapped.await_resource_watch(uri, subscription_ack_timeout) == :watching
+      return mapped if mapped.await_live_resource_watch(uri, subscription_ack_timeout) == :watching
 
       unmap_resource_subscription(mapped, uri)
       nil

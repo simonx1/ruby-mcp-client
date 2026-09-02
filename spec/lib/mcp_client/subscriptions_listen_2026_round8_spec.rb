@@ -218,8 +218,11 @@ RSpec.describe 'MCP 2026-07-28 subscriptions/listen — round 8' do
        { 'uri' => uri, 'blob' => payload, '_meta' => { sub_meta => 1 } }]
     end
 
+    # Everything the entry retains, method name included (round 9: the charge
+    # used to serialize the params alone).
     def bytes_of(uri, payload = '')
-      JSON.generate(updated(uri, payload).last).bytesize
+      method, params = updated(uri, payload)
+      method.bytesize + JSON.generate(params).bytesize
     end
 
     # A subscription whose dispatcher is parked inside the first delivery, so

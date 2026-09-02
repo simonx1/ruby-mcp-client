@@ -18,15 +18,17 @@ module MCPClient
     # The queue is filled by the peer and drained by the host, so it needs a
     # ceiling, and overflow has to discard something. There are two ceilings,
     # because a queue bounded by count alone is not bounded in memory: the
-    # params of every queued notification are retained until its listener has
-    # run, and the peer chooses how big they are. So there is a count ceiling
+    # method name and params of every queued notification are retained until
+    # its listener has run, and the peer chooses how big they are. So there is
+    # a count ceiling
     # ({MCPClient::Subscription::MAX_PENDING_NOTIFICATIONS}) and a byte budget
     # ({MCPClient::Subscription::MAX_PENDING_NOTIFICATION_BYTES}).
     #
     # Two rules keep the queue honest, and they are the same rule seen from
     # each end:
     #
-    # 1. **Every queued notification is charged exactly what it retains.**
+    # 1. **Every queued notification is charged exactly what it retains** —
+    #    its method name as well as its params, since the entry keeps both.
     #    {#pending_bytes} is the sum of the queue, always, because the queue
     #    and its totals are only ever changed together (see {#push} and
     #    {#discard}).
@@ -112,7 +114,7 @@ module MCPClient
       def deliver(listeners, method, params)
         # Measured before the lock is taken: sizing a large payload must not
         # hold up the reader thread that is delivering the next one.
-        bytes = payload_bytesize(params)
+        bytes = payload_bytesize(method, params)
         entry = Queued.new(identity(method, params), listeners, method, params, bytes, bytes > byte_capacity)
         @mutex.synchronize do
           return if @stopped
@@ -145,12 +147,27 @@ module MCPClient
         [method, named]
       end
 
-      # What holding a notification costs, measured as the JSON the peer sent:
-      # the parsed objects are larger but proportional, and the peer decides
-      # the size either way.
+      # What holding a notification costs, measured as the JSON the peer sent
+      # for it: the parsed objects are larger but proportional, and the peer
+      # decides the size either way.
+      #
+      # Everything the entry retains is charged, the method name included. It
+      # is not decoration on the params: the entry keeps it to call the
+      # listeners with, and keeps it again inside the identity the eviction
+      # policy is keyed by. Charging only the params let a peer tag `{}` with
+      # a multi-megabyte method name for two bytes apiece and put
+      # {MCPClient::Subscription::MAX_PENDING_NOTIFICATIONS} of them behind a
+      # slow listener without ever touching the byte ceiling.
+      # @param method [String] notification method
       # @param params [Hash, nil] notification params
       # @return [Integer] bytes
-      def payload_bytesize(params)
+      def payload_bytesize(method, params)
+        method.to_s.bytesize + params_bytesize(params)
+      end
+
+      # @param params [Hash, nil] notification params
+      # @return [Integer] bytes
+      def params_bytesize(params)
         return 0 if params.nil?
 
         JSON.generate(params).bytesize
