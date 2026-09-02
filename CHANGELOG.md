@@ -156,7 +156,16 @@ metadata). Each feature lands in its own PR; this section accumulates them.
   way the completion does — rediscovering the answer, and assuming the
   advertisement when it cannot be had — so a legacy in-flight callback
   never shows a success page (or the peer's error text) for a response the
-  token exchange then rejects.
+  token exchange then rejects. A peer-advertised host is percent-decoded
+  before it is classified — `URI#hostname` does not decode, but the HTTP
+  client dials the decoded name — so `169.254.169.254%2e`,
+  `127%2e0%2e0%2e1`, `%31%32%37.0.0.1` and `localhost%2e` are refused like
+  the plain spellings, and a host that is still not a hostname after
+  decoding is refused outright. A redirect URI's host is read the same way
+  for the registered `application_type`, so a shorthand or fully qualified
+  loopback callback (`http://127.1/cb`, `http://127.0.0.1./cb`) registers
+  as `native` instead of as a `web` client whose plain-HTTP redirect URI
+  the authorization server may reject.
 
 ### Tasks extension (`io.modelcontextprotocol/tasks`)
 

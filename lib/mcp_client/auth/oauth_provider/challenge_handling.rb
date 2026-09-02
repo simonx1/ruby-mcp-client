@@ -14,6 +14,17 @@ module MCPClient
         # One decimal, octal or hexadecimal component of a numeric IPv4 spec.
         IPV4_COMPONENT = /\A(?:0x[0-9a-f]+|0[0-7]*|[1-9][0-9]*)\z/i
 
+        # A percent escape in a hostname.
+        PERCENT_ESCAPE = /%([0-9a-f]{2})/i
+
+        # How many times a host is percent-decoded before it is classified.
+        HOST_DECODE_PASSES = 4
+
+        # The characters a hostname or IP literal is spelled with: letters,
+        # digits, '-' and '.' for names, ':' for an IPv6 literal, '_' because
+        # resolvers and real deployments tolerate it in names.
+        HOSTNAME_CHARACTERS = /\A[a-z0-9\-._:]+\z/i
+
         # Handle 401 Unauthorized response (for server discovery)
         # @param response [Faraday::Response] HTTP response
         # @return [ResourceMetadata, nil] Resource metadata if found
@@ -234,6 +245,13 @@ module MCPClient
             refuse_peer_url!("OAuth #{label} must not target a loopback or private address: #{safe_error_text(url)}",
                              latch: latch)
           end
+          # Anything left that a resolver could not look up as a name — an
+          # undecodable escape, a NUL, a slash smuggled in as '%2f' — is not a
+          # host we can classify, so it is refused rather than handed to the
+          # HTTP client to interpret.
+          return if hostname_shaped?(normalize_host(host))
+
+          refuse_peer_url!("OAuth #{label} must name a valid host: #{safe_error_text(url)}", latch: latch)
         rescue URI::InvalidURIError
           refuse_peer_url!("OAuth #{label} is not a valid URL: #{safe_error_text(url)}", latch: latch)
         end
@@ -290,15 +308,46 @@ module MCPClient
           local_ip?(host)
         end
 
-        # A host is classified by the name a resolver would look up: the
-        # brackets of an IPv6 literal are punctuation, and a single trailing
-        # dot only marks the name as fully qualified. '169.254.169.254.',
-        # '127.0.0.1.' and 'localhost.' reach exactly what the undotted
-        # spellings reach, so they must classify the same way.
+        # A host is classified by the name a resolver would look up: URI#hostname
+        # does not percent-decode, but the HTTP client dials the decoded name,
+        # so '169.254.169.254%2e', '127%2e0%2e0%2e1' and '%31%32%37.0.0.1' all
+        # reach 127.0.0.1 / the metadata endpoint and must classify as those.
+        # Decoding comes first; then the brackets of an IPv6 literal, which are
+        # punctuation, and a single trailing dot, which only marks the name as
+        # fully qualified.
         # @param host [String] a downcased hostname
-        # @return [String] the host with brackets and one trailing dot removed
+        # @return [String] the decoded host, brackets and one trailing dot removed
         def normalize_host(host)
-          host.to_s.delete_prefix('[').delete_suffix(']').delete_suffix('.')
+          percent_decode_host(host.to_s).delete_prefix('[').delete_suffix(']').delete_suffix('.')
+        end
+
+        # Decoding is repeated until the host stops changing so a doubly encoded
+        # spelling ('%252e') cannot hide behind one pass, and capped so a host
+        # of nothing but escapes cannot spin. A malformed or non-ASCII escape is
+        # left alone: it survives as a literal '%', which hostname_shaped?
+        # refuses.
+        # @param host [String] a hostname as it was written in the URL
+        # @return [String] the host with its ASCII percent escapes resolved
+        def percent_decode_host(host)
+          HOST_DECODE_PASSES.times do
+            break unless host.include?('%')
+
+            decoded = host.gsub(PERCENT_ESCAPE) do |escape|
+              byte = ::Regexp.last_match(1).hex
+              byte < 0x80 ? byte.chr : escape
+            end
+            break if decoded == host
+
+            host = decoded
+          end
+          host
+        end
+
+        # @param host [String] a normalized (decoded, unbracketed) hostname
+        # @return [Boolean] whether it is spelled with the characters a
+        #   hostname or IP literal may contain
+        def hostname_shaped?(host)
+          !host.empty? && host.match?(HOSTNAME_CHARACTERS)
         end
 
         # Classify a literal address semantically rather than by spelling: a

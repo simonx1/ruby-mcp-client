@@ -1507,16 +1507,23 @@ module MCPClient
       end
 
       # Whether a redirect URI host is a loopback interface: localhost or any
-      # loopback address (127.0.0.0/8, ::1, in any spelling).
+      # loopback address (127.0.0.0/8, ::1, in any spelling). The host is read
+      # the way a resolver reads it — decoded, unbracketed, undotted, and
+      # through the shorthand IPv4 parser — so '127.1', '0x7f.0.0.1',
+      # '127.0.0.1.' and '::ffff:127.0.0.1' register as native like the plain
+      # spelling, instead of being sent for registration as a web client whose
+      # HTTP redirect URI the authorization server may then reject.
       # @param host [String, nil]
       # @return [Boolean]
       def loopback_host?(host)
-        host = host.to_s.downcase.delete_prefix('[').delete_suffix(']')
+        host = normalize_host(host.to_s.downcase)
         return true if LOOPBACK_HOSTS.include?(host)
 
-        IPAddr.new(host).loopback?
-      rescue ArgumentError # IPAddr::Error included
-        false
+        ip = parse_address(host)
+        return false unless ip
+
+        ip = ip.native if ip.ipv6? && (ip.ipv4_mapped? || ip.ipv4_compat?)
+        ip.loopback?
       end
 
       # The RFC 7591 error of a failed registration response, sanitized for
