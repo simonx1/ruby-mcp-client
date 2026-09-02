@@ -150,9 +150,13 @@ module MCPClient
       return unless key.is_a?(String) && @cache_generations.count { |k, _| k.is_a?(String) } > MAX_READ_GENERATIONS
 
       # Too many URIs to remember one by one: fold them into the count that
-      # invalidates every read.
+      # invalidates every read. The shared count jumps past the largest
+      # per-URI count it absorbs, so no key's generation stands still or
+      # goes back — a read still in flight cannot be stored against a
+      # generation this fold already left behind.
+      absorbed = @cache_generations.select { |k, _| k.is_a?(String) }.values.max || 0
       @cache_generations.delete_if { |k, _| k.is_a?(String) }
-      @cache_generations[:'read:*'] = (@cache_generations[:'read:*'] || 0) + 1
+      @cache_generations[:'read:*'] = (@cache_generations[:'read:*'] || 0) + absorbed + 1
     end
 
     # Record the freshness hint of one result.
@@ -533,6 +537,29 @@ module MCPClient
     end
 
     # A stable, non-reversible identifier of an Authorization header, so a
+    # The Authorization value in a header collection, whatever the key's
+    # spelling: HTTP field names are case-insensitive and hosts configure
+    # them as strings or symbols (`Authorization:`, 'AUTHORIZATION').
+    # @param headers [Hash, #[], nil]
+    # @return [String, nil]
+    def authorization_header_value(headers)
+      MCPClient::ResultCaching.authorization_header_value(headers)
+    end
+
+    # @see #authorization_header_value (usable from middleware classes too)
+    # @param headers [Hash, #[], nil]
+    # @return [String, nil]
+    def self.authorization_header_value(headers)
+      return nil if headers.nil?
+
+      if headers.respond_to?(:each_pair)
+        headers.each_pair { |key, value| return value if key.to_s.casecmp?('authorization') }
+        nil
+      else
+        headers['Authorization'] || headers['authorization']
+      end
+    end
+
     # cache entry can be bound to the credentials that produced it without
     # keeping the credentials themselves around.
     # @param header [String, nil]

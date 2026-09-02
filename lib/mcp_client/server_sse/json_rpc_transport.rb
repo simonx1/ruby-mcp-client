@@ -243,7 +243,7 @@ module MCPClient
           # MCP 2026-07-28 caching: the result is bound to the credentials
           # this very request carries.
           if respond_to?(:note_request_authorization, true)
-            note_request_authorization(req.headers['Authorization'] || req.headers['authorization'])
+            note_request_authorization(authorization_header_value(req.headers))
           end
           req.body = request.to_json
         end

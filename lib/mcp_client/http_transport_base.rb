@@ -149,7 +149,7 @@ module MCPClient
           req.headers['Mcp-Protocol-Version'] = @protocol_version if @protocol_version
           # MCP: authorization MUST be included in every HTTP request
           @oauth_provider&.apply_authorization(req)
-          note_request_authorization(req.headers['Authorization'])
+          note_request_authorization(authorization_header_value(req.headers))
         end
 
         if response.success?
@@ -802,7 +802,7 @@ module MCPClient
       # Apply OAuth authorization if available
       @logger.debug("OAuth provider present: #{@oauth_provider ? 'yes' : 'no'}")
       @oauth_provider&.apply_authorization(req)
-      note_request_authorization(req.headers['Authorization'])
+      note_request_authorization(authorization_header_value(req.headers))
       # Middleware installed through faraday_config may still change the
       # header: the context of this attempt is known once it was sent.
       note_request_authorization_pending if @faraday_config

@@ -7,6 +7,16 @@ metadata). Each feature lands in its own PR; this section accumulates them.
 
 ### Cacheable results (`ttlMs` / `cacheScope`)
 
+- **Generations, header spelling and arrival times (round 21).** Folding
+  the per-URI invalidation generations past `MAX_READ_GENERATIONS` jumps
+  the shared read generation past every count it absorbs, so no key's
+  generation stands still or goes back and a read still in flight cannot
+  be stored against a generation the fold left behind; the configured
+  `Authorization` header is found whatever its spelling (`Authorization:`,
+  `'AUTHORIZATION'`, a symbol), on every transport, so such a credential
+  no longer makes every private entry look foreign; a queued stdio line or
+  SSE event is dated from its arrival, before it is decoded.
+
 - **Cleanup placeholders and slice identity (round 19).** Clearing the
   cache installs a stale placeholder for every list kind, recorded or
   not, and a transport keeps a fetched list only when its hint was

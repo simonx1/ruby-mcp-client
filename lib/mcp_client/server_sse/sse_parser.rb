@@ -32,13 +32,15 @@ module MCPClient
         return if event[:data].empty?
 
         begin
+          # Dated from the arrival of the event, before it is decoded.
+          arrived = respond_to?(:monotonic_now, true) ? monotonic_now : nil
           data = JSON.parse(event[:data])
 
           return if process_error_in_message?(data)
           return if process_server_request?(data)
           return if process_notification?(data)
 
-          process_response?(data)
+          process_response?(data, arrived)
         rescue MCPClient::Errors::ConnectionError
           raise
         rescue JSON::ParserError => e
@@ -97,8 +99,9 @@ module MCPClient
 
       # Process a JSON-RPC response (id => response)
       # @param data [Hash] the parsed JSON payload
+      # @param arrived [Float, nil] monotonic time the event arrived
       # @return [Boolean] true if we saw & handled a response
-      def process_response?(data)
+      def process_response?(data, arrived = nil)
         return false unless data['id']
 
         # Deliver the response to the waiting caller via @sse_results only.
@@ -117,7 +120,7 @@ module MCPClient
           end
 
           # Dated from arrival: the waiter polls and may wake much later.
-          (@sse_result_arrivals ||= {})[data['id']] = monotonic_now if respond_to?(:monotonic_now, true)
+          (@sse_result_arrivals ||= {})[data['id']] = arrived || monotonic_now if respond_to?(:monotonic_now, true)
           @sse_results[data['id']] =
             if data['error']
               # JSON-RPC error response: store the error under a Symbol key

@@ -543,7 +543,7 @@ module MCPClient
     # @param _kind [Symbol, String, nil] the cache kind (every request carries the same header)
     # @return [String, nil]
     def current_authorization_context(_kind = nil)
-      authorization_fingerprint(@headers['Authorization'] || @headers['authorization'])
+      authorization_fingerprint(authorization_header_value(@headers))
     end
 
     # The context the request this thread last sent went out with (noted
@@ -568,7 +568,7 @@ module MCPClient
       env = response.respond_to?(:env) ? response.env : nil
       return unless env.respond_to?(:request_headers) && env.request_headers
 
-      note_request_authorization(env.request_headers['Authorization'] || env.request_headers['authorization'])
+      note_request_authorization(authorization_header_value(env.request_headers))
     end
 
     # Register a callback for elicitation requests (MCP 2025-06-18)
@@ -814,7 +814,7 @@ module MCPClient
         # header on all HTTP requests after the initialize handshake.
         req.headers['Mcp-Protocol-Version'] = @protocol_version if @protocol_version
         @headers.each { |k, v| req.headers[k] = v }
-        note_request_authorization(req.headers['Authorization'] || req.headers['authorization'])
+        note_request_authorization(authorization_header_value(req.headers))
         req.body = json_body
       end
 
@@ -878,7 +878,7 @@ module MCPClient
     def establish_sse_connection(conn, sse_path)
       conn.get(sse_path) do |req|
         @headers.each { |k, v| req.headers[k] = v }
-        note_request_authorization(req.headers['Authorization'] || req.headers['authorization'])
+        note_request_authorization(authorization_header_value(req.headers))
 
         req.options.on_data = proc do |chunk, _bytes|
           process_sse_chunk(chunk.dup) if chunk && !chunk.empty?
