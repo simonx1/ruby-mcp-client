@@ -39,6 +39,26 @@ module MCPClient
       end
     end
 
+    # Run the block with this server's pin lifted for this thread: the
+    # request that establishes the session replacing an ended one is not
+    # part of the session it replaces, and the pin (whose epoch the end of
+    # that session has just invalidated) would otherwise refuse the very
+    # handshake the caller is in the middle of performing.
+    # @return [Object] the block's value
+    def unpinned_session
+      previous = Thread.current[SESSION_PINS]
+      return yield if previous.nil? || !previous.key?(self)
+
+      pins = {}.compare_by_identity
+      previous.each { |server, pinned| pins[server] = pinned unless server.equal?(self) }
+      Thread.current[SESSION_PINS] = pins
+      begin
+        yield
+      ensure
+        Thread.current[SESSION_PINS] = previous
+      end
+    end
+
     # Refuse a request whose session has ended (see #pinned_to_session).
     # Transports call this as late as they can, immediately before the
     # request goes on the wire, so nothing of an ended session is written.

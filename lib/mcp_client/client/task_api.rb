@@ -51,9 +51,14 @@ module MCPClient
         rpc_params = { name: tool_name, arguments: arguments, task: task_params }
         rpc_params[:_meta] = parameters[meta_key] if meta_key
 
+        # The task is created in the session this call reaches: a session that
+        # ends before the handle is built takes the task with it, so the
+        # handle names the session it was created in and not its successor.
+        epoch = invocation_session_epoch(srv)
+
         begin
-          result = srv.rpc_request('tools/call', rpc_params)
-          MCPClient::Task.from_create_result(result, server: srv)
+          result = pinned_to_session(srv, epoch) { srv.rpc_request('tools/call', rpc_params) }
+          MCPClient::Task.from_create_result(result, server: srv, session_epoch: epoch)
         rescue MCPClient::Errors::ServerError, MCPClient::Errors::TransportError,
                MCPClient::Errors::ConnectionError => e
           raise MCPClient::Errors::TaskError, "Error creating task for tool '#{tool_name}': #{e.message}"
@@ -77,20 +82,26 @@ module MCPClient
       # @param epoch [Integer, nil] the server session this poll is about (internal): task ids are
       #   per session and reusable, so a request that would reach the session which replaced it is
       #   not sent — what came back would describe another lifetime of the same id
-      def get_task(task_id, server: nil, timeout: nil, state: nil, epoch: nil)
+      # @param polling [Boolean] whether the caller is a wait (internal): a session that ended under
+      #   the request is a lost poll (SessionChangedError) for it, and a TaskError for anyone else
+      def get_task(task_id, server: nil, timeout: nil, state: nil, epoch: nil, polling: false)
         srv = select_task_server(task_id, server, 'get_task')
         # A caller that named the task with a handle asks about the task that
         # handle names: the request is pinned to its session and refused once
         # that session has ended, where the reused id names another task
-        # (the wait passes the session it polls in itself).
-        epoch ||= handle_session_epoch(task_id, srv, 'getting')
+        # (the wait passes the session it polls in itself). A bare id names
+        # what the session live at this call knows, and is pinned to it.
+        epoch ||= handle_session_epoch(task_id, srv, 'getting') || invocation_session_epoch(srv)
         task_id = task_identifier(task_id)
         ensure_task_capability!(srv, 'get')
 
         begin
           result = task_rpc(srv, 'tasks/get', { taskId: task_id }, timeout: timeout, epoch: epoch)
           validate_detailed_task_shape!(result) if modern_server?(srv)
-          task = MCPClient::Task.from_json(result, server: srv, detailed: true)
+          # The handle is about the session the request was pinned to: one
+          # that ended while the answer was in flight (or just after it came
+          # back) must not stamp it with the session that replaced it.
+          task = MCPClient::Task.from_json(result, server: srv, detailed: true, session_epoch: epoch)
           # The answer must be about the task that was asked for: its state
           # drives result delivery and tasks/update.
           if modern_server?(srv) && task.task_id != task_id.to_s
@@ -99,20 +110,26 @@ module MCPClient
                   "match the requested task #{sanitize_peer_log_text(task_id.to_s).inspect}"
           end
           # A terminal task is done with its input bookkeeping (answered keys,
-          # pending answers): a reused id must never inherit it.
-          forget_task_keys(srv, task_id, state: state) if task.terminal?
+          # pending answers): a reused id must never inherit it. What is
+          # forgotten is the bookkeeping of the session that was asked, never
+          # what the session replacing it has recorded under the same id.
+          forget_task_keys(srv, task_id, state: state, epoch: epoch) if task.terminal?
           task
         rescue MCPClient::Errors::ServerError => e
           raise if e.protocol_error?
 
           error = task_error_from(e, task_id, 'getting', modern: modern_server?(srv), method: 'tasks/get')
-          forget_task_keys(srv, task_id, state: state) if error.is_a?(MCPClient::Errors::TaskNotFound)
+          forget_task_keys(srv, task_id, state: state, epoch: epoch) if error.is_a?(MCPClient::Errors::TaskNotFound)
           raise error
-        rescue MCPClient::Errors::SessionChangedError
-          # Nothing was asked: the session this poll is about has ended, and
-          # the answer of the one that replaced it would be another task's.
-          # The caller (a wait) treats it as a lost poll.
-          raise
+        rescue MCPClient::Errors::SessionChangedError => e
+          # Nothing was asked: the session this request is about has ended,
+          # and the answer of the one that replaced it would be another
+          # task's. A wait wants the raw signal (it treats it as a lost poll);
+          # a direct caller gets the documented TaskError.
+          raise if polling
+
+          raise MCPClient::Errors::TaskError, "Error getting task '#{sanitize_peer_log_text(task_id.to_s)}': " \
+                                              "#{sanitize_peer_log_text(e.message)}"
         rescue MCPClient::Errors::TransportError, MCPClient::Errors::ConnectionError => e
           raise MCPClient::Errors::TaskError, "Error getting task '#{sanitize_peer_log_text(task_id.to_s)}': " \
                                               "#{sanitize_peer_log_text(e.message)}"
@@ -153,7 +170,7 @@ module MCPClient
         # The result of the task the handle names, in the session it was seen
         # in: the request is pinned to that session and refused once it has
         # ended, where the reused id would hand back another task's result.
-        epoch = handle_session_epoch(task_id, srv, 'getting result for')
+        epoch = handle_session_epoch(task_id, srv, 'getting result for') || invocation_session_epoch(srv)
         task_id = task_identifier(task_id)
 
         begin
@@ -190,9 +207,13 @@ module MCPClient
 
         params = cursor ? { cursor: cursor } : {}
 
+        # The listed tasks are the ones the session this call reaches knows:
+        # a handle from it names that session, not whatever replaced it.
+        epoch = invocation_session_epoch(srv)
+
         begin
-          result = srv.rpc_request('tasks/list', params) || {}
-          tasks = (result['tasks'] || []).map { |t| MCPClient::Task.from_json(t, server: srv) }
+          result = pinned_to_session(srv, epoch) { srv.rpc_request('tasks/list', params) } || {}
+          tasks = (result['tasks'] || []).map { |t| MCPClient::Task.from_json(t, server: srv, session_epoch: epoch) }
           { tasks: tasks, next_cursor: result['nextCursor'] }
         rescue MCPClient::Errors::ServerError, MCPClient::Errors::TransportError,
                MCPClient::Errors::ConnectionError => e
@@ -217,14 +238,15 @@ module MCPClient
         ensure_task_capability!(srv, 'cancel')
         # Cancelling by a handle cancels that task, in the session it was
         # seen in: a handle kept across a restart must not cancel whatever
-        # the replacement session named with the same id.
-        epoch = handle_session_epoch(task, srv, 'cancelling')
+        # the replacement session named with the same id. A bare id cancels
+        # what the session live at this call knows, and nothing else.
+        epoch = handle_session_epoch(task, srv, 'cancelling') || invocation_session_epoch(srv)
 
         begin
           result = task_rpc(srv, 'tasks/cancel', { taskId: task_id }, epoch: epoch)
-          return cancelled_task_handle(task, task_id, srv) if modern_server?(srv)
+          return cancelled_task_handle(task, task_id, srv, epoch) if modern_server?(srv)
 
-          MCPClient::Task.from_json(result, server: srv)
+          MCPClient::Task.from_json(result, server: srv, session_epoch: epoch)
         rescue MCPClient::Errors::ServerError => e
           raise if e.protocol_error?
           # A terminal task cannot be cancelled (-32602); that is an error, not a

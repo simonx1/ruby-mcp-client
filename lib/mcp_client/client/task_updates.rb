@@ -101,7 +101,8 @@ module MCPClient
       #   (answered keys, pending payload) lands there and nowhere else
       # @return [true]
       # @raise [MCPClient::Errors::TaskError, MCPClient::Errors::ServerError]
-      def send_task_update(srv, task_id, input_responses, timeout: nil, pending_only: false, epoch: nil, state: nil)
+      def send_task_update(srv, task_id, input_responses, timeout: nil, pending_only: false, epoch: nil, state: nil,
+                           strict_session: false)
         shown = shown_task_id(task_id)
         state ||= task_state(srv, task_id)
         # The answers are pending — and their keys answered — from the moment
@@ -125,7 +126,8 @@ module MCPClient
           return true if payload.nil?
 
           dispatch_task_update(srv, task_id, payload, shown: shown, state: state, lock: lock,
-                                                      timeout: timeout, epoch: epoch)
+                                                      timeout: timeout, epoch: epoch,
+                                                      strict_session: strict_session)
         end
       end
 
@@ -188,12 +190,13 @@ module MCPClient
       # wait abandoned this send, the retry that took the lock over owns the
       # bookkeeping.
       # @return [true]
-      def dispatch_task_update(srv, task_id, input_responses, shown:, state:, lock:, timeout:, epoch: nil)
+      def dispatch_task_update(srv, task_id, input_responses, shown:, state:, lock:, timeout:, epoch: nil,
+                               strict_session: false)
         keys = input_responses.keys.map(&:to_s)
         begin
           unless task_update_session_current?(srv, shown, epoch)
             drop_ended_session_update(state, lock, keys)
-            return true
+            return ended_session_update_result(shown, strict_session)
           end
 
           task_rpc(srv, 'tasks/update', { taskId: task_id, inputResponses: input_responses },
@@ -206,7 +209,7 @@ module MCPClient
           # would answer a different request.
           logger.warn("Task #{shown}: the session restarted before the answers were sent; they are discarded")
           drop_ended_session_update(state, lock, keys)
-          true
+          ended_session_update_result(shown, strict_session)
         rescue MCPClient::Errors::ServerError => e
           if definite_rejection?(e) && update_lock_current?(state, lock)
             release_answered_keys_in(state, keys)
@@ -221,6 +224,21 @@ module MCPClient
           raise MCPClient::Errors::TaskError,
                 "Error updating task '#{shown}': #{sanitize_peer_log_text(e.message)}"
         end
+      end
+
+      # What a delivery the session guard (or the pin at the wire) dropped
+      # reports. A wait polls again and ends on the session move it will see
+      # next, so the drop is not an error for it; a caller that asked for
+      # this very delivery is told that nothing was sent, rather than being
+      # left to believe the server has the answers.
+      # @return [true]
+      # @raise [MCPClient::Errors::TaskError] for a direct #update_task
+      def ended_session_update_result(shown, strict_session)
+        return true unless strict_session
+
+        raise MCPClient::Errors::TaskError,
+              "Error updating task '#{shown}': the server session the answers belong to ended before they were " \
+              'sent, so they were discarded (a restarted server may reuse the task id for an unrelated task)'
       end
 
       # Nothing was written: the keys go back and the payload is dropped, in

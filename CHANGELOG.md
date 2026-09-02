@@ -7,6 +7,30 @@ metadata). Each feature lands in its own PR; this section accumulates them.
 
 ### Tasks extension (`io.modelcontextprotocol/tasks`)
 
+- **A task handle carries the session its request was sent in (round 33).**
+  A `Task` is now stamped with the session epoch the request that produced
+  it was pinned to, instead of sampling the server when the object happens
+  to be built: a session that ends between the answer and the handle (a
+  stdio child exiting, a concurrent 404 recovery) no longer stamps the
+  handle with the *successor* session, where the reused task id names an
+  unrelated task, and a wait accepts a terminal payload only when it is
+  stamped with the very session it polled. Task requests that name their
+  task with a bare id are pinned to the session live at the call, so an
+  HTTP 404 recovery cannot replay `tasks/get` / `tasks/result` /
+  `tasks/cancel` into the replacement session; a session that ends under
+  such a request is reported as a `TaskError` (the documented failure) by
+  `get_task`, and `update_task` now reports answers the pin dropped instead
+  of returning `true` for a delivery that never went out. On the HTTP
+  transports the captured session id is now attached to the request
+  unconditionally, so a concurrent recovery clearing `@session_id` can no
+  longer send an in-flight pinned request with no session header at all,
+  and a 404 moves the session epoch the moment it ends the session rather
+  than after the replacement handshake succeeded — a handshake that fails
+  leaves the transport uninitialized instead of leaving requests treating
+  the dead session as current. A `tools/call` answered with a task is
+  validated against the tool definition in force when the call was made:
+  an unrelated `tools/list_changed` refresh landing during a wait that may
+  take minutes no longer changes the schema the result is checked against.
 - **An HTTP session restart moves the epoch, and a wait ends with its
   session (round 32).** The automatic recovery from an expired HTTP session
   (a 404 answering a request that carried an `Mcp-Session-Id`, which the

@@ -304,6 +304,9 @@ module MCPClient
       # request _meta and route matching notifications/progress to the
       # caller's callback while the request is active.
       parameters, token = setup_progress_tracking(parameters, progress)
+      # The session the call is made in: a task it comes back as belongs to
+      # that session, not to one that replaced it while the answer was read.
+      task_epoch = tasks_extension? ? invocation_session_epoch(server) : nil
 
       # The call and the re-resolve that follows it share one slot for the
       # definition the transport's request goes out under, so a call that a
@@ -323,10 +326,18 @@ module MCPClient
           unregister_progress_callback(token) if token
         end
 
+        # The transport may have refreshed the tool list mid-call (MCP
+        # 2026-07-28 HeaderMismatch recovery); validate against the definition
+        # the call was actually answered under. It is captured here, before a
+        # task's result is waited for: a tools/list_changed refresh that lands
+        # during a wait that may take minutes belongs to another invocation and
+        # says nothing about the definition this one was answered under.
+        tool = refreshed_tool(tool) || tool if tools_generation_of(server) != generation_before
+
         # MCP 2026-07-28 tasks extension: the server may have turned the call
         # into a task; drive it to its final result so the contract of this
         # method does not change.
-        result = complete_task_result(tool_name, server, result)
+        result = complete_task_result(tool_name, server, result, task_epoch)
 
         # MCP 2026-07-28 HeaderMismatch recovery re-derives a call's
         # Mcp-Param-* headers from a refreshed tools/list, so the attempt that
@@ -475,6 +486,7 @@ module MCPClient
 
       begin
         generation_before = tasks_extension? ? tools_generation_of(server) : nil
+        task_epoch = tasks_extension? ? invocation_session_epoch(server) : nil
         # Use the streaming API if it's available
         stream = server.call_tool_streaming(tool_name, parameters)
         return stream unless tasks_extension? && modern_server?(server)
@@ -487,8 +499,10 @@ module MCPClient
           stream.each do |chunk|
             next yielder << chunk unless task_result?(chunk)
 
-            result = complete_task_result(tool_name, server, chunk)
+            # The definition in force when the chunk arrived, captured
+            # before the task is waited for (see #call_tool).
             current = tools_generation_of(server) == generation_before ? tool : (refreshed_tool(tool) || tool)
+            result = complete_task_result(tool_name, server, chunk, task_epoch)
             yielder << validate_structured_content!(current, result)
           end
         end
