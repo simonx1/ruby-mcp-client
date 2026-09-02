@@ -216,7 +216,19 @@ module MCPClient
       problems = []
       counter = { count: 0, dialect: canonical_dialect(declared), walked: {}.compare_by_identity }
       walk_schema(root, root, 0, counter, problems)
+      problems.concat(duplicate_anchor_problems(root, counter)) if problems.empty?
       problems.uniq
+    end
+
+    # Anchor names must be unique within a schema resource (JSON Schema
+    # 2020-12 Core Section 8.2.2): a name declared twice would bind a
+    # reference to whichever declaration the walk met first, so the schema
+    # is unusable instead.
+    # @param resolver [Hash] holder of the memoized anchor index
+    # @return [Array<String>]
+    def self.duplicate_anchor_problems(root, resolver)
+      index = (resolver[:anchors] ||= anchor_index(root, resolver[:dialect]))
+      index[:duplicates].map { |name| "anchor #{clip(name.inspect)} is declared more than once in a schema resource" }
     end
 
     # Walk every subschema position, checking bounds and references. A
@@ -433,17 +445,20 @@ module MCPClient
 
     # @return [String, nil] the problem, if any; each resolved target is yielded
     def self.follow_ref_chain(ref, root, dialect, resolver, from)
-      seen = []
+      # A cycle is a chain returning to a schema it already reached: hops
+      # are told apart by where they land, not by their fragment text,
+      # since the same fragment means something else in another resource.
+      seen = {}.compare_by_identity
       current = ref
       loop do
-        return "$ref chain #{clip(ref.inspect)} cycles" if seen.include?(current)
         return "$ref chain #{clip(ref.inspect)} exceeds #{MAX_REF_DEPTH} hops" if seen.size >= MAX_REF_DEPTH
 
-        seen << current
         target = resolve_reference(root, current, dialect, resolver, from: from)
         return "unresolvable local $ref #{clip(current.inspect)}" if target.equal?(UNRESOLVED)
         return "$ref #{clip(current.inspect)} does not point at a schema" unless schema_value?(target)
+        return "$ref chain #{clip(ref.inspect)} cycles" if target.is_a?(Hash) && seen.key?(target)
 
+        seen[target] = true if target.is_a?(Hash)
         yield target
         return nil unless target.is_a?(Hash) && target.key?('$ref')
 

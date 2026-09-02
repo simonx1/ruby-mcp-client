@@ -85,6 +85,14 @@ metadata). Each feature lands in its own PR; this section accumulates them.
   not at a resource root is ignored). The structural bound counts array
   members too, so a wide array of boolean schemas is rejected before it is
   copied, and numeric bound errors clip the values they quote.
+- **Reference chains and anchors (round 10).** A `$ref` chain is
+  followed by where each hop lands, not by the text of its fragment, so a
+  reference entering an embedded resource whose own `$ref` reuses the same
+  fragment is not a cycle (a chain returning to a schema it reached still
+  is); an `$anchor` / `$dynamicAnchor` (or draft-07 fragment `$id`)
+  declared more than once within one schema resource makes the schema
+  unusable instead of binding references to whichever declaration was met
+  first.
 
 ### Authorization (RFC 9207 issuer validation, client registration)
 
