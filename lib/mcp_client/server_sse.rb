@@ -1,5 +1,6 @@
 # frozen_string_literal: true
 
+require_relative 'request_meta_scope'
 require 'uri'
 require 'json'
 require 'monitor'
@@ -32,6 +33,10 @@ module MCPClient
     require_relative 'server_sse/reconnect_monitor'
 
     include ReconnectMonitor
+    # Every operation that may weigh a cache decision runs inside a scope
+    # that reserves the host request_meta evaluation for the request it
+    # leads to, and drops it when the operation ends.
+    prepend MCPClient::RequestMetaScope
 
     # Ratio of close_after timeout to ping interval
     CLOSE_AFTER_PING_RATIO = 2.5

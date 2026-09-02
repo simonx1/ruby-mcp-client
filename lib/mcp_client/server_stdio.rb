@@ -1,5 +1,6 @@
 # frozen_string_literal: true
 
+require_relative 'request_meta_scope'
 require 'open3'
 require 'monitor'
 require 'json'
@@ -13,6 +14,10 @@ module MCPClient
     require_relative 'server_stdio/json_rpc_transport'
 
     include JsonRpcTransport
+    # Every operation that may weigh a cache decision runs inside a scope
+    # that reserves the host request_meta evaluation for the request it
+    # leads to, and drops it when the operation ends.
+    prepend MCPClient::RequestMetaScope
 
     # @!attribute [r] command
     #   @return [String, Array] the command used to launch the server

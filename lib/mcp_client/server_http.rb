@@ -1,5 +1,6 @@
 # frozen_string_literal: true
 
+require_relative 'request_meta_scope'
 require 'uri'
 require 'json'
 require 'monitor'
@@ -27,6 +28,10 @@ module MCPClient
     require_relative 'server_http/json_rpc_transport'
 
     include JsonRpcTransport
+    # Every operation that may weigh a cache decision runs inside a scope
+    # that reserves the host request_meta evaluation for the request it
+    # leads to, and drops it when the operation ends.
+    prepend MCPClient::RequestMetaScope
 
     # Default values for connection settings
     DEFAULT_READ_TIMEOUT = 30
