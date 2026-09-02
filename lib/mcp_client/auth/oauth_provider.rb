@@ -400,8 +400,12 @@ module MCPClient
         known = stored_server_metadata&.issuer
         return unless advertised && known && advertised != known
 
-        logger.debug('The challenge names another authorization server; retiring the stored token')
         @authorization_server_switched = true
+        # A token another provider sharing the storage already bound to the
+        # advertised server is exactly the token to keep.
+        return if record_bound_to?(stored_token_or_nil, advertised)
+
+        logger.debug('The challenge names another authorization server; retiring the stored token')
         delete_token(bind_to: Token::RETIRED_ISSUER)
       end
 
