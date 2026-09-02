@@ -7,6 +7,13 @@ metadata). Each feature lands in its own PR; this section accumulates them.
 
 ### Cacheable results (`ttlMs` / `cacheScope`)
 
+- **Pages with differing parameters (round 15).** A paginated list whose
+  pages went out under differing effective parameters (the host's
+  `request_meta` changed between pages, e.g. from a notification callback)
+  is never served from the cache: like pages fetched under differing
+  credentials, it leaves a stale placeholder that no request's parameters
+  match (`CachedResult::MIXED_PARAMS`), on every transport including stdio.
+
 - **Round 13.** An uncacheable `resources/read` (a multi round-trip retry,
   no `ttlMs`, `ttlMs` 0, stale on arrival) is not stored and drops the
   per-URI slot only when it still holds the entry that read set out to

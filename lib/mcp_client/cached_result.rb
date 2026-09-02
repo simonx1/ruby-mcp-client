@@ -15,6 +15,9 @@ module MCPClient
     # The context of a private list whose pages were fetched under different
     # credentials: it belongs to no context and never matches one.
     MIXED_CONTEXT = Object.new.freeze
+    # The params fingerprint of a list whose pages were fetched under
+    # differing effective parameters: no request's parameters match it.
+    MIXED_PARAMS = Object.new.freeze
     # @return [Float] monotonic receipt time (seconds)
     attr_reader :received_at
     # @return [Integer, Float, nil] the server's ttlMs (nil when it sent none)
