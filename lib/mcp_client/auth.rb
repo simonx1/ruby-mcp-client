@@ -80,9 +80,8 @@ module MCPClient
           expires_in: @expires_in,
           scope: @scope,
           refresh_token: @refresh_token,
-          expires_at: @expires_at&.iso8601,
-          issuer: @issuer
-        }.compact
+          expires_at: @expires_at&.iso8601
+        }.tap { |hash| hash[:issuer] = @issuer if @issuer }
       end
 
       # Create token from hash

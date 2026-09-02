@@ -94,7 +94,11 @@ metadata). Each feature lands in its own PR; this section accumulates them.
   issuer, so another provider sharing the storage may store the same
   opaque bytes issued by a new authorization server. A PKCE record that
   names no client (persisted by an earlier version, or by a backend that
-  dropped the field) fails closed like one without an issuer.
+  dropped the field) fails closed like one without an issuer. A 401
+  challenge retires the stored token only when its metadata would pass
+  discovery's checks (the resource matches, the advertised authorization
+  server is an acceptable URL); `Token#to_h` keeps every legacy key and
+  adds `issuer` only when set.
 
 ### Tasks extension (`io.modelcontextprotocol/tasks`)
 
