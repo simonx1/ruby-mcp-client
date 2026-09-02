@@ -92,7 +92,9 @@ metadata). Each feature lands in its own PR; this section accumulates them.
   credentials changed, so the browser never sees a success page for a
   callback the flow rejects; in-process retirement markers are scoped by
   issuer, so another provider sharing the storage may store the same
-  opaque bytes issued by a new authorization server.
+  opaque bytes issued by a new authorization server. A PKCE record that
+  names no client (persisted by an earlier version, or by a backend that
+  dropped the field) fails closed like one without an issuer.
 
 ### Tasks extension (`io.modelcontextprotocol/tasks`)
 
