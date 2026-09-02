@@ -434,6 +434,7 @@ module MCPClient
       end
       return nil unless copy
 
+      release_serving_request_meta
       note_served_entry(kind, entry)
       copy
     end
@@ -479,16 +480,20 @@ module MCPClient
     def entry_in_current_context?(entry, context: :current, kind: nil)
       return false if entry && !entry_for_current_params?(entry, context)
 
-      matched = entry_matches_authorization?(entry, context, kind)
-      # The whole decision is made: the entry is served, so this lookup leads
-      # to no request of its own and the metadata held for it is dropped
-      # rather than sent by a later one. Until then it stays held, so the
-      # authorization probe models the request on the very metadata the
-      # decision was made on instead of evaluating the host's callable again.
-      if matched && entry && context == :current && respond_to?(:release_held_request_meta, true)
-        release_held_request_meta
-      end
-      matched
+      # The metadata this lookup evaluated stays held: an entry that belongs
+      # to the context may still be too stale to serve, and the request that
+      # then goes out carries the very evaluation the decision was made on.
+      # {#release_serving_request_meta} drops it once a value really is
+      # served instead.
+      entry_matches_authorization?(entry, context, kind)
+    end
+
+    # A cached value was served, so the lookup that led here leads to no
+    # request of its own: the metadata held for that request is dropped
+    # rather than sent, some time later, by another one.
+    # @return [void]
+    def release_serving_request_meta
+      release_held_request_meta if respond_to?(:release_held_request_meta, true)
     end
 
     # @param entry [MCPClient::CachedResult, nil]
@@ -569,6 +574,7 @@ module MCPClient
       entry = private_entry_for_current_context(kind)
       return nil unless entry&.value && entry.fresh?(now: monotonic_now)
 
+      release_serving_request_meta
       entry.value
     end
 
@@ -764,7 +770,10 @@ module MCPClient
 
         cached.value.map(&:dup)
       end
-      return served if served
+      if served
+        release_serving_request_meta
+        return served
+      end
 
       epoch = cache_epoch(key)
       started = monotonic_now

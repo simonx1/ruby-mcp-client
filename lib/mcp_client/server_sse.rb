@@ -540,6 +540,7 @@ module MCPClient
         @prompts = nil
         @prompts_data = nil
         @resources_result = nil
+        @templates_result = nil
         # Don't clear auth error as we need it for reporting the correct error
         # Don't reset @consecutive_ping_failures or @reconnect_attempts as they're tracked across reconnections
       end
@@ -1126,6 +1127,9 @@ module MCPClient
           @prompts_data = nil
         when :resources
           @resources_result = nil
+        when :templates
+          # resources/list_changed covers resources/templates/list too.
+          @templates_result = nil
         end
       end
     end

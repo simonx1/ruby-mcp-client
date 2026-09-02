@@ -86,7 +86,7 @@ RSpec.describe 'MCP 2026-07-28 cacheable results — round 14' do
     server.request_meta = lambda {
       trace += 1
       { 'tenant' => 'a', 'traceparent' => "00-#{trace.to_s.rjust(32, '0')}-0000000000000001-01",
-        'tracestate' => "t=#{trace}", 'baggage' => "n=#{trace}", 'progressToken' => trace }
+        'tracestate' => "t=#{trace}", 'progressToken' => trace }
     }
 
     expect(server.list_tools.map(&:name)).to eq(['tool-a'])
@@ -135,16 +135,20 @@ RSpec.describe 'MCP 2026-07-28 cacheable results — round 14' do
       end
     end
 
-    it 'carries the effective _meta of a real request' do
+    it 'never runs middleware that authenticates by the request body' do
       counts = Hash.new(0)
       stub_tenant_server(counts)
       server = streamable(faraday_config: ->(f) { f.use meta_aware_middleware })
       server.request_meta = { 'tenant' => 'a' }
       expect(server.list_tools.map(&:name)).to eq(['tool-a'])
 
-      probe = server.send(:middleware_request_headers, {}, 'tools/list', {})
-      expect(probe['Authorization']).to eq('Bearer a')
-      expect(probe['X-Probe-Version']).to eq('2026-07-28')
+      # Whatever such middleware would choose is unknowable without sending,
+      # so no private entry of it is ever served.
+      expect(server.send(:current_authorization_context, :tools))
+        .to eq(MCPClient::HttpTransportBase::CacheSupport::UNKNOWN_CONTEXT)
+      server.request_meta = { 'tenant' => 'b' }
+      expect(server.list_tools.map(&:name)).to eq(['tool-b'])
+      expect(counts['tools/list']).to eq(2)
     ensure
       server&.cleanup
     end
@@ -152,13 +156,12 @@ RSpec.describe 'MCP 2026-07-28 cacheable results — round 14' do
     it 'sees the credentials the next real request would carry' do
       counts = Hash.new(0)
       stub_tenant_server(counts)
-      server = streamable(faraday_config: ->(f) { f.use meta_aware_middleware })
+      server = streamable(faraday_config: ->(f) { f.request :authorization, 'Bearer', 'a' })
       server.request_meta = { 'tenant' => 'a' }
       expect(server.list_tools.map(&:name)).to eq(['tool-a'])
       expect(server.send(:current_authorization_context, :tools)).to eq(server.send(:request_authorization_context))
 
       server.request_meta = { 'tenant' => 'b' }
-      expect(server.send(:current_authorization_context, :tools)).not_to eq(server.send(:request_authorization_context))
       expect(server.list_tools.map(&:name)).to eq(['tool-b'])
       expect(counts['tools/list']).to eq(2)
     ensure

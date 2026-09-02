@@ -736,7 +736,7 @@ module MCPClient
 
     # Drop the transport's cached list of a kind, so a re-list after a change
     # (or the HeaderMismatch refresh) really fetches the new definitions.
-    # @param kind [Symbol] :tools, :prompts or :resources
+    # @param kind [Symbol] :tools, :prompts, :resources or :templates
     # @return [void]
     def invalidate_list_cache(kind)
       case kind
@@ -751,6 +751,11 @@ module MCPClient
           @resources_result = nil
           @resources_data = nil
         end
+      when :templates
+        # resources/list_changed covers resources/templates/list too: the
+        # old templates are stale, and holding them keeps a list the next
+        # fetch will replace alive for the life of the connection.
+        @mutex.synchronize { @templates_result = nil }
       end
     end
 

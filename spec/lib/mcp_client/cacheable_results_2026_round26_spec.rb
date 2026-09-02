@@ -130,22 +130,12 @@ RSpec.describe 'MCP 2026-07-28 cacheable results — round 26' do
       expect(bearers).to eq(%w[nonce1 nonce2])
     end
 
-    it 'still serves a private entry when the shared state is a logger, a lock and a frozen holder' do
+    it 'still serves a private entry alongside framework middleware that sets no credential' do
       bearers = stub_tools_by_bearer
-      predictable = Class.new(Faraday::Middleware) do
-        def initialize(app, holder, lock, logger)
-          super(app)
-          @holder = holder
-          @lock = lock
-          @logger = logger
-        end
-
-        def on_request(env)
-          @lock.synchronize { env.request_headers['Authorization'] = "Bearer #{@holder[:value]}" }
-        end
-      end
       server = streamable(faraday_config: lambda { |f|
-        f.use predictable, { value: 'alice' }.freeze, Mutex.new, Logger.new(File::NULL)
+        f.request :authorization, 'Bearer', 'alice'
+        f.response :logger, Logger.new(File::NULL)
+        f.response :raise_error
       })
 
       expect(server.list_tools.map(&:name)).to eq(['alice-tool'])

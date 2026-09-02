@@ -19,43 +19,35 @@ module MCPClient
       # request would carry cannot be determined without sending it.
       UNKNOWN_CONTEXT = :unknown
 
-      # Middleware that overrides `call` outright (the retry middleware of the
-      # default stack) but never touches the request headers, so the probe
-      # may skip it.
-      PROBE_TRANSPARENT_MIDDLEWARE = %w[Faraday::Retry::Middleware Faraday::Request::Retry].freeze
+      # Framework middleware that never puts an Authorization header on a
+      # request, whatever it was configured with: the probe steps over it
+      # instead of running it (some of it overrides `call` and could not be
+      # run without sending anyway).
+      PROBE_AUTHORIZATION_NEUTRAL_MIDDLEWARE = %w[
+        Faraday::Retry::Middleware
+        Faraday::Request::Retry
+        Faraday::Request::Json
+        Faraday::Request::UrlEncoded
+        Faraday::Request::Multipart
+        Faraday::Response::Logger
+      ].freeze
 
-      # Collaborators a middleware may share with the live stack without the
-      # probe changing what a later request sends: they carry no request
-      # state of their own (a logger writes, a lock guards).
-      PROBE_SAFE_SHARED_STATE = [Logger, Mutex].freeze
+      # The only middleware the probe runs: Faraday's own Authorization
+      # middleware, whose header is a pure function of the arguments it was
+      # installed with -- and only when those arguments are literal
+      # configuration it can do nothing with but read
+      # ({#probe_static_value?}). Host middleware is never run.
+      PROBE_PURE_MIDDLEWARE = [Faraday::Request::Authorization].freeze
 
-      # The only shared state the probe treats as unchangeable: values that
-      # hold nothing beyond what {#probe_state_members} enumerates, so
-      # freezing them really does close off every value they can hand out.
-      # Anything else — a module or class (shared, never copied, and keeping
-      # state freezing does not reach), a frozen wrapper such as a Data or a
-      # custom object — may vend a different value on a later call.
-      PROBE_IMMUTABLE_CLASSES = [NilClass, TrueClass, FalseClass, Numeric, Symbol, String, Regexp, Time,
-                                 Hash, Array, Struct, Range].freeze
+      # Configuration a middleware can only read: a literal, or a plain
+      # container of literals. Anything else (a proc that vends a fresh
+      # token, an object that answers `call`, a holder something else can
+      # rotate) may hand a different credential to every request.
+      PROBE_STATIC_CLASSES = [NilClass, TrueClass, FalseClass, Numeric, Symbol, String].freeze
 
-      # Class-level state Faraday itself keeps on every middleware class it
-      # builds: the default options its own class API vends, memoized there
-      # on first use. It belongs to the framework, is identical for a fresh
-      # copy and for the instance Faraday calls, and no host request hook
-      # rotates it, so the probe looks past it.
-      PROBE_FRAMEWORK_CLASS_STATE = Faraday::Middleware.singleton_class.instance_methods(false)
-                                                       .map { |name| :"@#{name}" }.freeze
-
-      # Where {RubyVM::InstructionSequence#to_a} carries the kind of sequence
-      # it serialized (`:method` for a `def`, `:block` for a `define_method`
-      # body). A layout that no longer answers `:method` there leaves every
-      # host middleware unrunnable, which is the safe way to be wrong.
-      ISEQ_TYPE_INDEX = 9
-
-      # How far into shared state its immutability is checked: a frozen
-      # container may still hold mutable members, and beyond this depth the
-      # state counts as mutable (so the context is unknown).
-      PROBE_IMMUTABLE_DEPTH = 8
+      # How deep a container of configuration is looked into; beyond it the
+      # configuration counts as something the probe cannot read.
+      PROBE_STATIC_DEPTH = 4
 
       # Last request middleware on the JSON-RPC connection: records the
       # Authorization a request carries once every host middleware
@@ -179,9 +171,12 @@ module MCPClient
         headers = probe.headers
         if @faraday_config
           # Faraday middleware installed by the host (faraday_config) may
-          # add or replace the header after the request block ran: the probe
-          # runs that stack too, without sending anything — and gives up
-          # rather than guess when it cannot run it faithfully.
+          # add or replace the header after the request block ran. Host
+          # middleware is never run to find out what it would put there --
+          # running it spends whatever one-time credential it vends, and no
+          # inspection can tell which middleware does that -- so the answer
+          # is unknown for any stack that is not framework middleware the
+          # transport can read off its own configuration.
           headers = middleware_request_headers(headers, *probe_request_for(kind))
           return UNKNOWN_CONTEXT if headers.nil?
         end
@@ -209,289 +204,114 @@ module MCPClient
       # Authorization header it would apply.
       HeaderProbe = Struct.new(:headers)
 
-      # Run the request phase of the connection's middleware over a request
-      # shaped like the real JSON-RPC POST of the operation (endpoint, JSON
-      # body with its method and params) that is never sent, and return the
-      # headers it would go out with. Only `on_request` hooks run: response
-      # middleware (raise_error, a parser) never sees a response here, and
-      # the recorder must not note the probe as a sent request. Middleware
-      # that overrides `call` cannot be run without sending, middleware whose
-      # own state has moved on since the connection was built cannot be stood
-      # in for by a fresh copy, and middleware that shares mutable state with
-      # the live stack must not be run at all (the probe would change it) --
-      # state its class keeps or a block closed over included, neither of
-      # which building a copy leaves behind; the answer is then unknown.
+      # The headers a request of this operation would go out with, once the
+      # connection's middleware had its say -- without sending anything and
+      # without running a single line of the host's own code.
+      #
+      # A `faraday_config` block may install middleware that vends a
+      # credential of its own, and four review rounds of reflection could not
+      # tell such middleware apart from an inert one: the rotating state can
+      # sit in a constant, a global, a thread-local or the binding of a
+      # method, none of which building a copy leaves behind. So the probe no
+      # longer tries: it steps over framework middleware that sets no
+      # Authorization header, runs framework middleware whose header is a
+      # pure function of the literal configuration it was installed with
+      # ({PROBE_PURE_MIDDLEWARE}), and answers nil -- an unknown context, in
+      # which no private entry is served -- for anything else.
       # @param headers [Hash] the headers before middleware
       # @param method [String] the JSON-RPC method the probe models
       # @param params [Hash] its params
       # @return [Hash, nil] the headers after middleware, or nil when they cannot be determined
       def middleware_request_headers(headers, method = @probe_method || 'ping', params = {})
         conn = http_connection
+        pure = []
+        conn.builder.handlers.each do |handler|
+          # The recorder is the probe's own, and middleware that sets no
+          # Authorization header changes no answer here.
+          next if handler.klass == AuthorizationRecorder
+          next if PROBE_AUTHORIZATION_NEUTRAL_MIDDLEWARE.include?(handler.klass.name)
+          next if probe_response_only_middleware?(handler.klass)
+          return nil unless probe_pure_middleware?(handler)
+
+          pure << handler
+        end
+        # Nothing on the stack can change the header: no request is modelled
+        # at all, so the host's request_meta is not read for one either.
+        return headers if pure.empty?
+
+        env = probe_request_env(conn, headers, method, params)
+        pure.each { |handler| handler.build(NOOP_APP).on_request(env) }
+        env.request_headers
+      rescue StandardError => e
+        @logger.debug("Could not tell which Authorization header a request would carry: #{e.class}")
+        nil
+      end
+
+      # The Faraday env of a request shaped like the real JSON-RPC POST of
+      # the operation (endpoint, JSON body with its method and params),
+      # which is never sent: the framework middleware the probe runs sees
+      # the request a real one would.
+      # @param conn [Faraday::Connection]
+      # @param headers [Hash] the headers before middleware
+      # @param method [String] the JSON-RPC method the probe models
+      # @param params [Hash] its params
+      # @return [Faraday::Env]
+      def probe_request_env(conn, headers, method, params)
         request = conn.build_request(:post) do |req|
           req.url(@endpoint)
           headers.each { |k, v| req.headers[k] = v }
           req.headers['Content-Type'] = 'application/json'
           # The body a real request would carry, its effective `_meta`
-          # included (host request_meta, protocol fields), so middleware that
-          # picks credentials by it answers as it would for the request.
+          # included (host request_meta, protocol fields).
           probe = build_jsonrpc_request(method, params, 0, note: false)
           req.body = JSON.generate(probe)
-          # The routing headers a real modern POST carries, so middleware
-          # that authenticates by them answers as it would for the request.
+          # The routing headers a real modern POST carries.
           modern_request_headers(probe).each { |k, v| req.headers[k] = v } if modern?
         end
-        env = request.to_env(conn)
-        live = live_middleware(conn)
-        return nil if live.nil?
-
-        conn.builder.handlers.each_with_index do |handler, index|
-          # Middleware that is never run needs no stand-in: the recorder is
-          # the probe's own, and the transparent ones leave headers alone.
-          next if handler.klass == AuthorizationRecorder
-          next if PROBE_TRANSPARENT_MIDDLEWARE.include?(handler.klass.name)
-          return nil unless probe_runnable_middleware?(handler.klass)
-          # Middleware with no request hook cannot change what a request
-          # carries: Faraday's own `call` runs `on_request` and then the
-          # response phase, which a probe that sends nothing never reaches.
-          # It is neither built nor compared (a response middleware may well
-          # hold state the probe would refuse to stand in for).
-          next unless handler.klass.method_defined?(:on_request)
-          return nil unless probe_inert_middleware_class?(handler.klass)
-          return nil unless probe_buildable_middleware?(handler)
-
-          # A copy is run rather than the instance Faraday calls, so the
-          # probe cannot disturb it — which is only faithful while the copy
-          # still holds the same state.
-          middleware = handler.build(NOOP_APP)
-          return nil unless probe_stands_in_for?(middleware, live[index])
-
-          middleware.on_request(env) if middleware.respond_to?(:on_request)
-        end
-        env.request_headers
-      rescue StandardError => e
-        @logger.debug("Could not run the Faraday middleware to probe the Authorization header: #{e.class}")
-        nil
+        request.to_env(conn)
       end
 
-      # The middleware instances Faraday actually calls, in the order of
-      # `builder.handlers`. Building the stack is what the first request
-      # does anyway, and it is the state of these instances — not of a fresh
-      # copy — that decides what the next request sends.
-      # @param conn [Faraday::Connection]
-      # @return [Array<Faraday::Middleware>, nil] nil when the stack cannot be walked
-      def live_middleware(conn)
-        node = conn.builder.app
-        instances = []
-        while node.is_a?(Faraday::Middleware)
-          instances << node
-          node = node.app
-        end
-        instances.size == conn.builder.handlers.size ? instances : nil
-      end
-
-      # Whether a freshly built middleware answers as the instance Faraday
-      # will call would. Middleware that keeps state of its own — a token
-      # rotated per request, anything learned from an earlier response —
-      # drifts from a fresh copy, and the copy would then keep predicting
-      # credentials the real request has already moved past.
-      # @param fresh [Faraday::Middleware] the instance the probe would run
-      # @param live [Faraday::Middleware, nil] the instance Faraday calls
-      # @return [Boolean]
-      def probe_stands_in_for?(fresh, live)
-        return false unless live.instance_of?(fresh.class)
-
-        names = fresh.instance_variables | live.instance_variables
-        names.all? do |name|
-          # The app each instance wraps differs by construction (the probe
-          # ends at NOOP_APP) and never decides a header.
-          next true if name == :@app
-
-          same_middleware_state?(fresh.instance_variable_get(name), live.instance_variable_get(name))
-        end
-      end
-
-      # @return [Boolean] whether two middleware ivars hold indistinguishable state
-      #   the probe may run against
-      def same_middleware_state?(one, other)
-        # State the host keeps outside the middleware (a holder both
-        # instances point at) is not copied by building a fresh middleware:
-        # running the copy's request hook would change the very state the
-        # live instance uses — spending a nonce, advancing a one-time token
-        # the next real request then never sends. Only shared state that
-        # cannot change may be stood in for.
-        return probe_safe_shared_state?(one) if one.equal?(other)
-
-        # Two containers that merely compare equal are the usual shape of a
-        # Faraday middleware built with keyword arguments: `**opts` is a new
-        # hash on every build, holding the very same vendor. They stand in
-        # for one another only while nothing mutable is reachable through
-        # both of them.
-        one == other && probe_shares_no_mutable?(one, other)
-      rescue StandardError
-        false
-      end
-
-      # @param one [Object] the fresh copy's state
-      # @param other [Object] the live instance's state
-      # @return [Boolean] whether the only objects the two can both reach are
-      #   ones the probe may share (immutable, or on the safe list)
-      def probe_shares_no_mutable?(one, other)
-        mine = probe_reachable_state(one)
-        theirs = probe_reachable_state(other)
-        return false if mine.nil? || theirs.nil?
-
-        mine.each_key.all? { |object| !theirs.key?(object) || probe_safe_shared_state?(object) }
-      end
-
-      # Every object a value can hand out, itself included, keyed by identity.
-      # State the probe may share is kept whole: what it holds cannot change,
-      # or changing it changes no request. nil when the walk would go deeper
-      # than {PROBE_IMMUTABLE_DEPTH}, where what is reachable is no longer
-      # known and nothing may be assumed unshared.
-      # @param value [Object]
-      # @param depth [Integer]
-      # @param seen [Hash] the objects already walked, compared by identity
-      # @return [Hash, nil]
-      def probe_reachable_state(value, depth = 0, seen = {}.compare_by_identity)
-        return seen if seen.key?(value)
-
-        seen[value] = true
-        return seen if probe_safe_shared_state?(value)
-
-        members = probe_state_members(value)
-        return seen if members.empty?
-        return nil unless depth < PROBE_IMMUTABLE_DEPTH
-
-        members.each { |member| return nil unless probe_reachable_state(member, depth + 1, seen) }
-        seen
-      end
-
-      # Whether a middleware class keeps no state of its own that running the
-      # probe could disturb. Two instances of one class share that class, so
-      # anything the class holds -- a class-level instance variable, a class
-      # variable, a singleton method that can vend from either -- is state a
-      # copy does not isolate: a request hook reaching it (`self.class.next_nonce`)
-      # spends the very credential the next real request would have carried.
-      # A hook built by `define_method` is the same hazard one level further
-      # out: it keeps the binding it was defined in, which no comparison of
-      # instances or of constructor arguments can reach. So the rule is
-      # inverted for these: only a class whose own methods are all defined
-      # with `def` (or in C, an attribute reader closing over nothing), and
-      # which holds nothing at class level, may be run.
+      # Whether a middleware has no request phase at all, so nothing it does
+      # can change what a request carries: Faraday's own `call` runs
+      # `on_request` and then the response phase, which a probe that sends
+      # nothing never reaches. This is the shape of the class, not a guess
+      # about what its code does, and no host code runs to establish it.
       # @param klass [Class] a middleware class on the connection
       # @return [Boolean]
-      def probe_inert_middleware_class?(klass)
-        probe_host_ancestors(klass).all? do |mod|
-          (mod.instance_variables - PROBE_FRAMEWORK_CLASS_STATE).empty? && mod.class_variables(false).empty? &&
-            mod.singleton_methods(false).empty? && probe_closure_free_module?(mod)
-        end
-      rescue StandardError
-        false
+      def probe_response_only_middleware?(klass)
+        return false if klass.method_defined?(:on_request) || klass.private_method_defined?(:on_request)
+
+        klass.method_defined?(:call) && klass.instance_method(:call).owner == Faraday::Middleware
       end
 
-      # The classes and modules the host contributed to a middleware: what
-      # Faraday::Middleware itself brings is the framework's own and carries
-      # no host credential.
-      # @param klass [Class]
-      # @return [Array<Module>]
-      def probe_host_ancestors(klass)
-        klass.ancestors - Faraday::Middleware.ancestors
-      end
-
-      # @param mod [Module] a class or module the host contributed
-      # @return [Boolean] whether every method it defines closes over nothing
-      def probe_closure_free_module?(mod)
-        (mod.instance_methods(false) + mod.private_instance_methods(false)).all? do |name|
-          probe_closure_free_method?(mod.instance_method(name))
-        end
-      end
-
-      # Whether a method was defined with `def` rather than from a block.
-      # A block-bodied method (`define_method`) carries its defining binding;
-      # a method with no instruction sequence at all is implemented in C (an
-      # attribute accessor, say) and closes over nothing. Anything else --
-      # including a Ruby whose instruction sequences cannot be inspected --
-      # counts as a closure, so the probe gives up rather than guess.
-      # @param method [UnboundMethod]
-      # @return [Boolean]
-      def probe_closure_free_method?(method)
-        iseq = RubyVM::InstructionSequence.of(method)
-        return true if iseq.nil?
-
-        iseq.to_a[ISEQ_TYPE_INDEX] == :method
-      rescue StandardError, NotImplementedError
-        false
-      end
-
-      # Whether the probe may build a copy of a middleware at all. Building
-      # runs the host's constructor, and a constructor that takes a one-time
-      # credential from what it is handed spends it before any comparison can
-      # reject the copy — the credential the next real request then never
-      # presents. It can only consume what it is given, so a copy is built
-      # only when every argument is state the probe may share, or a plain
-      # container of such state (a container vends nothing of its own).
+      # Whether a handler installs framework middleware the probe may run:
+      # one of {PROBE_PURE_MIDDLEWARE} (exactly, never a subclass of it),
+      # configured without a block and with nothing but literal
+      # configuration. Its constructor can then take nothing to spend and
+      # its request hook can vend nothing but what it was handed.
       # @param handler [Faraday::RackBuilder::Handler]
       # @return [Boolean]
-      def probe_buildable_middleware?(handler)
+      def probe_pure_middleware?(handler)
+        return false unless PROBE_PURE_MIDDLEWARE.include?(handler.klass)
         return false if handler.instance_variable_get(:@block)
 
         args = handler.instance_variable_get(:@args)
         kwargs = handler.instance_variable_get(:@kwargs) || {}
         return false unless args.is_a?(Array) && kwargs.is_a?(Hash)
 
-        (args + kwargs.to_a.flatten(1)).all? { |arg| probe_inert_argument?(arg) }
+        (args + kwargs.to_a.flatten(1)).all? { |arg| probe_static_value?(arg) }
       end
 
-      # @param value [Object] an argument the handler would pass a fresh copy
+      # @param value [Object] an argument a middleware was installed with
       # @param depth [Integer]
-      # @return [Boolean] whether it can hand a constructor nothing to spend
-      def probe_inert_argument?(value, depth = 0)
-        return true if probe_safe_shared_state?(value)
+      # @return [Boolean] whether it is configuration and nothing else
+      def probe_static_value?(value, depth = 0)
+        return true if PROBE_STATIC_CLASSES.any? { |klass| value.is_a?(klass) }
         return false unless value.is_a?(Hash) || value.is_a?(Array)
-        return false unless depth < PROBE_IMMUTABLE_DEPTH
+        return false unless depth < PROBE_STATIC_DEPTH
 
-        probe_state_members(value).all? { |member| probe_inert_argument?(member, depth + 1) }
-      end
-
-      # @param value [Object] state the fresh and live middleware share
-      # @return [Boolean] whether running the probe against it can change nothing
-      def probe_safe_shared_state?(value)
-        probe_immutable_state?(value) || PROBE_SAFE_SHARED_STATE.any? { |klass| value.is_a?(klass) }
-      end
-
-      # Whether a value can vend nothing but itself: it must be frozen, of a
-      # kind whose whole state is enumerable here, and hold only such values
-      # in turn (to a bounded depth — deeper than that it counts as mutable).
-      # Being frozen is not enough on its own: a frozen wrapper still hands
-      # out the mutable members it was built around, and a module or class
-      # is shared rather than copied and keeps state of its own that no
-      # freeze reaches.
-      # @param value [Object]
-      # @param depth [Integer]
-      # @return [Boolean]
-      def probe_immutable_state?(value, depth = 0)
-        return false unless value.frozen?
-        return false unless PROBE_IMMUTABLE_CLASSES.any? { |klass| value.is_a?(klass) }
-
-        members = probe_state_members(value)
-        return true if members.empty?
-        return false unless depth < PROBE_IMMUTABLE_DEPTH
-
-        members.all? { |member| probe_immutable_state?(member, depth + 1) }
-      end
-
-      # Everything a value holds: what it was built around as well as
-      # whatever was set on it, since either can be handed out later.
-      # @param value [Object]
-      # @return [Array<Object>]
-      def probe_state_members(value)
-        held = value.instance_variables.map { |name| value.instance_variable_get(name) }
-        case value
-        when Hash then held + value.flat_map { |k, v| [k, v] }
-        when Array, Struct then held + value.to_a
-        when Range then held + [value.begin, value.end]
-        else held
-        end
+        members = value.is_a?(Hash) ? value.flat_map { |k, v| [k, v] } : value
+        members.all? { |member| probe_static_value?(member, depth + 1) }
       end
 
       # Whether a fetch brought tool definitions other than the ones it
@@ -509,16 +329,6 @@ module MCPClient
       # @return [Array<Array>] what a caller of the list can act on
       def tool_definitions(tools)
         tools.map { |t| [t.name, t.description, t.schema, t.output_schema, t.annotations] }
-      end
-
-      # @param klass [Class] a middleware class on the connection
-      # @return [Boolean] whether its request phase can be run without sending (it relies on
-      #   Faraday::Middleware#call, or is known not to touch the headers)
-      def probe_runnable_middleware?(klass)
-        return true if PROBE_TRANSPARENT_MIDDLEWARE.include?(klass.name)
-        return false unless klass.method_defined?(:call)
-
-        klass.instance_method(:call).owner == Faraday::Middleware
       end
 
       # Remember the Authorization a request actually carried once it was

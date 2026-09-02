@@ -231,9 +231,12 @@ module MCPClient
     end
 
     # `_meta` keys that identify one request rather than what it asks for
-    # (progress and OpenTelemetry trace context): a cached result does not
-    # depend on them.
-    CACHE_NEUTRAL_META_KEYS = %w[progressToken traceparent tracestate baggage].freeze
+    # (the progress token and the W3C trace identifiers): a cached result
+    # does not depend on them. `baggage` is deliberately not among them --
+    # it carries application-defined context (a tenant, a locale), which a
+    # server may well vary its result by, so a result cached under one
+    # baggage is never served under another.
+    CACHE_NEUTRAL_META_KEYS = %w[progressToken traceparent tracestate].freeze
 
     # Remember the effective parameters a request goes out with, so a result
     # cached from it is bound to them (MCP 2026-07-28 caching: a server may

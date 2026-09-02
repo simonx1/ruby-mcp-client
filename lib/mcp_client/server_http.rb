@@ -602,6 +602,7 @@ module MCPClient
         @prompts_data = nil
         @resources_result = nil
         @resources_data = nil
+        @templates_result = nil
       end
       # Cached results and their hints belong to the connection (and its
       # authorization context) that was just torn down; outside @mutex, as

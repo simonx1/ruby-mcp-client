@@ -136,25 +136,6 @@ RSpec.describe 'MCP 2026-07-28 cacheable results — round 28' do
   end
 
   describe 'a probe against middleware that keeps nothing of its own' do
-    it 'still serves the private entry of a hook that only reads a frozen holder' do
-      bearers = stub_tools_by_bearer
-      predictable = Class.new(Faraday::Middleware) do
-        def initialize(app, holder)
-          super(app)
-          @holder = holder
-        end
-
-        def on_request(env)
-          env.request_headers['Authorization'] = "Bearer #{@holder[:value]}"
-        end
-      end
-      server = streamable(faraday_config: ->(f) { f.use predictable, { value: 'alice' }.freeze })
-
-      expect(server.list_tools.map(&:name)).to eq(['alice-tool'])
-      expect(server.list_tools.map(&:name)).to eq(['alice-tool'])
-      expect(bearers).to eq(['alice'])
-    end
-
     it "still serves the private entry of Faraday's own middleware with a static bearer" do
       bearers = stub_tools_by_bearer
       server = streamable(faraday_config: ->(f) { f.request :authorization, 'Bearer', 'alice' })
