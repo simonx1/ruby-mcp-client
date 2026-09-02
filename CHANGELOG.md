@@ -19,21 +19,39 @@ metadata). Each feature lands in its own PR; this section accumulates them.
   silences the notices. The registry records when each feature entered the
   Deprecated state (the HTTP+SSE transport since 2025-03-26, the
   `includeContext` values since 2025-11-25) alongside each feature's
-  `earliest_removal`: only the HTTP+SSE transport has the short clock
-  (three months after SEP-2596 is Final), while the `includeContext` values
-  follow Sampling into the twelve-month window despite the earlier
-  deprecation date. The HTTP+SSE notice is logged once the transport is
-  actually connected (so `MCPClient.connect` probing a URL does not spend
-  it), Logging warns on every entry point (`log_level=` on a client or
-  server, an incoming `notifications/message`), a logger that drops
-  warnings, fails to report its level or raises does not consume the notice
-  (no logger failure ever reaches the deprecated operation, and the logger
-  is called outside the registry's lock), and the deprecated APIs —
-  including each transport's `log_level=` — carry YARD `@deprecated` tags.
+  `earliest_removal`, carrying the deprecated-features registry's own
+  "Earliest removal" wording: what Roots, Sampling, Logging and Dynamic
+  Client Registration wait for is *the first revision released on or after
+  2027-07-28* — a revision, not a date a host can plan around — while the
+  `includeContext` values *follow Sampling (SEP-2577)* and only the HTTP+SSE
+  transport has a clock of its own (*three months after SEP-2596 reaches
+  Final*). Every notice and every YARD `@deprecated` tag names that earliest
+  removal next to the deprecation SEP, as the feature lifecycle policy's
+  tier-1 SDK obligation requires.
+  The notices fire from the transport, not only from `MCPClient::Client`, so
+  a host that drives a `ServerStdio`, `ServerSSE`, `ServerHTTP` or
+  `ServerStreamableHTTP` object directly still sees them: serving a
+  `roots/list` or `sampling/createMessage` request through
+  `on_roots_list_request` / `on_sampling_request` warns (including the
+  `includeContext` values on the request), whether the request arrives
+  server-initiated or through the multi round-trip pattern, and a
+  `notifications/message` warns from the shared notification routing so a
+  bare `on_notification` callback is covered too. The HTTP+SSE notice is
+  logged once the transport is actually connected (so `MCPClient.connect`
+  probing a URL does not spend it) and a later `connect` on an
+  already-established connection retries a notice the first one could not
+  emit. A logger that drops warnings, fails to report its level or raises
+  does not consume the notice (no logger failure ever reaches the deprecated
+  operation, and the logger is called outside the registry's lock), and the
+  once-per-process bookkeeping is scoped to the owning PID, so a prefork
+  server (Puma, Unicorn) that warned while preloading does not silence each
+  worker's own first use.
 - **Documentation.** README documents the 2026-07-28 support (discovery
   and per-request metadata, multi round-trip requests, `x-mcp-header`,
   subscriptions, cacheable results, the tasks extension, authorization) and
-  the deprecated features with their migrations.
+  the deprecated features with their earliest removals and migrations; the
+  2026-07-28 section flags `log_level=` as deprecated where it presents it,
+  rather than only in the table further down.
 
 ### JSON Schema handling
 

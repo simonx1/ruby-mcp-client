@@ -437,9 +437,10 @@ module MCPClient
 
     # Set the roots for this client (MCP 2025-06-18)
     # When roots are changed, a notification is sent to all connected servers
-    # @deprecated Roots are deprecated since MCP 2026-07-28 (SEP-2577); pass
-    #   directories or files through tool parameters, resource URIs or server
-    #   configuration instead.
+    # @deprecated Roots are deprecated since MCP 2026-07-28 (SEP-2577);
+    #   earliest removal is the first revision released on or after
+    #   2027-07-28. Pass directories or files through tool parameters,
+    #   resource URIs or server configuration instead.
     # @param new_roots [Array<MCPClient::Root, Hash>] the new roots to set
     # @return [void]
     def roots=(new_roots)
@@ -616,8 +617,10 @@ module MCPClient
 
     # Set the logging level on all connected servers (MCP 2025-06-18)
     # To set on a specific server, use: client.find_server('name').log_level = 'debug'
-    # @deprecated Logging is deprecated since MCP 2026-07-28 (SEP-2577); have
-    #   the server log to stderr (stdio) or use OpenTelemetry instead.
+    # @deprecated Logging is deprecated since MCP 2026-07-28 (SEP-2577);
+    #   earliest removal is the first revision released on or after
+    #   2027-07-28. Have the server log to stderr (stdio) or use
+    #   OpenTelemetry instead.
     # @param level [String] the log level ('debug', 'info', 'notice', 'warning', 'error',
     #   'critical', 'alert', 'emergency')
     # @return [Array<Hash>] results from servers

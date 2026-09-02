@@ -5,6 +5,7 @@ require 'digest'
 require 'json'
 require 'zlib'
 require 'stringio'
+require_relative 'deprecation_notices'
 require_relative 'header_params'
 require_relative 'subscription_support'
 require_relative 'result_caching'
@@ -19,6 +20,7 @@ module MCPClient
   module JsonRpcCommon
     include RoundTripMarker
     include ResultCompleteness
+    include DeprecationNotices
     include SubscriptionSupport
     include ResultCaching
     # The `_meta` a request carries, the fingerprint a cached result is bound

@@ -16,8 +16,8 @@ module MCPClient
   #
   # @deprecated The HTTP+SSE transport has been deprecated since MCP
   #   2025-03-26 and is listed in the 2026-07-28 deprecated features
-  #   registry (SEP-2596; earliest removal three months after SEP-2596 is
-  #   Final). Use {MCPClient::ServerStreamableHTTP}.
+  #   registry (SEP-2596); earliest removal is three months after SEP-2596
+  #   reaches Final. Use {MCPClient::ServerStreamableHTTP}.
   #
   # @note Elicitation Support (MCP 2025-06-18)
   #   This transport FULLY supports server-initiated elicitation requests via bidirectional
@@ -429,8 +429,10 @@ module MCPClient
     #   'critical', 'alert', 'emergency')
     # @return [Hash] empty result on success
     # @raise [MCPClient::Errors::ServerError] if server returns an error
-    # @deprecated Logging is deprecated since MCP 2026-07-28 (SEP-2577); have
-    #   the server log to stderr (stdio) or use OpenTelemetry instead.
+    # @deprecated Logging is deprecated since MCP 2026-07-28 (SEP-2577);
+    #   earliest removal is the first revision released on or after
+    #   2027-07-28. Have the server log to stderr (stdio) or use
+    #   OpenTelemetry instead.
     def log_level=(level)
       MCPClient::Deprecations.warn(:logging, @logger)
       ensure_initialized
@@ -447,7 +449,15 @@ module MCPClient
     # @return [Boolean] true if connection was successful
     # @raise [MCPClient::Errors::ConnectionError] if connection fails
     def connect
-      return true if @mutex.synchronize { @connection_established }
+      # An already-established connection is another use of the transport,
+      # and another chance at the notice: the first connect may have found
+      # notices disabled, a logger above WARN or a logger that raised, all of
+      # which leave the slot unspent. A long-lived connection would otherwise
+      # never retry it.
+      if @mutex.synchronize { @connection_established }
+        MCPClient::Deprecations.warn(:http_sse_transport, @logger)
+        return true
+      end
 
       # Check for pre-existing auth error (needed for tests)
       pre_existing_auth_error = @mutex.synchronize { @auth_error }
@@ -709,6 +719,9 @@ module MCPClient
         return
       end
 
+      # Serving roots/list means this transport declared, and is using, the
+      # deprecated Roots capability (SEP-2577) — with or without a Client.
+      warn_roots_deprecated
       # Call the registered callback
       result = @roots_list_request_callback.call(request_id, params)
 
@@ -747,6 +760,9 @@ module MCPClient
         return
       end
 
+      # Sampling, and the includeContext values it may carry, are deprecated
+      # (SEP-2577, SEP-2596) — with or without a Client.
+      warn_sampling_deprecated(params)
       # Call the registered callback
       result = @sampling_request_callback.call(request_id, params)
 

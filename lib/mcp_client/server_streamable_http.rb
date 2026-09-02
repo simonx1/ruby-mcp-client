@@ -308,8 +308,10 @@ module MCPClient
     #   'critical', 'alert', 'emergency')
     # @return [Hash] empty result on success
     # @raise [MCPClient::Errors::ServerError] if server returns an error
-    # @deprecated Logging is deprecated since MCP 2026-07-28 (SEP-2577); have
-    #   the server log to stderr (stdio) or use OpenTelemetry instead.
+    # @deprecated Logging is deprecated since MCP 2026-07-28 (SEP-2577);
+    #   earliest removal is the first revision released on or after
+    #   2027-07-28. Have the server log to stderr (stdio) or use
+    #   OpenTelemetry instead.
     def log_level=(level)
       MCPClient::Deprecations.warn(:logging, @logger)
       ensure_connected
@@ -1344,6 +1346,9 @@ module MCPClient
         return
       end
 
+      # Serving roots/list means this transport declared, and is using, the
+      # deprecated Roots capability (SEP-2577) — with or without a Client.
+      warn_roots_deprecated
       # Call the registered callback
       result = @roots_list_request_callback.call(request_id, params)
 
@@ -1363,6 +1368,9 @@ module MCPClient
         return
       end
 
+      # Sampling, and the includeContext values it may carry, are deprecated
+      # (SEP-2577, SEP-2596) — with or without a Client.
+      warn_sampling_deprecated(params)
       # Call the registered callback
       result = @sampling_request_callback.call(request_id, params)
 

@@ -362,7 +362,15 @@ request with `MCPClient::Client.new(request_meta: ...)`. Force an era with
 probe with `discover_timeout:` on `MCPClient.connect`, `stdio_config`,
 `http_config` and `streamable_http_config` (or the server constructors).
 `ping` maps to `server/discover` and `log_level=` to the per-request log
-level on modern servers. Typed errors
+level on modern servers.
+
+> `log_level=` is deprecated in MCP 2026-07-28 (SEP-2577). On a modern
+> server it writes `_meta["io.modelcontextprotocol/logLevel"]`, part of the
+> Logging utility the revision marks Deprecated as a whole: new
+> implementations SHOULD NOT adopt it. See
+> [Deprecated features](#deprecated-features).
+
+Typed errors
 carry the JSON-RPC code: `MCPClient::Errors::HeaderMismatchError`
 (-32020), `MissingRequiredClientCapabilityError` (-32021) and
 `UnsupportedProtocolVersionError` (-32022).
@@ -452,21 +460,25 @@ of Client ID Metadata Documents (`client_id_metadata_url:`). See
 The 2026-07-28 [deprecated features registry](https://modelcontextprotocol.io/specification/2026-07-28/deprecated)
 lists these as Deprecated under the feature lifecycle policy: they keep
 working during their deprecation window, but new integrations should not
-adopt them. Features 2026-07-28 itself deprecates stay for at least twelve
-months. Only the HTTP+SSE transport may go sooner: the `includeContext`
-values were deprecated by an earlier revision, but SEP-2596's transition
-provision ties them to Sampling, so they share the twelve-month window. The
-client logs one notice per feature per process on first use, naming the
-suggested migration:
+adopt them. The earliest removal is the registry's own, and it names a
+*revision*, not a date: what the features 2026-07-28 deprecates wait for is
+the first revision released on or after 2027-07-28, which may itself land
+well after that date — do not plan around 2027-07-28 as a removal date. The
+`includeContext` values follow Sampling, and only the HTTP+SSE transport has
+a clock of its own. The earliest removal is when a feature becomes
+*eligible* for removal; the actual removal is a Core Maintainer decision
+taken during release preparation. The client logs one notice per feature per
+process on first use, naming the earliest removal and the suggested
+migration:
 
 | Feature | Deprecated since | Earliest removal | Migration |
 |---------|------------------|------------------|-----------|
-| Roots (`roots:`, `Client#roots=`) | 2026-07-28 (SEP-2577) | no earlier than twelve months after 2026-07-28 | Pass directories or files through tool parameters, resource URIs or server configuration |
-| Sampling (`sampling_handler:`) | 2026-07-28 (SEP-2577) | no earlier than twelve months after 2026-07-28 | Integrate directly with the LLM provider API |
-| Logging (`log_level=` on the client or a server, `notifications/message`) | 2026-07-28 (SEP-2577) | no earlier than twelve months after 2026-07-28 | Log to stderr (stdio) or use OpenTelemetry |
-| HTTP+SSE transport (`MCPClient::ServerSSE`, warned once it is connected) | 2025-03-26 (reclassified by SEP-2596) | no earlier than three months after SEP-2596 is Final | Migrate the server to Streamable HTTP |
-| `includeContext` `"thisServer"` / `"allServers"` in sampling requests | 2025-11-25 (reclassified by SEP-2596) | no earlier than twelve months after 2026-07-28 (it follows Sampling) | Servers omit the field or send `"none"` |
-| OAuth Dynamic Client Registration | 2026-07-28 (PR #2858) | no earlier than twelve months after 2026-07-28 | Client ID Metadata Documents or pre-registered credentials |
+| Roots (`roots:`, `Client#roots=`) | 2026-07-28 (SEP-2577) | the first revision released on or after 2027-07-28 | Pass directories or files through tool parameters, resource URIs or server configuration |
+| Sampling (`sampling_handler:`) | 2026-07-28 (SEP-2577) | the first revision released on or after 2027-07-28 | Integrate directly with the LLM provider API |
+| Logging (`log_level=` on the client or a server, `notifications/message`) | 2026-07-28 (SEP-2577) | the first revision released on or after 2027-07-28 | Log to stderr (stdio) or use OpenTelemetry |
+| HTTP+SSE transport (`MCPClient::ServerSSE`, warned once it is connected) | 2025-03-26 (reclassified by SEP-2596) | three months after SEP-2596 reaches Final | Migrate the server to Streamable HTTP |
+| `includeContext` `"thisServer"` / `"allServers"` in sampling requests | 2025-11-25 (reclassified by SEP-2596) | follows Sampling (SEP-2577) | Servers omit the field or send `"none"` |
+| OAuth Dynamic Client Registration | 2026-07-28 (PR #2858) | the first revision released on or after 2027-07-28 | Client ID Metadata Documents or pre-registered credentials |
 
 `MCPClient::Deprecations::REGISTRY` lists them, each with its
 `earliest_removal`; set

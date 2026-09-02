@@ -1555,7 +1555,8 @@ module MCPClient
 
       # Register OAuth client dynamically
       # @deprecated Dynamic Client Registration is deprecated since MCP 2026-07-28
-      #   (PR #2858); prefer a Client ID Metadata Document (client_id_metadata_url)
+      #   (PR #2858); earliest removal is the first revision released on or after
+      #   2027-07-28. Prefer a Client ID Metadata Document (client_id_metadata_url)
       #   or pre-registered credentials. It remains the fallback for authorization
       #   servers without Client ID Metadata Document support.
       # @param server_metadata [ServerMetadata] Authorization server metadata
