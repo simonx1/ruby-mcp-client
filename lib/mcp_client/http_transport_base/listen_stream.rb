@@ -21,6 +21,13 @@ module MCPClient
       # Cap on a listen stream's unterminated-event buffer (peer-controlled).
       LISTEN_MAX_BUFFER_BYTES = 32 * 1024 * 1024
 
+      # An SSE line ends with CRLF, CR or LF (a CR-only or mixed-ending
+      # server is as compliant as a CRLF one).
+      LINE_TERMINATOR = /\r\n|\r|\n/
+      # An event ends at a blank line — two line terminators in a row, in any
+      # mix. CRLF is matched first so one CRLF is never read as two.
+      EVENT_TERMINATOR = /(?:\r\n|\r(?!\n)|\n){2}/
+
       # @return [void]
       def ensure_session_ready
         ensure_connected
@@ -33,8 +40,9 @@ module MCPClient
       # @param subscription [MCPClient::Subscription]
       # @return [void]
       def open_subscription(subscription)
-        subscription.assign_id(next_request_id)
-        register_subscription(subscription)
+        return unless subscription.with_open_id(next_request_id) { register_subscription(subscription) }
+
+        listen_threads_mutex.synchronize { listen_wakeups[subscription] ||= Thread::Queue.new }
         thread = Thread.new do
           Thread.current.name = 'MCP-listen'
           Thread.current.report_on_exception = false
@@ -44,18 +52,20 @@ module MCPClient
       end
 
       # Cancel a subscription: on Streamable HTTP closing the SSE response
-      # stream is the cancellation signal, so the stream thread is stopped
-      # (which closes the connection); no notifications/cancelled is sent.
+      # stream is the cancellation signal, so the response stream is closed
+      # and the reader ends with it; no notifications/cancelled is sent. The
+      # thread is not killed — a kill would interrupt it wherever it happened
+      # to be, losing a notification it was in the middle of delivering.
       # @param subscription [MCPClient::Subscription]
       # @return [void]
       def cancel_subscription(subscription)
         subscription.finish(by_client: true)
         unregister_subscription(subscription)
         subscriptions_mutex.synchronize { resource_subscriptions.delete_if { |_uri, sub| sub.equal?(subscription) } }
+        close_listen_stream(subscription)
         thread = listen_threads_mutex.synchronize { listen_threads.delete(subscription) }
         return unless thread && thread != Thread.current
 
-        thread.kill
         thread.join(THREAD_JOIN_TIMEOUT_FOR_LISTEN)
       end
 
@@ -66,11 +76,17 @@ module MCPClient
       # @return [void]
       def close_listen_streams
         threads = listen_threads_mutex.synchronize { listen_threads.dup.tap { listen_threads.clear } }
-        subscriptions_mutex.synchronize do
-          subscriptions.each_value { |sub| sub.finish(gracefully: false, reason: 'transport closed') }
+        # Both registries move together under their own lock; the
+        # Subscriptions are finished outside it, since a subscription being
+        # opened holds its own lock while taking this one.
+        closing = subscriptions_mutex.synchronize do
+          open = subscriptions.values
           subscriptions.clear
+          resource_subscriptions.clear
+          open
         end
-        resource_subscriptions.clear
+        closing.each { |sub| sub.finish(gracefully: false, reason: 'transport closed') }
+        threads.each_key { |sub| close_listen_stream(sub) }
         threads.each_value do |thread|
           next if thread == Thread.current
 
@@ -81,12 +97,43 @@ module MCPClient
 
       private
 
+      # Close a subscription's response stream, and wake its thread if it is
+      # waiting to re-open: that ends the reader without killing it.
+      # @param subscription [MCPClient::Subscription]
+      # @return [void]
+      def close_listen_stream(subscription)
+        session, wakeup = listen_threads_mutex.synchronize do
+          [listen_sessions.delete(subscription), listen_wakeups[subscription]]
+        end
+        wakeup&.push(:cancelled)
+        return unless session
+
+        begin
+          session.finish if session.started?
+        rescue StandardError => e
+          @logger.debug("Closing a listen stream raised #{e.class}")
+        end
+      end
+
       # @return [Hash{MCPClient::Subscription => Thread}] running listen streams
       def listen_threads
         @listen_threads ||= {}
       end
 
-      # @return [Mutex]
+      # The HTTP session each listen stream is reading, so a cancellation can
+      # close the response stream from the host's thread.
+      # @return [Hash{MCPClient::Subscription => Net::HTTP}]
+      def listen_sessions
+        @listen_sessions ||= {}
+      end
+
+      # Queues that interrupt a stream's re-open backoff.
+      # @return [Hash{MCPClient::Subscription => Thread::Queue}]
+      def listen_wakeups
+        @listen_wakeups ||= {}
+      end
+
+      # @return [Mutex] guards the per-stream bookkeeping above
       def listen_threads_mutex
         @listen_threads_mutex ||= Mutex.new
       end
@@ -112,13 +159,13 @@ module MCPClient
 
           @logger.info("Subscription #{subscription.id} stream ended without a closing response; " \
                        "re-opening in #{delay}s")
-          sleep delay
+          wait_before_reopen(subscription, delay)
           delay = [delay * 2, LISTEN_MAX_RECONNECT_DELAY].min
           unregister_subscription(subscription)
-          subscription.assign_id(next_request_id)
-          break unless subscription.reconnectable?
-
-          register_subscription(subscription)
+          # Taking the new id, registering it and sending the request are one
+          # step: a close that lands in between must not leave a stream the
+          # host can no longer cancel.
+          break unless subscription.with_open_id(next_request_id) { register_subscription(subscription) }
         end
         # The subscription may still be marked open after an unrecoverable drop.
         unless subscription.closed?
@@ -126,7 +173,23 @@ module MCPClient
           subscription.finish(gracefully: false, reason: 'stream ended')
         end
       ensure
-        listen_threads_mutex.synchronize { listen_threads.delete(subscription) }
+        listen_threads_mutex.synchronize do
+          listen_threads.delete(subscription)
+          listen_sessions.delete(subscription)
+          listen_wakeups.delete(subscription)
+        end
+      end
+
+      # Wait out the re-open backoff, interruptibly: a cancellation wakes the
+      # stream so it ends at once instead of after the whole delay.
+      # @param subscription [MCPClient::Subscription]
+      # @param delay [Numeric] seconds to wait
+      # @return [void]
+      def wait_before_reopen(subscription, delay)
+        wakeup = listen_threads_mutex.synchronize { listen_wakeups[subscription] }
+        return sleep(delay) unless wakeup
+
+        wakeup.pop(timeout: delay)
       end
 
       # @return [Boolean] whether the transport is still connected
@@ -143,7 +206,7 @@ module MCPClient
                                         subscription.id)
         buffer = +''
         state = { finished: nil, scanned: 0 }
-        response = listen_connection.post(@endpoint) do |req|
+        response = listen_connection(subscription).post(@endpoint) do |req|
           apply_request_headers(req, request)
           # The stream is parsed incrementally as it arrives; a compressed
           # body could not be. Ask for it uncompressed.
@@ -252,7 +315,7 @@ module MCPClient
         while (separator = match_event_terminator(buffer, [state[:scanned].to_i - 3, 0].max))
           event = buffer.slice!(0, separator.end(0))
           state[:scanned] = 0
-          data = event.lines.map(&:chomp).select { |l| l.start_with?('data:') }.map { |l| l.sub(/\Adata:\s*/, '') }
+          data = event.split(LINE_TERMINATOR).select { |l| l.start_with?('data:') }.map { |l| l.sub(/\Adata:\s*/, '') }
           next if data.empty?
 
           message = parse_listen_message(data.join("\n"))
@@ -260,17 +323,18 @@ module MCPClient
 
           finished ||= handle_listen_message(message, subscription)
         end
-        # Only the bytes that arrive next are searched next time, so an
-        # unterminated event delivered in many chunks stays linear.
-        state[:scanned] = buffer.bytesize
+        # Only what arrives next is searched next time, so an unterminated
+        # event delivered in many chunks stays linear. Counted in characters,
+        # like the offset String#match takes.
+        state[:scanned] = buffer.length
         finished
       end
 
       # @param buffer [String] the stream buffer
-      # @param from [Integer] offset to search from
+      # @param from [Integer] character offset to search from
       # @return [MatchData, nil] the next event terminator
       def match_event_terminator(buffer, from)
-        buffer.match(/\r\n\r\n|\n\n/, from)
+        buffer.match(EVENT_TERMINATOR, from)
       end
 
       # @param message [Hash] a JSON-RPC message from the listen stream
@@ -321,8 +385,9 @@ module MCPClient
 
       # A streaming connection for listen requests (no retries: the loop above
       # decides about re-opening).
+      # @param subscription [MCPClient::Subscription] the stream it serves
       # @return [Faraday::Connection]
-      def listen_connection
+      def listen_connection(subscription)
         conn = Faraday.new(url: @base_url) do |f|
           f.request :retry, max: 0
           f.options.open_timeout = 10
@@ -330,6 +395,8 @@ module MCPClient
           f.adapter :net_http do |http|
             http.read_timeout = LISTEN_STREAM_TIMEOUT
             http.open_timeout = 10
+            # Keep the session so cancelling can close the response stream.
+            listen_threads_mutex.synchronize { listen_sessions[subscription] = http }
           end
         end
         @faraday_config&.call(conn)

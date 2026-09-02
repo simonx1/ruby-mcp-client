@@ -33,6 +33,10 @@ module MCPClient
 
     STATES = %i[pending active reconnecting closed].freeze
 
+    # The states {#wait_until_settled} waits for: the server has answered the
+    # listen request one way or the other.
+    SETTLED_STATES = %i[active closed].freeze
+
     # @return [Integer, String, nil] the JSON-RPC id of the listen request (nil before it is sent)
     attr_reader :id
     # @return [Hash] the requested SubscriptionFilter (camelCase keys)
@@ -82,12 +86,14 @@ module MCPClient
       @listeners << listener if listener
       @state = :pending
       @mutex = Mutex.new
+      @settled = ConditionVariable.new
       @id = nil
       @acknowledged = nil
       @error = nil
       @close_reason = nil
       @closed_gracefully = false
       @closed_by_client = false
+      @dispatch_queue = nil
     end
 
     # Add a listener for notifications delivered on this subscription.
@@ -141,6 +147,23 @@ module MCPClient
       wanted - granted
     end
 
+    # Block until the server has settled the subscription: acknowledged it,
+    # or ended it with a response, an error or a cancellation.
+    # @param timeout [Numeric] seconds to wait
+    # @return [Symbol, nil] :active or :closed, nil while it is still pending
+    def wait_until_settled(timeout)
+      deadline = Process.clock_gettime(Process::CLOCK_MONOTONIC) + timeout
+      @mutex.synchronize do
+        until SETTLED_STATES.include?(@state)
+          remaining = deadline - Process.clock_gettime(Process::CLOCK_MONOTONIC)
+          break if remaining <= 0
+
+          @settled.wait(@mutex, remaining)
+        end
+        SETTLED_STATES.include?(@state) ? @state : nil
+      end
+    end
+
     # Cancel the subscription: the transport closes the stream (HTTP) or
     # sends notifications/cancelled (stdio).
     # @return [MCPClient::Subscription, nil] self if it was open, nil if already closed
@@ -164,6 +187,26 @@ module MCPClient
       end
     end
 
+    # Take a fresh listen id and register/send the request under this
+    # subscription's own lock, so a concurrent {#close} either wins outright
+    # (nothing is sent) or waits and then cancels the id that was sent. A
+    # closed subscription is never re-opened.
+    # @param id [Integer, String] the new listen request id
+    # @yield runs while the id cannot change underneath it
+    # @return [Boolean] false when the host had already closed it
+    # @api private
+    def with_open_id(id)
+      @mutex.synchronize do
+        return false if @state == :closed
+
+        @id = id
+        @acknowledged = nil
+        @state = :pending
+        yield
+        true
+      end
+    end
+
     # @api private
     def acknowledge(filter)
       @mutex.synchronize do
@@ -171,20 +214,19 @@ module MCPClient
 
         @acknowledged = filter.is_a?(Hash) ? filter : {}
         @state = :active
+        @settled.broadcast
       end
     end
 
     # @api private
     def deliver(method, params)
-      listeners = @mutex.synchronize do
-        return if @state == :closed
+      @mutex.synchronize do
+        return if @state == :closed || @listeners.empty?
 
-        @listeners.dup
-      end
-      listeners.each do |listener|
-        listener.call(method, params)
-      rescue StandardError => e
-        @server.logger.warn("Subscription listener error: #{e.message}") if @server.respond_to?(:logger)
+        # Queued while still open, so a closure that follows cannot swallow a
+        # notification that had already arrived, and the :stop that ends the
+        # dispatcher can never overtake this one.
+        (@dispatch_queue ||= start_dispatcher) << [@listeners.dup, method, params]
       end
     end
 
@@ -203,6 +245,9 @@ module MCPClient
         @closed_by_client = by_client
         @error = error
         @close_reason = reason
+        @settled.broadcast
+        # Deliveries already queued still run; the dispatcher ends after them.
+        @dispatch_queue&.push(:stop)
       end
     end
 
@@ -214,6 +259,43 @@ module MCPClient
 
     def inspect
       "#<MCPClient::Subscription id=#{@id.inspect} state=#{@state} requested=#{@requested.keys.join(',')}>"
+    end
+
+    private
+
+    # Start this subscription's dispatcher: one thread per subscription, so
+    # listeners see notifications in the order they arrived and never run on
+    # the thread that reads the transport. On stdio that is the single stdout
+    # reader, so a listener reacting to an update with a request of its own
+    # (re-reading the resource, say) would otherwise wait for a response that
+    # only the thread it is blocking could deliver — and every other message
+    # would wait with it.
+    # @return [Thread::Queue] the queue it consumes
+    def start_dispatcher
+      queue = Thread::Queue.new
+      Thread.new do
+        Thread.current.name = 'MCP-subscription'
+        Thread.current.report_on_exception = false
+        loop do
+          item = queue.pop
+          break if item.nil? || item == :stop
+
+          call_listeners(*item)
+        end
+      end
+      queue
+    end
+
+    # @param listeners [Array<Proc>] listeners to run
+    # @param method [String] notification method
+    # @param params [Hash, nil] notification params
+    # @return [void]
+    def call_listeners(listeners, method, params)
+      listeners.each do |listener|
+        listener.call(method, params)
+      rescue StandardError => e
+        @server.logger.warn("Subscription listener error: #{e.message}") if @server.respond_to?(:logger)
+      end
     end
   end
 end

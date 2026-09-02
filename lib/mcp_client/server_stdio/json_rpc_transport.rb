@@ -55,9 +55,17 @@ module MCPClient
         # No caller waits on this id: the response, if any, is the server's
         # graceful closure and is routed to the subscription itself.
         @mutex.synchronize { @awaiting.delete(id) }
-        subscription.assign_id(id)
-        register_subscription(subscription)
-        send_request(build_jsonrpc_request('subscriptions/listen', { 'notifications' => subscription.requested }, id))
+        request = build_jsonrpc_request('subscriptions/listen', { 'notifications' => subscription.requested }, id)
+        # A {Subscription#close} racing with a re-open must not leave the
+        # server holding a subscription this client can no longer cancel:
+        # taking the id and registering it happen under the subscription's own
+        # lock (so a close that wins stops the re-open outright), and a close
+        # that cancelled this id while the request was still going out is
+        # named again below, once the server has seen the listen.
+        return unless subscription.with_open_id(id) { register_subscription(subscription) }
+
+        send_request(request)
+        send_subscription_cancellation(id) if subscription.closed_by_client?
       rescue StandardError => e
         unregister_subscription(subscription)
         subscription.finish(error: e.is_a?(MCPClient::Errors::MCPError) ? e : MCPClient::Errors::TransportError.new(e.message))

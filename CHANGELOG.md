@@ -19,22 +19,39 @@ metadata). Each feature lands in its own PR; this section accumulates them.
   notification handling (cache invalidation, `on_notification`). A response
   to the listen request is the server's graceful closure, a server
   `notifications/cancelled` for the listen id a teardown; `close` cancels —
-  by closing the SSE stream on Streamable HTTP (no `notifications/cancelled`)
-  or by sending `notifications/cancelled` on stdio.
+  by closing the SSE response stream on Streamable HTTP (no
+  `notifications/cancelled`, and the reader is never killed mid-delivery) or
+  by sending `notifications/cancelled` on stdio. Listener callbacks run on
+  the subscription's own dispatcher thread, in arrival order, never on the
+  transport's reader: a listener may issue requests of its own (re-reading
+  the resource that changed, say) without blocking the stdio reader that
+  would have to deliver its response.
 - **Transports.** On Streamable HTTP (and plain HTTP) the listen POST runs
   on its own thread; a stream that ends without the closing response is
-  re-opened with a new id (backoff 1 s → 30 s) while the host still wants
-  it. On stdio, subscriptions share the channel and are correlated by
-  subscription id; when the process is re-established (after `cleanup` or an
-  unexpected exit, which now marks the session for restart) every open
-  subscription is re-sent with a new id. Legacy sessions refuse `listen`
-  with a `CapabilityError`.
+  re-opened with a new id (backoff 1 s → 30 s, which a cancellation
+  interrupts) while the host still wants it. On stdio, subscriptions share
+  the channel and are correlated by subscription id; when the process is
+  re-established (after `cleanup` or an unexpected exit, which now marks the
+  session for restart) every open subscription is re-sent with a new id.
+  Taking a new id is atomic with closure on both, so a `close` racing with a
+  re-open either stops it or cancels the id that went out — never leaving
+  the server holding a stream the client can no longer cancel. Events are
+  read with SSE line endings (CR, LF or CRLF, in any mix). Legacy sessions
+  refuse `listen` with a `CapabilityError`.
 - **`subscribe_resource`/`unsubscribe_resource`** map onto one listen stream
   per URI (`resourceSubscriptions`) on modern servers, still gated on the
   `resources.subscribe` capability; legacy servers keep
   `resources/subscribe`. The mapping lives in shared code but each transport
-  decides its own era, so the gate is pinned per transport: on stdio, and on
-  both HTTP transports.
+  decides its own era (`modern?`, not the configured `protocol` mode), so
+  the gate is pinned per transport: on stdio, and on both HTTP transports.
+  `subscribe_resource` still answers `true`, but only once the server has
+  acknowledged the stream *for that URI*: a rejected `subscriptions/listen`,
+  a stream the server closes before acknowledging, an acknowledgment that
+  omits the URI, or no answer within the transport's `read_timeout` raises
+  (the server's own error, otherwise `ResourceReadError`) instead of
+  reporting a subscription that was never established. Opening and closing
+  the stream for one URI is serialized, so concurrent subscribers share a
+  single stream that `unsubscribe_resource` really closes.
 
 ### Multi round-trip requests (InputRequiredResult)
 

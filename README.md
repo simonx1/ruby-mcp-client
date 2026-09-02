@@ -136,7 +136,21 @@ contents.each do |content|
   puts content.text if content.text?
   data = Base64.decode64(content.blob) if content.binary?
 end
+
+# Resource update subscriptions (per server)
+server = client.servers.first
+server.subscribe_resource('file:///example.txt')
+server.unsubscribe_resource('file:///example.txt')
 ```
+
+`subscribe_resource` answers `true` only once the server has confirmed the
+subscription, and raises otherwise — the server's own error, or
+`MCPClient::Errors::ResourceReadError` (including when the confirmation does
+not arrive within the transport's `read_timeout`). On a 2025-11-25 server the
+confirmation is the `resources/subscribe` response; on a 2026-07-28 one it is
+the `subscriptions/listen` acknowledgment naming that URI, which the call
+waits for. Updates then arrive as `notifications/resources/updated` through
+`on_notification`.
 
 ## MCP 2025-11-25 Features
 

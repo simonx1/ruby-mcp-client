@@ -10,6 +10,10 @@ module MCPClient
   # Transports provide ensure_session_ready, open_subscription and
   # cancel_subscription.
   module SubscriptionSupport
+    # Seconds to wait for a resource subscription acknowledgment on a
+    # transport without its own read timeout.
+    DEFAULT_ACK_TIMEOUT = 30
+
     # Open a long-lived notification stream. Modern servers only: the legacy
     # transports keep resources/subscribe and the HTTP GET stream.
     # @param notifications [Hash] the SubscriptionFilter
@@ -145,24 +149,103 @@ module MCPClient
 
     # Open resource-update subscriptions the modern way: one listen stream
     # per URI (resources/subscribe was replaced by
-    # subscriptions/listen.resourceSubscriptions).
+    # subscriptions/listen.resourceSubscriptions). Blocks until the server
+    # acknowledges the stream, so the caller learns about a rejection the way
+    # it did from resources/subscribe.
     # @param uri [String] the resource URI
-    # @return [MCPClient::Subscription]
+    # @return [MCPClient::Subscription] the acknowledged subscription
+    # @raise [MCPClient::Errors::MCPError] if the server refused the stream,
+    #   ended it before acknowledging, or acknowledged it without the URI
     def subscribe_resource_via_listen(uri)
-      existing = subscriptions_mutex.synchronize { resource_subscriptions[uri] }
-      return existing if existing && !existing.closed?
+      existing = live_resource_subscription(uri)
+      return existing if existing
 
+      # One stream per URI: two threads subscribing to the same resource must
+      # not open two, or the second registration would hide the first and
+      # unsubscribe_resource would close only one of them.
+      resource_subscription_mutex(uri).synchronize do
+        existing = live_resource_subscription(uri)
+        next existing if existing
+
+        open_resource_subscription(uri)
+      end
+    end
+
+    # @param uri [String] the resource URI
+    # @return [MCPClient::Subscription, nil] its stream, while it is still open
+    def live_resource_subscription(uri)
+      existing = subscriptions_mutex.synchronize { resource_subscriptions[uri] }
+      existing if existing && !existing.closed?
+    end
+
+    # @param uri [String] the resource URI
+    # @return [MCPClient::Subscription] the acknowledged subscription
+    def open_resource_subscription(uri)
       subscription = listen(notifications: { 'resourceSubscriptions' => [uri] })
+      begin
+        confirm_resource_subscription(subscription, uri)
+      rescue StandardError
+        # Nothing watches a stream the caller could not use.
+        subscription.close
+        raise
+      end
       subscriptions_mutex.synchronize { resource_subscriptions[uri] = subscription }
       subscription
+    end
+
+    # Wait for the acknowledgment and check that it really covers the URI: a
+    # server MAY acknowledge a subset of the filter it was sent.
+    # @param subscription [MCPClient::Subscription]
+    # @param uri [String] the resource URI
+    # @return [void]
+    # @raise [MCPClient::Errors::MCPError] if the URI is not being watched
+    def confirm_resource_subscription(subscription, uri)
+      case subscription.wait_until_settled(subscription_ack_timeout)
+      when :active
+        return unless subscription.unacknowledged_resource_uris.include?(uri)
+
+        raise MCPClient::Errors::ResourceReadError,
+              "the server acknowledged the subscription without '#{uri}'"
+      when :closed
+        raise subscription.error if subscription.error
+
+        raise MCPClient::Errors::ResourceReadError, "the server closed the subscription for '#{uri}'"
+      else
+        raise MCPClient::Errors::ResourceReadError,
+              "timed out after #{subscription_ack_timeout}s waiting for the server to acknowledge '#{uri}'"
+      end
+    end
+
+    # @return [Numeric] seconds allowed for a resource subscription acknowledgment
+    def subscription_ack_timeout
+      timeout = defined?(@read_timeout) ? @read_timeout : nil
+      timeout.is_a?(Numeric) && timeout.positive? ? timeout : DEFAULT_ACK_TIMEOUT
+    end
+
+    # The lock that serializes opening the stream for one URI. Kept for the
+    # life of the transport: it is one Mutex per URI the host subscribed to.
+    # @param uri [String] the resource URI
+    # @return [Mutex]
+    def resource_subscription_mutex(uri)
+      subscriptions_mutex.synchronize { resource_subscription_mutexes[uri] ||= Mutex.new }
+    end
+
+    # @return [Hash{String => Mutex}]
+    def resource_subscription_mutexes
+      @resource_subscription_mutexes ||= {}
     end
 
     # @param uri [String] the resource URI
     # @return [MCPClient::Subscription, nil] the subscription that was closed, if any
     def unsubscribe_resource_via_listen(uri)
-      subscription = subscriptions_mutex.synchronize { resource_subscriptions.delete(uri) }
-      subscription&.close
-      subscription
+      # Behind the same per-URI lock as subscribing, so an unsubscribe cannot
+      # slip between a subscribe's acknowledgment and its registration and
+      # leave the stream running.
+      resource_subscription_mutex(uri).synchronize do
+        subscription = subscriptions_mutex.synchronize { resource_subscriptions.delete(uri) }
+        subscription&.close
+        subscription
+      end
     end
 
     # @return [Hash{String => MCPClient::Subscription}] listen streams opened by subscribe_resource
