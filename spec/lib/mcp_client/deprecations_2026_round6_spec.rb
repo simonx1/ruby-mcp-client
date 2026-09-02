@@ -103,8 +103,9 @@ RSpec.describe 'MCP 2026-07-28 deprecations (round 6)' do
 
     before { allow(server).to receive(:send_message) }
 
-    it 'warns when it serves a roots/list request' do
-      server.on_roots_list_request { |_id, _params| { 'roots' => [] } }
+    it 'warns when it serves a roots/list request that carries a root' do
+      # Round 7 narrowed the trigger: an empty answer is not use of Roots.
+      server.on_roots_list_request { |_id, _params| { 'roots' => [{ 'uri' => 'file:///workspace' }] } }
       server.send(:handle_server_request, { 'id' => 1, 'method' => 'roots/list', 'params' => {} })
 
       expect(MCPClient::Deprecations.emitted?(:roots)).to be(true)

@@ -102,6 +102,7 @@ module MCPClient
         )
       end
 
+      warn_input_request_answer_deprecated(request_method, response)
       response
     end
 

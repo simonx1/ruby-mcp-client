@@ -31,9 +31,10 @@ metadata). Each feature lands in its own PR; this section accumulates them.
   The notices fire from the transport, not only from `MCPClient::Client`, so
   a host that drives a `ServerStdio`, `ServerSSE`, `ServerHTTP` or
   `ServerStreamableHTTP` object directly still sees them: serving a
-  `roots/list` or `sampling/createMessage` request through
-  `on_roots_list_request` / `on_sampling_request` warns (including the
-  `includeContext` values on the request), whether the request arrives
+  `sampling/createMessage` request through `on_sampling_request` warns
+  (including the `includeContext` values on the request), and so does
+  answering a `roots/list` request through `on_roots_list_request` with a
+  list that carries a root, whether the request arrives
   server-initiated or through the multi round-trip pattern, and a
   `notifications/message` warns from the shared notification routing so a
   bare `on_notification` callback is covered too. The HTTP+SSE notice is
@@ -46,12 +47,25 @@ metadata). Each feature lands in its own PR; this section accumulates them.
   once-per-process bookkeeping is scoped to the owning PID, so a prefork
   server (Puma, Unicorn) that warned while preloading does not silence each
   worker's own first use.
+  The Roots notice follows use of the feature, not the presence of a
+  handler: `MCPClient::Client` registers a `roots/list` handler on every
+  server so that a later `client.roots = [...]` is served without
+  reconnecting, and it answers `roots/list` with an empty list until a root
+  is set — so a host that never passed `roots:` and never called
+  `Client#roots=` is never warned about Roots, while a configured list, a
+  `roots=` call or an answer carrying a root all warn. The deprecated
+  keyword arguments name the earliest removal next to their SEP too:
+  `Client.new`'s `roots:` and `sampling_handler:`, and the
+  `sampling_handler` option of `MCPClient.connect`.
 - **Documentation.** README documents the 2026-07-28 support (discovery
   and per-request metadata, multi round-trip requests, `x-mcp-header`,
   subscriptions, cacheable results, the tasks extension, authorization) and
   the deprecated features with their earliest removals and migrations; the
   2026-07-28 section flags `log_level=` as deprecated where it presents it,
-  rather than only in the table further down.
+  rather than only in the table further down, and states what actually
+  triggers the Roots notice (a configured list, a `roots=` call or a
+  non-empty `roots/list` answer — never the empty answer a client that never
+  configured a root gives).
 
 ### JSON Schema handling
 

@@ -13,10 +13,20 @@ module MCPClient
   #
   # Mixed into {MCPClient::JsonRpcCommon}, so every transport has it.
   module DeprecationNotices
-    # Serving a roots/list request means the host declared, and is using, the
-    # deprecated Roots capability.
+    # Serving a roots/list request. The Roots capability counts as USED only
+    # when the answer actually carries a root: a transport's roots handler is
+    # registered independently of whether the host ever configured a root —
+    # {MCPClient::Client} registers one on every server so a later `roots=`
+    # is served, and answers with an empty list until a root is set — so a
+    # registered handler is no evidence the host adopted the feature, while a
+    # non-empty answer is. A host that never opted in must not be told it is
+    # using a deprecated feature.
+    # @param result [Hash, nil] the roots/list result about to be served
     # @return [void]
-    def warn_roots_deprecated
+    def warn_roots_deprecated(result)
+      roots = result.is_a?(Hash) ? (result['roots'] || result[:roots]) : nil
+      return unless roots.is_a?(Array) && !roots.empty?
+
       MCPClient::Deprecations.warn(:roots, @logger)
     end
 
@@ -42,15 +52,25 @@ module MCPClient
 
     # The notice for an input request fulfilled through the multi round-trip
     # pattern, whose handler is the same callback the legacy
-    # server-initiated request would have reached.
+    # server-initiated request would have reached. Asking for a sample IS the
+    # use of Sampling, so its notice is raised before the handler runs; Roots
+    # is only used once the answer carries a root, so its notice waits for
+    # {#warn_input_request_answer_deprecated}.
     # @param method [String] the input request's JSON-RPC method
     # @param params [Hash, nil] the input request's params
     # @return [void]
     def warn_input_request_deprecated(method, params)
-      case method
-      when 'roots/list' then warn_roots_deprecated
-      when 'sampling/createMessage' then warn_sampling_deprecated(params)
-      end
+      warn_sampling_deprecated(params) if method == 'sampling/createMessage'
+    end
+
+    # The half of the input-request notice that needs the handler's answer:
+    # Roots is deprecated, but answering roots/list with no roots is not use
+    # of it (see {#warn_roots_deprecated}).
+    # @param method [String] the input request's JSON-RPC method
+    # @param result [Hash, nil] the handler's result
+    # @return [void]
+    def warn_input_request_answer_deprecated(method, result)
+      warn_roots_deprecated(result) if method == 'roots/list'
     end
   end
 end
