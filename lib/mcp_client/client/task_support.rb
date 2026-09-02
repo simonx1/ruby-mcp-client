@@ -68,7 +68,15 @@ module MCPClient
 
         srv = select_task_server(task, server, 'wait_for_task')
         task_id = task_identifier(task)
+        # The caller's deadline and the task's TTL backstop are kept apart:
+        # the TTL may change with every observation (the server MAY extend
+        # it) while the caller's timeout never moves. The deadline exists
+        # before anything is sent, so a capability probe (initialization,
+        # discovery) counts against it too.
+        wait = { task_id: task_id, srv: srv, deadline: timeout && (monotonic_time + timeout), ttl_deadline: nil,
+                 answered: nil, epoch: nil, last: nil }
         ensure_task_capability!(srv, 'get', strict: true)
+        raise_if_past_deadline!(wait)
         unless modern_server?(srv)
           raise MCPClient::Errors::TaskError, 'wait_for_task requires an MCP 2026-07-28 server (tasks extension)'
         end
@@ -81,11 +89,6 @@ module MCPClient
           return task
         end
 
-        # The caller's deadline and the task's TTL backstop are kept apart:
-        # the TTL may change with every observation (the server MAY extend
-        # it) while the caller's timeout never moves.
-        wait = { task_id: task_id, srv: srv, deadline: timeout && (monotonic_time + timeout), ttl_deadline: nil,
-                 answered: nil, epoch: nil, last: nil }
         refresh_wait_session(wait)
         # The CreateTaskResult seed is not an observation: the first
         # tasks/get goes out at once, whatever the seed claims. Its TTL
@@ -181,7 +184,7 @@ module MCPClient
         # Only what is still pending once the task's update lock is held is
         # sent: a snapshot taken before the lock could resend an answer a
         # concurrent, confirmed update has just superseded.
-        send_task_update(wait[:srv], wait[:task_id], nil, timeout: request_timeout(wait_deadline(wait)),
+        send_task_update(wait[:srv], wait[:task_id], nil, timeout: request_timeout(wait_deadline(wait), wait[:srv]),
                                                           pending_only: true)
       rescue MCPClient::Errors::TaskError => e
         raise unless ambiguous_update_failure?(e)
@@ -342,7 +345,7 @@ module MCPClient
       # like a lost tasks/get. A definite rejection surfaces.
       # @return [void]
       def deliver_task_update(task_id, responses, srv, wait)
-        send_task_update(srv, task_id, responses, timeout: request_timeout(wait_deadline(wait)))
+        send_task_update(srv, task_id, responses, timeout: request_timeout(wait_deadline(wait), srv))
       rescue MCPClient::Errors::TaskError => e
         raise unless ambiguous_update_failure?(e)
 
@@ -424,10 +427,12 @@ module MCPClient
       # for the task's whole lifetime.
       # @param deadline [Float, nil] monotonic deadline of the wait
       # @return [Float]
-      def request_timeout(deadline)
+      def request_timeout(deadline, srv = nil)
         remaining = deadline && [deadline - monotonic_time, MIN_TASK_REQUEST_TIMEOUT].max
-        remaining = [remaining, MAX_TASK_REQUEST_TIMEOUT].min if remaining
-        remaining || MAX_TASK_REQUEST_TIMEOUT
+        # The cap bounds a request whose wait has no near deadline; it never
+        # enlarges a shorter timeout the transport was configured with.
+        configured = srv.respond_to?(:read_timeout) ? srv.read_timeout : nil
+        [remaining, MAX_TASK_REQUEST_TIMEOUT, configured.is_a?(Numeric) ? configured : nil].compact.min
       end
 
       # @param task_id [Object] a peer-controlled task id
@@ -497,7 +502,7 @@ module MCPClient
       # @return [MCPClient::Task, nil]
       def poll_task(wait)
         wait[:polled] = true
-        get_task(wait[:task_id], server: wait[:srv], timeout: request_timeout(wait_deadline(wait)))
+        get_task(wait[:task_id], server: wait[:srv], timeout: request_timeout(wait_deadline(wait), wait[:srv]))
       rescue MCPClient::Errors::TaskNotFound
         # Gone for good: nothing of it may colour a later task with this id.
         forget_task_keys(wait[:srv], wait[:task_id])
@@ -519,7 +524,11 @@ module MCPClient
 
         field = task.failed? ? 'error' : 'result'
         present = task.failed? ? !task.error.nil? : !task.result.nil?
-        shape = task.failed? ? 'a JSON-RPC error object (integer code, string message)' : 'an object'
+        shape = if task.failed?
+                  'a JSON-RPC error object (integer code, string message)'
+                else
+                  'an object whose resultType, if any, is "complete"'
+                end
         problem = present ? "with #{field} that is not #{shape}" : "without the #{field} field"
         raise MCPClient::Errors::InvalidResultError, "Invalid task: status #{task.status} #{problem}"
       end
@@ -538,6 +547,14 @@ module MCPClient
 
       # @return [String, nil] what is wrong with a DetailedTask's shape
       def detailed_task_shape_problem(result)
+        task_shape_problem(result) || task_status_payload_problem(result)
+      end
+
+      # The fields every Task carries (CreateTaskResult and DetailedTask
+      # alike): a status, parseable timestamps and a ttlMs key.
+      # @param result [Object]
+      # @return [String, nil]
+      def task_shape_problem(result)
         return 'not an object' unless result.is_a?(Hash)
         return 'status is not a task status' unless MCPClient::Task::VALID_STATUSES.include?(result['status'])
 
@@ -546,7 +563,7 @@ module MCPClient
         return 'ttlMs is missing' unless result.key?('ttlMs')
         return 'ttlMs is not an integer or null' unless result['ttlMs'].nil? || result['ttlMs'].is_a?(Integer)
 
-        task_status_payload_problem(result)
+        nil
       end
 
       # The timestamps of a Task are ISO 8601; one that does not parse could
@@ -575,7 +592,9 @@ module MCPClient
       def task_status_payload_problem(result)
         case result['status']
         when 'completed'
-          'a completed task needs an object result' unless result['result'].is_a?(Hash)
+          unless MCPClient::Task.complete_result_object?(result['result'])
+            'a completed task needs an object result whose resultType, if any, is "complete"'
+          end
         when 'failed'
           unless MCPClient::Task.jsonrpc_error_object?(result['error'])
             'a failed task needs a JSON-RPC error object (integer code, string message)'
@@ -633,21 +652,16 @@ module MCPClient
       # @return [MCPClient::Task]
       # @raise [MCPClient::Errors::InvalidResultError]
       def created_task(result, srv)
-        task = MCPClient::Task.from_create_result(result, server: srv)
-        unless task.task_id.is_a?(String)
+        # A CreateTaskResult is a Task: a defaulted status or a missing TTL
+        # would drive the wait on made-up state (and lose the backstop).
+        unless result.is_a?(Hash) && result['taskId'].is_a?(String)
           raise MCPClient::Errors::InvalidResultError, 'Invalid CreateTaskResult: no taskId'
         end
 
-        # A timestamp that does not parse could never bound the wait.
-        %w[createdAt lastUpdatedAt].each do |field|
-          value = result[field]
-          next if value.nil? || (value.is_a?(String) && iso8601?(value))
+        problem = task_shape_problem(result)
+        raise MCPClient::Errors::InvalidResultError, "Invalid CreateTaskResult: #{problem}" if problem
 
-          raise MCPClient::Errors::InvalidResultError,
-                "Invalid CreateTaskResult: #{field} is not an ISO 8601 timestamp"
-        end
-
-        task
+        MCPClient::Task.from_create_result(result, server: srv)
       end
 
       # @param result [Object] a JSON-RPC result
