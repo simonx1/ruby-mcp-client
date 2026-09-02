@@ -235,6 +235,13 @@ module MCPClient
           next if handler.klass == AuthorizationRecorder
           next if PROBE_TRANSPARENT_MIDDLEWARE.include?(handler.klass.name)
           return nil unless probe_runnable_middleware?(handler.klass)
+          # Middleware with no request hook cannot change what a request
+          # carries: Faraday's own `call` runs `on_request` and then the
+          # response phase, which a probe that sends nothing never reaches.
+          # It is neither built nor compared (a response middleware may well
+          # hold state the probe would refuse to stand in for).
+          next unless handler.klass.method_defined?(:on_request)
+          return nil unless probe_buildable_middleware?(handler)
 
           # A copy is run rather than the instance Faraday calls, so the
           # probe cannot disturb it — which is only faithful while the copy
@@ -298,9 +305,79 @@ module MCPClient
         # cannot change may be stood in for.
         return probe_safe_shared_state?(one) if one.equal?(other)
 
-        one == other
+        # Two containers that merely compare equal are the usual shape of a
+        # Faraday middleware built with keyword arguments: `**opts` is a new
+        # hash on every build, holding the very same vendor. They stand in
+        # for one another only while nothing mutable is reachable through
+        # both of them.
+        one == other && probe_shares_no_mutable?(one, other)
       rescue StandardError
         false
+      end
+
+      # @param one [Object] the fresh copy's state
+      # @param other [Object] the live instance's state
+      # @return [Boolean] whether the only objects the two can both reach are
+      #   ones the probe may share (immutable, or on the safe list)
+      def probe_shares_no_mutable?(one, other)
+        mine = probe_reachable_state(one)
+        theirs = probe_reachable_state(other)
+        return false if mine.nil? || theirs.nil?
+
+        mine.each_key.all? { |object| !theirs.key?(object) || probe_safe_shared_state?(object) }
+      end
+
+      # Every object a value can hand out, itself included, keyed by identity.
+      # State the probe may share is kept whole: what it holds cannot change,
+      # or changing it changes no request. nil when the walk would go deeper
+      # than {PROBE_IMMUTABLE_DEPTH}, where what is reachable is no longer
+      # known and nothing may be assumed unshared.
+      # @param value [Object]
+      # @param depth [Integer]
+      # @param seen [Hash] the objects already walked, compared by identity
+      # @return [Hash, nil]
+      def probe_reachable_state(value, depth = 0, seen = {}.compare_by_identity)
+        return seen if seen.key?(value)
+
+        seen[value] = true
+        return seen if probe_safe_shared_state?(value)
+
+        members = probe_state_members(value)
+        return seen if members.empty?
+        return nil unless depth < PROBE_IMMUTABLE_DEPTH
+
+        members.each { |member| return nil unless probe_reachable_state(member, depth + 1, seen) }
+        seen
+      end
+
+      # Whether the probe may build a copy of a middleware at all. Building
+      # runs the host's constructor, and a constructor that takes a one-time
+      # credential from what it is handed spends it before any comparison can
+      # reject the copy — the credential the next real request then never
+      # presents. It can only consume what it is given, so a copy is built
+      # only when every argument is state the probe may share, or a plain
+      # container of such state (a container vends nothing of its own).
+      # @param handler [Faraday::RackBuilder::Handler]
+      # @return [Boolean]
+      def probe_buildable_middleware?(handler)
+        return false if handler.instance_variable_get(:@block)
+
+        args = handler.instance_variable_get(:@args)
+        kwargs = handler.instance_variable_get(:@kwargs) || {}
+        return false unless args.is_a?(Array) && kwargs.is_a?(Hash)
+
+        (args + kwargs.to_a.flatten(1)).all? { |arg| probe_inert_argument?(arg) }
+      end
+
+      # @param value [Object] an argument the handler would pass a fresh copy
+      # @param depth [Integer]
+      # @return [Boolean] whether it can hand a constructor nothing to spend
+      def probe_inert_argument?(value, depth = 0)
+        return true if probe_safe_shared_state?(value)
+        return false unless value.is_a?(Hash) || value.is_a?(Array)
+        return false unless depth < PROBE_IMMUTABLE_DEPTH
+
+        probe_state_members(value).all? { |member| probe_inert_argument?(member, depth + 1) }
       end
 
       # @param value [Object] state the fresh and live middleware share
@@ -342,6 +419,23 @@ module MCPClient
         when Range then held + [value.begin, value.end]
         else held
         end
+      end
+
+      # Whether a fetch brought tool definitions other than the ones it
+      # replaced. A first fetch replaces nothing, so it announces no change.
+      # @param previous [Array<MCPClient::Tool>, nil] the list held before the fetch
+      # @param tools [Array<MCPClient::Tool>] the freshly fetched list
+      # @return [Boolean]
+      def tool_definitions_changed?(previous, tools)
+        return false if previous.nil?
+
+        tool_definitions(previous) != tool_definitions(tools)
+      end
+
+      # @param tools [Array<MCPClient::Tool>]
+      # @return [Array<Array>] what a caller of the list can act on
+      def tool_definitions(tools)
+        tools.map { |t| [t.name, t.description, t.schema, t.output_schema, t.annotations] }
       end
 
       # @param klass [Class] a middleware class on the connection

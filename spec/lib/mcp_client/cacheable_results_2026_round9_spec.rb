@@ -153,9 +153,16 @@ RSpec.describe 'MCP 2026-07-28 cacheable results — round 9' do
       streamable(faraday_config: ->(f) { f.request :authorization, 'Bearer', -> { current[:value] } })
     end
 
+    # A static credential the probe may model: a callable one is state the
+    # probe refuses to run (it could vend a different value every call), so
+    # its context reads as unknown and nothing private is served for it.
+    def static_middleware_server
+      streamable(faraday_config: ->(f) { f.request :authorization, 'Bearer', 'alice' })
+    end
+
     it 'binds a private list to the token the middleware sent' do
       stub_private_tools
-      server = middleware_server
+      server = static_middleware_server
 
       expect(server.list_tools.map(&:name)).to eq(['tool-1'])
       expect(server.list_tools.map(&:name)).to eq(['tool-1'])

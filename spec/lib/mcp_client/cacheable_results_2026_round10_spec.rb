@@ -137,9 +137,11 @@ RSpec.describe 'MCP 2026-07-28 cacheable results — round 10' do
 
     it 'serves a fresh private list when the host also installs raise_error' do
       stub_private_tools
-      current = token
+      # A static credential, so the probe models the request rather than
+      # running a callable the live stack shares (which may vend a different
+      # value on every call).
       server = streamable(faraday_config: lambda { |f|
-        f.request :authorization, 'Bearer', -> { current[:value] }
+        f.request :authorization, 'Bearer', 'alice'
         f.response :raise_error
       })
 
