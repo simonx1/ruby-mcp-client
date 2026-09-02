@@ -54,15 +54,26 @@ module MCPClient
       end
 
       # The decoded fragment of a reference (RFC 3986 Section 2.1), or nil
-      # when what the peer wrote does not decode to readable text: escapes
-      # that are not valid UTF-8 name nothing in this document, and reading
-      # them must never raise out of the validation.
+      # when what the peer wrote does not decode to readable text: a
+      # malformed escape ("a%ZZ") and escapes that are not valid UTF-8 name
+      # nothing in this document, and reading them must never raise out of
+      # the validation. The undecoded text is never substituted -- it would
+      # make "#/$defs/a%ZZ" resolve onto a literal "a%ZZ" member and pass a
+      # reference the peer never wrote off as valid.
       # @param ref [String] the `$ref` value
       # @return [String, nil]
       def decoded_fragment(ref)
-        fragment = ref.delete_prefix('#')
-        decoded = URI.decode_uri_component(fragment) rescue fragment # rubocop:disable Style/RescueModifier
-        decoded if decoded.valid_encoding?
+        decoded = decode_component(ref.delete_prefix('#'))
+        decoded if decoded&.valid_encoding?
+      end
+
+      # Percent-decode one component.
+      # @param component [String]
+      # @return [String, nil] nil when an escape is malformed ("a%ZZ", "a%")
+      def decode_component(component)
+        URI.decode_uri_component(component)
+      rescue ArgumentError
+        nil
       end
 
       # Resolve a JSON pointer within a schema resource, adopting on the way

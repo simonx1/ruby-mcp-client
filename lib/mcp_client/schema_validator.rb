@@ -610,8 +610,8 @@ module MCPClient
       errors.concat(validate_type(data, schema['type'], path)) if schema.key?('type')
       errors.concat(validate_enum(data, schema, path))
       case data
-      when Hash then errors.concat(validate_object(data, schema, path, ctx, ref_depth))
-      when Array then errors.concat(validate_array(data, schema, path, ctx, ref_depth, dialect))
+      when Hash then errors.concat(validate_object(data, schema, path, ctx))
+      when Array then errors.concat(validate_array(data, schema, path, ctx, dialect))
       when String then errors.concat(validate_string(data, schema, path, ctx.deadline))
       when Numeric then errors.concat(validate_number(data, schema, path, dialect))
       end
@@ -776,7 +776,7 @@ module MCPClient
     # @param schema [Hash] string-keyed schema
     # @param path [String] location for error messages
     # @return [Array<String>] validation errors
-    def self.validate_object(data, schema, path, ctx, ref_depth)
+    def self.validate_object(data, schema, path, ctx)
       errors = []
       Array(schema['required']).each do |raw_name|
         name = raw_name.to_s
@@ -796,7 +796,10 @@ module MCPClient
               end
         next if key.nil?
 
-        errors.concat(validate_node(data[key], prop_schema, "#{path}/#{name}", ctx, ref_depth))
+        # A property is a smaller instance, so the hops taken to reach this
+        # schema cannot repeat forever below it: the budget counts a chain
+        # of references applied to one value, not how deep the data nests.
+        errors.concat(validate_node(data[key], prop_schema, "#{path}/#{name}", ctx, 0))
       end
       errors
     end
@@ -809,7 +812,7 @@ module MCPClient
     # @param schema [Hash] string-keyed schema
     # @param path [String] location for error messages
     # @return [Array<String>] validation errors
-    def self.validate_array(data, schema, path, ctx, ref_depth, dialect = ctx.dialect)
+    def self.validate_array(data, schema, path, ctx, dialect = ctx.dialect)
       errors = []
       min_items = schema['minItems']
       max_items = schema['maxItems']
@@ -836,7 +839,10 @@ module MCPClient
                       end
         next unless schema_value?(item_schema)
 
-        errors.concat(validate_node(item, item_schema, "#{path}/#{idx}", ctx, ref_depth))
+        # An item is a smaller instance: the hop budget starts over, so a
+        # recursive schema describes data of any depth (see
+        # {.validate_object}).
+        errors.concat(validate_node(item, item_schema, "#{path}/#{idx}", ctx, 0))
       end
       errors.concat(validate_contains(data, schema, path, dialect))
     end
