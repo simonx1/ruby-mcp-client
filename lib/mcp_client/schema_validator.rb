@@ -449,15 +449,21 @@ module MCPClient
         # and at its own lexical depth; a boolean target needs no preflight
         # and is charged once per distinct position (not per reference),
         # and that position still obeys the depth bound.
+        position, opaque = pointer_position(hop, root, counter[:dialect], counter, from)
         unless target.is_a?(Hash)
-          position = referenced_position_depth(hop, root, counter[:dialect], counter, from)
           problems << "schema nesting depth exceeds #{MAX_SCHEMA_DEPTH}" if position && position > MAX_SCHEMA_DEPTH
-          charge_boolean_target(hop, root, from, counter, problems)
+          # A boolean in a position the walk visits was admitted there; one
+          # behind an opaque keyword is charged here, once per position.
+          charge_boolean_target(hop, root, from, counter, problems) if opaque
           next
         end
 
-        target_depth = (counter[:depths] || {})[target] ||
-                       referenced_position_depth(hop, root, counter[:dialect], counter, from) || (depth + 1)
+        lexical = (counter[:depths] || {})[target]
+        target_depth = if opaque
+                         [position, lexical].compact.max || (depth + 1)
+                       else
+                         lexical || position || (depth + 1)
+                       end
         walk_schema(target, root, target_depth, counter, problems, indexed_dialect(target, counter) || dialect)
       end
       problems << problem if problem

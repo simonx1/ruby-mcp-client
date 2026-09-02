@@ -35,41 +35,106 @@ module MCPClient
       # (minContains / maxContains without contains, additionalItems beside
       # a non-tuple items — JSON Schema 2020-12 Validation Sections
       # 6.4.4-6.4.5, draft-07 Section 9.3.1.2), one the instance never
-      # reaches (additionalItems when the tuple covers every item), one its
-      # companion switches off (contains with minContains 0) or whose value
-      # cannot fail (additionalProperties true, uniqueItems false,
-      # minProperties 0, an empty dependency map) decides nothing.
+      # reaches (additionalItems or unevaluatedItems when the tuple or an
+      # items schema covers every item, additionalProperties or
+      # unevaluatedProperties when every property is covered, uniqueItems
+      # below two items, maxContains or maxProperties the instance cannot
+      # exceed, minProperties it already satisfies, a dependency none of
+      # whose triggers is present), one its companion switches off
+      # (contains with minContains 0) or whose value cannot fail
+      # (additionalProperties true, uniqueItems false, minProperties 0, an
+      # empty dependency map) decides nothing.
       # @return [Boolean]
       def effective_assertion?(schema, keyword, data, dialect = nil)
         value = schema[keyword]
         case keyword
-        when 'contains', 'minContains', 'maxContains', 'additionalItems'
+        when 'contains', 'minContains', 'maxContains', 'additionalItems', 'unevaluatedItems', 'uniqueItems'
           effective_array_assertion?(schema, keyword, value, data, dialect)
-        when 'additionalProperties', 'unevaluatedProperties', 'unevaluatedItems', 'propertyNames'
-          ![true, {}].include?(value)
-        when 'uniqueItems' then value == true
-        when 'minProperties' then value.is_a?(Numeric) && value.positive?
-        when 'maxProperties', 'multipleOf' then value.is_a?(Numeric)
-        when 'dependentRequired', 'dependentSchemas', 'dependencies', 'patternProperties'
-          !(value.is_a?(Hash) && value.empty?)
+        when 'additionalProperties', 'unevaluatedProperties', 'propertyNames', 'minProperties', 'maxProperties',
+             'dependentRequired', 'dependentSchemas', 'dependencies', 'patternProperties'
+          effective_object_assertion?(schema, keyword, value, data, dialect)
+        when 'multipleOf' then value.is_a?(Numeric) && data.is_a?(Numeric)
         else true
         end
       end
 
       # The array assertions whose effect depends on a companion keyword or
-      # on the instance's length.
+      # on the instance's length. A companion the dialect does not define
+      # (`minContains` under draft-07) changes nothing.
       # @return [Boolean]
-      # A companion the dialect does not define (`minContains` under
-      # draft-07) changes nothing.
       def effective_array_assertion?(schema, keyword, value, data, dialect = nil)
+        return false unless data.is_a?(Array)
+
         case keyword
         when 'contains' then !(keyword_known?('minContains', dialect) && schema['minContains'].eql?(0))
         when 'minContains' then schema.key?('contains') && value.is_a?(Numeric) && value.positive?
-        when 'maxContains' then schema.key?('contains')
+        when 'maxContains' then schema.key?('contains') && value.is_a?(Numeric) && data.length > value
+        when 'uniqueItems' then value == true && data.length > 1
         else
-          schema['items'].is_a?(Array) && ![true, {}].include?(value) &&
-            data.is_a?(Array) && data.length > schema['items'].length
+          # additionalItems (beside a tuple only) / unevaluatedItems: only
+          # items past what the tuple (or an items schema, which evaluates
+          # every item) covers.
+          return false if keyword == 'additionalItems' && !schema['items'].is_a?(Array)
+
+          ![true, {}].include?(value) && data.length > evaluated_item_count(schema, keyword, dialect)
         end
+      end
+
+      # How many leading items the tuple keywords in force evaluate, or
+      # infinity when an items schema evaluates them all.
+      # @return [Integer, Float]
+      def evaluated_item_count(schema, keyword, dialect)
+        tuple = schema['prefixItems'] if keyword_known?('prefixItems', dialect) && schema['prefixItems'].is_a?(Array)
+        tuple ||= schema['items'] if schema['items'].is_a?(Array)
+        return Float::INFINITY if keyword == 'unevaluatedItems' && schema_value?(schema['items'])
+
+        tuple ? tuple.length : 0
+      end
+
+      # The object assertions whose effect depends on the instance's
+      # properties.
+      # @return [Boolean]
+      def effective_object_assertion?(schema, keyword, value, data, dialect = nil)
+        return false unless data.is_a?(Hash)
+
+        case keyword
+        when 'additionalProperties', 'unevaluatedProperties'
+          ![true, {}].include?(value) && uncovered_property?(schema, keyword, data, dialect)
+        when 'propertyNames' then ![true, {}].include?(value) && !data.empty?
+        when 'minProperties' then value.is_a?(Numeric) && data.size < value
+        when 'maxProperties' then value.is_a?(Numeric) && data.size > value
+        when 'patternProperties' then value.is_a?(Hash) && !value.empty? && !data.empty?
+        else
+          value.is_a?(Hash) && value.keys.any? { |trigger| data.key?(trigger.to_s) }
+        end
+      end
+
+      # Whether the instance has a property the schema's own property
+      # applicators leave to the keyword: one named in `properties` is
+      # covered, one an `additionalProperties` schema evaluates is covered
+      # for `unevaluatedProperties`, and one matching a `patternProperties`
+      # pattern is covered (an unreadable pattern is assumed to match
+      # nothing, keeping the branch undecided).
+      # @return [Boolean]
+      def uncovered_property?(schema, keyword, data, dialect)
+        return false if keyword == 'unevaluatedProperties' && schema.key?('additionalProperties') &&
+                        keyword_known?('additionalProperties', dialect)
+
+        named = schema['properties'].is_a?(Hash) ? schema['properties'].keys.map(&:to_s) : []
+        patterns = schema['patternProperties'].is_a?(Hash) ? schema['patternProperties'].keys.map(&:to_s) : []
+        data.each_key.any? do |name|
+          name = name.to_s
+          next false if named.include?(name)
+
+          patterns.none? { |pattern| pattern_matches?(pattern, name) }
+        end
+      end
+
+      # @return [Boolean]
+      def pattern_matches?(pattern, name)
+        Regexp.new(pattern).match?(name)
+      rescue RegexpError, TypeError
+        false
       end
 
       # The verdict of a branch evaluated speculatively: :fail when a

@@ -43,7 +43,9 @@ module MCPClient
 
         resource = (from && index[:resources][from]) || root
         fragment = ref.delete_prefix('#')
-        return resolve_pointer(resource, ref) if fragment.empty? || fragment.start_with?('/', '%2F', '%2f')
+        if fragment.empty? || fragment.start_with?('/', '%2F', '%2f')
+          return adopt_reached_target(resolve_pointer(resource, ref), resource, index)
+        end
 
         # A plain-name fragment is percent-decoded like a pointer fragment
         # (RFC 3986 Section 2.1): "#foo%2Dbar" names the anchor "foo-bar".
@@ -51,6 +53,33 @@ module MCPClient
         return UNRESOLVED unless fragment.match?(ANCHOR_NAME)
 
         index[:anchors].fetch(resource, {}).fetch(fragment, UNRESOLVED)
+      end
+
+      # A schema a pointer reaches outside every indexed position (inside
+      # `default`, another data keyword or a vendor member) is still part of
+      # the resource it was reached from: it is indexed on arrival, so a
+      # `$ref` written in it resolves within that resource, and a document
+      # given with symbol keys is normalized there like everywhere else
+      # (data values are kept as given for equality; a target resolved as a
+      # schema gets one string-keyed copy, memoized by identity).
+      # @return [Object] the target (or its normalized copy)
+      def adopt_reached_target(target, resource, index)
+        return target unless target.is_a?(Hash)
+
+        if target.each_key.any? { |key| !key.is_a?(String) }
+          copies = (index[:normalized] ||= {}.compare_by_identity)
+          target = copies[target] ||= deep_stringify(target)
+        end
+        return target if index[:resources].key?(target)
+
+        inherited = index[:dialects][resource]
+        if resource_root?(target, inherited)
+          index[:resources][target] = target
+          index[:dialects][target] = embedded_dialect(target, inherited) || inherited
+        else
+          index[:resources][target] = resource
+        end
+        target
       end
 
       # Every plain-name anchor in the document, per schema resource:
@@ -211,33 +240,57 @@ module MCPClient
       # are both one below the enclosing schema), and every token under a
       # data or unknown keyword is a step, so a document hidden inside
       # `default`, `enum`, `const`, `examples` or a vendor keyword obeys the
-      # same bound as one written in a schema position. A schema object whose
-      # depth the lexical index knows resets the count to that depth.
+      # same bound as one written in a schema position. Keywords are
+      # classified by the dialect in force at each node (an embedded
+      # resource's own `$schema` takes over when the pointer enters it). A
+      # schema object whose depth the lexical index knows resets the count
+      # to that depth — unless the pointer already passed through an opaque
+      # keyword, after which every token counts (the index placed such an
+      # object under another dialect's grammar).
       # @return [Integer, nil] nil when the pointer cannot be followed
       def referenced_position_depth(ref, root, dialect, counter, from)
+        pointer_position(ref, root, dialect, counter, from)&.first
+      end
+
+      # @return [Array(Integer, Boolean), nil] the depth and whether the
+      #   pointer crossed an opaque keyword; nil when it cannot be followed
+      def pointer_position(ref, root, dialect, counter, from)
         tokens = pointer_tokens(ref)
         return nil unless tokens
 
         index = (counter[:anchors] ||= anchor_index(root, dialect))
         node = (from && index[:resources][from]) || root
         depths = counter[:depths] || {}
-        depth = depths[node] || 0
-        mode = :schema
+        walk = { index: index, depths: depths, dialect: index[:dialects][node] || dialect,
+                 depth: depths[node] || 0, mode: :schema, opaque: false }
         tokens.each do |token|
           child = pointer_child(node, token)
           return nil if child.equal?(UNRESOLVED)
 
-          if mode == :schema
-            depth = depths[node] if node.is_a?(Hash) && depths.key?(node)
-            mode = pointer_step_mode(node, token, dialect)
-            depth += 1 unless %i[map array].include?(mode)
-          else
-            depth += 1
-            mode = :schema if %i[map array].include?(mode)
-          end
+          pointer_step(walk, node, token)
           node = child
         end
-        depth
+        [walk[:depth], walk[:opaque]]
+      end
+
+      # Advance one pointer token: in schema mode the node's own dialect
+      # and known depth apply and the keyword decides how the next token
+      # counts; inside a map or array keyword the member is the step;
+      # under an opaque keyword every token is a step.
+      # @return [void]
+      def pointer_step(walk, node, token)
+        unless walk[:mode] == :schema
+          walk[:depth] += 1
+          walk[:mode] = :schema if %i[map array].include?(walk[:mode])
+          return
+        end
+        if node.is_a?(Hash)
+          walk[:depth] = walk[:depths][node] if !walk[:opaque] && walk[:depths].key?(node)
+          walk[:dialect] = walk[:index][:dialects][node] || embedded_dialect(node, walk[:dialect]) || walk[:dialect]
+        end
+        walk[:mode] = pointer_step_mode(node, token, walk[:dialect])
+        walk[:opaque] ||= walk[:mode] == :opaque
+        walk[:depth] += 1 unless %i[map array].include?(walk[:mode])
       end
 
       # The decoded RFC 6901 tokens of a fragment pointer.
