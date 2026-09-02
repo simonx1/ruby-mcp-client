@@ -1,5 +1,7 @@
 # frozen_string_literal: true
 
+require 'digest'
+
 require 'json'
 require 'zlib'
 require 'stringio'
@@ -210,14 +212,72 @@ module MCPClient
     # @param method [String] JSON-RPC method name
     # @param params [Hash] parameters for the request
     # @param id [Integer] request ID
+    # @param note [Boolean] whether this request's effective parameters are
+    #   remembered as this thread's current request (a probe that is never
+    #   sent passes false)
     # @return [Hash] the JSON-RPC request object
-    def build_jsonrpc_request(method, params, id)
+    def build_jsonrpc_request(method, params, id, note: true)
+      effective = with_request_meta(params)
+      note_request_params(effective) if note
       {
         'jsonrpc' => '2.0',
         'id' => id,
         'method' => method,
-        'params' => with_request_meta(params)
+        'params' => effective
       }
+    end
+
+    # `_meta` keys that identify one request rather than what it asks for
+    # (progress and OpenTelemetry trace context): a cached result does not
+    # depend on them.
+    CACHE_NEUTRAL_META_KEYS = %w[progressToken traceparent tracestate baggage].freeze
+
+    # Remember the effective parameters a request goes out with, so a result
+    # cached from it is bound to them (MCP 2026-07-28 caching: a server may
+    # vary a result by host metadata such as a vendor tenant key).
+    # @param params [Hash, nil] the effective (wire) parameters
+    # @return [void]
+    def note_request_params(params)
+      Thread.current[request_params_key] = params_fingerprint_of(params)
+    end
+
+    # @return [String, nil] the fingerprint of the effective parameters of
+    #   the request this thread last built
+    def request_params_fingerprint
+      Thread.current[request_params_key]
+    end
+
+    # @return [String] the fingerprint of the effective parameters the next
+    #   request on this transport would carry
+    def current_params_fingerprint
+      params_fingerprint_of(with_request_meta({}))
+    end
+
+    # A stable fingerprint of the metadata that shapes a result: the
+    # effective `_meta` without the reserved protocol fields (the
+    # transport's own state) and the per-request identifiers.
+    # @param params [Hash, nil] effective parameters
+    # @return [String]
+    def params_fingerprint_of(params)
+      meta = params.is_a?(Hash) ? (params['_meta'] || params[:_meta]) : nil
+      meta = meta.is_a?(Hash) ? meta.transform_keys(&:to_s) : {}
+      meta = meta.except(*PROTECTED_META_KEYS, META_LOG_LEVEL, *CACHE_NEUTRAL_META_KEYS)
+      Digest::SHA256.hexdigest(JSON.generate(deep_sort_keys(meta)))
+    end
+
+    # @return [Symbol] this transport's thread-local key for the request parameters
+    def request_params_key
+      :"mcp_client_request_params_#{object_id}"
+    end
+
+    # @param value [Object]
+    # @return [Object] the value with every nested Hash sorted by key
+    def deep_sort_keys(value)
+      case value
+      when Hash then value.map { |k, v| [k.to_s, deep_sort_keys(v)] }.sort_by(&:first).to_h
+      when Array then value.map { |v| deep_sort_keys(v) }
+      else value
+      end
     end
 
     # Reserved `_meta` keys (MCP 2026-07-28 basic/index "_meta").

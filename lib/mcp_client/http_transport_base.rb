@@ -493,9 +493,11 @@ module MCPClient
         result = parse_response(response, request)
         # Parsing an SSE-framed response dispatches the notifications it
         # carries; a callback may have sent a request of its own on this
-        # thread. The result stays bound to the credentials of its own
-        # request (MCP 2026-07-28 caching), not to that nested request's.
+        # thread. The result stays bound to the credentials and effective
+        # parameters of its own request (MCP 2026-07-28 caching), not to
+        # that nested request's.
         note_sent_authorization(response)
+        note_request_params(request['params'])
         result
       rescue MCPClient::Errors::ConnectionError, MCPClient::Errors::TransportError, MCPClient::Errors::ServerError
         raise

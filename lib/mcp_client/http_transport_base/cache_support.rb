@@ -190,7 +190,10 @@ module MCPClient
           req.url(@endpoint)
           headers.each { |k, v| req.headers[k] = v }
           req.headers['Content-Type'] = 'application/json'
-          probe = { 'jsonrpc' => '2.0', 'id' => 0, 'method' => method, 'params' => params }
+          # The body a real request would carry, its effective `_meta`
+          # included (host request_meta, protocol fields), so middleware that
+          # picks credentials by it answers as it would for the request.
+          probe = build_jsonrpc_request(method, params, 0, note: false)
           req.body = JSON.generate(probe)
           # The routing headers a real modern POST carries, so middleware
           # that authenticates by them answers as it would for the request.
