@@ -17,6 +17,7 @@ require_relative 'request_metadata'
 require_relative 'round_trip_marker'
 require_relative 'result_completeness'
 require_relative 'session_pin'
+require_relative 'input_round_trips'
 
 module MCPClient
   # Shared retry/backoff logic for JSON-RPC transports
@@ -34,6 +35,8 @@ module MCPClient
     include RequestMetadata
     # Requests may be pinned to the session they belong to (see SessionPin).
     include SessionPin
+    # Input requests of a multi-round tool call (see InputRoundTrips).
+    include InputRoundTrips
 
     # JSON-RPC methods with arbitrary side effects that MUST NOT be re-sent
     # automatically. Even a "transient" failure (5xx, dropped connection,
@@ -954,13 +957,6 @@ module MCPClient
     # burn the round-trip budget; doubles up to the maximum.
     INPUT_RETRY_DELAY = 0.5
     INPUT_RETRY_MAX_DELAY = 5
-
-    # Input request methods and the transport callback that fulfils each.
-    INPUT_REQUEST_HANDLERS = {
-      'elicitation/create' => :@elicitation_request_callback,
-      'sampling/createMessage' => :@sampling_request_callback,
-      'roots/list' => :@roots_list_request_callback
-    }.freeze
 
     # Drive a request through the multi round-trip pattern (MCP 2026-07-28
     # basic/patterns/mrtr): while the server answers with an
