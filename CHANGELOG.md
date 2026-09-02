@@ -3228,6 +3228,19 @@ metadata). Each feature lands in its own PR; this section accumulates them.
   for most of the timeout can no longer buy a full pause and another request
   on top of it. A transport that configures no read timeout is unbounded as
   before, with the round-trip ceiling as its only limit.
+- **URL-mode elicitation drops `elicitationId` on modern servers.**
+  2026-07-28 removed the `notifications/elicitation/complete` notification
+  and the `elicitationId` field of URL-mode `elicitation/create` requests:
+  the outcome is learned by retrying the original request, and a server that
+  must correlate an elicitation across retries carries its own identifier in
+  the opaque `requestState`. The metadata hash handed to an elicitation
+  handler therefore no longer carries an `elicitationId` key at all for a
+  modern server — a modern server that sends the field anyway cannot smuggle
+  a correlation id to the host through it, and the client logs one warning
+  naming the field (never its value). On a 2025-11-25 server the field is
+  part of the protocol and the host contract is unchanged, key present (nil
+  when the server sent none) and all. This library never implemented
+  `notifications/elicitation/complete`, so nothing there had to be removed.
 - **Limits and errors.** More than 10 consecutive `input_required` answers,
   an input request this client cannot honour (unknown method, no handler,
   handler error) or a malformed `inputRequests` raise
@@ -3385,7 +3398,10 @@ metadata). Each feature lands in its own PR; this section accumulates them.
   `notifications/cancelled` on timeout). Server-initiated JSON-RPC requests on
   a response stream are dropped with a warning; SSE comment keep-alives are
   ignored. `ping` maps to `server/discover` and `log_level=` to the
-  per-request `_meta` level.
+  per-request `_meta` level. A session id a non-conforming modern server
+  sends back anyway is never captured (the only capture point is the
+  `initialize` response, which a modern server is never sent), so it is
+  never echoed on a later request and no DELETE terminates it.
 - **A broken response stream is re-issued, `tools/call` included** (changelog
   major change 9: "A broken response stream loses the in-flight request;
   clients **MUST** re-issue it as a new request with a new request ID"). The
