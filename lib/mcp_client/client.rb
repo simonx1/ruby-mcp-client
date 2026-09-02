@@ -1285,23 +1285,32 @@ module MCPClient
     def warn_unusable_input_schema(tool)
       return false if tool.schema.nil?
 
-      # Keyed by the schema object itself as well, so a refreshed tool
+      # Keyed by the definition's identity as well, so a refreshed tool
       # definition (list_changed, cache expiry, HeaderMismatch recovery) is
-      # re-checked. The object, not its hash: hashing a peer-supplied
-      # document walks it whole (or overflows the stack) before the bounded
-      # check could reject it.
+      # re-checked while the copies the client cache hands out are not. The
+      # identity, not the schema's hash: hashing a peer-supplied document
+      # walks it whole (or overflows the stack) before the bounded check
+      # could reject it.
       @input_schema_warnings ||= {}
       key = [tool.server&.object_id, tool.name]
       known = @input_schema_warnings[key]
-      return known[:unusable] if known && known[:schema].equal?(tool.schema)
+      return known[:unusable] if known && known[:identity].equal?(tool_definition_identity(tool))
 
       problems = MCPClient::SchemaValidator.check_schema(tool.schema)
-      @input_schema_warnings[key] = { schema: tool.schema, unusable: !problems.empty? }
+      @input_schema_warnings[key] = { identity: tool_definition_identity(tool), unusable: !problems.empty? }
       return false if problems.empty?
 
       @logger.warn("Tool '#{sanitize_peer_log_text(tool.name.to_s)}' input schema is not usable for validation: " \
                    "#{sanitize_peer_log_text(problems.join('; '))}")
       true
+    end
+
+    # The token naming a tool definition ({MCPClient::Tool#schema_identity});
+    # a tool-like object without one is identified by itself.
+    # @param tool [MCPClient::Tool, Object]
+    # @return [Object]
+    def tool_definition_identity(tool)
+      tool.respond_to?(:schema_identity) ? tool.schema_identity : tool
     end
 
     # Warn (in both :warn and :strict modes) when a tool's output schema uses
@@ -1313,10 +1322,10 @@ module MCPClient
     def warn_partial_schema_coverage(tool)
       @output_schema_coverage ||= {}
       key = [tool.server&.object_id, tool.name]
-      return if @output_schema_coverage[key].equal?(tool.output_schema)
+      return if @output_schema_coverage[key].equal?(tool_definition_identity(tool))
 
       unsupported = MCPClient::SchemaValidator.unsupported_keywords(tool.output_schema)
-      @output_schema_coverage[key] = tool.output_schema
+      @output_schema_coverage[key] = tool_definition_identity(tool)
       return if unsupported.empty?
 
       @logger.warn(

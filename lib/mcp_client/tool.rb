@@ -31,6 +31,13 @@ module MCPClient
     attr_reader :name, :title, :description, :schema, :output_schema, :annotations, :server, :task_support,
                 :icons, :meta
 
+    # @!attribute [r] schema_identity
+    #   @return [Object] a token naming this tool definition: every copy the
+    #     client cache hands out carries the same one, and a definition
+    #     fetched again carries a new one, so once-per-definition checks of
+    #     its schemas can be keyed without hashing a peer-supplied document
+    attr_reader :schema_identity
+
     # Initialize a new Tool
     # @param name [String] the name of the tool
     # @param description [String] the description of the tool
@@ -54,6 +61,9 @@ module MCPClient
       @task_support = task_support
       @icons = icons
       @meta = meta
+      # A frozen object is copied by reference by DeepCopy, so the token
+      # survives every copy of this definition.
+      @schema_identity = Object.new.freeze
     end
 
     # Create a Tool instance from JSON data
