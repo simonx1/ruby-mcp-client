@@ -369,6 +369,7 @@ module MCPClient
       servers.each(&:cleanup)
       # The transports forgot their results; the slices built from them go too.
       clear_cache
+      clear_task_states
     end
 
     # The list kinds this client caches, each with the transport-level cache
