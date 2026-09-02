@@ -83,17 +83,31 @@ The implementation follows the standard OAuth 2.1 authorization code flow with P
      non-empty string (RFC 7591 Section 3.2.1). A `201` without one registered nothing, so it raises a
      `ConnectionError` and the flow ends *before* the browser is opened, rather than sending the user
      to the authorization endpoint with an empty `client_id`.
+   - Every other field is read against the type RFC 7591 gives it: `client_secret`,
+     `token_endpoint_auth_method`, `scope`, `client_name`, `client_uri`, `logo_uri`, `tos_uri`,
+     `policy_uri` and `application_type` are strings, `client_id_issued_at` and
+     `client_secret_expires_at` are integers, and `redirect_uris`, `grant_types`, `response_types`
+     and `contacts` are arrays of strings. A field of any other type fails the registration with the
+     same `ConnectionError` — `{"client_id": "c", "redirect_uris": "http://localhost:1/cb"}` is a
+     reported registration failure, not a `NoMethodError` — and a `redirect_uris` the server omits or
+     echoes back empty falls back to the redirect URI the registration asked for.
 3. **Authorization**: Redirect user to authorization server with PKCE parameters
 4. **Token Exchange**: Exchange authorization code for access token using PKCE verifier
    - A token response carries a credential only when it is a JSON object whose `access_token` is a
      non-empty string (RFC 6749 Section 5.1). Anything else — `200 {}`, `200 []`, `200 null`,
      `{"access_token": ["x"]}` — is a protocol error, not a credential: the exchange raises a
      `ConnectionError` and nothing is stored.
+   - Every other field is read against the type RFC 6749 Section 5.1 gives it: `token_type` is a
+     non-empty string, `expires_in` an integer, and `refresh_token` and `scope` strings. A field of
+     any other type fails the exchange with the same `ConnectionError`, so `token_type: ["Bearer"]`
+     never reaches the `Authorization` header and `expires_in: "3600"` never reaches a `Time`. A
+     `null` field reads as an absent one (`token_type` still defaults to `Bearer`).
 5. **Token Usage**: Include access token in MCP requests via `Authorization` header
 6. **Token Refresh**: Automatically refresh tokens when they expire
-   - A refresh response that carries no such `access_token` is a failed refresh: the still-valid token
-     stays in storage and keeps being presented rather than being replaced by a bare `Bearer ` or by
-     the `to_s` of whatever JSON arrived.
+   - A refresh response that carries no such `access_token`, or whose fields have the wrong JSON
+     types, is a failed refresh: the still-valid token stays in storage and keeps being presented
+     rather than being replaced by a bare `Bearer `, by the `to_s` of whatever JSON arrived, or by a
+     `TypeError` raised out of the request path.
 
 ## Configuration Options
 
@@ -158,8 +172,8 @@ class DatabaseTokenStorage
   def set_client_info(server_url, client_info)
     # Store client info. A nil client_info means "forget it": remove the
     # record rather than serializing nil, for the same reason as set_token
-    # (a record without a client_id reads back as no client at all, and the
-    # next flow registers a new one).
+    # (a record whose client_id is not a non-empty string reads back as no
+    # client at all, and the next flow registers a new one).
   end
 
   # Implement other required methods:
