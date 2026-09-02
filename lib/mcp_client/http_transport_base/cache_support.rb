@@ -38,6 +38,20 @@ module MCPClient
       PROBE_IMMUTABLE_CLASSES = [NilClass, TrueClass, FalseClass, Numeric, Symbol, String, Regexp, Time,
                                  Hash, Array, Struct, Range].freeze
 
+      # Class-level state Faraday itself keeps on every middleware class it
+      # builds: the default options its own class API vends, memoized there
+      # on first use. It belongs to the framework, is identical for a fresh
+      # copy and for the instance Faraday calls, and no host request hook
+      # rotates it, so the probe looks past it.
+      PROBE_FRAMEWORK_CLASS_STATE = Faraday::Middleware.singleton_class.instance_methods(false)
+                                                       .map { |name| :"@#{name}" }.freeze
+
+      # Where {RubyVM::InstructionSequence#to_a} carries the kind of sequence
+      # it serialized (`:method` for a `def`, `:block` for a `define_method`
+      # body). A layout that no longer answers `:method` there leaves every
+      # host middleware unrunnable, which is the safe way to be wrong.
+      ISEQ_TYPE_INDEX = 9
+
       # How far into shared state its immutability is checked: a frozen
       # container may still hold mutable members, and beyond this depth the
       # state counts as mutable (so the context is unknown).
@@ -204,8 +218,9 @@ module MCPClient
       # that overrides `call` cannot be run without sending, middleware whose
       # own state has moved on since the connection was built cannot be stood
       # in for by a fresh copy, and middleware that shares mutable state with
-      # the live stack must not be run at all (the probe would change it);
-      # the answer is then unknown.
+      # the live stack must not be run at all (the probe would change it) --
+      # state its class keeps or a block closed over included, neither of
+      # which building a copy leaves behind; the answer is then unknown.
       # @param headers [Hash] the headers before middleware
       # @param method [String] the JSON-RPC method the probe models
       # @param params [Hash] its params
@@ -241,6 +256,7 @@ module MCPClient
           # It is neither built nor compared (a response middleware may well
           # hold state the probe would refuse to stand in for).
           next unless handler.klass.method_defined?(:on_request)
+          return nil unless probe_inert_middleware_class?(handler.klass)
           return nil unless probe_buildable_middleware?(handler)
 
           # A copy is run rather than the instance Faraday calls, so the
@@ -348,6 +364,63 @@ module MCPClient
 
         members.each { |member| return nil unless probe_reachable_state(member, depth + 1, seen) }
         seen
+      end
+
+      # Whether a middleware class keeps no state of its own that running the
+      # probe could disturb. Two instances of one class share that class, so
+      # anything the class holds -- a class-level instance variable, a class
+      # variable, a singleton method that can vend from either -- is state a
+      # copy does not isolate: a request hook reaching it (`self.class.next_nonce`)
+      # spends the very credential the next real request would have carried.
+      # A hook built by `define_method` is the same hazard one level further
+      # out: it keeps the binding it was defined in, which no comparison of
+      # instances or of constructor arguments can reach. So the rule is
+      # inverted for these: only a class whose own methods are all defined
+      # with `def` (or in C, an attribute reader closing over nothing), and
+      # which holds nothing at class level, may be run.
+      # @param klass [Class] a middleware class on the connection
+      # @return [Boolean]
+      def probe_inert_middleware_class?(klass)
+        probe_host_ancestors(klass).all? do |mod|
+          (mod.instance_variables - PROBE_FRAMEWORK_CLASS_STATE).empty? && mod.class_variables(false).empty? &&
+            mod.singleton_methods(false).empty? && probe_closure_free_module?(mod)
+        end
+      rescue StandardError
+        false
+      end
+
+      # The classes and modules the host contributed to a middleware: what
+      # Faraday::Middleware itself brings is the framework's own and carries
+      # no host credential.
+      # @param klass [Class]
+      # @return [Array<Module>]
+      def probe_host_ancestors(klass)
+        klass.ancestors - Faraday::Middleware.ancestors
+      end
+
+      # @param mod [Module] a class or module the host contributed
+      # @return [Boolean] whether every method it defines closes over nothing
+      def probe_closure_free_module?(mod)
+        (mod.instance_methods(false) + mod.private_instance_methods(false)).all? do |name|
+          probe_closure_free_method?(mod.instance_method(name))
+        end
+      end
+
+      # Whether a method was defined with `def` rather than from a block.
+      # A block-bodied method (`define_method`) carries its defining binding;
+      # a method with no instruction sequence at all is implemented in C (an
+      # attribute accessor, say) and closes over nothing. Anything else --
+      # including a Ruby whose instruction sequences cannot be inspected --
+      # counts as a closure, so the probe gives up rather than guess.
+      # @param method [UnboundMethod]
+      # @return [Boolean]
+      def probe_closure_free_method?(method)
+        iseq = RubyVM::InstructionSequence.of(method)
+        return true if iseq.nil?
+
+        iseq.to_a[ISEQ_TYPE_INDEX] == :method
+      rescue StandardError, NotImplementedError
+        false
       end
 
       # Whether the probe may build a copy of a middleware at all. Building

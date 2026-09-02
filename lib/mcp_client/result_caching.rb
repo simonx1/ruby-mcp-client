@@ -305,18 +305,28 @@ module MCPClient
       LEGACY_ENTRY
     end
 
+    # Take the note left for a kind: it is written for the one cache above
+    # this transport that tags its slice with it, so reading it consumes it.
+    # The slot itself goes once nothing is left in it, rather than staying on
+    # the thread for the life of a worker that lists through many transports.
     # @param kind [Symbol]
-    # @return [Object, nil] the identity of the entry this thread's last
-    #   list of the kind came from
-    def served_entry_token(kind)
-      Thread.current[served_entries_key]&.[](kind)&.first
+    # @return [Array(Object, String), nil] the identity of the entry this
+    #   thread's last list of the kind came from and the parameters
+    #   fingerprint it is bound to
+    def take_served_entry(kind)
+      notes = Thread.current[served_entries_key]
+      return nil if notes.nil?
+
+      note = notes.delete(kind)
+      Thread.current[served_entries_key] = nil if notes.empty?
+      note
     end
 
-    # @param kind [Symbol]
-    # @return [String, nil] the parameters fingerprint the entry this
-    #   thread's last list of the kind came from is bound to
-    def served_entry_params_fingerprint(kind)
-      Thread.current[served_entries_key]&.[](kind)&.last
+    # Drop every note this thread holds for this transport (its connection
+    # is going away, so nothing will tag a slice with them).
+    # @return [void]
+    def forget_served_entries
+      Thread.current[served_entries_key] = nil
     end
 
     # @param kind [Symbol]
