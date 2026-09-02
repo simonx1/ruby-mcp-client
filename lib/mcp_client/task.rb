@@ -69,8 +69,9 @@ module MCPClient
     # @raise [MCPClient::Errors::InvalidResultError] when the peer data is not
     #   an object or names a status that is not a task status
     def self.from_json(json, server: nil, detailed: false)
-      data = json || {}
-      raise MCPClient::Errors::InvalidResultError, 'Invalid task: not an object' unless data.is_a?(Hash)
+      raise MCPClient::Errors::InvalidResultError, 'Invalid task: not an object' unless json.is_a?(Hash)
+
+      data = json
 
       modern = modern_shape?(data)
       new(

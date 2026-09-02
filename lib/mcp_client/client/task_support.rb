@@ -75,8 +75,7 @@ module MCPClient
         # discovery) counts against it too.
         wait = { task_id: task_id, srv: srv, deadline: timeout && (monotonic_time + timeout), ttl_deadline: nil,
                  answered: nil, epoch: nil, last: nil }
-        ensure_task_capability!(srv, 'get', strict: true)
-        raise_if_past_deadline!(wait)
+        probe_task_capability!(wait)
         unless modern_server?(srv)
           raise MCPClient::Errors::TaskError, 'wait_for_task requires an MCP 2026-07-28 server (tasks extension)'
         end
@@ -447,6 +446,35 @@ module MCPClient
       # @raise [MCPClient::Errors::TaskError]
       def raise_if_past_deadline!(wait)
         raise_ttl_elapsed!(wait) if wait[:polled] && wait[:ttl_deadline] && monotonic_time >= wait[:ttl_deadline]
+        raise_if_past_caller_deadline!(wait)
+      end
+
+      # The capability probe (initialization, discovery) counts against the
+      # caller's budget: a spent budget sends nothing, and a probe that
+      # outlives the remaining budget ends the wait — the transports take no
+      # per-call budget for their handshake, so the probe runs on its own
+      # thread and is abandoned (it finishes or fails on its own) once the
+      # wait is over.
+      # @param wait [Hash]
+      # @return [void]
+      # @raise [MCPClient::Errors::TaskError] when the budget ran out
+      def probe_task_capability!(wait)
+        raise_if_past_caller_deadline!(wait)
+        return ensure_task_capability!(wait[:srv], 'get', strict: true) unless wait[:deadline]
+
+        outcome = Queue.new
+        probe = Thread.new do
+          ensure_task_capability!(wait[:srv], 'get', strict: true)
+          outcome << nil
+        rescue Exception => e # rubocop:disable Lint/RescueException -- handed back to the waiting thread
+          outcome << e
+        end
+        remaining = [wait[:deadline] - monotonic_time, 0].max
+        raise_if_past_caller_deadline!(wait) unless probe.join(remaining)
+
+        error = outcome.pop
+        raise error if error
+
         raise_if_past_caller_deadline!(wait)
       end
 

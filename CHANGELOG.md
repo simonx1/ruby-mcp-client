@@ -20,6 +20,14 @@ metadata). Each feature lands in its own PR; this section accumulates them.
   replaces it, and a task object that is not an object or names an
   unknown status is an `InvalidResultError` (`Task.from_json`), never a
   `NoMethodError` or `ArgumentError`.
+- **Bounded probes and null payloads (round 19).** The caller's `timeout:`
+  bounds the capability probe (initialization, discovery) that
+  `wait_for_task` may need before its first poll: a spent budget sends
+  nothing, and a probe outliving the remaining budget ends the wait with
+  the timed-out `TaskError` (the transports take no per-call handshake
+  budget, so the probe runs on its own thread and is abandoned). A null or
+  non-object task payload (`Task.from_json(nil)`, a `notifications/tasks`
+  without params) is an `InvalidResultError`, never an empty working task.
 - **Waits and lookups (round 17).** The caller's `timeout:` bounds the
   whole `wait_for_task`, capability probe (initialization, discovery)
   included; a task request never outlives the transport's configured
