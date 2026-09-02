@@ -13,6 +13,16 @@ metadata). Each feature lands in its own PR; this section accumulates them.
   never sent again (an explicit answer is newer than a pending one for the
   same key and wins); the bookkeeping of a previous server session is
   dropped when the session ends, and `Client#cleanup` forgets every task.
+  A wait that outlives a server restart follows the new session (a reused
+  task id or input key is a new request and is answered again), and the
+  session epoch never runs backwards: a request that read it before the
+  restart gets the current session's state and can neither delete it nor
+  bring the ended session back. A modern `tasks/get` result must carry
+  every field the Task shape requires (`status`, `createdAt`,
+  `lastUpdatedAt`, and `ttlMs` — null for unlimited, but present) and a
+  failed task's `error` must be a JSON-RPC error object (integer `code`,
+  string `message`); anything else is an `InvalidResultError` rather than
+  a wait driven on made-up state.
 
 - **Opt-in extension.** `MCPClient::Client.new(extensions:
   ['io.modelcontextprotocol/tasks'])` (or a `identifier => settings` Hash)

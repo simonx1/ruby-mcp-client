@@ -623,6 +623,7 @@ module MCPClient
                  else
                    srv.rpc_request('tasks/get', { taskId: task_id })
                  end
+        validate_detailed_task_shape!(result) if modern_server?(srv)
         task = MCPClient::Task.from_json(result, server: srv, detailed: true)
         # The answer must be about the task that was asked for: its state
         # drives result delivery and tasks/update.

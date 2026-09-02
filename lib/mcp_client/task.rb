@@ -168,9 +168,22 @@ module MCPClient
     def payload_present?
       case @status
       when 'completed' then @result.is_a?(Hash)
-      when 'failed' then @error.is_a?(Hash)
+      when 'failed' then jsonrpc_error_object?(@error)
       else terminal?
       end
+    end
+
+    # Whether a failed task's error is a JSON-RPC error object ("The
+    # request failed due to a JSON-RPC error": an integer code and a
+    # string message, as the JSON-RPC error shape requires).
+    # @param error [Object]
+    # @return [Boolean]
+    def jsonrpc_error_object?(error)
+      return false unless error.is_a?(Hash)
+
+      code = error['code'] || error[:code]
+      message = error['message'] || error[:message]
+      code.is_a?(Integer) && message.is_a?(String)
     end
 
     # Seconds left before the TTL backstop (createdAt + ttlMs), nil when
