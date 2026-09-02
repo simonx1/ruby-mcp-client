@@ -462,6 +462,13 @@ module MCPClient
     # @raise [MCPClient::Errors::ServerError] if server returns an error
     # @raise [MCPClient::Errors::ResourceReadError] for other errors during resource template listing
     def list_resource_templates(cursor: nil)
+      # Unlike tools, prompts and resources, template lists have no
+      # client-level cache above this transport, so the fresh entry is
+      # served here: a positive ttlMs means no second request (MCP
+      # 2026-07-28 caching).
+      cached = cursor ? nil : fresh_list_value(:templates)
+      return cached if cached
+
       ensure_initialized
       params = {}
       params['cursor'] = cursor if cursor

@@ -560,7 +560,6 @@ module MCPClient
       end
     end
 
-    # A stable, non-reversible identifier of an Authorization header, so a
     # The Authorization value in a header collection, whatever the key's
     # spelling: HTTP field names are case-insensitive and hosts configure
     # them as strings or symbols (`Authorization:`, 'AUTHORIZATION').
@@ -575,15 +574,41 @@ module MCPClient
     # @return [String, nil]
     def self.authorization_header_value(headers)
       return nil if headers.nil?
+      # Faraday's own table already holds one entry per field name.
+      return headers['Authorization'] if headers.is_a?(Faraday::Utils::Headers)
+      return headers['Authorization'] || headers['authorization'] unless headers.respond_to?(:each_pair)
 
-      if headers.respond_to?(:each_pair)
-        headers.each_pair { |key, value| return value if key.to_s.casecmp?('authorization') }
-        nil
-      else
-        headers['Authorization'] || headers['authorization']
-      end
+      # A plain Hash can hold several spellings at once (a configured
+      # `authorization:` and an OAuth provider's canonical `Authorization`).
+      # Faraday copies them into a case-insensitive table, so the request
+      # carries what the last of them writes — and so must the fingerprint.
+      value = nil
+      headers.each_pair { |key, header| value = header if key.to_s.casecmp?('authorization') }
+      value
     end
 
+    # The header table a Faraday request built from these headers carries:
+    # field names are case-insensitive there, so several spellings of one
+    # header collapse into a single entry and a later write of any spelling
+    # (an OAuth provider's canonical `Authorization`) replaces it rather
+    # than leaving the older one behind.
+    # @param headers [Hash, #each_pair, nil]
+    # @return [Faraday::Utils::Headers]
+    def self.faraday_headers(headers)
+      return headers if headers.is_a?(Faraday::Utils::Headers)
+      return Faraday::Utils::Headers.new unless headers.respond_to?(:each_pair)
+
+      Faraday::Utils::Headers.new(headers.to_h)
+    end
+
+    # @see .faraday_headers
+    # @param headers [Hash, #each_pair, nil]
+    # @return [Faraday::Utils::Headers]
+    def faraday_headers(headers)
+      MCPClient::ResultCaching.faraday_headers(headers)
+    end
+
+    # A stable, non-reversible identifier of an Authorization header, so a
     # cache entry can be bound to the credentials that produced it without
     # keeping the credentials themselves around.
     # @param header [String, nil]

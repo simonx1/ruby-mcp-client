@@ -553,7 +553,10 @@ module MCPClient
     # @param _kind [Symbol, String, nil] the cache kind (every request carries the same header)
     # @return [String, nil]
     def current_authorization_context(_kind = nil)
-      authorization_fingerprint(authorization_header_value(@headers))
+      # Through Faraday's case-insensitive table, so several spellings of
+      # the header in the configured hash resolve to the one value a
+      # request would actually carry.
+      authorization_fingerprint(authorization_header_value(faraday_headers(@headers)))
     end
 
     # The context the request this thread last sent went out with (noted
