@@ -281,6 +281,19 @@ module MCPClient
       nil
     end
 
+    # A copy of this handle naming a definite lifetime of its (reusable) task
+    # id: the task one CreateTaskResult started, as opposed to whatever the
+    # id means later (see {MCPClient::Client::TaskRegistry}). Used by the
+    # creation paths that build the handle before the lifetime it starts is
+    # counted.
+    # @param generation [Integer, nil] the lifetime the handle names
+    # @return [Task]
+    def with_task_generation(generation)
+      copy = dup
+      copy.instance_variable_set(:@task_generation, generation)
+      copy
+    end
+
     # Whether this task exists on the server (has an id) as opposed to a
     # request the server answered synchronously (see .completed_locally).
     # @return [Boolean]

@@ -306,6 +306,11 @@ module MCPClient
       parameters, token = setup_progress_tracking(parameters, progress)
       # The session the call is made in: a task it comes back as belongs to
       # that session, not to one that replaced it while the answer was read.
+      # The call goes into that very session and no other — a transport that
+      # reconnects inside the request would otherwise run the tool in the
+      # replacement session while the task is stamped with the sampled one,
+      # and the wait would then refuse a task whose (possibly non-idempotent)
+      # tool has already run, inviting a duplicate retry.
       task_epoch = tasks_extension? ? invocation_session_epoch(server) : nil
 
       # The call and the re-resolve that follows it share one slot for the
@@ -314,7 +319,7 @@ module MCPClient
       # there.
       with_called_tool_definition(server) do
         result = begin
-          server.call_tool(tool_name, parameters)
+          pinned_to_session(server, task_epoch) { server.call_tool(tool_name, parameters) }
         rescue MCPClient::Errors::ConnectionError => e
           # Add server identity information to the error for better context
           server_id = server.name ? "#{server.class}[#{server.name}]" : server.class.name
@@ -487,8 +492,11 @@ module MCPClient
       begin
         generation_before = tasks_extension? ? tools_generation_of(server) : nil
         task_epoch = tasks_extension? ? invocation_session_epoch(server) : nil
-        # Use the streaming API if it's available
-        stream = server.call_tool_streaming(tool_name, parameters)
+        # Use the streaming API if it's available, opened in the session the
+        # epoch was sampled for: a chunk that comes back as a task is stamped
+        # with that session, so the call must not have been written into the
+        # one that replaced it (see #call_tool).
+        stream = pinned_to_session(server, task_epoch) { server.call_tool_streaming(tool_name, parameters) }
         return stream unless tasks_extension? && modern_server?(server)
 
         # MCP 2026-07-28 tasks extension: a chunk may be a task; resolve it

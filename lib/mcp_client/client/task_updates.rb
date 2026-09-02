@@ -39,6 +39,23 @@ module MCPClient
         error.code.is_a?(Integer) && !error.is_a?(MCPClient::Errors::TransientServerError)
       end
 
+      # Which of a rejected delivery's keys it still owns: the ones whose
+      # pending value is still the very value it carried. A key another
+      # update answered while this one was on the wire belongs to that
+      # newer delivery — it holds the pending value, it is sending it, and
+      # unmarking the key here would leave it unrecorded, so a later poll
+      # would put the same input request to the host again.
+      # @param state [Hash] the task state the rejected update was bound to
+      # @param input_responses [Hash] what that update carried
+      # @return [Array<String>] the keys to give back
+      def rejected_keys_of(state, input_responses)
+        answered_keys_mutex.synchronize do
+          pending = state[:pending_update] || {}
+          input_responses.reject { |key, value| pending.key?(key) && !pending[key].equal?(value) }
+                         .keys.map(&:to_s)
+        end
+      end
+
       # Give back keys the server definitely did not take, in the state the
       # rejected update was built from: a rejection that lands after a
       # restart must not unmark keys the new session has answered for what
@@ -221,8 +238,9 @@ module MCPClient
           ended_session_update_result(shown, strict_session)
         rescue MCPClient::Errors::ServerError => e
           if definite_rejection?(e) && update_lock_current?(state, lock)
-            release_answered_keys_in(state, keys)
-            clear_pending_update(state, lock, keys)
+            rejected = rejected_keys_of(state, input_responses)
+            release_answered_keys_in(state, rejected)
+            clear_pending_update(state, lock, rejected)
           end
           raise if e.protocol_error?
 
