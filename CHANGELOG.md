@@ -110,7 +110,11 @@ metadata). Each feature lands in its own PR; this section accumulates them.
   authorization server switch leaves records another provider already
   bound to the new server alone, and the redirect URI an authorization
   request was made with is recorded with its PKCE record and used for the
-  code exchange.
+  code exchange. Accepting a new challenge metadata URL forgets the
+  previous document and any refusal before the fetch, so a failed fetch
+  leaves the flow waiting on the URL the current header named (the
+  precheck fails and discovery retries it) instead of completing against
+  stale state.
 
 ### Tasks extension (`io.modelcontextprotocol/tasks`)
 
