@@ -1310,8 +1310,10 @@ module MCPClient
       # @param token [Token]
       # @return [void]
       def store_token(token)
-        @retired_tokens&.delete(retirement_key(token, nil)) if token.respond_to?(:access_token)
         storage.set_token(server_url, token)
+        # Only a persisted replacement lifts the marker: if the write failed,
+        # the stale record still in storage stays retired.
+        @retired_tokens&.delete(retirement_key(token, nil)) if token.respond_to?(:access_token)
       end
 
       # Whether a token was retired in this process: a bound token when its
