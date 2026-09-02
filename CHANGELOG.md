@@ -126,7 +126,16 @@ metadata). Each feature lands in its own PR; this section accumulates them.
   challenge's metadata URL is pending and unresolved no cached token is
   presented; the next access retries that URL first — before the token is
   read, so a record that retry retired is never written back — and judges
-  the token by what the document names.
+  the token by what the document names. Only a 401 challenge's refusal
+  stays authoritative for later discovery: a peer URL refused during
+  speculative well-known discovery is fetched again next time, so a
+  document the operator fixes no longer leaves the provider failing for
+  its lifetime. An authority-less URL (`https:foo`) is refused for want of
+  a host before it can retire the stored token, and the code is redeemed
+  with the redirect URI recorded for the authorization request (RFC 6749
+  Section 4.1.3): a token endpoint whose error names another redirect URI
+  is reported as a mismatch rather than retried with the peer's value
+  (records made before the URI was recorded keep the legacy retry).
 
 ### Tasks extension (`io.modelcontextprotocol/tasks`)
 

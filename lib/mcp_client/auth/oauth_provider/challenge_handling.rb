@@ -197,26 +197,56 @@ module MCPClient
         # honored here only when the configured MCP server is itself loopback,
         # i.e. the developer is already pointed at a local stack.
         #
-        # The rejection is recorded so a later discovery fails closed instead of
-        # silently reusing cached authorization-server metadata.
+        # A refusal of a CHALLENGE-advertised URL is recorded (latch: true) so a
+        # later discovery fails closed instead of silently reusing cached
+        # authorization-server metadata. A refusal of a document found by
+        # speculative well-known discovery records nothing: there is no cache to
+        # protect, and latching it would leave a server that is later fixed
+        # unreachable for the life of this provider.
         #
         # NOTE: hostnames are checked literally. This does not resolve DNS, so a
         # public name that resolves to a private address is not caught here;
         # that needs resolution-time checking in the HTTP layer.
         # @param url [String] the peer-advertised URL
         # @param label [String] human-readable name for errors
+        # @param latch [Boolean] whether a refusal is recorded as an authoritative
+        #   challenge refusal (true for a 401 challenge, false for speculative
+        #   well-known discovery, which must stay retryable)
         # @raise [MCPClient::Errors::ConnectionError] if the URL is not acceptable
-        def validate_peer_advertised_url!(url, label)
+        def validate_peer_advertised_url!(url, label, latch: true)
           uri = URI.parse(url)
           host = uri.hostname.to_s.downcase
 
           if uri.scheme != 'https' && !(uri.scheme == 'http' && local_development?)
-            reject_challenge!("OAuth #{label} must use HTTPS: #{safe_error_text(url)}")
+            refuse_peer_url!("OAuth #{label} must use HTTPS: #{safe_error_text(url)}", latch: latch)
           end
-          reject_challenge!("OAuth #{label} must not target a loopback or private address: #{safe_error_text(url)}") if
-            local_address?(host) && !local_development?
+          # An authority-less URL ('https:foo', 'https:///foo') has an acceptable
+          # scheme and an empty host, so it would otherwise pass every check
+          # below and be treated as a validated authorization server — enough to
+          # retire the stored token before discovery can only fail.
+          refuse_peer_url!("OAuth #{label} must name a host: #{safe_error_text(url)}", latch: latch) if host.empty?
+          if local_address?(host) && !local_development?
+            refuse_peer_url!("OAuth #{label} must not target a loopback or private address: #{safe_error_text(url)}",
+                             latch: latch)
+          end
         rescue URI::InvalidURIError
-          reject_challenge!("OAuth #{label} is not a valid URL: #{safe_error_text(url)}")
+          refuse_peer_url!("OAuth #{label} is not a valid URL: #{safe_error_text(url)}", latch: latch)
+        end
+
+        # @param message [String] why the peer-advertised URL was refused
+        # @param latch [Boolean] whether to record the refusal for later discovery
+        # @raise [MCPClient::Errors::ConnectionError] always
+        def refuse_peer_url!(message, latch:)
+          reject_challenge!(message) if latch
+
+          raise MCPClient::Errors::ConnectionError, message
+        end
+
+        # @return [Boolean] whether the resource metadata being acted on was
+        #   advertised by a 401 challenge (authoritative) rather than found by
+        #   speculative well-known discovery
+        def challenge_advertised_metadata?
+          !(@challenge_resource_metadata.nil? && @challenge_metadata_url.nil?)
         end
 
         # @param message [String] why the challenge was refused
