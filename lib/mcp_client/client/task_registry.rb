@@ -12,6 +12,17 @@ module MCPClient
     # answer of one lifetime never reaches another. Mixed into
     # {MCPClient::Client} through {TaskSupport}.
     module TaskRegistry
+      # How many task ids one client keeps a lifetime counter for. The counter
+      # has to outlive the task's own bookkeeping — that is the point: a
+      # creation under an id this client has already seen is a different task,
+      # whether or not anything of the previous one is still around — so on a
+      # sessionless connection, where the epoch never moves and nothing else
+      # prunes it, the map would otherwise grow with every task ever created.
+      MAX_TRACKED_TASK_LIFETIMES = 4096
+      # How far a prune goes once the cap is passed: dropping a batch keeps the
+      # scan amortized instead of walking the map on every creation.
+      TRACKED_TASK_LIFETIMES_LOW_WATER = (MAX_TRACKED_TASK_LIFETIMES * 3) / 4
+
       private
 
       # Per-task bookkeeping shared by every wait on the task: the answered
@@ -71,26 +82,57 @@ module MCPClient
       end
 
       # Begin the lifetime a CreateTaskResult just created. A task id is
-      # unique within a session, so a server that answers with an id whose
-      # previous task is still on this client's books has ended that task and
-      # started another: the bookkeeping of the previous lifetime is dropped
-      # and the id's generation moves, which gives the new task an answered
-      # set, an in-flight registry entry and a pending update entirely of its
-      # own. Without the move, an input key a handler of the previous task is
+      # unique within a session, so a server that answers with an id it has
+      # already handed out in this session has ended that task and started
+      # another: the bookkeeping of the previous lifetime is dropped and the
+      # id's generation moves, which gives the new task an answered set, an
+      # in-flight registry entry and a pending update entirely of its own.
+      # Without the move, an input key a handler of the previous task is
       # still presenting would be suppressed as already in flight on the new
       # one, and that handler's answer would be delivered to the new task.
       #
-      # Only an id whose previous lifetime is still around is counted: for
-      # every well-behaved server (and for the first task under any id) there
-      # is nothing to separate, so nothing is recorded.
+      # Every creation this client observed counts, whether or not anything
+      # of the previous one is still around: a second CreateTaskResult that
+      # arrives before any wait allocated state, or after a terminal poll (or
+      # a TTL expiry) forgot it, is just as much a different task, and two
+      # handles that named the same lifetime would let the older one update
+      # or cancel the task that replaced it. The id goes on the books at its
+      # first creation, at generation 0, so nothing is recorded for the
+      # single-creation case every well-behaved server produces.
       # @return [void]
       def start_task_lifetime(srv, task_id, epoch)
         answered_keys_mutex.synchronize do
           lookup = [srv.object_id, epoch, task_id]
           previous = @task_states&.delete(lookup)
-          next unless previous || presenting_earlier_lifetime?(lookup)
+          lifetimes = (@task_lifetimes ||= {})
+          replaces = lifetimes.key?(lookup) || previous || presenting_earlier_lifetime?(lookup)
+          generation = replaces ? task_lifetime(lookup) + 1 : 0
+          # Re-inserted, so the ids created most recently are the last a prune
+          # reaches (a Hash keeps a rewritten key where it was).
+          lifetimes.delete(lookup)
+          lifetimes[lookup] = generation
+          prune_task_lifetimes(lifetimes)
+        end
+      end
 
-          (@task_lifetimes ||= {})[lookup] = task_lifetime(lookup) + 1
+      # Forget the counters of the task ids created longest ago, once more of
+      # them are kept than {MAX_TRACKED_TASK_LIFETIMES}. An id nothing holds
+      # any more is one no live request can name: a creation under it later
+      # starts its count over, exactly as an id this client never saw does.
+      # An id whose bookkeeping is still live — or whose keys a handler is
+      # still presenting — is never dropped: its counter is what tells that
+      # state, and the handles built from it, which task they belong to.
+      # @return [void] (callers hold answered_keys_mutex)
+      def prune_task_lifetimes(lifetimes)
+        return if lifetimes.size <= MAX_TRACKED_TASK_LIFETIMES
+
+        # A snapshot: the entries are deleted as the scan walks them.
+        tracked = lifetimes.keys
+        tracked.each do |lookup|
+          break if lifetimes.size <= TRACKED_TASK_LIFETIMES_LOW_WATER
+          next if @task_states&.key?(lookup) || presenting_earlier_lifetime?(lookup)
+
+          lifetimes.delete(lookup)
         end
       end
 
@@ -128,6 +170,21 @@ module MCPClient
         raise MCPClient::Errors::TaskError,
               "Error #{operation} task '#{shown_task_id(task.task_id)}': the server has created a new task with " \
               'this id since, so the task this handle names was replaced and is gone'
+      end
+
+      # The lifetime a handle refreshed from another one keeps: the one the
+      # source handle named, when that handle is this server's. A request
+      # that named its task with a bare id (or with another server's handle)
+      # asks about whatever the id means now and produces a handle that says
+      # the same, exactly as before — but a handle built from one that named
+      # a definite task must keep naming it, or a later creation under the id
+      # would silently move it to the task that replaced it.
+      # @param task [Object] what the caller named the task with
+      # @return [Integer, nil]
+      def handle_task_generation(task, srv)
+        return nil unless task.is_a?(MCPClient::Task) && task.server.equal?(srv)
+
+        task.task_generation
       end
 
       # Whether the bookkeeping a request was built from is still what its

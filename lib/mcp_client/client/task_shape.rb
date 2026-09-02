@@ -28,7 +28,8 @@ module MCPClient
       end
 
       # The fields every Task carries (CreateTaskResult and DetailedTask
-      # alike): a status, parseable timestamps and a ttlMs key.
+      # alike): a status, parseable timestamps, a ttlMs key and, when the
+      # server offers one, a usable pollIntervalMs.
       # @param result [Object]
       # @return [String, nil]
       def task_shape_problem(result)
@@ -41,7 +42,22 @@ module MCPClient
         return 'ttlMs is missing' unless result.key?('ttlMs')
         return 'ttlMs is not an integer or null' unless result['ttlMs'].nil? || result['ttlMs'].is_a?(Integer)
 
-        nil
+        task_poll_interval_problem(result)
+      end
+
+      # pollIntervalMs is the pace the client is asked to keep ("Clients
+      # SHOULD respect the pollIntervalMs provided in responses"), so a
+      # malformed one is a malformed task rather than a hint to ignore:
+      # silently falling back to the default would poll at a rate the server
+      # never asked for. An absent field (and an explicit null) asks for
+      # nothing and is not a problem.
+      # @return [String, nil]
+      def task_poll_interval_problem(result)
+        interval = result['pollIntervalMs']
+        return nil if interval.nil?
+        return nil if interval.is_a?(Integer) && !interval.negative?
+
+        'pollIntervalMs is not a non-negative integer'
       end
 
       # The timestamps of a Task are ISO 8601; one that does not parse could

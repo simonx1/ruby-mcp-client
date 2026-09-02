@@ -7,6 +7,46 @@ metadata). Each feature lands in its own PR; this section accumulates them.
 
 ### Tasks extension (`io.modelcontextprotocol/tasks`)
 
+- **A lifetime is established for every creation, and every handle names the
+  one it belongs to (round 37).** Round 36 gave each `CreateTaskResult` its own
+  lifetime, but only recorded one when the id was already on the books: two
+  creations under the same id with no wait in between — or one made after a
+  terminal poll, a TTL expiry or a `TaskNotFound` had dropped the id's
+  bookkeeping — left both handles naming the same lifetime, so the older one
+  could still `update_task`, `cancel_task` or `wait_for_task` the task that
+  replaced it. Every observed creation now moves the id's generation, on the
+  legacy `call_tool_as_task` path as well, and `get_task` propagates the
+  lifetime of the handle it was asked about instead of dropping it — a
+  refreshed handle used to pass the replacement guard unchecked and operate on
+  whatever the id named later. A detailed terminal handle waited on again after
+  its id was reused no longer deletes the live task's bookkeeping, and a
+  `tasks/cancel` the server answers with an unknown task forgets the keys of
+  the session it was pinned to rather than those of a session that replaced it
+  under the request. The lifetime counters, which by design outlive the tasks
+  they belong to, are bounded: the ids created longest ago are dropped once
+  more than 4096 are tracked, never one whose bookkeeping is still live.
+- **A task-producing `tools/call` is written into the session it was sampled
+  for (round 37).** `call_tool`, `call_tool_as_task` and `call_tool_streaming`
+  now pin the creating call to the epoch they sampled for it, as every other
+  task request already was. A transport that reconnects inside the request
+  (a stdio child that exited, an HTTP 404 recovery) could otherwise run the
+  tool in the replacement session while the returned task was stamped with the
+  sampled one, and the wait would then refuse a task whose possibly
+  non-idempotent tool had already run — inviting a duplicate retry.
+- **The task bookkeeping cleanups are bounded (round 37).** A `tasks/update`
+  that the server definitely rejected now gives back only the keys whose
+  pending value it still owns: a newer answer for the same key, queued while
+  the older update was on the wire, keeps its pending payload and its
+  answered/submitted markers, so a later poll no longer puts the same input
+  request to the host again. A task request through a custom transport that
+  implements only the documented two-argument `rpc_request(method, params)` is
+  bounded on the wall clock instead of silently losing its computed timeout, so
+  a hung `tasks/get` can no longer block a wait that has no caller deadline for
+  the task's whole lifetime; the session pin is applied inside that bound.
+  Answers whose task another waiter already saw terminal or missing are
+  discarded rather than delivered, and a malformed `pollIntervalMs` (a string,
+  a negative integer) is now an `InvalidResultError` instead of silently
+  becoming the default polling interval.
 - **Every `CreateTaskResult` starts an isolated task lifetime, and closing a
   sessionless connection ends none (round 36).** A task id is unique within a
   session, so a server that answers with an id whose previous task is still on
