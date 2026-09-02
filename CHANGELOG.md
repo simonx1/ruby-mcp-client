@@ -122,7 +122,10 @@ metadata). Each feature lands in its own PR; this section accumulates them.
   presented when the refresh — or the discovery it needs — cannot run,
   provided it is still current after that discovery (one it retired is
   not); only an expired token whose refresh fails yields none; metadata
-  bodies that are not JSON objects are a discovery failure.
+  bodies that are not JSON objects are a discovery failure. While a
+  challenge's metadata URL is pending and unresolved no cached token is
+  presented; the next access retries that URL first and judges the token
+  by what it names.
 
 ### Tasks extension (`io.modelcontextprotocol/tasks`)
 
