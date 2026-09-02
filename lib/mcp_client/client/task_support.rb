@@ -481,7 +481,13 @@ module MCPClient
       def bound_wait_by_ttl(current, wait)
         remaining = current.ttl_remaining
         raise_ttl_elapsed!(wait) if remaining && remaining <= 0
-        wait[:ttl_deadline] = remaining && (monotonic_time + remaining)
+        if remaining
+          wait[:ttl_deadline] = monotonic_time + remaining
+        elsif current.ttl.nil?
+          # Only an explicit ttlMs null lifts the backstop; anything else
+          # that yields no remaining time keeps the last one.
+          wait[:ttl_deadline] = nil
+        end
       end
 
       # One tasks/get, bounded by what is left of the wait. A request that
@@ -535,13 +541,48 @@ module MCPClient
         return 'not an object' unless result.is_a?(Hash)
         return 'status is not a task status' unless MCPClient::Task::VALID_STATUSES.include?(result['status'])
 
-        %w[createdAt lastUpdatedAt].each do |field|
-          return "#{field} is not a string" unless result[field].is_a?(String)
-        end
+        problem = task_timestamp_problem(result)
+        return problem if problem
         return 'ttlMs is missing' unless result.key?('ttlMs')
         return 'ttlMs is not an integer or null' unless result['ttlMs'].nil? || result['ttlMs'].is_a?(Integer)
 
+        task_status_payload_problem(result)
+      end
+
+      # The timestamps of a Task are ISO 8601; one that does not parse could
+      # never bound a wait, so it is not a task at all.
+      # @return [String, nil]
+      def task_timestamp_problem(result)
+        %w[createdAt lastUpdatedAt].each do |field|
+          return "#{field} is not a string" unless result[field].is_a?(String)
+          return "#{field} is not an ISO 8601 timestamp" unless iso8601?(result[field])
+        end
         nil
+      end
+
+      # @return [Boolean]
+      def iso8601?(text)
+        Time.iso8601(text)
+        true
+      rescue ArgumentError
+        false
+      end
+
+      # The payload a DetailedTask's status implies ("If status is completed,
+      # result MUST be included; if failed, error; if input_required,
+      # inputRequests").
+      # @return [String, nil]
+      def task_status_payload_problem(result)
+        case result['status']
+        when 'completed'
+          'a completed task needs an object result' unless result['result'].is_a?(Hash)
+        when 'failed'
+          unless MCPClient::Task.jsonrpc_error_object?(result['error'])
+            'a failed task needs a JSON-RPC error object (integer code, string message)'
+          end
+        when 'input_required'
+          'an input_required task needs an inputRequests object' unless result['inputRequests'].is_a?(Hash)
+        end
       end
 
       # Enforce the MCP 2026-07-28 tasks extension gate: this client must have
@@ -595,6 +636,15 @@ module MCPClient
         task = MCPClient::Task.from_create_result(result, server: srv)
         unless task.task_id.is_a?(String)
           raise MCPClient::Errors::InvalidResultError, 'Invalid CreateTaskResult: no taskId'
+        end
+
+        # A timestamp that does not parse could never bound the wait.
+        %w[createdAt lastUpdatedAt].each do |field|
+          value = result[field]
+          next if value.nil? || (value.is_a?(String) && iso8601?(value))
+
+          raise MCPClient::Errors::InvalidResultError,
+                "Invalid CreateTaskResult: #{field} is not an ISO 8601 timestamp"
         end
 
         task
