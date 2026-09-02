@@ -713,8 +713,11 @@ module MCPClient
     def store_tools(tools, generation)
       @mutex.synchronize do
         if tools_generation == generation
-          attach_list_value(:tools, tools)
-          return @tools = tools
+          # A copy is kept only when its hint was attached (or the list
+          # carried none): a fetch whose entry was cleared or replaced in
+          # flight leaves nothing behind, so the next access fetches again.
+          @tools = attach_list_value(:tools, tools) ? tools : nil
+          return tools
         end
 
         # Invalidated while in flight: this list is stale even if nothing

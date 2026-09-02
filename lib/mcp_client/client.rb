@@ -856,7 +856,13 @@ module MCPClient
       return false unless fingerprint == server.send(:current_params_fingerprint)
       return true unless server.respond_to?(:cache_entry_token, true)
 
-      server.send(:cache_entry_token, kind).equal?(token)
+      # A slice is identified by the very entry it came from; a legacy list
+      # (no hint recorded) stays a hit only while the transport still holds
+      # no entry, and a fetch that recorded no entry identifies nothing.
+      current = server.send(:cache_entry_token, kind)
+      return current.nil? if token == MCPClient::ResultCaching::LEGACY_ENTRY
+
+      !token.nil? && !current.nil? && current.equal?(token)
     end
 
     # The cache's items as copies: a caller can neither change the cache nor

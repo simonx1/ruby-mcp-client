@@ -346,8 +346,7 @@ module MCPClient
 
       prompts = request_prompts_list.map { |prompt_data| MCPClient::Prompt.from_json(prompt_data, server: self) }
       @mutex.synchronize do
-        @prompts = prompts
-        attach_list_value(:prompts, prompts)
+        @prompts = attach_list_value(:prompts, prompts) ? prompts : nil
       end
 
       # This request's own list, never a re-read of @prompts (another
@@ -423,8 +422,7 @@ module MCPClient
 
       @mutex.synchronize do
         unless cursor
-          @resources_result = resources_result
-          attach_list_value(:resources, resources_result)
+          @resources_result = attach_list_value(:resources, resources_result) ? resources_result : nil
         end
       end
 
