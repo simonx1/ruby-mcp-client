@@ -91,23 +91,36 @@ The implementation follows the standard OAuth 2.1 authorization code flow with P
      same `ConnectionError` — `{"client_id": "c", "redirect_uris": "http://localhost:1/cb"}` is a
      reported registration failure, not a `NoMethodError` — and a `redirect_uris` the server omits or
      echoes back empty falls back to the redirect URI the registration asked for.
+   - An array of strings is not yet an array of redirect URIs: every element must be an absolute,
+     parseable URI, so `{"redirect_uris": [""]}` (or `["/cb"]`) is a reported registration failure
+     rather than a browser opened at `…&redirect_uri=&…`.
 3. **Authorization**: Redirect user to authorization server with PKCE parameters
 4. **Token Exchange**: Exchange authorization code for access token using PKCE verifier
    - A token response carries a credential only when it is a JSON object whose `access_token` is a
      non-empty string (RFC 6749 Section 5.1). Anything else — `200 {}`, `200 []`, `200 null`,
      `{"access_token": ["x"]}` — is a protocol error, not a credential: the exchange raises a
      `ConnectionError` and nothing is stored.
-   - Every other field is read against the type RFC 6749 Section 5.1 gives it: `token_type` is a
-     non-empty string, `expires_in` an integer, and `refresh_token` and `scope` strings. A field of
-     any other type fails the exchange with the same `ConnectionError`, so `token_type: ["Bearer"]`
-     never reaches the `Authorization` header and `expires_in: "3600"` never reaches a `Time`. A
-     `null` field reads as an absent one (`token_type` still defaults to `Bearer`).
+   - Every other field is read against the type RFC 6749 Section 5.1 gives it: `expires_in` is an
+     integer and `scope` a string. A field of any other type fails the exchange with the same
+     `ConnectionError`, so `token_type: ["Bearer"]` never reaches the `Authorization` header and
+     `expires_in: "3600"` never reaches a `Time`. A `null` field reads as an absent one
+     (`token_type` still defaults to `Bearer`).
+   - `access_token` and `token_type` must carry bytes an HTTP header can hold: both are non-empty
+     strings free of control characters, so a token containing CR/LF (`"fresh\r\nX-Injected: 1"`)
+     is refused instead of being stored and split into two header lines.
+   - `refresh_token` is a credential too, so it is bytes or nothing: `refresh_token: ""` fails the
+     response rather than being persisted over the refresh token the client already holds.
 5. **Token Usage**: Include access token in MCP requests via `Authorization` header
 6. **Token Refresh**: Automatically refresh tokens when they expire
-   - A refresh response that carries no such `access_token`, or whose fields have the wrong JSON
-     types, is a failed refresh: the still-valid token stays in storage and keeps being presented
-     rather than being replaced by a bare `Bearer `, by the `to_s` of whatever JSON arrived, or by a
-     `TypeError` raised out of the request path.
+   - A refresh response that carries no such `access_token`, whose fields have the wrong JSON types,
+     whose credentials are unusable bytes, or that is not JSON at all, is a failed refresh: the
+     still-valid token stays in storage and keeps being presented rather than being replaced by a
+     bare `Bearer `, by the `to_s` of whatever JSON arrived, or by an exception raised out of the
+     request path.
+   - The same checks are made of what storage reads back, since a backend answers with whatever it
+     was given: a record whose `access_token` or `token_type` is missing, empty, of another type or
+     carrying control bytes presents no token at all (and a new authorization flow starts) instead
+     of crashing while the `Authorization` header is built.
 
 ## Configuration Options
 
@@ -282,6 +295,14 @@ This implementation follows OAuth 2.1 security best practices:
 - **HTTPS is enforced** on all discovered authorization-server endpoints (authorization, token, and
   registration), with a loopback exception (`localhost`, `*.localhost`, 127.0.0.0/8, `::1`, in
   any spelling) for local development
+- **RFC 9207 `iss` fails closed**: `authorization_response_iss_parameter_supported` is a JSON
+  boolean; a document (or a persisted record) carrying anything else — `"true"`, `1`, `{}` — says
+  nothing this client can act on and is read as "advertised", so a callback without `iss` is
+  refused rather than accepted from a server that may well send one
+- **Peer text is sanitized** before it reaches a log line or an exception message (which
+  `BrowserOAuth` renders on its error page): response bodies and error descriptions are stripped of
+  control characters and bounded, and a body that is not JSON is reported by position and size
+  (`malformed JSON, at line 1 column 1, 26 byte body`) rather than by the bytes the parser choked on
 - **Secure token storage** guidelines should be followed
 
 ## Examples

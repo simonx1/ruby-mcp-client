@@ -335,7 +335,8 @@ module MCPClient
         @grant_types_supported = grant_types_supported
         @code_challenge_methods_supported = code_challenge_methods_supported
         @client_id_metadata_document_supported = client_id_metadata_document_supported
-        @authorization_response_iss_parameter_supported = authorization_response_iss_parameter_supported
+        @authorization_response_iss_parameter_supported =
+          self.class.normalize_iss_advertisement(authorization_response_iss_parameter_supported)
       end
 
       # Whether the server advertises the RFC 9207 `iss` authorization
@@ -344,6 +345,25 @@ module MCPClient
       # @return [Boolean]
       def iss_parameter_supported?
         @authorization_response_iss_parameter_supported == true
+      end
+
+      # RFC 8414 makes authorization_response_iss_parameter_supported a JSON
+      # boolean. A document (or a persisted record) carrying anything else —
+      # "true", 1, {} — says nothing this client can act on, and "says
+      # nothing" must never be read as "not advertised": that is the reading
+      # that accepts a callback with no `iss` from a server that does send
+      # one, which is exactly the mix-up RFC 9207 exists to stop. An
+      # unusable answer is therefore treated as an advertisement — the check
+      # fails closed, refusing a response without `iss` — and is recorded as
+      # one, so a round trip through storage keeps the same reading. Only an
+      # absent value (nil) stays "no answer at all" (see
+      # {#iss_parameter_recorded?}).
+      # @param value [Object, nil] the value as given
+      # @return [Boolean, nil]
+      def self.normalize_iss_advertisement(value)
+        return value if value.nil? || value == true || value == false
+
+        true
       end
 
       # Whether this record actually carries an answer about the RFC 9207
@@ -494,7 +514,12 @@ module MCPClient
         @code_challenge = code_challenge || generate_code_challenge(@code_verifier)
         @code_challenge_method = code_challenge_method || 'S256'
         @issuer = issuer
-        @iss_parameter_supported = iss_parameter_supported
+        # A record read back from a hash-persisting backend can carry
+        # anything here. Not a boolean is not an answer: the record says
+        # nothing about the `iss` parameter, so the authorization server's own
+        # metadata decides (and that reading fails closed), rather than a
+        # mangled value silently meaning "not advertised".
+        @iss_parameter_supported = iss_parameter_supported if [true, false].include?(iss_parameter_supported)
         @client_id = client_id
         @redirect_uri = redirect_uri
       end

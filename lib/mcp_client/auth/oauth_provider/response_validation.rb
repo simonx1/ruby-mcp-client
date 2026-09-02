@@ -1,5 +1,7 @@
 # frozen_string_literal: true
 
+require 'uri'
+
 module MCPClient
   module Auth
     class OAuthProvider
@@ -32,15 +34,19 @@ module MCPClient
 
         # The fields of a successful token response and the types RFC 6749
         # Section 5.1 gives them. access_token and token_type are REQUIRED and
-        # carry bytes that go into an `Authorization` header, so an empty
-        # string is no more usable than a JSON array; the OPTIONAL strings may
-        # be empty. Fields the RFC does not name are ignored: an authorization
-        # server may return anything else it likes.
+        # end up in an `Authorization` header, so they must be bytes a header
+        # can carry: an empty string is no more usable than a JSON array, and
+        # a CR or an LF would not be part of the value at all but the start of
+        # another header line. refresh_token is OPTIONAL but is a credential
+        # too: bytes or nothing, because "" would be persisted over the
+        # refresh token the client already holds. scope is free text.
+        # Fields the RFC does not name are ignored: an authorization server
+        # may return anything else it likes.
         TOKEN_RESPONSE_FIELDS = {
-          'access_token' => :non_empty_string,
-          'token_type' => :non_empty_string,
+          'access_token' => :header_value,
+          'token_type' => :header_value,
           'expires_in' => :integer,
-          'refresh_token' => :string,
+          'refresh_token' => :non_empty_string,
           'scope' => :string
         }.freeze
 
@@ -52,7 +58,7 @@ module MCPClient
           'client_secret' => :string,
           'client_id_issued_at' => :integer,
           'client_secret_expires_at' => :integer,
-          'redirect_uris' => :string_array,
+          'redirect_uris' => :redirect_uri_array,
           'token_endpoint_auth_method' => :string,
           'grant_types' => :string_array,
           'response_types' => :string_array,
@@ -70,9 +76,19 @@ module MCPClient
         TYPE_DESCRIPTIONS = {
           string: 'a string',
           non_empty_string: 'a non-empty string',
+          header_value: 'a non-empty string of bytes an HTTP header can carry',
           integer: 'an integer',
-          string_array: 'an array of strings'
+          string_array: 'an array of strings',
+          redirect_uri_array: 'an array of usable redirect URIs'
         }.freeze
+
+        # Bytes no HTTP header field value may carry: the C0 controls (CR and
+        # LF above all, which would end the header line and start one of the
+        # peer's choosing) and DEL. RFC 6749 Appendix A is stricter still —
+        # an access token is 1*VSCHAR — but obs-text is at least transported,
+        # while a control byte is either refused by the HTTP stack or splits
+        # the request.
+        HEADER_UNSAFE_BYTE = ->(byte) { byte < 0x20 || byte == 0x7F }
 
         private
 
@@ -129,25 +145,32 @@ module MCPClient
           case type
           when :string then value.is_a?(String)
           when :non_empty_string then non_empty_string?(value)
+          when :header_value then header_value_bytes?(value)
           # `true` and `false` are not Integers, so booleans are rejected here.
           when :integer then value.is_a?(Integer)
           when :string_array then value.is_a?(Array) && value.all?(String)
+          when :redirect_uri_array then value.is_a?(Array) && value.all? { |uri| redirect_uri_bytes?(uri) }
           else false
           end
         end
 
-        # RFC 6749 Section 5.1 makes access_token REQUIRED in a successful
-        # token response, and it is a string: the bytes go into an
-        # `Authorization` header verbatim. A record whose access_token is
-        # absent, empty or of any other type is never a credential — its
-        # header would be a bare "Bearer " or, worse, `Bearer ["x"]`, a to_s
-        # of whatever JSON arrived, attributed to whatever authorization
-        # server is current. Checked wherever a token is read, issued or
-        # applied.
+        # Whether a token record can be presented at all. Both fields
+        # {MCPClient::Auth::Token#to_header} builds the `Authorization` header
+        # out of are checked, not just the access token: a record whose
+        # access_token is absent, empty or of any other type is never a
+        # credential — its header would be a bare "Bearer " or, worse,
+        # `Bearer ["x"]`, a to_s of whatever JSON arrived, attributed to
+        # whatever authorization server is current — and a token_type that is
+        # not a string crashes `capitalize`, while one carrying CR or LF makes
+        # the header value two header lines. Storage answers with whatever it
+        # was given, so this is asked wherever a token is read, issued or
+        # applied, not only of what came off the wire.
         # @param token [Object, nil] a token record
-        # @return [Boolean] whether it carries access token bytes
+        # @return [Boolean] whether it carries bytes an Authorization header can present
         def token_bytes?(token)
-          token.respond_to?(:access_token) && access_token_bytes?(token.access_token)
+          return false unless token.respond_to?(:access_token) && access_token_bytes?(token.access_token)
+
+          token.respond_to?(:token_type) && header_value_bytes?(token.token_type)
         end
 
         # The same question about a parsed token endpoint response body.
@@ -171,9 +194,32 @@ module MCPClient
         end
 
         # @param value [Object, nil] a candidate access token
-        # @return [Boolean] whether it is a non-empty string of token bytes
+        # @return [Boolean] whether it is token bytes an Authorization header can carry
         def access_token_bytes?(value)
-          non_empty_string?(value)
+          header_value_bytes?(value)
+        end
+
+        # @param value [Object, nil] a candidate header field value
+        # @return [Boolean] whether it is a non-empty string an HTTP header can carry
+        def header_value_bytes?(value)
+          non_empty_string?(value) && value.each_byte.none?(&HEADER_UNSAFE_BYTE)
+        end
+
+        # A registered redirect URI is asked for its `first` and put into the
+        # authorization URL the browser is sent to. An empty string is an
+        # array element of the right JSON type and no redirect URI at all: it
+        # opens the browser with `redirect_uri=`, and the authorization server
+        # rejects the request the user was just sent into. So an array of
+        # strings registers redirect URIs only when every element is one:
+        # absolute, and parseable as a URI.
+        # @param value [Object, nil] a candidate redirect URI
+        # @return [Boolean]
+        def redirect_uri_bytes?(value)
+          return false unless non_empty_string?(value)
+
+          !URI.parse(value).scheme.to_s.empty?
+        rescue URI::InvalidURIError
+          false
         end
 
         # @param value [Object, nil] a candidate client id
