@@ -548,10 +548,12 @@ module MCPClient
       # @return [ServerMetadata] Authorization server metadata
       # @raise [MCPClient::Errors::ConnectionError] if discovery fails
       def discover_authorization_server
-        # A challenge we refused is still authoritative: it says the cached
+        # A CHALLENGE we refused is still authoritative: it says the cached
         # authorization server is no longer the right one. Falling back to
         # that cache (or to speculative well-known probing) would quietly
-        # undo the rejection, so surface it instead.
+        # undo the rejection, so surface it instead. Only a challenge sets
+        # this: a refused well-known document leaves nothing latched and is
+        # fetched again below.
         raise MCPClient::Errors::ConnectionError, @challenge_error if @challenge_error
 
         # A fresh 401 challenge is authoritative and overrides any cached
@@ -715,8 +717,13 @@ module MCPClient
         # advertised origin BEFORE constructing and fetching well-known URLs
         # on it, so a malicious protected resource cannot drive discovery GETs
         # against internal services (SSRF).
+        # Only a challenge-advertised document is authoritative enough for a
+        # refusal to latch: a speculative well-known document that is refused
+        # now must be fetched again by the next discovery, so a server the
+        # operator fixes is not unreachable for the life of this provider.
         validate_peer_advertised_url!(auth_server_url,
-                                      'authorization server (advertised by protected resource metadata)')
+                                      'authorization server (advertised by protected resource metadata)',
+                                      latch: challenge_advertised_metadata?)
 
         server_metadata = fetch_first_server_metadata(authorization_server_metadata_urls(auth_server_url),
                                                       auth_server_url)
@@ -1524,8 +1531,8 @@ module MCPClient
 
         # The redirect_uri the authorization request was made with (recorded
         # with the PKCE record), else the registered one
-        registered_redirect_uri = (pkce.respond_to?(:redirect_uri) && pkce.redirect_uri) ||
-                                  client_info.metadata.redirect_uris.first
+        recorded_redirect_uri = pkce.redirect_uri if pkce.respond_to?(:redirect_uri)
+        registered_redirect_uri = recorded_redirect_uri || client_info.metadata.redirect_uris.first
 
         params = {
           grant_type: 'authorization_code',
@@ -1554,18 +1561,11 @@ module MCPClient
         response = send_token_request.call(request_body)
 
         unless response.success?
-          redirect_hint = extract_redirect_mismatch(response.body)
-
-          if redirect_hint && redirect_hint[:expected] && redirect_hint[:expected] != registered_redirect_uri
-            expected_uri = redirect_hint[:expected]
-            logger.warn(
-              "Token exchange failed: redirect_uri mismatch. Retrying with server's expected value: #{expected_uri}"
-            )
-
-            params[:redirect_uri] = redirect_hint[:expected]
-            retry_body = URI.encode_www_form(params)
-
-            response = send_token_request.call(retry_body)
+          retry_uri = redirect_uri_retry_target(response.body, sent: registered_redirect_uri,
+                                                               recorded: recorded_redirect_uri)
+          if retry_uri
+            params[:redirect_uri] = retry_uri
+            response = send_token_request.call(URI.encode_www_form(params))
           end
         end
 
@@ -1667,6 +1667,35 @@ module MCPClient
           return false
         end
         true
+      end
+
+      # The redirect_uri to retry a failed code exchange with, if any.
+      #
+      # RFC 6749 Section 4.1.3 redeems the code with the redirect_uri of the
+      # authorization request, which is recorded on the PKCE record. Where it
+      # was recorded, a value parsed out of the peer's error text is never
+      # substituted for it: redeeming with a URI this client never sent is not
+      # a recovery, so the contradiction is surfaced. Only legacy records made
+      # before the URI was recorded keep the older retry-with-the-server's-value
+      # behaviour, where there is nothing authoritative to contradict.
+      # @param body [String] the token endpoint's error body
+      # @param sent [String, nil] the redirect_uri the request was made with
+      # @param recorded [String, nil] the redirect_uri recorded for this authorization request
+      # @return [String, nil] the URI to retry with, or nil to keep the failure
+      # @raise [MCPClient::Errors::ConnectionError] when the error contradicts the recorded URI
+      def redirect_uri_retry_target(body, sent:, recorded:)
+        expected = extract_redirect_mismatch(body)&.fetch(:expected, nil)
+        return nil unless expected && expected != sent
+
+        if recorded
+          raise MCPClient::Errors::ConnectionError,
+                'Token exchange failed: the authorization server expected a redirect_uri other than the one the ' \
+                "authorization request was made with (#{recorded}); restart the authorization"
+        end
+
+        logger.warn("Token exchange failed: redirect_uri mismatch. Retrying with server's expected value: " \
+                    "#{safe_error_text(expected)}")
+        expected
       end
 
       # Extract redirect_uri mismatch details from an OAuth error response
