@@ -463,9 +463,11 @@ module MCPClient
     #   multiple connection attempts. This is essential for proper reconnection
     #   logic and exponential backoff.
     def cleanup
-      # The cache notes this transport left on this thread are for a slice
-      # that will never be tagged now.
-      forget_served_entries
+      # Everything this transport left on this thread — the notes of the
+      # entries it served and recorded, the credentials, parameters and
+      # metadata of its requests — describes a slice that will never be
+      # tagged and a request that will never be made.
+      forget_transport_thread_state
       @mutex.synchronize do
         # Set flags first before killing threads to prevent race conditions
         # where threads might check flags after they're set but before they're killed

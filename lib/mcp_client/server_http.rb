@@ -578,9 +578,11 @@ module MCPClient
     # Clean up the server connection
     # Properly closes HTTP connections and clears cached state
     def cleanup
-      # The cache notes this transport left on this thread are for a slice
-      # that will never be tagged now.
-      forget_served_entries
+      # Everything this transport left on this thread — the notes of the
+      # entries it served and recorded, the credentials, parameters and
+      # metadata of its requests — describes a slice that will never be
+      # tagged and a request that will never be made.
+      forget_transport_thread_state
       @mutex.synchronize do
         # Attempt to terminate session before cleanup
         terminate_session if @session_id
