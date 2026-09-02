@@ -1033,10 +1033,12 @@ module MCPClient
       # @return [Object] result from the JSON-RPC response
       def send_request_and_wait(method, params, timeout)
         req_id, = send_on_current_transport(method, params) do |built|
+          clear_response_received_at if respond_to?(:clear_response_received_at, true)
           yield declared_protocol_version(built) if block_given?
         end
         begin
           res = wait_response(req_id, timeout: timeout)
+          note_response_received_at if respond_to?(:note_response_received_at, true)
         rescue MCPClient::Errors::RequestTimeoutError
           # MCP lifecycle: on timeout the sender SHOULD issue a cancellation
           # notification for the abandoned request and stop waiting.
