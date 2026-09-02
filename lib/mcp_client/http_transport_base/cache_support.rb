@@ -37,7 +37,7 @@ module MCPClient
 
         def on_request(env)
           @transport.send(:note_request_authorization,
-                          env.request_headers['Authorization'] || env.request_headers['authorization'])
+                          MCPClient::ResultCaching.authorization_header_value(env.request_headers))
         end
       end
 
@@ -111,7 +111,7 @@ module MCPClient
         headers = response.is_a?(Hash) ? response.dig(:request, :headers) : nil
         return unless headers.respond_to?(:[])
 
-        note_request_authorization(headers['Authorization'] || headers['authorization'])
+        note_request_authorization(authorization_header_value(headers))
       end
 
       # @return [String, nil] the Authorization header of the request this thread last sent
@@ -149,7 +149,7 @@ module MCPClient
           headers = middleware_request_headers(headers, *probe_request_for(kind))
           return UNKNOWN_CONTEXT if headers.nil?
         end
-        authorization_fingerprint(headers['Authorization'] || headers['authorization'])
+        authorization_fingerprint(authorization_header_value(headers))
       end
 
       # The JSON-RPC request the probe models for a cache kind: the very
@@ -258,7 +258,7 @@ module MCPClient
         env = response.respond_to?(:env) ? response.env : nil
         return unless env.respond_to?(:request_headers) && env.request_headers
 
-        note_request_authorization(env.request_headers['Authorization'] || env.request_headers['authorization'])
+        note_request_authorization(authorization_header_value(env.request_headers))
       end
 
       # @param error [Exception] a failure raised by the HTTP pipeline

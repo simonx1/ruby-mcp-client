@@ -329,6 +329,9 @@ module MCPClient
     # @param line [String] line of output to parse
     # @return [void]
     def handle_line(line)
+      # The response is dated from the arrival of its line, before it is
+      # decoded: parsing time is not freshness.
+      arrived = respond_to?(:monotonic_now, true) ? monotonic_now : nil
       msg = JSON.parse(line)
       @logger.debug("Received line: #{describe_jsonrpc_message(msg)}")
 
@@ -388,7 +391,7 @@ module MCPClient
           @modern_answer_received = true if era_probe_in_flight? && identifies_modern_server?(msg)
           @pending[id] = msg
           # Dated from arrival: the waiter may wake much later.
-          (@response_arrivals ||= {})[id] = monotonic_now if respond_to?(:monotonic_now, true)
+          (@response_arrivals ||= {})[id] = arrived || monotonic_now if respond_to?(:monotonic_now, true)
           @cond.broadcast
         else
           @logger.debug("Discarding response for unknown or expired request id=#{id}")
