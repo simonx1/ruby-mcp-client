@@ -133,6 +133,11 @@ RSpec.describe 'MCP 2026-07-28 cacheable results — round 31' do
     # transport's own bookkeeping rather than by writing the keys directly.
     def fill_thread_slots(server)
       server.send(:note_request_authorization, 'Bearer static') if server.respond_to?(:note_request_authorization, true)
+      if server.respond_to?(:note_called_tool_definition, true)
+        server.send(:note_called_tool_definition, 'greet',
+                    MCPClient::Tool.new(name: 'greet', description: 'g', schema: { 'type' => 'object' },
+                                        server: server))
+      end
       server.send(:note_request_params, { 'a' => 1 })
       server.send(:mark_round_trip_result, true)
       Thread.current[server.send(:recorded_entries_key)] = { tools: Object.new }

@@ -7,6 +7,33 @@ metadata). Each feature lands in its own PR; this section accumulates them.
 
 ### Cacheable results (`ttlMs` / `cacheScope`)
 
+- **A freshness check that aborts releases every server's held evaluation
+  (round 32).** With several cached servers, a check reads each server's
+  parameters in turn and each transport holds that evaluation for the fetch
+  the check is deciding on. When a later server's probe raised — an OAuth
+  refresh failing — no fetch followed for any of them, but the servers the
+  loop had already passed kept holding theirs: a later request on the same
+  worker thread went out carrying that decision's tenant, baggage or trace
+  id. Round 30 released the evaluation of the server whose own lookup
+  aborted; the client now releases every server's on an exceptional exit.
+- **A post-call re-resolve reads the definition the call went out under
+  (round 32).** A `tools/call` derives its `Mcp-Param-*` headers from the
+  transport's tool list, re-fetching it when the list is stale (a server that
+  sends `ttlMs: 0`, or a TTL that expires mid-call). The client then
+  re-resolved the tool by listing again, which fetched once more and could
+  answer with a newer definition than the request carried — validating the
+  result against a schema the call was never made with. The transport now
+  keeps the definition its request went out under and the client takes it
+  from there instead of triggering another re-fetch.
+- **`cleanup` forgets its thread state after terminating the session (round
+  32).** `ServerHTTP` and `ServerStreamableHTTP` cleared their thread-local
+  slots first and terminated the session afterwards; the DELETE that
+  terminates it runs the authorization recorder on its own connection, which
+  put the transport's Authorization fingerprint straight back on the thread.
+  A long-lived worker that built and disposed transports therefore kept one
+  fingerprint per transport after all. Both transports now drop the slots
+  once termination is done, and do so even when cleanup exits early or
+  raises.
 - **A reconnect's handshake no longer spends the metadata a list holds
   (round 31).** A cache decision evaluates the host's `request_meta` once and
   holds that evaluation for the request it leads to. That request reconnects

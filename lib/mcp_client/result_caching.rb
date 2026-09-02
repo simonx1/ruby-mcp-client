@@ -343,7 +343,8 @@ module MCPClient
     # @return [Array<Symbol>] the keys defined on this transport
     def transport_thread_local_keys
       %i[served_entries_key recorded_entries_key response_received_key
-         request_params_key round_trip_marker_key request_authorization_key]
+         request_params_key round_trip_marker_key request_authorization_key
+         called_tool_definition_key]
         .select { |name| respond_to?(name, true) }
         .map { |name| send(name) }
     end

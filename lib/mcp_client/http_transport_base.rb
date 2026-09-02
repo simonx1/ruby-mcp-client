@@ -11,6 +11,7 @@ require_relative 'http_transport_base/stream_capture'
 require_relative 'http_transport_base/era_detection'
 require_relative 'http_transport_base/listen_stream'
 require_relative 'http_transport_base/cache_support'
+require_relative 'http_transport_base/tool_listing'
 
 require_relative 'http_transport_base/param_headers'
 require_relative 'http_transport_base/stream_recovery'
@@ -31,6 +32,8 @@ module MCPClient
     include ListCaches
     include ListenStream
     include CacheSupport
+    include ToolListing
+    include MCPClient::CalledToolDefinition
 
     # Lightweight response wrapper for Faraday exception payloads (Hashes),
     # so the exception path and the default path share one challenge pipeline.
