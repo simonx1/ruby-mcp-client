@@ -75,7 +75,12 @@ metadata). Each feature lands in its own PR; this section accumulates them.
   registration is stamped as retired before it is deleted, so a backend
   that cannot delete never lets it be adopted for the server discovery
   finds; serialized `ClientInfo` records are read back through `from_h`
-  like every other record.
+  like every other record. A persisted record without a
+  `registration_type` counts as a dynamic registration (RFC 7591's
+  `client_id_issued_at` is optional, so its absence proves nothing);
+  credentials a host pre-registers should be stored with
+  `registration_type: 'pre_registered'` so they survive an authorization
+  server change as a reported mismatch instead of a re-registration.
 
 ### Tasks extension (`io.modelcontextprotocol/tasks`)
 

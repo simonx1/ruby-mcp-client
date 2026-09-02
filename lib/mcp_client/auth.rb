@@ -183,8 +183,8 @@ module MCPClient
       # @param metadata [ClientMetadata] Client metadata
       # @param issuer [String, nil] issuer identifier of the authorization server these credentials
       #   belong to (MCP 2026-07-28 "Authorization Server Binding")
-      # @param registration_type [String, nil] one of REGISTRATION_TYPES (nil: unknown, treated like a
-      #   dynamic registration)
+      # @param registration_type [String, nil] one of REGISTRATION_TYPES (nil: unknown, treated as a
+      #   dynamic registration; credentials a host pre-registered should say 'pre_registered')
       def initialize(client_id:, metadata:, client_secret: nil, client_id_issued_at: nil,
                      client_secret_expires_at: nil, issuer: nil, registration_type: nil)
         unless registration_type.nil? || REGISTRATION_TYPES.include?(registration_type)
@@ -210,12 +210,14 @@ module MCPClient
         effective_registration_type == 'pre_registered'
       end
 
-      # The registration type, inferred for credentials persisted before the
-      # field existed: a client_id_issued_at is what a Dynamic Client
-      # Registration response carries, anything else was pre-registered.
+      # The registration type. Credentials persisted before the field existed
+      # count as a dynamic registration: RFC 7591's client_id_issued_at is
+      # optional, so its absence proves nothing, and this library only ever
+      # stored the registrations it made. Credentials a host pre-registered
+      # are recorded as such explicitly (registration_type: 'pre_registered').
       # @return [String]
       def effective_registration_type
-        @registration_type || (@client_id_issued_at ? 'dynamic' : 'pre_registered')
+        @registration_type || 'dynamic'
       end
 
       # A copy bound to an authorization server.

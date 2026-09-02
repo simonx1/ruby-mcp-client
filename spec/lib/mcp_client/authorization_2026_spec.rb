@@ -41,7 +41,10 @@ RSpec.describe 'MCP 2026-07-28 authorization' do
     allow(provider).to receive(:fetch_server_metadata).and_return(meta)
   end
 
+  # Host-provided credentials say they are pre-registered (an untyped
+  # record counts as a dynamic registration since round 9).
   def client_info(client_id: 'pre-registered', **opts)
+    opts = { registration_type: 'pre_registered' }.merge(opts)
     MCPClient::Auth::ClientInfo.new(client_id: client_id,
                                     metadata: MCPClient::Auth::ClientMetadata.new(redirect_uris: [redirect_uri]),
                                     **opts)
