@@ -362,7 +362,7 @@ module MCPClient
       pages = []
       received_ats = []
       fingerprints = []
-      epoch = cache_epoch
+      epoch = cache_epoch(:prompts)
       prompts = collect_paginated('prompts') do |cursor|
         params = {}
         params['cursor'] = cursor if cursor
@@ -415,7 +415,7 @@ module MCPClient
       ensure_initialized
       params = {}
       params['cursor'] = cursor if cursor
-      epoch = cache_epoch
+      epoch = cache_epoch(:resources)
       result = rpc_request('resources/list', params) || {}
       record_cache_hint(:resources, result, epoch: epoch) unless cursor
       resources = (result['resources'] || []).map { |td| MCPClient::Resource.from_json(td, server: self) }
@@ -462,7 +462,7 @@ module MCPClient
       ensure_initialized
       params = {}
       params['cursor'] = cursor if cursor
-      epoch = cache_epoch
+      epoch = cache_epoch(:templates)
       result = rpc_request('resources/templates/list', params) || {}
       record_cache_hint(:templates, result, epoch: epoch) unless cursor
       templates = (result['resourceTemplates'] || []).map { |td| MCPClient::ResourceTemplate.from_json(td, server: self) }
@@ -542,7 +542,7 @@ module MCPClient
       pages = []
       received_ats = []
       fingerprints = []
-      epoch = cache_epoch
+      epoch = cache_epoch(:tools)
       tools = collect_paginated('tools') do |cursor|
         params = {}
         params['cursor'] = cursor if cursor

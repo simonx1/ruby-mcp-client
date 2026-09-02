@@ -91,16 +91,45 @@ module MCPClient
       @cache_entries_mutex || CACHE_INIT_LOCK.synchronize { @cache_entries_mutex ||= Mutex.new }
     end
 
-    # A counter bumped by every invalidation, so a response that was in
-    # flight while its cache entry was invalidated is not written back.
+    # The invalidation generation of one cache key, so a response that was
+    # in flight while its own entry was invalidated is not written back —
+    # while an invalidation of another key (a resource updated during a
+    # tools/list) leaves it alone. Every key shares a base bumped when the
+    # whole cache goes (cleanup, a new authorization context); each key adds
+    # its own count, and every read shares one more.
+    # @param key [Symbol, String, nil] the cache key; nil for the base alone
     # @return [Integer]
-    def cache_epoch
-      cache_entries_mutex.synchronize { @cache_epoch || 0 }
+    def cache_epoch(key = nil)
+      cache_entries_mutex.synchronize { cache_generation(key) }
+    end
+
+    # @param method [String] a list method, e.g. 'tools/list'
+    # @return [Integer] the generation of that list's cache key
+    def list_cache_epoch(method)
+      cache_epoch(LIST_METHOD_KINDS[method])
+    end
+
+    # @return [Integer] (call while holding cache_entries_mutex)
+    def cache_generation(key)
+      base = @cache_epoch || 0
+      return base if key.nil?
+
+      gens = @cache_generations || {}
+      own = gens[key] || 0
+      reads = key.is_a?(String) && key.start_with?('read:') ? (gens[:'read:*'] || 0) : 0
+      base + own + reads
     end
 
     # @return [void] (call while holding cache_entries_mutex)
     def bump_cache_epoch
       @cache_epoch = (@cache_epoch || 0) + 1
+    end
+
+    # @param key [Symbol, String] a cache key, or :'read:*' for every read
+    # @return [void] (call while holding cache_entries_mutex)
+    def bump_cache_generation(key)
+      @cache_generations ||= {}
+      @cache_generations[key] = (@cache_generations[key] || 0) + 1
     end
 
     # Record the freshness hint of one result.
@@ -114,7 +143,7 @@ module MCPClient
       now = received_at || response_received_at
       entry = cache_entry_for(result, value, now: now)
       cache_entries_mutex.synchronize do
-        if epoch && epoch != (@cache_epoch || 0)
+        if epoch && epoch != cache_generation(kind)
           # Invalidated while in flight: whatever is installed now (the
           # invalidation's placeholder, or a newer fetch) stays; this result
           # is reported stale and never stored.
@@ -178,7 +207,7 @@ module MCPClient
       # whatever its scope.
       combined = mixed_pages_placeholder(combined, now, contexts: contexts, params: params)
       cache_entries_mutex.synchronize do
-        if epoch && epoch != (@cache_epoch || 0)
+        if epoch && epoch != cache_generation(kind)
           combined = MCPClient::CachedResult.stale(now: now, like: combined)
         else
           cache_entries[kind] = combined
@@ -225,6 +254,41 @@ module MCPClient
       :"mcp_client_recorded_entries_#{object_id}"
     end
 
+    # Remember, per thread, the entry a list of a kind was last served or
+    # attached from — its identity and the parameters it is bound to — so a
+    # cache built on top (the client's) can tie its slice to that very entry.
+    # @param kind [Symbol]
+    # @param entry [MCPClient::CachedResult, nil] the entry (nil: none)
+    # @return [void]
+    def note_served_entry(kind, entry)
+      (Thread.current[served_entries_key] ||= {})[kind] = entry && [entry.fetch_token, entry.params_fingerprint]
+    end
+
+    # @param kind [Symbol]
+    # @return [Object, nil] the identity of the entry this thread's last
+    #   list of the kind came from
+    def served_entry_token(kind)
+      Thread.current[served_entries_key]&.[](kind)&.first
+    end
+
+    # @param kind [Symbol]
+    # @return [String, nil] the parameters fingerprint the entry this
+    #   thread's last list of the kind came from is bound to
+    def served_entry_params_fingerprint(kind)
+      Thread.current[served_entries_key]&.[](kind)&.last
+    end
+
+    # @param kind [Symbol]
+    # @return [Object, nil] the identity of the entry currently holding the kind
+    def cache_entry_token(kind)
+      cache_entries_mutex.synchronize { cache_entries[kind]&.fetch_token }
+    end
+
+    # @return [Symbol] the thread-local key of this server's served entries
+    def served_entries_key
+      :"mcp_client_served_entries_#{object_id}"
+    end
+
     # Called by the paginated list helper with the raw page results.
     # @param method [String] the list method
     # @param page_results [Array<Hash>]
@@ -262,9 +326,13 @@ module MCPClient
     # @return [Object, nil]
     def fresh_list_value(kind)
       entry = private_entry_for_current_context(kind)
-      return (block_given? ? yield : nil) if entry.nil?
+      if entry.nil?
+        note_served_entry(kind, nil)
+        return block_given? ? yield : nil
+      end
       return nil unless entry.value && entry.fresh?(now: monotonic_now)
 
+      note_served_entry(kind, entry)
       MCPClient::DeepCopy.copy(entry.value)
     end
 
@@ -328,7 +396,10 @@ module MCPClient
       return true unless entry.params_fingerprint && respond_to?(:current_params_fingerprint, true)
 
       expected = context == :current ? current_params_fingerprint : request_params_fingerprint
-      entry.params_fingerprint == expected
+      # A failed attempt that never built its request noted no parameters:
+      # it matches no entry, whatever the previous request on this thread
+      # carried.
+      expected.is_a?(String) && entry.params_fingerprint == expected
     end
 
     # Attach the list a request produced to the very entry that request
@@ -343,6 +414,7 @@ module MCPClient
     # @return [Boolean] whether the value was attached
     def attach_list_value(kind, value, entry: nil)
       token = entry ? entry.fetch_token : Thread.current[recorded_entries_key]&.delete(kind)
+      note_served_entry(kind, nil)
       return false unless token
 
       context = respond_to?(:request_authorization_context, true) ? request_authorization_context : nil
@@ -354,6 +426,7 @@ module MCPClient
         # The cache keeps its own copy: what the fetch returns to its caller
         # may be changed freely.
         entry.value = MCPClient::DeepCopy.copy(value)
+        note_served_entry(kind, entry)
         true
       end
     end
@@ -381,6 +454,8 @@ module MCPClient
     def stale_fallback_for(kind, entry, context: :current)
       return nil unless entry.is_a?(MCPClient::CachedResult) && entry.value
 
+      note_served_entry(kind, entry)
+
       entry_in_current_context?(entry, context: context, kind: kind) ? MCPClient::DeepCopy.copy(entry.value) : nil
     end
 
@@ -403,7 +478,7 @@ module MCPClient
       now = monotonic_now
       cache_entries_mutex.synchronize do
         cache_entries[kind] = MCPClient::CachedResult.stale(now: now, like: cache_entries[kind])
-        bump_cache_epoch
+        bump_cache_generation(kind)
       end
     end
 
@@ -455,10 +530,11 @@ module MCPClient
       cache_entries_mutex.synchronize do
         if uri
           cache_entries.delete(read_cache_key(uri))
+          bump_cache_generation(read_cache_key(uri))
         else
           cache_entries.delete_if { |key, _| key.is_a?(String) && key.start_with?('read:') }
+          bump_cache_generation(:'read:*')
         end
-        bump_cache_epoch
       end
     end
 
@@ -480,7 +556,7 @@ module MCPClient
       cached = private_entry_for_current_context(key)
       return cached.value.map(&:dup) if cached&.value && cached.fresh?(now: monotonic_now)
 
-      epoch = cache_epoch
+      epoch = cache_epoch(key)
       started = monotonic_now
       result = yield
       # The TTL runs from receipt — before the response's notifications were
@@ -519,7 +595,7 @@ module MCPClient
       cache_entries_mutex.synchronize do
         if last_result_from_round_trip? || !entry.hint? || !entry.fresh?(now: now)
           cache_entries.delete(key) if replacing && cache_entries[key].equal?(replacing)
-        elsif epoch == (@cache_epoch || 0)
+        elsif epoch == cache_generation(key)
           prune_read_entries(now: now)
           cache_entries[key] = entry
         end

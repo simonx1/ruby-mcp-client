@@ -209,7 +209,7 @@ module MCPClient
 
         params = {}
         params['cursor'] = cursor if cursor
-        epoch = cache_epoch
+        epoch = cache_epoch(:resources)
         result = rpc_request('resources/list', params)
         # MCP 2026-07-28 caching: the first page's hint decides how long the
         # cached list may be served, counted from receipt (the list is
@@ -270,7 +270,7 @@ module MCPClient
       ensure_initialized
       params = {}
       params['cursor'] = cursor if cursor
-      epoch = cache_epoch
+      epoch = cache_epoch(:templates)
       result = rpc_request('resources/templates/list', params)
       # MCP 2026-07-28 caching: the first page's hint decides freshness,
       # counted from receipt.

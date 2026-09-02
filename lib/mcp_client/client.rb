@@ -823,17 +823,40 @@ module MCPClient
     def replace_cached_slice(kind, cache, server, fingerprint)
       @cache_mutex.synchronize do
         drop_cached_entries(cache, server)
-        @cache_params[kind][server] = fingerprint if server.respond_to?(:current_params_fingerprint, true)
+        if server.respond_to?(:current_params_fingerprint, true)
+          # The slice is tied to the very transport entry its list came
+          # from — its identity and the parameters that entry is bound to
+          # (the request that produced it, which a first fetch may have made
+          # with more than was known before connecting): a transport list
+          # refreshed on its own (rotated credentials, a concurrent fetch)
+          # replaces that entry, and the slice with it.
+          token, bound = served_entry_for(kind, server)
+          @cache_params[kind][server] = [bound || fingerprint, token]
+        end
         yield
       end
     end
 
+    # @return [Array(Object, String), nil] the identity of the transport
+    #   entry the list this thread just obtained from the server came from,
+    #   and the parameters fingerprint it is bound to
+    def served_entry_for(kind, server)
+      return nil unless server.respond_to?(:served_entry_token, true)
+
+      [server.send(:served_entry_token, kind), server.send(:served_entry_params_fingerprint, kind)]
+    end
+
     # @return [Boolean] whether the server's next request would carry the
-    #   parameters its slice of the cache was filled under
+    #   parameters its slice of the cache was filled under, and the transport
+    #   still holds the entry that slice came from
     def cache_params_current?(kind, server)
       return true unless server.respond_to?(:current_params_fingerprint, true)
 
-      @cache_params[kind][server] == server.send(:current_params_fingerprint)
+      fingerprint, token = @cache_params[kind][server]
+      return false unless fingerprint == server.send(:current_params_fingerprint)
+      return true unless server.respond_to?(:cache_entry_token, true)
+
+      server.send(:cache_entry_token, kind).equal?(token)
     end
 
     # The cache's items as copies: a caller can neither change the cache nor

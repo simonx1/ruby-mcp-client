@@ -153,11 +153,11 @@ RSpec.describe 'MCP 2026-07-28 cacheable results — round 11' do
 
     it 'keeps the newer list entry' do
       server.record_cache_hint(:tools, { 'ttlMs' => 60_000, 'cacheScope' => 'public' }, ['old'],
-                               epoch: server.cache_epoch)
-      old_epoch = server.cache_epoch
+                               epoch: server.cache_epoch(:tools))
+      old_epoch = server.cache_epoch(:tools)
       server.invalidate_cache(:tools)
       newer = server.record_cache_hint(:tools, { 'ttlMs' => 60_000, 'cacheScope' => 'public' }, ['new'],
-                                       epoch: server.cache_epoch)
+                                       epoch: server.cache_epoch(:tools))
 
       late = server.record_cache_hint(:tools, { 'ttlMs' => 60_000, 'cacheScope' => 'public' }, ['late'],
                                       epoch: old_epoch)
@@ -168,10 +168,10 @@ RSpec.describe 'MCP 2026-07-28 cacheable results — round 11' do
     end
 
     it 'keeps the newer paginated entry' do
-      old_epoch = server.cache_epoch
+      old_epoch = server.cache_epoch(:prompts)
       server.invalidate_cache(:prompts)
       newer = server.record_paginated_cache_hint(:prompts, [{ 'ttlMs' => 60_000, 'cacheScope' => 'public' }], ['new'],
-                                                 epoch: server.cache_epoch)
+                                                 epoch: server.cache_epoch(:prompts))
 
       server.record_paginated_cache_hint(:prompts, [{ 'ttlMs' => 60_000, 'cacheScope' => 'public' }], ['late'],
                                          epoch: old_epoch)

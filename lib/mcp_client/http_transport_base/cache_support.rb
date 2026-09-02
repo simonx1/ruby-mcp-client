@@ -65,6 +65,7 @@ module MCPClient
         # The marker of the previous request on this thread must not stand
         # in for an attempt that fails before it applies its own headers.
         Thread.current[request_authorization_key] = UNRECORDED_AUTHORIZATION
+        note_request_params_pending
         yield
       rescue MCPClient::Errors::TransientServerError, MCPClient::Errors::ConnectionError,
              MCPClient::Errors::TransportError => e

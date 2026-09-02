@@ -342,7 +342,7 @@ module MCPClient
     def fetch_resources_list(cursor)
       params = {}
       params['cursor'] = cursor if cursor
-      epoch = cache_epoch
+      epoch = cache_epoch(:resources)
       result = rpc_request('resources/list', params)
       record_cache_hint(:resources, result, epoch: epoch) unless cursor
 
@@ -438,7 +438,7 @@ module MCPClient
       params = {}
       params['cursor'] = cursor if cursor
       ensure_connected
-      epoch = cache_epoch
+      epoch = cache_epoch(:templates)
       result = rpc_request('resources/templates/list', params)
       record_cache_hint(:templates, result, epoch: epoch) unless cursor
 

@@ -128,10 +128,10 @@ RSpec.describe 'MCP 2026-07-28 cacheable results — round 12' do
     it 'never replaces a newer entry recorded after an invalidation' do
       stub_request(:post, url).to_return { |request| json_response(JSON.parse(request.body)['id'], discover_result) }
       server = streamable
-      old_epoch = server.cache_epoch
+      old_epoch = server.cache_epoch(:tools)
       server.send(:invalidate_cache, :tools)
       fresh = { 'tools' => [], 'ttlMs' => 60_000, 'cacheScope' => 'public' }
-      server.send(:record_cache_hint, :tools, fresh, ['fresh'], epoch: server.cache_epoch)
+      server.send(:record_cache_hint, :tools, fresh, ['fresh'], epoch: server.cache_epoch(:tools))
 
       mixed = [{ 'tools' => [], 'ttlMs' => 60_000, 'cacheScope' => 'private' }] * 2
       server.send(:record_paginated_cache_hint, :tools, mixed, nil, contexts: %w[alice bob], epoch: old_epoch)

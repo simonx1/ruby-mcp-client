@@ -323,7 +323,7 @@ module MCPClient
       received_ats = []
       contexts = []
       fingerprints = []
-      epoch = cache_epoch if respond_to?(:cache_epoch, true)
+      epoch = list_cache_epoch(method) if respond_to?(:list_cache_epoch, true)
       items = collect_paginated(key) do |cursor|
         params = cursor ? { cursor: cursor } : {}
         started = respond_to?(:monotonic_now, true) ? monotonic_now : nil

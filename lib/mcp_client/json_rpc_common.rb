@@ -247,6 +247,15 @@ module MCPClient
       Thread.current[request_params_key]
     end
 
+    # Marks an attempt that has not built its request yet: the parameters
+    # of the previous request on this thread say nothing about it.
+    UNRECORDED_PARAMS = :unrecorded
+
+    # @return [void]
+    def note_request_params_pending
+      Thread.current[request_params_key] = UNRECORDED_PARAMS
+    end
+
     # @return [String] the fingerprint of the effective parameters the next
     #   request on this transport would carry
     def current_params_fingerprint
@@ -254,14 +263,17 @@ module MCPClient
     end
 
     # A stable fingerprint of the metadata that shapes a result: the
-    # effective `_meta` without the reserved protocol fields (the
-    # transport's own state) and the per-request identifiers.
+    # effective `_meta` without the protocol version and client identity
+    # (the transport's own state), the log level and the per-request
+    # identifiers. The client capabilities stay in: a server may vary a
+    # result by the extensions and features a request advertises, and those
+    # change when the host declares an extension or registers a handler.
     # @param params [Hash, nil] effective parameters
     # @return [String]
     def params_fingerprint_of(params)
       meta = params.is_a?(Hash) ? (params['_meta'] || params[:_meta]) : nil
       meta = meta.is_a?(Hash) ? meta.transform_keys(&:to_s) : {}
-      meta = meta.except(*PROTECTED_META_KEYS, META_LOG_LEVEL, *CACHE_NEUTRAL_META_KEYS)
+      meta = meta.except(META_PROTOCOL_VERSION, META_CLIENT_INFO, META_LOG_LEVEL, *CACHE_NEUTRAL_META_KEYS)
       Digest::SHA256.hexdigest(JSON.generate(deep_sort_keys(meta)))
     end
 
