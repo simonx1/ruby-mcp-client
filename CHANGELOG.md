@@ -7,6 +7,21 @@ metadata). Each feature lands in its own PR; this section accumulates them.
 
 ### Tasks extension (`io.modelcontextprotocol/tasks`)
 
+- **Polls are pinned to their session, terminal results never cross it
+  (round 31).** `tasks/get` is now pinned to the session the wait joined,
+  like `tasks/update`: a reconnect inside `rpc_request` makes the transport
+  refuse the poll (counted as a lost poll) instead of asking the
+  replacement session about a reused task id. Every observation is checked
+  against the session again before it is acted on, terminal ones included,
+  so another lifetime's `result` — or `error` — can never become the
+  outcome of `call_tool` / `wait_for_task`; the input requests of an
+  observation are re-checked once more after the pending update is
+  retransmitted, so a session that ended under that round trip cannot put a
+  dead task's elicitation to the host. Bookkeeping is forgotten only in the
+  session it belongs to (a terminal poll, and a terminal task handle kept
+  across a restart, no longer wipe the replacement session's answered
+  keys), and an explicit `update_task` / `cancel_task` for a task handle is
+  pinned to the handle's session and refused when that session has ended.
 - **An ended session's observation is discarded, the epoch holds at the
   send (round 30).** A `tasks/get` answer that came back after the server
   session ended is no longer acted on: the wait joins the replacement

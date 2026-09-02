@@ -73,13 +73,16 @@ module MCPClient
       # @param state [Hash, nil] the task bookkeeping this poll belongs to (internal): a poll a
       #   wait abandoned on its wall clock forgets only what it was polling, never what a new
       #   session — or a new lifetime of a reused task id — recorded since
-      def get_task(task_id, server: nil, timeout: nil, state: nil)
+      # @param epoch [Integer, nil] the server session this poll is about (internal): task ids are
+      #   per session and reusable, so a request that would reach the session which replaced it is
+      #   not sent — what came back would describe another lifetime of the same id
+      def get_task(task_id, server: nil, timeout: nil, state: nil, epoch: nil)
         srv = select_task_server(task_id, server, 'get_task')
         task_id = task_identifier(task_id)
         ensure_task_capability!(srv, 'get')
 
         begin
-          result = task_rpc(srv, 'tasks/get', { taskId: task_id }, timeout: timeout)
+          result = task_rpc(srv, 'tasks/get', { taskId: task_id }, timeout: timeout, epoch: epoch)
           validate_detailed_task_shape!(result) if modern_server?(srv)
           task = MCPClient::Task.from_json(result, server: srv, detailed: true)
           # The answer must be about the task that was asked for: its state
@@ -99,6 +102,11 @@ module MCPClient
           error = task_error_from(e, task_id, 'getting', modern: modern_server?(srv), method: 'tasks/get')
           forget_task_keys(srv, task_id, state: state) if error.is_a?(MCPClient::Errors::TaskNotFound)
           raise error
+        rescue MCPClient::Errors::SessionChangedError
+          # Nothing was asked: the session this poll is about has ended, and
+          # the answer of the one that replaced it would be another task's.
+          # The caller (a wait) treats it as a lost poll.
+          raise
         rescue MCPClient::Errors::TransportError, MCPClient::Errors::ConnectionError => e
           raise MCPClient::Errors::TaskError, "Error getting task '#{sanitize_peer_log_text(task_id.to_s)}': " \
                                               "#{sanitize_peer_log_text(e.message)}"
@@ -189,15 +197,20 @@ module MCPClient
       # @raise [ArgumentError] if the server is ambiguous in a multi-server client
       # @raise [MCPClient::Errors::ServerNotFound] if no server is available
       # @raise [MCPClient::Errors::TaskNotFound] if the task does not exist
-      # @raise [MCPClient::Errors::TaskError] if cancellation fails (including cancelling a terminal task)
+      # @raise [MCPClient::Errors::TaskError] if cancellation fails (including cancelling a terminal task, or
+      #   naming it with a task handle whose server session has ended)
       def cancel_task(task_id, server: nil)
         srv = select_task_server(task_id, server, 'cancel_task')
         task = task_id
         task_id = task_identifier(task_id)
         ensure_task_capability!(srv, 'cancel')
+        # Cancelling by a handle cancels that task, in the session it was
+        # seen in: a handle kept across a restart must not cancel whatever
+        # the replacement session named with the same id.
+        epoch = handle_session_epoch(task, srv, 'cancelling')
 
         begin
-          result = srv.rpc_request('tasks/cancel', { taskId: task_id })
+          result = task_rpc(srv, 'tasks/cancel', { taskId: task_id }, epoch: epoch)
           return cancelled_task_handle(task, task_id, srv) if modern_server?(srv)
 
           MCPClient::Task.from_json(result, server: srv)

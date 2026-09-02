@@ -124,9 +124,11 @@ RSpec.describe 'MCP 2026-07-28 tasks extension — round 15' do
   it 'never lets a caller with an outdated epoch delete or replace the current session state' do
     client = client_for(stdio)
     script_stdio(stdio, [{ 'result' => discover_result }, tool_list, { 'result' => task_result }, { 'result' => {} }])
-    task = client.call_tool_as_task('slow', {})
+    client.call_tool_as_task('slow', {})
     stdio.send(:bump_session_epoch)
-    client.update_task(task, { 'k2' => { 'action' => 'decline' } })
+    # The handle belongs to the session that ended and no longer names a
+    # task (see round 32); the live session's task of that id is named by id.
+    client.update_task('task-1', { 'k2' => { 'action' => 'decline' } })
     current = client.send(:task_state, stdio, 'task-1')
     expect(current[:answered]).to include('k2')
 
