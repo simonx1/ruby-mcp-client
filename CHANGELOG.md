@@ -293,7 +293,56 @@ metadata). Each feature lands in its own PR; this section accumulates them.
   live on the OAuth classes themselves, so a rescue path can no longer raise
   `NoMethodError` over a helper only the JSON-RPC transports have — which is
   what a non-JSON `200` on a token refresh did, out of the very request the
-  still-valid token should have served.
+  still-valid token should have served. Those helpers are now total: nothing
+  a peer sends can raise out of them. Bytes that are not valid UTF-8 — a
+  `400` body, an `error_description=%FF` a callback carries through
+  `CGI.unescape`, or the undecodable fragment a `JSON::ParserError` message
+  quotes — used to raise `ArgumentError` out of `String#gsub`, `String#strip`
+  and the regexp match, so the sanitizer that exists to make peer bytes safe
+  was the one thing those bytes could crash; they are replaced before
+  anything looks at them, and the flow reports a `ConnectionError` (and the
+  browser flow finishes) as it does for any other bad response. The type
+  checks now cover the two metadata documents as well as the two response
+  bodies: a protected resource document is read against RFC 9728 Section 2
+  (`resource` a string, `authorization_servers` and `scopes_supported` arrays
+  of strings) and an authorization server document against RFC 8414
+  Section 2 (the endpoints strings, `scopes_supported`,
+  `response_types_supported`, `grant_types_supported` and
+  `code_challenge_methods_supported` arrays of strings), so a
+  `scopes_supported` of `"mcp:read"` is a refused document rather than a
+  `NoMethodError` out of `start_authorization_flow` — and a
+  `code_challenge_methods_supported` of `"S256 …"` is no longer read as PKCE
+  support because a String answers `include?("S256")`. The two boolean
+  advertisements keep their fail-closed reading. A cached record a
+  hash-persisting backend reads back is held to the same standard where it
+  is used: PKCE support requires an array, and a `scopes_supported` that is
+  not one contributes no scopes instead of crashing `join`. Client
+  authentication now follows the method the authorization server registered:
+  RFC 7591 Section 2 makes `client_secret_basic` the default when a
+  registration response names none, so a registration that issues a secret
+  is recorded as a confidential client instead of as `none` (a combination
+  that authenticates nowhere), and the credentials go out in an
+  `Authorization: Basic` header — form-urlencoded before they are base64'd,
+  per RFC 6749 Section 2.3.1 — for `client_secret_basic`, in the body for
+  `client_secret_post`, and not at all for a public client or for a method
+  this client cannot present (which is logged). An authorization endpoint's
+  own query string is retained when the authorization parameters are
+  appended (RFC 6749 Section 3.1), so an endpoint of
+  `https://as.example/authorize?tenant=acme` no longer loses its tenant. A
+  persisted token record's expiry is validated before it is used in
+  arithmetic: an `expires_in` that is not a number and an `expires_at` that
+  is not a readable instant no longer raise a `TypeError` out of
+  `access_token`, and — since an expiry that cannot be read is not "no
+  expiry" — such a record reads as expired (through a storage round trip
+  too), so it is refreshed or re-authorized rather than presented forever.
+  No log line carries a credential at any level: the `Authorization` header
+  is no longer logged even truncated, and the browser callback logs only the
+  request path, never the query string that carries `code=`. And a
+  registered `redirect_uris` must name a URI a callback could actually
+  arrive on — an http(s) URL with a host, or an RFC 8252 Section 7.1
+  private-use scheme with a path, and no fragment (RFC 6749 Section 3.1.2) —
+  so `javascript:alert(1)`, `data:text/html,…` and a bare `http:` are a
+  reported registration failure instead of a browser opened at them.
 
 ### Tasks extension (`io.modelcontextprotocol/tasks`)
 

@@ -171,7 +171,11 @@ module MCPClient
         return unless parts.length >= 2
 
         method, path = parts[0..1]
-        @logger.debug("Received #{method} request: #{path}")
+        # The query string of a callback carries the authorization code (and
+        # the state that binds it to this flow): a credential, and a
+        # single-use one only until someone reads the log. Only the path is
+        # logged, and only after the peer's bytes are made safe.
+        @logger.debug("Received #{method} request: #{safe_error_text(path.split('?', 2).first.to_s)}")
 
         # Read and discard headers until blank line (with limit to prevent memory exhaustion)
         header_count = 0

@@ -7,6 +7,7 @@ require 'ipaddr'
 require_relative '../auth'
 require_relative 'peer_text'
 require_relative 'oauth_provider/challenge_handling'
+require_relative 'oauth_provider/client_authentication'
 require_relative 'oauth_provider/response_validation'
 
 module MCPClient
@@ -28,6 +29,7 @@ module MCPClient
       AUTH_PARAMS_RUN = /\A(?:[\s,]*#{AUTH_PARAM})*/
 
       include ChallengeHandling
+      include ClientAuthentication
       include PeerText
       include ResponseValidation
 
@@ -174,7 +176,9 @@ module MCPClient
       # @return [Array<String>] supported scopes, or empty array if not advertised
       # @raise [MCPClient::Errors::ConnectionError] if server discovery fails
       def supported_scopes
-        @supported_scopes ||= discover_authorization_server.scopes_supported || []
+        # A record a hash-persisting backend read back may carry anything
+        # here; only an array of scopes is a scope list (RFC 8414 Section 2).
+        @supported_scopes ||= advertised_scopes(discover_authorization_server.scopes_supported)
       end
 
       # Start OAuth authorization flow
@@ -358,7 +362,9 @@ module MCPClient
         # "Bearer " is not a credential (RFC 6749 Section 5.1).
         return unless token_bytes?(token)
 
-        logger.debug("OAuth applying authorization header: #{token.to_header[0..20]}...")
+        # The header's value is the credential: not a prefix of it, not a
+        # truncation of it. It is never written to a log at any level.
+        logger.debug('OAuth applying authorization header')
         request.headers['Authorization'] = token.to_header
       end
 
@@ -505,10 +511,23 @@ module MCPClient
         end
 
         prm = @challenge_resource_metadata || @resource_metadata
-        prm_scopes = prm&.scopes_supported
-        return prm_scopes.join(' ') if prm_scopes && !prm_scopes.empty?
+        prm_scopes = advertised_scopes(prm&.scopes_supported)
+        return prm_scopes.join(' ') unless prm_scopes.empty?
 
         nil
+      end
+
+      # A scopes_supported value as a scope list: RFC 8414 Section 2 and RFC
+      # 9728 Section 2 both make it an array of strings, and a document that
+      # breaks that is refused on the wire — but a record read back from a
+      # storage backend that persists plain hashes is not, and `"a b".join`
+      # is a NoMethodError out of the flow.
+      # @param scopes [Object, nil] the advertised value
+      # @return [Array<String>] the scopes, or none
+      def advertised_scopes(scopes)
+        return [] unless scopes.is_a?(Array)
+
+        scopes.grep(String)
       end
 
       # Normalize server URL to canonical form
@@ -948,6 +967,14 @@ module MCPClient
           raise MCPClient::Errors::ConnectionError,
                 'Authorization server metadata omits code_challenge_methods_supported; ' \
                 'the server does not support PKCE and the client must refuse to proceed'
+        elsif !methods.is_a?(Array)
+          # A String answers `include?('S256')` for "S256 not supported": read
+          # that way, a server with no PKCE at all would pass this check. The
+          # wire path refuses such a document outright; a record read back
+          # from a hash-persisting storage backend arrives here instead.
+          raise MCPClient::Errors::ConnectionError,
+                'Authorization server metadata code_challenge_methods_supported is not an array of strings ' \
+                '(RFC 8414); PKCE support cannot be established and the client must refuse to proceed'
         elsif !methods.include?('S256')
           raise MCPClient::Errors::ConnectionError,
                 'Authorization server does not support PKCE S256 ' \
@@ -1079,6 +1106,16 @@ module MCPClient
         data = JSON.parse(response.body)
         raise MCPClient::Errors::ConnectionError, 'Invalid resource metadata: not a JSON object' unless data.is_a?(Hash)
 
+        # RFC 9728 Section 2 gives every field a type, and this client acts on
+        # them: a `scopes_supported` that is not an array of strings would be
+        # joined into a scope parameter (or crash trying), an
+        # `authorization_servers` that is not one would drive discovery at
+        # whatever `Array()` made of it. A document that breaks a type is a
+        # protocol error, not metadata.
+        if (error = resource_metadata_error(data))
+          raise MCPClient::Errors::ConnectionError, "Invalid resource metadata: #{error}"
+        end
+
         metadata = ResourceMetadata.from_h(data)
         # Retain the most recently fetched PRM so scope resolution can fall
         # back to its scopes_supported (MCP scope selection priority 2).
@@ -1109,6 +1146,16 @@ module MCPClient
 
         data = JSON.parse(response.body)
         raise MCPClient::Errors::ConnectionError, 'Invalid server metadata: not a JSON object' unless data.is_a?(Hash)
+
+        # RFC 8414 Section 2 gives every field a type, and a document that
+        # breaks one is never usable metadata: an endpoint that is not a
+        # string is not an endpoint, and a `code_challenge_methods_supported`
+        # that is not an array of strings cannot establish PKCE support — a
+        # String would answer `include?("S256")` for "S256 is not supported
+        # here", which is precisely the downgrade the check exists to stop.
+        if (error = server_metadata_error(data))
+          raise MCPClient::Errors::ConnectionError, "Invalid server metadata: #{error}"
+        end
 
         ServerMetadata.from_discovery_document(data)
       rescue JSON::ParserError => e
@@ -1546,7 +1593,7 @@ module MCPClient
         # Parse registered metadata from server response (may differ from our request)
         registered_metadata = ClientMetadata.new(
           redirect_uris: registered_redirect_uris(data),
-          token_endpoint_auth_method: data['token_endpoint_auth_method'] || 'none',
+          token_endpoint_auth_method: registered_auth_method(data),
           grant_types: data['grant_types'] || %w[authorization_code refresh_token],
           response_types: data['response_types'] || ['code'],
           scope: data['scope'],
@@ -1727,7 +1774,16 @@ module MCPClient
         }.compact
 
         uri = URI.parse(server_metadata.authorization_endpoint)
-        uri.query = URI.encode_www_form(params)
+        # "The client directs the resource owner to the constructed URI using
+        # an HTTP redirection response... The endpoint URI MAY include an
+        # application/x-www-form-urlencoded formatted query component, which
+        # MUST be retained when adding additional query parameters" (RFC 6749
+        # Section 3.1). An authorization server that identifies a tenant, a
+        # brand or a locale in its endpoint URL loses that identification if
+        # the query is replaced, and sends the user somewhere else entirely.
+        existing_query = uri.query.to_s
+        appended = URI.encode_www_form(params)
+        uri.query = existing_query.empty? ? appended : "#{existing_query}&#{appended}"
         uri.to_s
       end
 
@@ -1755,10 +1811,10 @@ module MCPClient
           resource: server_url
         }
 
-        # Add client_secret if required by token_endpoint_auth_method
-        if client_info.client_secret && client_info.metadata.token_endpoint_auth_method == 'client_secret_post'
-          params[:client_secret] = client_info.client_secret
-        end
+        # The credentials go out the way the authorization server registered
+        # them: in the body for client_secret_post, in an Authorization header
+        # for client_secret_basic (RFC 7591's default).
+        authorization = apply_client_credentials!(params, client_info)
 
         request_body = URI.encode_www_form(params)
 
@@ -1766,6 +1822,7 @@ module MCPClient
           @http_client.post(server_metadata.token_endpoint) do |req|
             req.headers['Content-Type'] = 'application/x-www-form-urlencoded'
             req.headers['Accept'] = 'application/json'
+            req.headers['Authorization'] = authorization if authorization
             req.body = body
           end
         end
@@ -1832,14 +1889,12 @@ module MCPClient
           resource: server_url
         }
 
-        # Add client_secret if required by token_endpoint_auth_method
-        if client_info.client_secret && client_info.metadata.token_endpoint_auth_method == 'client_secret_post'
-          params[:client_secret] = client_info.client_secret
-        end
+        authorization = apply_client_credentials!(params, client_info)
 
         response = @http_client.post(server_metadata.token_endpoint) do |req|
           req.headers['Content-Type'] = 'application/x-www-form-urlencoded'
           req.headers['Accept'] = 'application/json'
+          req.headers['Authorization'] = authorization if authorization
           req.body = URI.encode_www_form(params)
         end
 

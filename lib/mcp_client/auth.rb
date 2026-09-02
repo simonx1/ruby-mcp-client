@@ -21,15 +21,54 @@ module MCPClient
       # @param refresh_token [String, nil] Refresh token for renewal
       # @param issuer [String, nil] issuer identifier of the authorization server that issued the token
       #   (MCP 2026-07-28: tokens are per authorization server and never presented to another)
+      # @param expires_at [Time, String, nil] an already-known expiry, as persisted by {#to_h}; it
+      #   takes precedence over expires_in
       def initialize(access_token:, token_type: 'Bearer', expires_in: nil, scope: nil, refresh_token: nil,
-                     issuer: nil)
+                     issuer: nil, expires_at: nil)
         @access_token = access_token
         @token_type = token_type
-        @expires_in = expires_in
+        # A record read back from a storage backend that persists plain
+        # hashes carries whatever was written (or edited) there. The lifetime
+        # is validated BEFORE it is added to a Time: `Time.now + "3600"` is a
+        # TypeError out of `OAuthProvider#access_token` — a crash in the
+        # request path, over a record the read-path checks were about to
+        # refuse anyway.
+        @expires_in = self.class.usable_lifetime(expires_in)
         @scope = scope
         @issuer = issuer
         @refresh_token = refresh_token
-        @expires_at = expires_in ? Time.now + expires_in : nil
+        @expires_at = resolve_expiry(expires_in, expires_at)
+      end
+
+      # An expiry this client cannot read is recorded as this instant. An
+      # unreadable expiry is not "no expiry": read that way, a mangled
+      # lifetime would make a token that never expires and is never
+      # refreshed. Read as an instant long past, the record is refreshed or
+      # re-authorized instead — and says so again after a round trip through
+      # storage.
+      UNREADABLE_EXPIRY = Time.at(0).utc.freeze
+
+      # A lifetime that can be added to a Time. RFC 6749 Section 5.1 makes
+      # expires_in a number of seconds; anything else says nothing.
+      # @param value [Object, nil]
+      # @return [Integer, Float, nil]
+      def self.usable_lifetime(value)
+        value if value.is_a?(Integer) || value.is_a?(Float)
+      end
+
+      # An expiry instant, as persisted by {#to_h} (an ISO 8601 string) or as
+      # given. Unparseable text, or a value of another type, is no expiry.
+      # @param value [Object, nil]
+      # @return [Time, nil]
+      def self.usable_expiry(value)
+        return value if value.is_a?(Time)
+        return nil unless value.is_a?(String)
+
+        begin
+          Time.parse(value)
+        rescue ArgumentError
+          nil
+        end
       end
 
       # Check if the token is expired
@@ -84,25 +123,35 @@ module MCPClient
         }.tap { |hash| hash[:issuer] = @issuer if @issuer }
       end
 
+      # The instant this token expires: the recorded one, else the lifetime
+      # added to now, else none at all — and {UNREADABLE_EXPIRY} when the
+      # record carries an expiry that is neither.
+      # @param expires_in [Object, nil] the lifetime as given
+      # @param expires_at [Object, nil] the expiry as given
+      # @return [Time, nil]
+      def resolve_expiry(expires_in, expires_at)
+        recorded = self.class.usable_expiry(expires_at)
+        return recorded if recorded
+        return Time.now + @expires_in if @expires_in
+        return nil if expires_in.nil? && expires_at.nil?
+
+        UNREADABLE_EXPIRY
+      end
+      private :resolve_expiry
+
       # Create token from hash
       # @param data [Hash] Token data
       # @return [Token] New token instance
       def self.from_h(data)
-        token = new(
+        new(
           access_token: data[:access_token] || data['access_token'],
           token_type: data[:token_type] || data['token_type'] || 'Bearer',
           expires_in: data[:expires_in] || data['expires_in'],
           scope: data[:scope] || data['scope'],
           refresh_token: data[:refresh_token] || data['refresh_token'],
-          issuer: data[:issuer] || data['issuer']
+          issuer: data[:issuer] || data['issuer'],
+          expires_at: data[:expires_at] || data['expires_at']
         )
-
-        # Set expires_at if provided
-        if (expires_at_str = data[:expires_at] || data['expires_at'])
-          token.instance_variable_set(:@expires_at, Time.parse(expires_at_str))
-        end
-
-        token
       end
     end
 
