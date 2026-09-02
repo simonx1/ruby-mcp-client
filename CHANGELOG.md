@@ -46,8 +46,10 @@ metadata). Each feature lands in its own PR; this section accumulates them.
   part of the cache context: the header a request actually went out with is
   recorded after it was sent, and the freshness probe runs the middleware
   stack without sending anything; a request that fails before any response
-  under such middleware has an unknown context (no private stale fallback)
-  unless the error reports the headers it went out with. Raw list pages
+  under such middleware has the context recorded right before the adapter
+  sent it (a request that never got that far has no private stale
+  fallback), and the freshness probe runs only the request phase of the
+  middleware, so a host `raise_error` does not blind it. Raw list pages
   are never handed from one fetch to another, and HTTP+SSE dates resource
   and template lists from receipt. `server.cache_info(:tools | :prompts |
   :resources | :templates | :discover)` and `cache_info(:read, uri)` expose

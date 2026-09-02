@@ -971,7 +971,9 @@ module MCPClient
       # Apply user's Faraday customizations after defaults
       @faraday_config&.call(conn)
 
-      conn
+      # MCP 2026-07-28 caching: the Authorization a request finally carries
+      # is recorded after the host's middleware ran.
+      record_sent_authorization(conn)
     end
 
     # Log HTTP response (to be overridden by specific transports)

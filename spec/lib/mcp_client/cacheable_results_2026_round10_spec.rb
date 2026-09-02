@@ -93,16 +93,72 @@ RSpec.describe 'MCP 2026-07-28 cacheable results — round 10' do
 
         json_response(body['id'], { 'tools' => [tool('alice-secret')], 'ttlMs' => 0, 'cacheScope' => 'private' })
       end
-      current = token
       # The configured header matches the entry's context; the middleware
-      # is what actually decides the token the request carries.
+      # rewrites it, so it alone decides the token the request carries.
+      rewriting = Class.new(Faraday::Middleware) do
+        def initialize(app, holder)
+          super(app)
+          @holder = holder
+        end
+
+        def on_request(env)
+          env.request_headers['Authorization'] = "Bearer #{@holder[:value]}"
+        end
+      end
+      current = token
       server = streamable(headers: { 'Authorization' => 'Bearer alice' },
-                          faraday_config: ->(f) { f.request :authorization, 'Bearer', -> { current[:value] } })
+                          faraday_config: ->(f) { f.use rewriting, current })
       expect(server.list_tools.map(&:name)).to eq(['alice-secret'])
 
       token[:value] = 'bob'
 
       expect { server.list_tools }.to raise_error(MCPClient::Errors::ConnectionError)
+    ensure
+      server&.cleanup
+    end
+  end
+
+  describe 'Faraday middleware credentials' do
+    let(:token) { { value: 'alice' } }
+    let(:requests) { [] }
+
+    def stub_private_tools(fail_after: nil)
+      stub_request(:post, url).to_return do |request|
+        body = JSON.parse(request.body)
+        next json_response(body['id'], discover_result) unless body['method'] == 'tools/list'
+
+        requests << request.headers['Authorization']
+        raise Faraday::TimeoutError, 'slow' if fail_after && requests.size > fail_after
+
+        json_response(body['id'], { 'tools' => [tool('alice-secret')], 'ttlMs' => fail_after ? 0 : 60_000,
+                                    'cacheScope' => 'private' })
+      end
+    end
+
+    it 'serves a fresh private list when the host also installs raise_error' do
+      stub_private_tools
+      current = token
+      server = streamable(faraday_config: lambda { |f|
+        f.request :authorization, 'Bearer', -> { current[:value] }
+        f.response :raise_error
+      })
+
+      expect(server.list_tools.map(&:name)).to eq(['alice-secret'])
+      expect(server.cache_fresh?(:tools)).to be(true)
+      expect(server.list_tools.map(&:name)).to eq(['alice-secret'])
+      expect(requests).to eq(['Bearer alice'])
+    ensure
+      server&.cleanup
+    end
+
+    it 'serves the stale private list to the middleware credentials when the re-fetch times out' do
+      stub_private_tools(fail_after: 1)
+      current = token
+      server = streamable(faraday_config: ->(f) { f.request :authorization, 'Bearer', -> { current[:value] } })
+      expect(server.list_tools.map(&:name)).to eq(['alice-secret'])
+
+      expect(server.list_tools.map(&:name)).to eq(['alice-secret'])
+      expect(requests).to eq(['Bearer alice', 'Bearer alice'])
     ensure
       server&.cleanup
     end
