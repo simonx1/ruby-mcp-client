@@ -78,6 +78,10 @@ RSpec.describe 'MCP 2026-07-28 deprecations (round 7)' do
     context 'with a Client whose roots were set after construction' do
       it 'warns on the roots= call itself' do
         client = MCPClient::Client.new(mcp_server_configs: [client_config], logger: logger)
+        # `roots=` tells every connected server the list changed; the stub
+        # keeps this example off the wire, where `true` never answers and the
+        # notification would wait out the discovery timeout.
+        allow(stdio_server(client)).to receive(:rpc_notify)
         expect(MCPClient::Deprecations.emitted?(:roots)).to be(false)
 
         client.roots = [{ uri: 'file:///workspace' }]
