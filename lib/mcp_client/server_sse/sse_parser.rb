@@ -12,7 +12,8 @@ module MCPClient
 
       # Parse and handle a raw SSE event payload.
       # @param event_data [String] the raw event chunk
-      def parse_and_handle_sse_event(event_data)
+      # @param arrived [Float, nil] monotonic time the chunk carrying it arrived
+      def parse_and_handle_sse_event(event_data, arrived = nil)
         event = parse_sse_event(event_data)
         return if event.nil?
 
@@ -22,18 +23,20 @@ module MCPClient
         when 'ping'
           # no-op
         when 'message'
-          handle_message_event(event)
+          handle_message_event(event, arrived)
         end
       end
 
       # Handle a "message" SSE event (payload is JSON-RPC over SSE)
       # @param event [Hash] the parsed SSE event (with :data, :id, etc)
-      def handle_message_event(event)
+      # @param arrived [Float, nil] monotonic time the chunk carrying it arrived
+      def handle_message_event(event, arrived = nil)
         return if event[:data].empty?
 
         begin
-          # Dated from the arrival of the event, before it is decoded.
-          arrived = respond_to?(:monotonic_now, true) ? monotonic_now : nil
+          # Dated from the arrival of the chunk it came in, before any event
+          # of that chunk was decoded or dispatched.
+          arrived ||= monotonic_now if respond_to?(:monotonic_now, true)
           data = JSON.parse(event[:data])
 
           return if process_error_in_message?(data)

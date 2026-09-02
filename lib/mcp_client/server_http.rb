@@ -578,6 +578,9 @@ module MCPClient
     # Clean up the server connection
     # Properly closes HTTP connections and clears cached state
     def cleanup
+      # The cache notes this transport left on this thread are for a slice
+      # that will never be tagged now.
+      forget_served_entries
       @mutex.synchronize do
         # Attempt to terminate session before cleanup
         terminate_session if @session_id

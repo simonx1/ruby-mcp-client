@@ -798,11 +798,16 @@ module MCPClient
 
     # Whether every server's cached list of a kind is still fresh (MCP
     # 2026-07-28 caching: a stale list is re-fetched on access).
+    # The parameters go first: reading them evaluates the host's request_meta
+    # and the transport holds that evaluation, which the freshness check then
+    # reuses instead of reading the callable a second time. Asking the other
+    # way round released the held value in between, so a hit spent two
+    # trace ids (or nonces) on a decision that sends nothing.
     # @param kind [Symbol] :tools, :prompts or :resources
     # @return [Boolean]
     def caches_fresh?(kind)
       servers.all? do |server|
-        (!server.respond_to?(:cache_fresh?) || server.cache_fresh?(kind)) && cache_params_current?(kind, server)
+        cache_params_current?(kind, server) && (!server.respond_to?(:cache_fresh?) || server.cache_fresh?(kind))
       end
     end
 
@@ -937,9 +942,12 @@ module MCPClient
     #   entry the list this thread just obtained from the server came from,
     #   and the parameters fingerprint it is bound to
     def served_entry_for(kind, server)
-      return nil unless server.respond_to?(:served_entry_token, true)
+      return nil unless server.respond_to?(:take_served_entry, true)
 
-      [server.send(:served_entry_token, kind), server.send(:served_entry_params_fingerprint, kind)]
+      # Taken rather than read: the note exists for this one tagging, and
+      # leaving it behind would keep a slot on this thread for every
+      # transport a long-lived worker has ever listed through.
+      server.send(:take_served_entry, kind)
     end
 
     # @return [Boolean] whether the server's next request would carry the

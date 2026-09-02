@@ -463,6 +463,9 @@ module MCPClient
     #   multiple connection attempts. This is essential for proper reconnection
     #   logic and exponential backoff.
     def cleanup
+      # The cache notes this transport left on this thread are for a slice
+      # that will never be tagged now.
+      forget_served_entries
       @mutex.synchronize do
         # Set flags first before killing threads to prevent race conditions
         # where threads might check flags after they're set but before they're killed
@@ -954,6 +957,11 @@ module MCPClient
     # Process an SSE chunk from the server
     # @param chunk [String] the chunk to process
     def process_sse_chunk(chunk)
+      # Every event in this chunk arrived together, before any of them was
+      # decoded or dispatched: a response is dated from that moment, so a
+      # slow callback on an earlier event in the same chunk cannot make it
+      # look younger than the ttlMs its server sent (MCP 2026-07-28 caching).
+      arrived = monotonic_now if respond_to?(:monotonic_now, true)
       # Size only: the chunk is raw wire data carrying sampling prompts,
       # elicitation content and tool results.
       @logger.debug("Processing SSE chunk (#{describe_body_size(chunk)})")
@@ -967,7 +975,7 @@ module MCPClient
       event_buffers = extract_complete_events(chunk)
 
       # Process extracted events outside the mutex to avoid deadlocks
-      event_buffers&.each { |event_data| parse_and_handle_sse_event(event_data) }
+      event_buffers&.each { |event_data| parse_and_handle_sse_event(event_data, arrived) }
     end
 
     # Check if the error represents an authorization error

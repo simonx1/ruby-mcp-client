@@ -7,6 +7,26 @@ metadata). Each feature lands in its own PR; this section accumulates them.
 
 ### Cacheable results (`ttlMs` / `cacheScope`)
 
+- **Only provably inert middleware is probed (round 28).** A middleware
+  copy shares its class, and a `define_method` request hook keeps the
+  binding it was defined in, so comparing two instances could never see a
+  nonce vended by `self.class` or closed over by a block. The rule is now
+  inverted for those: the probe runs a host request hook only when its class
+  holds nothing of its own (no class-level instance variable, class variable
+  or singleton method) and every method it defines was written with `def`;
+  anything else reports the unknown context with the counter untouched.
+  Faraday's own Authorization middleware and hooks that read a frozen holder
+  keep predicting the next request as before. A stdio
+  `resources/templates/list` now follows the server's hint like the other
+  lists: a 2025-11-25 list with no `ttlMs` is asked for again rather than
+  kept (an empty one included), while a positive `ttlMs` is still served
+  without a second request. A client-level cache hit reads the host's
+  `request_meta` once for the whole decision instead of twice, the note a
+  transport leaves on the thread for the cache above it is taken rather than
+  left behind (and dropped on cleanup), and an SSE response is dated from
+  the arrival of the chunk that carried it, so a slow notification callback
+  in the same chunk cannot stretch a `ttlMs` past what the server sent.
+
 - **Middleware the probe may neither build nor stand in for, and lists
   taken under the lock (round 27).** Two middleware ivars that merely
   compare equal are a stand-in only while nothing mutable is reachable
