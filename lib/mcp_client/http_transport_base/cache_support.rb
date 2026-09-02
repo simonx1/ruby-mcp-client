@@ -239,9 +239,16 @@ module MCPClient
         clear_response_received_at if respond_to?(:clear_response_received_at, true)
         response = send_http_request(request, timeout: timeout, extra_headers: extra_headers)
         received_at = monotonic_now if respond_to?(:monotonic_now, true)
-        result = parse_response(response, request)
-        note_sent_authorization(response)
-        note_request_params(request['params'])
+        begin
+          result = parse_response(response, request)
+        ensure
+          # The outer request's own context, whatever a notification the
+          # response carried did on this thread — and whether or not the
+          # parse succeeded, so a failed re-fetch is judged by its own
+          # credentials and parameters.
+          note_sent_authorization(response)
+          note_request_params(request['params'])
+        end
         note_response_received_at(received_at) if respond_to?(:note_response_received_at, true)
         result
       end

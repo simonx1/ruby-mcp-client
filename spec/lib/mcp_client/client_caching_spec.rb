@@ -149,8 +149,11 @@ RSpec.describe MCPClient::Client, 'caching' do
       client.list_prompts
 
       expect(client.prompt_cache.size).to eq(2)
-      expect(client.prompt_cache['123456:duplicate_prompt']).to eq(prompt1_from_server1)
-      expect(client.prompt_cache['789012:duplicate_prompt']).to eq(prompt2_from_server2)
+      # The client cache keeps its own copies (MCP 2026-07-28 caching)
+      expect(client.prompt_cache['123456:duplicate_prompt'])
+        .to have_attributes(name: prompt1_from_server1.name, description: prompt1_from_server1.description)
+      expect(client.prompt_cache['789012:duplicate_prompt'])
+        .to have_attributes(name: prompt2_from_server2.name, description: prompt2_from_server2.description)
     end
 
     it 'returns all prompts including duplicates' do

@@ -387,6 +387,8 @@ module MCPClient
           # requests stay owed their responses.
           @modern_answer_received = true if era_probe_in_flight? && identifies_modern_server?(msg)
           @pending[id] = msg
+          # Dated from arrival: the waiter may wake much later.
+          (@response_arrivals ||= {})[id] = monotonic_now if respond_to?(:monotonic_now, true)
           @cond.broadcast
         else
           @logger.debug("Discarding response for unknown or expired request id=#{id}")
@@ -1112,6 +1114,7 @@ module MCPClient
           # fail on that record, whenever they next run, rather than wait out
           # their timeouts because the restart cleared the retirement first.
           dropped_requests.merge(@awaiting.keys)
+          @response_arrivals&.clear
           @awaiting.clear
           @cond.broadcast
         end

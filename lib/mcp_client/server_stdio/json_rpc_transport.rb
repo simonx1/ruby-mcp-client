@@ -920,8 +920,13 @@ module MCPClient
           # timeout so neither @pending nor @awaiting accumulates entries.
           msg = @pending.delete(id)
           transport_gone = @transport_retired || !dropped_requests.delete?(id).nil?
+          arrival = (@response_arrivals ||= {}).delete(id)
           @awaiting.delete(id)
-          return msg if msg
+          if msg
+            # The response's receipt time is the reader's, not this wake-up.
+            note_response_received_at(arrival || monotonic_now) if respond_to?(:note_response_received_at, true)
+            return msg
+          end
 
           if transport_gone
             raise MCPClient::Errors::TransportError,
@@ -1038,7 +1043,6 @@ module MCPClient
         end
         begin
           res = wait_response(req_id, timeout: timeout)
-          note_response_received_at if respond_to?(:note_response_received_at, true)
         rescue MCPClient::Errors::RequestTimeoutError
           # MCP lifecycle: on timeout the sender SHOULD issue a cancellation
           # notification for the abandoned request and stop waiting.
