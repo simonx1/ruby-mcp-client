@@ -317,11 +317,13 @@ module MCPClient
       # @param client_id_metadata_document_supported [Boolean, nil] Whether the server accepts
       #   Client ID Metadata Document client IDs (MCP 2025-11-25 / SEP-991)
       # @param authorization_response_iss_parameter_supported [Boolean, nil] Whether the server includes
-      #   the `iss` parameter in authorization responses (RFC 9207 Section 2.3, MCP 2026-07-28)
+      #   the `iss` parameter in authorization responses (RFC 9207 Section 2.3, MCP 2026-07-28).
+      #   Defaults to the RFC 8414 default (false, "not advertised"); an explicit nil means the
+      #   record carries no answer at all — see {#iss_parameter_recorded?}
       def initialize(issuer:, authorization_endpoint:, token_endpoint:, registration_endpoint: nil,
                      scopes_supported: nil, response_types_supported: nil, grant_types_supported: nil,
                      code_challenge_methods_supported: nil, client_id_metadata_document_supported: nil,
-                     authorization_response_iss_parameter_supported: nil)
+                     authorization_response_iss_parameter_supported: false)
         @issuer = issuer
         @authorization_endpoint = authorization_endpoint
         @token_endpoint = token_endpoint
@@ -340,6 +342,16 @@ module MCPClient
       # @return [Boolean]
       def iss_parameter_supported?
         @authorization_response_iss_parameter_supported == true
+      end
+
+      # Whether this record actually carries an answer about the RFC 9207
+      # `iss` parameter. A record persisted before this client read the field
+      # carries none, and "no answer" must not be read as "not supported":
+      # that would accept a response without `iss` from a server that
+      # advertises it.
+      # @return [Boolean]
+      def iss_parameter_recorded?
+        !@authorization_response_iss_parameter_supported.nil?
       end
 
       # Check if dynamic client registration is supported
@@ -390,6 +402,21 @@ module MCPClient
           authorization_response_iss_parameter_supported:
             fetch_boolean(data, :authorization_response_iss_parameter_supported)
         )
+      end
+
+      # Read an authorization server's own metadata document. An absent
+      # authorization_response_iss_parameter_supported in a FETCHED document
+      # is the server's own answer ("no", the RFC 8414 default), so it is
+      # recorded as an explicit false; only a record PERSISTED before this
+      # client read the field ({.from_h} of a hash without the key) is left
+      # without an answer.
+      # @param data [Hash] the parsed metadata document
+      # @return [ServerMetadata]
+      def self.from_discovery_document(data)
+        metadata = from_h(data)
+        return metadata if metadata.iss_parameter_recorded?
+
+        from_h(data.merge(authorization_response_iss_parameter_supported: false))
       end
 
       # Fetch a possibly-false value from a hash by symbol or string key.

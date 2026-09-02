@@ -1,5 +1,7 @@
 # frozen_string_literal: true
 
+require 'ipaddr'
+
 module MCPClient
   module Auth
     class OAuthProvider
@@ -9,6 +11,9 @@ module MCPClient
       # peer-advertised URL must pass. Mixed into OAuthProvider; every method
       # relies on its state.
       module ChallengeHandling
+        # One decimal, octal or hexadecimal component of a numeric IPv4 spec.
+        IPV4_COMPONENT = /\A(?:0x[0-9a-f]+|0[0-7]*|[1-9][0-9]*)\z/i
+
         # Handle 401 Unauthorized response (for server discovery)
         # @param response [Faraday::Response] HTTP response
         # @return [ResourceMetadata, nil] Resource metadata if found
@@ -239,6 +244,11 @@ module MCPClient
         def refuse_peer_url!(message, latch:)
           reject_challenge!(message) if latch
 
+          # A speculative document is not latched, but it is still refused: the
+          # copy fetch_resource_metadata kept for scope resolution must go too,
+          # or its scopes_supported would be sent in the registration and
+          # authorization requests of a flow that discarded the document.
+          @resource_metadata = nil
           raise MCPClient::Errors::ConnectionError, message
         end
 
@@ -273,13 +283,68 @@ module MCPClient
         # @param host [String] a downcased hostname
         # @return [Boolean] whether it names a loopback, private or link-local address
         def local_address?(host)
-          return true if %w[localhost 127.0.0.1 ::1 0.0.0.0].include?(host)
+          host = host.to_s.delete_prefix('[').delete_suffix(']')
+          return true if host == 'localhost'
           return true if host.end_with?('.localhost', '.local', '.internal')
-          return true if host.start_with?('127.', '10.', '192.168.', '169.254.')
-          return true if host.match?(/\A172\.(1[6-9]|2\d|3[01])\./)
-          return true if host.match?(/\A\[?(fc|fd|fe80)/)
 
-          false
+          local_ip?(host)
+        end
+
+        # Classify a literal address semantically rather than by spelling: a
+        # prefix list misses the forms IPv6 permits for the very ranges it
+        # means to reject ('::ffff:169.254.169.254' for the link-local metadata
+        # endpoint, '0:0:0:0:0:0:0:1' for loopback), so parse the host and ask
+        # IPAddr. IPv4-mapped and IPv4-compatible addresses are folded to their
+        # IPv4 form first, so one set of range checks covers both families.
+        # @param host [String] a hostname with any brackets already stripped
+        # @return [Boolean] whether it is a literal address in a local range
+        def local_ip?(host)
+          ip = parse_address(host)
+          return false unless ip
+
+          ip = ip.native if ip.ipv6? && (ip.ipv4_mapped? || ip.ipv4_compat?)
+          # 0.0.0.0 / :: name "this host" and are neither loopback nor private
+          # to IPAddr, but reach local services just the same.
+          return true if ip.to_i.zero?
+
+          ip.loopback? || ip.link_local? || ip.private?
+        end
+
+        # @param host [String] a hostname
+        # @return [IPAddr, nil] the address it names, or nil when it is a name
+        def parse_address(host)
+          IPAddr.new(host)
+        rescue ArgumentError # IPAddr::Error included
+          # IPAddr only accepts dotted quads, but the resolver (inet_aton) also
+          # accepts shorthand and alternate radixes — '127.1', '0177.0.0.1',
+          # '0x7f.0.0.1' and '2130706433' all reach 127.0.0.1 — so a check that
+          # stopped at IPAddr would wave those straight through.
+          shorthand_ipv4(host)
+        end
+
+        # @param host [String] a hostname
+        # @return [IPAddr, nil] the address inet_aton would read, when the host
+        #   is a numeric IPv4 spec IPAddr itself rejects
+        def shorthand_ipv4(host)
+          parts = host.split('.', -1)
+          return nil unless (1..4).cover?(parts.size) && parts.all? { |part| part.match?(IPV4_COMPONENT) }
+
+          values = parts.map { |part| Integer(part, ipv4_component_base(part)) }
+          # inet_aton: the last component fills every byte the earlier ones left.
+          last = values.pop
+          return nil if last >= (1 << (8 * (4 - values.size))) || values.any? { |value| value > 255 }
+
+          IPAddr.new(values.each_with_index.sum { |value, i| value << (8 * (3 - i)) } + last, Socket::AF_INET)
+        rescue ArgumentError
+          nil
+        end
+
+        # @param part [String] one component of a numeric IPv4 spec
+        # @return [Integer] its radix (leading '0x' hex, leading '0' octal, else decimal)
+        def ipv4_component_base(part)
+          return 16 if part.downcase.start_with?('0x')
+
+          part.start_with?('0') ? 8 : 10
         end
       end
     end

@@ -72,8 +72,27 @@ RSpec.describe 'MCP 2026-07-28 authorization' do
       expect(unsupported.authorization_response_iss_parameter_supported).to be(false)
       expect(unsupported).not_to be_iss_parameter_supported
       expect(as_meta).not_to be_iss_parameter_supported
-      expect(as_meta.to_h).not_to have_key(:authorization_response_iss_parameter_supported)
+      # A record built here (as one read from a discovery document) answers the
+      # question, and its answer survives serialization.
+      expect(as_meta).to be_iss_parameter_recorded
+      expect(as_meta.to_h[:authorization_response_iss_parameter_supported]).to be(false)
       expect(described_class.from_h(supported.to_h)).to be_iss_parameter_supported
+    end
+
+    it 'carries no answer for a record persisted before the field was read' do
+      legacy = described_class.from_h('issuer' => 'https://auth.example.com',
+                                      'authorization_endpoint' => 'https://auth.example.com/authorize',
+                                      'token_endpoint' => 'https://auth.example.com/token')
+
+      expect(legacy).not_to be_iss_parameter_recorded
+      # A document the authorization server itself served answers "no" by
+      # staying silent (RFC 8414 default), which is recorded as such.
+      fetched = described_class.from_discovery_document('issuer' => 'https://auth.example.com',
+                                                        'authorization_endpoint' =>
+                                                          'https://auth.example.com/authorize',
+                                                        'token_endpoint' => 'https://auth.example.com/token')
+      expect(fetched).to be_iss_parameter_recorded
+      expect(fetched).not_to be_iss_parameter_supported
     end
   end
 

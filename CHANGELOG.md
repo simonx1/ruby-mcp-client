@@ -135,7 +135,19 @@ metadata). Each feature lands in its own PR; this section accumulates them.
   with the redirect URI recorded for the authorization request (RFC 6749
   Section 4.1.3): a token endpoint whose error names another redirect URI
   is reported as a mismatch rather than retried with the peer's value
-  (records made before the URI was recorded keep the legacy retry).
+  (records made before the URI was recorded keep the legacy retry). A
+  peer-advertised URL's host is now classified by parsing it as an address
+  rather than by string prefixes, so IPv4-mapped and expanded IPv6
+  spellings (`[::ffff:169.254.169.254]`, `[0:0:0:0:0:0:0:1]`) and the
+  shorthand IPv4 forms resolvers accept (`127.1`, `0x7f.0.0.1`,
+  `2130706433`) are refused like the dotted-quad ones. A refused challenge
+  now withholds the cached token as well: while it stands, `access_token`
+  and `apply_authorization` present nothing, just as discovery refuses the
+  cached authorization server. A speculative protected-resource document
+  whose authorization server is refused no longer supplies the scopes of
+  the next request, and authorization server metadata persisted before
+  `authorization_response_iss_parameter_supported` was recorded is
+  rediscovered rather than read as "the server does not send `iss`".
 
 ### Tasks extension (`io.modelcontextprotocol/tasks`)
 

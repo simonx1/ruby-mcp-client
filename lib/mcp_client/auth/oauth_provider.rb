@@ -566,7 +566,14 @@ module MCPClient
           # Validate the cached entry before use so a persisted/older cache with
           # an HTTP endpoint or without S256 is still rejected.
           validate_server_metadata!(cached)
-          return cached
+          # A record persisted before this client read RFC 9207's
+          # authorization_response_iss_parameter_supported says nothing about
+          # the parameter. Treating that silence as "not supported" would
+          # accept an authorization response without `iss` from a server that
+          # advertises it, so the answer is rediscovered rather than assumed.
+          return cached if cached.iss_parameter_recorded?
+
+          logger.debug('Cached authorization server metadata predates the iss parameter record; rediscovering')
         end
 
         discover_and_cache_authorization_server
@@ -997,7 +1004,7 @@ module MCPClient
         data = JSON.parse(response.body)
         raise MCPClient::Errors::ConnectionError, 'Invalid server metadata: not a JSON object' unless data.is_a?(Hash)
 
-        ServerMetadata.from_h(data)
+        ServerMetadata.from_discovery_document(data)
       rescue JSON::ParserError => e
         raise MCPClient::Errors::ConnectionError, "Invalid server metadata JSON: #{e.message}"
       rescue Faraday::Error => e
@@ -1209,6 +1216,12 @@ module MCPClient
       # (discovery treats it so), else the cached metadata's issuer.
       # @return [String, nil]
       def current_issuer_for_tokens
+        # A challenge we REFUSED said the cached authorization server is no
+        # longer the right one, and discovery fails closed on that latch. The
+        # request path must fail closed too: presenting the cached bearer would
+        # undo the rejection exactly as falling back to the cache would.
+        return nil if @challenge_error
+
         advertised = Array(@challenge_resource_metadata&.authorization_servers).first
         return advertised if advertised.is_a?(String)
         # An unresolved challenge URL means the current server is unknown.
@@ -1225,6 +1238,9 @@ module MCPClient
       # @return [Token, nil] the bound token, or nil when it cannot be bound yet
       def bind_token_issuer(token)
         return token unless token.respond_to?(:issuer) && token.issuer.nil? && token.respond_to?(:with_issuer)
+        # A refused challenge says the cached server is no longer current, so
+        # it cannot attribute an unbound token either.
+        return nil if @challenge_error
 
         current = stored_server_metadata&.issuer
         return nil unless current
