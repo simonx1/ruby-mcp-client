@@ -67,8 +67,11 @@ module MCPClient
         return target unless target.is_a?(Hash)
 
         if target.each_key.any? { |key| !key.is_a?(String) }
+          # Copied under the same structural budget as the root document: a
+          # data keyword may not hide an unbounded map behind a pointer.
           copies = (index[:normalized] ||= {}.compare_by_identity)
-          target = copies[target] ||= deep_stringify(target)
+          index[:budget] ||= { objects: 0, deadline: nil }
+          target = copies[target] ||= deep_stringify(target, 0, index[:budget])
         end
         return target if index[:resources].key?(target)
 
@@ -262,7 +265,7 @@ module MCPClient
         node = (from && index[:resources][from]) || root
         depths = counter[:depths] || {}
         walk = { index: index, depths: depths, dialect: index[:dialects][node] || dialect,
-                 depth: depths[node] || 0, mode: :schema, opaque: false }
+                 depth: depths[node] || 0, mode: :schema, opaque: false, visited: true }
         tokens.each do |token|
           child = pointer_child(node, token)
           return nil if child.equal?(UNRESOLVED)
@@ -270,7 +273,7 @@ module MCPClient
           pointer_step(walk, node, token)
           node = child
         end
-        [walk[:depth], walk[:opaque]]
+        [walk[:depth], walk[:opaque], walk[:visited]]
       end
 
       # Advance one pointer token: in schema mode the node's own dialect
@@ -290,6 +293,11 @@ module MCPClient
         end
         walk[:mode] = pointer_step_mode(node, token, walk[:dialect])
         walk[:opaque] ||= walk[:mode] == :opaque
+        # The preflight walk does not descend into an opaque keyword, nor
+        # into anything beside a draft-07 $ref but its definitions.
+        walk[:visited] &&= walk[:mode] != :opaque &&
+                           !(walk[:dialect] == DRAFT_07 && node.is_a?(Hash) && node.key?('$ref') &&
+                             token != 'definitions')
         walk[:depth] += 1 unless %i[map array].include?(walk[:mode])
       end
 

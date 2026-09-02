@@ -7,6 +7,19 @@ metadata). Each feature lands in its own PR; this section accumulates them.
 
 ### JSON Schema handling
 
+- **Inert assertions and unvisited positions (round 20).** Under `not` /
+  `oneOf` / `if`, `contains` of `true` / `{}` on an array that already
+  holds the items `minContains` requires, `unevaluatedItems` once such a
+  `contains` (or an `items` schema) evaluated every item, `patternProperties`
+  matching nothing or only tautologies, and a dependency whose present
+  trigger cannot fail (an empty required list, `true`, `{}`) decide
+  nothing; a boolean in a position the preflight walk never visits — beside
+  a draft-07 `$ref`, or behind an opaque keyword — is charged toward
+  `MAX_SUBSCHEMAS` when a reference reaches it; the unsupported-keyword
+  scan follows a pointer into a data keyword at the target's own position;
+  a symbol-keyed target adopted from a data keyword is copied within the
+  structural budget.
+
 - **Definition identity (round 19).** `Tool#schema_identity` names a tool
   definition: every copy the client cache hands out carries the same
   token and a definition fetched again carries a new one, so the

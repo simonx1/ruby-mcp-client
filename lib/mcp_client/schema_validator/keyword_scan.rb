@@ -77,7 +77,13 @@ module MCPClient
         # and at its own lexical depth, so member order and reference fan-out
         # cannot hide its keywords.
         scan[:depths] ||= lexical_depths(root, scan[:dialect])
-        target_depth = (target.is_a?(Hash) && scan[:depths][target]) || (depth + 1)
+        lexical = target.is_a?(Hash) && scan[:depths][target]
+        position, opaque = pointer_position(ref, root, scan[:dialect], scan, schema)
+        target_depth = if opaque
+                         [position, lexical].compact.max || (depth + 1)
+                       else
+                         lexical || position || (depth + 1)
+                       end
         collect_unsupported_keywords(target, root, found, target_depth, scan,
                                      (target.is_a?(Hash) && indexed_dialect(target, scan)) || dialect)
       end
