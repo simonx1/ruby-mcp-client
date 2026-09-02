@@ -69,7 +69,12 @@ RSpec.describe 'MCP 2026-07-28 subscriptions/listen — round 3' do
         stub_listen { |body| sse_response(ack_message(body['id'], { 'resourceSubscriptions' => ['file:///a'] })) }
 
         expect(server.subscribe_resource('file:///a')).to be(true)
-        expect(server.resource_subscriptions['file:///a']).to be_active
+        # The stub's stream ends as soon as it has handed over the
+        # acknowledgment, which leaves the subscription re-opening rather than
+        # active (round 4); what the call promises is that the server answered.
+        registered = server.resource_subscriptions['file:///a']
+        expect(registered).not_to be_closed
+        expect(registered.acknowledged).to eq({ 'resourceSubscriptions' => ['file:///a'] })
       end
 
       it 'raises instead of reporting success when the listen request is rejected' do

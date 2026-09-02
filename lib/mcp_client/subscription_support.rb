@@ -141,10 +141,26 @@ module MCPClient
         @logger.warn("subscriptions/listen #{subscription.id} failed: #{sanitize_log_text(error.message)}")
         subscription.finish(gracefully: false, error: error)
       else
-        @logger.debug("Server closed subscription #{subscription.id} gracefully")
-        subscription.finish(gracefully: true)
+        close_subscription_gracefully(subscription, message['result'])
       end
       subscription
+    end
+
+    # End a subscription on the server's closing response — but only when the
+    # result is one the client recognizes. Every other response goes through
+    # {MCPClient::JsonRpcCommon#validate_result_type!}; skipping it here would
+    # make a missing, scalar or unknown-resultType result indistinguishable
+    # from a clean close.
+    # @param subscription [MCPClient::Subscription]
+    # @param result [Object] the response's result member
+    # @return [void]
+    def close_subscription_gracefully(subscription, result)
+      validate_result_type!(result)
+      @logger.debug("Server closed subscription #{subscription.id} gracefully")
+      subscription.finish(gracefully: true)
+    rescue MCPClient::Errors::InvalidResultError => e
+      @logger.warn("subscriptions/listen #{subscription.id} closed with an invalid result: #{e.message}")
+      subscription.finish(gracefully: false, error: e)
     end
 
     # Open resource-update subscriptions the modern way: one listen stream

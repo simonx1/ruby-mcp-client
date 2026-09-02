@@ -25,12 +25,38 @@ metadata). Each feature lands in its own PR; this section accumulates them.
   the subscription's own dispatcher thread, in arrival order, never on the
   transport's reader: a listener may issue requests of its own (re-reading
   the resource that changed, say) without blocking the stdio reader that
-  would have to deliver its response.
+  would have to deliver its response. That queue is filled by the peer, so it
+  is bounded (`Subscription::MAX_PENDING_NOTIFICATIONS`): once it is full the
+  **oldest** entry is dropped, counted in `dropped_notifications` and named
+  once in the log, with `pending_notifications` reporting the current depth.
+  Blocking the reader instead would restore the deadlock the dispatcher
+  exists to prevent, and dropping the newest would leave the host acting on a
+  stale view for good — every MCP notification is a "look again" signal about
+  state the host re-reads for itself, so the newest one still carries what
+  the dropped ones said. A closing response the client cannot recognize (an
+  unknown `resultType`, a missing result, a scalar) fails the subscription
+  with an `InvalidResultError` rather than ending it gracefully, the way
+  every other response is checked.
 - **Transports.** On Streamable HTTP (and plain HTTP) the listen POST runs
   on its own thread; a stream that ends without the closing response is
   re-opened with a new id (backoff 1 s → 30 s, which a cancellation
-  interrupts) while the host still wants it. On stdio, subscriptions share
-  the channel and are correlated by subscription id; when the process is
+  interrupts) while the host still wants it, and stops reporting `active?`
+  for as long as it is between streams — no server-side subscription exists
+  then. Closing the response stream is the cancellation, and it is reliable
+  at both ends of the race now: the stream's HTTP session is handed over
+  before its socket is opened, under the same lock the cancellation takes, so
+  a `close` either stops the request before it goes out or finds the session
+  it has to close (and comes back for one whose socket was still opening).
+  A listen answer is framed by its `Content-Type`: the single JSON object a
+  server MAY answer with instead of a stream is no longer run through the SSE
+  parser, which used to swallow a compact body followed by a blank line and
+  turn a clean close into a dropped stream and a typed rejection into a
+  generic one. Transport shutdown closes every stream cooperatively —
+  including one caught between two listen ids, which belonged to neither
+  registry and would re-open onto a transport that was already gone — and no
+  longer kills the reader threads or waits for them under the transport lock
+  they need themselves. On stdio, subscriptions share the channel and are
+  correlated by subscription id; when the process is
   re-established (after `cleanup` or an unexpected exit, which now marks the
   session for restart) every open subscription is re-sent with a new id.
   Taking a new id is atomic with closure on both, so a `close` racing with a

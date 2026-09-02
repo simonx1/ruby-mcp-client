@@ -33,6 +33,20 @@ module MCPClient
 
     STATES = %i[pending active reconnecting closed].freeze
 
+    # Ceiling on the notifications waiting for this subscription's listeners.
+    # The queue is filled by the peer and drained by the host, so a chatty
+    # server and a listener that does real work (re-reading the resource that
+    # changed, say) would otherwise grow it without bound.
+    #
+    # A full queue drops its *oldest* entry. Blocking the transport reader
+    # instead would reinstate the deadlock the dispatcher exists to prevent —
+    # the reader would wait for a listener that is waiting for a response only
+    # that reader can deliver — and dropping the newest would leave the host
+    # acting on a stale view for good. Every MCP notification is a "look
+    # again" signal about state the host re-reads for itself, so the newest
+    # one still carries everything the dropped ones said.
+    MAX_PENDING_NOTIFICATIONS = 1024
+
     # The states {#wait_until_settled} waits for: the server has answered the
     # listen request one way or the other.
     SETTLED_STATES = %i[active closed].freeze
@@ -94,6 +108,21 @@ module MCPClient
       @closed_gracefully = false
       @closed_by_client = false
       @dispatch_queue = nil
+      @dropped_notifications = 0
+      @warned_about_drops = false
+      @answered = false
+    end
+
+    # @return [Integer] notifications queued for this subscription's listeners
+    def pending_notifications
+      @mutex.synchronize { @dispatch_queue ? @dispatch_queue.size : 0 }
+    end
+
+    # Notifications dropped because the listeners could not keep up with the
+    # server (see {MAX_PENDING_NOTIFICATIONS}).
+    # @return [Integer]
+    def dropped_notifications
+      @mutex.synchronize { @dropped_notifications }
     end
 
     # Add a listener for notifications delivered on this subscription.
@@ -154,13 +183,15 @@ module MCPClient
     def wait_until_settled(timeout)
       deadline = Process.clock_gettime(Process::CLOCK_MONOTONIC) + timeout
       @mutex.synchronize do
-        until SETTLED_STATES.include?(@state)
+        loop do
+          answer = settled_state
+          return answer if answer
+
           remaining = deadline - Process.clock_gettime(Process::CLOCK_MONOTONIC)
-          break if remaining <= 0
+          return nil if remaining <= 0
 
           @settled.wait(@mutex, remaining)
         end
-        SETTLED_STATES.include?(@state) ? @state : nil
       end
     end
 
@@ -214,6 +245,7 @@ module MCPClient
 
         @acknowledged = filter.is_a?(Hash) ? filter : {}
         @state = :active
+        @answered = true
         @settled.broadcast
       end
     end
@@ -225,8 +257,12 @@ module MCPClient
 
         # Queued while still open, so a closure that follows cannot swallow a
         # notification that had already arrived, and the :stop that ends the
-        # dispatcher can never overtake this one.
-        (@dispatch_queue ||= start_dispatcher) << [@listeners.dup, method, params]
+        # dispatcher can never overtake this one. Enqueuing never waits for
+        # the listeners: the transport reader must stay free to deliver the
+        # responses a listener's own requests are waiting for.
+        queue = (@dispatch_queue ||= start_dispatcher)
+        drop_oldest_notifications(queue)
+        queue << [@listeners.dup, method, params]
       end
     end
 
@@ -284,6 +320,59 @@ module MCPClient
         end
       end
       queue
+    end
+
+    # The answer {#wait_until_settled} reports. Settling is one-way: once the
+    # server has acknowledged the listen request it has answered it, and a
+    # later drop — which puts the stream back to :reconnecting until it is
+    # acknowledged again — does not unask the question the waiter asked.
+    # Called with the lock held.
+    # @return [Symbol, nil] :closed, :active, or nil while it is still pending
+    def settled_state
+      return @state if SETTLED_STATES.include?(@state)
+      return :active if @answered
+
+      nil
+    end
+
+    # Make room for one more notification, dropping the oldest queued ones
+    # (see {MAX_PENDING_NOTIFICATIONS}). Called with the lock held.
+    # @param queue [Thread::Queue] the dispatcher's queue
+    # @return [void]
+    def drop_oldest_notifications(queue)
+      dropped = 0
+      dropped += 1 while queue.size >= MAX_PENDING_NOTIFICATIONS && discard_oldest_notification(queue)
+      return if dropped.zero?
+
+      @dropped_notifications += dropped
+      report_dropped_notifications(dropped)
+    end
+
+    # @param queue [Thread::Queue] the dispatcher's queue
+    # @return [Boolean] whether an entry was removed (the dispatcher may have
+    #   drained it first)
+    def discard_oldest_notification(queue)
+      queue.pop(true)
+      true
+    rescue ThreadError
+      false
+    end
+
+    # @param dropped [Integer] how many were dropped just now
+    # @return [void]
+    def report_dropped_notifications(dropped)
+      return unless @server.respond_to?(:logger)
+
+      # The peer controls how often this happens, so it is said once per
+      # subscription at warn level and counted after that.
+      if @warned_about_drops
+        @server.logger.debug("Subscription #{@id} dropped #{dropped} more queued notification(s)")
+      else
+        @warned_about_drops = true
+        @server.logger.warn("Subscription #{@id} is receiving notifications faster than its listeners " \
+                            "handle them; dropping the oldest of #{MAX_PENDING_NOTIFICATIONS} queued " \
+                            '(see MCPClient::Subscription#dropped_notifications)')
+      end
     end
 
     # @param listeners [Array<Proc>] listeners to run
