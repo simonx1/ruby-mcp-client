@@ -53,9 +53,12 @@ RSpec.describe 'MCP 2026-07-28 authorization — round 19' do
 
       expect(storage.get_token(server_url).issuer).to eq('https://auth.example.com')
       expect(provider.instance_variable_get(:@retired_tokens)).to be_nil.or be_empty
-      # Presented once discovery confirmed the advertised server.
-      provider.send(:discover_authorization_server)
+      # The validated challenge names the token's server: presented at once,
+      # on the path that actually presents tokens.
       expect(provider.access_token&.access_token).to eq('new')
+      request = instance_double(Faraday::Request, headers: {})
+      provider.apply_authorization(request)
+      expect(request.headers['Authorization']).to eq('Bearer new')
     end
   end
 
