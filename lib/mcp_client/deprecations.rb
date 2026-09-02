@@ -1,5 +1,7 @@
 # frozen_string_literal: true
 
+require 'logger'
+
 module MCPClient
   # Deprecation notices for the features listed as Deprecated by the MCP
   # 2026-07-28 deprecated features registry (feature lifecycle policy,
