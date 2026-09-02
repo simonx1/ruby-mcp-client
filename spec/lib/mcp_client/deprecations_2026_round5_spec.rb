@@ -67,25 +67,43 @@ RSpec.describe 'MCP 2026-07-28 deprecations (round 5)' do
       end
     end
 
-    it 'gives only the HTTP+SSE transport a shorter clock than the 2026-07-28 features' do
-      # SEP-2596 reclassified both the HTTP+SSE transport and the
-      # includeContext values, but only the transport may go early: its
-      # transition provision ties includeContext to Sampling.
+    it 'gives the features 2026-07-28 deprecates one shared clock' do
+      # The exact wording is pinned in the round 6 spec, against the
+      # registry's own "Earliest removal" column; here only the grouping.
       long_window = registry[:sampling][:earliest_removal]
-      expect(long_window).to eq('no earlier than twelve months after 2026-07-28')
-      %i[roots logging dynamic_client_registration include_context].each do |key|
+      %i[roots logging dynamic_client_registration].each do |key|
         expect(registry[key][:earliest_removal]).to eq(long_window), key.to_s
       end
 
-      expect(registry[:http_sse_transport][:earliest_removal])
-        .to eq('no earlier than three months after SEP-2596 is Final')
+      # SEP-2596 reclassified both the HTTP+SSE transport and the
+      # includeContext values, but only the transport has a clock of its own:
+      # the transition provision ties includeContext to Sampling.
+      expect(registry[:include_context][:earliest_removal]).to match(/follows Sampling/)
+      expect(registry[:http_sse_transport][:earliest_removal]).not_to eq(long_window)
+      expect(registry[:http_sse_transport][:earliest_removal]).to match(/SEP-2596/)
     end
 
-    it 'is what the README documents, verbatim' do
+    # The table row each feature owns, so a clock cannot satisfy the pin from
+    # some other feature's row.
+    let(:rows) do
+      {
+        roots: /^\| Roots \(.*$/,
+        sampling: /^\| Sampling \(.*$/,
+        logging: /^\| Logging \(.*$/,
+        http_sse_transport: /^\| HTTP\+SSE transport \(.*$/,
+        include_context: /^\| `includeContext`.*$/,
+        dynamic_client_registration: /^\| OAuth Dynamic Client Registration.*$/
+      }
+    end
+
+    it 'is what the README documents, verbatim, on that feature\'s own row' do
       readme = File.read(File.expand_path('../../../README.md', __dir__))
       section = readme[/### Deprecated features.*?\n## /m] || readme
+      expect(rows.keys).to match_array(registry.keys)
       registry.each do |key, entry|
-        expect(section).to include(entry[:earliest_removal]), key.to_s
+        row = section[rows.fetch(key)]
+        expect(row).not_to be_nil, "no README table row for #{key}"
+        expect(row).to include(entry[:earliest_removal]), "#{key}: #{row}"
       end
     end
   end

@@ -6,63 +6,72 @@ module MCPClient
   # Deprecation notices for the features listed as Deprecated by the MCP
   # 2026-07-28 deprecated features registry (feature lifecycle policy,
   # SEP-2596): they keep working during their deprecation window, but new
-  # integrations should not adopt them. The earliest removal of each feature
-  # is set by the registry (https://modelcontextprotocol.io/specification/2026-07-28/deprecated)
-  # and recorded in `earliest_removal`. Only the HTTP+SSE transport may go
-  # sooner than the features 2026-07-28 itself deprecates: the includeContext
-  # values were deprecated by an earlier revision, but SEP-2596's transition
-  # provision ties them to Sampling, so they share the same window as Roots,
-  # Sampling and Logging. The client logs one notice per feature per process,
-  # on the first use, and names the suggested migration.
+  # integrations should not adopt them. `earliest_removal` carries the
+  # registry's own "Earliest removal" wording
+  # (https://modelcontextprotocol.io/specification/2026-07-28/deprecated)
+  # rather than a paraphrase of the policy floor: what the features
+  # 2026-07-28 deprecates wait for is the first revision RELEASED on or after
+  # 2027-07-28, which may fall well after that date, so a host must not plan
+  # around 2027-07-28 as a removal date. The includeContext values follow
+  # Sampling, and only the HTTP+SSE transport has a clock of its own. The
+  # earliest removal marks when a feature becomes eligible for removal; the
+  # actual removal is a Core Maintainer decision. The client logs one notice
+  # per feature per process, on the first use, and names both the earliest
+  # removal and the suggested migration.
   #
   # Notices can be silenced with `MCPClient::Deprecations.enabled = false`.
   module Deprecations
+    # The "Earliest removal" the registry gives Roots, Sampling, Logging and
+    # Dynamic Client Registration. It names a revision, not a date: the
+    # release on or after 2027-07-28 may itself be later than 2027-07-28.
+    REVISION_AFTER_2027_07_28 = 'the first revision released on or after 2027-07-28'
+
     # Every feature the 2026-07-28 deprecated features registry lists, keyed
     # by the identifier passed to {.warn}. `since` is the protocol revision
     # in which the feature entered the Deprecated state; `earliest_removal`
-    # is the soonest the registry allows it to go, and features that share a
-    # window carry the identical string.
+    # is the registry's "Earliest removal" cell verbatim, so features that
+    # share a window carry the identical string.
     REGISTRY = {
       roots: {
         feature: 'Roots',
         since: '2026-07-28',
         reference: 'SEP-2577',
-        earliest_removal: 'no earlier than twelve months after 2026-07-28',
+        earliest_removal: REVISION_AFTER_2027_07_28,
         migration: 'pass directories or files through tool parameters, resource URIs or server configuration'
       },
       sampling: {
         feature: 'Sampling',
         since: '2026-07-28',
         reference: 'SEP-2577',
-        earliest_removal: 'no earlier than twelve months after 2026-07-28',
+        earliest_removal: REVISION_AFTER_2027_07_28,
         migration: 'integrate directly with the LLM provider API instead of serving sampling/createMessage'
       },
       logging: {
         feature: 'Logging',
         since: '2026-07-28',
         reference: 'SEP-2577',
-        earliest_removal: 'no earlier than twelve months after 2026-07-28',
+        earliest_removal: REVISION_AFTER_2027_07_28,
         migration: 'have the server log to stderr (stdio) or use OpenTelemetry instead of notifications/message'
       },
       http_sse_transport: {
         feature: 'The HTTP+SSE transport',
         since: '2025-03-26',
         reference: 'reclassified by SEP-2596 in 2026-07-28',
-        earliest_removal: 'no earlier than three months after SEP-2596 is Final',
+        earliest_removal: 'three months after SEP-2596 reaches Final',
         migration: 'migrate the server to Streamable HTTP (MCPClient::ServerStreamableHTTP)'
       },
       include_context: {
         feature: 'The includeContext values "thisServer" and "allServers"',
         since: '2025-11-25',
         reference: 'reclassified by SEP-2596 in 2026-07-28',
-        earliest_removal: 'no earlier than twelve months after 2026-07-28',
+        earliest_removal: 'follows Sampling (SEP-2577)',
         migration: 'servers should omit includeContext or send "none"; the values are removed no later than Sampling'
       },
       dynamic_client_registration: {
         feature: 'OAuth 2.0 Dynamic Client Registration (RFC 7591)',
         since: '2026-07-28',
         reference: 'MCP PR #2858',
-        earliest_removal: 'no earlier than twelve months after 2026-07-28',
+        earliest_removal: REVISION_AFTER_2027_07_28,
         migration: 'prefer a Client ID Metadata Document (client_id_metadata_url) or pre-registered credentials'
       }
     }.freeze
@@ -73,6 +82,7 @@ module MCPClient
     @enabled = true
     @emitted = Set.new
     @mutex = Mutex.new
+    @owner_pid = Process.pid
 
     class << self
       # @return [Boolean] whether notices are logged (default true)
@@ -101,13 +111,13 @@ module MCPClient
         entry = REGISTRY[feature] or raise ArgumentError, "unknown deprecated feature: #{feature.inspect}"
         return false unless enabled? && logger
         return false unless accepts_warnings?(logger)
-        return false unless @mutex.synchronize { @emitted.add?(feature) }
+        return false unless @mutex.synchronize { emitted_set.add?(feature) }
 
         begin
           logger.warn(message(entry, detail))
           true
         rescue StandardError
-          @mutex.synchronize { @emitted.delete(feature) }
+          @mutex.synchronize { emitted_set.delete(feature) }
           false
         end
       end
@@ -115,17 +125,34 @@ module MCPClient
       # @param feature [Symbol] a {REGISTRY} key
       # @return [Boolean] whether the notice for the feature was already logged
       def emitted?(feature)
-        @mutex.synchronize { @emitted.include?(feature) }
+        @mutex.synchronize { emitted_set.include?(feature) }
       end
 
       # Forget which notices were emitted (each feature warns again on its
       # next use). Intended for tests.
       # @return [void]
       def reset!
-        @mutex.synchronize { @emitted.clear }
+        @mutex.synchronize do
+          @owner_pid = Process.pid
+          @emitted.clear
+        end
       end
 
       private
+
+      # The set of features already warned about IN THIS PROCESS. A prefork
+      # server (Puma, Unicorn) that warns while preloading would otherwise
+      # hand every worker an already-spent set and silence the worker's own
+      # first use, so an inherited set is dropped the first time the owning
+      # PID no longer matches. Callers hold @mutex.
+      # @return [Set<Symbol>]
+      def emitted_set
+        if @owner_pid != Process.pid
+          @owner_pid = Process.pid
+          @emitted = Set.new
+        end
+        @emitted
+      end
 
       # Whether the logger would keep a warning. Asking is itself protected:
       # a Logger subclass whose `level` accessor raises must not abort the
@@ -142,7 +169,8 @@ module MCPClient
       # @return [String] the notice text
       def message(entry, detail)
         text = "#{entry[:feature]} is deprecated since MCP #{entry[:since]} (#{entry[:reference]}); " \
-               "it keeps working during its deprecation window. Migration: #{entry[:migration]}."
+               'it keeps working during its deprecation window. Earliest removal: ' \
+               "#{entry[:earliest_removal]}. Migration: #{entry[:migration]}."
         detail ? "#{text} Received: #{sanitize(detail)}" : text
       end
 

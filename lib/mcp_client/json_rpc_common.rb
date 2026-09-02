@@ -6,6 +6,7 @@ require 'json'
 require 'zlib'
 require 'stringio'
 require_relative 'deep_copy'
+require_relative 'deprecation_notices'
 require_relative 'header_params'
 require_relative 'json_rpc_common/envelopes'
 require_relative 'json_rpc_common/error_bodies'
@@ -26,6 +27,7 @@ module MCPClient
     include InputWaits
     include RoundTripMarker
     include ResultCompleteness
+    include DeprecationNotices
     include SubscriptionSupport
     include InputRoundTrips
     include ResultCaching
