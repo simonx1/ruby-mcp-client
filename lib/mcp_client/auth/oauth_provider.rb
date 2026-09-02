@@ -102,7 +102,15 @@ module MCPClient
 
       # @param url [String] Server URL to normalize
       def server_url=(url)
-        @server_url = normalize_server_url(url)
+        normalized = normalize_server_url(url)
+        # Everything discovery leaves on the instance describes the resource
+        # it was discovered FOR. Retargeting the provider at another server
+        # must not let the previous server's metadata answer for the new one:
+        # the fallback that survives a backend which does not persist metadata
+        # would otherwise send the new server's authorization, registration
+        # and token requests to the previous server's endpoints.
+        forget_per_server_state if defined?(@server_url) && @server_url && normalized != @server_url
+        @server_url = normalized
       end
 
       # Set the Client ID Metadata Document URL (SEP-991), validating it per the
@@ -1220,6 +1228,33 @@ module MCPClient
                     'ignored while the authorization server differs from its issuer.')
       end
 
+      # Drop every piece of in-process state that belongs to one MCP server,
+      # so a retargeted provider discovers the new one from scratch:
+      #
+      # * the discovered-metadata fallback and the memoized scopes, which name
+      #   the previous server's authorization server and what it advertises;
+      # * the challenge state — an adopted document, a URL whose fetch is
+      #   still pending, a latched refusal and the scope the challenge asked
+      #   for — all of it said by the previous server's 401;
+      # * the resource metadata kept for scope resolution;
+      # * the "the authorization server changed" flag, which is a fact about
+      #   the previous server's history.
+      #
+      # Retirement markers are deliberately kept: they are keyed by the issuer
+      # the bytes were retired for, not by the resource URL, so they stay true
+      # when two MCP servers sit behind one authorization server.
+      # @return [void]
+      def forget_per_server_state
+        @discovered_server_metadata = nil
+        @supported_scopes = nil
+        @resource_metadata = nil
+        @challenge_resource_metadata = nil
+        @challenge_metadata_url = nil
+        @challenge_error = nil
+        @challenge_scope = nil
+        @authorization_server_switched = nil
+      end
+
       # Storage backends may persist plain hashes (the FileTokenStorage
       # example does); records are normalized before any field is read.
       # @return [ServerMetadata, nil]
@@ -1260,20 +1295,32 @@ module MCPClient
       end
 
       # RFC 6749 Section 5.1 makes access_token REQUIRED in a successful token
-      # response, so a record without those bytes is never a credential: its
-      # header would be a bare "Bearer ", attributed to whatever authorization
-      # server is current. Checked wherever a token is read, issued or applied.
+      # response, and it is a string: the bytes go into an `Authorization`
+      # header verbatim. A record whose access_token is absent, empty or of
+      # any other type is never a credential — its header would be a bare
+      # "Bearer " or, worse, `Bearer ["x"]`, a to_s of whatever JSON arrived,
+      # attributed to whatever authorization server is current. Checked
+      # wherever a token is read, issued or applied.
       # @param token [Object, nil] a token record
       # @return [Boolean] whether it carries access token bytes
       def token_bytes?(token)
-        token.respond_to?(:access_token) && !token.access_token.to_s.empty?
+        token.respond_to?(:access_token) && access_token_bytes?(token.access_token)
       end
 
-      # The same question about a parsed token endpoint response body.
-      # @param data [Hash] the parsed JSON body
+      # The same question about a parsed token endpoint response body. The
+      # body is peer-controlled JSON of any shape: `200 []` and `200 null`
+      # parse to an Array and to nil, which cannot be asked for a member at
+      # all, so the shape is established before the value is read.
+      # @param data [Object, nil] the parsed JSON body
       # @return [Boolean]
       def issued_access_token?(data)
-        !data['access_token'].to_s.empty?
+        data.is_a?(Hash) && access_token_bytes?(data['access_token'])
+      end
+
+      # @param value [Object, nil] a candidate access token
+      # @return [Boolean] whether it is a non-empty string of token bytes
+      def access_token_bytes?(value)
+        value.is_a?(String) && !value.empty?
       end
 
       # @param record [Object, Hash, nil]
@@ -1501,7 +1548,8 @@ module MCPClient
         raise_registration_failure!(response) unless response.success?
 
         data = JSON.parse(response.body)
-        logger.debug("OAuth client registered successfully: #{data['client_id']}")
+        client_id = registered_client_id!(data)
+        logger.debug("OAuth client registered successfully: #{client_id}")
 
         # Parse registered metadata from server response (may differ from our request)
         registered_metadata = ClientMetadata.new(
@@ -1530,7 +1578,7 @@ module MCPClient
         end
 
         client_info = ClientInfo.new(
-          client_id: data['client_id'],
+          client_id: client_id,
           client_secret: data['client_secret'],
           client_id_issued_at: data['client_id_issued_at'],
           client_secret_expires_at: data['client_secret_expires_at'],
@@ -1548,6 +1596,26 @@ module MCPClient
         raise MCPClient::Errors::ConnectionError, "Invalid client registration response: #{e.message}"
       rescue Faraday::Error => e
         raise MCPClient::Errors::ConnectionError, "Network error during client registration: #{e.message}"
+      end
+
+      # RFC 7591 Section 3.2.1 makes client_id REQUIRED in a registration
+      # response, and it is a string: it goes into the authorization URL and
+      # into every token request. A response without usable bytes has
+      # registered nothing — accepting it sends the user to the authorization
+      # endpoint with an empty (or a `to_s`-mangled) client_id, and the flow
+      # only fails on the way back, after the browser has already been opened.
+      # A registration response is refused here exactly as a token response
+      # without an access token is.
+      # @param data [Object, nil] the parsed JSON registration response
+      # @return [String] the registered client id
+      # @raise [MCPClient::Errors::ConnectionError] when the response names no client
+      def registered_client_id!(data)
+        client_id = data['client_id'] if data.is_a?(Hash)
+        return client_id if client_id.is_a?(String) && !client_id.empty?
+
+        raise MCPClient::Errors::ConnectionError,
+              'Client registration failed: the registration response carries no client_id ' \
+              '(RFC 7591 Section 3.2.1)'
       end
 
       # One Dynamic Client Registration request.
