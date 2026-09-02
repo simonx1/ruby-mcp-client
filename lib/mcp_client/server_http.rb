@@ -578,11 +578,6 @@ module MCPClient
     # Clean up the server connection
     # Properly closes HTTP connections and clears cached state
     def cleanup
-      # Everything this transport left on this thread — the notes of the
-      # entries it served and recorded, the credentials, parameters and
-      # metadata of its requests — describes a slice that will never be
-      # tagged and a request that will never be made.
-      forget_transport_thread_state
       @mutex.synchronize do
         # Attempt to terminate session before cleanup
         terminate_session if @session_id
@@ -610,6 +605,16 @@ module MCPClient
       # authorization context) that was just torn down; outside @mutex, as
       # the cache has its own lock.
       clear_result_cache
+    ensure
+      # Everything this transport left on this thread — the notes of the
+      # entries it served and recorded, the credentials, parameters and
+      # metadata of its requests — describes a slice that will never be
+      # tagged and a request that will never be made. Dropped after the
+      # session was terminated, never before: the DELETE that terminates it
+      # is a request of this transport's own, and the recorder on its
+      # connection would put its Authorization fingerprint straight back on
+      # this thread.
+      forget_transport_thread_state
     end
 
     private

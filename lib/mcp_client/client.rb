@@ -809,6 +809,15 @@ module MCPClient
       servers.all? do |server|
         cache_params_current?(kind, server) && (!server.respond_to?(:cache_fresh?) || server.cache_fresh?(kind))
       end
+    rescue StandardError
+      # One server's check aborted -- an OAuth refresh that failed, a host
+      # `request_meta` callable that raised -- so nothing is fetched from any
+      # of them. Every server the loop had already passed is still holding
+      # the evaluation this decision read for the fetch it would have made:
+      # dropped here, all of them, or an unrelated request on this worker
+      # thread would go out carrying that decision's tenant, baggage or nonce.
+      release_held_request_meta
+      raise
     end
 
     # A freshness check reads the parameters each server's next request
@@ -1509,6 +1518,19 @@ module MCPClient
       return nil unless server.respond_to?(:take_called_tool_definition, true)
 
       server.send(:take_called_tool_definition, tool_name.to_s)&.first
+    end
+
+    # The definition the transport's own tools/call request went out under,
+    # taken from the transport so it is spent on this one re-resolve.
+    # @param tool [MCPClient::Tool] the tool as resolved before the call
+    # @return [Array(MCPClient::Tool, nil), nil] a one-element array holding
+    #   the definition the call carried (its element is nil when the list no
+    #   longer carried the tool), or nil when the transport recorded none
+    def called_tool_definition(tool)
+      server = tool.server
+      return nil unless server.respond_to?(:take_called_tool_definition, true)
+
+      server.send(:take_called_tool_definition, tool.name.to_s)
     end
 
     # Reject a plain (synchronous) call for a tool whose execution.taskSupport is
