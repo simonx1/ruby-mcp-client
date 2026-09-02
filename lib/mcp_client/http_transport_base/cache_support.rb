@@ -138,7 +138,10 @@ module MCPClient
       def current_authorization_context(kind = nil)
         # The probe starts from the configured headers, as a real request
         # does: a provider without a token leaves a static header in place.
-        probe = HeaderProbe.new(@headers.to_h.dup)
+        # They are held in Faraday's own case-insensitive table, so the
+        # provider's `Authorization` replaces a header configured under any
+        # other spelling instead of being read past by the lookup below.
+        probe = HeaderProbe.new(faraday_headers(@headers))
         @oauth_provider&.apply_authorization(probe)
         headers = probe.headers
         if @faraday_config
@@ -179,8 +182,9 @@ module MCPClient
       # headers it would go out with. Only `on_request` hooks run: response
       # middleware (raise_error, a parser) never sees a response here, and
       # the recorder must not note the probe as a sent request. Middleware
-      # that overrides `call` cannot be run without sending, so the answer
-      # is then unknown.
+      # that overrides `call` cannot be run without sending, and middleware
+      # whose own state has moved on since the connection was built cannot
+      # be stood in for by a fresh copy; the answer is then unknown.
       # @param headers [Hash] the headers before middleware
       # @param method [String] the JSON-RPC method the probe models
       # @param params [Hash] its params
@@ -201,17 +205,74 @@ module MCPClient
           modern_request_headers(probe).each { |k, v| req.headers[k] = v } if modern?
         end
         env = request.to_env(conn)
-        conn.builder.handlers.each do |handler|
+        live = live_middleware(conn)
+        return nil if live.nil?
+
+        conn.builder.handlers.each_with_index do |handler, index|
+          # Middleware that is never run needs no stand-in: the recorder is
+          # the probe's own, and the transparent ones leave headers alone.
           next if handler.klass == AuthorizationRecorder
+          next if PROBE_TRANSPARENT_MIDDLEWARE.include?(handler.klass.name)
           return nil unless probe_runnable_middleware?(handler.klass)
 
+          # A copy is run rather than the instance Faraday calls, so the
+          # probe cannot disturb it — which is only faithful while the copy
+          # still holds the same state.
           middleware = handler.build(NOOP_APP)
+          return nil unless probe_stands_in_for?(middleware, live[index])
+
           middleware.on_request(env) if middleware.respond_to?(:on_request)
         end
         env.request_headers
       rescue StandardError => e
         @logger.debug("Could not run the Faraday middleware to probe the Authorization header: #{e.class}")
         nil
+      end
+
+      # The middleware instances Faraday actually calls, in the order of
+      # `builder.handlers`. Building the stack is what the first request
+      # does anyway, and it is the state of these instances — not of a fresh
+      # copy — that decides what the next request sends.
+      # @param conn [Faraday::Connection]
+      # @return [Array<Faraday::Middleware>, nil] nil when the stack cannot be walked
+      def live_middleware(conn)
+        node = conn.builder.app
+        instances = []
+        while node.is_a?(Faraday::Middleware)
+          instances << node
+          node = node.app
+        end
+        instances.size == conn.builder.handlers.size ? instances : nil
+      end
+
+      # Whether a freshly built middleware answers as the instance Faraday
+      # will call would. Middleware that keeps state of its own — a token
+      # rotated per request, anything learned from an earlier response —
+      # drifts from a fresh copy, and the copy would then keep predicting
+      # credentials the real request has already moved past. State the host
+      # keeps outside the middleware (a holder both instances point at) is
+      # shared, so those stacks stay predictable.
+      # @param fresh [Faraday::Middleware] the instance the probe would run
+      # @param live [Faraday::Middleware, nil] the instance Faraday calls
+      # @return [Boolean]
+      def probe_stands_in_for?(fresh, live)
+        return false unless live.instance_of?(fresh.class)
+
+        names = fresh.instance_variables | live.instance_variables
+        names.all? do |name|
+          # The app each instance wraps differs by construction (the probe
+          # ends at NOOP_APP) and never decides a header.
+          next true if name == :@app
+
+          same_middleware_state?(fresh.instance_variable_get(name), live.instance_variable_get(name))
+        end
+      end
+
+      # @return [Boolean] whether two middleware ivars hold indistinguishable state
+      def same_middleware_state?(one, other)
+        one.equal?(other) || one == other
+      rescue StandardError
+        false
       end
 
       # @param klass [Class] a middleware class on the connection

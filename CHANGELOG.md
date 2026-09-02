@@ -7,6 +7,18 @@ metadata). Each feature lands in its own PR; this section accumulates them.
 
 ### Cacheable results (`ttlMs` / `cacheScope`)
 
+- **One Authorization, and unpredictable middleware (round 24).** The
+  freshness probe resolves the `Authorization` a Faraday request would
+  really carry: the header table is case-insensitive, so a provider's
+  canonical write replaces a header configured under any other spelling
+  instead of leaving an older token behind for the fingerprint to find.
+  Host middleware (`faraday_config`) that keeps state of its own — a token
+  rotated per request, anything learned from an earlier response — is no
+  longer predicted from a fresh copy that has not seen those requests: the
+  probe reports the unknown context instead, so no private entry is served
+  for such a stack. Resource template lists are served from their fresh
+  entry on stdio too, which has no client-level cache above it.
+
 - **Generations, header spelling and arrival times (round 21).** Folding
   the per-URI invalidation generations past `MAX_READ_GENERATIONS` jumps
   the shared read generation past every count it absorbs, so no key's
