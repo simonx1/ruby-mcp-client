@@ -114,7 +114,9 @@ metadata). Each feature lands in its own PR; this section accumulates them.
   previous document and any refusal before the fetch, so a failed fetch
   leaves the flow waiting on the URL the current header named (the
   precheck fails and discovery retries it) instead of completing against
-  stale state.
+  stale state. A challenge naming the authorization server a stored token
+  is already bound to (another provider sharing the storage finished the
+  switch) retires nothing.
 
 ### Tasks extension (`io.modelcontextprotocol/tasks`)
 
