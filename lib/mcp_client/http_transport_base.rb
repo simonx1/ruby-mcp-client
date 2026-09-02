@@ -950,11 +950,14 @@ module MCPClient
       # Apply user's Faraday customizations after defaults
       @faraday_config&.call(conn)
 
-      # Appended last, so it is the innermost handler: its on_complete puts
-      # the streamed body back before any user middleware (raise_error and
-      # friends) inspects it, and the retry middleware above it re-enters it
-      # on every attempt.
+      # Appended below any user middleware: the capture's on_complete puts the
+      # streamed body back before raise_error and friends inspect it, and the
+      # retry middleware above re-enters it on every attempt.
       conn.builder.use(ResponseBodyCapture)
+      # Innermost of all, so its on_request sees the Authorization a request
+      # finally carries -- after the host's middleware has run (MCP 2026-07-28
+      # caching binds an entry to the credentials it was fetched with).
+      record_sent_authorization(conn)
 
       conn
     end
