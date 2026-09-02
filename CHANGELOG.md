@@ -165,7 +165,22 @@ metadata). Each feature lands in its own PR; this section accumulates them.
   for the registered `application_type`, so a shorthand or fully qualified
   loopback callback (`http://127.1/cb`, `http://127.0.0.1./cb`) registers
   as `native` instead of as a `web` client whose plain-HTTP redirect URI
-  the authorization server may reject.
+  the authorization server may reject. The local-development exception for
+  peer-advertised URLs is now loopback-only: it applies when the
+  *configured* server URL is loopback AND the advertised target is
+  loopback too, so a server on a private network (`10.0.0.5`,
+  `app.internal`, `printer.local`) no longer turns off the HTTPS
+  requirement or the local-address refusal, and not even a loopback server
+  can send the client to `169.254.169.254` or another private address. One
+  definition of loopback now serves the SSRF classifier, the registered
+  `application_type` and the plain-HTTP exception for configured and
+  discovered endpoints: RFC 6761 `*.localhost` names count as loopback
+  (`http://app.localhost:3000/cb` registers as `native`), and an HTTP
+  authorization or token endpoint on a loopback spelling (`http://127.1`,
+  `http://localhost.`, `http://[::ffff:127.0.0.1]`) is accepted like
+  `http://127.0.0.1`. A host is case-folded after its percent escapes are
+  decoded, so `%4Cocalhost` ("Localhost") classifies as loopback rather
+  than as an unknown public name.
 
 ### Tasks extension (`io.modelcontextprotocol/tasks`)
 
@@ -2003,7 +2018,11 @@ retries, logs and reflects back.
 - A server that advertises a cross-origin SSE `endpoint`, a plain-HTTP or loopback
   OAuth discovery URL, or redirects RPC POSTs off-origin will now be rejected. If
   you develop against a local stack, point the *configured* server URL at
-  localhost and the loopback exception still applies.
+  loopback (`localhost`, a `*.localhost` name, or any spelling of 127.0.0.0/8
+  or `::1`) and the exception still applies — but only to loopback discovery
+  URLs. A configured server URL that is merely private (`10.0.0.5`,
+  `app.internal`, `printer.local`) gets no exception at all: its discovery URLs
+  must be HTTPS and must not name a loopback or private address.
 - Set `max_decompressed_body_bytes:` if you legitimately exchange responses that
   expand beyond 64 MiB.
 - Development now expects Ruby 4.0.6 (`.ruby-version`); the gem still supports

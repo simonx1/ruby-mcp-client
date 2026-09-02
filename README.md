@@ -989,7 +989,7 @@ default behaviour — but it is worth knowing what the client will refuse:
 | `retry:` directives | Honored, but floored so `retry: 0` cannot drive a reconnect loop |
 | SSE event IDs | Bounded length, printable ASCII only (they are echoed in `Last-Event-ID`) |
 | Legacy SSE `endpoint` events | Must stay on the connection's origin; off-origin redirects are refused, so configured credential headers never reach another host |
-| OAuth discovery URLs from a peer | Must be HTTPS, and rejected when the host is a *literal* loopback/private/link-local address (unless the configured server is itself local); a refused challenge fails closed. Hostnames are not resolved, so a public name pointing at a private address is not caught — see the note below |
+| OAuth discovery URLs from a peer | Must be HTTPS, and rejected when the host is a *literal* loopback/private/link-local address. The only exception is a local stack: a configured server URL on the loopback interface (`localhost`, `*.localhost`, 127.0.0.0/8, `::1`) may be sent to a plain-HTTP *loopback* URL — never to a link-local or otherwise private one. A refused challenge fails closed. Hostnames are not resolved, so a public name pointing at a private address is not caught — see the note below |
 | Unsolicited JSON-RPC responses | Discarded — only IDs with an outstanding request are accepted |
 | Server-initiated requests | Replies are bounded by a concurrency budget rather than spawning unbounded threads |
 | Schema `pattern` values | Matched under a whole-operation time budget; a timeout fails validation rather than silently passing |

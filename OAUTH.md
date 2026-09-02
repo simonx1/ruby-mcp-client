@@ -75,8 +75,9 @@ The implementation follows the standard OAuth 2.1 authorization code flow with P
      path, the well-known segment is *inserted* (not appended); both `oauth-authorization-server` and
      `openid-configuration` forms are tried in priority order.
    - The discovered protected-resource `resource` is validated against the server host (confused-deputy
-     protection), and every authorization-server endpoint must use HTTPS (localhost is allowed for
-     local development).
+     protection), and every authorization-server endpoint must use HTTPS (plain HTTP is allowed on the
+     loopback interface — `localhost`, a `*.localhost` name, or any spelling of 127.0.0.0/8 or
+     `::1` — for local development).
 2. **Client Registration**: Automatically register OAuth client if dynamic registration is supported
 3. **Authorization**: Redirect user to authorization server with PKCE parameters
 4. **Token Exchange**: Exchange authorization code for access token using PKCE verifier
@@ -234,7 +235,8 @@ This implementation follows OAuth 2.1 security best practices:
 - **Confused-deputy protection**: the protected-resource metadata `resource` is validated against the
   server host before its advertised authorization server is trusted
 - **HTTPS is enforced** on all discovered authorization-server endpoints (authorization, token, and
-  registration), with a `localhost`/`127.0.0.1` exception for local development
+  registration), with a loopback exception (`localhost`, `*.localhost`, 127.0.0.0/8, `::1`, in
+  any spelling) for local development
 - **Secure token storage** guidelines should be followed
 
 ## Examples
