@@ -18,15 +18,18 @@ metadata). Each feature lands in its own PR; this section accumulates them.
   Everything keeps working; `MCPClient::Deprecations.enabled = false`
   silences the notices. The registry records when each feature entered the
   Deprecated state (the HTTP+SSE transport since 2025-03-26, the
-  `includeContext` values since 2025-11-25) because the deprecated features
-  registry sets their earliest removal separately; the HTTP+SSE notice is
-  logged once the transport is actually connected (so `MCPClient.connect`
-  probing a URL does not spend it), Logging warns on every entry point
-  (`log_level=` on a client or server, an incoming `notifications/message`),
-  a logger that drops warnings or raises does not consume the notice (a
-  logger failure never reaches the deprecated operation, and the logger is
-  called outside the registry's lock), and the deprecated APIs — including
-  each transport's `log_level=` — carry YARD `@deprecated` tags.
+  `includeContext` values since 2025-11-25) alongside each feature's
+  `earliest_removal`: only the HTTP+SSE transport has the short clock
+  (three months after SEP-2596 is Final), while the `includeContext` values
+  follow Sampling into the twelve-month window despite the earlier
+  deprecation date. The HTTP+SSE notice is logged once the transport is
+  actually connected (so `MCPClient.connect` probing a URL does not spend
+  it), Logging warns on every entry point (`log_level=` on a client or
+  server, an incoming `notifications/message`), a logger that drops
+  warnings, fails to report its level or raises does not consume the notice
+  (no logger failure ever reaches the deprecated operation, and the logger
+  is called outside the registry's lock), and the deprecated APIs —
+  including each transport's `log_level=` — carry YARD `@deprecated` tags.
 - **Documentation.** README documents the 2026-07-28 support (discovery
   and per-request metadata, multi round-trip requests, `x-mcp-header`,
   subscriptions, cacheable results, the tasks extension, authorization) and
