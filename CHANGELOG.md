@@ -80,7 +80,12 @@ metadata). Each feature lands in its own PR; this section accumulates them.
   `client_id_issued_at` is optional, so its absence proves nothing);
   credentials a host pre-registers should be stored with
   `registration_type: 'pre_registered'` so they survive an authorization
-  server change as a reported mismatch instead of a re-registration.
+  server change as a reported mismatch instead of a re-registration. The
+  client id an authorization request was made with is recorded with its
+  PKCE record, and the code is redeemed only with those credentials: a
+  record swapped in shared storage during the flow (another client id, or
+  credentials bound to another authorization server) ends the flow
+  instead of reaching the token endpoint.
 
 ### Tasks extension (`io.modelcontextprotocol/tasks`)
 

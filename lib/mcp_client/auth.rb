@@ -444,7 +444,8 @@ module MCPClient
 
     # PKCE (Proof Key for Code Exchange) helper
     class PKCE
-      attr_reader :code_verifier, :code_challenge, :code_challenge_method, :issuer, :iss_parameter_supported
+      attr_reader :code_verifier, :code_challenge, :code_challenge_method, :issuer, :iss_parameter_supported,
+                  :client_id
 
       # Generate PKCE parameters
       # @param code_verifier [String, nil] Existing code verifier (for deserialization)
@@ -455,13 +456,16 @@ module MCPClient
       # @param iss_parameter_supported [Boolean, nil] whether that authorization server advertised
       #   authorization_response_iss_parameter_supported, recorded with the request so the response
       #   is judged by the server the request went to
+      # @param client_id [String, nil] the client id the authorization request was made with, so the
+      #   code is redeemed with the same credentials
       def initialize(code_verifier: nil, code_challenge: nil, code_challenge_method: nil, issuer: nil,
-                     iss_parameter_supported: nil)
+                     iss_parameter_supported: nil, client_id: nil)
         @code_verifier = code_verifier || generate_code_verifier
         @code_challenge = code_challenge || generate_code_challenge(@code_verifier)
         @code_challenge_method = code_challenge_method || 'S256'
         @issuer = issuer
         @iss_parameter_supported = iss_parameter_supported
+        @client_id = client_id
       end
 
       # Convert to hash for serialization
@@ -474,6 +478,7 @@ module MCPClient
         }
         hash[:issuer] = @issuer if @issuer
         hash[:iss_parameter_supported] = @iss_parameter_supported unless @iss_parameter_supported.nil?
+        hash[:client_id] = @client_id if @client_id
         hash
       end
 
@@ -499,7 +504,7 @@ module MCPClient
         raise ArgumentError, 'Missing code_challenge' unless challenge
 
         new(code_verifier: verifier, code_challenge: challenge, code_challenge_method: method, issuer: issuer,
-            iss_parameter_supported: supported)
+            iss_parameter_supported: supported, client_id: data[:client_id] || data['client_id'])
       end
 
       private
