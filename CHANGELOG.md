@@ -97,8 +97,10 @@ metadata). Each feature lands in its own PR; this section accumulates them.
   dropped the field) fails closed like one without an issuer. A 401
   challenge retires the stored token only when its metadata would pass
   discovery's checks (the resource matches, the advertised authorization
-  server is an acceptable URL); `Token#to_h` keeps every legacy key and
-  adds `issuer` only when set.
+  server is an acceptable URL) and is otherwise refused whole, like a
+  challenge with an unacceptable metadata URL; the browser precheck also
+  fails while a refused or still-unfetched challenge is outstanding;
+  `Token#to_h` keeps every legacy key and adds `issuer` only when set.
 
 ### Tasks extension (`io.modelcontextprotocol/tasks`)
 

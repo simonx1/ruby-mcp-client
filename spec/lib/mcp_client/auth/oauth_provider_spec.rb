@@ -606,7 +606,7 @@ RSpec.describe MCPClient::Auth::OAuthProvider do
         allow(response).to receive(:headers).and_return('WWW-Authenticate' => www_authenticate)
         allow(oauth_provider).to receive(:fetch_resource_metadata).and_return(
           MCPClient::Auth::ResourceMetadata.new(
-            resource: 'https://example.com',
+            resource: server_url, # MCP 2026-07-28: a challenge naming another resource is refused
             authorization_servers: ['https://auth.example.com']
           )
         )

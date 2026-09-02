@@ -279,9 +279,14 @@ module MCPClient
         end
 
         cached = stored_server_metadata
-        # A challenge received meanwhile that names another authorization
-        # server, or cached metadata for another one, ends this flow here —
-        # not after a success page was shown.
+        # A challenge received meanwhile — refused, still to be fetched, or
+        # naming another authorization server — or cached metadata for
+        # another server ends this flow here, not after a success page.
+        if @challenge_error || @challenge_metadata_url
+          raise MCPClient::Errors::ConnectionError,
+                'Authorization response rejected: a challenge received during the flow must be resolved first; ' \
+                'restart the authorization'
+        end
         advertised = Array(@challenge_resource_metadata&.authorization_servers).first
         if (advertised && advertised != pkce.issuer) || (cached && cached.issuer != pkce.issuer)
           raise MCPClient::Errors::ConnectionError,
@@ -367,6 +372,9 @@ module MCPClient
         # This URL was explicitly advertised by the 401 challenge, so a 404 is a
         # misconfiguration to surface (strict), not a speculative miss to skip.
         metadata = fetch_resource_metadata(url, strict: true)
+        # Metadata discovery would reject is refused now, whole: it neither
+        # retires the token nor lingers as an authoritative challenge.
+        reject_unacceptable_challenge!(metadata)
         # Reuse this challenge-advertised metadata during the subsequent OAuth
         # flow instead of re-deriving (and possibly missing) the well-known URL.
         @challenge_resource_metadata = metadata
@@ -383,29 +391,29 @@ module MCPClient
         advertised = Array(resource_metadata&.authorization_servers).first
         known = stored_server_metadata&.issuer
         return unless advertised && known && advertised != known
-        # Only metadata discovery would accept can retire a token: a document
-        # for another resource or naming an unacceptable server is rejected
-        # later and must not cost the valid token now.
-        return unless challenge_metadata_acceptable?(resource_metadata, advertised)
 
         logger.debug('The challenge names another authorization server; retiring the stored token')
         @authorization_server_switched = true
         delete_token(bind_to: Token::RETIRED_ISSUER)
       end
 
-      # Whether challenge-advertised resource metadata passes the checks
-      # discovery applies before it is trusted (resource identity, an
-      # acceptable authorization server URL).
+      # Apply the checks discovery applies to challenge-advertised resource
+      # metadata (resource identity, an acceptable authorization server URL)
+      # before anything acts on it; a failing document refuses the whole
+      # challenge (see {#reject_challenge!}).
       # @param resource_metadata [ResourceMetadata]
-      # @param advertised [String] the advertised authorization server
-      # @return [Boolean]
-      def challenge_metadata_acceptable?(resource_metadata, advertised)
-        validate_resource_matches!(resource_metadata)
+      # @return [void]
+      # @raise [MCPClient::Errors::ConnectionError] when the challenge is refused
+      def reject_unacceptable_challenge!(resource_metadata)
+        begin
+          validate_resource_matches!(resource_metadata)
+        rescue MCPClient::Errors::ConnectionError => e
+          reject_challenge!(e.message)
+        end
+        advertised = Array(resource_metadata.authorization_servers).first
+        return unless advertised
+
         validate_peer_advertised_url!(advertised, 'authorization server URL (from resource metadata)')
-        true
-      rescue MCPClient::Errors::ConnectionError => e
-        logger.debug("Ignoring a challenge whose metadata discovery would reject: #{e.message}")
-        false
       end
 
       # Extract the protected-resource-metadata URL from a WWW-Authenticate header.
