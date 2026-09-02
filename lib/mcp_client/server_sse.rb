@@ -628,6 +628,13 @@ module MCPClient
     end
 
     # Register a callback for roots/list requests (MCP 2025-06-18)
+    #
+    # @deprecated Roots is deprecated since MCP 2026-07-28 (SEP-2577); earliest
+    #   removal is the first revision released on or after 2027-07-28. Registering
+    #   a handler is not itself use of Roots — a handler that answers with no root
+    #   exposes nothing deprecated — but a handler that answers with a root adopts
+    #   the deprecated feature and raises the notice. Pass directories or files
+    #   through tool parameters, resource URIs or server configuration instead.
     # @param block [Proc] callback that receives (request_id, params) and returns response hash
     # @return [void]
     def on_roots_list_request(&block)
@@ -635,6 +642,11 @@ module MCPClient
     end
 
     # Register a callback for sampling requests (MCP 2025-11-25)
+    #
+    # @deprecated Sampling is deprecated since MCP 2026-07-28 (SEP-2577); earliest
+    #   removal is the first revision released on or after 2027-07-28. Integrate
+    #   directly with the LLM provider API instead of serving
+    #   sampling/createMessage.
     # @param block [Proc] callback that receives (request_id, params) and returns response hash
     # @return [void]
     def on_sampling_request(&block)

@@ -85,7 +85,9 @@ RSpec.describe 'MCP 2026-07-28 deprecations (round 6)' do
     end
 
     it 'covers every API this gem marks deprecated' do
-      expect(tags.size).to be >= 7
+      # Round 8 added the sse_config builder and the Roots and Sampling
+      # callback registrations on all four transports.
+      expect(tags.size).to be >= 17
     end
 
     it 'cites the deprecation SEP and the earliest removal on each one' do

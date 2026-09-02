@@ -158,7 +158,9 @@ RSpec.describe 'MCP 2026-07-28 deprecations (round 7)' do
     # Feature lifecycle policy, tier-1 SDK obligation: an API that exposes a
     # deprecated feature names the SEP *and* the earliest removal wherever it
     # is documented. A keyword argument has no @deprecated tag of its own, so
-    # the round 6 tag sweep never reached these.
+    # the round 6 tag sweep never reached these. Round 8 extended the sweep to
+    # the transport callbacks a host registers when it drives a transport
+    # without a Client.
     def doc_block(source, start_pattern)
       lines = source.lines
       index = lines.index { |line| line.match?(start_pattern) }
@@ -177,12 +179,47 @@ RSpec.describe 'MCP 2026-07-28 deprecations (round 7)' do
     let(:client_source) { File.read(File.expand_path('../../../lib/mcp_client/client.rb', __dir__)) }
     let(:module_source) { File.read(File.expand_path('../../../lib/mcp_client.rb', __dir__)) }
 
+    # The @deprecated tag of the doc block above a definition.
+    def deprecated_tag_above(source, definition)
+      lines = source.lines
+      index = lines.index { |line| line.match?(definition) }
+      return nil unless index
+
+      start = index
+      start -= 1 while start.positive? && lines[start - 1].match?(/^\s*#/)
+      tag_at = (start...index).find { |i| lines[i].match?(/^\s*#\s*@deprecated\b/) }
+      return nil unless tag_at
+
+      text = +lines[tag_at].sub(/^\s*#\s?/, '').strip
+      lines[(tag_at + 1)...index].each do |line|
+        break if line.match?(/^\s*#\s*@\w/)
+
+        text << " #{line.sub(/^\s*#\s?/, '').strip}"
+      end
+      text
+    end
+
+    let(:transport_sources) do
+      %w[server_sse server_stdio server_http server_streamable_http].to_h do |name|
+        [name, File.read(File.expand_path("../../../lib/mcp_client/#{name}.rb", __dir__))]
+      end
+    end
+
+    let(:transport_callbacks) do
+      transport_sources.flat_map do |name, source|
+        [["#{name} on_roots_list_request",
+          deprecated_tag_above(source, /^\s*def on_roots_list_request\b/)],
+         ["#{name} on_sampling_request",
+          deprecated_tag_above(source, /^\s*def on_sampling_request\b/)]]
+      end
+    end
+
     let(:documented_apis) do
       [
         ['Client.new roots:', doc_block(client_source, /^\s*#\s*@param roots\b/)],
         ['Client.new sampling_handler:', doc_block(client_source, /^\s*#\s*@param sampling_handler\b/)],
         ['MCPClient.connect sampling_handler', doc_block(module_source, /^\s*#\s*-\s*sampling_handler\b/)]
-      ]
+      ] + transport_callbacks
     end
 
     it 'documents every one of them' do

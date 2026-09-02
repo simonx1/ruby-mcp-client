@@ -20,7 +20,7 @@ gem install ruby-mcp-client
 MCP enables AI assistants to discover and invoke external tools via different transport mechanisms:
 
 - **stdio** - Local processes implementing the MCP protocol
-- **SSE** - Server-Sent Events with streaming support
+- **SSE** *(deprecated)* - Server-Sent Events with streaming support; the HTTP+SSE transport is deprecated and new integrations should use **Streamable HTTP** instead (see [Deprecated features](#deprecated-features))
 - **HTTP** - Simple request/response (non-streaming)
 - **Streamable HTTP** - HTTP POST with SSE-formatted responses
 
@@ -67,9 +67,9 @@ The simplest way to connect to an MCP server:
 require 'mcp_client'
 
 # Auto-detect transport from URL
-client = MCPClient.connect('http://localhost:8000/sse')      # SSE
 client = MCPClient.connect('http://localhost:8931/mcp')      # Streamable HTTP
 client = MCPClient.connect('npx -y @modelcontextprotocol/server-filesystem /home')  # stdio
+client = MCPClient.connect('http://localhost:8000/sse')      # SSE (HTTP+SSE: deprecated, use Streamable HTTP)
 
 # With options
 client = MCPClient.connect('http://api.example.com/mcp',
@@ -80,7 +80,7 @@ client = MCPClient.connect('http://api.example.com/mcp',
 )
 
 # Multiple servers
-client = MCPClient.connect(['http://server1/mcp', 'http://server2/sse'])
+client = MCPClient.connect(['http://server1/mcp', 'http://server2/mcp'])
 
 # Force specific transport
 client = MCPClient.connect('http://custom.com/api', transport: :streamable_http)
@@ -103,7 +103,7 @@ protocol meaning, send it unchanged.
 
 | URL Pattern | Transport |
 |-------------|-----------|
-| Ends with `/sse` | SSE |
+| Ends with `/sse` | SSE — HTTP+SSE is *deprecated*, prefer Streamable HTTP ([Deprecated features](#deprecated-features)) |
 | Ends with `/mcp` | Streamable HTTP |
 | `stdio://command` or Array | stdio |
 | `npx`, `node`, `python`, etc. | stdio |
