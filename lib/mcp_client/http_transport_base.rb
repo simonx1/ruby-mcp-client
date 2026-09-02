@@ -7,6 +7,7 @@ require_relative 'auth/oauth_provider'
 require_relative 'http_transport_base/listen_stream'
 require_relative 'http_transport_base/cache_support'
 require_relative 'http_transport_base/tool_listing'
+require_relative 'http_transport_base/session_recovery'
 
 require_relative 'http_transport_base/param_headers'
 require_relative 'http_transport_base/request_recovery'
@@ -22,6 +23,7 @@ module MCPClient
     include ListenStream
     include CacheSupport
     include ToolListing
+    include SessionRecovery
 
     # Lightweight response wrapper for Faraday exception payloads (Hashes),
     # so the exception path and the default path share one challenge pipeline.
@@ -171,29 +173,6 @@ module MCPClient
       end
     end
 
-    # Resend a request against the freshly restarted session — unless doing so
-    # could execute a side effect twice.
-    #
-    # A 404 usually means the server rejected the request outright, but it does
-    # not prove that: a session can expire after the tool ran. Automatic
-    # session recovery is worth having for idempotent methods, and would
-    # otherwise be a hole straight through the no-replay guarantee that
-    # with_retry enforces for NON_IDEMPOTENT_METHODS.
-    #
-    # Raises ConnectionError (which with_retry never retries) so no other path
-    # can turn this into a second attempt.
-    # @param request [Hash] the JSON-RPC request that hit the expired session
-    # @return [Faraday::Response] the response to the resent request
-    # @raise [MCPClient::Errors::ConnectionError] for a non-idempotent method
-    def resend_after_session_restart(request)
-      method = request['method']
-      return send_http_request(request) unless NON_IDEMPOTENT_METHODS.include?(method)
-
-      raise MCPClient::Errors::ConnectionError,
-            "Session expired during #{method}; a new session was started but the request was NOT resent " \
-            'because it may already have executed. Retry it explicitly if that is safe.'
-    end
-
     # Validate session ID format
     # Per MCP 2025-11-25, the server-assigned session ID "MUST only contain
     # visible ASCII characters (ranging from 0x21 to 0x7E)" — e.g. a UUID, a
@@ -255,7 +234,6 @@ module MCPClient
     def configure_protocol_mode(protocol, discover_timeout)
       unless PROTOCOL_MODES.include?(protocol)
         raise ArgumentError, "protocol must be one of #{PROTOCOL_MODES.inspect}, got #{protocol.inspect}"
-      end
 
       @protocol_mode = protocol
       @discover_timeout = discover_timeout || @read_timeout
@@ -516,7 +494,15 @@ module MCPClient
       conn = http_connection
       # The session id this request goes out with: a later 404 is attributed
       # to it, not to a fresh session another caller established meanwhile.
-      sent_session_id = @mutex.synchronize { @session_id }
+      # The pin is re-checked in the same critical section: a cleanup or a
+      # reconnect completing between the check in #send_jsonrpc_request and
+      # this capture would otherwise select the session that replaced the
+      # one the request belongs to (the epoch is bumped before the session
+      # is torn down and re-established under this monitor).
+      sent_session_id = @mutex.synchronize do
+        check_session_pin!
+        @session_id
+      end
 
       begin
         response = post_json_rpc(conn) do |req|
@@ -621,43 +607,6 @@ module MCPClient
       cause = (error.wrapped_exception if error.respond_to?(:wrapped_exception)) || error.cause
       INTERRUPTED_EXCHANGE_ERRORS.any? { |klass| cause.is_a?(klass) }
     end
-
-    # Start a new session after the server invalidated the current one, then
-    # resend the original request once. The @restarting_session flag prevents
-    # a second restart if the fresh session also answers 404.
-    # @param request [Hash] the JSON-RPC request that hit the expired session
-    # @param expired_session_id [String] the session id the 404'd request was sent with
-    # @return [Faraday::Response] the response to the resent request
-    def restart_session_and_resend(request, expired_session_id)
-      # Serialized on the transport monitor so concurrent 404s trigger a
-      # single restart; the monitor is reentrant, so the nested
-      # perform_initialize/id generation inside is safe.
-      @mutex.synchronize do
-        # Recheck now that the monitor is held: another caller may already
-        # have restarted the session while this one waited. If so, skip the
-        # extra initialize and just resend against the fresh session.
-        return resend_after_session_restart(request) if @session_id != expired_session_id
-
-        @logger.warn("Session #{@session_id} no longer valid (HTTP 404); starting a new session")
-        @restarting_session = true
-        @session_id = nil
-        @last_event_id = nil if instance_variable_defined?(:@last_event_id)
-        perform_initialize
-        resend_after_session_restart(request)
-      ensure
-        @restarting_session = false
-      end
-    end
-
-    # Whether a 404 should trigger a session restart: only when the 404'd
-    # request was actually sent with a session id and no restart is already
-    # in flight (a restart's own resend answering 404 must not loop).
-    # @param sent_session_id [String, nil] session id captured when the request was sent
-    # @return [Boolean] true if session restart recovery applies
-    def session_restart_applicable?(sent_session_id)
-      return false if sent_session_id.nil?
-
-      @mutex.synchronize { !@restarting_session }
     end
 
     # Build the ServerError for a 4xx surfaced as a Faraday::ClientError by

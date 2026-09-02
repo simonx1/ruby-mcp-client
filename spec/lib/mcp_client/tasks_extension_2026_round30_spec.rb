@@ -174,28 +174,25 @@ RSpec.describe 'MCP 2026-07-28 tasks extension — round 30' do
       expect(wait[:ttl_deadline]).to be_nil
     end
 
-    it 'keeps polling the replacement session after a restart during the poll' do
+    it 'ends on the session that is over rather than on the ended session TTL' do
       client = client_for(stdio)
       negotiated(stdio)
       polls = 0
       allow(client).to receive(:poll_task) do |wait|
         polls += 1
         wait[:polled] = true
-        if polls == 1
-          # The poll timed out; the server restarted while it was outstanding.
-          wait[:ttl_deadline] = monotonic - 1
-          stdio.send(:bump_session_epoch)
-          nil
-        else
-          MCPClient::Task.from_json(detailed_task(status: 'completed', 'result' => call_result),
-                                    server: stdio, detailed: true)
-        end
+        # The poll timed out; the server restarted while it was outstanding.
+        wait[:ttl_deadline] = monotonic - 1
+        stdio.send(:bump_session_epoch)
+        nil
       end
 
-      task = client.wait_for_task('task-1', server: stdio, timeout: 2)
-
-      expect(task.status).to eq('completed')
-      expect(polls).to eq(2)
+      # The stale backstop is dropped all the same — what ends the wait is the
+      # session the task belonged to being over, not a TTL it no longer has
+      # (round 33: the reused id is never polled in the new session).
+      expect { client.wait_for_task('task-1', server: stdio, timeout: 2) }
+        .to raise_error(MCPClient::Errors::TaskError, /session it belongs to ended/i)
+      expect(polls).to eq(1)
     end
   end
 

@@ -7,6 +7,32 @@ metadata). Each feature lands in its own PR; this section accumulates them.
 
 ### Tasks extension (`io.modelcontextprotocol/tasks`)
 
+- **An HTTP session restart moves the epoch, and a wait ends with its
+  session (round 32).** The automatic recovery from an expired HTTP session
+  (a 404 answering a request that carried an `Mcp-Session-Id`, which the
+  client answers with a fresh `initialize`) now ends the session it
+  replaces: the session epoch moves, so the task bookkeeping keyed by it —
+  answered keys, pending answers, in-flight holds, rounds — dies with the
+  old session instead of colouring a reused task id in the new one, and a
+  wait notices the move exactly as it does for a cleanup or a restarted
+  stdio process. A request pinned to the ended session is no longer resent
+  into its replacement (the 404 recovery resent it without re-checking the
+  pin), and every transport now checks the pin in the same critical section
+  that picks the session the request goes out on — the HTTP session id, the
+  stdio pipe, the SSE endpoint — so a cleanup or reconnect completing after
+  the check cannot put the request on the replacement session's wire. A
+  wait no longer follows a restart into the new session at all: a
+  terminal payload that came back from a poll pinned to the wait's own
+  session *is* the task's outcome even when the session ends right after,
+  and short of that the wait fails (`TaskError`) rather than polling an id
+  the replacement session may have reused for an unrelated task —
+  `wait_for_task` and `get_task` refuse a task handle whose session has
+  ended (as `update_task` and `cancel_task` already did), and so does the
+  legacy `tasks/result`, which is now pinned to the handle's session too. A
+  session that moves while the wait sleeps between polls ends it there
+  rather than being silently joined. A `tasks/update` the session guard
+  drops now gives its keys back in the state the answers were built in,
+  never in the replacement session's.
 - **Polls are pinned to their session, terminal results never cross it
   (round 31).** `tasks/get` is now pinned to the session the wait joined,
   like `tasks/update`: a reconnect inside `rpc_request` makes the transport

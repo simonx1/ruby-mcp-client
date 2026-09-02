@@ -6,10 +6,12 @@ TASKS_EXT = MCPClient::JsonRpcCommon::TASKS_EXTENSION unless defined?(TASKS_EXT)
 
 # MCP 2026-07-28 tasks extension, thirty-second round: every task request is
 # pinned to the session it belongs to (tasks/get and the explicit
-# tasks/update / tasks/cancel of a handle, not only the wait's updates), a
-# terminal observation never crosses a session move, and no bookkeeping of the
-# session that replaced the one a request belongs to is forgotten on its
-# behalf.
+# tasks/update / tasks/cancel of a handle, not only the wait's updates), what
+# a session answered stays that session's (round 33 settled that a terminal
+# payload the wait's own session answered is the outcome, and that the
+# replacement session is never polled for the reused id), and no bookkeeping
+# of the session that replaced the one a request belongs to is forgotten on
+# its behalf.
 RSpec.describe 'MCP 2026-07-28 tasks extension — round 32' do
   def discover_result
     { 'resultType' => 'complete', 'supportedVersions' => ['2026-07-28'],
@@ -103,70 +105,63 @@ RSpec.describe 'MCP 2026-07-28 tasks extension — round 32' do
     end
   end
 
-  describe 'a terminal observation of a session the wait has left' do
-    it 'is never returned as the task result' do
+  # Round 33 settled which side of a session move a terminal payload belongs
+  # to: the poll was pinned to the wait's own session, so what came back is
+  # this task's outcome; the session that replaced it is never asked about
+  # the reused id.
+  describe 'a session that ends around a terminal observation' do
+    it 'returns the payload the wait own session answered' do
       client = client_for(stdio)
       negotiated(stdio)
       polls = 0
       allow(client).to receive(:poll_task) do |w|
         polls += 1
         w[:polled] = true
-        if polls == 1
-          observation = task_from(detailed_task(status: 'completed', 'result' => call_result('other lifetime')))
-          stdio.send(:bump_session_epoch)
-          observation
-        else
-          task_from(detailed_task(status: 'completed', 'result' => call_result('this task')))
-        end
+        observation = task_from(detailed_task(status: 'completed', 'result' => call_result('this task')))
+        stdio.send(:bump_session_epoch)
+        observation
       end
 
       result = client.wait_for_task('task-1', server: stdio, timeout: 2)
       expect(result.result).to eq(call_result('this task'))
-      expect(polls).to eq(2)
+      expect(polls).to eq(1)
     end
 
-    it 'does not raise the failure of another lifetime of the task id' do
+    it 'raises no failure of another lifetime of the task id' do
       client = client_for(stdio)
       negotiated(stdio)
       polls = 0
       allow(client).to receive(:poll_task) do |w|
         polls += 1
         w[:polled] = true
-        if polls == 1
-          observation = task_from(detailed_task(status: 'failed',
-                                                'error' => { 'code' => -32_000, 'message' => 'other lifetime' }))
-          stdio.send(:bump_session_epoch)
-          observation
-        else
-          task_from(detailed_task(status: 'completed', 'result' => call_result))
-        end
+        observation = task_from(detailed_task(status: 'failed',
+                                              'error' => { 'code' => -32_000, 'message' => 'this task' }))
+        stdio.send(:bump_session_epoch)
+        observation
       end
 
-      expect(client.wait_for_task('task-1', server: stdio, timeout: 2).status).to eq('completed')
-      expect(polls).to eq(2)
+      # The failure the wait's own session reported, and no poll of the id in
+      # the session that replaced it (whose task-1 may be anything at all).
+      expect(client.wait_for_task('task-1', server: stdio, timeout: 2).error['message']).to eq('this task')
+      expect(polls).to eq(1)
     end
 
     it 'forgets nothing of the session that replaced it' do
       client = client_for(stdio)
       negotiated(stdio)
       polls = 0
-      survived = nil
       allow(client).to receive(:poll_task) do |w|
         polls += 1
         w[:polled] = true
-        if polls == 1
-          observation = task_from(detailed_task(status: 'completed', 'result' => call_result))
-          stdio.send(:bump_session_epoch)
-          client.send(:remember_answered_keys, stdio, 'task-1', ['k9'])
-          observation
-        else
-          survived = client.send(:answered_task_keys, stdio, 'task-1').include?('k9')
-          task_from(detailed_task(status: 'completed', 'result' => call_result))
-        end
+        observation = task_from(detailed_task(status: 'completed', 'result' => call_result))
+        stdio.send(:bump_session_epoch)
+        client.send(:remember_answered_keys, stdio, 'task-1', ['k9'])
+        observation
       end
 
       expect(client.wait_for_task('task-1', server: stdio, timeout: 2).status).to eq('completed')
-      expect(survived).to be(true)
+      expect(polls).to eq(1)
+      expect(client.send(:answered_task_keys, stdio, 'task-1')).to include('k9')
     end
   end
 
@@ -188,9 +183,12 @@ RSpec.describe 'MCP 2026-07-28 tasks extension — round 32' do
         end
       end
 
-      expect(client.wait_for_task('task-1', server: stdio, timeout: 2).status).to eq('completed')
+      # The session did not survive the round trip, and neither does the
+      # wait: the task is gone with it (round 33).
+      expect { client.wait_for_task('task-1', server: stdio, timeout: 2) }
+        .to raise_error(MCPClient::Errors::TaskError, /session it belongs to ended/i)
       expect(asked).to eq(0)
-      expect(polls).to eq(2)
+      expect(polls).to eq(1)
     end
   end
 

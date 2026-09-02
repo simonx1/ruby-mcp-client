@@ -186,7 +186,15 @@ module MCPClient
       def post_json_rpc_request(request)
         uri = URI.parse(@base_url)
         base = "#{uri.scheme}://#{uri.host}:#{uri.port}"
-        rpc_ep = @mutex.synchronize { @rpc_endpoint }
+        # The endpoint this request goes to, and the pin checked in the same
+        # critical section: a reconnect completing between the check in
+        # #send_jsonrpc_request and this capture would otherwise post a
+        # request of the ended session to the session that replaced it
+        # (cleanup bumps the epoch before it takes this monitor).
+        rpc_ep = @mutex.synchronize do
+          check_session_pin!
+          @rpc_endpoint
+        end
 
         @rpc_conn ||= create_json_rpc_connection(base)
 

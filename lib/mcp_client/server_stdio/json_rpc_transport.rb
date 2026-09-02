@@ -638,7 +638,17 @@ module MCPClient
         @logger.debug("Sending JSONRPC request: #{describe_jsonrpc_message(req)}")
         raise IOError, 'the server process is gone' unless io
 
+        # The pin is checked in the same critical section the handles are
+        # swapped under, so a restart completing between the caller's check
+        # and this write cannot carry a request of the ended session; the
+        # write itself goes to the pipe this request was recorded against,
+        # never to whichever pipe the transport holds by now.
+        @mutex.synchronize { check_session_pin! }
         io.puts(req.to_json)
+      rescue MCPClient::Errors::SessionChangedError
+        # Nothing was written, and nothing will answer this id.
+        @mutex.synchronize { @awaiting.delete(req['id']) } if req.is_a?(Hash) && req['id']
+        raise
       rescue StandardError => e
         # A request that failed to send will never receive a response, so drop
         # its awaiting marker; otherwise a broken transport (e.g. the server
