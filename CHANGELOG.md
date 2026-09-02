@@ -85,7 +85,14 @@ metadata). Each feature lands in its own PR; this section accumulates them.
   PKCE record, and the code is redeemed only with those credentials: a
   record swapped in shared storage during the flow (another client id, or
   credentials bound to another authorization server) ends the flow
-  instead of reaching the token endpoint.
+  instead of reaching the token endpoint. An unbound record swapped in
+  meanwhile counts as changed credentials; the callback precheck
+  (`validate_authorization_response!`) also fails when a challenge or
+  cached metadata names another authorization server or the stored
+  credentials changed, so the browser never sees a success page for a
+  callback the flow rejects; in-process retirement markers are scoped by
+  issuer, so another provider sharing the storage may store the same
+  opaque bytes issued by a new authorization server.
 
 ### Tasks extension (`io.modelcontextprotocol/tasks`)
 
