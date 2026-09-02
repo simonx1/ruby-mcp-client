@@ -1,6 +1,8 @@
 # frozen_string_literal: true
 
 require 'uri'
+require_relative 'schema_validator/dialects'
+require_relative 'schema_validator/normalization'
 require_relative 'schema_validator/references'
 require_relative 'schema_validator/keyword_scan'
 
@@ -51,6 +53,8 @@ module MCPClient
   # never silent, {.unsupported_keywords} reports which unapplied validation
   # keywords a schema uses; callers surface them as a warning.
   module SchemaValidator
+    extend Dialects
+    extend Normalization
     extend References
     extend KeywordScan
 
@@ -167,41 +171,13 @@ module MCPClient
     # so a peer-supplied document is never copied whole.
     class TooLarge < StandardError; end
 
-    # Structural objects (schemas and the keyword maps holding them) a
-    # schema document may contain before it is rejected unread. A usable
-    # schema has at most MAX_SUBSCHEMAS subschemas, each with a handful of
-    # keyword maps at most, so this bound only ever stops documents the
-    # preflight would reject anyway.
+    # Structural elements (schemas, the keyword maps holding them, and array
+    # members — boolean subschemas included) a schema document may contain
+    # before it is rejected unread. A usable schema has at most
+    # MAX_SUBSCHEMAS subschemas, each with a handful of keyword maps at
+    # most, so this bound only ever stops documents the preflight would
+    # reject anyway.
     MAX_STRUCTURAL_OBJECTS = MAX_SUBSCHEMAS * 4
-
-    # The dialect a schema declares, or the default.
-    # @param schema [Object] the schema
-    # @return [String] the `$schema` value (without a trailing `#`), or DEFAULT_DIALECT
-    def self.dialect(schema)
-      return DEFAULT_DIALECT unless schema.is_a?(Hash)
-      return DEFAULT_DIALECT unless schema.key?('$schema') || schema.key?(:$schema)
-
-      declared = schema.key?('$schema') ? schema['$schema'] : schema[:$schema]
-      # A declaration that is present but unusable is not the default.
-      return nil unless declared.is_a?(String) && !declared.empty?
-
-      declared.sub(/#\z/, '')
-    end
-
-    # The supported dialect a declared URI stands for (scheme-insensitive),
-    # or nil.
-    # @param uri [String]
-    # @return [String, nil]
-    def self.canonical_dialect(uri)
-      canonical = uri.sub(/#\z/, '').sub(%r{\Ahttps?://}, '')
-      SUPPORTED_DIALECTS.find { |d| d.sub(%r{\Ahttps?://}, '') == canonical }
-    end
-
-    # @param uri [String]
-    # @return [Boolean]
-    def self.supported_dialect?(uri)
-      !canonical_dialect(uri).nil?
-    end
 
     # Check that a schema can be used at all: it is an object or a boolean,
     # its dialect is supported, it stays within the resource bounds, and
@@ -245,20 +221,27 @@ module MCPClient
 
     # Walk every subschema position, checking bounds and references. A
     # schema object is walked once, however many positions or references
-    # lead to it, so a recursive schema stays within the bounds.
+    # lead to it, so a recursive schema stays within the bounds. The dialect
+    # follows the resource: an embedded resource declaring `$schema` is
+    # walked under its own dialect.
     # @return [void]
-    def self.walk_schema(schema, root, depth, counter, problems)
+    def self.walk_schema(schema, root, depth, counter, problems, dialect = counter[:dialect])
       return unless problems.empty? && schema_value?(schema)
       return unless admit_schema?(schema, depth, counter, problems)
 
-      dialect = counter[:dialect]
+      if resource_start?(schema) && schema.key?('$schema')
+        problem = embedded_dialect_problem(schema)
+        return problems << problem if problem
+
+        dialect = embedded_dialect(schema, dialect)
+      end
       check_ref(schema, root, depth, problems, dialect, counter) if schema.key?('$ref')
       # draft-07: the $ref replaces its siblings, so the applicators next to
       # it are never applied and are not preflighted either; definitions are
       # a bag of reusable schemas, not applicators, and stay reachable
       # through references.
       if dialect == DRAFT_07 && schema.key?('$ref')
-        each_definition(schema, dialect) { |sub| walk_schema(sub, root, depth + 1, counter, problems) }
+        each_definition(schema, dialect) { |sub| walk_schema(sub, root, depth + 1, counter, problems, dialect) }
         return
       end
 
@@ -272,7 +255,7 @@ module MCPClient
       end
       check_applicator_shapes(schema, dialect, problems)
       check_exclusive_bounds(schema, dialect, problems)
-      each_subschema(schema, dialect) { |sub| walk_schema(sub, root, depth + 1, counter, problems) }
+      each_subschema(schema, dialect) { |sub| walk_schema(sub, root, depth + 1, counter, problems, dialect) }
     end
 
     # Account for a schema object about to be walked: once per object, and
@@ -416,8 +399,9 @@ module MCPClient
         return
       end
 
-      problem = ref_chain_problem(ref, root, dialect, counter, from: schema) do |target|
-        walk_schema(target, root, depth + 1, counter, problems)
+      problem = ref_chain_problem(ref, root, counter[:dialect], counter, from: schema) do |target|
+        # What a reference reaches is walked under its own resource's dialect.
+        walk_schema(target, root, depth + 1, counter, problems, indexed_dialect(target, counter) || dialect)
       end
       problems << problem if problem
     end
@@ -520,8 +504,10 @@ module MCPClient
       return [] unless schema.is_a?(Hash)
 
       # draft-07: "$ref" replaces the schema it appears in; later drafts
-      # apply it alongside the sibling keywords.
-      return validate_ref(data, schema, path, ctx, ref_depth) if schema.key?('$ref') && ctx.dialect == DRAFT_07
+      # apply it alongside the sibling keywords. The dialect is the one of
+      # the schema resource the node belongs to.
+      dialect = node_dialect(schema, ctx)
+      return validate_ref(data, schema, path, ctx, ref_depth) if schema.key?('$ref') && dialect == DRAFT_07
 
       errors = []
       counted_before = ctx.errors
@@ -530,14 +516,23 @@ module MCPClient
       errors.concat(validate_enum(data, schema, path))
       case data
       when Hash then errors.concat(validate_object(data, schema, path, ctx, ref_depth))
-      when Array then errors.concat(validate_array(data, schema, path, ctx, ref_depth))
+      when Array then errors.concat(validate_array(data, schema, path, ctx, ref_depth, dialect))
       when String then errors.concat(validate_string(data, schema, path, ctx.deadline))
-      when Numeric then errors.concat(validate_number(data, schema, path, ctx.dialect))
+      when Numeric then errors.concat(validate_number(data, schema, path, dialect))
       end
       errors.concat(validate_composition(data, schema, path, ctx, ref_depth))
       # Errors raised by nested nodes were counted when they were produced;
       # only this node's own errors are new.
       count_errors(ctx, errors, already_counted: ctx.errors - counted_before)
+    end
+
+    # The dialect in force at a schema object during validation: the one
+    # recorded for its resource by the anchor index (built once per
+    # validation), else the root's.
+    # @return [String, nil]
+    def self.node_dialect(schema, ctx)
+      ctx.anchors ||= anchor_index(ctx.root, ctx.dialect)
+      indexed_dialect(schema, ctx) || ctx.dialect
     end
 
     # Run a branch whose errors are only a verdict (anyOf/oneOf candidates,
@@ -754,7 +749,7 @@ module MCPClient
     # @param schema [Hash] string-keyed schema
     # @param path [String] location for error messages
     # @return [Array<String>] validation errors
-    def self.validate_array(data, schema, path, ctx, ref_depth)
+    def self.validate_array(data, schema, path, ctx, ref_depth, dialect = ctx.dialect)
       errors = []
       min_items = schema['minItems']
       max_items = schema['maxItems']
@@ -768,7 +763,7 @@ module MCPClient
       # 2020-12 puts positional schemas in prefixItems (items must be a
       # schema); draft-07 and 2019-09 put them in an items array and know no
       # prefixItems.
-      positional = if ctx.dialect == DEFAULT_DIALECT
+      positional = if dialect == DEFAULT_DIALECT
                      schema['prefixItems'].is_a?(Array) ? schema['prefixItems'] : []
                    else
                      items.is_a?(Array) ? items : []
@@ -861,44 +856,20 @@ module MCPClient
       maximum = schema['maximum']
       exclusive_min = schema['exclusiveMinimum']
       exclusive_max = schema['exclusiveMaximum']
-      errors << "#{path}: value #{data} is less than minimum #{minimum}" if minimum.is_a?(Numeric) && data < minimum
-      errors << "#{path}: value #{data} is greater than maximum #{maximum}" if maximum.is_a?(Numeric) && data > maximum
+      shown = clip_value(data)
+      if minimum.is_a?(Numeric) && data < minimum
+        errors << "#{path}: value #{shown} is less than minimum #{clip_value(minimum)}"
+      end
+      if maximum.is_a?(Numeric) && data > maximum
+        errors << "#{path}: value #{shown} is greater than maximum #{clip_value(maximum)}"
+      end
       if exclusive_min.is_a?(Numeric) && data <= exclusive_min
-        errors << "#{path}: value #{data} must be greater than exclusiveMinimum #{exclusive_min}"
+        errors << "#{path}: value #{shown} must be greater than exclusiveMinimum #{clip_value(exclusive_min)}"
       end
       if exclusive_max.is_a?(Numeric) && data >= exclusive_max
-        errors << "#{path}: value #{data} must be less than exclusiveMaximum #{exclusive_max}"
+        errors << "#{path}: value #{shown} must be less than exclusiveMaximum #{clip_value(exclusive_max)}"
       end
       errors
-    end
-
-    # A copy of the schema with every structural Hash key as a String, so
-    # keyword lookups and JSON pointers see one key form. Data-carrying
-    # keywords (enum, const, default, examples) are left exactly as given,
-    # the walk stops at the nesting bound, and — given a budget — the copy
-    # stops as soon as the document holds more structural objects than
-    # MAX_STRUCTURAL_OBJECTS, before the rest is ever read.
-    # @param node [Object]
-    # @param depth [Integer]
-    # @param budget [Hash, nil] :objects copied so far
-    # @return [Object]
-    # @raise [TooLarge] when the budget is exceeded
-    def self.deep_stringify(node, depth = 0, budget = nil)
-      return node if depth > MAX_SCHEMA_DEPTH + 1
-
-      case node
-      when Hash
-        if budget && (budget[:objects] += 1) > MAX_STRUCTURAL_OBJECTS
-          raise TooLarge, "schema has more than #{MAX_STRUCTURAL_OBJECTS} objects"
-        end
-
-        node.to_h do |key, value|
-          name = key.to_s
-          [name, DATA_KEYWORDS.include?(name) ? value : deep_stringify(value, depth + 1, budget)]
-        end
-      when Array then node.map { |value| deep_stringify(value, depth + 1, budget) }
-      else node
-      end
     end
 
     # Bound a piece of peer-derived text destined for a message.
