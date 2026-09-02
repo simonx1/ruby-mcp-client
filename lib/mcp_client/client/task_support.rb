@@ -85,7 +85,8 @@ module MCPClient
         # the TTL may change with every observation (the server MAY extend
         # it) while the caller's timeout never moves.
         wait = { task_id: task_id, srv: srv, deadline: timeout && (monotonic_time + timeout), ttl_deadline: nil,
-                 answered: answered_task_keys(srv, task_id), last: nil }
+                 answered: nil, epoch: nil, last: nil }
+        refresh_wait_session(wait)
         # The CreateTaskResult seed is not an observation: the first
         # tasks/get goes out at once, whatever the seed claims. Its TTL
         # still bounds a wait whose polls never come back, and its
@@ -120,6 +121,10 @@ module MCPClient
           # that came back late (transport retries) ends the wait here.
           bound_wait_by_ttl(current, wait)
           raise_if_past_deadline!(wait)
+          # The server may have restarted since the last poll: the task id
+          # and its keys then belong to a new session, and so must the
+          # answered set this wait reserves keys in.
+          refresh_wait_session(wait)
           retransmit_pending_update(wait)
           # No new handler round once the wait is over, whatever the
           # retransmission took.
@@ -209,19 +214,36 @@ module MCPClient
         task_state(srv, task_id)[:answered]
       end
 
+      # Point a wait at the task state of the server's current session: a
+      # wait that outlives a restart must reserve keys in the new session's
+      # answered set, since the restarted server may reuse the task id and
+      # its keys for what is a new request.
+      # @param wait [Hash]
+      # @return [void]
+      def refresh_wait_session(wait)
+        epoch = current_session_epoch(wait[:srv])
+        return if wait[:epoch] == epoch && wait[:answered]
+
+        wait[:epoch] = epoch
+        wait[:answered] = answered_task_keys(wait[:srv], wait[:task_id])
+      end
+
       # Per-task bookkeeping shared by every wait on the task: the answered
       # keys, the input rounds spent, an update still to be delivered and
       # the lock that serializes its updates. Task ids are per server
       # session (a restarted stdio process may reuse them), so the state is
-      # keyed by the transport's session epoch too and dies with it.
+      # keyed by the transport's session epoch too and dies with it. The
+      # epoch is read under the lock and never runs backwards: a caller
+      # that read it before a restart gets the current session's state and
+      # cannot delete it or bring an older session back.
       # @return [Hash]
       def task_state(srv, task_id)
-        key = task_state_key(srv, task_id)
         answered_keys_mutex.synchronize do
           @task_states ||= {}
+          key = [srv.object_id, current_session_epoch(srv), task_id]
           # A previous session of this server is over: its state (answered
           # keys, pending answers) is dropped, not left behind.
-          @task_states.delete_if { |other, _| other[0] == key[0] && other[1] != key[1] }
+          @task_states.delete_if { |other, _| other[0] == key[0] && other[1] < key[1] }
           @task_states[key] ||= { answered: Set.new, submitted: Set.new, rounds: 0,
                                   pending_update: nil, update_mutex: Mutex.new }
         end
@@ -230,13 +252,27 @@ module MCPClient
       # Forget every task's bookkeeping (the client is being cleaned up).
       # @return [void]
       def clear_task_states
-        answered_keys_mutex.synchronize { @task_states = nil }
+        answered_keys_mutex.synchronize do
+          @task_states = nil
+          @task_session_epochs = nil
+        end
+      end
+
+      # The server's session epoch as this client knows it, monotonic: the
+      # highest value ever read wins, so a stale reading never reopens an
+      # ended session. Callers hold answered_keys_mutex or do not care about
+      # a concurrent bump (the next task_state resolves it).
+      # @return [Integer]
+      def current_session_epoch(srv)
+        read = srv.respond_to?(:session_epoch) ? srv.session_epoch : 0
+        @task_session_epochs ||= {}.compare_by_identity
+        seen = @task_session_epochs[srv] || 0
+        @task_session_epochs[srv] = [read, seen].max
       end
 
       # @return [Array] the registry key of a task's state
       def task_state_key(srv, task_id)
-        epoch = srv.respond_to?(:session_epoch) ? srv.session_epoch : 0
-        [srv.object_id, epoch, task_id]
+        [srv.object_id, current_session_epoch(srv), task_id]
       end
 
       # The pace before the server ever said one (a bare task id, a handle
@@ -477,8 +513,35 @@ module MCPClient
 
         field = task.failed? ? 'error' : 'result'
         present = task.failed? ? !task.error.nil? : !task.result.nil?
-        problem = present ? "with a #{field} that is not an object" : "without the #{field} field"
+        shape = task.failed? ? 'a JSON-RPC error object (integer code, string message)' : 'an object'
+        problem = present ? "with #{field} that is not #{shape}" : "without the #{field} field"
         raise MCPClient::Errors::InvalidResultError, "Invalid task: status #{task.status} #{problem}"
+      end
+
+      # A modern tasks/get result is a DetailedTask: every field the Task
+      # shape requires must be there (ttlMs may be null but must be
+      # present), since a defaulted status or a missing TTL would drive the
+      # wait on made-up state.
+      # @param result [Object] the raw tasks/get result
+      # @return [void]
+      # @raise [MCPClient::Errors::InvalidResultError]
+      def validate_detailed_task_shape!(result)
+        problem = detailed_task_shape_problem(result)
+        raise MCPClient::Errors::InvalidResultError, "Invalid tasks/get result: #{problem}" if problem
+      end
+
+      # @return [String, nil] what is wrong with a DetailedTask's shape
+      def detailed_task_shape_problem(result)
+        return 'not an object' unless result.is_a?(Hash)
+        return 'status is not a task status' unless MCPClient::Task::VALID_STATUSES.include?(result['status'])
+
+        %w[createdAt lastUpdatedAt].each do |field|
+          return "#{field} is not a string" unless result[field].is_a?(String)
+        end
+        return 'ttlMs is missing' unless result.key?('ttlMs')
+        return 'ttlMs is not an integer or null' unless result['ttlMs'].nil? || result['ttlMs'].is_a?(Integer)
+
+        nil
       end
 
       # Enforce the MCP 2026-07-28 tasks extension gate: this client must have
