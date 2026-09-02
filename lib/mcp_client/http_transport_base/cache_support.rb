@@ -11,6 +11,13 @@ module MCPClient
       # the attempt unknown, so no private stale copy may be served for it.
       UNRECORDED_AUTHORIZATION = :unrecorded
 
+      # Thread-local marker for "this attempt went out with no Authorization
+      # at all". The anonymous context is `nil` everywhere else, and an empty
+      # thread-local slot is `nil` too: a request that really was anonymous
+      # is noted with this marker so that a slot a cleanup dropped reads as
+      # unrecorded rather than as an anonymous request that never happened.
+      ANONYMOUS_AUTHORIZATION = :anonymous
+
       # Stand-in app for instantiating middleware whose request hook is run
       # without a request (the freshness probe).
       NOOP_APP = ->(_env) {}
@@ -20,16 +27,26 @@ module MCPClient
       UNKNOWN_CONTEXT = :unknown
 
       # Framework middleware that never puts an Authorization header on a
-      # request, whatever it was configured with: the probe steps over it
-      # instead of running it (some of it overrides `call` and could not be
-      # run without sending anyway).
+      # request, whatever literal configuration it was installed with: the
+      # probe steps over it instead of running it (some of it overrides
+      # `call` and could not be run without sending anyway). A handler that
+      # was also handed a host callback is unknown all the same
+      # ({#probe_host_callback_free?} is checked first).
+      #
+      # `Faraday::FollowRedirects::Middleware` is on the list because the gem
+      # itself depends on it and a host that installs it should keep its
+      # private cache hits: it has no request phase, and the only header it
+      # ever touches is the Authorization it *deletes* on a cross-host
+      # redirect -- which can cost a hit, never leak one.
       PROBE_AUTHORIZATION_NEUTRAL_MIDDLEWARE = %w[
         Faraday::Retry::Middleware
         Faraday::Request::Retry
         Faraday::Request::Json
         Faraday::Request::UrlEncoded
         Faraday::Request::Multipart
+        Faraday::Response::Json
         Faraday::Response::Logger
+        Faraday::FollowRedirects::Middleware
       ].freeze
 
       # The only middleware the probe runs: Faraday's own Authorization
@@ -48,6 +65,14 @@ module MCPClient
       # How deep a container of configuration is looked into; beyond it the
       # configuration counts as something the probe cannot read.
       PROBE_STATIC_DEPTH = 4
+
+      # Constructors that build a middleware instance and nothing else. A
+      # class with a constructor of its own can give its instances an
+      # `on_request` hook (`define_singleton_method`, an extended module),
+      # which a test of the class would never see -- so a class-level
+      # "no request phase" verdict only holds when Faraday's own constructor
+      # is the one that builds the instance.
+      PROBE_DEFAULT_INITIALIZE_OWNERS = [Faraday::Middleware, Object, Kernel, BasicObject].freeze
 
       # Last request middleware on the JSON-RPC connection: records the
       # Authorization a request carries once every host middleware
@@ -113,7 +138,8 @@ module MCPClient
       # @param authorization [String, nil] the Authorization header of the request
       # @return [void]
       def note_request_authorization(authorization)
-        Thread.current[request_authorization_key] = authorization_fingerprint(authorization)
+        Thread.current[request_authorization_key] =
+          authorization_fingerprint(authorization) || ANONYMOUS_AUTHORIZATION
       end
 
       # Forget the header recorded before middleware ran: until the request
@@ -142,12 +168,16 @@ module MCPClient
       # @return [String, nil] the Authorization header of the request this thread last sent
       def request_authorization_context
         context = Thread.current[request_authorization_key]
-        context == UNRECORDED_AUTHORIZATION ? nil : context
+        context.is_a?(String) ? context : nil
       end
 
-      # @return [Boolean] whether the current attempt on this thread applied its headers
+      # @return [Boolean] whether the current attempt on this thread applied
+      #   its headers. An empty slot — nothing sent yet on this thread, or a
+      #   cleanup that dropped what this transport left on it — is as
+      #   unrecorded as the pending marker.
       def request_authorization_recorded?
-        Thread.current[request_authorization_key] != UNRECORDED_AUTHORIZATION
+        context = Thread.current[request_authorization_key]
+        !context.nil? && context != UNRECORDED_AUTHORIZATION
       end
 
       # @return [Symbol] the thread-local key of this transport's request authorization
@@ -166,7 +196,10 @@ module MCPClient
         # They are held in Faraday's own case-insensitive table, so the
         # provider's `Authorization` replaces a header configured under any
         # other spelling instead of being read past by the lookup below.
-        probe = HeaderProbe.new(faraday_headers(@headers))
+        base = probe_base_headers
+        return UNKNOWN_CONTEXT if base.nil?
+
+        probe = HeaderProbe.new(base)
         @oauth_provider&.apply_authorization(probe)
         headers = probe.headers
         if @faraday_config
@@ -181,6 +214,33 @@ module MCPClient
           return UNKNOWN_CONTEXT if headers.nil?
         end
         authorization_fingerprint(authorization_header_value(headers))
+      end
+
+      # The headers a request starts from, before the OAuth provider and
+      # before any middleware: the transport's own configured headers, laid
+      # over whatever the connection itself carries.
+      #
+      # A `faraday_config` block may set or mutate `conn.headers` — including
+      # `Authorization` — and every request Faraday builds on that connection
+      # starts from that table, so a probe that read only `@headers` would
+      # answer "anonymous" for requests that go out with a bearer. Reading a
+      # built connection's header table executes no middleware and runs no
+      # host code: the block has already run (the same connection sends the
+      # real requests), and the table is plain configuration.
+      # @return [Faraday::Utils::Headers, nil] nil when the connection could
+      #   carry an authorization the probe cannot see
+      def probe_base_headers
+        headers = faraday_headers(@headers)
+        return headers unless @faraday_config
+
+        # `@headers` wins over the connection's table, exactly as it does on
+        # the wire ({#apply_request_headers} applies it per request).
+        base = faraday_headers(http_connection.headers)
+        headers.each { |key, value| base[key] = value }
+        base
+      rescue StandardError => e
+        @logger.debug("Could not read the Authorization configured on the connection: #{e.class}")
+        nil
       end
 
       # The JSON-RPC request the probe models for a cache kind: the very
@@ -229,6 +289,10 @@ module MCPClient
           # The recorder is the probe's own, and middleware that sets no
           # Authorization header changes no answer here.
           next if handler.klass == AuthorizationRecorder
+          # A callback the host supplied is host code Faraday hands the
+          # mutable request env: nothing about the middleware class it was
+          # given to says what a request would then carry.
+          return nil unless probe_host_callback_free?(handler)
           next if PROBE_AUTHORIZATION_NEUTRAL_MIDDLEWARE.include?(handler.klass.name)
           next if probe_response_only_middleware?(handler.klass)
           return nil unless probe_pure_middleware?(handler)
@@ -280,26 +344,72 @@ module MCPClient
       # @return [Boolean]
       def probe_response_only_middleware?(klass)
         return false if klass.method_defined?(:on_request) || klass.private_method_defined?(:on_request)
+        return false unless klass.method_defined?(:call) && klass.instance_method(:call).owner == Faraday::Middleware
 
-        klass.method_defined?(:call) && klass.instance_method(:call).owner == Faraday::Middleware
+        probe_default_construction?(klass)
+      end
+
+      # @param klass [Class] a middleware class on the connection
+      # @return [Boolean] whether its instances come out of Faraday's own constructor
+      def probe_default_construction?(klass)
+        return false unless PROBE_DEFAULT_INITIALIZE_OWNERS.include?(klass.instance_method(:initialize).owner)
+
+        klass.method(:new).owner == Class
       end
 
       # Whether a handler installs framework middleware the probe may run:
       # one of {PROBE_PURE_MIDDLEWARE} (exactly, never a subclass of it),
-      # configured without a block and with nothing but literal
-      # configuration. Its constructor can then take nothing to spend and
-      # its request hook can vend nothing but what it was handed.
+      # configured with nothing but literal configuration. Its constructor
+      # can then take nothing to spend and its request hook can vend nothing
+      # but what it was handed. This is stricter than
+      # {#probe_host_callback_free?}: a holder something else can rotate is
+      # nothing a middleware may *run*, but it is still a credential that
+      # can differ from request to request.
       # @param handler [Faraday::RackBuilder::Handler]
       # @return [Boolean]
       def probe_pure_middleware?(handler)
         return false unless PROBE_PURE_MIDDLEWARE.include?(handler.klass)
-        return false if handler.instance_variable_get(:@block)
 
         args = handler.instance_variable_get(:@args)
         kwargs = handler.instance_variable_get(:@kwargs) || {}
         return false unless args.is_a?(Array) && kwargs.is_a?(Hash)
 
         (args + kwargs.to_a.flatten(1)).all? { |arg| probe_static_value?(arg) }
+      end
+
+      # Whether a handler carries no host code of its own: no configuration
+      # block, and no argument the middleware it was given to could call.
+      #
+      # A logger formatter, a redirect callback, a class the middleware
+      # instantiates -- all of it is host code that the middleware hands the
+      # mutable request env, and the middleware class it was given to says
+      # nothing about what it will do with it. A handler that carries one is
+      # an unknown context however inert its class looks; a logger *sink*,
+      # which only ever receives strings, is configuration like any other.
+      # @param handler [Faraday::RackBuilder::Handler]
+      # @return [Boolean]
+      def probe_host_callback_free?(handler)
+        return false if handler.instance_variable_get(:@block)
+
+        args = handler.instance_variable_get(:@args)
+        kwargs = handler.instance_variable_get(:@kwargs) || {}
+        return false unless args.is_a?(Array) && kwargs.is_a?(Hash)
+
+        (args + kwargs.to_a.flatten(1)).none? { |arg| probe_host_callback?(arg) }
+      end
+
+      # @param value [Object] an argument a middleware was installed with
+      # @param depth [Integer]
+      # @return [Boolean] whether it is (or contains) code the middleware could run
+      def probe_host_callback?(value, depth = 0)
+        return true if value.is_a?(Proc) || value.is_a?(Method) || value.is_a?(Module) || value.respond_to?(:call)
+        return false unless value.is_a?(Hash) || value.is_a?(Array)
+        # Past the depth a container is looked into, what it holds is
+        # unknown -- and unknown counts as host code.
+        return true unless depth < PROBE_STATIC_DEPTH
+
+        members = value.is_a?(Hash) ? value.flat_map { |k, v| [k, v] } : value
+        members.any? { |member| probe_host_callback?(member, depth + 1) }
       end
 
       # @param value [Object] an argument a middleware was installed with

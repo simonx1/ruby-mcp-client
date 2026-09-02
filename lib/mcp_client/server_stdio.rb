@@ -970,9 +970,11 @@ module MCPClient
     # the meantime (see {#teardown_transport}).
     # @return [void]
     def cleanup
-      # The cache notes this transport left on this thread are for a slice
-      # that will never be tagged now.
-      forget_served_entries
+      # Everything this transport left on this thread — the notes of the
+      # entries it served and recorded, the credentials, parameters and
+      # metadata of its requests — describes a slice that will never be
+      # tagged and a request that will never be made.
+      forget_transport_thread_state
       teardown_transport(@transport_lock.synchronize { @transport_generation })
     end
 

@@ -7,6 +7,49 @@ metadata). Each feature lands in its own PR; this section accumulates them.
 
 ### Cacheable results (`ttlMs` / `cacheScope`)
 
+- **The probe reads the Authorization the connection carries (round 30).**
+  A `faraday_config` block may set `conn.headers['Authorization']`, and every
+  request Faraday builds on that connection starts from that table. The
+  probe used to start from the transport's own headers alone, so it answered
+  "anonymous" for requests that go out with a bearer — a private entry of one
+  context could be matched against another. It now starts from the built
+  connection's header table (reading it runs no middleware and no host code)
+  with the transport's own headers laid over it, exactly as a real request
+  does, and reports the unknown context if that table cannot be read.
+- **A handler that carries a host callback is an unknown context (round
+  30).** A middleware class being inert says nothing when the host handed it
+  code to run: `Faraday::Response::Logger` takes a formatter whose `request`
+  method receives the mutable env, `follow_redirects` takes a redirect
+  callback, and a configuration block can define a singleton method on
+  either. Any handler installed with a block, or with a proc, method, class
+  or other callable among its arguments, now makes the context unknown. The
+  "no request phase" test also requires that Faraday's own constructor build
+  the instance: a middleware with a constructor of its own can give its
+  instances an `on_request` hook that no class-level test would ever see.
+- **A cache lookup that aborts releases the metadata it held (round 30).** A
+  freshness check reads the parameters the next request would carry, which
+  evaluates the host's `request_meta`, and holds that evaluation for the
+  request the decision leads to. When the authorization probe raised (an
+  OAuth refresh failing, say) no request was built and neither release path
+  ran, so a later request on that thread sent the previous tenant's
+  metadata. The held evaluation is now released when a lookup aborts.
+- **`cleanup` drops every thread-local slot a transport owns (round 30).**
+  It used to clear only the served-entry notes, leaving the per-object
+  authorization, request-parameter, round-trip and recorded-entry slots on
+  the thread: a long-lived worker that created and discarded transports
+  accumulated entries for its whole life. An anonymous request is now noted
+  with its own marker, so an emptied slot reads as "nothing recorded" rather
+  than as an anonymous request that never happened. The metadata held for
+  the *next* request is deliberately kept — `ensure_connected` cleans up
+  before it reconnects, in the middle of the very request that holds it.
+- **`follow_redirects` is framework middleware the probe steps over (round
+  30).** The gem depends on `faraday-follow_redirects`, so the ordinary
+  stack `faraday_config: ->(f) { f.response :follow_redirects }` with a
+  static bearer never got a private cache hit. The middleware has no request
+  phase and the only header it ever touches is the Authorization it
+  *deletes* on a cross-host redirect, which can cost a hit but never leak
+  one; `Faraday::Response::Json` joins the list for the same reason. A
+  redirect callback still makes the context unknown.
 - **Host middleware is never run by the freshness probe (round 29).** Four
   rounds of reflection could not tell a middleware that vends a one-time
   credential apart from an inert one: the rotating state can sit in a

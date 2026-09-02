@@ -329,6 +329,33 @@ module MCPClient
       Thread.current[served_entries_key] = nil
     end
 
+    # The thread-local slots a transport owns, each keyed by its own
+    # `object_id`: the notes of the entries it served and recorded, the
+    # receipt time, the credentials and effective parameters of the request
+    # this thread last sent through it, and its multi round-trip marker.
+    #
+    # The metadata held for the *next* request is deliberately not among
+    # them: a reconnect tears the connection down (`ensure_connected` cleans
+    # up before it connects) in the middle of the very request a cache
+    # decision held its evaluation for, and that request must still carry it.
+    # @return [Array<Symbol>] the keys defined on this transport
+    def transport_thread_local_keys
+      %i[served_entries_key recorded_entries_key response_received_key
+         request_params_key round_trip_marker_key request_authorization_key]
+        .select { |name| respond_to?(name, true) }
+        .map { |name| send(name) }
+    end
+
+    # Drop everything this transport left on the calling thread: its
+    # connection is going away, so none of it describes a request that will
+    # ever be made or a slice that will ever be tagged. A worker thread that
+    # creates and discards transports would otherwise accumulate one entry
+    # per slot per transport for its whole life.
+    # @return [void]
+    def forget_transport_thread_state
+      transport_thread_local_keys.each { |key| Thread.current[key] = nil }
+    end
+
     # @param kind [Symbol]
     # @return [Object, nil] the identity of the entry currently holding the kind
     # Whether the entry a client-level slice came from is still fresh by its
@@ -486,6 +513,14 @@ module MCPClient
       # {#release_serving_request_meta} drops it once a value really is
       # served instead.
       entry_matches_authorization?(entry, context, kind)
+    rescue StandardError
+      # The lookup aborted — the authorization probe raised, an OAuth
+      # refresh failed — so it builds no request at all. Whatever evaluation
+      # of the host's request_meta it was holding for that request would
+      # otherwise sit on this thread and be sent, much later, by an
+      # unrelated request: the next request reads the host afresh instead.
+      release_serving_request_meta
+      raise
     end
 
     # A cached value was served, so the lookup that led here leads to no
