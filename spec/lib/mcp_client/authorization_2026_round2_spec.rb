@@ -42,7 +42,10 @@ RSpec.describe 'MCP 2026-07-28 authorization — round 2' do
     allow(provider).to receive(:fetch_server_metadata).and_return(meta)
   end
 
+  # Host-provided credentials say they are pre-registered (an untyped
+  # record counts as a dynamic registration since round 9).
   def client_info(client_id: 'pre-registered', **opts)
+    opts = { registration_type: 'pre_registered' }.merge(opts)
     MCPClient::Auth::ClientInfo.new(client_id: client_id,
                                     metadata: MCPClient::Auth::ClientMetadata.new(redirect_uris: [redirect_uri]),
                                     **opts)
@@ -163,26 +166,25 @@ RSpec.describe 'MCP 2026-07-28 authorization — round 2' do
     expect(provider.access_token).to be_nil
   end
 
-  it 'binds legacy credentials as pre-registered unless they look dynamically registered' do
-    storage.set_client_info(server_url, client_info)
+  it 'binds an untyped legacy record as a dynamic registration and keeps explicit pre-registration' do
+    storage.set_server_metadata(server_url, as_meta)
+    storage.set_client_info(server_url, client_info(registration_type: nil))
     provider = provider_for
     stub_discovery(provider, as_meta)
     provider.start_authorization_flow
-    expect(storage.get_client_info(server_url).registration_type).to eq('pre_registered')
-
-    switch_authorization_server(provider, as_meta(issuer: 'https://other.example.com',
-                                                  registration_endpoint: 'https://other.example.com/register'))
-    expect { provider.start_authorization_flow }.to raise_error(MCPClient::Errors::ConnectionError, /Pre-registered/)
+    expect(storage.get_client_info(server_url).registration_type).to eq('dynamic')
+    expect(storage.get_client_info(server_url).issuer).to eq('https://auth.example.com')
 
     storage2 = MCPClient::Auth::OAuthProvider::MemoryStorage.new
-    # A dynamic registration is bound only when the authorization server it
-    # came from is known (cached alongside it); see round 7 for the rest.
-    storage2.set_server_metadata(server_url, as_meta)
-    storage2.set_client_info(server_url, client_info(client_id: 'dyn', client_id_issued_at: 1_700_000_000))
+    storage2.set_client_info(server_url, client_info)
     provider2 = provider_for(storage: storage2)
     stub_discovery(provider2, as_meta)
     provider2.start_authorization_flow
-    expect(storage2.get_client_info(server_url).registration_type).to eq('dynamic')
+    expect(storage2.get_client_info(server_url).registration_type).to eq('pre_registered')
+
+    switch_authorization_server(provider2, as_meta(issuer: 'https://other.example.com',
+                                                   registration_endpoint: 'https://other.example.com/register'))
+    expect { provider2.start_authorization_flow }.to raise_error(MCPClient::Errors::ConnectionError, /Pre-registered/)
   end
 
   it 'treats an application_type given through client_metadata as the explicit choice' do

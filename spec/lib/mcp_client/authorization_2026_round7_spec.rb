@@ -57,7 +57,7 @@ RSpec.describe 'MCP 2026-07-28 authorization — round 7' do
   it 'keeps pre-registered credentials configured by the host when no authorization server was cached' do
     storage = MCPClient::Auth::OAuthProvider::MemoryStorage.new
     storage.set_client_info(server_url, MCPClient::Auth::ClientInfo.new(
-                                          client_id: 'pre-registered',
+                                          client_id: 'pre-registered', registration_type: 'pre_registered',
                                           metadata: MCPClient::Auth::ClientMetadata.new(redirect_uris: [redirect_uri])
                                         ))
     provider = provider_for(storage)

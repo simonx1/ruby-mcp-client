@@ -9,6 +9,7 @@ This implementation provides OAuth 2.1 authentication support for the Ruby MCP C
 - **Automatic server discovery** via `.well-known` endpoints
 - **Dynamic client registration** when supported by servers
 - **Token refresh** and automatic token management
+- **Per-authorization-server credentials** (MCP 2026-07-28): store pre-registered credentials with `registration_type: 'pre_registered'`; a stored record without a type counts as a dynamic registration and is redone for a new authorization server
 - **Resource parameter implementation** (RFC 8707) for proper token audience binding
 - **Pluggable storage** for tokens and client credentials
 

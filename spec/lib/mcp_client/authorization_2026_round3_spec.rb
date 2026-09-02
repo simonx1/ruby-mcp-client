@@ -42,7 +42,10 @@ RSpec.describe 'MCP 2026-07-28 authorization — round 3' do
     allow(provider).to receive(:fetch_server_metadata).and_return(meta)
   end
 
+  # Host-provided credentials say they are pre-registered (an untyped
+  # record counts as a dynamic registration since round 9).
   def client_info(client_id: 'pre-registered', **opts)
+    opts = { registration_type: 'pre_registered' }.merge(opts)
     MCPClient::Auth::ClientInfo.new(client_id: client_id,
                                     metadata: MCPClient::Auth::ClientMetadata.new(redirect_uris: [redirect_uri]),
                                     **opts)
@@ -70,7 +73,7 @@ RSpec.describe 'MCP 2026-07-28 authorization — round 3' do
   it 'recognizes a persisted Client ID Metadata Document client as portable' do
     cimd_url = 'https://app.example.com/oauth/client-metadata.json'
     storage.set_server_metadata(server_url, as_meta(issuer: 'https://old.example.com'))
-    storage.set_client_info(server_url, client_info(client_id: cimd_url))
+    storage.set_client_info(server_url, client_info(client_id: cimd_url, registration_type: nil))
     provider = provider_for(client_id_metadata_url: cimd_url)
     switch_authorization_server(provider, as_meta(client_id_metadata_document_supported: true))
 
