@@ -41,9 +41,12 @@ module MCPClient
     # @param modern [Boolean] whether the task uses the 2026-07-28 field names (ttlMs, pollIntervalMs)
     # @param detailed [Boolean] whether this is a DetailedTask (tasks/get, notifications/tasks) whose
     #   result / error / inputRequests are authoritative, as opposed to a creation seed
+    # @param ttl_reported [Boolean, nil] whether the source hash carried the ttl / ttlMs field at all,
+    #   whatever its value (nil: derived from ttl, for a task not built from peer data)
     def initialize(task_id:, status: 'working', status_message: nil, created_at: nil,
                    last_updated_at: nil, ttl: nil, poll_interval: nil, server: nil,
-                   input_requests: nil, result: nil, error: nil, modern: false, detailed: false)
+                   input_requests: nil, result: nil, error: nil, modern: false, detailed: false,
+                   ttl_reported: nil)
       validate_status!(status)
       @task_id = task_id
       @status = status
@@ -51,6 +54,10 @@ module MCPClient
       @created_at = created_at
       @last_updated_at = last_updated_at
       @ttl = ttl
+      # An explicit null ttlMs is a reported TTL (an unlimited one); a hash
+      # without the field reports nothing, so an observation of it must not
+      # be read as the server lifting a TTL it never mentioned.
+      @ttl_reported = ttl_reported.nil? ? !ttl.nil? : ttl_reported
       @poll_interval = poll_interval
       @server = server
       @input_requests = input_requests
@@ -82,6 +89,7 @@ module MCPClient
         created_at: extract_field(data, 'createdAt', :created_at),
         last_updated_at: extract_field(data, 'lastUpdatedAt', :last_updated_at),
         ttl: modern ? extract_field(data, 'ttlMs', :ttl_ms) : extract_field(data, 'ttl'),
+        ttl_reported: modern ? field_present?(data, 'ttlMs', :ttl_ms) : field_present?(data, 'ttl'),
         poll_interval: if modern
                          extract_field(data, 'pollIntervalMs', :poll_interval_ms)
                        else
@@ -137,6 +145,14 @@ module MCPClient
       nil
     end
     private_class_method :extract_field
+
+    # Whether a field is present at all, whatever its value (an explicit
+    # null included). Mirrors the key lookup of {.extract_field}.
+    # @return [Boolean]
+    def self.field_present?(data, str_key, sym_key = nil)
+      data.key?(str_key) || data.key?(str_key.to_sym) || (!sym_key.nil? && data.key?(sym_key))
+    end
+    private_class_method :field_present?
 
     # Convert to a spec-shaped, JSON-serializable hash
     # @return [Hash]
@@ -212,6 +228,16 @@ module MCPClient
       code = error['code'] || error[:code]
       message = error['message'] || error[:message]
       code.is_a?(Integer) && message.is_a?(String)
+    end
+
+    # Whether the observation this task was built from carried a ttl / ttlMs
+    # field at all. It separates "no TTL reported" from a reported TTL that
+    # yields no deadline (an explicit null, or a value the clock cannot
+    # represent): both of the latter mean the task has no backstop, while the
+    # former says nothing about one.
+    # @return [Boolean]
+    def ttl_reported?
+      @ttl_reported
     end
 
     # Seconds left before the TTL backstop (createdAt + ttlMs), nil when
