@@ -116,7 +116,9 @@ metadata). Each feature lands in its own PR; this section accumulates them.
   precheck fails and discovery retries it) instead of completing against
   stale state. A challenge naming the authorization server a stored token
   is already bound to (another provider sharing the storage finished the
-  switch) retires nothing.
+  switch) retires nothing, and that token is presented at once: a
+  validated pending challenge is the authoritative server for tokens, as
+  it already is for discovery.
 
 ### Tasks extension (`io.modelcontextprotocol/tasks`)
 

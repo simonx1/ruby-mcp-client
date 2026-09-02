@@ -1384,8 +1384,19 @@ module MCPClient
         return false if retired_token?(token)
         return true unless token.respond_to?(:issuer)
 
-        current = stored_server_metadata&.issuer
+        current = current_issuer_for_tokens
         !current.nil? && current == token.issuer
+      end
+
+      # The authorization server tokens are judged against: a validated
+      # challenge received since the metadata was cached is authoritative
+      # (discovery treats it so), else the cached metadata's issuer.
+      # @return [String, nil]
+      def current_issuer_for_tokens
+        advertised = Array(@challenge_resource_metadata&.authorization_servers).first
+        return advertised if advertised.is_a?(String)
+
+        stored_server_metadata&.issuer
       end
 
       # A token persisted before issuers were recorded was obtained from the
