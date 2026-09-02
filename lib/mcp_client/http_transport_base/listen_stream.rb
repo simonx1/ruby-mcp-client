@@ -42,13 +42,21 @@ module MCPClient
       def open_subscription(subscription)
         return unless subscription.with_open_id(next_request_id) { register_subscription(subscription) }
 
-        listen_threads_mutex.synchronize { listen_wakeups[subscription] ||= Thread::Queue.new }
+        # The thread is held until both registries name it, so a cancellation
+        # that arrives the moment this returns always finds the stream to
+        # close and the thread to wait for.
+        started = Thread::Queue.new
         thread = Thread.new do
           Thread.current.name = 'MCP-listen'
           Thread.current.report_on_exception = false
+          started.pop
           run_listen_stream(subscription)
         end
-        listen_threads_mutex.synchronize { listen_threads[subscription] = thread }
+        listen_threads_mutex.synchronize do
+          listen_wakeups[subscription] ||= Thread::Queue.new
+          listen_threads[subscription] = thread
+        end
+        started << :go
       end
 
       # Cancel a subscription: on Streamable HTTP closing the SSE response
@@ -59,20 +67,30 @@ module MCPClient
       # @param subscription [MCPClient::Subscription]
       # @return [void]
       def cancel_subscription(subscription)
+        # Closed first: the stream's own thread reads this state before it
+        # sends anything, so once this line has run no listen request for the
+        # subscription can still go out.
         subscription.finish(by_client: true)
         unregister_subscription(subscription)
         subscriptions_mutex.synchronize { resource_subscriptions.delete_if { |_uri, sub| sub.equal?(subscription) } }
         close_listen_stream(subscription)
-        thread = listen_threads_mutex.synchronize { listen_threads.delete(subscription) }
-        return unless thread && thread != Thread.current
-
-        thread.join(THREAD_JOIN_TIMEOUT_FOR_LISTEN)
+        await_listen_stream(subscription)
       end
 
       THREAD_JOIN_TIMEOUT_FOR_LISTEN = 2
 
       # Stop every listen stream (transport shutdown). Unlike stdio there is no
       # process to re-establish: the host re-listens on a new connection.
+      #
+      # The threads are neither killed nor waited for. A kill would interrupt
+      # a reader wherever it happened to be — losing whatever it was
+      # delivering, or dropping it while it holds the subscription's own lock
+      # to take a new listen id, which is exactly what a later {#close} or
+      # {#listen} would then wait on. Waiting is no better: this runs under
+      # the transport lock a reader needs for its next id, so a join here
+      # would stall every later call for its whole timeout. Once its
+      # subscription is closed and its response stream is closed, a reader can
+      # no longer send anything: it leaves the loop and cleans up after itself.
       # @return [void]
       def close_listen_streams
         threads = listen_threads_mutex.synchronize { listen_threads.dup.tap { listen_threads.clear } }
@@ -85,33 +103,77 @@ module MCPClient
           resource_subscriptions.clear
           open
         end
-        closing.each { |sub| sub.finish(gracefully: false, reason: 'transport closed') }
+        # A stream between two listen ids is registered under neither, so the
+        # threads name their own subscriptions too: one left open here would
+        # re-open onto a transport that is already gone.
+        (closing | threads.keys).each { |sub| sub.finish(gracefully: false, reason: 'transport closed') }
         threads.each_key { |sub| close_listen_stream(sub) }
-        threads.each_value do |thread|
-          next if thread == Thread.current
-
-          thread.kill
-          thread.join(THREAD_JOIN_TIMEOUT_FOR_LISTEN)
-        end
       end
 
       private
 
-      # Close a subscription's response stream, and wake its thread if it is
-      # waiting to re-open: that ends the reader without killing it.
+      # Wake a subscription's thread if it is waiting to re-open, and close the
+      # response stream it is reading: that ends the reader without killing it.
       # @param subscription [MCPClient::Subscription]
-      # @return [void]
+      # @return [Symbol] :closed, or :opening while the socket is still being
+      #   opened (see {#close_listen_session})
       def close_listen_stream(subscription)
-        session, wakeup = listen_threads_mutex.synchronize do
-          [listen_sessions.delete(subscription), listen_wakeups[subscription]]
-        end
+        wakeup = listen_threads_mutex.synchronize { listen_wakeups[subscription] }
         wakeup&.push(:cancelled)
-        return unless session
+        close_listen_session(subscription)
+      end
 
+      # Close the HTTP response stream of a listen request that is in flight —
+      # the cancellation signal on Streamable HTTP. A session whose socket is
+      # still being opened cannot be closed and must not be forgotten: the
+      # request it is about to send would leave the server holding a stream
+      # nothing reads, so the caller comes back for it.
+      # @param subscription [MCPClient::Subscription]
+      # @return [Symbol] :closed when the response stream is closed (or none
+      #   was ever opened), :opening while its socket is still being opened
+      def close_listen_session(subscription)
+        session = listen_threads_mutex.synchronize { listen_sessions[subscription] }
+        return :closed unless session
+        return :opening unless session.started?
+
+        listen_threads_mutex.synchronize { listen_sessions.delete(subscription) }
         begin
-          session.finish if session.started?
+          session.finish
         rescue StandardError => e
           @logger.debug("Closing a listen stream raised #{e.class}")
+        end
+        :closed
+      end
+
+      # Wait for a cancelled stream's thread to end. A first close that found
+      # the socket still opening had nothing to close; by the time the join
+      # has timed out the request is on the wire, and closing the response
+      # stream is what tells the server the subscription is gone.
+      # @param subscription [MCPClient::Subscription]
+      # @return [void]
+      def await_listen_stream(subscription)
+        thread = listen_threads_mutex.synchronize { listen_threads.delete(subscription) }
+        return if thread.nil? || thread == Thread.current
+        return if thread.join(THREAD_JOIN_TIMEOUT_FOR_LISTEN)
+
+        close_listen_session(subscription)
+        thread.join(THREAD_JOIN_TIMEOUT_FOR_LISTEN)
+      end
+
+      # Hand the stream's HTTP session over before its socket is opened, so a
+      # cancellation can close the response stream — and refuse to open one at
+      # all for a subscription the host has already closed. Both halves happen
+      # under the lock {#close_listen_stream} takes, so a close either stops
+      # the request outright or finds the session it has to close.
+      # @param subscription [MCPClient::Subscription]
+      # @param http [Net::HTTP] the session Faraday is about to use
+      # @return [void]
+      # @raise [ListenStreamClosed] when the subscription is already closed
+      def arm_listen_session(subscription, http)
+        listen_threads_mutex.synchronize do
+          raise ListenStreamClosed if subscription.closed?
+
+          listen_sessions[subscription] = http
         end
       end
 
@@ -157,6 +219,9 @@ module MCPClient
           outcome = stream_listen_request(subscription)
           break unless outcome == :dropped && subscription.reconnectable? && listen_transport_connected?
 
+          # No server-side subscription exists between the drop and the next
+          # acknowledgment, so it stops being active for as long as that lasts.
+          subscription.mark_reconnecting
           @logger.info("Subscription #{subscription.id} stream ended without a closing response; " \
                        "re-opening in #{delay}s")
           wait_before_reopen(subscription, delay)
@@ -202,29 +267,36 @@ module MCPClient
       # @return [Symbol] :closed when the subscription ended (response, error,
       #   client), :dropped when the stream ended without a closing response
       def stream_listen_request(subscription)
+        # A request for a subscription the host has already closed must never
+        # go out: the server would hold a stream nothing reads until its own
+        # timeout. {#arm_listen_session} checks again under the cancellation's
+        # own lock, when the request is about to open its socket.
+        return :closed if subscription.closed?
+
         request = build_jsonrpc_request('subscriptions/listen', { 'notifications' => subscription.requested },
                                         subscription.id)
         buffer = +''
-        state = { finished: nil, scanned: 0 }
+        state = { finished: nil, scanned: 0, framing: nil }
         response = listen_connection(subscription).post(@endpoint) do |req|
           apply_request_headers(req, request)
           # The stream is parsed incrementally as it arrives; a compressed
           # body could not be. Ask for it uncompressed.
           req.headers['Accept-Encoding'] = 'identity'
           req.body = request.to_json
-          req.options.on_data = proc do |chunk, _bytes|
+          req.options.on_data = proc do |chunk, _bytes, env|
             # Closing the response stream is the cancellation signal: stop
-            # reading as soon as the host closed the subscription.
-            raise ListenStreamClosed if subscription.closed_by_client?
+            # reading as soon as the subscription is closed, by whichever end.
+            raise ListenStreamClosed if subscription.closed?
             next if state[:finished]
 
             buffer << chunk
-            state[:finished] = consume_listen_events(buffer, subscription, state)
+            state[:framing] ||= listen_stream_framing(env, buffer)
+            state[:finished] = consume_listen_events(buffer, subscription, state) unless state[:framing] == :json
             enforce_listen_buffer_cap!(buffer)
           end
         end
         return :closed if state[:finished]
-        return listen_stream_ended(subscription, response, buffer) if response.success?
+        return listen_stream_ended(subscription, response, buffer, state[:framing]) if response.success?
 
         fail_subscription_from_response(subscription, response, buffer)
         :closed
@@ -261,16 +333,59 @@ module MCPClient
       # response. The server MAY answer with a single JSON object instead of
       # a stream: a JSON-RPC response for this listen id is then the closing
       # response (or the rejection). Anything else is a dropped stream.
+      # @param framing [Symbol, nil] the framing the stream was read with
       # @return [Symbol] :closed or :dropped
-      def listen_stream_ended(subscription, response, buffer)
-        headers = response.headers || {}
-        content_type = (headers['content-type'] || headers['Content-Type']).to_s
-        return :dropped unless content_type.include?('application/json') || buffer.lstrip.start_with?('{')
+      def listen_stream_ended(subscription, response, buffer, framing = nil)
+        return :dropped unless json_framed_answer?(response, buffer, framing)
 
         message = parse_listen_message(buffer.strip)
         return :closed if message&.key?('id') && handle_listen_message(message, subscription) == :closed
 
         :dropped
+      end
+
+      # How a listen answer is framed. The server MAY answer the listen
+      # request with a single JSON object rather than a stream, and SSE
+      # framing applied to one would consume it as an event with no data
+      # lines: a graceful close would then read as a dropped stream and a
+      # typed rejection as a generic one. The Content-Type decides — Faraday
+      # has saved the response headers before the first chunk reaches
+      # `on_data` — and a server that sent none is read the way its answer
+      # opens.
+      # @param env [Faraday::Env, nil] the streaming request's environment
+      # @param buffer [String] what has arrived so far
+      # @return [Symbol, nil] :json or :sse, nil while it cannot be told yet
+      def listen_stream_framing(env, buffer)
+        content_type = listen_response_content_type(env)
+        return :json if content_type.include?('application/json')
+        return :sse if content_type.include?('text/event-stream')
+
+        head = buffer.lstrip
+        return nil if head.empty?
+
+        head.start_with?('{') ? :json : :sse
+      end
+
+      # @param env [Faraday::Env, nil] the streaming request's environment
+      # @return [String] the answer's Content-Type, empty when it had none
+      def listen_response_content_type(env)
+        headers = env.respond_to?(:response_headers) ? env.response_headers : nil
+        return '' unless headers.respond_to?(:[])
+
+        (headers['content-type'] || headers['Content-Type']).to_s
+      end
+
+      # @param response [Faraday::Response] the finished listen response
+      # @param buffer [String] the bytes it delivered
+      # @param framing [Symbol, nil] the framing the stream was read with
+      # @return [Boolean] whether the answer is a single JSON object
+      def json_framed_answer?(response, buffer, framing)
+        return true if framing == :json
+        return false if framing == :sse
+
+        headers = response.headers || {}
+        content_type = (headers['content-type'] || headers['Content-Type']).to_s
+        content_type.include?('application/json') || buffer.lstrip.start_with?('{')
       end
 
       # A non-2xx answer to subscriptions/listen: 401/403 are authorization
@@ -395,8 +510,10 @@ module MCPClient
           f.adapter :net_http do |http|
             http.read_timeout = LISTEN_STREAM_TIMEOUT
             http.open_timeout = 10
-            # Keep the session so cancelling can close the response stream.
-            listen_threads_mutex.synchronize { listen_sessions[subscription] = http }
+            # Runs on the stream's own thread, just before the socket is
+            # opened: the last point at which a cancellation can still stop
+            # the request, and the first at which it can close it.
+            arm_listen_session(subscription, http)
           end
         end
         @faraday_config&.call(conn)

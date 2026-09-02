@@ -152,6 +152,23 @@ the `subscriptions/listen` acknowledgment naming that URI, which the call
 waits for. Updates then arrive as `notifications/resources/updated` through
 `on_notification`.
 
+On a 2026-07-28 server a host can also open a stream of its own with
+`server.listen(notifications: { tools_list_changed: true }) { |method, params| … }`
+and end it with `subscription.close`. The block runs on the subscription's own
+dispatcher thread, never on the transport's reader, so a listener may issue
+requests of its own; the notifications waiting for it are bounded
+(`MCPClient::Subscription::MAX_PENDING_NOTIFICATIONS`). A listener that cannot
+keep up with the server loses the **oldest** queued notifications rather than
+the newest — every MCP notification is a "look again" signal about state the
+host re-reads for itself, so the newest one still carries what the dropped ones
+said — and `pending_notifications` / `dropped_notifications` report how far
+behind it fell. `active?` answers false while a dropped stream waits to
+re-open, and a closing response the client cannot recognize (an unknown
+`resultType`, a missing or scalar result) fails the subscription instead of
+closing it gracefully. On Streamable HTTP closing the SSE response stream *is*
+the cancellation: once `close` returns, either the listen request was never
+sent or its response stream has been closed.
+
 ## MCP 2025-11-25 Features
 
 ### Tool Annotations
