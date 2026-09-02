@@ -84,6 +84,14 @@ module MCPClient
         # Where the authorization server document's field types are specified.
         SERVER_METADATA_REFERENCE = 'RFC 8414 Section 2'
 
+        # RFC 9728 Section 2 makes `resource` REQUIRED, and this client cannot
+        # do without it: it is the identifier the confused-deputy check
+        # compares with the server URL, and a document that omits it is not a
+        # protected resource's metadata at all. Refusing it here rather than
+        # at the comparison keeps the document out of the copy
+        # {#fetch_resource_metadata} retains for scope resolution.
+        REQUIRED_RESOURCE_METADATA_FIELDS = %w[resource].freeze
+
         # The protected resource metadata fields this client reads, and their
         # RFC 9728 Section 2 types. `resource` is compared with the server
         # URL, `authorization_servers` supplies the issuer discovery is driven
@@ -114,6 +122,20 @@ module MCPClient
           'grant_types_supported' => :string_array,
           'code_challenge_methods_supported' => :string_array
         }.freeze
+
+        # RFC 8414 Section 2 makes `issuer`, `authorization_endpoint` and
+        # `token_endpoint` REQUIRED, and every one of them is a URL this
+        # client parses: the issuer identifies the authorization server a
+        # token and a client are bound to, the authorization endpoint is what
+        # the browser is sent to, and the token endpoint is where the code is
+        # redeemed. A type check alone accepts a document that simply omits
+        # them — there is no field of the wrong type — so the document is
+        # cached as metadata and the flow crashes with a
+        # `URI::InvalidURIError` out of `start_authorization_flow` or
+        # `complete_authorization_flow`, by which time dynamic client
+        # registration has already created a client at the authorization
+        # server. What the RFC requires is required here, at discovery.
+        REQUIRED_SERVER_METADATA_FIELDS = %w[issuer authorization_endpoint token_endpoint].freeze
 
         # How each type reads in a failure message.
         TYPE_DESCRIPTIONS = {
@@ -172,8 +194,10 @@ module MCPClient
         # @param data [Hash] the parsed JSON body (its Hash-ness is checked by the caller)
         # @return [String, nil] the reason, or nil when the document is usable
         def resource_metadata_error(data)
-          mistyped_field_error(data, RESOURCE_METADATA_FIELDS, 'protected resource metadata',
-                               RESOURCE_METADATA_REFERENCE)
+          missing_field_error(data, REQUIRED_RESOURCE_METADATA_FIELDS, 'protected resource metadata',
+                              RESOURCE_METADATA_REFERENCE) ||
+            mistyped_field_error(data, RESOURCE_METADATA_FIELDS, 'protected resource metadata',
+                                 RESOURCE_METADATA_REFERENCE)
         end
 
         # Why a parsed authorization server document is not usable metadata,
@@ -181,8 +205,25 @@ module MCPClient
         # @param data [Hash] the parsed JSON body (its Hash-ness is checked by the caller)
         # @return [String, nil] the reason, or nil when the document is usable
         def server_metadata_error(data)
-          mistyped_field_error(data, SERVER_METADATA_FIELDS, 'authorization server metadata',
-                               SERVER_METADATA_REFERENCE)
+          missing_field_error(data, REQUIRED_SERVER_METADATA_FIELDS, 'authorization server metadata',
+                              SERVER_METADATA_REFERENCE) ||
+            mistyped_field_error(data, SERVER_METADATA_FIELDS, 'authorization server metadata',
+                                 SERVER_METADATA_REFERENCE)
+        end
+
+        # The first field a document's RFC makes REQUIRED and the document
+        # does not carry. A JSON null is an omission: it is no more a URL than
+        # an absent key is.
+        # @param data [Hash] the parsed JSON body
+        # @param fields [Array<String>] the field names the RFC requires
+        # @param label [String] what the document is, for the message
+        # @param reference [String] the RFC section the requirement comes from
+        # @return [String, nil]
+        def missing_field_error(data, fields, label, reference)
+          missing = fields.find { |field| data[field].nil? }
+          return nil unless missing
+
+          "the #{label} omits the required #{missing} (#{reference})"
         end
 
         # The first field of a response body that is present and not of the

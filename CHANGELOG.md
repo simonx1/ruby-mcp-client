@@ -343,6 +343,37 @@ metadata). Each feature lands in its own PR; this section accumulates them.
   private-use scheme with a path, and no fragment (RFC 6749 Section 3.1.2) —
   so `javascript:alert(1)`, `data:text/html,…` and a bare `http:` are a
   reported registration failure instead of a browser opened at them.
+  Peer bytes are now made decodable where they are *parsed*, not only where
+  they are printed: a total sanitizer only helps the text that reaches it,
+  and `String#gsub`, `String#match`, `Regexp#match?`, `String#split` and
+  `String#strip` all raise `ArgumentError` on bytes that are not valid
+  UTF-8. So the `unauthorized_client` body matched for a `redirect_uri`
+  mismatch, the `WWW-Authenticate` header masked and matched for its
+  `Bearer` challenge segment (in `OAuthProvider` and in the HTTP transports
+  alike) and the callback query string `CGI.unescape` hands back are scrubbed
+  before a pattern is run over them, without the truncation and
+  control-stripping a message needs but a parser cannot have. A token
+  endpoint `400` whose `error_description` is not UTF-8 now raises the
+  `ConnectionError` it always should have, a `401`/`403` challenge with an
+  undecodable parameter is still classified rather than crashing the code
+  reading it, and a callback of `?code=%FF&state=%FE` finishes the browser
+  flow. Metadata documents must now carry what their RFCs make REQUIRED, not
+  merely avoid fields of the wrong type: an authorization server document
+  without `issuer`, `authorization_endpoint` or `token_endpoint` (RFC 8414
+  Section 2) and a protected resource document without `resource` (RFC 9728
+  Section 2) are refused at discovery, cached nowhere and used for no scope
+  resolution — previously such a document was accepted and the flow failed
+  with a `URI::InvalidURIError` out of `start_authorization_flow` or
+  `complete_authorization_flow`, after a dynamic client registration had
+  already created a client at the authorization server. And a token record
+  that carries an `expires_at` is answered by that `expires_at` alone:
+  `expires_in` is the lifetime a token had when it was *issued* (RFC 6749
+  Section 5.1) and a record read back from storage was not issued now, so it
+  no longer stands in for a stored expiry that cannot be read.
+  `Token.from_h(expires_in: 3600, expires_at: 'not a time')` — the shape
+  `to_h` persists, with the one field this client depends on mangled — reads
+  as expired and is refreshed, where before it came back with an hour of
+  fresh lifetime.
 
 ### Tasks extension (`io.modelcontextprotocol/tasks`)
 

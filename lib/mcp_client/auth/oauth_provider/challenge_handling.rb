@@ -148,6 +148,14 @@ module MCPClient
         # @param header [String] the WWW-Authenticate header value
         # @return [String, nil] the metadata URL if present
         def extract_resource_metadata_url(header)
+          # A URL is not free text. RFC 3986 spells a URI in ASCII, so a
+          # header this client had to scrub to read did not advertise one:
+          # every undecodable byte in it became a '?', and fetching that
+          # rewriting would send a request to a URL nobody wrote. The
+          # challenge simply names no metadata URL, and discovery falls back
+          # to the well-known URIs.
+          return nil unless PeerText.decodable?(header)
+
           params = bearer_challenge_segment(header)
           return nil unless params
 
@@ -175,6 +183,13 @@ module MCPClient
         # @return [String, nil] the Bearer challenge's parameters (possibly
         #   empty), or nil when the header has no Bearer challenge
         def bearer_challenge_segment(header)
+          # A header value is peer bytes, and `gsub`, `match` and `[]` all
+          # raise `ArgumentError` on bytes that are not valid UTF-8 — out of
+          # the 401 handler, which would then report the client's own
+          # ArgumentError instead of the challenge. It is made decodable
+          # before it is read; nothing else about it is changed, because the
+          # URL and scope this parser returns have to be what the peer wrote.
+          header = matchable_peer_text(header)
           return nil unless header
 
           # Locate the Bearer scheme token only OUTSIDE quoted strings: a
@@ -193,6 +208,9 @@ module MCPClient
         # @param name [String] the auth-param name
         # @return [String, nil] the parameter value if present
         def extract_challenge_param(header, name)
+          header = matchable_peer_text(header)
+          return nil unless header
+
           if (m = header.match(/(?:^|[\s,])#{Regexp.escape(name)}\s*=\s*"([^"]*)"/i))
             return m[1]
           end

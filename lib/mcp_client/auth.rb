@@ -125,15 +125,25 @@ module MCPClient
 
       # The instant this token expires: the recorded one, else the lifetime
       # added to now, else none at all — and {UNREADABLE_EXPIRY} when the
-      # record carries an expiry that is neither.
+      # record carries an expiry, or a lifetime, that is neither.
+      #
+      # A record that carries an expires_at is answered by that expires_at
+      # alone. `expires_in` is the lifetime of a token at the moment it was
+      # ISSUED (RFC 6749 Section 5.1), and a record read back from storage was
+      # not issued now: reading `{ expires_in: 3600, expires_at: 'not a time' }`
+      # — the exact shape {#to_h} persists, with the one field this client
+      # depends on mangled — as an hour from now hands back a token that is
+      # very likely expired and is never refreshed until a request fails with
+      # it. An expiry that cannot be read is not a fresh lifetime; it is an
+      # expiry this client cannot vouch for, so the record fails closed and
+      # is refreshed or re-authorized instead.
       # @param expires_in [Object, nil] the lifetime as given
       # @param expires_at [Object, nil] the expiry as given
       # @return [Time, nil]
       def resolve_expiry(expires_in, expires_at)
-        recorded = self.class.usable_expiry(expires_at)
-        return recorded if recorded
+        return self.class.usable_expiry(expires_at) || UNREADABLE_EXPIRY unless expires_at.nil?
         return Time.now + @expires_in if @expires_in
-        return nil if expires_in.nil? && expires_at.nil?
+        return nil if expires_in.nil?
 
         UNREADABLE_EXPIRY
       end
