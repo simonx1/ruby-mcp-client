@@ -264,7 +264,10 @@ metadata). Each feature lands in its own PR; this section accumulates them.
   `client_id` is not a non-empty string is likewise no client — the same
   test the stored token's bytes get — so a hash-persisting backend that
   reads one back registers a new client before the browser opens instead of
-  starting a flow the callback then rejects.
+  starting a flow the callback then rejects. In the same reading of RFC 7591
+  Section 3.2.1, a `client_secret_expires_at` of `0` means a secret that does
+  not expire, so a client registered with one is no longer treated as having
+  expired at the epoch and re-registered on every flow.
 
 ### Tasks extension (`io.modelcontextprotocol/tasks`)
 

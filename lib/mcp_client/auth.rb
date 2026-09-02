@@ -229,10 +229,12 @@ module MCPClient
                        issuer: issuer, registration_type: registration_type)
       end
 
-      # Check if client secret is expired
+      # Check if client secret is expired. RFC 7591 Section 3.2.1 gives 0 the
+      # meaning "this secret does not expire", so it is not an expiry in the
+      # past.
       # @return [Boolean] true if client secret is expired
       def client_secret_expired?
-        return false unless @client_secret_expires_at
+        return false if @client_secret_expires_at.nil? || @client_secret_expires_at.zero?
 
         Time.now.to_i >= @client_secret_expires_at
       end
