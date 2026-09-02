@@ -132,7 +132,11 @@ module MCPClient
         # Refresh early when possible; a still-valid token is presented when
         # the refresh (or the discovery it needs) cannot run right now.
         refreshed = refresh_if_possible(token)
-        refreshed || (token.expired? ? nil : token)
+        return refreshed if refreshed
+        # The discovery a refresh ran may have retired this very token.
+        return nil if token.expired? || retired_token?(token) || !token_for_current_issuer?(token)
+
+        token
       end
 
       # @param token [Token]
@@ -1167,6 +1171,8 @@ module MCPClient
         end
 
         data = JSON.parse(response.body)
+        raise MCPClient::Errors::ConnectionError, 'Invalid resource metadata: not a JSON object' unless data.is_a?(Hash)
+
         metadata = ResourceMetadata.from_h(data)
         # Retain the most recently fetched PRM so scope resolution can fall
         # back to its scopes_supported (MCP scope selection priority 2).
@@ -1194,6 +1200,8 @@ module MCPClient
         end
 
         data = JSON.parse(response.body)
+        raise MCPClient::Errors::ConnectionError, 'Invalid server metadata: not a JSON object' unless data.is_a?(Hash)
+
         ServerMetadata.from_h(data)
       rescue JSON::ParserError => e
         raise MCPClient::Errors::ConnectionError, "Invalid server metadata JSON: #{e.message}"
