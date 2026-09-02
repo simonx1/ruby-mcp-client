@@ -79,14 +79,21 @@ The implementation follows the standard OAuth 2.1 authorization code flow with P
      loopback interface — `localhost`, a `*.localhost` name, or any spelling of 127.0.0.0/8 or
      `::1` — for local development).
 2. **Client Registration**: Automatically register OAuth client if dynamic registration is supported
+   - A registration response names a client only when it is a JSON object whose `client_id` is a
+     non-empty string (RFC 7591 Section 3.2.1). A `201` without one registered nothing, so it raises a
+     `ConnectionError` and the flow ends *before* the browser is opened, rather than sending the user
+     to the authorization endpoint with an empty `client_id`.
 3. **Authorization**: Redirect user to authorization server with PKCE parameters
 4. **Token Exchange**: Exchange authorization code for access token using PKCE verifier
-   - A `200` response that carries no `access_token` is a protocol error (RFC 6749 Section 5.1), not a
-     credential: the exchange raises a `ConnectionError` and nothing is stored.
+   - A token response carries a credential only when it is a JSON object whose `access_token` is a
+     non-empty string (RFC 6749 Section 5.1). Anything else — `200 {}`, `200 []`, `200 null`,
+     `{"access_token": ["x"]}` — is a protocol error, not a credential: the exchange raises a
+     `ConnectionError` and nothing is stored.
 5. **Token Usage**: Include access token in MCP requests via `Authorization` header
 6. **Token Refresh**: Automatically refresh tokens when they expire
-   - A refresh response without an `access_token` is a failed refresh: the still-valid token stays in
-     storage and keeps being presented rather than being replaced by a bare `Bearer `.
+   - A refresh response that carries no such `access_token` is a failed refresh: the still-valid token
+     stays in storage and keeps being presented rather than being replaced by a bare `Bearer ` or by
+     the `to_s` of whatever JSON arrived.
 
 ## Configuration Options
 
@@ -119,6 +126,14 @@ oauth_provider = MCPClient::Auth::OAuthProvider.new(
   storage: custom_storage                       # Custom storage backend
 )
 ```
+
+`server_url=` retargets an existing provider at another MCP server. Everything the provider learned
+about the previous server in this process — the discovered authorization server metadata it keeps as a
+fallback for storage backends that do not persist it, the memoized `supported_scopes`, and any adopted,
+pending or refused `401` challenge — is forgotten, so the new server is discovered from scratch rather
+than answered with the previous server's endpoints. Retirement markers for tokens are keyed by the
+issuer they were retired for, not by the server URL, so they survive the change: bytes retired at an
+authorization server stay retired for every MCP server behind it.
 
 ## Storage Backends
 

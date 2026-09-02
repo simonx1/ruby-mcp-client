@@ -220,7 +220,28 @@ metadata). Each feature lands in its own PR; this section accumulates them.
   backend reads back after the `set_client_info(server_url, nil)` fallback
   deleted an issuer-less dynamic client) is no client at all: a new dynamic
   registration is made instead of an authorization request with an empty
-  `client_id`.
+  `client_id`. Those checks now read the response's type as well as its
+  presence: a token response carries a credential only when it is a JSON
+  object whose `access_token` is a non-empty string, so `200 []` and
+  `200 null` are a failed refresh (keeping the still-valid token) or a
+  failed exchange instead of a `TypeError`, and `{"access_token": ["x"]}`
+  no longer overwrites the stored token and goes out as
+  `Authorization: Bearer ["x"]`. A registration response is held to the
+  same standard (RFC 7591 Section 3.2.1): a `201` whose `client_id` is
+  missing, empty or not a string fails the registration outright, so the
+  flow ends before the browser is opened rather than after the user has
+  already visited an authorization endpoint with no usable `client_id`.
+  Finally, the in-process state a provider accumulates for one MCP server —
+  the discovered-metadata fallback for backends that do not persist
+  metadata, the memoized `supported_scopes`, the adopted, pending or
+  refused 401 challenge and its scope, and the "authorization server
+  changed" flag — is forgotten when the public `server_url=` setter
+  retargets the provider, so a provider reused for another server
+  discovers it instead of sending its authorization, registration and
+  token requests to the previous server's endpoints. Retirement markers
+  are kept: they name the issuer the bytes were retired for, not the
+  resource URL, and stay true when two MCP servers share one
+  authorization server.
 
 ### Tasks extension (`io.modelcontextprotocol/tasks`)
 
