@@ -5,6 +5,7 @@ require 'json'
 require 'uri'
 require 'ipaddr'
 require_relative '../auth'
+require_relative 'peer_text'
 require_relative 'oauth_provider/challenge_handling'
 require_relative 'oauth_provider/response_validation'
 
@@ -27,6 +28,7 @@ module MCPClient
       AUTH_PARAMS_RUN = /\A(?:[\s,]*#{AUTH_PARAM})*/
 
       include ChallengeHandling
+      include PeerText
       include ResponseValidation
 
       # @!attribute [rw] redirect_uri
@@ -893,7 +895,8 @@ module MCPClient
           rescue MCPClient::Errors::ConnectionError => e
             # Not this candidate: the next well-known location may hold the
             # document for the issuer actually asked for.
-            logger.debug("Authorization server metadata candidate rejected (#{url}): #{e.message}")
+            logger.debug("Authorization server metadata candidate rejected (#{safe_error_text(url.to_s)}): " \
+                         "#{e.message}")
             rejected = e
             next
           end
@@ -928,7 +931,7 @@ module MCPClient
       def try_fetch_server_metadata(url)
         fetch_server_metadata(url)
       rescue MCPClient::Errors::ConnectionError => e
-        logger.debug("Authorization server metadata candidate failed (#{url}): #{e.message}")
+        logger.debug("Authorization server metadata candidate failed (#{safe_error_text(url.to_s)}): #{e.message}")
         nil
       end
 
@@ -1030,7 +1033,8 @@ module MCPClient
       def resource_identity(url)
         uri = URI.parse(url)
         unless uri.scheme && uri.host
-          raise MCPClient::Errors::ConnectionError, "Invalid resource URL (must be absolute): #{url}"
+          raise MCPClient::Errors::ConnectionError,
+                "Invalid resource URL (must be absolute): #{safe_error_text(url.to_s)}"
         end
 
         scheme = uri.scheme.downcase
@@ -1060,7 +1064,7 @@ module MCPClient
       # @return [ResourceMetadata, nil] metadata, or nil if a speculative URL returns 404
       # @raise [MCPClient::Errors::ConnectionError] on any non-404 failure, or on 404 when strict
       def fetch_resource_metadata(url, strict: false)
-        logger.debug("Fetching resource metadata from: #{url}")
+        logger.debug("Fetching resource metadata from: #{safe_error_text(url.to_s)}")
 
         response = @http_client.get(url) do |req|
           req.headers['Accept'] = 'application/json'
@@ -1081,9 +1085,11 @@ module MCPClient
         @resource_metadata = metadata
         metadata
       rescue JSON::ParserError => e
-        raise MCPClient::Errors::ConnectionError, "Invalid resource metadata JSON: #{e.message}"
+        raise MCPClient::Errors::ConnectionError,
+              "Invalid resource metadata JSON: #{describe_parse_error(e, response&.body)}"
       rescue Faraday::Error => e
-        raise MCPClient::Errors::ConnectionError, "Network error fetching resource metadata: #{e.message}"
+        raise MCPClient::Errors::ConnectionError,
+              "Network error fetching resource metadata: #{safe_error_text(e.message)}"
       end
 
       # Fetch authorization server metadata from URL
@@ -1091,7 +1097,7 @@ module MCPClient
       # @return [ServerMetadata] Server metadata
       # @raise [MCPClient::Errors::ConnectionError] if fetch fails
       def fetch_server_metadata(url)
-        logger.debug("Fetching server metadata from: #{url}")
+        logger.debug("Fetching server metadata from: #{safe_error_text(url.to_s)}")
 
         response = @http_client.get(url) do |req|
           req.headers['Accept'] = 'application/json'
@@ -1106,9 +1112,11 @@ module MCPClient
 
         ServerMetadata.from_discovery_document(data)
       rescue JSON::ParserError => e
-        raise MCPClient::Errors::ConnectionError, "Invalid server metadata JSON: #{e.message}"
+        raise MCPClient::Errors::ConnectionError,
+              "Invalid server metadata JSON: #{describe_parse_error(e, response&.body)}"
       rescue Faraday::Error => e
-        raise MCPClient::Errors::ConnectionError, "Network error fetching server metadata: #{e.message}"
+        raise MCPClient::Errors::ConnectionError,
+              "Network error fetching server metadata: #{safe_error_text(e.message)}"
       end
 
       # Get or register OAuth client, following the MCP 2025-11-25 client
@@ -1295,7 +1303,13 @@ module MCPClient
         # persists plain hashes writes `nil.to_h` — `{}`. Read back that is a
         # record without token bytes, whose header would be a bare "Bearer "
         # attributed to whatever authorization server is current now. It is
-        # not a token: it is the absence storage meant to express.
+        # not a token: it is the absence storage meant to express. The same
+        # backend can read back any other JSON type, or bytes no header can
+        # carry, in EVERY field the token presents: a token_type that is not a
+        # string crashes `capitalize`, and one carrying CR/LF makes the
+        # `Authorization` value two header lines. A record that cannot be
+        # presented is not a token either, so the read path is as strict as
+        # the wire path.
         return nil if token.respond_to?(:access_token) && !token_bytes?(token)
 
         token
@@ -1506,7 +1520,7 @@ module MCPClient
       def register_client(server_metadata)
         logger.warn('Dynamic Client Registration is deprecated in MCP 2026-07-28; prefer a Client ID Metadata ' \
                     'Document (client_id_metadata_url) or pre-registered credentials')
-        logger.debug("Registering OAuth client at: #{server_metadata.registration_endpoint}")
+        logger.debug("Registering OAuth client at: #{safe_error_text(server_metadata.registration_endpoint.to_s)}")
 
         app_type = resolved_application_type
         response = post_registration(server_metadata, app_type)
@@ -1527,7 +1541,7 @@ module MCPClient
 
         data = JSON.parse(response.body)
         client_id = registered_client_id!(data)
-        logger.debug("OAuth client registered successfully: #{client_id}")
+        logger.debug("OAuth client registered successfully: #{safe_error_text(client_id)}")
 
         # Parse registered metadata from server response (may differ from our request)
         registered_metadata = ClientMetadata.new(
@@ -1545,15 +1559,7 @@ module MCPClient
           application_type: data['application_type'] || app_type
         )
 
-        # Warn if server changed redirect_uri
-        requested_uri = redirect_uri
-        registered_uri = registered_metadata.redirect_uris.first
-        if registered_uri != requested_uri
-          logger.warn('OAuth server changed redirect_uri:')
-          logger.warn("  Requested:  #{requested_uri}")
-          logger.warn("  Registered: #{registered_uri}")
-          logger.warn("Using server's registered redirect_uri for token exchange.")
-        end
+        warn_registered_redirect_uri(registered_metadata)
 
         client_info = ClientInfo.new(
           client_id: client_id,
@@ -1571,9 +1577,26 @@ module MCPClient
 
         client_info
       rescue JSON::ParserError => e
-        raise MCPClient::Errors::ConnectionError, "Invalid client registration response: #{e.message}"
+        raise MCPClient::Errors::ConnectionError,
+              "Invalid client registration response: #{describe_parse_error(e, response&.body)}"
       rescue Faraday::Error => e
-        raise MCPClient::Errors::ConnectionError, "Network error during client registration: #{e.message}"
+        raise MCPClient::Errors::ConnectionError,
+              "Network error during client registration: #{safe_error_text(e.message)}"
+      end
+
+      # The authorization server may register a redirect URI other than the
+      # one asked for; the registered value is what the token exchange must
+      # then present (RFC 6749 Section 4.1.3), so say so.
+      # @param registered_metadata [ClientMetadata] the metadata as registered
+      # @return [void]
+      def warn_registered_redirect_uri(registered_metadata)
+        registered_uri = registered_metadata.redirect_uris.first
+        return if registered_uri == redirect_uri
+
+        logger.warn('OAuth server changed redirect_uri:')
+        logger.warn("  Requested:  #{redirect_uri}")
+        logger.warn("  Registered: #{safe_error_text(registered_uri.to_s)}")
+        logger.warn("Using server's registered redirect_uri for token exchange.")
       end
 
       # The client id of a registration response, once the response has been
@@ -1682,14 +1705,6 @@ module MCPClient
         {}
       end
 
-      # @param value [Object] peer-supplied text
-      # @return [String, nil] printable, bounded text
-      def safe_error_text(value)
-        return nil unless value.is_a?(String)
-
-        value.gsub(/[[:cntrl:]]/, ' ')[0, 200]
-      end
-
       # Build authorization URL
       # @param server_metadata [ServerMetadata] Server metadata
       # @param client_info [ClientInfo] Client information
@@ -1767,7 +1782,8 @@ module MCPClient
         end
 
         unless response.success?
-          raise MCPClient::Errors::ConnectionError, "Token exchange failed: HTTP #{response.status} - #{response.body}"
+          raise MCPClient::Errors::ConnectionError,
+                "Token exchange failed: HTTP #{response.status} - #{safe_body_text(response.body)}"
         end
 
         data = JSON.parse(response.body)
@@ -1788,9 +1804,11 @@ module MCPClient
           issuer: server_metadata.issuer
         )
       rescue JSON::ParserError => e
-        raise MCPClient::Errors::ConnectionError, "Invalid token response: #{e.message}"
+        raise MCPClient::Errors::ConnectionError,
+              "Invalid token response: #{describe_parse_error(e, response&.body)}"
       rescue Faraday::Error => e
-        raise MCPClient::Errors::ConnectionError, "Network error during token exchange: #{e.message}"
+        raise MCPClient::Errors::ConnectionError,
+              "Network error during token exchange: #{safe_error_text(e.message)}"
       end
 
       # Refresh access token
@@ -1854,10 +1872,10 @@ module MCPClient
         store_token(new_token)
         new_token
       rescue JSON::ParserError => e
-        logger.warn("Invalid token refresh response: #{describe_parse_error(e)}")
+        logger.warn("Invalid token refresh response: #{describe_parse_error(e, response&.body)}")
         nil
       rescue Faraday::Error => e
-        logger.warn("Network error during token refresh: #{e.message}")
+        logger.warn("Network error during token refresh: #{safe_error_text(e.message)}")
         nil
       end
 

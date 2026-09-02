@@ -267,7 +267,33 @@ metadata). Each feature lands in its own PR; this section accumulates them.
   starting a flow the callback then rejects. In the same reading of RFC 7591
   Section 3.2.1, a `client_secret_expires_at` of `0` means a secret that does
   not expire, so a client registered with one is no longer treated as having
-  expired at the epoch and re-registered on every flow.
+  expired at the epoch and re-registered on every flow. A field of the right
+  JSON type is still not a usable credential, and the read path is now as
+  strict as the wire path: `access_token` and `token_type` must carry bytes an
+  HTTP header can hold, so a `200` whose token contains CR/LF (or any control
+  byte) is refused instead of being stored and turned into a two-line
+  `Authorization` value, and a record storage reads back whose `token_type` is
+  empty, of another type or control-bearing presents no token at all instead
+  of crashing `String#capitalize`. A `refresh_token` is a credential too — `""`
+  is refused like a missing one rather than persisted over the refresh token
+  the client already holds — and a registration response's `redirect_uris`
+  must be usable redirect URIs (absolute and parseable), so `[""]` is a
+  reported registration failure instead of a browser opened at
+  `…&redirect_uri=&…`. An `authorization_response_iss_parameter_supported`
+  that is not a JSON boolean (`"true"`, `1`, `{}`) is no answer at all and now
+  fails closed — it is read as "advertised", so a callback without `iss` is
+  refused — where before it counted as "not advertised"; a PKCE record
+  carrying such a value defers to the authorization server's own metadata.
+  Finally, every peer-supplied string that reaches a log line or an exception
+  message — which `BrowserOAuth` renders on its error page — goes through one
+  sanitizer (`MCPClient::Auth::PeerText`): a failed token exchange quotes a
+  printable, bounded body instead of the raw one, and a body that is not JSON
+  is described by position and size (`malformed JSON, at line 1 column 1,
+  26 byte body`) rather than by the token the parser choked on. Those helpers
+  live on the OAuth classes themselves, so a rescue path can no longer raise
+  `NoMethodError` over a helper only the JSON-RPC transports have — which is
+  what a non-JSON `200` on a token refresh did, out of the very request the
+  still-valid token should have served.
 
 ### Tasks extension (`io.modelcontextprotocol/tasks`)
 

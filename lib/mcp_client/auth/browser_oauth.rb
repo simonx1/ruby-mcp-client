@@ -3,6 +3,7 @@
 require 'socket'
 require 'uri'
 require 'cgi'
+require_relative 'peer_text'
 require_relative 'oauth_provider'
 
 module MCPClient
@@ -10,6 +11,8 @@ module MCPClient
     # Browser-based OAuth authentication flow helper
     # Provides a complete OAuth flow using browser authentication with a local callback server
     class BrowserOAuth
+      include PeerText
+
       # @!attribute [r] oauth_provider
       #   @return [OAuthProvider] The OAuth provider instance
       # @!attribute [r] callback_port
@@ -138,7 +141,10 @@ module MCPClient
               # Server was closed, exit loop
               break
             rescue StandardError => e
-              @logger.error("Error handling callback request: #{e.message}")
+              # The request being handled is whatever the browser (or
+              # anything else that reached the loopback port) sent: an
+              # exception raised over it can quote those bytes.
+              @logger.error("Error handling callback request: #{safe_error_text(e.message)}")
             end
           end
         end
