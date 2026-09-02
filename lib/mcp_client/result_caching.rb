@@ -388,6 +388,17 @@ module MCPClient
       entry.fresh?(now: monotonic_now)
     end
 
+    # The list a transport with no cache of its own may serve for a kind:
+    # only one the server itself bounded ("If ttlMs is positive, the client
+    # SHOULD consider the result fresh for that many milliseconds"). A list
+    # without a hint is left to the client's own cache, which asks again for
+    # an empty one instead of keeping it for the life of the connection.
+    # @param kind [Symbol]
+    # @return [Object, nil]
+    def hinted_list_value(kind)
+      cache_entry_hinted?(kind) ? fresh_list_value(kind) : nil
+    end
+
     # The list a transport may serve for a kind without fetching: the value
     # of a fresh entry in the current authorization context. With no entry
     # at all (nothing recorded yet) the transport's own copy, given by the
@@ -401,10 +412,20 @@ module MCPClient
         note_legacy_served(kind)
         return block_given? ? yield : nil
       end
-      return nil unless entry.value && entry.fresh?(now: monotonic_now)
+      # An invalidation (a list_changed notification, a cleanup) that lands
+      # after the lookup — the authorization probe makes that a wide window —
+      # replaces the slot but leaves this reference intact: the copy is made
+      # under the lock, and only while the entry is still the one the map
+      # holds and still fresh.
+      copy = cache_entries_mutex.synchronize do
+        next nil unless cache_entries[kind].equal?(entry) && entry.value && entry.fresh?(now: monotonic_now)
+
+        MCPClient::DeepCopy.copy(entry.value)
+      end
+      return nil unless copy
 
       note_served_entry(kind, entry)
-      MCPClient::DeepCopy.copy(entry.value)
+      copy
     end
 
     # The list recorded for a kind whatever its freshness: the candidate for
@@ -447,6 +468,24 @@ module MCPClient
     #   that very operation (middleware may pick credentials by method or body)
     def entry_in_current_context?(entry, context: :current, kind: nil)
       return false if entry && !entry_for_current_params?(entry, context)
+
+      matched = entry_matches_authorization?(entry, context, kind)
+      # The whole decision is made: the entry is served, so this lookup leads
+      # to no request of its own and the metadata held for it is dropped
+      # rather than sent by a later one. Until then it stays held, so the
+      # authorization probe models the request on the very metadata the
+      # decision was made on instead of evaluating the host's callable again.
+      if matched && entry && context == :current && respond_to?(:release_held_request_meta, true)
+        release_held_request_meta
+      end
+      matched
+    end
+
+    # @param entry [MCPClient::CachedResult, nil]
+    # @param context [String, nil, :current, :unknown]
+    # @param kind [Symbol, String, nil]
+    # @return [Boolean] whether a privately scoped entry belongs to the context being served
+    def entry_matches_authorization?(entry, context, kind)
       return true unless entry&.cache_scope == 'private' && respond_to?(:current_authorization_context, true)
       return false if entry.authorization_context.equal?(MCPClient::CachedResult::MIXED_CONTEXT)
 
@@ -470,13 +509,11 @@ module MCPClient
       # A failed attempt that never built its request noted no parameters:
       # it matches no entry, whatever the previous request on this thread
       # carried.
-      matched = expected.is_a?(String) && entry.params_fingerprint == expected
       # Reading the next request's parameters evaluates a host request_meta
       # callable, and the transport holds that evaluation for the request
-      # this lookup leads to. A match means the entry is served instead, so
-      # the held metadata is dropped rather than sent by a later request.
-      release_held_request_meta if matched && context == :current && respond_to?(:release_held_request_meta, true)
-      matched
+      # this lookup leads to (or for the probe that models it); the caller
+      # drops it once the entry is served instead.
+      expected.is_a?(String) && entry.params_fingerprint == expected
     end
 
     # Attach the list a request produced to the very entry that request
@@ -541,8 +578,16 @@ module MCPClient
       return nil unless cache_entries_mutex.synchronize { cache_entries[kind].equal?(entry) }
 
       note_served_entry(kind, entry)
+      return nil unless entry_in_current_context?(entry, context: context, kind: kind)
 
-      entry_in_current_context?(entry, context: context, kind: kind) ? MCPClient::DeepCopy.copy(entry.value) : nil
+      # Judging the context runs the probe, and an invalidation may land
+      # while it does: the copy is taken under the lock, and only while the
+      # entry is still the one the map holds.
+      cache_entries_mutex.synchronize do
+        next nil unless cache_entries[kind].equal?(entry) && entry.value
+
+        MCPClient::DeepCopy.copy(entry.value)
+      end
     end
 
     # The freshness hint recorded for an operation.

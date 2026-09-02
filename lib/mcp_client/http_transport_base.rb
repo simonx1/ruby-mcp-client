@@ -716,7 +716,14 @@ module MCPClient
           # A copy is kept only when its hint was attached (or the list
           # carried none): a fetch whose entry was cleared or replaced in
           # flight leaves nothing behind, so the next access fetches again.
+          previous = @tools
           @tools = attach_list_value(:tools, tools) ? tools : nil
+          # A re-fetch that brought different definitions (an expired ttlMs
+          # during a tools/call) is a change the host must see: a client
+          # re-resolves a tool for post-call validation only when the
+          # generation moves, and would otherwise check the result against
+          # the definition the call was not answered under.
+          @tools_generation = tools_generation + 1 if tool_definitions_changed?(previous, tools)
           return tools
         end
 

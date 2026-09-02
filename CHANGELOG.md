@@ -7,6 +7,28 @@ metadata). Each feature lands in its own PR; this section accumulates them.
 
 ### Cacheable results (`ttlMs` / `cacheScope`)
 
+- **Middleware the probe may neither build nor stand in for, and lists
+  taken under the lock (round 27).** Two middleware ivars that merely
+  compare equal are a stand-in only while nothing mutable is reachable
+  through both of them: Faraday rebuilds middleware as
+  `klass.new(app, **kwargs)`, so a fresh options hash around the very same
+  vendor now reports the unknown context instead of letting the probe spend
+  a one-time credential (a callable credential, `-> { token }`, is such
+  shared state too). A middleware copy is built only when every argument the
+  handler carries can hand its constructor nothing to spend, so a
+  constructor that consumes a nonce is never run; middleware with no
+  request hook is neither built nor compared, since it cannot change what a
+  request carries. The probe models the request with the metadata held for
+  the decision rather than evaluating the host's `request_meta` again. A
+  cached list is copied out under the cache lock and only while its entry is
+  still the one the cache holds, so a `list_changed` notification landing
+  during the lookup is never served past. Stdio serves a still-fresh hinted
+  `tools` / `prompts` / `resources` list instead of re-listing on every call
+  (an unhinted list is still left to the client's cache). And a re-fetch
+  that replaced the tool definitions (an expired `ttlMs` during a
+  `tools/call`) announces the change, so a result is validated against the
+  definitions its call was answered under.
+
 - **Unpredictable shared state, and empty legacy lists (round 26).** The
   freshness probe now treats shared state as predictable only where it can
   vend nothing but itself: a module or class a host middleware shares is no

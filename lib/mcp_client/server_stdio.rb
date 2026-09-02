@@ -361,6 +361,9 @@ module MCPClient
     # @raise [MCPClient::Errors::ServerError] if server returns an error
     # @raise [MCPClient::Errors::PromptGetError] for other errors during prompt listing
     def list_prompts
+      cached = hinted_list_value(:prompts)
+      return cached if cached
+
       ensure_initialized
       pages = []
       received_ats = []
@@ -415,6 +418,9 @@ module MCPClient
     # @raise [MCPClient::Errors::ServerError] if server returns an error
     # @raise [MCPClient::Errors::ResourceReadError] for other errors during resource listing
     def list_resources(cursor: nil)
+      cached = cursor ? nil : hinted_list_value(:resources)
+      return cached if cached
+
       ensure_initialized
       params = {}
       params['cursor'] = cursor if cursor
@@ -550,6 +556,12 @@ module MCPClient
     # @raise [MCPClient::Errors::ServerError] if server returns an error
     # @raise [MCPClient::Errors::ToolCallError] for other errors during tool listing
     def list_tools
+      # MCP 2026-07-28 caching: a list the server put a positive ttlMs on is
+      # served here while it is still fresh, so a host reaching for the
+      # transport directly does not re-list on every call.
+      cached = hinted_list_value(:tools)
+      return cached if cached
+
       ensure_initialized
       pages = []
       received_ats = []
