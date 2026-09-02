@@ -383,10 +383,29 @@ module MCPClient
         advertised = Array(resource_metadata&.authorization_servers).first
         known = stored_server_metadata&.issuer
         return unless advertised && known && advertised != known
+        # Only metadata discovery would accept can retire a token: a document
+        # for another resource or naming an unacceptable server is rejected
+        # later and must not cost the valid token now.
+        return unless challenge_metadata_acceptable?(resource_metadata, advertised)
 
         logger.debug('The challenge names another authorization server; retiring the stored token')
         @authorization_server_switched = true
         delete_token(bind_to: Token::RETIRED_ISSUER)
+      end
+
+      # Whether challenge-advertised resource metadata passes the checks
+      # discovery applies before it is trusted (resource identity, an
+      # acceptable authorization server URL).
+      # @param resource_metadata [ResourceMetadata]
+      # @param advertised [String] the advertised authorization server
+      # @return [Boolean]
+      def challenge_metadata_acceptable?(resource_metadata, advertised)
+        validate_resource_matches!(resource_metadata)
+        validate_peer_advertised_url!(advertised, 'authorization server URL (from resource metadata)')
+        true
+      rescue MCPClient::Errors::ConnectionError => e
+        logger.debug("Ignoring a challenge whose metadata discovery would reject: #{e.message}")
+        false
       end
 
       # Extract the protected-resource-metadata URL from a WWW-Authenticate header.
