@@ -800,14 +800,17 @@ module MCPClient
         end
         return [] if pending.empty?
 
+        abandoned = false
         begin
-          responses = bounded_by_wait(wait) { srv.fulfil_input_requests(pending, task.to_h) }
+          responses = bounded_by_wait(wait, on_abandon: lambda { |runner|
+            abandoned = true
+            hold_in_flight_keys(runner, state, answered, pending.keys)
+          }) { srv.fulfil_input_requests(pending, task.to_h) }
           # The whole deadline (caller timeout and task TTL) is enforced
           # before anything is delivered.
           raise_if_past_deadline!(wait)
         rescue StandardError
-          submitted = task_state(srv, task.task_id)[:submitted]
-          answered_keys_mutex.synchronize { answered.subtract(pending.keys - submitted.to_a) }
+          answered_keys_mutex.synchronize { answered.subtract(pending.keys - state[:submitted].to_a) } unless abandoned
           raise
         end
         # A session that restarted while the host was answering may have
@@ -822,13 +825,28 @@ module MCPClient
         pending.keys
       end
 
+      # Whether a task request's error means the task is gone. A rejection of
+      # the supplied inputResponses (tasks/update) is about the params,
+      # whatever else the message says: the task still exists. tasks/get
+      # answers -32602 for an unknown task; tasks/update and tasks/cancel use
+      # it for other reasons too, so there only an explicit indication counts.
+      # @return [Boolean]
+      def task_not_found_error?(error, method, modern)
+        return false if method != 'tasks/get' && error.message.match?(/inputResponses|params/i)
+        return true if error.message.match?(/not found|unknown task|no such task|invalid taskId|expired/i)
+
+        modern && error.respond_to?(:code) && error.code == MCPClient::Errors::Codes::INVALID_PARAMS &&
+          (method.nil? || method == 'tasks/get')
+      end
+
       # Run a host handler within what is left of the wait: with a deadline
       # the handler runs on its own thread and the wait ends with the
       # timed-out TaskError when it outlives the budget (the handler thread
       # is abandoned — a blocked elicitation cannot be interrupted — and its
       # eventual answer is dropped); without a deadline it runs inline.
+      # @param on_abandon [Proc, nil] called with the abandoned thread before the wait ends
       # @return [Object] the handler's result
-      def bounded_by_wait(wait)
+      def bounded_by_wait(wait, on_abandon: nil)
         deadline = wait_deadline(wait)
         return yield unless deadline
 
@@ -838,6 +856,7 @@ module MCPClient
           yield
         end
         unless runner.join(remaining)
+          on_abandon&.call(runner)
           # Whichever bound ran out ends the wait: the task's TTL or the
           # caller's timeout.
           raise_if_past_deadline!(wait)
@@ -845,6 +864,25 @@ module MCPClient
         end
 
         runner.value
+      end
+
+      # An abandoned handler is still presenting its requests: the keys stay
+      # reserved until it finishes (a later wait polls instead of asking the
+      # host again, and the late answer is dropped), and the round it never
+      # completed is given back so retries of a timed-out wait cannot spend
+      # the per-task budget on one outstanding request.
+      # @return [void]
+      def hold_in_flight_keys(runner, state, answered, keys)
+        answered_keys_mutex.synchronize { state[:rounds] -= 1 if state[:rounds].positive? }
+        Thread.new do
+          Thread.current.report_on_exception = false
+          begin
+            runner.join
+          rescue StandardError
+            nil
+          end
+          answered_keys_mutex.synchronize { answered.subtract(keys - state[:submitted].to_a) }
+        end
       end
 
       # The wait before the next tasks/get: the server's pollIntervalMs
