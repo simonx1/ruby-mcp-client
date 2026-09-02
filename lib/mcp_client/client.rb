@@ -1200,10 +1200,11 @@ module MCPClient
         # MCP 2025-06-18: Handle logging messages from server
         handle_log_message(server_id, params)
       when 'notifications/tasks/status', 'notifications/tasks'
+        # (both handled below; the legacy method carries the flat 2025 shape)
         # MCP 2025-11-25: task status update (params are a flat Task);
         # MCP 2026-07-28 tasks extension: notifications/tasks carries a
         # DetailedTask (only ever on a subscriptions/listen stream).
-        handle_task_status_notification(server_id, params)
+        handle_task_status_notification(server_id, params, method)
       when 'notifications/subscriptions/acknowledged'
         # MCP 2026-07-28: the transport already recorded the acknowledged
         # filter on the Subscription; log for observability.
@@ -1619,9 +1620,12 @@ module MCPClient
     #   unknown task for tasks/get, while tasks/update and tasks/cancel may use it for bad params too
     def task_error_from(error, task_id, action, modern: false, method: nil)
       shown = sanitize_peer_log_text(task_id.to_s)
-      not_found = error.message.match?(/not found|unknown task|expired/i) ||
-                  (modern && error.respond_to?(:code) && error.code == MCPClient::Errors::Codes::INVALID_PARAMS &&
-                   (method == 'tasks/get' || !error.message.match?(/inputResponses|params/i)))
+      # A rejection of the supplied inputResponses (tasks/update) is about
+      # the params, whatever else the message says: the task still exists.
+      about_params = method != 'tasks/get' && error.message.match?(/inputResponses|params/i)
+      not_found = !about_params &&
+                  (error.message.match?(/not found|unknown task|expired/i) ||
+                   (modern && error.respond_to?(:code) && error.code == MCPClient::Errors::Codes::INVALID_PARAMS))
       return MCPClient::Errors::TaskNotFound.new("Task '#{shown}' not found") if not_found
 
       MCPClient::Errors::TaskError.new("Error #{action} task '#{shown}': #{sanitize_peer_log_text(error.message)}")
@@ -1632,13 +1636,21 @@ module MCPClient
     # @param server_id [String] server identifier for the log prefix
     # @param params [Hash] the flat task params
     # @return [void]
-    def handle_task_status_notification(server_id, params)
-      # The params are a DetailedTask: anything short of that is a parse
-      # failure, not a working task.
-      problem = params.is_a?(Hash) ? detailed_task_shape_problem(params) : 'not an object'
+    def handle_task_status_notification(server_id, params, method = 'notifications/tasks')
+      # A 2026-07-28 notifications/tasks carries a DetailedTask: anything
+      # short of that is a parse failure, not a working task. The legacy
+      # notifications/tasks/status carries the flat 2025 Task (ttl,
+      # pollInterval, no inline payloads).
+      if method == 'notifications/tasks/status'
+        problem = params.is_a?(Hash) && params['taskId'].is_a?(String) ? nil : 'not a task'
+        detailed = false
+      else
+        problem = params.is_a?(Hash) ? detailed_task_shape_problem(params) : 'not an object'
+        detailed = true
+      end
       raise MCPClient::Errors::InvalidResultError, "Invalid task notification: #{problem}" if problem
 
-      task = MCPClient::Task.from_json(params, detailed: true)
+      task = MCPClient::Task.from_json(params, detailed: detailed)
       logger.info("[#{server_id}] Task #{sanitize_peer_log_text(task.task_id.to_s)} status: #{task.status}")
     rescue StandardError => e
       logger.debug("[#{server_id}] Failed to parse task status notification: #{e.message}")

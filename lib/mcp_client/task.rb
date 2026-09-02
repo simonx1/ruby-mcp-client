@@ -1,6 +1,7 @@
 # frozen_string_literal: true
 
 require 'time'
+require_relative 'errors'
 
 module MCPClient
   # Represents an MCP Task for long-running, task-augmented operations.

@@ -223,11 +223,16 @@ module MCPClient
       # @param wait [Hash]
       # @return [void]
       def refresh_wait_session(wait)
-        epoch = current_session_epoch(wait[:srv])
-        return if wait[:epoch] == epoch && wait[:answered]
+        # The epoch and the state keyed under it are read in one step, so
+        # a restart between the two cannot leave the wait pointing at one
+        # session's set while recording another's epoch.
+        answered_keys_mutex.synchronize do
+          epoch = current_session_epoch(wait[:srv])
+          next if wait[:epoch] == epoch && wait[:answered]
 
-        wait[:epoch] = epoch
-        wait[:answered] = answered_task_keys(wait[:srv], wait[:task_id])
+          wait[:epoch] = epoch
+          wait[:answered] = task_state_locked(wait[:srv], wait[:task_id], epoch)[:answered]
+        end
       end
 
       # Per-task bookkeeping shared by every wait on the task: the answered
@@ -240,15 +245,20 @@ module MCPClient
       # cannot delete it or bring an older session back.
       # @return [Hash]
       def task_state(srv, task_id)
-        answered_keys_mutex.synchronize do
-          @task_states ||= {}
-          key = [srv.object_id, current_session_epoch(srv), task_id]
-          # A previous session of this server is over: its state (answered
-          # keys, pending answers) is dropped, not left behind.
-          @task_states.delete_if { |other, _| other[0] == key[0] && other[1] < key[1] }
-          @task_states[key] ||= { answered: Set.new, submitted: Set.new, rounds: 0,
-                                  pending_update: nil, update_mutex: Mutex.new }
-        end
+        answered_keys_mutex.synchronize { task_state_locked(srv, task_id, current_session_epoch(srv)) }
+      end
+
+      # {#task_state} for a caller already holding the registry lock and the
+      # epoch it read under it.
+      # @return [Hash]
+      def task_state_locked(srv, task_id, epoch)
+        @task_states ||= {}
+        key = [srv.object_id, epoch, task_id]
+        # A previous session of this server is over: its state (answered
+        # keys, pending answers) is dropped, not left behind.
+        @task_states.delete_if { |other, _| other[0] == key[0] && other[1] < key[1] }
+        @task_states[key] ||= { answered: Set.new, submitted: Set.new, rounds: 0,
+                                pending_update: nil, update_mutex: Mutex.new }
       end
 
       # Forget every task's bookkeeping (the client is being cleaned up).
@@ -792,8 +802,9 @@ module MCPClient
 
         begin
           responses = bounded_by_wait(wait) { srv.fulfil_input_requests(pending, task.to_h) }
-          # The deadline is enforced before anything is delivered.
-          raise_if_past_caller_deadline!(wait)
+          # The whole deadline (caller timeout and task TTL) is enforced
+          # before anything is delivered.
+          raise_if_past_deadline!(wait)
         rescue StandardError
           submitted = task_state(srv, task.task_id)[:submitted]
           answered_keys_mutex.synchronize { answered.subtract(pending.keys - submitted.to_a) }
@@ -818,14 +829,18 @@ module MCPClient
       # eventual answer is dropped); without a deadline it runs inline.
       # @return [Object] the handler's result
       def bounded_by_wait(wait)
-        return yield unless wait[:deadline]
+        deadline = wait_deadline(wait)
+        return yield unless deadline
 
-        remaining = [wait[:deadline] - monotonic_time, 0].max
+        remaining = [deadline - monotonic_time, 0].max
         runner = Thread.new do
           Thread.current.report_on_exception = false
           yield
         end
         unless runner.join(remaining)
+          # Whichever bound ran out ends the wait: the task's TTL or the
+          # caller's timeout.
+          raise_if_past_deadline!(wait)
           raise MCPClient::Errors::TaskError, "Timed out waiting for task '#{shown_task_id(wait[:task_id])}'"
         end
 

@@ -151,6 +151,16 @@ metadata). Each feature lands in its own PR; this section accumulates them.
   it. A poll that times out before the server ever said a pace waits the
   default interval, not the busy-loop floor.
 
+- **Rejections, notifications and bounds (round 21).** A `tasks/update`
+  rejection about the supplied `inputResponses` is a `TaskError`, never a
+  `TaskNotFound` (the task still exists); the legacy
+  `notifications/tasks/status` keeps its flat 2025 shape while
+  `notifications/tasks` requires a DetailedTask; an input handler is bounded
+  by the task's TTL as well as the caller's timeout, and the whole deadline
+  is enforced before delivery; a wait reads the server's session epoch and
+  the answered set it points at in one step; `mcp_client/task` requires the
+  error definitions it raises.
+
 ### Cacheable results (`ttlMs` / `cacheScope`)
 
 - **A result is bound to its own exchange, not to a request the response phase
