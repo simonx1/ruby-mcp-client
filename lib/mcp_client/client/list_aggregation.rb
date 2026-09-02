@@ -20,18 +20,67 @@ module MCPClient
 
       # Reserve, on every server, the evaluation of the host `request_meta`
       # for the request this listing leads to -- for the listing and no
-      # longer.
+      # longer. Each reservation is kept by name: it is handed to that
+      # server's own fetch when the loop reaches it ({#fetching_from}) and to
+      # nothing else, so a list a notification listener runs meanwhile on a
+      # server the loop has not reached cannot spend an evaluation this
+      # decision weighed for that server's fetch.
       # @param method [String] the JSON-RPC method the listing's fetch sends
       # @yield the listing
       # @return [Object] the block's value
       def holding_request_meta(method)
         holders = servers.select { |server| server.respond_to?(:open_request_meta_hold, true) }
-        holders.each { |server| server.send(:open_request_meta_hold, method) }
+        reservations = holders.to_h { |server| [server, server.send(:open_request_meta_hold, method)] }
+        request_meta_reservations.push(reservations)
         begin
           yield
         ensure
+          pop_request_meta_reservations
           holders.each { |server| server.send(:close_request_meta_hold) }
         end
+      end
+
+      # Run this server's fetch under the reservation this listing opened for
+      # it: the transport's own listing operation adopts it, and only it --
+      # an operation that begins meanwhile finds nothing to adopt and
+      # reserves its own.
+      # @param server [MCPClient::ServerBase]
+      # @yield the fetch
+      # @return [Object] the block's value
+      def fetching_from(server)
+        reservation = request_meta_reservations.last&.[](server)
+        return yield unless reservation && server.respond_to?(:offer_request_meta_hold, true)
+
+        server.send(:offer_request_meta_hold, reservation)
+        begin
+          yield
+        ensure
+          server.send(:withdraw_request_meta_hold)
+        end
+      end
+
+      # The reservations of the listings open on this thread, innermost last:
+      # a listing a notification listener nests inside this one has its own,
+      # and neither reaches the other's.
+      # @return [Array<Hash>]
+      def request_meta_reservations
+        Thread.current[request_meta_reservations_key] ||= []
+      end
+
+      # @return [void]
+      def pop_request_meta_reservations
+        stack = Thread.current[request_meta_reservations_key]
+        return nil unless stack.is_a?(Array)
+
+        stack.pop
+        Thread.current[request_meta_reservations_key] = nil if stack.empty?
+        nil
+      end
+
+      # @return [Symbol] this client's thread-local key for the reservations
+      #   its open listings hold
+      def request_meta_reservations_key
+        :"mcp_client_list_reservations_#{object_id}"
       end
 
       # A freshness check reads the parameters each server's next request
@@ -95,7 +144,7 @@ module MCPClient
           # The parameters this fetch will carry are read before it goes out:
           # whatever request ran last on this thread says nothing about it.
           fingerprint = params_fingerprint_for(server)
-          server_tools = server.list_tools
+          server_tools = fetching_from(server) { server.list_tools }
           # Replace this server's slice: an item the refreshed list no longer
           # carries must not linger from the previous fetch.
           replace_cached_slice(:tools, @tool_cache, server, fingerprint) do
@@ -134,7 +183,7 @@ module MCPClient
         servers.each do |server|
           refresh_server_cache(server, :prompts) unless cache
           fingerprint = params_fingerprint_for(server)
-          server_prompts = server.list_prompts
+          server_prompts = fetching_from(server) { server.list_prompts }
           replace_cached_slice(:prompts, @prompt_cache, server, fingerprint) do
             server_prompts.each do |prompt|
               @prompt_cache[cache_key_for(server, prompt.name)] = MCPClient::DeepCopy.copy(prompt)
@@ -161,7 +210,7 @@ module MCPClient
         servers.each do |server|
           refresh_server_cache(server, :resources) unless cache
           fingerprint = params_fingerprint_for(server)
-          result = server.list_resources
+          result = fetching_from(server) { server.list_resources }
           resource_list = result['resources'] || []
           replace_cached_slice(:resources, @resource_cache, server, fingerprint) do
             resource_list.each do |resource|

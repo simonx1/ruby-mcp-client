@@ -228,11 +228,13 @@ module MCPClient
     #
     # A probe is never sent: it models the reserved request, so it reads that
     # request's evaluation without spending it. A real request spends the
-    # reservation only when it *is* the request the reservation was made for.
-    # Everything else -- a reconnect's handshake, a re-opened
-    # `subscriptions/listen`, a cancellation, a nested request a notification
-    # listener issues -- reads the host afresh and leaves the reservation for
-    # the request that holds it.
+    # reservation only when it *is* the request the reservation was made for
+    # -- the one the operation holding it sends. Everything else -- a
+    # reconnect's handshake, a re-opened `subscriptions/listen`, a
+    # cancellation, and everything host code issues from behind the boundary
+    # a transport crosses to reach it ({MCPClient::RequestMetadata#outside_request_meta_hold}),
+    # raw `rpc_request` of the very same method included -- reads the host
+    # afresh and leaves the reservation for the request that holds it.
     # @param method [String] the JSON-RPC method being built
     # @param note [Boolean] whether the message is really going out
     # @return [Symbol] :spend, :model or :none
@@ -253,12 +255,7 @@ module MCPClient
     # @return [Hash] the JSON-RPC request object
     def build_jsonrpc_request(method, params, id, note: true)
       effective = with_request_meta(params, claim: request_meta_claim(method, note))
-      if note
-        # The operation is talking to the server now, so anything that starts
-        # from here on is a nested operation with a reservation of its own.
-        mark_request_meta_dispatched
-        note_request_params(effective)
-      end
+      note_request_params(effective) if note
       {
         'jsonrpc' => '2.0',
         'id' => id,
@@ -525,7 +522,6 @@ module MCPClient
       # A notification is never the request a cache decision was made for: it
       # reads the host afresh and leaves the reservation for that request.
       effective = with_request_meta(params, claim: :none)
-      mark_request_meta_dispatched
       {
         'jsonrpc' => '2.0',
         'method' => method,

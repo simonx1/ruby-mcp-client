@@ -7,6 +7,39 @@ metadata). Each feature lands in its own PR; this section accumulates them.
 
 ### Cacheable results (`ttlMs` / `cacheScope`)
 
+- **A reservation is adopted only by the operation it was opened for (round
+  34).** A `Client` listing opens a same-method reservation on every server
+  up front, and the transports adopted one on the rule "entered before the
+  operation dispatched, for the same method". A list a notification listener
+  ran on a server the loop had not reached yet therefore adopted *that*
+  server's reservation and spent the evaluation the freshness check had
+  already weighed for it: the nested request went out carrying another
+  request's tenant, baggage or one-time value, and the fetch the client then
+  made for that server was sent under an evaluation nothing had weighed. A
+  reservation is now handed to the one operation it was made for, by name
+  and once (`offer_request_meta_hold`), immediately before that operation is
+  invoked; an operation that merely uses the same method reserves its own.
+- **Host code the transport calls back into starts an operation of its own
+  (round 34).** The claim rule spent a reservation for any message whose
+  method equalled it, and several public entry points open no reservation of
+  their own — `rpc_request`, `Client#send_rpc`, `Client#call_tool_as_task`,
+  the HTTP transports' `fetch_prompts_list` / `fetch_resources_list`. A raw
+  `rpc_request('tools/list')` a notification listener issued from inside a
+  reconnect's handshake therefore spent the evaluation the interrupted
+  listing was holding, and that listing's own fetch went out under a
+  different one; wrapping `call_tool` and `get_prompt`, which weigh no cache
+  decision, had created a reservation a raw `tools/call` could spend the same
+  way. Every notification listener and server-request handler now runs behind
+  a boundary (`outside_request_meta_hold`): whatever it asks of the transport
+  — a nested list, a raw `rpc_request`, whatever method it names — reads the
+  host afresh and leaves the reservation to the request that holds it.
+- **`clear_cache` reaches the transports (round 34).** `Client#clear_cache`
+  erased only the client's aggregation maps, so a transport still holding a
+  list the server had bounded with a positive `ttlMs` answered the next
+  `list_tools`, `list_prompts` or `list_resources` from its own copy without
+  sending anything — the documented promise of fresh data was not kept. It
+  now drops the transport-level entry for each list kind too, as
+  `cache: false` already did.
 - **A held evaluation belongs to the request it was reserved for, and to no
   other (round 33).** A cache decision reads the host's `request_meta` once
   and reserves that evaluation for the request it leads to. The rule used to

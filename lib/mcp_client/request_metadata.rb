@@ -47,17 +47,16 @@ module MCPClient
 
     # The evaluation of the host's `request_meta` that one operation reserves
     # for the request it leads to: the JSON-RPC method of that request, the
-    # evaluation once it has been made, whether the operation has begun
-    # talking to the server, and whether the request it was held for has
-    # already spent it.
+    # evaluation once it has been made, and whether the request it was held
+    # for has already spent it.
     #
     # A reservation is claimed by that one request and by nothing else.
     # Everything else a transport sends while it is open -- a reconnect's
     # handshake, the `subscriptions/listen` a reconnect re-opens, the
-    # `notifications/cancelled` for an abandoned request, a nested request a
-    # notification listener issues -- reads the host afresh and leaves the
-    # reservation for the request that holds it.
-    HeldRequestMeta = Struct.new(:request_method, :evaluated, :value, :dispatched, :spent)
+    # `notifications/cancelled` for an abandoned request, a raw `rpc_request`
+    # or nested list a notification listener issues -- reads the host afresh
+    # and leaves the reservation for the request that holds it.
+    HeldRequestMeta = Struct.new(:request_method, :evaluated, :value, :spent)
 
     # Reserve the evaluation of the host's `request_meta` for the request
     # `method` this operation leads to, for the operation's dynamic extent
@@ -79,20 +78,78 @@ module MCPClient
     # Open a hold scope without a block, for a caller whose operation spans
     # several transports (a client listing across its servers). Every opener
     # closes it from an `ensure`.
+    #
+    # The operation adopts a reservation only when that very reservation was
+    # handed to it ({#offer_request_meta_hold}) -- the opener naming the
+    # operation it made it for, immediately before invoking it. Sharing a
+    # method name is not enough: an operation that begins meanwhile (a list a
+    # notification listener runs on a server the opener's loop has not
+    # reached) would otherwise spend an evaluation weighed for somebody else,
+    # sending its tenant, baggage or nonce on the wrong request and leaving
+    # the right one to go out under an evaluation nothing weighed.
     # @param method [String] the JSON-RPC method of the request the operation sends
-    # @return [void]
+    # @return [MCPClient::RequestMetadata::HeldRequestMeta] this operation's reservation
     def open_request_meta_hold(method)
       stack = (Thread.current[held_request_meta_key] ||= [])
-      top = stack.last
-      # The same operation continuing -- a client asking its transport to run
-      # the very list it just weighed -- shares the reservation, so the
-      # request goes out with the evaluation the decision was made on. An
-      # operation that begins once this one is already talking to the server
-      # is a nested one (a listener called from a response's notification
-      # dispatch): it reserves its own and leaves this one untouched.
-      shared = top && top.request_method == method && !top.dispatched && !top.spent
-      stack.push(shared ? top : HeldRequestMeta.new(method, false, nil, false, false))
+      reservation = adoptable_request_meta_hold(take_offered_request_meta_hold, stack.last, method) ||
+                    HeldRequestMeta.new(method, false, nil, false)
+      stack.push(reservation)
+      reservation
+    end
+
+    # @param offered [MCPClient::RequestMetadata::HeldRequestMeta, nil] the reservation handed over
+    # @param innermost [MCPClient::RequestMetadata::HeldRequestMeta, nil] the reservation open here
+    # @param method [String] the JSON-RPC method of the request the operation sends
+    # @return [MCPClient::RequestMetadata::HeldRequestMeta, nil] the offer when
+    #   it really is the reservation open here, still waiting for the request
+    #   it was made for
+    def adoptable_request_meta_hold(offered, innermost, method)
+      return nil if offered.nil? || !offered.equal?(innermost)
+
+      offered if offered.request_method == method && !offered.spent
+    end
+
+    # Hand a reservation to the one operation it was opened for: the next
+    # operation this transport opens adopts it, and only if it really is the
+    # reservation currently innermost here. The offer is taken up once; an
+    # opener that never invokes the operation withdraws it.
+    # @param reservation [MCPClient::RequestMetadata::HeldRequestMeta]
+    # @return [void]
+    def offer_request_meta_hold(reservation)
+      Thread.current[offered_request_meta_key] = reservation
       nil
+    end
+
+    # @return [void]
+    def withdraw_request_meta_hold
+      Thread.current[offered_request_meta_key] = nil
+      nil
+    end
+
+    # @return [MCPClient::RequestMetadata::HeldRequestMeta, nil] the offer,
+    #   which no later operation can take up again
+    def take_offered_request_meta_hold
+      offered = Thread.current[offered_request_meta_key]
+      Thread.current[offered_request_meta_key] = nil unless offered.nil?
+      offered
+    end
+
+    # The boundary a transport crosses when it hands control to host code: a
+    # notification listener, a handler for a server-initiated request. The
+    # reservation the open operation holds is out of reach behind it, so
+    # whatever that code issues -- a nested list, a raw `rpc_request`, a
+    # `fetch_prompts_list`, whatever method it names -- reads the host afresh
+    # and is an operation of its own.
+    # @yield the host code
+    # @return [Object] the block's value
+    def outside_request_meta_hold
+      stack = (Thread.current[held_request_meta_key] ||= [])
+      stack.push(nil)
+      begin
+        yield
+      ensure
+        close_request_meta_hold
+      end
     end
 
     # Close the innermost hold scope.
@@ -118,15 +175,6 @@ module MCPClient
     def claimable_request_meta_hold
       held = held_request_meta
       held unless held.nil? || held.spent
-    end
-
-    # Note that the operation holding a reservation has begun talking to the
-    # server, so an operation that begins from here on is a nested one.
-    # @return [void]
-    def mark_request_meta_dispatched
-      held = held_request_meta
-      held.dispatched = true if held
-      nil
     end
 
     # @return [String] the fingerprint of the effective parameters the next
@@ -157,6 +205,12 @@ module MCPClient
     # @return [Symbol] this transport's thread-local key for held metadata
     def held_request_meta_key
       :"mcp_client_held_request_meta_#{object_id}"
+    end
+
+    # @return [Symbol] this transport's thread-local key for the reservation
+    #   offered to the operation about to be opened on it
+    def offered_request_meta_key
+      :"mcp_client_offered_request_meta_#{object_id}"
     end
 
     # A stable fingerprint of the metadata that shapes a result: the

@@ -360,7 +360,12 @@ module MCPClient
       clear_cache
     end
 
-    # Clear the cached tools so that next list_tools will fetch fresh data
+    # The list kinds this client caches, each with the transport-level cache
+    # behind it.
+    CACHED_LIST_KINDS = %i[tools prompts resources].freeze
+
+    # Clear the cached lists so that the next list_tools, list_prompts or
+    # list_resources fetches fresh data.
     # @return [void]
     def clear_cache
       @cache_mutex.synchronize do
@@ -372,6 +377,14 @@ module MCPClient
         # for a server whose slice a later, partial refill never rebuilt.
         @cache_params.clear
         @cache_filled.clear
+      end
+      # The promise is fresh data, and a transport holding a list the server
+      # bounded with a positive `ttlMs` (MCP 2026-07-28
+      # server/utilities/caching) would answer the next listing from it
+      # without sending anything at all. Dropped outside this client's lock:
+      # each transport takes its own.
+      servers.each do |server|
+        CACHED_LIST_KINDS.each { |kind| refresh_server_cache(server, kind) }
       end
     end
 
