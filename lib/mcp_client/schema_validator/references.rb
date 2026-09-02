@@ -63,10 +63,11 @@ module MCPClient
       # apart from its `definitions`.
       # @return [Hash] :resources (schema object => its resource root, by
       #   identity), :anchors (resource root => name => subschema, first
-      #   occurrence, by identity) and :dialects (resource root => dialect)
+      #   occurrence, by identity), :dialects (resource root => dialect) and
+      #   :duplicates (names declared more than once within one resource)
       def anchor_index(root, dialect)
         index = { resources: {}.compare_by_identity, anchors: {}.compare_by_identity,
-                  dialects: {}.compare_by_identity }
+                  dialects: {}.compare_by_identity, duplicates: [] }
         index[:dialects][root] = dialect
         pending = [[root, root, 0, dialect, true]]
         visited = 0
@@ -83,13 +84,25 @@ module MCPClient
           end
           index[:resources][schema] = resource
           if named && !(dialect == DRAFT_07 && schema.key?('$ref'))
-            names = (index[:anchors][resource] ||= {})
-            anchor_names(schema, dialect).each { |name| names[name] ||= schema }
+            record_anchor_names(index, resource, schema,
+                                dialect)
           end
           each_walked_position(schema, dialect) { |sub| pending << [sub, resource, depth + 1, dialect, named] }
           each_foreign_definition(schema, dialect) { |sub| pending << [sub, resource, depth + 1, dialect, false] }
         end
         index
+      end
+
+      # Record the plain names a schema object declares for its resource; a
+      # name already bound to another object of the same resource is a
+      # duplicate (anchor names are unique within a resource).
+      # @return [void]
+      def record_anchor_names(index, resource, schema, dialect)
+        names = (index[:anchors][resource] ||= {})
+        anchor_names(schema, dialect).each do |name|
+          index[:duplicates] << name if names.key?(name) && !names[name].equal?(schema)
+          names[name] ||= schema
+        end
       end
 
       # Yield the schema positions the dialect walks under a schema object:
