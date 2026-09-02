@@ -7,6 +7,18 @@ metadata). Each feature lands in its own PR; this section accumulates them.
 
 ### JSON Schema handling
 
+- **The pointer to an empty-named member, decided `contains` and satisfied
+  dependencies (round 23).** The JSON pointer `/` (`#/`, `#%2F`) addresses
+  the member named `""` (RFC 6901 Section 5) instead of the whole document,
+  so a `$ref` to it resolves rather than being reported as a cyclic chain,
+  and `#/` without such a member is unresolvable. A `contains` whose schema
+  matches every item (`true` / `{}`) is decided against the array's own
+  length — the default `minContains` of 1 rejects the empty array, and
+  `maxContains` bounds it — instead of only leaving a branch undecided, so
+  `not` / `if` / `oneOf` / `anyOf` no longer fail open on it. A
+  `dependentRequired` (or draft-07 `dependencies`) list whose names the
+  instance already carries cannot fail, so those branches are decided too.
+
 - **Adopted subtrees, data-keyword identifiers and readable fragments
   (round 22).** A subtree a pointer enters through a data keyword
   (`default`, `enum`, `const`, `examples`) is normalized and indexed once,
