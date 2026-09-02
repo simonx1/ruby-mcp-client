@@ -37,19 +37,28 @@ RSpec.describe 'MCP 2026-07-28 authorization — round 13' do
     nil
   end
 
-  it 'keeps the token when the challenge metadata names another resource' do
+  # A refused challenge does not RETIRE the stored token (the bytes survive for
+  # a provider that later learns the right authorization server), but while the
+  # refusal stands the token is not presented either — see round 26.
+  it 'keeps the stored token when the challenge metadata names another resource' do
     provider = provider_with_token
     challenge(provider, { 'resource' => 'https://other.example.com/mcp',
                           'authorization_servers' => ['https://other.example.com'] })
 
-    expect(provider.access_token&.access_token).to eq('alice')
+    stored = storage.get_token(server_url)
+    expect(stored&.access_token).to eq('alice')
+    expect(stored.issuer).to eq('https://auth.example.com')
+    expect(provider.access_token).to be_nil
   end
 
-  it 'keeps the token when the advertised authorization server is not an acceptable URL' do
+  it 'keeps the stored token when the advertised authorization server is not an acceptable URL' do
     provider = provider_with_token
     challenge(provider, { 'resource' => server_url, 'authorization_servers' => ['http://10.0.0.1/'] })
 
-    expect(provider.access_token&.access_token).to eq('alice')
+    stored = storage.get_token(server_url)
+    expect(stored&.access_token).to eq('alice')
+    expect(stored.issuer).to eq('https://auth.example.com')
+    expect(provider.access_token).to be_nil
   end
 
   it 'retires the token when validated metadata names another authorization server' do

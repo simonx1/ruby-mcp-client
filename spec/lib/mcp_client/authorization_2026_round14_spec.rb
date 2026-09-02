@@ -54,7 +54,12 @@ RSpec.describe 'MCP 2026-07-28 authorization — round 14' do
       .to raise_error(MCPClient::Errors::ConnectionError, /HTTPS/)
 
     expect(provider.instance_variable_get(:@challenge_resource_metadata)).to be_nil
-    expect(provider.access_token&.access_token).to eq('alice')
+    # The bytes survive the refusal, but they are not presented while it stands
+    # (round 26): the refused challenge says the cached server is not current.
+    stored = storage.get_token(server_url)
+    expect(stored&.access_token).to eq('alice')
+    expect(stored.issuer).to eq('https://auth.example.com')
+    expect(provider.access_token).to be_nil
   end
 
   it 'refuses a challenge whose metadata names another resource' do
