@@ -100,7 +100,9 @@ metadata). Each feature lands in its own PR; this section accumulates them.
   server is an acceptable URL) and is otherwise refused whole, like a
   challenge with an unacceptable metadata URL; the browser precheck also
   fails while a refused or still-unfetched challenge is outstanding;
-  `Token#to_h` keeps every legacy key and adds `issuer` only when set.
+  `Token#to_h` keeps every legacy key and adds `issuer` only when set;
+  a retirement marker is lifted only once the replacement token was
+  persisted.
 
 ### Tasks extension (`io.modelcontextprotocol/tasks`)
 
