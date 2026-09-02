@@ -447,11 +447,12 @@ module MCPClient
       problem = ref_chain_problem(ref, root, counter[:dialect], counter, from: schema) do |target, hop, from|
         # What a reference reaches is walked under its own resource's dialect
         # and at its own lexical depth; a boolean target needs no preflight
-        # and is not charged per reference, but its position still obeys the
-        # depth bound.
+        # and is charged once per distinct position (not per reference),
+        # and that position still obeys the depth bound.
         unless target.is_a?(Hash)
           position = referenced_position_depth(hop, root, counter[:dialect], counter, from)
           problems << "schema nesting depth exceeds #{MAX_SCHEMA_DEPTH}" if position && position > MAX_SCHEMA_DEPTH
+          charge_boolean_target(hop, root, from, counter, problems)
           next
         end
 
@@ -460,6 +461,25 @@ module MCPClient
         walk_schema(target, root, target_depth, counter, problems, indexed_dialect(target, counter) || dialect)
       end
       problems << problem if problem
+    end
+
+    # Count a boolean a reference reaches toward the subschema bound, once
+    # per distinct position (resource and decoded pointer): a document may
+    # not hide thousands of applied schemas behind pointer-addressable
+    # booleans.
+    # @return [void]
+    def self.charge_boolean_target(hop, root, from, counter, problems)
+      tokens = pointer_tokens(hop)
+      return unless tokens
+
+      resource = (counter[:anchors] && from && counter[:anchors][:resources][from]) || root
+      key = [resource.object_id, tokens]
+      seen = (counter[:boolean_targets] ||= {})
+      return if seen.key?(key)
+
+      seen[key] = true
+      counter[:count] += 1
+      problems << "schema has more than #{MAX_SUBSCHEMAS} subschemas" if counter[:count] > MAX_SUBSCHEMAS
     end
 
     # A `$dynamicRef` / `$recursiveRef` is not evaluated, but one pointing
