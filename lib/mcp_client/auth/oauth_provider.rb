@@ -207,11 +207,7 @@ module MCPClient
         # made with: a record swapped in shared storage meanwhile (another
         # client id, or credentials of another authorization server) is
         # never sent to this token endpoint.
-        unless client_for_request?(client_info, pkce)
-          raise MCPClient::Errors::ConnectionError,
-                'Authorization response rejected: the client credentials changed during the flow; ' \
-                'restart the authorization'
-        end
+        ensure_client_for_request!(client_info, pkce)
 
         # Exchange authorization code for tokens
         token = exchange_authorization_code(server_metadata, client_info, code, pkce)
@@ -226,15 +222,34 @@ module MCPClient
         token
       end
 
+      # The stored credentials must be the ones the authorization request
+      # was made with; a request that recorded no client cannot be bound to
+      # any and fails closed, like one that recorded no issuer.
+      # @param client_info [ClientInfo, nil]
+      # @param pkce [PKCE]
+      # @return [void]
+      # @raise [MCPClient::Errors::ConnectionError]
+      def ensure_client_for_request!(client_info, pkce)
+        unless pkce.respond_to?(:client_id) && pkce.client_id.is_a?(String)
+          raise MCPClient::Errors::ConnectionError,
+                'Authorization response rejected: no client was recorded for this authorization request; ' \
+                'restart the authorization'
+        end
+        return if client_info && client_for_request?(client_info, pkce)
+
+        raise MCPClient::Errors::ConnectionError,
+              'Authorization response rejected: the client credentials changed during the flow; ' \
+              'restart the authorization'
+      end
+
       # Whether stored credentials are the ones an authorization request was
-      # made with: the same client id (when the request recorded one) and,
-      # unless portable, bound to the request's authorization server.
+      # made with: the recorded client id and, unless portable, bound to the
+      # request's authorization server.
       # @param client_info [ClientInfo]
       # @param pkce [PKCE]
       # @return [Boolean]
       def client_for_request?(client_info, pkce)
-        recorded = pkce.respond_to?(:client_id) ? pkce.client_id : nil
-        return false if recorded && recorded != client_info.client_id
+        return false if pkce.client_id != client_info.client_id
         return true if portable_client?(client_info)
 
         # A started flow binds its non-portable client, so an unbound record
@@ -273,12 +288,7 @@ module MCPClient
                 'Authorization response rejected: the authorization server changed during the flow; ' \
                 'restart the authorization'
         end
-        client_info = stored_client_info
-        unless client_info && client_for_request?(client_info, pkce)
-          raise MCPClient::Errors::ConnectionError,
-                'Authorization response rejected: the client credentials changed during the flow; ' \
-                'restart the authorization'
-        end
+        ensure_client_for_request!(stored_client_info, pkce)
         validate_authorization_response_issuer!(iss, pkce.issuer, iss_parameter_supported_for?(pkce, cached))
       end
 
