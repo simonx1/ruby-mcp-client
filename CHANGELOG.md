@@ -53,6 +53,20 @@ metadata). Each feature lands in its own PR; this section accumulates them.
   failed task's `error` must be a JSON-RPC error object (integer `code`,
   string `message`); anything else is an `InvalidResultError` rather than
   a wait driven on made-up state.
+- **Handlers, sessions and probes (round 20).** An input handler runs
+  within what is left of the wait (with a deadline it runs on its own
+  thread and the wait ends with the timed-out `TaskError` when it
+  outlives the budget; the handler thread is abandoned and its answer
+  dropped) and the deadline is enforced before anything is delivered;
+  answers produced while the server session restarted are discarded and
+  the task is polled again rather than delivered to a possibly reused
+  task id; one capability probe runs per server at a time, so a wait that
+  timed out on the handshake leaves it to finish and the next wait joins
+  it instead of tearing the session down; a completed task's result with
+  an explicit `resultType: null` is invalid; a streamed task result is
+  validated against the tool a mid-stream refresh replaced; a
+  `notifications/tasks` whose params are not a DetailedTask is a logged
+  parse failure.
 
 - **Opt-in extension.** `MCPClient::Client.new(extensions:
   ['io.modelcontextprotocol/tasks'])` (or a `identifier => settings` Hash)

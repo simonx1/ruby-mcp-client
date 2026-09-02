@@ -472,17 +472,22 @@ module MCPClient
       raise MCPClient::Errors::ServerNotFound, "No server found for tool '#{tool_name}'" unless server
 
       begin
+        generation_before = tasks_extension? ? tools_generation_of(server) : nil
         # Use the streaming API if it's available
         stream = server.call_tool_streaming(tool_name, parameters)
         return stream unless tasks_extension? && modern_server?(server)
 
         # MCP 2026-07-28 tasks extension: a chunk may be a task; resolve it
-        # to the call's result, validated as #call_tool does.
+        # to the call's result, validated as #call_tool does — against the
+        # definition a mid-stream refresh (HeaderMismatch recovery) may have
+        # replaced.
         Enumerator.new do |yielder|
           stream.each do |chunk|
             next yielder << chunk unless task_result?(chunk)
 
-            yielder << validate_structured_content!(tool, complete_task_result(tool_name, server, chunk))
+            result = complete_task_result(tool_name, server, chunk)
+            current = tools_generation_of(server) == generation_before ? tool : (refreshed_tool(tool) || tool)
+            yielder << validate_structured_content!(current, result)
           end
         end
       rescue MCPClient::Errors::ConnectionError => e
@@ -1628,6 +1633,11 @@ module MCPClient
     # @param params [Hash] the flat task params
     # @return [void]
     def handle_task_status_notification(server_id, params)
+      # The params are a DetailedTask: anything short of that is a parse
+      # failure, not a working task.
+      problem = params.is_a?(Hash) ? detailed_task_shape_problem(params) : 'not an object'
+      raise MCPClient::Errors::InvalidResultError, "Invalid task notification: #{problem}" if problem
+
       task = MCPClient::Task.from_json(params, detailed: true)
       logger.info("[#{server_id}] Task #{sanitize_peer_log_text(task.task_id.to_s)} status: #{task.status}")
     rescue StandardError => e

@@ -462,20 +462,39 @@ module MCPClient
         raise_if_past_caller_deadline!(wait)
         return ensure_task_capability!(wait[:srv], 'get', strict: true) unless wait[:deadline]
 
-        outcome = Queue.new
-        probe = Thread.new do
-          ensure_task_capability!(wait[:srv], 'get', strict: true)
-          outcome << nil
-        rescue Exception => e # rubocop:disable Lint/RescueException -- handed back to the waiting thread
-          outcome << e
-        end
+        probe = shared_task_probe(wait[:srv])
         remaining = [wait[:deadline] - monotonic_time, 0].max
-        raise_if_past_caller_deadline!(wait) unless probe.join(remaining)
+        unless probe.join(remaining)
+          raise MCPClient::Errors::TaskError, "Timed out waiting for task '#{shown_task_id(wait[:task_id])}'"
+        end
 
-        error = outcome.pop
+        error = probe[:error]
         raise error if error
 
         raise_if_past_caller_deadline!(wait)
+      end
+
+      # One capability probe per server at a time: a wait that timed out on
+      # the handshake leaves it running, and the next wait joins that same
+      # probe instead of starting another (HTTP transports would tear down
+      # the session the first handshake just established).
+      # @param srv [MCPClient::ServerBase]
+      # @return [Thread] the live probe
+      def shared_task_probe(srv)
+        answered_keys_mutex.synchronize do
+          @task_probes ||= {}.compare_by_identity
+          live = @task_probes[srv]
+          return live if live&.alive?
+
+          @task_probes[srv] = Thread.new do
+            Thread.current.report_on_exception = false
+            begin
+              ensure_task_capability!(srv, 'get', strict: true)
+            rescue Exception => e # rubocop:disable Lint/RescueException -- handed back to the waiting thread
+              Thread.current[:error] = e
+            end
+          end
+        end
       end
 
       # The caller's timeout never moves and is enforced whatever the task
@@ -772,14 +791,45 @@ module MCPClient
         return [] if pending.empty?
 
         begin
-          responses = srv.fulfil_input_requests(pending, task.to_h)
+          responses = bounded_by_wait(wait) { srv.fulfil_input_requests(pending, task.to_h) }
+          # The deadline is enforced before anything is delivered.
+          raise_if_past_caller_deadline!(wait)
         rescue StandardError
           submitted = task_state(srv, task.task_id)[:submitted]
           answered_keys_mutex.synchronize { answered.subtract(pending.keys - submitted.to_a) }
           raise
         end
+        # A session that restarted while the host was answering may have
+        # reused the task id and the keys: the answers belong to the ended
+        # session and are not delivered; the next poll asks again.
+        if wait[:epoch] && current_session_epoch(srv) != wait[:epoch]
+          logger.warn("Task #{shown_task_id(task.task_id)}: the server session restarted while its input was " \
+                      'being answered; the answers are discarded')
+          return []
+        end
         deliver_task_update(task.task_id, responses, srv, wait)
         pending.keys
+      end
+
+      # Run a host handler within what is left of the wait: with a deadline
+      # the handler runs on its own thread and the wait ends with the
+      # timed-out TaskError when it outlives the budget (the handler thread
+      # is abandoned — a blocked elicitation cannot be interrupted — and its
+      # eventual answer is dropped); without a deadline it runs inline.
+      # @return [Object] the handler's result
+      def bounded_by_wait(wait)
+        return yield unless wait[:deadline]
+
+        remaining = [wait[:deadline] - monotonic_time, 0].max
+        runner = Thread.new do
+          Thread.current.report_on_exception = false
+          yield
+        end
+        unless runner.join(remaining)
+          raise MCPClient::Errors::TaskError, "Timed out waiting for task '#{shown_task_id(wait[:task_id])}'"
+        end
+
+        runner.value
       end
 
       # The wait before the next tasks/get: the server's pollIntervalMs
