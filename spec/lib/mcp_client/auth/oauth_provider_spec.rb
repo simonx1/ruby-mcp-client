@@ -191,13 +191,25 @@ RSpec.describe MCPClient::Auth::OAuthProvider do
           .not_to raise_error
       end
 
-      it 'allows http on localhost for local development' do
+      # The local-development exception needs a local stack on both ends: a
+      # loopback endpoint advertised to a client whose configured server is
+      # loopback too. For this remote server it is no exception at all.
+      it 'rejects http on localhost for a remote server' do
         expect { oauth_provider.send(:enforce_https!, 'http://localhost:9292/token', 'token endpoint') }
+          .to raise_error(MCPClient::Errors::ConnectionError, /must use HTTPS/)
+      end
+
+      it 'allows http on localhost when the configured server is loopback' do
+        local = described_class.new(server_url: 'http://localhost:9292/mcp', redirect_uri: redirect_uri,
+                                    logger: logger, storage: storage)
+        expect { local.send(:enforce_https!, 'http://localhost:9292/token', 'token endpoint') }
           .not_to raise_error
       end
 
-      it 'allows http on an IPv6 loopback endpoint' do
-        expect { oauth_provider.send(:enforce_https!, 'http://[::1]:9292/token', 'token endpoint') }
+      it 'allows http on an IPv6 loopback endpoint when the configured server is loopback' do
+        local = described_class.new(server_url: 'http://localhost:9292/mcp', redirect_uri: redirect_uri,
+                                    logger: logger, storage: storage)
+        expect { local.send(:enforce_https!, 'http://[::1]:9292/token', 'token endpoint') }
           .not_to raise_error
       end
 

@@ -180,7 +180,30 @@ metadata). Each feature lands in its own PR; this section accumulates them.
   `http://localhost.`, `http://[::ffff:127.0.0.1]`) is accepted like
   `http://127.0.0.1`. A host is case-folded after its percent escapes are
   decoded, so `%4Cocalhost` ("Localhost") classifies as loopback rather
-  than as an unknown public name.
+  than as an unknown public name. When that rediscovery of an unrecorded
+  `iss` advertisement returns a *different* authorization server, the
+  callback precheck and `authorization_error_message` now reject the
+  response as "the authorization server changed during the flow" — the
+  same refusal `complete_authorization_flow` makes — instead of reading it
+  as "the server advertises `iss`", so a legacy in-flight callback carrying
+  the recorded issuer no longer shows a success page for a flow the
+  completion refuses; a rediscovery that cannot be made is still unknown
+  rather than a change. An endpoint discovered in authorization server
+  metadata is now classified exactly like a peer-advertised URL, so the
+  plain-HTTP exception applies only to a local stack (a loopback endpoint
+  and a loopback configured server) and a discovered endpoint may not name
+  a loopback, private or link-local address: metadata from a public
+  authorization server can no longer collect the authorization code at
+  `http://app.localhost:3000/steal` or at an internal address. A protected
+  resource document rejected as not this resource's — or naming no
+  authorization server — no longer supplies the scopes of a later flow, as
+  a refused authorization server URL already did not. And a token record a
+  storage backend left behind for a deleted token (a backend without
+  `delete_token` is asked to store `nil`, and one that persists hashes
+  writes `nil.to_h`) is no token: it is never presented as a bare
+  `Bearer ` bound to the current authorization server. The
+  `FileTokenStorage` example and the storage documentation remove the
+  record for a `nil` token instead of serializing it.
 
 ### Tasks extension (`io.modelcontextprotocol/tasks`)
 
