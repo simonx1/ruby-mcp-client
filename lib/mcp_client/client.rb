@@ -156,8 +156,13 @@ module MCPClient
         # supports: transports derive their declared client capabilities from
         # the callbacks registered before connecting, and MCP forbids using
         # capabilities that were not negotiated.
+        # The transports call the callback with (request_id, params) only, so
+        # the asking server is closed over here: the URL-mode host contract
+        # depends on its protocol era (MCP 2026-07-28 removed elicitationId).
         if @elicitation_handler && server.respond_to?(:on_elicitation_request)
-          server.on_elicitation_request(&method(:handle_elicitation_request))
+          server.on_elicitation_request do |request_id, request_params|
+            handle_elicitation_request(request_id, request_params, server)
+          end
         end
         # The client always implements the roots feature (roots/list and
         # list_changed notifications), independent of the current roots list.
@@ -1612,8 +1617,11 @@ module MCPClient
     # Supports both form mode (structured data) and URL mode (out-of-band interaction).
     # @param _request_id [String, Integer] the JSON-RPC request ID (unused at client layer)
     # @param params [Hash] the elicitation parameters
+    # @param server [MCPClient::ServerBase, nil] the server that asked, so the
+    #   URL-mode host contract can follow its protocol era; nil (an era that
+    #   was never established) keeps the 2025-11-25 contract
     # @return [Hash] the elicitation response
-    def handle_elicitation_request(_request_id, params)
+    def handle_elicitation_request(_request_id, params, server = nil)
       mode = params['mode'] || 'form'
       # MCP 2025-11-25: requests with a mode not declared in client
       # capabilities MUST be rejected with -32602 (Invalid params). This check
@@ -1635,7 +1643,7 @@ module MCPClient
 
       begin
         result = if mode == 'url'
-                   handle_url_elicitation(params, message)
+                   handle_url_elicitation(params, message, server)
                  else
                    handle_form_elicitation(params, message)
                  end
@@ -1693,10 +1701,10 @@ module MCPClient
     # Handle URL mode elicitation (MCP 2025-11-25)
     # @param params [Hash] the elicitation parameters
     # @param message [String] the human-readable message
+    # @param server [MCPClient::ServerBase, nil] the server that asked
     # @return [Object] handler result
-    def handle_url_elicitation(params, message)
-      url = params['url']
-      elicitation_id = params['elicitationId']
+    def handle_url_elicitation(params, message, server = nil)
+      url_params = url_elicitation_metadata(params, server)
 
       # Call handler with URL-mode specific params
       case @elicitation_handler.arity
@@ -1705,11 +1713,38 @@ module MCPClient
       when 1
         @elicitation_handler.call(message)
       when 2, -1
-        @elicitation_handler.call(message, { 'mode' => 'url', 'url' => url, 'elicitationId' => elicitation_id })
+        @elicitation_handler.call(message, url_params)
       else
-        @elicitation_handler.call(message, { 'mode' => 'url', 'url' => url, 'elicitationId' => elicitation_id },
-                                  params['metadata'])
+        @elicitation_handler.call(message, url_params, params['metadata'])
       end
+    end
+
+    # The URL-mode metadata handed to the host. MCP 2026-07-28 (changelog,
+    # minor change 11) removed the `elicitationId` field along with
+    # `notifications/elicitation/complete`: under the multi round-trip
+    # requests pattern the client learns the outcome by retrying the original
+    # request, and a server that must correlate an elicitation across retries
+    # carries its own identifier in `requestState`. So a modern server's
+    # contract has no such key at all — not even a nil one — and a
+    # non-conforming modern server that sends the field anyway cannot smuggle
+    # a correlation id to the host through it. For a server on an earlier
+    # revision the field is part of the protocol and the contract is
+    # unchanged, key present (nil when the server sent none) and all; a nil
+    # server (an era that was never established) is treated the same way.
+    # @param params [Hash] the elicitation parameters
+    # @param server [MCPClient::ServerBase, nil] the server that asked
+    # @return [Hash] the metadata hash for the host's handler
+    def url_elicitation_metadata(params, server)
+      metadata = { 'mode' => 'url', 'url' => params['url'] }
+      return metadata.merge('elicitationId' => params['elicitationId']) unless modern_server?(server)
+
+      if params.key?('elicitationId')
+        # The value is a server-chosen correlation id: name the field, never
+        # quote it.
+        @logger.warn('Ignoring elicitationId on a URL-mode elicitation request: MCP 2026-07-28 removed the field ' \
+                     '(the outcome is learned by retrying the original request; correlate via requestState)')
+      end
+      metadata
     end
 
     # Format and validate the elicitation response

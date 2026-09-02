@@ -390,6 +390,21 @@ than 10 rounds, a request the client cannot honour or a malformed
 `inputRequests` raise `MCPClient::Errors::InputRequiredError` (exposing
 `input_requests` and `request_state`).
 
+### URL-mode elicitation
+
+An elicitation handler of arity 2 (or more) is called with the message and a
+metadata hash when the server asks for an out-of-band (`url`) interaction.
+On a **2025-11-25** server that hash is
+`{ 'mode' => 'url', 'url' => ..., 'elicitationId' => ... }`; on a
+**2026-07-28** server it is `{ 'mode' => 'url', 'url' => ... }` — the
+revision removed `elicitationId` together with
+`notifications/elicitation/complete`, because the outcome is learned by
+retrying the original request rather than from a server-initiated signal, and
+a server that must correlate an elicitation across retries carries its own
+identifier in the opaque `requestState`. A modern server that sends
+`elicitationId` anyway does not reach the host with it: the field is dropped
+and a warning is logged.
+
 ### Custom headers from tool parameters
 
 Tool parameters annotated with `x-mcp-header` are mirrored into
