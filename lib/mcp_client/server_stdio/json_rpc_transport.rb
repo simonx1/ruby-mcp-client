@@ -878,6 +878,12 @@ module MCPClient
       # @raise [MCPClient::Errors::TransportError] on write errors
       def send_request(req, generation = nil, io: @stdin)
         @logger.debug("Sending JSONRPC request: #{describe_jsonrpc_message(req)}")
+        # A request pinned to a session that has since ended is not written at
+        # all: its payload names something else in the replacement session.
+        # The pin is read outside the transport lock (the two locks never
+        # nest); a restart completing between this check and the write moves
+        # the transport generation, which the locked check below catches.
+        @mutex.synchronize { check_session_pin! }
         @transport_lock.synchronize do
           # A replacement whose negotiation has not completed is not current
           # either, whatever its generation says: an ordinary request written
@@ -885,9 +891,15 @@ module MCPClient
           return :replaced if generation && (generation != @transport_generation || @negotiating)
           raise IOError, 'the server process is gone' unless io
 
+          # The write goes to the pipe this request was recorded against,
+          # never to whichever pipe the transport holds by now.
           io.puts(req.to_json)
         end
         :sent
+      rescue MCPClient::Errors::SessionChangedError
+        # Nothing was written, and nothing will answer this id.
+        @mutex.synchronize { @awaiting.delete(req['id']) } if req.is_a?(Hash) && req['id']
+        raise
       rescue StandardError => e
         # A request that failed to send will never receive a response, so drop
         # its awaiting marker; otherwise a broken transport (e.g. the server

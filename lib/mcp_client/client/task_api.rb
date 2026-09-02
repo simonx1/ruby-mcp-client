@@ -68,7 +68,8 @@ module MCPClient
       # @raise [ArgumentError] if the server is ambiguous in a multi-server client
       # @raise [MCPClient::Errors::ServerNotFound] if no server is available
       # @raise [MCPClient::Errors::TaskNotFound] if the task does not exist
-      # @raise [MCPClient::Errors::TaskError] if retrieving the task fails
+      # @raise [MCPClient::Errors::TaskError] if retrieving the task fails, or the task handle belongs to a
+      #   server session that has ended (its task id is another task's now)
       # @param timeout [Numeric, nil] request timeout in seconds (the transport default when nil)
       # @param state [Hash, nil] the task bookkeeping this poll belongs to (internal): a poll a
       #   wait abandoned on its wall clock forgets only what it was polling, never what a new
@@ -78,6 +79,11 @@ module MCPClient
       #   not sent — what came back would describe another lifetime of the same id
       def get_task(task_id, server: nil, timeout: nil, state: nil, epoch: nil)
         srv = select_task_server(task_id, server, 'get_task')
+        # A caller that named the task with a handle asks about the task that
+        # handle names: the request is pinned to its session and refused once
+        # that session has ended, where the reused id names another task
+        # (the wait passes the session it polls in itself).
+        epoch ||= handle_session_epoch(task_id, srv, 'getting')
         task_id = task_identifier(task_id)
         ensure_task_capability!(srv, 'get')
 
@@ -129,7 +135,8 @@ module MCPClient
       # @return [Object] the underlying task result
       # @raise [ArgumentError] if the server is ambiguous in a multi-server client
       # @raise [MCPClient::Errors::TaskNotFound] if the task does not exist
-      # @raise [MCPClient::Errors::TaskError] if retrieval fails
+      # @raise [MCPClient::Errors::TaskError] if retrieval fails, or the task handle belongs to a server
+      #   session that has ended (its task id is another task's now)
       def get_task_result(task_id, server: nil)
         # A handle the server completed synchronously already carries its
         # result: no server is needed (or probed) to read it.
@@ -143,10 +150,14 @@ module MCPClient
         # by tasks/get once the task is terminal.
         return task_outcome(wait_for_task(task_id, server: srv)) if modern_server?(srv)
 
+        # The result of the task the handle names, in the session it was seen
+        # in: the request is pinned to that session and refused once it has
+        # ended, where the reused id would hand back another task's result.
+        epoch = handle_session_epoch(task_id, srv, 'getting result for')
         task_id = task_identifier(task_id)
 
         begin
-          srv.rpc_request('tasks/result', { taskId: task_id })
+          task_rpc(srv, 'tasks/result', { taskId: task_id }, epoch: epoch)
         rescue MCPClient::Errors::ServerError => e
           raise if e.protocol_error?
 

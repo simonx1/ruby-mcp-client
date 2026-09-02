@@ -77,7 +77,8 @@ module MCPClient
       # @return [MCPClient::Task] the terminal task (completed, failed or cancelled), with its result or error
       # @raise [MCPClient::Errors::TaskNotFound] if the task does not exist
       # @raise [MCPClient::Errors::InputRequiredError] if an input request cannot be fulfilled
-      # @raise [MCPClient::Errors::TaskError] on timeout, TTL expiry or a failed request
+      # @raise [MCPClient::Errors::TaskError] on timeout, TTL expiry, a failed request, or a server session
+      #   that ended before the task was terminal (the task went with it; its id may be another task's now)
       def wait_for_task(task, server: nil, timeout: nil)
         return task if task.is_a?(MCPClient::Task) && !task.remote?
 
@@ -98,6 +99,11 @@ module MCPClient
         final = final_task_handle(task, srv, wait)
         return final if final
 
+        # A handle whose session has ended names a task that is gone: it is
+        # never polled in the session that replaced it, where the id may
+        # belong to something else (the same rule #update_task and
+        # #cancel_task apply to a handle).
+        handle_session_epoch(task, srv, 'waiting for')
         refresh_wait_session(wait)
         # The CreateTaskResult seed is not an observation: the first
         # tasks/get goes out at once, whatever the seed claims. Its TTL
@@ -109,41 +115,33 @@ module MCPClient
         # ended, whose task id the new session may have reused.
         seed_wait_from_handle(task, srv, wait)
         loop do
-          # The server may have restarted since the last poll: the task id
-          # and its keys then belong to a new session, and so must the
-          # answered set this wait reserves keys in — and the ended
-          # session's TTL backstop must be dropped before anything enforces
-          # it (see #refresh_wait_session).
-          refresh_wait_session(wait)
+          # The server may have restarted since the last poll (during the
+          # sleep between two of them, say): the task belonged to the session
+          # that ended, so the wait ends here rather than polling an id the
+          # new session may have reused for something else.
+          end_of_session!(wait) if refresh_wait_session(wait)
           current = observe_task(wait)
-          # A poll that timed out is no observation: try again at the pace
-          # the server last asked for, unless the wait is over. The poll may
-          # have timed out because the session ended under it, so the wait
-          # joins the live session first: the ended one's pace (a
-          # pollIntervalMs of up to an hour) must not delay the first poll of
-          # the task that replaced this one.
+          # A poll that came back with nothing is no observation: try again at
+          # the pace the server last asked for, unless the wait is over. It
+          # may have come back with nothing because the session ended under
+          # it (a poll that timed out, or one the transport held back from
+          # the session that replaced its own): the task then ended with its
+          # session, and the wait ends here rather than asking the new
+          # session about an id it may have reused — or waiting out the pace
+          # of a task that no longer exists.
           unless current
-            refresh_wait_session(wait)
+            end_of_session!(wait) if refresh_wait_session(wait)
             raise_if_past_deadline!(wait)
             next sleep(wait[:last] ? task_poll_delay(wait[:last], wait_deadline(wait)) : default_poll_delay(wait))
           end
 
-          # The poll itself may have spanned a restart: what came back then
-          # describes the task of a session that has ended. Nothing of it
-          # holds for the session the wait now joins — not its TTL backstop,
-          # not its pace, not its inputRequests (which must not be presented
-          # to the host, let alone answered in the new session where the same
-          # task id may name something else) and not its terminal payload,
-          # which is the result or error of another lifetime of a reusable
-          # task id and must never become this call's outcome. Poll again.
+          # The session the poll belongs to may have ended while it was in
+          # flight or just after it came back. The task went with it: its id
+          # in the replacement session names whatever that session made of
+          # it, so the wait never polls it there. What the ended session
+          # already answered still stands — see #outcome_of_ended_session.
           polled_state = wait[:state]
-          if refresh_wait_session(wait)
-            # Only the bookkeeping of the session the poll asked belongs to
-            # that observation; the replacement session's is untouched.
-            forget_task_keys(srv, task_id, state: polled_state) if current.terminal?
-            raise_if_past_deadline!(wait)
-            next sleep(default_poll_delay(wait))
-          end
+          return outcome_of_ended_session(current, wait, polled_state) if refresh_wait_session(wait)
 
           if current.terminal?
             # A terminal task that came back after the caller's deadline
@@ -164,13 +162,10 @@ module MCPClient
           # retransmission took.
           raise_if_past_deadline!(wait)
           # The retransmission is a full tasks/update round trip, and the
-          # session may have ended under it: an observation of the session
-          # the wait has just left says nothing about the live one, and its
-          # input requests must never be put to the host. Poll again.
-          if refresh_wait_session(wait)
-            raise_if_past_deadline!(wait)
-            next sleep(default_poll_delay(wait))
-          end
+          # session may have ended under it: the observation in hand says
+          # nothing about the live session, its input requests must never be
+          # put to the host, and the task itself did not survive.
+          end_of_session!(wait) if refresh_wait_session(wait)
           answer_task_round(current, wait)
 
           sleep(task_poll_delay(current, wait_deadline(wait)))
@@ -185,6 +180,54 @@ module MCPClient
       end
 
       private
+
+      # What a wait whose session has just ended returns — or raises.
+      #
+      # A task lives in one server session: the session that replaced it may
+      # name an entirely different task with the same id, so the wait never
+      # polls it there. What the ended session already answered is another
+      # matter: a terminal payload that came back from a poll the transport
+      # pinned to that session is this very task's result or error (the pin
+      # holds a request back until the wire, so an answer in hand is the
+      # answer of the session the wait was in), and it is the outcome. Short
+      # of that — no observation, a non-terminal one, or a transport that
+      # cannot pin a request to its session and so cannot vouch for which
+      # session answered — the wait ends: the task did not survive.
+      # @param current [MCPClient::Task, nil] the observation in hand
+      # @param wait [Hash]
+      # @param polled_state [Hash] the bookkeeping the poll belonged to
+      # @return [MCPClient::Task] the terminal task
+      # @raise [MCPClient::Errors::TaskError]
+      def outcome_of_ended_session(current, wait, polled_state)
+        # Only the bookkeeping of the session the poll asked is forgotten;
+        # the replacement session's is untouched.
+        forget_task_keys(wait[:srv], wait[:task_id], state: polled_state) if current&.terminal?
+        end_of_session!(wait) unless current&.terminal? && session_pinning?(wait[:srv])
+
+        # A terminal task that came back after the caller's deadline
+        # (transport retries) does not rescue a timed-out wait.
+        raise_if_past_caller_deadline!(wait)
+        current
+      end
+
+      # End a wait whose server session is over: the task belonged to that
+      # session and is gone with it.
+      # @return [void]
+      # @raise [MCPClient::Errors::TaskError]
+      def end_of_session!(wait)
+        raise MCPClient::Errors::TaskError,
+              "Error waiting for task '#{shown_task_id(wait[:task_id])}': the server session it belongs to ended " \
+              'before the task did, so the task is gone (a restarted server may reuse its id for an unrelated task)'
+      end
+
+      # Whether the transport holds a request back from the session that
+      # replaced the one it belongs to (see {MCPClient::SessionPin}), which
+      # is what makes an answer in hand provably the answer of the session
+      # the wait was in.
+      # @return [Boolean]
+      def session_pinning?(srv)
+        srv.respond_to?(:pinned_to_session)
+      end
 
       # The task state to act on for this iteration: the seed when it is
       # still usable, else a fresh tasks/get; a seed that claims a terminal
@@ -247,14 +290,14 @@ module MCPClient
         task_state(srv, task_id)[:answered]
       end
 
-      # Point a wait at the task state of the server's current session: a
-      # wait that outlives a restart must reserve keys in the new session's
-      # answered set, since the restarted server may reuse the task id and
-      # its keys for what is a new request. What the previous session said
-      # about the task goes with it: its TTL backstop (createdAt + ttlMs of
-      # a task that no longer exists) must not end the wait before the
-      # replacement session has been polled, and its last observation must
-      # not pace the polls of a task it knows nothing about.
+      # Point a wait at the task state of the server's current session, and
+      # report whether that is a session it has not been in before. What the
+      # previous session said about the task goes with it: its TTL backstop
+      # (createdAt + ttlMs of a task that no longer exists) must not end the
+      # wait in place of the session being over, and its last observation
+      # must not pace anything. A wait that reserves keys after a restart
+      # reserves them in the new session's answered set, since the restarted
+      # server may reuse the task id and its keys for what is a new request.
       # @param wait [Hash]
       # @return [Boolean] whether the wait moved to another session, so that
       #   nothing the previous one said (an observation in hand, its TTL, its
@@ -670,10 +713,11 @@ module MCPClient
         forget_task_keys(wait[:srv], wait[:task_id], state: wait[:state])
         raise
       rescue MCPClient::Errors::SessionChangedError
-        # A lost poll, not the end of the task: the wait joins the live
-        # session and asks it about the task it is waiting for.
+        # Nothing was asked: the transport held the poll back from the
+        # session that replaced its own. The wait sees the move on its next
+        # refresh and ends there (the task belonged to the ended session).
         logger.debug("tasks/get for task #{shown_task_id(wait[:task_id])} was not sent into the session that " \
-                     'replaced its own; polling again')
+                     'replaced its own')
         nil
       rescue MCPClient::Errors::TaskError => e
         raise unless e.cause.is_a?(MCPClient::Errors::RequestTimeoutError)

@@ -5,9 +5,9 @@ require 'spec_helper'
 TASKS_EXT = MCPClient::JsonRpcCommon::TASKS_EXTENSION unless defined?(TASKS_EXT)
 
 # MCP 2026-07-28 tasks extension, thirty-first round: an observation that came
-# back after the session ended is discarded (its input requests are never
-# presented, its TTL never ends the replacement wait, its pace never delays the
-# first poll of the new session), the session epoch holds at the wire rather
+# back after the session ended is not acted on (its input requests are never
+# presented, its TTL never ends the wait in place of the session that is over,
+# its pace never delays anything), the session epoch holds at the wire rather
 # than at the guard, and every piece of per-task bookkeeping is taken from the
 # session the wait captured.
 RSpec.describe 'MCP 2026-07-28 tasks extension — round 31' do
@@ -84,41 +84,40 @@ RSpec.describe 'MCP 2026-07-28 tasks extension — round 31' do
         end
       end
 
-      expect(client.wait_for_task('task-1', server: stdio, timeout: 2).status).to eq('completed')
+      # The task went with its session: it is not asked about in the session
+      # that replaced it, where the id may name something else (round 33).
+      expect { client.wait_for_task('task-1', server: stdio, timeout: 2) }
+        .to raise_error(MCPClient::Errors::TaskError, /session it belongs to ended/i)
       expect(asked).to eq(0)
-      expect(polls).to eq(2)
+      expect(polls).to eq(1)
     end
 
-    it 'does not end the replacement wait on the ended session TTL' do
+    it 'ends on the session that is over, not on the ended session TTL' do
       client = client_for(stdio)
       negotiated(stdio)
       polls = 0
-      survived = nil
       allow(client).to receive(:poll_task) do |wait|
         polls += 1
         wait[:polled] = true
-        if polls == 1
-          expired = detailed_task(status: 'working', ttl_ms: 1,
-                                  created_at: (Time.now.utc - 60).iso8601(3))
-          observation = task_from(expired)
-          stdio.send(:bump_session_epoch)
-          # The replacement session answered a key of its own already.
-          client.send(:remember_answered_keys, stdio, 'task-1', ['k9'])
-          observation
-        else
-          # The replacement session's bookkeeping is intact: the ended
-          # session's TTL neither raised nor forgot it.
-          survived = client.send(:answered_task_keys, stdio, 'task-1').include?('k9')
-          task_from(detailed_task(status: 'completed', 'result' => call_result))
-        end
+        expired = detailed_task(status: 'working', ttl_ms: 1,
+                                created_at: (Time.now.utc - 60).iso8601(3))
+        observation = task_from(expired)
+        stdio.send(:bump_session_epoch)
+        # The replacement session answered a key of its own already.
+        client.send(:remember_answered_keys, stdio, 'task-1', ['k9'])
+        observation
       end
 
-      expect(client.wait_for_task('task-1', server: stdio, timeout: 2).status).to eq('completed')
-      expect(polls).to eq(2)
-      expect(survived).to be(true)
+      # The wait ends because the task's session is over — the TTL of a task
+      # that no longer exists says nothing — and the replacement session's
+      # bookkeeping is left alone.
+      expect { client.wait_for_task('task-1', server: stdio, timeout: 2) }
+        .to raise_error(MCPClient::Errors::TaskError, /session it belongs to ended/i)
+      expect(polls).to eq(1)
+      expect(client.send(:answered_task_keys, stdio, 'task-1')).to include('k9')
     end
 
-    it 'paces the first poll of the replacement session by its own default' do
+    it 'never waits out the ended session pace' do
       client = client_for(stdio)
       negotiated(stdio)
       delays = []
@@ -130,19 +129,19 @@ RSpec.describe 'MCP 2026-07-28 tasks extension — round 31' do
       allow(client).to receive(:poll_task) do |wait|
         polls += 1
         wait[:polled] = true
-        if polls == 1
-          stdio.send(:bump_session_epoch)
-          nil
-        else
-          task_from(detailed_task(status: 'completed', 'result' => call_result))
-        end
+        stdio.send(:bump_session_epoch)
+        nil
       end
 
-      expect(client.wait_for_task(seed, server: stdio, timeout: 5).status).to eq('completed')
-      expect(delays.first).to be <= MCPClient::Client::TaskSupport::DEFAULT_TASK_POLL_INTERVAL
+      # The wait ends with the session rather than sleeping out the hour-long
+      # pace of a task that no longer exists.
+      expect { client.wait_for_task(seed, server: stdio, timeout: 5) }
+        .to raise_error(MCPClient::Errors::TaskError, /session it belongs to ended/i)
+      expect(polls).to eq(1)
+      expect(delays).to be_empty
     end
 
-    it 'does not seed a wait from a task handle of a session that has ended' do
+    it 'refuses to wait on a task handle of a session that has ended' do
       client = client_for(stdio)
       negotiated(stdio)
       seed = MCPClient::Task.from_json({ 'resultType' => 'task', 'taskId' => 'task-1', 'status' => 'working',
@@ -153,11 +152,14 @@ RSpec.describe 'MCP 2026-07-28 tasks extension — round 31' do
       allow(client).to receive(:poll_task) do |wait|
         polls += 1
         wait[:polled] = true
-        polls == 1 ? nil : task_from(detailed_task(status: 'completed', 'result' => call_result))
+        task_from(detailed_task(status: 'completed', 'result' => call_result))
       end
 
-      expect(client.wait_for_task(seed, server: stdio, timeout: 2).status).to eq('completed')
-      expect(polls).to eq(2)
+      # Neither its TTL nor its pace is taken from it — nothing is: the
+      # handle names a task of a session that is over (round 33).
+      expect { client.wait_for_task(seed, server: stdio, timeout: 2) }
+        .to raise_error(MCPClient::Errors::TaskError, /session it belongs to/i)
+      expect(polls).to eq(0)
     end
   end
 

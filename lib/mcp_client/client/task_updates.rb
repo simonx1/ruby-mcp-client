@@ -65,7 +65,11 @@ module MCPClient
         # the send record its keys, drop its pending payload or release them
         # in another session's state (the epoch guard drops the payload
         # instead), and an abandoned send finishes against this very state.
-        state = task_state(srv, task_id)
+        # It is the wait's own state — the one the answers were built in —
+        # not whatever the live session now keys under the same id: a
+        # delivery the pin drops must not give back keys a concurrent wait
+        # has reserved in the session that replaced it.
+        state = wait[:state] || task_state(srv, task_id)
         bounded_by_wait(wait, deadline: wait[:deadline],
                               on_abandon: ->(_runner) { abandon_task_update(state) }) do
           send_task_update(srv, task_id, responses, epoch: wait[:epoch], pending_only: pending_only, state: state,

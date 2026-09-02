@@ -4,10 +4,11 @@ require 'spec_helper'
 
 TASKS_EXT = MCPClient::JsonRpcCommon::TASKS_EXTENSION unless defined?(TASKS_EXT)
 
-# MCP 2026-07-28 tasks extension, fifteenth review round: a wait that is
-# active across a server restart follows the new session (a reused task id
-# or key is a new request), and a caller holding an outdated session epoch
-# can neither delete the newer session's bookkeeping nor become it.
+# MCP 2026-07-28 tasks extension, fifteenth review round: a server restart
+# ends the wait that spans it (a reused task id or key is a new request, and
+# round 33 stopped the wait from following it into the new session), and a
+# caller holding an outdated session epoch can neither delete the newer
+# session's bookkeeping nor become it.
 RSpec.describe 'MCP 2026-07-28 tasks extension — round 15' do
   def discover_result
     { 'resultType' => 'complete', 'supportedVersions' => ['2026-07-28'],
@@ -72,7 +73,7 @@ RSpec.describe 'MCP 2026-07-28 tasks extension — round 15' do
     JSON.parse(JSON.generate(request))
   end
 
-  it 'answers a reused key again when the server session changed during the wait' do
+  it 'ends the call when the server session changed during the wait' do
     handled = 0
     client = client_for(stdio, elicitation_handler: lambda { |_m, _s|
       handled += 1
@@ -86,22 +87,21 @@ RSpec.describe 'MCP 2026-07-28 tasks extension — round 15' do
                           lambda { |_req|
                             # The process restarted while this poll was
                             # outstanding: what came back describes the ended
-                            # session and is discarded.
+                            # session and is not acted on.
                             stdio.send(:bump_session_epoch)
                             { 'result' => detailed_task(status: 'input_required',
                                                         'inputRequests' => { 'k1' => elicit_request }) }
                           },
-                          # The new process reused the task id and the key, and
-                          # presents the request again.
+                          # The new process reused the task id and the key for
+                          # a request of its own; the call never sees it.
                           { 'result' => detailed_task(status: 'input_required',
-                                                      'inputRequests' => { 'k1' => elicit_request }) },
-                          { 'result' => {} },
-                          { 'result' => detailed_task(status: 'completed', 'result' => call_result) }
+                                                      'inputRequests' => { 'k1' => elicit_request }) }
                         ])
 
-    expect(client.call_tool('slow', {})['isError']).to be(false)
-    expect(handled).to eq(2)
-    expect(sent.count { |r| r['method'] == 'tasks/update' }).to eq(2)
+    expect { client.call_tool('slow', {}) }
+      .to raise_error(MCPClient::Errors::TaskError, /session it belongs to ended/i)
+    expect(handled).to eq(1)
+    expect(sent.count { |r| r['method'] == 'tasks/update' }).to eq(1)
   end
 
   it 'reserves keys in the current session even when the wait started in the previous one' do

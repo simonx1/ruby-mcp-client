@@ -135,9 +135,12 @@ RSpec.describe 'MCP 2026-07-28 tasks extension — round 29' do
                              end
                            }])
 
-      expect(client.call_tool('slow', {})['isError']).to be(false)
+      # Nothing is written into the session that replaced the answers' own,
+      # and the wait ends with the session the task belonged to (round 33).
+      expect { client.call_tool('slow', {}) }
+        .to raise_error(MCPClient::Errors::TaskError, /session it belongs to ended/i)
       expect(output.string).to include('session restarted')
-      expect(answered).to eq(2)
+      expect(answered).to eq(1)
     end
   end
 

@@ -81,16 +81,16 @@ RSpec.describe 'MCP 2026-07-28 tasks extension — round 20' do
     sent = script_stdio(stdio, [{ 'result' => discover_result }, tool_list, { 'result' => task_result },
                                 { 'result' => detailed_task(status: 'input_required',
                                                             'inputRequests' => { 'k1' => elicit_request }) },
-                                # Repolled: the restarted server reuses the id and the key.
+                                # The restarted server would reuse the id and the
+                                # key; the wait never asks it (round 33).
                                 { 'result' => detailed_task(status: 'input_required',
-                                                            'inputRequests' => { 'k1' => elicit_request }) },
-                                { 'result' => {} },
-                                { 'result' => detailed_task(status: 'completed', 'result' => call_result) }])
+                                                            'inputRequests' => { 'k1' => elicit_request }) }])
     task = client.call_tool_as_task('slow', {})
 
-    expect(client.wait_for_task(task)).to be_completed
-    expect(handled).to eq(2)
-    expect(sent.count { |r| r['method'] == 'tasks/update' }).to eq(1)
+    expect { client.wait_for_task(task) }
+      .to raise_error(MCPClient::Errors::TaskError, /session it belongs to ended/i)
+    expect(handled).to eq(1)
+    expect(sent.count { |r| r['method'] == 'tasks/update' }).to eq(0)
   end
 
   it 'bounds a slow input handler by the wait deadline' do
