@@ -16,7 +16,7 @@ metadata). Each feature lands in its own PR; this section accumulates them.
   found`) makes `TaskNotFound` even when it mentions params; every task
   payload needs a string `taskId`; `tasks/update` goes out without a
   `timeout:` keyword when no bound applies, so transports implementing
-  only `rpc_request(method, params)` keep working.
+  only `rpc_request(method, params)` keep working. A `tasks/update` or `tasks/cancel` that reports the task gone forgets its bookkeeping like a `tasks/get` that does.
 - **Abandoned handlers (round 22).** A handler round that outlived the
   wait spends no input round (retries of a timed-out wait cannot exhaust
   the per-task budget on one outstanding request), and the keys an

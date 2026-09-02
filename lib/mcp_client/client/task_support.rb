@@ -423,7 +423,7 @@ module MCPClient
             end
             raise if e.protocol_error?
 
-            raise task_error_from(e, task_id, 'updating', modern: true, method: 'tasks/update')
+            raise task_failure(e, srv, task_id, 'updating', method: 'tasks/update')
           rescue MCPClient::Errors::TransportError, MCPClient::Errors::ConnectionError => e
             keep_pending_update(state, input_responses)
             raise MCPClient::Errors::TaskError,
