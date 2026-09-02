@@ -842,6 +842,11 @@ RSpec.describe 'MCP 2026-07-28 cacheable results — round 4' do
     server.send(:route_notification, 'notifications/resources/updated',
                 { 'uri' => 'file:///a', '_meta' => { sub_id_meta => 7 } })
 
+    # Listeners are delivered on the subscription's own dispatcher thread, so
+    # the read happens after this returns; what matters is that when it does,
+    # the cache the notification invalidated is already gone.
+    deadline = Time.now + 2
+    sleep 0.005 while seen.nil? && Time.now < deadline
     expect(seen).to eq('two')
   end
 
