@@ -7,6 +7,33 @@ metadata). Each feature lands in its own PR; this section accumulates them.
 
 ### Tasks extension (`io.modelcontextprotocol/tasks`)
 
+- **Every `CreateTaskResult` starts an isolated task lifetime, and closing a
+  sessionless connection ends none (round 36).** A task id is unique within a
+  session, so a server that answers with an id whose previous task is still on
+  the client's books has ended that task and started another. The per-task
+  bookkeeping is now stamped with a per-creation lifetime: the new task gets an
+  answered set, an in-flight registry entry and a pending update of its own, so
+  an input key a handler of the previous task is still presenting no longer
+  suppresses the same key on the new one, and that handler's answer is
+  discarded instead of being delivered to the new task through `tasks/update`.
+  A wait whose task id was handed out again ends with a `TaskError` rather than
+  reporting the new task's outcome, and a `Task` handle built from a
+  `CreateTaskResult` names the task that creation started — `wait_for_task`,
+  `get_task`, `get_task_result`, `update_task` and `cancel_task` refuse a
+  handle whose task was replaced, as they already refuse one whose session
+  ended. Conversely, an MCP 2026-07-28 HTTP transport has no session at all (no
+  `initialize` handshake, no `Mcp-Session-Id`): its `cleanup` closes a
+  connection, it does not reset a task namespace, so it no longer moves the
+  session epoch. A task on such a server lives for its own `ttlMs` in the
+  server's id namespace and survives a reconnect together with its answered
+  keys and its undelivered `tasks/update` — previously every reconnect (and
+  `ensure_connected` performs one after any transient failure) discarded that
+  bookkeeping, so a handler could be asked to answer the same input request
+  twice, an unconfirmed answer was never retransmitted, and the task's own
+  handles were refused for a session that never existed. A session a handshake
+  *did* open still ends with the connection, and round 35's other epoch moves
+  (`terminate_session`, a changed session id, the 404 recovery, a restarted
+  stdio process, an ended SSE stream) are unchanged.
 - **Every path that replaces an HTTP session moves the session epoch (round
   35).** The 404 recovery already did (round 32), but it is not the only way
   a session is replaced without a `cleanup`: `terminate_session` — the

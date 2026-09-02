@@ -232,6 +232,31 @@ module MCPClient
 
     private
 
+    # Whether tearing this connection down ends an MCP session — and with it
+    # the namespace a task id and an input request key live in.
+    #
+    # A legacy transport's session is the one `initialize` opened (named by
+    # Mcp-Session-Id when the server assigned one, unnamed otherwise): closing
+    # the connection ends it, the next request opens another with a fresh
+    # handshake, and the server may hand the ids of the old one out again — so
+    # the epoch must move. MCP 2026-07-28 removed the handshake and the
+    # session with it: a modern transport is sessionless (it never sends an
+    # Mcp-Session-Id — this client only ever captures one from an initialize
+    # response, which a modern server does not send), a task lives for its own
+    # ttlMs in the server's own id namespace, and a reconnect resumes exactly
+    # what was there before. Ending the connection there is not a task
+    # namespace reset: throwing away the answered keys and the undelivered
+    # tasks/update of a task that is still alive would ask the host to answer
+    # an input request twice and drop an answer the server never confirmed,
+    # and it would make the task's own handles refuse tasks/get, tasks/update
+    # and tasks/cancel for a session that never existed. A modern server that
+    # does hand a task id out again is handled where it happens, by the task
+    # registry's per-creation lifetime.
+    # @return [Boolean]
+    def session_bearing_connection?
+      !modern? || !@session_id.nil?
+    end
+
     # Store the session id a handshake established. A handshake that lands a
     # different id on a live session replaced it — the 404 recovery is only
     # one way there, and none of them goes through #cleanup — so the epoch
@@ -252,6 +277,7 @@ module MCPClient
     def configure_protocol_mode(protocol, discover_timeout)
       unless PROTOCOL_MODES.include?(protocol)
         raise ArgumentError, "protocol must be one of #{PROTOCOL_MODES.inspect}, got #{protocol.inspect}"
+      end
 
       @protocol_mode = protocol
       @discover_timeout = discover_timeout || @read_timeout
@@ -636,8 +662,6 @@ module MCPClient
       else
         req.headers.delete('Mcp-Session-Id')
       end
-    end
-
     end
 
     # Build the ServerError for a 4xx surfaced as a Faraday::ClientError by

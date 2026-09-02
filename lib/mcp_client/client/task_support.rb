@@ -69,6 +69,7 @@ module MCPClient
         # the reused id and keys would answer an unrelated request. A bare id
         # answers the task of the session live at this call.
         epoch = handle_session_epoch(task, srv, 'updating') || invocation_session_epoch(srv)
+        check_handle_lifetime!(task, srv, epoch, 'updating')
         # A caller that asked for this delivery is told when it did not
         # happen: a wait would poll again, but nothing else would notice.
         send_task_update(srv, task_id, input_responses, epoch: epoch, strict_session: true)
@@ -113,6 +114,10 @@ module MCPClient
         # #cancel_task apply to a handle).
         handle_session_epoch(task, srv, 'waiting for')
         refresh_wait_session(wait)
+        # And a handle of a task a later CreateTaskResult under the same id
+        # replaced is never polled either: what the wait would follow is the
+        # task that answers to the id now, not the one the caller named.
+        check_handle_lifetime!(task, srv, wait[:epoch], 'waiting for')
         # The CreateTaskResult seed is not an observation: the first
         # tasks/get goes out at once, whatever the seed claims. Its TTL
         # still bounds a wait whose polls never come back, and its
@@ -127,7 +132,7 @@ module MCPClient
           # sleep between two of them, say): the task belonged to the session
           # that ended, so the wait ends here rather than polling an id the
           # new session may have reused for something else.
-          end_of_session!(wait) if refresh_wait_session(wait)
+          end_of_task!(wait) if refresh_wait_session(wait)
           current = observe_task(wait)
           # A poll that came back with nothing is no observation: try again at
           # the pace the server last asked for, unless the wait is over. It
@@ -138,7 +143,7 @@ module MCPClient
           # session about an id it may have reused — or waiting out the pace
           # of a task that no longer exists.
           unless current
-            end_of_session!(wait) if refresh_wait_session(wait)
+            end_of_task!(wait) if refresh_wait_session(wait)
             raise_if_past_deadline!(wait)
             next sleep(wait[:last] ? task_poll_delay(wait[:last], wait_deadline(wait)) : default_poll_delay(wait))
           end
@@ -174,7 +179,7 @@ module MCPClient
           # session may have ended under it: the observation in hand says
           # nothing about the live session, its input requests must never be
           # put to the host, and the task itself did not survive.
-          end_of_session!(wait) if refresh_wait_session(wait)
+          end_of_task!(wait) if refresh_wait_session(wait)
           answer_task_round(current, wait)
 
           sleep(task_poll_delay(current, wait_deadline(wait)))
@@ -211,12 +216,16 @@ module MCPClient
       def outcome_of_ended_session(current, wait, polled_state, polled_epoch)
         # An answer counts as this wait's outcome only when it is stamped
         # with the very session the poll was pinned to: a handle carrying
-        # another session's epoch describes another lifetime of the id.
-        terminal = current&.terminal? && observation_of_session?(current, polled_epoch)
+        # another session's epoch describes another lifetime of the id. A
+        # task id the server handed out again is not that case: the pin is
+        # about sessions, and nothing on the wire tells which of the two
+        # tasks under that id the answer describes — so the wait ends.
+        terminal = wait[:ended] == :session && current&.terminal? &&
+                   observation_of_session?(current, polled_epoch)
         # Only the bookkeeping of the session the poll asked is forgotten;
         # the replacement session's is untouched.
         forget_task_keys(wait[:srv], wait[:task_id], state: polled_state) if terminal
-        end_of_session!(wait) unless terminal && session_pinning?(wait[:srv])
+        end_of_task!(wait) unless terminal && session_pinning?(wait[:srv])
 
         # A terminal task that came back after the caller's deadline
         # (transport retries) does not rescue a timed-out wait.
@@ -224,13 +233,22 @@ module MCPClient
         current
       end
 
-      # End a wait whose server session is over: the task belonged to that
-      # session and is gone with it.
+      # End a wait whose task is gone: its server session is over and the task
+      # went with it, or the server handed the task id out again — a task id
+      # is unique within a session, so a fresh CreateTaskResult under it ended
+      # the task this wait was following.
       # @return [void]
       # @raise [MCPClient::Errors::TaskError]
-      def end_of_session!(wait)
+      def end_of_task!(wait)
+        shown = shown_task_id(wait[:task_id])
+        if wait[:ended] == :replaced
+          raise MCPClient::Errors::TaskError,
+                "Error waiting for task '#{shown}': the server created a new task with this id, so the task " \
+                'being waited for was replaced and is gone'
+        end
+
         raise MCPClient::Errors::TaskError,
-              "Error waiting for task '#{shown_task_id(wait[:task_id])}': the server session it belongs to ended " \
+              "Error waiting for task '#{shown}': the server session it belongs to ended " \
               'before the task did, so the task is gone (a restarted server may reuse its id for an unrelated task)'
       end
 
@@ -313,37 +331,52 @@ module MCPClient
         task_state(srv, task_id)[:answered]
       end
 
-      # Point a wait at the task state of the server's current session, and
-      # report whether that is a session it has not been in before. What the
-      # previous session said about the task goes with it: its TTL backstop
-      # (createdAt + ttlMs of a task that no longer exists) must not end the
-      # wait in place of the session being over, and its last observation
-      # must not pace anything. A wait that reserves keys after a restart
-      # reserves them in the new session's answered set, since the restarted
-      # server may reuse the task id and its keys for what is a new request.
+      # Point a wait at the task state of the server's current session and
+      # lifetime, and report whether that is one it has not been in before.
+      # What the previous session — or the previous task under this id — said
+      # goes with it: its TTL backstop (createdAt + ttlMs of a task that no
+      # longer exists) must not end the wait in place of the boundary being
+      # crossed, and its last observation must not pace anything. A wait that
+      # reserves keys afterwards reserves them in the new set, since the id
+      # and its keys now name a different request.
       # @param wait [Hash]
-      # @return [Boolean] whether the wait moved to another session, so that
-      #   nothing the previous one said (an observation in hand, its TTL, its
-      #   pace) may be acted on
+      # @return [Boolean] whether the wait crossed a boundary, so that
+      #   nothing the previous lifetime said (an observation in hand, its TTL,
+      #   its pace) may be acted on
       def refresh_wait_session(wait)
-        # The epoch and the state keyed under it are read in one step, so
-        # a restart between the two cannot leave the wait pointing at one
-        # session's set while recording another's epoch.
+        # The epoch, the lifetime and the state keyed under them are read in
+        # one step, so a restart (or a creation) between them cannot leave the
+        # wait pointing at one task's set while recording another's stamp.
         answered_keys_mutex.synchronize do
           epoch = current_session_epoch(wait[:srv])
-          next false if wait[:epoch] == epoch && wait[:answered]
+          generation = task_lifetime([wait[:srv].object_id, epoch, wait[:task_id]])
+          next false if wait[:epoch] == epoch && wait[:generation] == generation && wait[:answered]
 
-          moved = !wait[:epoch].nil? && wait[:epoch] != epoch
+          moved = wait_boundary_crossed(wait, epoch, generation)
           if moved
             wait[:ttl_deadline] = nil
             wait[:last] = nil
           end
+          wait[:ended] = moved
           wait[:epoch] = epoch
+          wait[:generation] = generation
           state = task_state_locked(wait[:srv], wait[:task_id], epoch)
           wait[:state] = state
           wait[:answered] = state[:answered]
-          moved
+          !moved.nil?
         end
+      end
+
+      # Which boundary the wait has just crossed: the session it was in ended
+      # (:session), or the server handed the task id it is polling out again,
+      # so the task the wait follows is over and another one answers to that
+      # id now (:replaced).
+      # @return [Symbol, nil] nil when the wait is still where it was
+      def wait_boundary_crossed(wait, epoch, generation)
+        return :session if !wait[:epoch].nil? && wait[:epoch] != epoch
+        return :replaced if !wait[:generation].nil? && wait[:generation] != generation
+
+        nil
       end
 
       # A handle that is already final: a DetailedTask of this server whose
@@ -709,14 +742,19 @@ module MCPClient
 
         epoch ||= invocation_session_epoch(srv)
         # A creation is a new task lifetime: whatever an earlier task with
-        # this id left behind (answered keys, an ambiguous update) is not its.
-        forget_task_keys(srv, result['taskId'], epoch: epoch)
+        # this id left behind (answered keys, an ambiguous update, a handler
+        # still presenting its input requests) is not its, and neither a wait
+        # nor a hold nor an answer of that task may reach this one.
+        start_task_lifetime(srv, result['taskId'], epoch)
         # The handle is the object just validated: a 2026-07-28
         # CreateTaskResult is the flat Task itself, and an extra `task`
         # property (the legacy 2025 wrapper) must not replace it. It names
         # the session the call was answered in, not one that replaced it
-        # between the answer and this handle.
-        MCPClient::Task.from_json(result, server: srv, session_epoch: epoch)
+        # between the answer and this handle — and, within that session, the
+        # task this creation started rather than whichever one answers to the
+        # id later.
+        MCPClient::Task.from_json(result, server: srv, session_epoch: epoch,
+                                          task_generation: current_task_lifetime(srv, result['taskId'], epoch))
       end
 
       # @param result [Object] a JSON-RPC result
@@ -816,15 +854,33 @@ module MCPClient
         # answered set keeps them deduplicated for this session).
         answered_keys_mutex.synchronize { end_in_flight(pending.keys, held, held_key) }
         # A session that restarted while the host was answering may have
-        # reused the task id and the keys: the answers belong to the ended
-        # session and are not delivered; the next poll asks again.
-        if wait[:epoch] && answered_keys_mutex.synchronize { current_session_epoch(srv) } != wait[:epoch]
-          logger.warn("Task #{shown_task_id(task.task_id)}: the server session restarted while its input was " \
-                      'being answered; the answers are discarded')
+        # reused the task id and the keys, and so may a fresh CreateTaskResult
+        # under that id in this very session: the answers belong to the task
+        # that is over and are not delivered; the next poll asks again.
+        unless answers_still_this_task?(srv, task.task_id, wait)
+          logger.warn("Task #{shown_task_id(task.task_id)}: the task the input was requested for ended while it " \
+                      'was being answered (the session restarted, or the id was handed out again); the answers ' \
+                      'are discarded')
           return []
         end
         deliver_task_update(srv, task.task_id, responses, wait)
         pending.keys
+      end
+
+      # Whether the answers a handler just produced still belong to the task
+      # they were asked for: the session must not have restarted under the
+      # host, and the task id must not have been handed out again in it. In
+      # either case the task the request came from is over and the keys would
+      # answer something else.
+      # @return [Boolean]
+      def answers_still_this_task?(srv, task_id, wait)
+        answered_keys_mutex.synchronize do
+          epoch = current_session_epoch(srv)
+          next false if wait[:epoch] && wait[:epoch] != epoch
+          next true unless wait[:state]
+
+          task_lifetime([srv.object_id, epoch, task_id]) == wait[:state][:generation]
+        end
       end
 
       # Whether a task request's error means the task is gone. A rejection of
