@@ -342,8 +342,7 @@ module MCPClient
     def fetch_resources_list(cursor)
       params = {}
       params['cursor'] = cursor if cursor
-      generation = @mutex.synchronize { list_generation(:resources) }
-      epoch = cache_epoch
+      epoch = cache_epoch(:resources)
       result = require_complete_result!(rpc_request('resources/list', params), 'resources/list')
       record_cache_hint(:resources, result, epoch: epoch) unless cursor
 
@@ -452,7 +451,7 @@ module MCPClient
       params = {}
       params['cursor'] = cursor if cursor
       ensure_connected
-      epoch = cache_epoch
+      epoch = cache_epoch(:templates)
       result = require_complete_result!(rpc_request('resources/templates/list', params), 'resources/templates/list')
       record_cache_hint(:templates, result, epoch: epoch) unless cursor
 

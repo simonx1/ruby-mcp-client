@@ -7,6 +7,17 @@ metadata). Each feature lands in its own PR; this section accumulates them.
 
 ### Cacheable results (`ttlMs` / `cacheScope`)
 
+- **Client slices, per-key invalidation, capabilities (round 18).** A
+  client-level cache slice is tied to the very transport entry its list
+  came from (identity and the parameters that entry is bound to), so a
+  transport list refreshed on its own — rotated credentials, a concurrent
+  fetch, a re-fetch after the TTL elapsed — replaces that entry and the
+  slice with it; invalidation generations are kept per cache key
+  (`cache_epoch(key)`), so a resource updated while `tools/list` is in
+  flight no longer discards the tools hint; the client capabilities a
+  request advertises (`declare_extension`, newly registered handlers) are
+  part of the parameters a cached result is bound to; a re-fetch that
+  never built its request matches no stale entry, public ones included.
 - **Client caches and queued responses (round 17).** The client-level
   tool, prompt and resource caches are tagged with the parameters of the
   list they hold — read before the fetch, never the leftover of whatever
