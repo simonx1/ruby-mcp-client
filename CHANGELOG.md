@@ -7,6 +7,13 @@ metadata). Each feature lands in its own PR; this section accumulates them.
 
 ### Tasks extension (`io.modelcontextprotocol/tasks`)
 
+- **Task shape (round 16).** A task timestamp (`createdAt`,
+  `lastUpdatedAt`) that is not an ISO 8601 timestamp is an
+  `InvalidResultError` — in a `tasks/get` result and in a
+  `CreateTaskResult` — so it can never lift the TTL backstop, which only an
+  explicit `ttlMs` null does; `Client#get_task` also requires the payload a
+  status implies (`completed` ⇒ an object `result`, `failed` ⇒ a JSON-RPC
+  error object, `input_required` ⇒ an `inputRequests` object).
 - **Retransmissions and sessions (round 14).** A retransmitted
   `tasks/update` carries only what is still pending once the task's update
   lock is held, so an answer a concurrent, confirmed update superseded is

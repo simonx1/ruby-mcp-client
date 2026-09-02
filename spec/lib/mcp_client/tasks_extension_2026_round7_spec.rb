@@ -96,7 +96,9 @@ RSpec.describe 'MCP 2026-07-28 tasks extension — round 7' do
     script_stdio(stdio, [{ 'result' => discover_result }, tool_list, { 'result' => task_result },
                          { 'result' => detailed_task(status: 'input_required', 'inputRequests' => []) }])
 
-    expect { client.call_tool('slow', {}) }.to raise_error(MCPClient::Errors::InputRequiredError, /inputRequests/)
+    # Since round 16 the malformed DetailedTask is rejected as an invalid
+    # result before the input handling could see it.
+    expect { client.call_tool('slow', {}) }.to raise_error(MCPClient::Errors::InvalidResultError, /inputRequests/)
   end
 
   it 'reserves input keys before the handlers run so concurrent waits do not both answer' do

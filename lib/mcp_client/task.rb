@@ -179,6 +179,12 @@ module MCPClient
     # @param error [Object]
     # @return [Boolean]
     def jsonrpc_error_object?(error)
+      self.class.jsonrpc_error_object?(error)
+    end
+
+    # @param error [Object]
+    # @return [Boolean] whether it is a JSON-RPC error object (integer code, string message)
+    def self.jsonrpc_error_object?(error)
       return false unless error.is_a?(Hash)
 
       code = error['code'] || error[:code]
