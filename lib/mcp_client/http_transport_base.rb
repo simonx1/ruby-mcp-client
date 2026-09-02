@@ -613,17 +613,7 @@ module MCPClient
       # socket and stalls the TLS handshake never delivers a byte for the
       # deadline check to see.
       req.options.timeout = req.options.open_timeout = timeout if timeout
-      # The wire header must match the captured id exactly: a restart
-      # completing between capture and header attachment would otherwise
-      # attach a different (or fresh) session than the one attributed to
-      # this request at 404-handling time.
-      if req.headers.key?('Mcp-Session-Id')
-        if sent_session_id
-          req.headers['Mcp-Session-Id'] = sent_session_id
-        else
-          req.headers.delete('Mcp-Session-Id')
-        end
-      end
+      apply_captured_session_id(req, request, sent_session_id)
       req.body = request.to_json
     end
 
@@ -714,6 +704,29 @@ module MCPClient
       (error['code'] || error[:code]) == MCPClient::Errors::Codes::METHOD_NOT_FOUND &&
         (error['message'] || error[:message]).is_a?(String)
     end
+
+    # Put the captured session id on the wire, whatever @session_id says by
+    # now: the header must match the id this request was cleared for and is
+    # attributed to at 404-handling time. It is set (or removed)
+    # unconditionally — #apply_request_headers reads @session_id outside the
+    # monitor, so a concurrent recovery that nils it (a 404 restart running
+    # its replacement handshake) would otherwise send this pinned request
+    # with no session header at all, where the server may run it in another
+    # session. The handshake that establishes a session carries none.
+    # @param req [Faraday::Request] the request being built
+    # @param request [Hash] the JSON-RPC request
+    # @param sent_session_id [String, nil] the session id captured under the monitor
+    # @return [void]
+    def apply_captured_session_id(req, request, sent_session_id)
+      return if request['method'] == 'initialize'
+
+      if sent_session_id
+        req.headers['Mcp-Session-Id'] = sent_session_id
+      else
+        req.headers.delete('Mcp-Session-Id')
+      end
+    end
+
     end
 
     # Build the ServerError for a 4xx surfaced as a Faraday::ClientError by

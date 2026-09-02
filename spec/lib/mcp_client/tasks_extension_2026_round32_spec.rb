@@ -238,7 +238,11 @@ RSpec.describe 'MCP 2026-07-28 tasks extension — round 32' do
       handle = modern_handle
       sent = reconnecting_transport(stdio)
 
-      expect(client.update_task(handle, { 'k1' => { 'action' => 'accept' } })).to be(true)
+      # Nothing went out, and the caller that asked for this delivery is told
+      # so (round 34): a silent true would leave the host believing the
+      # server has answers it never received.
+      expect { client.update_task(handle, { 'k1' => { 'action' => 'accept' } }) }
+        .to raise_error(MCPClient::Errors::TaskError, /session/i)
       expect(sent).to be_empty
     end
 

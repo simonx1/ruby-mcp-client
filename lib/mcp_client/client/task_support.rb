@@ -3,6 +3,7 @@
 require_relative '../task'
 require_relative '../errors'
 require_relative '../json_rpc_common'
+require_relative 'task_registry'
 require_relative 'task_shape'
 require_relative 'task_updates'
 
@@ -13,6 +14,9 @@ module MCPClient
     # answer tools/call with a task that the client then polls (tasks/get),
     # feeds (tasks/update) and cancels (tasks/cancel).
     module TaskSupport
+      # The per-task bookkeeping (answered keys, in-flight keys, the session
+      # epochs everything is keyed by) lives in its own module.
+      include TaskRegistry
       include TaskShape
       # The tasks/update delivery path (answered keys, pending payloads, the
       # session guard) lives in its own module; the wait loop below drives it.
@@ -62,8 +66,12 @@ module MCPClient
 
         # The answers are for the task the handle names, in the session it
         # was seen in: they never reach the session that replaced it, where
-        # the reused id and keys would answer an unrelated request.
-        send_task_update(srv, task_id, input_responses, epoch: handle_session_epoch(task, srv, 'updating'))
+        # the reused id and keys would answer an unrelated request. A bare id
+        # answers the task of the session live at this call.
+        epoch = handle_session_epoch(task, srv, 'updating') || invocation_session_epoch(srv)
+        # A caller that asked for this delivery is told when it did not
+        # happen: a wait would poll again, but nothing else would notice.
+        send_task_update(srv, task_id, input_responses, epoch: epoch, strict_session: true)
       end
 
       # Wait for a task to reach a terminal status (MCP 2026-07-28 tasks
@@ -141,7 +149,8 @@ module MCPClient
           # it, so the wait never polls it there. What the ended session
           # already answered still stands — see #outcome_of_ended_session.
           polled_state = wait[:state]
-          return outcome_of_ended_session(current, wait, polled_state) if refresh_wait_session(wait)
+          polled_epoch = wait[:epoch]
+          return outcome_of_ended_session(current, wait, polled_state, polled_epoch) if refresh_wait_session(wait)
 
           if current.terminal?
             # A terminal task that came back after the caller's deadline
@@ -196,13 +205,18 @@ module MCPClient
       # @param current [MCPClient::Task, nil] the observation in hand
       # @param wait [Hash]
       # @param polled_state [Hash] the bookkeeping the poll belonged to
+      # @param polled_epoch [Integer, nil] the session the poll was sent in
       # @return [MCPClient::Task] the terminal task
       # @raise [MCPClient::Errors::TaskError]
-      def outcome_of_ended_session(current, wait, polled_state)
+      def outcome_of_ended_session(current, wait, polled_state, polled_epoch)
+        # An answer counts as this wait's outcome only when it is stamped
+        # with the very session the poll was pinned to: a handle carrying
+        # another session's epoch describes another lifetime of the id.
+        terminal = current&.terminal? && observation_of_session?(current, polled_epoch)
         # Only the bookkeeping of the session the poll asked is forgotten;
         # the replacement session's is untouched.
-        forget_task_keys(wait[:srv], wait[:task_id], state: polled_state) if current&.terminal?
-        end_of_session!(wait) unless current&.terminal? && session_pinning?(wait[:srv])
+        forget_task_keys(wait[:srv], wait[:task_id], state: polled_state) if terminal
+        end_of_session!(wait) unless terminal && session_pinning?(wait[:srv])
 
         # A terminal task that came back after the caller's deadline
         # (transport retries) does not rescue a timed-out wait.
@@ -218,6 +232,15 @@ module MCPClient
         raise MCPClient::Errors::TaskError,
               "Error waiting for task '#{shown_task_id(wait[:task_id])}': the server session it belongs to ended " \
               'before the task did, so the task is gone (a restarted server may reuse its id for an unrelated task)'
+      end
+
+      # Whether an observation is about the session it was polled in: the
+      # handle carries the session its request was pinned to. A handle
+      # without one (a server that reports no session), or a poll that
+      # belonged to no session, is taken at its word, as before.
+      # @return [Boolean]
+      def observation_of_session?(task, epoch)
+        task.session_epoch.nil? || epoch.nil? || task.session_epoch == epoch
       end
 
       # Whether the transport holds a request back from the session that
@@ -360,84 +383,6 @@ module MCPClient
         task.session_epoch.nil? || task.session_epoch == wait[:epoch]
       end
 
-      # Per-task bookkeeping shared by every wait on the task: the answered
-      # keys, the input rounds spent, an update still to be delivered and
-      # the lock that serializes its updates. Task ids are per server
-      # session (a restarted stdio process may reuse them), so the state is
-      # keyed by the transport's session epoch too and dies with it. The
-      # epoch is read under the lock and never runs backwards: a caller
-      # that read it before a restart gets the current session's state and
-      # cannot delete it or bring an older session back.
-      # @return [Hash]
-      def task_state(srv, task_id)
-        answered_keys_mutex.synchronize { task_state_locked(srv, task_id, current_session_epoch(srv)) }
-      end
-
-      # {#task_state} for a caller already holding the registry lock and the
-      # epoch it read under it.
-      # @return [Hash]
-      def task_state_locked(srv, task_id, epoch)
-        @task_states ||= {}
-        key = [srv.object_id, epoch, task_id]
-        # A previous session of this server is over: its state (answered
-        # keys, pending answers) is dropped, not left behind.
-        @task_states.delete_if { |other, _| other[0] == key[0] && other[1] < key[1] }
-        # The state carries its own registry key, so a request that captured
-        # it can drop exactly what it was working on (see #forget_task_keys)
-        # and never a later lifetime of the same task id.
-        @task_states[key] ||= { key: key, answered: Set.new, submitted: Set.new, rounds: 0,
-                                pending_update: nil, update_mutex: Mutex.new }
-      end
-
-      # Forget every task's bookkeeping (the client is being cleaned up).
-      # @return [void]
-      def clear_task_states
-        answered_keys_mutex.synchronize do
-          @task_states = nil
-          @in_flight_keys = nil
-          @task_session_epochs = nil
-        end
-      end
-
-      # The server's session epoch as this client knows it, monotonic: the
-      # highest value ever read wins, so a stale reading never reopens an
-      # ended session. Callers hold answered_keys_mutex or do not care about
-      # a concurrent bump (the next task_state resolves it).
-      # @return [Integer]
-      def current_session_epoch(srv)
-        read = srv.respond_to?(:session_epoch) ? srv.session_epoch : 0
-        @task_session_epochs ||= {}.compare_by_identity
-        seen = @task_session_epochs[srv] || 0
-        @task_session_epochs[srv] = [read, seen].max
-      end
-
-      # The session an explicit request for a task handle belongs to. Task
-      # ids are per session and reusable, so a handle a host kept across a
-      # restart names a task that no longer exists: the request is refused
-      # rather than sent into the session that replaced it, where the same id
-      # may name something else. A bare task id, a handle from another
-      # server, or a server that reports no session names whatever the live
-      # session knows and carries no pin.
-      # @param task [Object] what the caller named the task with
-      # @param operation [String] for the error message ('updating', 'cancelling')
-      # @return [Integer, nil] the epoch to pin the request to
-      # @raise [MCPClient::Errors::TaskError] if the handle's session has ended
-      def handle_session_epoch(task, srv, operation)
-        return nil unless task.is_a?(MCPClient::Task) && task.server.equal?(srv) && task.session_epoch
-
-        epoch = task.session_epoch
-        return epoch if answered_keys_mutex.synchronize { current_session_epoch(srv) } == epoch
-
-        raise MCPClient::Errors::TaskError,
-              "Error #{operation} task '#{shown_task_id(task.task_id)}': the server session it belongs to has " \
-              'ended, so the task is gone (a restarted server may reuse its id for an unrelated task)'
-      end
-
-      # @return [Array] the registry key of a task's state
-      def task_state_key(srv, task_id)
-        [srv.object_id, current_session_epoch(srv), task_id]
-      end
-
       # The pace before the server ever said one (a bare task id, a handle
       # from another server): the default interval, never the busy-loop
       # floor, clamped to what is left of the wait.
@@ -453,59 +398,6 @@ module MCPClient
       # @return [Float, nil]
       def wait_deadline(wait)
         [wait[:deadline], wait[:ttl_deadline]].compact.min
-      end
-
-      # @return [Mutex] guards the answered-key registry (request threads share the client)
-      def answered_keys_mutex
-        @answered_keys_mutex ||= Mutex.new
-      end
-
-      # Drop a task's bookkeeping: it is terminal, cancelled, gone or past
-      # its TTL, so nothing of it may colour a later task with the same id.
-      # @param state [Hash, nil] the bookkeeping the caller was working on;
-      #   only that very state is dropped, so a request abandoned on the
-      #   wait's wall clock cannot, on its late completion, wipe what a new
-      #   session — or a new lifetime of a reused task id — has recorded
-      #   since. Without one, the current session's state is dropped.
-      # @return [void]
-      def forget_task_keys(srv, task_id, state: nil)
-        answered_keys_mutex.synchronize do
-          unless state
-            @task_states&.delete(task_state_key(srv, task_id))
-            next
-          end
-          next unless @task_states && @task_states[state[:key]].equal?(state)
-
-          @task_states.delete(state[:key])
-        end
-      end
-
-      NO_KEYS = Set.new.freeze
-      private_constant :NO_KEYS
-
-      # Keys a running handler presents, kept apart from the task's
-      # bookkeeping so no forget lets a retry present them again meanwhile.
-      # A read allocates nothing; the reservation that holds keys asks for
-      # the set to be created and receives its registry key with it.
-      # @param key [Array, nil] the registry key to use; without one the
-      #   current session's is resolved (a caller working on the state a wait
-      #   captured passes that state's key, so a restart cannot move its
-      #   reservation to the replacement session)
-      # @return [Set<String>, Array(Set<String>, Array)] (callers hold answered_keys_mutex)
-      def in_flight_task_keys(srv, task_id, create: false, key: nil)
-        key ||= task_state_key(srv, task_id)
-        return [(@in_flight_keys ||= {})[key] ||= Set.new, key] if create
-
-        @in_flight_keys&.fetch(key, nil) || NO_KEYS
-      end
-
-      # Drop a registry entry once its own set is empty; another task's or
-      # session's entry is never touched.
-      # @return [void] (callers hold answered_keys_mutex)
-      def release_in_flight_entry(held, held_key)
-        return unless held.empty? && @in_flight_keys && @in_flight_keys[held_key].equal?(held)
-
-        @in_flight_keys.delete(held_key)
       end
 
       # Send a task request through a transport that may implement only the
@@ -705,7 +597,7 @@ module MCPClient
       def poll_task(wait)
         wait[:polled] = true
         bounded_by_wait(wait, deadline: wait[:deadline]) do
-          get_task(wait[:task_id], server: wait[:srv], state: wait[:state], epoch: wait[:epoch],
+          get_task(wait[:task_id], server: wait[:srv], state: wait[:state], epoch: wait[:epoch], polling: true,
                                    timeout: request_timeout(wait_deadline(wait), wait[:srv]))
         end
       rescue MCPClient::Errors::TaskNotFound
@@ -769,6 +661,9 @@ module MCPClient
       def call_tool_as_modern_task(tool_name, parameters, srv, tool: nil)
         ensure_tasks_extension!(srv)
         generation_before = tools_generation_of(srv)
+        # The session the call reaches: a task it creates belongs to that
+        # session, whatever session is live once the answer is parsed.
+        epoch = invocation_session_epoch(srv)
         result = begin
           srv.call_tool(tool_name, parameters)
         rescue MCPClient::Errors::ServerError => e
@@ -785,7 +680,7 @@ module MCPClient
                                               "'#{sanitize_peer_log_text(tool_name.to_s)}': " \
                                               "#{sanitize_peer_log_text(e.message)}"
         end
-        return created_task(result, srv) if task_result?(result)
+        return created_task(result, srv, epoch) if task_result?(result)
 
         # Answered synchronously: the result is validated against the tool's
         # outputSchema exactly as #call_tool would — against the definition
@@ -798,9 +693,11 @@ module MCPClient
       end
 
       # The handle for a CreateTaskResult, which MUST carry a taskId.
+      # @param epoch [Integer, nil] the session the creating call was sent in;
+      #   without one the session live at this call is taken
       # @return [MCPClient::Task]
       # @raise [MCPClient::Errors::InvalidResultError]
-      def created_task(result, srv)
+      def created_task(result, srv, epoch = nil)
         # A CreateTaskResult is a Task: a defaulted status or a missing TTL
         # would drive the wait on made-up state (and lose the backstop).
         unless result.is_a?(Hash) && result['taskId'].is_a?(String)
@@ -810,13 +707,16 @@ module MCPClient
         problem = task_shape_problem(result)
         raise MCPClient::Errors::InvalidResultError, "Invalid CreateTaskResult: #{problem}" if problem
 
+        epoch ||= invocation_session_epoch(srv)
         # A creation is a new task lifetime: whatever an earlier task with
         # this id left behind (answered keys, an ambiguous update) is not its.
-        forget_task_keys(srv, result['taskId'])
+        forget_task_keys(srv, result['taskId'], epoch: epoch)
         # The handle is the object just validated: a 2026-07-28
         # CreateTaskResult is the flat Task itself, and an extra `task`
-        # property (the legacy 2025 wrapper) must not replace it.
-        MCPClient::Task.from_json(result, server: srv)
+        # property (the legacy 2025 wrapper) must not replace it. It names
+        # the session the call was answered in, not one that replaced it
+        # between the answer and this handle.
+        MCPClient::Task.from_json(result, server: srv, session_epoch: epoch)
       end
 
       # @param result [Object] a JSON-RPC result
@@ -827,11 +727,12 @@ module MCPClient
 
       # Turn a CreateTaskResult answer to tools/call into the call's final
       # result by waiting for the task.
+      # @param epoch [Integer, nil] the session the tools/call was sent in
       # @return [Object] the final CallToolResult
-      def complete_task_result(tool_name, server, result)
+      def complete_task_result(tool_name, server, result, epoch = nil)
         return result unless task_result?(result)
 
-        task = created_task(result, server)
+        task = created_task(result, server, epoch)
         logger.info("tools/call '#{sanitize_peer_log_text(tool_name.to_s)}' was accepted as task " \
                     "#{shown_task_id(task.task_id)}; waiting for it to finish")
         task_outcome(wait_for_task(task))
@@ -1070,10 +971,10 @@ module MCPClient
       # this server's task. A handle from another server (or a bare id)
       # knows nothing about it: the task counts as still active.
       # @return [MCPClient::Task]
-      def cancelled_task_handle(task, task_id, srv)
+      def cancelled_task_handle(task, task_id, srv, epoch = nil)
         return task if task.is_a?(MCPClient::Task) && task.server.equal?(srv)
 
-        MCPClient::Task.new(task_id: task_id, status: 'working', server: srv, modern: true)
+        MCPClient::Task.new(task_id: task_id, status: 'working', server: srv, modern: true, session_epoch: epoch)
       end
     end
   end

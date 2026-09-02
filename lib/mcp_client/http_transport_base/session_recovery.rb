@@ -67,17 +67,35 @@ module MCPClient
           @restarting_session = true
           @session_id = nil
           @last_event_id = nil if instance_variable_defined?(:@last_event_id)
-          perform_initialize
-          # The handshake itself is the new session being established, and it
-          # goes out on this very transport: the epoch moves once it is
-          # through, before anything of the old session can be resent into the
-          # new one. No other request can slip in between — the monitor is
-          # held for the whole restart.
+          # The 404 ended the session, so the epoch moves here — before the
+          # replacement handshake, not after it. A handshake that fails (or
+          # that is still running) must never leave a request, or a task
+          # handle, treating the session the server has already dropped as
+          # the current one. No other request can slip in meanwhile: the
+          # monitor is held for the whole restart.
           bump_session_epoch
+          # The handshake is not part of the session that ended: it is what
+          # establishes the one that follows, so this thread's pin — which
+          # the bump above has just invalidated — is lifted for it.
+          establish_replacement_session
           resend_after_session_restart(request)
         ensure
           @restarting_session = false
         end
+      end
+
+      # Send the InitializeRequest that replaces the session the 404 ended,
+      # with this thread's session pin lifted. A handshake that fails leaves
+      # no session behind: the transport is marked uninitialized so the next
+      # request rebuilds one through ensure_connected (whose cleanup ends
+      # this epoch too) instead of talking into a session that never came up.
+      # @return [void]
+      def establish_replacement_session
+        unpinned_session { perform_initialize }
+      rescue StandardError
+        @connection_established = false
+        @initialized = false
+        raise
       end
 
       # Whether a 404 should trigger a session restart: only when the 404'd
