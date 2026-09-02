@@ -7,6 +7,15 @@ metadata). Each feature lands in its own PR; this section accumulates them.
 
 ### JSON Schema handling
 
+- **Definition identity (round 19).** `Tool#schema_identity` names a tool
+  definition: every copy the client cache hands out carries the same
+  token and a definition fetched again carries a new one, so the
+  once-per-definition checks of a tool's schemas (unusable input schema,
+  partial output-schema coverage) run once across cache hits and again
+  after a refresh, without hashing a peer-supplied document.
+  `MCPClient::DeepCopy.copy` is iterative, so copying a document nested
+  deeper than the Ruby stack allows cannot overflow it.
+
 - **Dialect-opaque pointers and charged booleans (round 17).** A pointer
   step through a keyword the dialect in force does not define
   (`prefixItems` under draft-07) is opaque data, so it cannot undercount a
