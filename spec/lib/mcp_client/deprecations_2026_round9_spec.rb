@@ -14,7 +14,10 @@ require 'spec_helper'
 # false; the reserving one then raises and releases the slot, and if there is
 # no later use nothing is ever logged. A reservation and an emitted notice
 # have to be distinguishable so a contender can wait for the outcome and take
-# the notice over when the reservation fails.
+# the notice over when the reservation fails. (Round 10 kept that outcome and
+# dropped the machinery: the contender now waits on the feature's emission
+# gate, with no bounded wait to expire and nothing to hand back a notice that
+# was neither emitted nor owed.)
 #
 # Then the places round 8's HTTP+SSE sweep did not reach. Round 8 marked the
 # Overview bullet, the Quick Connect line, the `/sse` detection row and
@@ -180,20 +183,21 @@ RSpec.describe 'MCP 2026-07-28 deprecations (round 9)' do
       expect(output.string).not_to match(/Roots is deprecated/)
     end
 
-    it 'never holds up the deprecated operation behind a reservation that hangs' do
+    # Round 9 bounded the contender's wait, on the strength of a promise this
+    # path cannot keep (the bound never constrained the blocked caller
+    # itself). Round 10 narrowed the promise instead: a notice costs its
+    # caller what a `logger.warn` costs it, no more. What a notice still may
+    # not do is reach past the feature it is logging, which is what this
+    # example — and the round 10 file — pin in its place.
+    it 'never holds up anything but the feature it is logging' do
       reserver = Thread.new { MCPClient::Deprecations.warn(:roots, gated_logger) }
       gated_logger.await_entry
 
-      started = Process.clock_gettime(Process::CLOCK_MONOTONIC)
-      # The reservation never resolves; the contender must give up on it.
-      expect(MCPClient::Deprecations.warn(:roots, working_logger)).to be(false)
-      waited = Process.clock_gettime(Process::CLOCK_MONOTONIC) - started
-
-      expect(waited).to be <= (MCPClient::Deprecations::PENDING_WAIT_SECONDS * 4)
+      expect(MCPClient::Deprecations.warn(:logging, working_logger)).to be(true)
       expect(MCPClient::Deprecations.emitted?(:roots)).to be(false)
 
       gated_logger.release(:succeed)
-      reserver.join
+      expect(reserver.value).to be(true)
     end
   end
 
