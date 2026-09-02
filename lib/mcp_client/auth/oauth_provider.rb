@@ -367,8 +367,13 @@ module MCPClient
 
         # Remember the advertised URL even if the fetch below fails, so a
         # later discovery retries it instead of probing well-known URIs the
-        # challenge already superseded.
+        # challenge already superseded. The current header is the one to
+        # honour: an earlier document, and an earlier refusal, are forgotten
+        # before the fetch so a failed fetch leaves the flow waiting on this
+        # URL rather than completing against stale state.
         @challenge_metadata_url = url
+        @challenge_resource_metadata = nil
+        @challenge_error = nil
 
         # This URL was explicitly advertised by the 401 challenge, so a 404 is a
         # misconfiguration to surface (strict), not a speculative miss to skip.
