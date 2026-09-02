@@ -7,6 +7,16 @@ metadata). Each feature lands in its own PR; this section accumulates them.
 
 ### Tasks extension (`io.modelcontextprotocol/tasks`)
 
+- **In-flight holds survive forgets (round 23).** The keys an abandoned
+  input handler is still presenting stay reserved apart from the task's
+  bookkeeping, so the TTL backstop, a gone task or a terminal lookup
+  cannot let a retry present them again while the host is answering; a
+  round whose delivery the deadline forbade (or whose handler failed) is
+  refunded; an explicit missing-task message (`unknown task`, `not
+  found`) makes `TaskNotFound` even when it mentions params; every task
+  payload needs a string `taskId`; `tasks/update` goes out without a
+  `timeout:` keyword when no bound applies, so transports implementing
+  only `rpc_request(method, params)` keep working.
 - **Abandoned handlers (round 22).** A handler round that outlived the
   wait spends no input round (retries of a timed-out wait cannot exhaust
   the per-task budget on one outstanding request), and the keys an

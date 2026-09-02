@@ -3,6 +3,7 @@
 require_relative '../task'
 require_relative '../errors'
 require_relative '../json_rpc_common'
+require_relative 'task_shape'
 
 module MCPClient
   class Client
@@ -11,6 +12,8 @@ module MCPClient
     # answer tools/call with a task that the client then polls (tasks/get),
     # feeds (tasks/update) and cancels (tasks/cancel).
     module TaskSupport
+      include TaskShape
+
       # Seconds to wait before the next tasks/get when the server gave no
       # pollIntervalMs ("Clients SHOULD respect the pollIntervalMs provided
       # in responses"), and the floor that keeps a pollIntervalMs of 0 from
@@ -266,6 +269,7 @@ module MCPClient
       def clear_task_states
         answered_keys_mutex.synchronize do
           @task_states = nil
+          @in_flight_keys = nil
           @task_session_epochs = nil
         end
       end
@@ -348,6 +352,13 @@ module MCPClient
         answered_keys_mutex.synchronize { @task_states&.delete(task_state_key(srv, task_id)) }
       end
 
+      # Keys an abandoned handler still presents, kept apart from the task's
+      # bookkeeping so no forget lets a retry present them again meanwhile.
+      # @return [Set<String>] (callers hold answered_keys_mutex)
+      def in_flight_task_keys(srv, task_id)
+        (@in_flight_keys ||= {})[task_state_key(srv, task_id)] ||= Set.new
+      end
+
       # Send the answers a handler produced. An ambiguous delivery (the
       # server may or may not have applied it) is not the end of the wait:
       # the payload stays pending and goes out again with the next poll,
@@ -392,7 +403,15 @@ module MCPClient
           keys = input_responses.keys.map(&:to_s)
           remember_answered_keys(srv, task_id, keys)
           begin
-            srv.rpc_request('tasks/update', { taskId: task_id, inputResponses: input_responses }, timeout: timeout)
+            # The timeout keyword goes out only when a bound applies: the
+            # documented transport interface is rpc_request(method, params).
+            params = { taskId: task_id, inputResponses: input_responses }
+            if timeout.nil?
+              srv.rpc_request('tasks/update',
+                              params)
+            else
+              srv.rpc_request('tasks/update', params, timeout: timeout)
+            end
             answered_keys_mutex.synchronize { state[:pending_update] = nil }
             true
           rescue MCPClient::Errors::ServerError => e
@@ -590,77 +609,6 @@ module MCPClient
         raise MCPClient::Errors::InvalidResultError, "Invalid task: status #{task.status} #{problem}"
       end
 
-      # A modern tasks/get result is a DetailedTask: every field the Task
-      # shape requires must be there (ttlMs may be null but must be
-      # present), since a defaulted status or a missing TTL would drive the
-      # wait on made-up state.
-      # @param result [Object] the raw tasks/get result
-      # @return [void]
-      # @raise [MCPClient::Errors::InvalidResultError]
-      def validate_detailed_task_shape!(result)
-        problem = detailed_task_shape_problem(result)
-        raise MCPClient::Errors::InvalidResultError, "Invalid tasks/get result: #{problem}" if problem
-      end
-
-      # @return [String, nil] what is wrong with a DetailedTask's shape
-      def detailed_task_shape_problem(result)
-        task_shape_problem(result) || task_status_payload_problem(result)
-      end
-
-      # The fields every Task carries (CreateTaskResult and DetailedTask
-      # alike): a status, parseable timestamps and a ttlMs key.
-      # @param result [Object]
-      # @return [String, nil]
-      def task_shape_problem(result)
-        return 'not an object' unless result.is_a?(Hash)
-        return 'status is not a task status' unless MCPClient::Task::VALID_STATUSES.include?(result['status'])
-
-        problem = task_timestamp_problem(result)
-        return problem if problem
-        return 'ttlMs is missing' unless result.key?('ttlMs')
-        return 'ttlMs is not an integer or null' unless result['ttlMs'].nil? || result['ttlMs'].is_a?(Integer)
-
-        nil
-      end
-
-      # The timestamps of a Task are ISO 8601; one that does not parse could
-      # never bound a wait, so it is not a task at all.
-      # @return [String, nil]
-      def task_timestamp_problem(result)
-        %w[createdAt lastUpdatedAt].each do |field|
-          return "#{field} is not a string" unless result[field].is_a?(String)
-          return "#{field} is not an ISO 8601 timestamp" unless iso8601?(result[field])
-        end
-        nil
-      end
-
-      # @return [Boolean]
-      def iso8601?(text)
-        Time.iso8601(text)
-        true
-      rescue ArgumentError
-        false
-      end
-
-      # The payload a DetailedTask's status implies ("If status is completed,
-      # result MUST be included; if failed, error; if input_required,
-      # inputRequests").
-      # @return [String, nil]
-      def task_status_payload_problem(result)
-        case result['status']
-        when 'completed'
-          unless MCPClient::Task.complete_result_object?(result['result'])
-            'a completed task needs an object result whose resultType, if any, is "complete"'
-          end
-        when 'failed'
-          unless MCPClient::Task.jsonrpc_error_object?(result['error'])
-            'a failed task needs a JSON-RPC error object (integer code, string message)'
-          end
-        when 'input_required'
-          'an input_required task needs an inputRequests object' unless result['inputRequests'].is_a?(Hash)
-        end
-      end
-
       # Enforce the MCP 2026-07-28 tasks extension gate: this client must have
       # declared it and the server must have negotiated it.
       # @param srv [MCPClient::ServerBase]
@@ -785,7 +733,7 @@ module MCPClient
         # #update_task in the meantime.
         state = task_state(srv, task.task_id)
         pending = answered_keys_mutex.synchronize do
-          keys = requests.except(*answered)
+          keys = requests.except(*answered, *in_flight_task_keys(srv, task.task_id).to_a)
           next keys if keys.empty?
           if state[:rounds] >= MAX_TASK_INPUT_ROUNDS
             raise MCPClient::Errors::InputRequiredError.new(
@@ -804,13 +752,20 @@ module MCPClient
         begin
           responses = bounded_by_wait(wait, on_abandon: lambda { |runner|
             abandoned = true
-            hold_in_flight_keys(runner, state, answered, pending.keys)
+            hold_in_flight_keys(runner, state, answered, pending.keys, srv, task.task_id)
           }) { srv.fulfil_input_requests(pending, task.to_h) }
           # The whole deadline (caller timeout and task TTL) is enforced
           # before anything is delivered.
           raise_if_past_deadline!(wait)
         rescue StandardError
-          answered_keys_mutex.synchronize { answered.subtract(pending.keys - state[:submitted].to_a) } unless abandoned
+          # Nothing was delivered: the keys go back (except those answered
+          # through #update_task meanwhile) and so does the round.
+          unless abandoned
+            answered_keys_mutex.synchronize do
+              answered.subtract(pending.keys - state[:submitted].to_a)
+              state[:rounds] -= 1 if state[:rounds].positive?
+            end
+          end
           raise
         end
         # A session that restarted while the host was answering may have
@@ -832,8 +787,9 @@ module MCPClient
       # it for other reasons too, so there only an explicit indication counts.
       # @return [Boolean]
       def task_not_found_error?(error, method, modern)
-        return false if method != 'tasks/get' && error.message.match?(/inputResponses|params/i)
+        return false if method != 'tasks/get' && error.message.match?(/inputResponses/i)
         return true if error.message.match?(/not found|unknown task|no such task|invalid taskId|expired/i)
+        return false if method != 'tasks/get' && error.message.match?(/params/i)
 
         modern && error.respond_to?(:code) && error.code == MCPClient::Errors::Codes::INVALID_PARAMS &&
           (method.nil? || method == 'tasks/get')
@@ -872,8 +828,11 @@ module MCPClient
       # completed is given back so retries of a timed-out wait cannot spend
       # the per-task budget on one outstanding request.
       # @return [void]
-      def hold_in_flight_keys(runner, state, answered, keys)
-        answered_keys_mutex.synchronize { state[:rounds] -= 1 if state[:rounds].positive? }
+      def hold_in_flight_keys(runner, state, answered, keys, srv, task_id)
+        answered_keys_mutex.synchronize do
+          state[:rounds] -= 1 if state[:rounds].positive?
+          in_flight_task_keys(srv, task_id).merge(keys)
+        end
         Thread.new do
           Thread.current.report_on_exception = false
           begin
@@ -881,7 +840,10 @@ module MCPClient
           rescue StandardError
             nil
           end
-          answered_keys_mutex.synchronize { answered.subtract(keys - state[:submitted].to_a) }
+          answered_keys_mutex.synchronize do
+            answered.subtract(keys - state[:submitted].to_a)
+            in_flight_task_keys(srv, task_id).subtract(keys)
+          end
         end
       end
 
