@@ -245,7 +245,9 @@ module MCPClient
 
       created = Time.iso8601(@created_at)
       now > created + (@ttl / 1000.0)
-    rescue ArgumentError
+    rescue ArgumentError, RangeError, TypeError # FloatDomainError is a RangeError
+      # Like #ttl_remaining: an unparseable timestamp or an overflowing
+      # ttlMs is no backstop, never a raw exception for a host that polls.
       false
     end
 
