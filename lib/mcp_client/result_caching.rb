@@ -45,6 +45,42 @@ module MCPClient
       Process.clock_gettime(Process::CLOCK_MONOTONIC)
     end
 
+    # Transports note the moment a response's bytes were in hand, before the
+    # notifications it carried are dispatched (a callback may run long, or
+    # send a nested request on this thread): the TTL runs from receipt (MCP
+    # 2026-07-28 caching, "Freshness Calculation"), not from the end of that
+    # processing. The value is per thread and per transport, consumed once.
+    # @param now [Float] the monotonic receipt time
+    # @return [void]
+    def note_response_received_at(now = monotonic_now)
+      Thread.current[response_received_key] = now
+    end
+
+    # Forget a receipt time a request path is about to replace.
+    # @return [void]
+    def clear_response_received_at
+      Thread.current[response_received_key] = nil
+    end
+
+    # The receipt time of the response this thread just got, or the current
+    # time when none was noted (a stubbed transport) or the noted one is older
+    # than the request that asks (a leftover from an earlier request).
+    # @param since [Float, nil] when the consuming request started
+    # @return [Float]
+    def response_received_at(since: nil)
+      noted = Thread.current[response_received_key]
+      Thread.current[response_received_key] = nil
+      return monotonic_now unless noted
+      return monotonic_now if since && noted < since
+
+      noted
+    end
+
+    # @return [Symbol] this transport's thread-local key for the receipt time
+    def response_received_key
+      :"mcp_response_received_at_#{object_id}"
+    end
+
     # @return [Hash{Object => MCPClient::CachedResult}]
     def cache_entries
       @cache_entries || CACHE_INIT_LOCK.synchronize { @cache_entries ||= {} }
@@ -74,8 +110,8 @@ module MCPClient
     # @return [MCPClient::CachedResult]
     # @param epoch [Integer, nil] the cache epoch captured before the request went out: a result
     #   whose entry was invalidated meanwhile is recorded as stale, not as fresh
-    def record_cache_hint(kind, result, value = nil, epoch: nil)
-      now = monotonic_now
+    def record_cache_hint(kind, result, value = nil, epoch: nil, received_at: nil)
+      now = received_at || response_received_at
       entry = cache_entry_for(result, value, now: now)
       cache_entries_mutex.synchronize do
         if epoch && epoch != (@cache_epoch || 0)
@@ -445,9 +481,11 @@ module MCPClient
       return cached.value.map(&:dup) if cached&.value && cached.fresh?(now: monotonic_now)
 
       epoch = cache_epoch
+      started = monotonic_now
       result = yield
-      # The TTL runs from receipt, not from the end of the conversion below.
-      received_at = monotonic_now
+      # The TTL runs from receipt — before the response's notifications were
+      # dispatched — not from the end of the conversion below.
+      received_at = response_received_at(since: started)
       unless result.is_a?(Hash)
         raise MCPClient::Errors::TransportError,
               "Invalid resources/read response: expected an object, got #{result.class}"

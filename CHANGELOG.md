@@ -7,6 +7,15 @@ metadata). Each feature lands in its own PR; this section accumulates them.
 
 ### Cacheable results (`ttlMs` / `cacheScope`)
 
+- **Client caches and receipt times (round 16).** `MCPClient::Client`'s
+  own tool, prompt and resource caches are bound to the effective
+  parameters each server's slice was filled under, so a later transport
+  fetch (or a callback) under other `request_meta` never makes them a
+  false hit, and they hand out copies. A result's TTL runs from the moment
+  its response was received — transports note that time before the
+  notifications the response carried are dispatched — not from the end of
+  those callbacks.
+
 - **Pages with differing parameters (round 15).** A paginated list whose
   pages went out under differing effective parameters (the host's
   `request_meta` changed between pages, e.g. from a notification callback)

@@ -227,6 +227,25 @@ module MCPClient
       # sent (middleware may have changed it after the request block).
       # @param response [Faraday::Response, nil]
       # @return [void]
+      # Send a JSON-RPC request and parse its response, keeping the result
+      # bound to its own request: parsing an SSE-framed response dispatches
+      # the notifications it carries, and a callback may send a nested
+      # request on this thread, so the credentials, effective parameters and
+      # receipt time (taken before parsing) of the outer request are re-noted
+      # afterwards (MCP 2026-07-28 caching).
+      # @param request [Hash] the JSON-RPC request
+      # @return [Object] the parsed result
+      def exchange_jsonrpc(request, timeout: nil, extra_headers: {})
+        clear_response_received_at if respond_to?(:clear_response_received_at, true)
+        response = send_http_request(request, timeout: timeout, extra_headers: extra_headers)
+        received_at = monotonic_now if respond_to?(:monotonic_now, true)
+        result = parse_response(response, request)
+        note_sent_authorization(response)
+        note_request_params(request['params'])
+        note_response_received_at(received_at) if respond_to?(:note_response_received_at, true)
+        result
+      end
+
       def note_sent_authorization(response)
         env = response.respond_to?(:env) ? response.env : nil
         return unless env.respond_to?(:request_headers) && env.request_headers

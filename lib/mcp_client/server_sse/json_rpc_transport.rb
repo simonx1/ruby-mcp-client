@@ -130,13 +130,16 @@ module MCPClient
         register_pending_request(request['id'])
 
         begin
+          clear_response_received_at if respond_to?(:clear_response_received_at, true)
           response = post_json_rpc_request(request)
 
-          if @use_sse
-            wait_for_sse_result(request, timeout: timeout)
-          else
-            parse_direct_response(response)
-          end
+          result = if @use_sse
+                     wait_for_sse_result(request, timeout: timeout)
+                   else
+                     parse_direct_response(response)
+                   end
+          note_response_received_at if respond_to?(:note_response_received_at, true)
+          result
         rescue MCPClient::Errors::ConnectionError, MCPClient::Errors::TransportError, MCPClient::Errors::ServerError
           raise
         rescue JSON::ParserError => e

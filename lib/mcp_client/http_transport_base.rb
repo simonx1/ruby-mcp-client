@@ -489,16 +489,7 @@ module MCPClient
       @logger.debug("Sending JSON-RPC request: #{describe_jsonrpc_message(request)}")
 
       begin
-        response = send_http_request(request, timeout: timeout, extra_headers: extra_headers)
-        result = parse_response(response, request)
-        # Parsing an SSE-framed response dispatches the notifications it
-        # carries; a callback may have sent a request of its own on this
-        # thread. The result stays bound to the credentials and effective
-        # parameters of its own request (MCP 2026-07-28 caching), not to
-        # that nested request's.
-        note_sent_authorization(response)
-        note_request_params(request['params'])
-        result
+        exchange_jsonrpc(request, timeout: timeout, extra_headers: extra_headers)
       rescue MCPClient::Errors::ConnectionError, MCPClient::Errors::TransportError, MCPClient::Errors::ServerError
         raise
       rescue JSON::ParserError => e
@@ -517,11 +508,8 @@ module MCPClient
     # @raise [MCPClient::Errors::ConnectionError] if connection fails
     def send_http_request(request, timeout: nil, extra_headers: {})
       conn = http_connection
-      # Capture the session id this request goes out with — the value
-      # apply_request_headers attaches — so a later 404 is attributed to the
-      # id that actually accompanied the request, not to whatever @session_id
-      # holds by 404-handling time (another caller may have completed a
-      # restart in between, and its fresh session must not be re-initialized).
+      # The session id this request goes out with: a later 404 is attributed
+      # to it, not to a fresh session another caller established meanwhile.
       sent_session_id = @mutex.synchronize { @session_id }
 
       begin

@@ -364,9 +364,10 @@ module MCPClient
       prompts = collect_paginated('prompts') do |cursor|
         params = {}
         params['cursor'] = cursor if cursor
+        started = monotonic_now
         result = rpc_request('prompts/list', params) || {}
         pages << result
-        received_ats << monotonic_now
+        received_ats << response_received_at(since: started)
         fingerprints << request_params_fingerprint
         prompts = (result['prompts'] || []).map { |td| MCPClient::Prompt.from_json(td, server: self) }
         [prompts, result['nextCursor']]
@@ -543,9 +544,10 @@ module MCPClient
       tools = collect_paginated('tools') do |cursor|
         params = {}
         params['cursor'] = cursor if cursor
+        started = monotonic_now
         result = rpc_request('tools/list', params) || {}
         pages << result
-        received_ats << monotonic_now
+        received_ats << response_received_at(since: started)
         fingerprints << request_params_fingerprint
         tools = (result['tools'] || []).map { |td| MCPClient::Tool.from_json(td, server: self) }
         [tools, result['nextCursor']]

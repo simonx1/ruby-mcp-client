@@ -326,9 +326,10 @@ module MCPClient
       epoch = cache_epoch if respond_to?(:cache_epoch, true)
       items = collect_paginated(key) do |cursor|
         params = cursor ? { cursor: cursor } : {}
+        started = respond_to?(:monotonic_now, true) ? monotonic_now : nil
         result = rpc_request(method, params)
         pages << result
-        received_ats << monotonic_now if respond_to?(:monotonic_now, true)
+        received_ats << response_received_at(since: started) if respond_to?(:response_received_at, true)
         contexts << (respond_to?(:request_authorization_context, true) ? request_authorization_context : nil)
         fingerprints << (respond_to?(:request_params_fingerprint, true) ? request_params_fingerprint : nil)
         case result

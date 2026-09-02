@@ -2,6 +2,7 @@
 
 require 'logger'
 require 'securerandom'
+require_relative 'deep_copy'
 
 module MCPClient
   # MCP Client for integrating with the Model Context Protocol
@@ -93,6 +94,10 @@ module MCPClient
         MCPClient::ServerFactory.create(config, logger: @logger)
       end
       @tool_cache = {}
+      # The effective-parameter fingerprint each server's slice of a list
+      # cache was filled under (MCP 2026-07-28 caching: a result is served
+      # only to a request that would carry the same parameters).
+      @cache_params = Hash.new { |h, k| h[k] = {}.compare_by_identity }
       # Active progressToken -> callback registrations (MCP progress utility)
       @progress_callbacks = {}
       @progress_mutex = Mutex.new
@@ -138,7 +143,7 @@ module MCPClient
     # @raise [MCPClient::Errors::ConnectionError] on authorization failures
     # @raise [MCPClient::Errors::PromptGetError] if no prompts could be retrieved from any server
     def list_prompts(cache: true)
-      return @prompt_cache.values if cache && !@prompt_cache.empty? && caches_fresh?(:prompts)
+      return cached_copies(@prompt_cache) if cache && !@prompt_cache.empty? && caches_fresh?(:prompts)
 
       prompts = []
       connection_errors = []
@@ -146,6 +151,7 @@ module MCPClient
       servers.each do |server|
         server_prompts = server.list_prompts
         drop_cached_entries(@prompt_cache, server)
+        note_cache_params(:prompts, server)
         server_prompts.each do |prompt|
           cache_key = cache_key_for(server, prompt.name)
           @prompt_cache[cache_key] = prompt
@@ -232,7 +238,7 @@ module MCPClient
 
       # Use cache if available and no cursor
       if cache && !@resource_cache.empty? && caches_fresh?(:resources)
-        return { 'resources' => @resource_cache.values, 'nextCursor' => nil }
+        return { 'resources' => cached_copies(@resource_cache), 'nextCursor' => nil }
       end
 
       resources = []
@@ -242,10 +248,11 @@ module MCPClient
         result = server.list_resources
         resource_list = result['resources'] || []
         drop_cached_entries(@resource_cache, server)
+        note_cache_params(:resources, server)
 
         resource_list.each do |resource|
           cache_key = cache_key_for(server, resource.uri)
-          @resource_cache[cache_key] = resource
+          @resource_cache[cache_key] = MCPClient::DeepCopy.copy(resource)
           resources << resource
         end
       rescue MCPClient::Errors::ConnectionError => e
@@ -286,7 +293,7 @@ module MCPClient
     # @raise [MCPClient::Errors::ConnectionError] on authorization failures
     # @raise [MCPClient::Errors::ToolCallError] if no tools could be retrieved from any server
     def list_tools(cache: true)
-      return @tool_cache.values if cache && !@tool_cache.empty? && caches_fresh?(:tools)
+      return cached_copies(@tool_cache) if cache && !@tool_cache.empty? && caches_fresh?(:tools)
 
       tools = []
       connection_errors = []
@@ -296,9 +303,10 @@ module MCPClient
         # Replace this server's slice: an item the refreshed list no longer
         # carries must not linger from the previous fetch.
         drop_cached_entries(@tool_cache, server)
+        note_cache_params(:tools, server)
         server_tools.each do |tool|
           cache_key = cache_key_for(server, tool.name)
-          @tool_cache[cache_key] = tool
+          @tool_cache[cache_key] = MCPClient::DeepCopy.copy(tool)
           tools << tool
         end
       rescue MCPClient::Errors::ConnectionError => e
@@ -764,7 +772,38 @@ module MCPClient
     # @param kind [Symbol] :tools, :prompts or :resources
     # @return [Boolean]
     def caches_fresh?(kind)
-      servers.all? { |server| !server.respond_to?(:cache_fresh?) || server.cache_fresh?(kind) }
+      servers.all? do |server|
+        (!server.respond_to?(:cache_fresh?) || server.cache_fresh?(kind)) && cache_params_current?(kind, server)
+      end
+    end
+
+    # Remember the effective parameters a server's slice of a list cache was
+    # fetched under, so a later fetch on the transport (or a callback) under
+    # other parameters cannot make the client cache a false hit.
+    # @param kind [Symbol]
+    # @param server [MCPClient::ServerBase]
+    # @return [void]
+    def note_cache_params(kind, server)
+      return unless server.respond_to?(:current_params_fingerprint, true)
+
+      fingerprint = server.respond_to?(:request_params_fingerprint, true) && server.send(:request_params_fingerprint)
+      @cache_params[kind][server] = fingerprint || server.send(:current_params_fingerprint)
+    end
+
+    # @return [Boolean] whether the server's next request would carry the
+    #   parameters its slice of the cache was filled under
+    def cache_params_current?(kind, server)
+      return true unless server.respond_to?(:current_params_fingerprint, true)
+
+      @cache_params[kind][server] == server.send(:current_params_fingerprint)
+    end
+
+    # The cache's items as copies: a caller can neither change the cache nor
+    # what later callers (and the x-mcp-header derivation) see.
+    # @param cache [Hash]
+    # @return [Array]
+    def cached_copies(cache)
+      cache.values.map { |item| MCPClient::DeepCopy.copy(item) }
     end
 
     # Whether the server's negotiated capability set is available yet.
