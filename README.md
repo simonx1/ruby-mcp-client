@@ -453,21 +453,23 @@ The 2026-07-28 [deprecated features registry](https://modelcontextprotocol.io/sp
 lists these as Deprecated under the feature lifecycle policy: they keep
 working during their deprecation window, but new integrations should not
 adopt them. Features 2026-07-28 itself deprecates stay for at least twelve
-months; the HTTP+SSE transport and the `includeContext` values were
-deprecated by earlier revisions and may be removed sooner (the registry
-gives the earliest removal of each). The client logs one notice per feature
-per process on first use, naming the suggested migration:
+months. Only the HTTP+SSE transport may go sooner: the `includeContext`
+values were deprecated by an earlier revision, but SEP-2596's transition
+provision ties them to Sampling, so they share the twelve-month window. The
+client logs one notice per feature per process on first use, naming the
+suggested migration:
 
-| Feature | Deprecated since | Migration |
-|---------|------------------|-----------|
-| Roots (`roots:`, `Client#roots=`) | 2026-07-28 (SEP-2577) | Pass directories or files through tool parameters, resource URIs or server configuration |
-| Sampling (`sampling_handler:`) | 2026-07-28 (SEP-2577) | Integrate directly with the LLM provider API |
-| Logging (`log_level=` on the client or a server, `notifications/message`) | 2026-07-28 (SEP-2577) | Log to stderr (stdio) or use OpenTelemetry |
-| HTTP+SSE transport (`MCPClient::ServerSSE`, warned once it is connected) | 2025-03-26 (reclassified by SEP-2596) | Migrate the server to Streamable HTTP |
-| `includeContext` `"thisServer"` / `"allServers"` in sampling requests | 2025-11-25 (reclassified by SEP-2596) | Servers omit the field or send `"none"` |
-| OAuth Dynamic Client Registration | 2026-07-28 (PR #2858) | Client ID Metadata Documents or pre-registered credentials |
+| Feature | Deprecated since | Earliest removal | Migration |
+|---------|------------------|------------------|-----------|
+| Roots (`roots:`, `Client#roots=`) | 2026-07-28 (SEP-2577) | no earlier than twelve months after 2026-07-28 | Pass directories or files through tool parameters, resource URIs or server configuration |
+| Sampling (`sampling_handler:`) | 2026-07-28 (SEP-2577) | no earlier than twelve months after 2026-07-28 | Integrate directly with the LLM provider API |
+| Logging (`log_level=` on the client or a server, `notifications/message`) | 2026-07-28 (SEP-2577) | no earlier than twelve months after 2026-07-28 | Log to stderr (stdio) or use OpenTelemetry |
+| HTTP+SSE transport (`MCPClient::ServerSSE`, warned once it is connected) | 2025-03-26 (reclassified by SEP-2596) | no earlier than three months after SEP-2596 is Final | Migrate the server to Streamable HTTP |
+| `includeContext` `"thisServer"` / `"allServers"` in sampling requests | 2025-11-25 (reclassified by SEP-2596) | no earlier than twelve months after 2026-07-28 (it follows Sampling) | Servers omit the field or send `"none"` |
+| OAuth Dynamic Client Registration | 2026-07-28 (PR #2858) | no earlier than twelve months after 2026-07-28 | Client ID Metadata Documents or pre-registered credentials |
 
-`MCPClient::Deprecations::REGISTRY` lists them; set
+`MCPClient::Deprecations::REGISTRY` lists them, each with its
+`earliest_removal`; set
 `MCPClient::Deprecations.enabled = false` (before constructing clients) to
 silence the notices. Notices go to the logger the client or server was
 given; without one they go to the default `$stdout` logger like every other
