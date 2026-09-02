@@ -110,7 +110,9 @@ module MCPClient
       @value = value
       @received_at = received_at
       @ttl_ms = ttl_ms
-      @cache_scope = cache_scope
+      # Kept frozen: the scope is compared against the exact sentinels and
+      # is handed out through #to_info.
+      @cache_scope = cache_scope.is_a?(String) ? -cache_scope : cache_scope
     end
 
     # @return [Boolean] whether the server gave a ttlMs at all
@@ -132,7 +134,8 @@ module MCPClient
     # @param now [Float] monotonic time
     # @return [Hash] ttl_ms, cache_scope, received_at, fresh
     def to_info(now:)
-      { ttl_ms: @ttl_ms, cache_scope: @cache_scope, received_at: @received_at, fresh: fresh?(now: now) }
+      # Detached values: nothing a caller does to them reaches the entry.
+      { ttl_ms: @ttl_ms, cache_scope: @cache_scope&.dup, received_at: @received_at, fresh: fresh?(now: now) }
     end
   end
 end

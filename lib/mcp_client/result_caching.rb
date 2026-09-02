@@ -41,6 +41,11 @@ module MCPClient
     # resources must not grow memory with every URI ever read.
     MAX_CACHED_READS = 64
 
+    # How many per-URI invalidation generations are kept: a server varying
+    # the URI of notifications/resources/updated cannot grow the map without
+    # bound — past this, every read counts as invalidated at once instead.
+    MAX_READ_GENERATIONS = 256
+
     # Paginated list methods and their cache kind.
     LIST_METHOD_KINDS = {
       'tools/list' => :tools,
@@ -132,6 +137,9 @@ module MCPClient
     # @return [void] (call while holding cache_entries_mutex)
     def bump_cache_epoch
       @cache_epoch = (@cache_epoch || 0) + 1
+      # Every key's generation moved with the base: the per-key counts have
+      # nothing left to add.
+      @cache_generations = nil
     end
 
     # @param key [Symbol, String] a cache key, or :'read:*' for every read
@@ -139,6 +147,12 @@ module MCPClient
     def bump_cache_generation(key)
       @cache_generations ||= {}
       @cache_generations[key] = (@cache_generations[key] || 0) + 1
+      return unless key.is_a?(String) && @cache_generations.count { |k, _| k.is_a?(String) } > MAX_READ_GENERATIONS
+
+      # Too many URIs to remember one by one: fold them into the count that
+      # invalidates every read.
+      @cache_generations.delete_if { |k, _| k.is_a?(String) }
+      @cache_generations[:'read:*'] = (@cache_generations[:'read:*'] || 0) + 1
     end
 
     # Record the freshness hint of one result.

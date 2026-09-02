@@ -14,7 +14,16 @@ metadata). Each feature lands in its own PR; this section accumulates them.
   never leaves a hintless copy to serve — `ttlMs` 0 re-fetches on every
   access; a client-level slice is identified by the very transport entry
   it came from, never by "no entry" (a legacy list stays a hit only while
-  the transport still holds no entry).
+  the transport still holds no entry). `cache_info` hands out detached
+  values (a caller mutating them cannot reach the entry's scope); the
+  per-URI invalidation generations are bounded (`MAX_READ_GENERATIONS`,
+  past which every read counts as invalidated, and the map is dropped
+  when the whole cache is cleared); the client identity a request
+  carries is part of the parameters a cached result is bound to, so
+  `client_info=` / `send_client_info=` re-fetch; the client-level
+  freshness check runs outside the cache lock and the copy is served only
+  when nothing changed meanwhile, so a freshness callback that clears the
+  client cache cannot deadlock.
 - **Client slices, per-key invalidation, capabilities (round 18).** A
   client-level cache slice is tied to the very transport entry its list
   came from (identity and the parameters that entry is bound to), so a

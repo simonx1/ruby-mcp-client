@@ -263,17 +263,17 @@ module MCPClient
     end
 
     # A stable fingerprint of the metadata that shapes a result: the
-    # effective `_meta` without the protocol version and client identity
-    # (the transport's own state), the log level and the per-request
-    # identifiers. The client capabilities stay in: a server may vary a
-    # result by the extensions and features a request advertises, and those
-    # change when the host declares an extension or registers a handler.
+    # effective `_meta` without the protocol version, the log level and the
+    # per-request identifiers. The client identity and capabilities stay
+    # in: a server may vary a result by who asks and by the extensions and
+    # features a request advertises, and those change when the host sets
+    # client_info, drops it, declares an extension or registers a handler.
     # @param params [Hash, nil] effective parameters
     # @return [String]
     def params_fingerprint_of(params)
       meta = params.is_a?(Hash) ? (params['_meta'] || params[:_meta]) : nil
       meta = meta.is_a?(Hash) ? meta.transform_keys(&:to_s) : {}
-      meta = meta.except(META_PROTOCOL_VERSION, META_CLIENT_INFO, META_LOG_LEVEL, *CACHE_NEUTRAL_META_KEYS)
+      meta = meta.except(META_PROTOCOL_VERSION, META_LOG_LEVEL, *CACHE_NEUTRAL_META_KEYS)
       Digest::SHA256.hexdigest(JSON.generate(deep_sort_keys(meta)))
     end
 
