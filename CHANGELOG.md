@@ -32,7 +32,9 @@ metadata). Each feature lands in its own PR; this section accumulates them.
 - **`subscribe_resource`/`unsubscribe_resource`** map onto one listen stream
   per URI (`resourceSubscriptions`) on modern servers, still gated on the
   `resources.subscribe` capability; legacy servers keep
-  `resources/subscribe`.
+  `resources/subscribe`. The mapping lives in shared code but each transport
+  decides its own era, so the gate is pinned per transport: on stdio, and on
+  both HTTP transports.
 
 ### Multi round-trip requests (InputRequiredResult)
 
