@@ -73,8 +73,12 @@ module MCPClient
         target = resolve_reference(root, ref, scan[:dialect], scan, from: schema)
         return if target.equal?(UNRESOLVED)
 
-        # What a reference reaches is scanned under its own resource's dialect.
-        collect_unsupported_keywords(target, root, found, depth + 1, scan,
+        # What a reference reaches is scanned under its own resource's dialect
+        # and at its own lexical depth, so member order and reference fan-out
+        # cannot hide its keywords.
+        scan[:depths] ||= lexical_depths(root, scan[:dialect])
+        target_depth = (target.is_a?(Hash) && scan[:depths][target]) || (depth + 1)
+        collect_unsupported_keywords(target, root, found, target_depth, scan,
                                      (target.is_a?(Hash) && indexed_dialect(target, scan)) || dialect)
       end
     end

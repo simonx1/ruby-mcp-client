@@ -324,27 +324,6 @@ module MCPClient
       schema.is_a?(Hash)
     end
 
-    # The lexical nesting depth of every schema object reachable from the
-    # root (subschema positions, definition bags of any dialect), so a
-    # referenced target is bounded by where it is written, not by where it
-    # is referenced from: neither member order nor reference fan-out can
-    # change the verdict.
-    # @return [Hash{Hash => Integer}] identity-keyed
-    def self.lexical_depths(root, dialect)
-      depths = {}.compare_by_identity
-      pending = [[root, 0]]
-      while (schema, depth = pending.shift)
-        next unless schema.is_a?(Hash) && !depths.key?(schema)
-
-        depths[schema] = depth
-        break if depths.size > MAX_SUBSCHEMAS * 2
-
-        each_subschema(schema, dialect) { |sub| pending << [sub, depth + 1] }
-        each_foreign_definition(schema, dialect) { |sub| pending << [sub, depth + 1] }
-      end
-      depths
-    end
-
     # Every applicator value must be a schema (object or boolean), an array
     # of schemas or a map of schemas; anything else is not silently read as
     # "true". Keywords the dialect does not define are ignored.
@@ -465,11 +444,16 @@ module MCPClient
         return
       end
 
-      problem = ref_chain_problem(ref, root, counter[:dialect], counter, from: schema) do |target|
+      problem = ref_chain_problem(ref, root, counter[:dialect], counter, from: schema) do |target, hop, from|
         # What a reference reaches is walked under its own resource's dialect
         # and at its own lexical depth; a boolean target needs no preflight
-        # and is not charged per reference.
-        next unless target.is_a?(Hash)
+        # and is not charged per reference, but its position still obeys the
+        # depth bound.
+        unless target.is_a?(Hash)
+          position = referenced_position_depth(hop, root, counter[:dialect], counter, from)
+          problems << "schema nesting depth exceeds #{MAX_SCHEMA_DEPTH}" if position && position > MAX_SCHEMA_DEPTH
+          next
+        end
 
         target_depth = (counter[:depths] || {})[target] || (depth + 1)
         walk_schema(target, root, target_depth, counter, problems, indexed_dialect(target, counter) || dialect)
@@ -497,8 +481,8 @@ module MCPClient
     # @return [String, nil] the problem, if any
     def self.ref_chain_problem(ref, root, dialect, resolver, from:, &block)
       targets = []
-      problem = follow_ref_chain(ref, root, dialect, resolver, from) { |target| targets << target }
-      targets.each(&block) if problem.nil? && block
+      problem = follow_ref_chain(ref, root, dialect, resolver, from) { |*hop| targets << hop }
+      targets.each { |target, used, origin| block.call(target, used, origin) } if problem.nil? && block
       problem
     end
 
@@ -518,7 +502,7 @@ module MCPClient
         return "$ref chain #{clip(ref.inspect)} cycles" if target.is_a?(Hash) && seen.key?(target)
 
         seen[target] = true if target.is_a?(Hash)
-        yield target
+        yield target, current, from
         return nil unless target.is_a?(Hash) && target.key?('$ref')
 
         from = target

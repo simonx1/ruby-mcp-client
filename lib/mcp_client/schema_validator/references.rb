@@ -181,6 +181,49 @@ module MCPClient
         names.select { |name| name.is_a?(String) && name.match?(ANCHOR_NAME) }
       end
 
+      # The lexical nesting depth of every schema object reachable from the
+      # root (subschema positions, definition bags of any dialect), so a
+      # referenced target is bounded by where it is written, not by where it
+      # is referenced from: neither member order nor reference fan-out can
+      # change the verdict.
+      # @return [Hash{Hash => Integer}] identity-keyed
+      def lexical_depths(root, dialect)
+        depths = {}.compare_by_identity
+        pending = [[root, 0, dialect]]
+        while (schema, depth, current = pending.shift)
+          next unless schema.is_a?(Hash) && !depths.key?(schema)
+
+          depths[schema] = depth
+          break if depths.size > MAX_SUBSCHEMAS * 2
+
+          # An embedded resource's positions follow its own dialect.
+          current = embedded_dialect(schema, current) || current
+          each_subschema(schema, current) { |sub| pending << [sub, depth + 1, current] }
+          each_foreign_definition(schema, current) { |sub| pending << [sub, depth + 1, current] }
+        end
+        depths
+      end
+
+      # The lexical depth of a value a pointer reference reaches that is not
+      # a schema object (a boolean): one below the nearest enclosing object
+      # whose depth is known, counting each array level in between.
+      # @return [Integer, nil] nil when the position cannot be placed
+      def referenced_position_depth(ref, root, dialect, counter, from)
+        return nil unless ref.start_with?('#/')
+
+        tokens = ref.delete_prefix('#').split('/', -1)[1..]
+        extra = 0
+        while tokens.length > 1
+          tokens = tokens[0...-1]
+          extra += 1
+          parent = resolve_reference(root, "##{tokens.map { |t| "/#{t}" }.join}", dialect, counter, from: from)
+          next unless parent.is_a?(Hash) && (depth = (counter[:depths] || {})[parent])
+
+          return depth + extra
+        end
+        nil
+      end
+
       # Yield the definitions held in the bag the dialect does not define
       # (`definitions` under 2019-09 / 2020-12, `$defs` under draft-07):
       # unknown to the dialect, but pointer-addressable all the same.

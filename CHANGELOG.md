@@ -138,6 +138,13 @@ metadata). Each feature lands in its own PR; this section accumulates them.
   bounded by its own lexical depth, not the referring location, a boolean
   target is not charged per reference, and boolean subschemas obey the
   depth bound.
+- **Positions and assertions (round 15).** Lexical depths follow each
+  resource's own dialect, so the bounds verdict cannot depend on key
+  order; the unsupported-keyword scan reads a referenced target at its
+  own lexical depth; a boolean a pointer reaches obeys the depth bound at
+  its own position; a tautological `additionalItems` beside a tuple
+  decides nothing; an input schema the validator cannot interpret asserts
+  nothing (the call goes out without the `required` check).
 
 ### Authorization (RFC 9207 issuer validation, client registration)
 
