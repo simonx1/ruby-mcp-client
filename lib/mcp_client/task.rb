@@ -197,8 +197,10 @@ module MCPClient
     def self.complete_result_object?(result)
       return false unless result.is_a?(Hash)
 
-      type = result['resultType'] || result[:resultType]
-      type.nil? || type == 'complete'
+      # Only an absent discriminator gets the compatibility default; a
+      # present null is an unrecognized result type.
+      key = ['resultType', :resultType].find { |k| result.key?(k) }
+      key.nil? || result[key] == 'complete'
     end
 
     # @param error [Object]
