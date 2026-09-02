@@ -7,6 +7,21 @@ metadata). Each feature lands in its own PR; this section accumulates them.
 
 ### Tasks extension (`io.modelcontextprotocol/tasks`)
 
+- **The epoch guard reaches the wire (round 29).** A `tasks/update`
+  establishes the transport's session *before* it compares the session
+  epoch, so a reconnect inside `rpc_request` (`ensure_initialized`) can no
+  longer slip an ended session's `inputResponses` into the next one; a
+  rejected update releases its keys — and forgets a task the server reports
+  gone — in the state it was built from rather than in whatever the current
+  epoch resolves to, so keys the new session already answered stay answered;
+  a wait refreshes its session before enforcing a TTL deadline, dropping the
+  previous session's backstop (and its last observation) instead of ending
+  the wait on a task that no longer exists; and a `tasks/get` or
+  `tasks/update` abandoned on the caller's wall clock keeps the bookkeeping
+  consistent — the answers stay pending and the task's update lock is
+  replaced, so a retry of `wait_for_task(timeout:)` retransmits them without
+  asking the host again, while the abandoned call's late completion touches
+  only the state it captured and never a reused task id's.
 - **Answers stay in their session, waits stay bounded (round 28).** The
   session epoch an input handler answered in is carried through the whole
   update path and compared again under the per-task update lock, so a
