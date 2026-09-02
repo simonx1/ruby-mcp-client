@@ -156,6 +156,7 @@ module MCPClient
     # @raise [MCPClient::Errors::PromptGetError] if no prompts could be retrieved from any server
     def list_prompts(cache: true)
       if cache && (snapshot = cached_snapshot(:prompts, @prompt_cache))
+        release_held_request_meta
         return snapshot
       end
 
@@ -252,6 +253,7 @@ module MCPClient
 
       # Use cache if available and no cursor
       if cache && (snapshot = cached_snapshot(:resources, @resource_cache))
+        release_held_request_meta
         return { 'resources' => snapshot, 'nextCursor' => nil }
       end
 
@@ -307,6 +309,7 @@ module MCPClient
     # @raise [MCPClient::Errors::ToolCallError] if no tools could be retrieved from any server
     def list_tools(cache: true)
       if cache && (snapshot = cached_snapshot(:tools, @tool_cache))
+        release_held_request_meta
         return snapshot
       end
 
@@ -803,6 +806,18 @@ module MCPClient
       end
     end
 
+    # A freshness check reads the parameters each server's next request
+    # would carry, which evaluates a host `request_meta` callable; the
+    # transports hold that evaluation for the fetch the check decides on.
+    # Nothing is fetched after a snapshot is served, so the held metadata is
+    # dropped instead of being sent by some later request.
+    # @return [void]
+    def release_held_request_meta
+      servers.each do |server|
+        server.send(:release_held_request_meta) if server.respond_to?(:release_held_request_meta, true)
+      end
+    end
+
     # The effective-parameter fingerprint a server's next request would
     # carry, read before a fetch so its slice of the cache is tagged with
     # the parameters of the list it holds (never with a leftover of whatever
@@ -829,14 +844,14 @@ module MCPClient
       # An empty snapshot is a hit too: a server may list nothing, and its
       # entry says so for as long as it is fresh. What makes a hit is that
       # every server has filled its slice, not that the hash holds items.
-      return nil unless @cache_mutex.synchronize { snapshot_complete?(kind) }
+      return nil unless @cache_mutex.synchronize { snapshot_complete?(kind, cache) }
       return nil unless caches_fresh?(kind)
 
       @cache_mutex.synchronize do
         # A cleanup that landed after the verdict replaced the transport
         # entries the slices came from; that check touches only the
         # transport's cache lock, so it can run under this one.
-        next unless version == @cache_version && snapshot_complete?(kind) && slices_still_current?(kind)
+        next unless version == @cache_version && snapshot_complete?(kind, cache) && slices_still_current?(kind)
 
         cached_copies(cache)
       end
@@ -846,13 +861,29 @@ module MCPClient
     # list cache (an empty list fills a slice as much as a long one does).
     # Called under {@cache_mutex}.
     # @param kind [Symbol]
+    # @param cache [Hash] the kind's cache, to tell an empty snapshot apart
     # @return [Boolean]
-    def snapshot_complete?(kind)
+    def snapshot_complete?(kind, cache)
       filled = @cache_filled[kind]
       return false if filled.nil?
 
       list = servers
-      !list.empty? && list.all? { |server| filled.key?(server) }
+      return false if list.empty? || !list.all? { |server| filled.key?(server) }
+      # A snapshot with nothing in it is only a hit while a server says so
+      # itself: a 2026-07-28 server bounds its empty list with a ttlMs, an
+      # older one records no hint at all and keeps the client's previous
+      # heuristic — ask again until something is listed.
+      return true unless cache.empty?
+
+      list.all? { |server| hinted_slice?(kind, server) }
+    end
+
+    # @param kind [Symbol]
+    # @param server [MCPClient::ServerBase]
+    # @return [Boolean] whether the entry behind this server's slice bounds
+    #   its own freshness (the server sent a hint)
+    def hinted_slice?(kind, server)
+      server.respond_to?(:cache_entry_hinted?, true) && server.send(:cache_entry_hinted?, kind)
     end
 
     # Whether every server's slice of a kind still comes from the transport

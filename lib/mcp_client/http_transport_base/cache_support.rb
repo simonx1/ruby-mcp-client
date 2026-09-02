@@ -27,7 +27,16 @@ module MCPClient
       # Collaborators a middleware may share with the live stack without the
       # probe changing what a later request sends: they carry no request
       # state of their own (a logger writes, a lock guards).
-      PROBE_SAFE_SHARED_STATE = [Logger, Mutex, Module].freeze
+      PROBE_SAFE_SHARED_STATE = [Logger, Mutex].freeze
+
+      # The only shared state the probe treats as unchangeable: values that
+      # hold nothing beyond what {#probe_state_members} enumerates, so
+      # freezing them really does close off every value they can hand out.
+      # Anything else — a module or class (shared, never copied, and keeping
+      # state freezing does not reach), a frozen wrapper such as a Data or a
+      # custom object — may vend a different value on a later call.
+      PROBE_IMMUTABLE_CLASSES = [NilClass, TrueClass, FalseClass, Numeric, Symbol, String, Regexp, Time,
+                                 Hash, Array, Struct, Range].freeze
 
       # How far into shared state its immutability is checked: a frozen
       # container may still hold mutable members, and beyond this depth the
@@ -300,23 +309,38 @@ module MCPClient
         probe_immutable_state?(value) || PROBE_SAFE_SHARED_STATE.any? { |klass| value.is_a?(klass) }
       end
 
-      # Whether a value cannot be changed at all: a frozen container still
-      # yields mutable members, so they are checked too (to a bounded depth —
-      # deeper than that the state counts as mutable).
+      # Whether a value can vend nothing but itself: it must be frozen, of a
+      # kind whose whole state is enumerable here, and hold only such values
+      # in turn (to a bounded depth — deeper than that it counts as mutable).
+      # Being frozen is not enough on its own: a frozen wrapper still hands
+      # out the mutable members it was built around, and a module or class
+      # is shared rather than copied and keeps state of its own that no
+      # freeze reaches.
       # @param value [Object]
       # @param depth [Integer]
       # @return [Boolean]
       def probe_immutable_state?(value, depth = 0)
         return false unless value.frozen?
+        return false unless PROBE_IMMUTABLE_CLASSES.any? { |klass| value.is_a?(klass) }
 
+        members = probe_state_members(value)
+        return true if members.empty?
+        return false unless depth < PROBE_IMMUTABLE_DEPTH
+
+        members.all? { |member| probe_immutable_state?(member, depth + 1) }
+      end
+
+      # Everything a value holds: what it was built around as well as
+      # whatever was set on it, since either can be handed out later.
+      # @param value [Object]
+      # @return [Array<Object>]
+      def probe_state_members(value)
+        held = value.instance_variables.map { |name| value.instance_variable_get(name) }
         case value
-        when Hash
-          depth < PROBE_IMMUTABLE_DEPTH &&
-            value.all? { |k, v| probe_immutable_state?(k, depth + 1) && probe_immutable_state?(v, depth + 1) }
-        when Array, Struct
-          depth < PROBE_IMMUTABLE_DEPTH && value.to_a.all? { |item| probe_immutable_state?(item, depth + 1) }
-        else
-          true
+        when Hash then held + value.flat_map { |k, v| [k, v] }
+        when Array, Struct then held + value.to_a
+        when Range then held + [value.begin, value.end]
+        else held
         end
       end
 

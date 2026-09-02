@@ -218,6 +218,9 @@ module MCPClient
     # @return [Hash] the JSON-RPC request object
     def build_jsonrpc_request(method, params, id, note: true)
       effective = with_request_meta(params)
+      # This request carries whatever evaluation of the host's request_meta
+      # was held for it; the next one reads the host's callable afresh.
+      release_held_request_meta if note
       note_request_params(effective) if note
       {
         'jsonrpc' => '2.0',
@@ -256,10 +259,32 @@ module MCPClient
       Thread.current[request_params_key] = UNRECORDED_PARAMS
     end
 
+    # Marks metadata that is to be held once it is evaluated: the request a
+    # cache decision leads to carries the very parameters the decision was
+    # made on, and a host callable that vends a one-time value (a nonce) or
+    # rotates is read once for the two of them.
+    HELD_REQUEST_META_PENDING = :pending
+
     # @return [String] the fingerprint of the effective parameters the next
-    #   request on this transport would carry
+    #   request on this transport would carry. Reading it evaluates the
+    #   host's request_meta, so the evaluation is held for the request this
+    #   decision leads to instead of being spent on the decision alone.
     def current_params_fingerprint
+      Thread.current[held_request_meta_key] ||= HELD_REQUEST_META_PENDING
       params_fingerprint_of(with_request_meta({}))
+    end
+
+    # Drop a held evaluation of the host's request_meta: the decision that
+    # took it leads to no request of its own, so the next one evaluates
+    # afresh rather than sending metadata read some time ago.
+    # @return [void]
+    def release_held_request_meta
+      Thread.current[held_request_meta_key] = nil
+    end
+
+    # @return [Symbol] this transport's thread-local key for held metadata
+    def held_request_meta_key
+      :"mcp_client_held_request_meta_#{object_id}"
     end
 
     # A stable fingerprint of the metadata that shapes a result: the
@@ -458,11 +483,14 @@ module MCPClient
     # reserved protocol keys it tries to set.
     # @return [Hash] String-keyed metadata (possibly empty)
     def host_request_meta
+      held = Thread.current[held_request_meta_key]
+      return held if held.is_a?(Hash)
+
       source = request_meta
       source = source.call if source.respond_to?(:call)
-      return {} unless source.is_a?(Hash)
-
-      source.transform_keys(&:to_s).except(*PROTECTED_META_KEYS)
+      meta = source.is_a?(Hash) ? source.transform_keys(&:to_s).except(*PROTECTED_META_KEYS) : {}
+      Thread.current[held_request_meta_key] = meta if held == HELD_REQUEST_META_PENDING
+      meta
     end
 
     # Apply a DiscoverResult (server/discover): choose the protocol version
