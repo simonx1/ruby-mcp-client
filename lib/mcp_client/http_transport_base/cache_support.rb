@@ -129,9 +129,12 @@ module MCPClient
         :"mcp_client_request_authorization_#{object_id}"
       end
 
-      # @return [String, nil, Symbol] the Authorization header the next request would carry,
-      #   or {UNKNOWN_CONTEXT} when host middleware makes that impossible to tell
-      def current_authorization_context
+      # @param kind [Symbol, String, nil] the cache kind whose next request is modelled
+      #   (:tools, :prompts, :resources, :templates, :discover or "read:<uri>")
+      # @return [String, nil, Symbol] the Authorization header the next request of that
+      #   operation would carry, or {UNKNOWN_CONTEXT} when host middleware makes that
+      #   impossible to tell
+      def current_authorization_context(kind = nil)
         # The probe starts from the configured headers, as a real request
         # does: a provider without a token leaves a static header in place.
         probe = HeaderProbe.new(@headers.to_h.dup)
@@ -142,10 +145,27 @@ module MCPClient
           # add or replace the header after the request block ran: the probe
           # runs that stack too, without sending anything — and gives up
           # rather than guess when it cannot run it faithfully.
-          headers = middleware_request_headers(headers)
+          headers = middleware_request_headers(headers, *probe_request_for(kind))
           return UNKNOWN_CONTEXT if headers.nil?
         end
         authorization_fingerprint(headers['Authorization'] || headers['authorization'])
+      end
+
+      # The JSON-RPC request the probe models for a cache kind: the very
+      # operation whose cache is being checked, so middleware that chooses
+      # credentials by method or body answers as it would for that request.
+      # @param kind [Symbol, String, nil]
+      # @return [Array(String, Hash)] method and params
+      def probe_request_for(kind)
+        case kind
+        when :tools then ['tools/list', {}]
+        when :prompts then ['prompts/list', {}]
+        when :resources then ['resources/list', {}]
+        when :templates then ['resources/templates/list', {}]
+        when :discover then ['server/discover', {}]
+        when /\Aread:(.+)\z/m then ['resources/read', { 'uri' => Regexp.last_match(1) }]
+        else [@probe_method || 'ping', {}]
+        end
       end
 
       # Minimal request stand-in for asking the OAuth provider which
@@ -153,22 +173,24 @@ module MCPClient
       HeaderProbe = Struct.new(:headers)
 
       # Run the request phase of the connection's middleware over a request
-      # shaped like a real JSON-RPC POST (endpoint, JSON body of the last
-      # method sent) that is never sent, and return the headers it would go
-      # out with. Only `on_request` hooks run: response middleware
-      # (raise_error, a parser) never sees a response here, and the recorder
-      # must not note the probe as a sent request. Middleware that overrides
-      # `call` cannot be run without sending, so the answer is then unknown.
+      # shaped like the real JSON-RPC POST of the operation (endpoint, JSON
+      # body with its method and params) that is never sent, and return the
+      # headers it would go out with. Only `on_request` hooks run: response
+      # middleware (raise_error, a parser) never sees a response here, and
+      # the recorder must not note the probe as a sent request. Middleware
+      # that overrides `call` cannot be run without sending, so the answer
+      # is then unknown.
       # @param headers [Hash] the headers before middleware
+      # @param method [String] the JSON-RPC method the probe models
+      # @param params [Hash] its params
       # @return [Hash, nil] the headers after middleware, or nil when they cannot be determined
-      def middleware_request_headers(headers)
+      def middleware_request_headers(headers, method = @probe_method || 'ping', params = {})
         conn = http_connection
         request = conn.build_request(:post) do |req|
           req.url(@endpoint)
           headers.each { |k, v| req.headers[k] = v }
           req.headers['Content-Type'] = 'application/json'
-          req.body = JSON.generate('jsonrpc' => '2.0', 'id' => 0, 'method' => @probe_method || 'ping',
-                                   'params' => {})
+          req.body = JSON.generate('jsonrpc' => '2.0', 'id' => 0, 'method' => method, 'params' => params)
         end
         env = request.to_env(conn)
         conn.builder.handlers.each do |handler|

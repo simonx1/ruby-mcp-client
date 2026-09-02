@@ -64,7 +64,14 @@ metadata). Each feature lands in its own PR; this section accumulates them.
   invalidated never overwrites the newer entry installed meanwhile; the
   per-URI read cache keeps only results that are fresh on arrival, drops
   expired ones as new ones are stored and holds at most `MAX_CACHED_READS`
-  (oldest evicted first).
+  (oldest evicted first). The freshness probe models the request of the
+  operation whose cache is checked (`tools/list`, `resources/read` with its
+  URI, ...) rather than the last request sent, so middleware that picks
+  credentials by method or body answers for that request; a result stays
+  bound to the credentials of its own request even when its SSE-framed
+  response dispatched a notification whose callback sent another request
+  on the same thread; an old fetch spanning two contexts never replaces
+  the entry a newer fetch installed after an invalidation.
 
 ### Subscriptions (`subscriptions/listen`)
 
