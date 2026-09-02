@@ -103,6 +103,7 @@ module MCPClient
     # @return [MCPClient::CachedResult] the same entry, bound to the current request's context
     def bind_authorization_context(entry)
       entry.authorization_context = request_authorization_context if respond_to?(:request_authorization_context, true)
+      entry.params_fingerprint = request_params_fingerprint if respond_to?(:request_params_fingerprint, true)
       entry
     end
 
@@ -249,11 +250,27 @@ module MCPClient
     # @param kind [Symbol, String, nil] the cache kind, so the transport models the request of
     #   that very operation (middleware may pick credentials by method or body)
     def entry_in_current_context?(entry, context: :current, kind: nil)
+      return false if entry && !entry_for_current_params?(entry, context)
       return true unless entry&.cache_scope == 'private' && respond_to?(:current_authorization_context, true)
       return false if entry.authorization_context.equal?(MCPClient::CachedResult::MIXED_CONTEXT)
 
       context = current_authorization_context(kind) if context == :current
       entry.authorization_context == context
+    end
+
+    # Whether an entry was produced by a request carrying the effective
+    # parameters (host `_meta`) the request being served would carry: the
+    # next request's for a :current lookup, the failed attempt's own when a
+    # stale fallback is judged. A result is never served across them,
+    # whatever its scope.
+    # @param entry [MCPClient::CachedResult]
+    # @param context [String, nil, :current, :unknown]
+    # @return [Boolean]
+    def entry_for_current_params?(entry, context)
+      return true unless entry.params_fingerprint && respond_to?(:current_params_fingerprint, true)
+
+      expected = context == :current ? current_params_fingerprint : request_params_fingerprint
+      entry.params_fingerprint == expected
     end
 
     # Attach the list a request produced to the very entry that request

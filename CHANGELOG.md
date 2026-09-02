@@ -84,6 +84,17 @@ metadata). Each feature lands in its own PR; this section accumulates them.
   response dispatched a notification whose callback sent another request
   on the same thread; an old fetch spanning two contexts never replaces
   the entry a newer fetch installed after an invalidation.
+- **Effective parameters (round 14).** A cached list or read is bound to
+  the effective request parameters its request went out with — the host's
+  `request_meta` (vendor keys such as a tenant) without the reserved
+  protocol fields and the per-request identifiers (`progressToken`,
+  `traceparent`, `tracestate`, `baggage`) — and is served, fresh or as a
+  stale fallback, only to a request that would carry the same
+  (`CachedResult#params_fingerprint`); a result's binding survives a
+  nested request made by a notification callback. The freshness probe is
+  built like a real request (`build_jsonrpc_request`, its effective `_meta`
+  included), so host middleware that picks credentials by the body's
+  metadata answers as it would for the next request.
 
 ### Subscriptions (`subscriptions/listen`)
 

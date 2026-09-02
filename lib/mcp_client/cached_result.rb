@@ -33,6 +33,12 @@ module MCPClient
     # @return [Object, nil]
     attr_accessor :fetch_token
 
+    # Fingerprint of the effective request parameters (host `_meta`) the
+    # request that produced this entry went out with; the entry is served
+    # only to requests that would carry the same.
+    # @return [String, nil]
+    attr_accessor :params_fingerprint
+
     # Build an entry from a CacheableResult.
     # @param result [Hash, nil] the JSON-RPC result carrying ttlMs/cacheScope
     # @param value [Object] what to cache
@@ -69,7 +75,9 @@ module MCPClient
               else
                 entries.map(&:cache_scope).compact.first
               end
-      new(value: value, received_at: now, ttl_ms: ttl, cache_scope: scope)
+      combined = new(value: value, received_at: now, ttl_ms: ttl, cache_scope: scope)
+      combined.params_fingerprint = entries.first&.params_fingerprint
+      combined
     end
 
     # An entry that is stale from the start: what a change notification
@@ -81,6 +89,7 @@ module MCPClient
     def self.stale(now:, like: nil)
       entry = new(value: nil, received_at: now, ttl_ms: 0, cache_scope: like&.cache_scope)
       entry.authorization_context = like&.authorization_context
+      entry.params_fingerprint = like&.params_fingerprint
       entry
     end
 
