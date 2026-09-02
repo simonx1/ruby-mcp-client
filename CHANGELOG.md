@@ -7,6 +7,18 @@ metadata). Each feature lands in its own PR; this section accumulates them.
 
 ### Tasks extension (`io.modelcontextprotocol/tasks`)
 
+- **Answers stay in their session, waits stay bounded (round 28).** The
+  session epoch an input handler answered in is carried through the whole
+  update path and compared again under the per-task update lock, so a
+  restart between the check and the send drops the payload instead of
+  answering an unrelated task in the new session; `wait_for_task(timeout:)`
+  now bounds the complete poll/update RPC by wall clock (the call runs on
+  its own thread joined with the remaining budget), so a transport that
+  implements only `rpc_request(method, params)` — or one whose retry
+  backoff outruns its per-attempt timeout — can no longer block a wait past
+  its deadline; a TTL extension whose `ttlMs` is valid but too large for the
+  clock lifts the previous backstop like an explicit `ttlMs: null`, while an
+  observation that carries no `ttlMs` at all keeps the last one.
 - **In-flight holds per task (round 26).** The keys a running input handler
   presents are in flight from the moment it starts (not only once it is
   abandoned) and each watcher touches only the registry entry it owns, so

@@ -181,22 +181,13 @@ module MCPClient
       end
 
       # Deliver again an update whose acknowledgement was lost, before any
-      # new input is answered (the server ignores keys it already has). An
-      # outcome that is ambiguous again keeps the payload pending and the
-      # wait polling; a definite rejection surfaces (its keys were given
-      # back, so the next wait presents the requests again).
+      # new input is answered (the server ignores keys it already has). Only
+      # what is still pending once the task's update lock is held is sent: a
+      # snapshot taken before the lock could resend an answer a concurrent,
+      # confirmed update has just superseded.
       # @return [void]
       def retransmit_pending_update(wait)
-        # Only what is still pending once the task's update lock is held is
-        # sent: a snapshot taken before the lock could resend an answer a
-        # concurrent, confirmed update has just superseded.
-        send_task_update(wait[:srv], wait[:task_id], nil, timeout: request_timeout(wait_deadline(wait), wait[:srv]),
-                                                          pending_only: true)
-      rescue MCPClient::Errors::TaskError => e
-        raise unless ambiguous_update_failure?(e)
-
-        logger.debug("tasks/update for task #{shown_task_id(wait[:task_id])} could not be confirmed; " \
-                     'it is sent again on the next poll')
+        deliver_task_update(wait[:srv], wait[:task_id], nil, wait, pending_only: true)
       end
 
       # Whether the task lists an input request that has not been answered.
@@ -387,7 +378,9 @@ module MCPClient
 
       # Send a task request through a transport that may implement only the
       # documented rpc_request(method, params) interface: the timeout keyword
-      # goes out only when a bound applies and the transport accepts it.
+      # goes out only when a bound applies and the transport accepts it. It
+      # is a per-attempt transport timeout only; the wall-clock bound of a
+      # wait comes from {#bounded_by_wait} around the whole call.
       # @return [Object] the JSON-RPC result
       def task_rpc(srv, method, params, timeout: nil)
         return srv.rpc_request(method, params) if timeout.nil? || !accepts_timeout?(srv)
@@ -402,13 +395,18 @@ module MCPClient
         true
       end
 
-      # Send the answers a handler produced. An ambiguous delivery (the
-      # server may or may not have applied it) is not the end of the wait:
-      # the payload stays pending and goes out again with the next poll,
-      # like a lost tasks/get. A definite rejection surfaces.
+      # Send the answers a handler produced (or, with pending_only, only what
+      # an earlier ambiguous delivery left pending), bounded by the caller's
+      # timeout and carrying the session the answers belong to. An ambiguous
+      # delivery (the server may or may not have applied it) is not the end
+      # of the wait: the payload stays pending and goes out again with the
+      # next poll, like a lost tasks/get. A definite rejection surfaces.
       # @return [void]
-      def deliver_task_update(task_id, responses, srv, wait)
-        send_task_update(srv, task_id, responses, timeout: request_timeout(wait_deadline(wait), srv))
+      def deliver_task_update(srv, task_id, responses, wait, pending_only: false)
+        bounded_by_wait(wait, deadline: wait[:deadline]) do
+          send_task_update(srv, task_id, responses, epoch: wait[:epoch], pending_only: pending_only,
+                                                    timeout: request_timeout(wait_deadline(wait), srv))
+        end
       rescue MCPClient::Errors::TaskError => e
         raise unless ambiguous_update_failure?(e)
 
@@ -429,9 +427,11 @@ module MCPClient
       # @param timeout [Numeric, nil] request timeout, bounded by the wait when there is one
       # @param pending_only [Boolean] send whatever is pending under the lock and nothing else
       #   (a retransmission; nothing pending sends nothing)
+      # @param epoch [Integer, nil] the session epoch the answers were produced in; the update is
+      #   dropped when the server's session moved on since (nil: no expectation, e.g. #update_task)
       # @return [true]
       # @raise [MCPClient::Errors::TaskError, MCPClient::Errors::ServerError]
-      def send_task_update(srv, task_id, input_responses, timeout: nil, pending_only: false)
+      def send_task_update(srv, task_id, input_responses, timeout: nil, pending_only: false, epoch: nil)
         shown = shown_task_id(task_id)
         state = task_state(srv, task_id)
         # One update at a time per task: a concurrent update that read an
@@ -439,6 +439,16 @@ module MCPClient
         # another delivery had just left pending. An explicit answer is
         # newer than a pending one for the same key and wins the merge.
         state[:update_mutex].synchronize do
+          # The session is compared once more here, as late as the payload
+          # can still be held back: a restart between the caller's check and
+          # this send (or while the transport reconnected on the way in)
+          # would otherwise answer whatever the new session calls this task,
+          # since task ids and input keys are session-scoped and reusable.
+          if epoch && answered_keys_mutex.synchronize { current_session_epoch(srv) } != epoch
+            logger.warn("Task #{shown}: the session restarted before the answers were sent; they are discarded")
+            return true
+          end
+
           pending = answered_keys_mutex.synchronize { state[:pending_update] }
           input_responses = pending_only ? pending : pending&.merge(input_responses) || input_responses
           return true if input_responses.nil?
@@ -602,9 +612,13 @@ module MCPClient
         raise_ttl_elapsed!(wait) if remaining && remaining <= 0
         if remaining
           wait[:ttl_deadline] = monotonic_time + remaining
-        elsif current.ttl.nil?
-          # Only an explicit ttlMs null lifts the backstop; anything else
-          # that yields no remaining time keeps the last one.
+        elsif current.ttl_reported?
+          # The observation reported a ttlMs the wait cannot turn into a
+          # deadline: an explicit null, or a value the clock cannot
+          # represent (Task#ttl_remaining answers nil for both). Either way
+          # the task has no backstop any more, and keeping the previous one
+          # would end the wait before the TTL the server just extended.
+          # Only an observation carrying no ttlMs at all keeps the last one.
           wait[:ttl_deadline] = nil
         end
       end
@@ -616,7 +630,9 @@ module MCPClient
       # @return [MCPClient::Task, nil]
       def poll_task(wait)
         wait[:polled] = true
-        get_task(wait[:task_id], server: wait[:srv], timeout: request_timeout(wait_deadline(wait), wait[:srv]))
+        bounded_by_wait(wait, deadline: wait[:deadline]) do
+          get_task(wait[:task_id], server: wait[:srv], timeout: request_timeout(wait_deadline(wait), wait[:srv]))
+        end
       rescue MCPClient::Errors::TaskNotFound
         # Gone for good: nothing of it may colour a later task with this id.
         forget_task_keys(wait[:srv], wait[:task_id])
@@ -820,7 +836,7 @@ module MCPClient
                       'being answered; the answers are discarded')
           return []
         end
-        deliver_task_update(task.task_id, responses, srv, wait)
+        deliver_task_update(srv, task.task_id, responses, wait)
         pending.keys
       end
 
@@ -839,15 +855,28 @@ module MCPClient
           (method.nil? || method == 'tasks/get')
       end
 
-      # Run a host handler within what is left of the wait: with a deadline
-      # the handler runs on its own thread and the wait ends with the
-      # timed-out TaskError when it outlives the budget (the handler thread
-      # is abandoned — a blocked elicitation cannot be interrupted — and its
-      # eventual answer is dropped); without a deadline it runs inline.
+      # Run a host handler or a task RPC within what is left of the wait:
+      # with a deadline the work runs on its own thread and the wait ends
+      # with the timed-out TaskError when it outlives the budget (the thread
+      # is abandoned — a blocked elicitation cannot be interrupted, and a
+      # transport implementing only the documented two-argument
+      # rpc_request(method, params) takes no timeout at all, while the
+      # built-in ones enforce theirs per attempt and may exceed it through
+      # retry backoff — and its eventual answer is dropped); without a
+      # deadline it runs inline.
+      #
+      # A handler is bounded by the whole wait (the caller's timeout and the
+      # task's TTL); a task RPC only by the caller's timeout, which is what
+      # makes wait_for_task(timeout:) a wall-clock bound on the complete
+      # poll/update operation. The TTL is not applied to a request in
+      # flight: an observation that comes back late MAY carry the extended
+      # ttlMs that lifts the very backstop it outlived, so the TTL is
+      # weighed against each observation (see #bound_wait_by_ttl) rather
+      # than against the request fetching it.
       # @param on_abandon [Proc, nil] called with the abandoned thread before the wait ends
+      # @param deadline [Float, nil] the bound to apply (default: the whole wait's)
       # @return [Object] the handler's result
-      def bounded_by_wait(wait, on_abandon: nil)
-        deadline = wait_deadline(wait)
+      def bounded_by_wait(wait, on_abandon: nil, deadline: wait_deadline(wait))
         return yield unless deadline
 
         remaining = [deadline - monotonic_time, 0].max
