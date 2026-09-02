@@ -495,25 +495,14 @@ module MCPClient
         # Use the streaming API if it's available, opened in the session the
         # epoch was sampled for: a chunk that comes back as a task is stamped
         # with that session, so the call must not have been written into the
-        # one that replaced it (see #call_tool).
+        # one that replaced it (see #call_tool). The stream every built-in
+        # transport hands back is lazy, so the call itself goes out under the
+        # pin the enumeration takes (see #streamed_call_chunks) — this one
+        # covers a transport that sends while building it.
         stream = pinned_to_session(server, task_epoch) { server.call_tool_streaming(tool_name, parameters) }
-        return stream unless tasks_extension? && modern_server?(server)
+        return stream unless task_epoch || (tasks_extension? && modern_server?(server))
 
-        # MCP 2026-07-28 tasks extension: a chunk may be a task; resolve it
-        # to the call's result, validated as #call_tool does — against the
-        # definition a mid-stream refresh (HeaderMismatch recovery) may have
-        # replaced.
-        Enumerator.new do |yielder|
-          stream.each do |chunk|
-            next yielder << chunk unless task_result?(chunk)
-
-            # The definition in force when the chunk arrived, captured
-            # before the task is waited for (see #call_tool).
-            current = tools_generation_of(server) == generation_before ? tool : (refreshed_tool(tool) || tool)
-            result = complete_task_result(tool_name, server, chunk, task_epoch)
-            yielder << validate_structured_content!(current, result)
-          end
-        end
+        streamed_call_chunks(stream, tool, tool_name, server, epoch: task_epoch, generation: generation_before)
       rescue MCPClient::Errors::ConnectionError => e
         # Add server identity information to the error for better context
         server_id = server.name ? "#{server.class}[#{server.name}]" : server.class.name
@@ -635,6 +624,45 @@ module MCPClient
     end
 
     private
+
+    # The chunks of a streaming tools/call, still in the session the call was
+    # sampled for.
+    #
+    # Every built-in transport answers call_tool_streaming with a lazy
+    # Enumerator: nothing is sent until the host enumerates it, and the pin
+    # around the construction is long gone by then (pins are per thread, and
+    # the consumer may not even be the thread that opened the stream). The
+    # call is therefore made under a pin taken inside the enumeration itself,
+    # so a session that ended meanwhile stops the call at the wire instead of
+    # running a (possibly non-idempotent) tool in the session that replaced
+    # the sampled one — where the task it answers with would be stamped with
+    # a session it never belonged to, and the wait would refuse the very task
+    # that ran.
+    # @param stream [Enumerator] the transport's lazy stream
+    # @param tool [MCPClient::Tool] the definition the call was validated against
+    # @param epoch [Integer, nil] the session the call belongs to
+    # @param generation [Integer, nil] the tool-definition generation before the call
+    # @return [Enumerator]
+    def streamed_call_chunks(stream, tool, tool_name, server, epoch:, generation:)
+      resolve = tasks_extension? && modern_server?(server)
+      Enumerator.new do |yielder|
+        pinned_to_session(server, epoch) do
+          stream.each do |chunk|
+            # MCP 2026-07-28 tasks extension: a chunk may be a task; resolve
+            # it to the call's result, validated as #call_tool does — against
+            # the definition a mid-stream refresh (HeaderMismatch recovery)
+            # may have replaced.
+            next yielder << chunk unless resolve && task_result?(chunk)
+
+            # The definition in force when the chunk arrived, captured
+            # before the task is waited for (see #call_tool).
+            current = tools_generation_of(server) == generation ? tool : (refreshed_tool(tool) || tool)
+            result = complete_task_result(tool_name, server, chunk, epoch)
+            yielder << validate_structured_content!(current, result)
+          end
+        end
+      end
+    end
 
     # Hand the host's identity and request metadata to a transport.
     # @param server [MCPClient::ServerBase] the transport
@@ -1304,6 +1332,7 @@ module MCPClient
 
       server.send(:take_called_tool_definition, tool_name.to_s)&.first
     end
+
     # Remove one server's entries from a client-level cache.
     # @param cache [Hash] the cache keyed by #cache_key_for
     # @param server [MCPClient::ServerBase]

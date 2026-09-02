@@ -440,5 +440,12 @@ module MCPClient
 
     # Raised when there's an error creating or managing a task
     class TaskError < MCPError; end
+
+    # Raised when a request names a task the server has since replaced: task
+    # ids are unique only within a server session, and a fresh
+    # CreateTaskResult under an id ended the task that answered to it before.
+    # A subclass of TaskError so existing rescues keep treating it as the task
+    # failure it is.
+    class TaskReplacedError < TaskError; end
   end
 end

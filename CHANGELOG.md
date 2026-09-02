@@ -7,6 +7,40 @@ metadata). Each feature lands in its own PR; this section accumulates them.
 
 ### Tasks extension (`io.modelcontextprotocol/tasks`)
 
+- **A streaming `tools/call` is pinned while it is enumerated, not only while
+  it is built (round 38).** Every built-in transport answers
+  `call_tool_streaming` with a lazy `Enumerator`: round 37's pin only wrapped
+  its construction and was gone by the time `each` reached the transport's
+  `call_tool`, so a session that ended before the host consumed the stream ran
+  the (possibly non-idempotent) tool in the replacement session while the task
+  it answered with carried the sampled epoch — and `wait_for_task` then refused
+  the very task that had run. The call now goes out under a pin taken inside
+  the enumeration, in the thread that consumes it.
+- **A task request is bound to the lifetime it is about, at the wire (round
+  38).** `check_handle_lifetime!` was a preflight: a `CreateTaskResult` a
+  concurrent call recorded after the check left the caller already past the
+  guard, so `get_task` handed back the replacement's answer stamped with the
+  old lifetime, `update_task` queued its answers in the replacement's state and
+  sent them for it, and `cancel_task` cancelled the replacement. Every task
+  request now carries a lifetime pin: the transport refuses to write it once
+  the id names another task (checked where the session pin is, immediately
+  before the wire), the answer is re-checked before it is acted on, and
+  `update_task` resolves the bookkeeping its answers belong to in the same
+  locked step as the check. The refusal is a `TaskReplacedError`, a new
+  subclass of `TaskError`. On the read path a terminal or
+  `TaskNotFound` answer now forgets only the bookkeeping of the lifetime it
+  asked about: a bare-id `tasks/get`, and a detailed terminal handle that names
+  no lifetime, no longer delete the keys of a task that took the id over since.
+- **Task lifetimes stay distinguishable after a prune (round 38).** The
+  lifetime of an id was a per-id count starting at 0, so evicting an id an
+  outstanding handle still named (the map keeps 4096 ids) let a later creation
+  under that id start at 0 again and the stale handle pass the guard, free to
+  update or cancel the replacement. Lifetimes are now numbers of a
+  monotonic per-session counter — one counter per session, so the map costs
+  what it did — never reused and never restarted; a handle whose lifetime the
+  prune forgot is refused rather than sent on a guess. Establishing a lifetime
+  and reading it back is a single locked step as well: two concurrent creations
+  of one id used to stamp both handles with the later of the two.
 - **A lifetime is established for every creation, and every handle names the
   one it belongs to (round 37).** Round 36 gave each `CreateTaskResult` its own
   lifetime, but only recorded one when the id was already on the books: two
