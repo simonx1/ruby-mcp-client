@@ -16,6 +16,25 @@ metadata). Each feature lands in its own PR; this section accumulates them.
   2020-12 keep it an annotation; a companion keyword the dialect does not
   define (`minContains` under draft-07) changes nothing.
 
+- **Pointer depth by the dialect in force, ineffective assertions
+  (round 18).** The depth of what a pointer `$ref` reaches is classified by
+  the dialect in force at each node — an embedded resource's own `$schema`
+  takes over when the pointer enters it — and once the pointer crossed a
+  keyword that dialect does not define, every token counts, a lexical depth
+  recorded under another grammar never overriding it (a 2020-12
+  `prefixItems` boolean inside a draft-07 document is legal at the bound; a
+  draft-07 `prefixItems` nest reached by pointer is out of bounds). A
+  boolean the preflight walk already admitted is not charged a second time
+  when a reference reaches it. A schema a pointer reaches under a data or
+  vendor keyword is indexed on arrival (a `$ref` written in it resolves in
+  its resource) and normalized when given with symbol keys. Under `not`,
+  `oneOf` and `if`, an unevaluated assertion that cannot change this
+  instance decides nothing: `unevaluatedItems` when the tuple or an `items`
+  schema covers every item, `additionalProperties` / `unevaluatedProperties`
+  when every property is covered, `uniqueItems` below two items,
+  `maxContains` / `maxProperties` the instance cannot exceed,
+  `minProperties` it already satisfies, a dependency none of whose
+  triggers is present.
 - **Round 12.** A `$id` resource the anchor index could not reach (beyond
   the depth bound) counts as truncation and a reference from a schema the
   index does not know is unresolvable, never resolved against the document
