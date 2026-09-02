@@ -66,6 +66,19 @@ module MCPClient
       subscriptions_mutex.synchronize { subscriptions.delete(subscription.id.to_s) }
     end
 
+    # Drop the registration a particular listen id made, and only that one: a
+    # subscription re-opened under a newer id (by a reconnect, or by a stdio
+    # restart racing a blocked write) is registered under that newer id, and
+    # the older attempt must not delete it.
+    # @param subscription [MCPClient::Subscription]
+    # @param id [Integer, String] the listen id it was registered under
+    # @return [void]
+    def unregister_subscription_id(subscription, id)
+      subscriptions_mutex.synchronize do
+        subscriptions.delete(id.to_s) if subscriptions[id.to_s].equal?(subscription)
+      end
+    end
+
     # The subscription a notification belongs to, from its
     # io.modelcontextprotocol/subscriptionId.
     # @param params [Hash, nil] notification params
@@ -95,14 +108,31 @@ module MCPClient
     # notification says is stale. Dropping the caches before the delivery is
     # queued makes "the caches are already invalid when a listener sees the
     # notification" a guarantee instead of a race the scheduler usually wins.
+    #
+    # The host callback sits between the two and can prevent neither: it is
+    # host code driven by the peer, and an exception escaping it used to take
+    # the notification down with it — the subscription's listeners never saw
+    # something the host's own handler had already been told about — and, on
+    # stdio, the transport's reader thread with it.
     # @param method [String] notification method
     # @param params [Hash, nil] notification params
     # @return [void]
     def route_notification(method, params)
       handle_subscription_control(method, params)
       invalidate_cache_for_notification(method) if respond_to?(:invalidate_cache_for_notification, true)
-      @notification_callback&.call(method, params)
+      notify_host(method, params)
       deliver_subscription_notification(method, params) unless CONTROL_NOTIFICATIONS.include?(method)
+    end
+
+    # Hand a notification to the host's callback, surviving whatever it does
+    # with it (see {#route_notification}).
+    # @param method [String] notification method
+    # @param params [Hash, nil] notification params
+    # @return [void]
+    def notify_host(method, params)
+      @notification_callback&.call(method, params)
+    rescue StandardError => e
+      @logger.warn("Notification callback error for #{method}: #{sanitize_log_text(e.message)}")
     end
 
     # Subscription bookkeeping carried by a notification: the server's
@@ -266,13 +296,49 @@ module MCPClient
       subscription = listen(notifications: { 'resourceSubscriptions' => [uri] })
       begin
         confirm_resource_subscription(subscription, uri)
+        subscriptions_mutex.synchronize { resource_subscriptions[uri] = subscription }
+        recheck_mapped_resource_subscription(subscription, uri)
       rescue StandardError
         # Nothing watches a stream the caller could not use.
+        unmap_resource_subscription(subscription, uri)
         subscription.close
         raise
       end
-      subscriptions_mutex.synchronize { resource_subscriptions[uri] = subscription }
       subscription
+    end
+
+    # Check the acknowledgment that stands *now that the URI is mapped*.
+    #
+    # {#drop_unacknowledged_resource_subscriptions} can only see a stream
+    # through the mapping, and the mapping is written after the acknowledgment
+    # the subscriber waited for. A stream that dropped and was re-opened in
+    # between is acknowledged afresh and MAY be granted more narrowly, so
+    # without this second look a re-acknowledgment that landed in that window
+    # was stored as a live watch nothing was honouring.
+    # @param subscription [MCPClient::Subscription]
+    # @param uri [String] the resource URI
+    # @return [void]
+    # @raise [MCPClient::Errors::MCPError] if the URI is no longer being watched
+    def recheck_mapped_resource_subscription(subscription, uri)
+      if subscription.closed?
+        raise subscription.error if subscription.error
+
+        raise MCPClient::Errors::ResourceReadError, "the server closed the subscription for '#{uri}'"
+      end
+      return unless subscription.unacknowledged_resource_uris.include?(uri)
+
+      raise MCPClient::Errors::ResourceReadError,
+            "the server acknowledged the subscription without '#{uri}'"
+    end
+
+    # Drop a URI's mapping, but only while it still names this stream.
+    # @param subscription [MCPClient::Subscription]
+    # @param uri [String] the resource URI
+    # @return [void]
+    def unmap_resource_subscription(subscription, uri)
+      subscriptions_mutex.synchronize do
+        resource_subscriptions.delete(uri) if resource_subscriptions[uri].equal?(subscription)
+      end
     end
 
     # Wait for the acknowledgment and check that it really covers the URI: a

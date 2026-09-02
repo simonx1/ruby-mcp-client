@@ -45,15 +45,26 @@ metadata). Each feature lands in its own PR; this section accumulates them.
   what the dropped one said; the only notice of another thing does not. A
   notification larger than the whole byte budget is still delivered, alone —
   the peer can hold one payload behind a stalled listener, never a queueful
-  of them, and no signal is lost merely for being large. Blocking the reader
-  instead would restore the deadlock the dispatcher exists to prevent, and
-  dropping the newest would leave the host acting on a stale view for good.
+  of them, and no signal is lost merely for being large: that payload is not
+  charged against the budget it exceeds on its own, or the queue would stay
+  over budget for as long as it held it and the next notice of anything else
+  would evict it — losing the only notice of its resource, the very loss the
+  policy exists to prevent. Only one payload is ever exempt, so the retained
+  total stays within the budget plus one peer-sized payload. Blocking the
+  reader instead would restore the deadlock the dispatcher exists to prevent,
+  and dropping the newest would leave the host acting on a stale view for good.
   Drops are counted in `dropped_notifications` and named once in the log,
   with `pending_notifications` and `pending_notification_bytes` reporting the
   current depth. A closing response the client cannot recognize (an unknown
   `resultType`, a missing result, a scalar) fails the subscription with an
   `InvalidResultError` rather than ending it gracefully, the way every other
-  response is checked.
+  response is checked. The requested filter is copied and frozen when the
+  subscription is created: the listen request is built from it on a background
+  thread after `listen` returns, and again on every reconnect, so a caller that
+  kept the array it passed could otherwise change what goes out. `unsupported`
+  reads the acknowledgment's *values*, not its keys — a `resourceSubscriptions`
+  echoed with none of the requested URIs, or a flag acknowledged as `false`, is
+  a field the server declined while naming it.
 - **Caches are invalidated before the notification reaches the listeners.**
   A listener runs on the subscription's dispatcher thread, so queuing its
   delivery makes the notification visible at once: a listener reacting to
@@ -62,7 +73,12 @@ metadata). Each feature lands in its own PR; this section accumulates them.
   caches that notification invalidates had been dropped, and read the very
   entry it says is stale. Routing now drops both caches first and delivers
   afterwards, making that a guarantee rather than a race the scheduler
-  usually happens to win.
+  usually happens to win. The host's `on_notification` callback runs between
+  the two and can stop neither: it is host code driven by the peer, and an
+  exception escaping it used to take the notification down with it — the
+  subscription's listeners never saw something the host's own handler had
+  already been told about — and, on stdio, the transport's reader thread with
+  it. Such an exception is now logged and routing continues.
 - **Transports.** On Streamable HTTP (and plain HTTP) the listen POST runs
   on its own thread; a stream that ends without the closing response is
   re-opened with a new id (backoff 1 s → 30 s, which a cancellation
@@ -103,7 +119,19 @@ metadata). Each feature lands in its own PR; this section accumulates them.
   the restart was attempted: a server whose start-up alone outlasts the
   interval (an `npx -y …` command fetching its package, say) and which then
   exits immediately would otherwise be credited with its whole handshake,
-  read as healthy every time, and respawned for ever.
+  read as healthy every time, and respawned for ever. It is stamped as soon
+  as the handshake is answered — the process can exit while the subscriptions
+  are still going out to it — and per session even when restarts overlap: the
+  process one restart spawns can exit while that restart is still finishing,
+  so a second begins on the new process's reader thread before the first has
+  returned, and whichever finished first used to clear the shared "restarting"
+  mark and leave the other's session stamped with nothing. A restarted process
+  that negotiates a pre-2026-07-28 version cannot carry the subscriptions
+  either: they end with a `CapabilityError` instead of staying `:reconnecting`
+  for ever with the host never told. And a listen write that fails only
+  *after* a restart has re-opened the same subscription under a new id no
+  longer tears that healthy stream down — the failure cleanup names the id the
+  write went out with.
   Taking a new id is atomic with closure on both, so a `close` racing with a
   re-open either stops it or cancels the id that went out — never leaving
   the server holding a stream the client can no longer cancel. Events are
@@ -128,7 +156,11 @@ metadata). Each feature lands in its own PR; this section accumulates them.
   the subscription and drops the mapping instead of leaving
   `live_resource_subscription` reporting a watch nothing is honouring; a
   later `subscribe_resource` then opens a fresh stream and raises if that
-  one is refused too. Opening and closing the stream for one URI is
+  one is refused too. That recheck reads the URI-to-stream mapping, which is
+  written only after the acknowledgment the subscriber waited for, so the
+  acknowledgment that stands is checked once more with the mapping in
+  place — a narrowing that landed in the window between the two used to be
+  stored as a live watch. Opening and closing the stream for one URI is
   serialized, so concurrent subscribers share a single stream that
   `unsubscribe_resource` really closes.
 

@@ -154,7 +154,10 @@ waits for. Updates then arrive as `notifications/resources/updated` through
 a stream re-opened after a dropped HTTP connection or a stdio restart is a new
 listen request the server may acknowledge more narrowly, so one that comes back
 without the URI closes the subscription instead of leaving the resource
-reported as watched while nothing watches it.
+reported as watched while nothing watches it — including one that arrives in
+the window between the acknowledgment `subscribe_resource` waited for and the
+URI being mapped to the stream, which is checked once more with the mapping in
+place before the call answers.
 
 On a 2026-07-28 server a host can also open a stream of its own with
 `server.listen(notifications: { tools_list_changed: true }) { |method, params| … }`
@@ -173,13 +176,25 @@ only queued update for a quiet one to make room for a busy one. Every MCP
 notification is a "look again" signal about state the host re-reads for itself,
 so a later notice of the same thing carries what the dropped one said, while
 the only notice of another thing carries what nothing else would. A single
-notification larger than the whole byte budget is still delivered, alone.
+notification larger than the whole byte budget is still delivered, alone, and
+is not charged against the budget it exceeds by itself — otherwise the queue
+would stay over budget for as long as it held that payload and the next notice
+of anything else would evict it. Only one payload is ever exempt, so what the
+queue retains stays within the budget plus one peer-sized payload.
 `pending_notifications` / `pending_notification_bytes` /
 `dropped_notifications` report how far behind a listener fell. Caches are
 dropped *before* a notification reaches the listeners, so a listener reacting
 to a `list_changed` notification by calling `list_tools` (or the prompt or
 resource equivalents) always re-fetches rather than reading the entry the
-notification just invalidated. `active?` answers false while a dropped stream
+notification just invalidated; an `on_notification` callback that raises is
+logged and stops neither the invalidation nor the delivery. The requested
+filter is copied and frozen when the subscription is created, so a caller that
+keeps and mutates the array it passed cannot change the request that goes out
+(Streamable HTTP builds it on the stream's own thread) or what a reconnect asks
+for. `unsupported` names the requested fields the acknowledgment did not really
+grant, read from its values rather than its keys: a `resourceSubscriptions`
+echoed with none of the requested URIs, or a flag acknowledged as `false`,
+counts as unsupported. `active?` answers false while a dropped stream
 waits to re-open, and a closing response the client cannot recognize (an unknown
 `resultType`, a missing or scalar result) fails the subscription instead of
 closing it gracefully. On Streamable HTTP closing the SSE response stream *is*
@@ -193,9 +208,12 @@ notifications never makes the request that would otherwise restart it, and the
 subscriptions are re-sent on the new process; if it cannot be restarted, or if
 the restarted process stays up for less than
 `MCPClient::ServerStdio::SUBSCRIPTION_RESTART_MIN_INTERVAL` — counted from the
-moment it became ready, so a server whose handshake alone takes longer than
-that and which then exits is not respawned for ever — they end with that error
-rather than waiting for ever.
+moment its handshake was answered, so a server whose start-up alone takes
+longer than that and which then exits is not respawned for ever, and counted
+per session even when one restart begins while the previous one is still
+finishing — they end with that error rather than waiting for ever. A restarted
+process that negotiates a pre-2026-07-28 version cannot carry them either, and
+ends them with a `CapabilityError` rather than leaving them `:reconnecting`.
 
 ## MCP 2025-11-25 Features
 

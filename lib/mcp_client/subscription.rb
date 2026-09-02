@@ -85,8 +85,15 @@ module MCPClient
 
     # Normalize and validate a SubscriptionFilter given with String or Symbol,
     # camelCase or snake_case keys.
+    #
+    # The result is detached from the caller and frozen. The filter is not
+    # serialized once and forgotten: Streamable HTTP builds the listen request
+    # on the stream's own thread, after `listen` has returned, and every
+    # reconnect builds it again — so an array the caller kept a reference to
+    # would let a later `<<` or a mutated String change the request that goes
+    # out, or change what a re-opened stream asks for.
     # @param filter [Hash] the notification filter
-    # @return [Hash] camelCase String keys
+    # @return [Hash] camelCase String keys, frozen
     # @raise [ArgumentError] on an unknown key or a mistyped value
     def self.normalize_filter(filter)
       raise ArgumentError, 'notifications must be a Hash (SubscriptionFilter)' unless filter.is_a?(Hash)
@@ -102,9 +109,11 @@ module MCPClient
           raise ArgumentError, "#{name} must be true or false" unless [true, false].include?(value)
         when :string_array
           raise ArgumentError, "#{name} must be an array of strings" unless value.is_a?(Array) && value.all?(String)
+
+          value = value.map { |item| item.dup.freeze }.freeze
         end
         [name, value]
-      end
+      end.freeze
     end
 
     # @param server [MCPClient::ServerBase] owning transport
@@ -180,16 +189,20 @@ module MCPClient
       @mutex.synchronize { @closed_by_client }
     end
 
-    # Requested notification types the server did not agree to honour
-    # (a resource subscription counts as unsupported when none of its URIs
-    # was acknowledged; see {#unacknowledged_resource_uris} for a partial
-    # acknowledgment).
+    # Requested notification types the server did not agree to honour.
+    #
+    # Support is read from the value the server acknowledged, not from the
+    # mere presence of the field: an acknowledgment that names
+    # `resourceSubscriptions` with none of the URIs it was sent has accepted
+    # no resource subscription at all, and a flag acknowledged as `false` will
+    # not be honoured either. A list the server granted in part counts as
+    # supported; see {#unacknowledged_resource_uris} for the URIs it left out.
     # @return [Array<String>] empty until acknowledged
     def unsupported
       ack = @mutex.synchronize { @acknowledged }
       return [] unless ack
 
-      @requested.keys - ack.keys
+      @requested.keys.reject { |field| granted?(@requested[field], ack[field]) }
     end
 
     # Requested resource URIs the server did not agree to watch.
@@ -265,6 +278,17 @@ module MCPClient
       end
     end
 
+    # Whether this subscription is still the stream a given listen id opened.
+    # A transport that fails an attempt asks before undoing it: a restart
+    # racing a blocked write may already have re-opened the subscription under
+    # a newer id, and that stream is not the older attempt's to tear down.
+    # @param id [Integer, String] a listen request id
+    # @return [Boolean]
+    # @api private
+    def open_as?(id)
+      @mutex.synchronize { @id == id }
+    end
+
     # @api private
     def acknowledge(filter)
       @mutex.synchronize do
@@ -323,6 +347,25 @@ module MCPClient
     end
 
     private
+
+    # Whether the value the server acknowledged for a requested field grants
+    # anything: a flag has to come back true, and a list of URIs or task ids
+    # has to name at least one of those asked for. Anything else is the server
+    # declining the field while echoing its name. A field this client did not
+    # really ask for (a `false` flag, an empty list) is trivially granted —
+    # there was nothing there for the server to decline.
+    # @param wanted [Object] the value this client asked for
+    # @param granted [Object] the value the server acknowledged
+    # @return [Boolean]
+    def granted?(wanted, granted)
+      if wanted.is_a?(Array)
+        return true if wanted.empty?
+
+        return granted.is_a?(Array) && wanted.intersect?(granted)
+      end
+
+      wanted == false || granted == true
+    end
 
     # The answer {#wait_until_settled} reports. Settling is one-way: once the
     # server has acknowledged the listen request it has answered it, and a

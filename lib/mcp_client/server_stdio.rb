@@ -111,9 +111,10 @@ module MCPClient
       @transport_retired = false
       @modern_answer_received = false
       # Crash-loop bookkeeping for a process restarted to keep subscriptions
-      # alive: whether a restart is in flight, and when the process it spawned
-      # became ready (see JsonRpcTransport#restarting_too_often?).
-      @restarting_for_subscriptions = false
+      # alive: how many restarts are in flight (they can nest — see
+      # JsonRpcTransport#restart_session), and when the process the latest one
+      # spawned became ready (see JsonRpcTransport#restarting_too_often?).
+      @restarting_for_subscriptions = 0
       @subscription_restart_ready_at = nil
     end
 
