@@ -162,9 +162,10 @@ RSpec.describe 'MCP 2026-07-28 subscriptions/listen — round 4' do
 
       # grok [1]: a session that has been armed but whose socket is not open
       # yet cannot be closed — and silently doing nothing left the stream
-      # running until the 300-second read timeout.
+      # running until the 300-second read timeout. Round 5 made the close come
+      # back for it until the socket really is open, instead of once.
       it 'closes a stream whose socket was still opening when the cancellation arrived' do
-        stub_const('MCPClient::HttpTransportBase::ListenStream::THREAD_JOIN_TIMEOUT_FOR_LISTEN', 0.1)
+        stub_const('MCPClient::HttpTransportBase::ListenStream::THREAD_JOIN_TIMEOUT_FOR_LISTEN', 0.5)
         gate = stub_gated_listen
         sessions = armed_sessions
         attempts = Thread::Queue.new
@@ -180,7 +181,9 @@ RSpec.describe 'MCP 2026-07-28 subscriptions/listen — round 4' do
         closer = Thread.new { subscription.close }
         expect(attempts.pop(timeout: 3)).to eq(:opening)
         opening = false
-        expect(attempts.pop(timeout: 3)).to eq(:closed)
+        outcome = attempts.pop(timeout: 3)
+        outcome = attempts.pop(timeout: 3) while outcome == :opening
+        expect(outcome).to eq(:closed)
         gate << :go
         expect(closer.join(3)).to be_truthy
       end
@@ -388,34 +391,42 @@ RSpec.describe 'MCP 2026-07-28 subscriptions/listen — round 4' do
 
   # grok [3]: round 3 made deliver enqueue and return, which removed the
   # deadlock and the backpressure with it. The queue is peer-fed, so it needs
-  # a ceiling; the oldest notification is the one to lose, because every MCP
-  # notification is a "look again" signal and the newest one still carries it.
+  # a ceiling, and every MCP notification is a "look again" signal, so a
+  # repeat of one already queued is the notification to lose. Round 5 replaced
+  # "the oldest" with "the oldest of the same thing" — dropping by arrival
+  # order alone discarded the only queued update for a quiet resource on a
+  # mixed filter (see the round 5 spec); what stands here is the ceiling
+  # itself, which one notification per thing cannot exercise.
   describe 'the notification queue' do
     let(:server) { double('server') }
 
-    it 'bounds its depth and drops the oldest notification' do
+    def update(uri)
+      ['notifications/resources/updated', { 'uri' => uri }]
+    end
+
+    it 'bounds its depth and counts what it dropped' do
       stub_const('MCPClient::Subscription::MAX_PENDING_NOTIFICATIONS', 4)
       entered = Thread::Queue.new
       release = Thread::Queue.new
       delivered = []
-      subscription = MCPClient::Subscription.new(server: server, requested: {}) do |method, _params|
-        delivered << method
-        next unless method == 'n0'
+      subscription = MCPClient::Subscription.new(server: server, requested: {}) do |_method, params|
+        delivered << params['uri']
+        next unless params['uri'] == 'file:///0'
 
         entered << :in
         release.pop
       end
       subscription.assign_id(1)
 
-      subscription.deliver('n0', nil)
+      subscription.deliver(*update('file:///0'))
       entered.pop(timeout: 3)
-      20.times { |index| subscription.deliver("n#{index + 1}", nil) }
+      20.times { |index| subscription.deliver(*update("file:///#{index + 1}")) }
 
       expect(subscription.pending_notifications).to eq(4)
       expect(subscription.dropped_notifications).to eq(16)
       release << :go
       wait_until { delivered.size == 5 }
-      expect(delivered).to eq(%w[n0 n17 n18 n19 n20])
+      expect(delivered).to eq(['file:///0', 'file:///17', 'file:///18', 'file:///19', 'file:///20'])
       subscription.finish
     end
 
@@ -429,9 +440,9 @@ RSpec.describe 'MCP 2026-07-28 subscriptions/listen — round 4' do
       end
       subscription.assign_id(1)
 
-      subscription.deliver('first', nil)
+      subscription.deliver(*update('file:///first'))
       entered.pop(timeout: 3)
-      reader = Thread.new { 50.times { |index| subscription.deliver("n#{index}", nil) } }
+      reader = Thread.new { 50.times { |index| subscription.deliver(*update("file:///#{index}")) } }
 
       expect(reader.join(3)).to be_truthy
       expect(subscription.pending_notifications).to eq(2)

@@ -18,6 +18,11 @@ module MCPClient
       # Read timeout for a listen stream; servers keep quiet streams alive with
       # SSE comment lines, so this only bounds a dead connection.
       LISTEN_STREAM_TIMEOUT = 300
+      # Time allowed for a listen stream's socket to open. A cancellation
+      # cannot close a session that is still inside this window (there is no
+      # response stream yet), so it is also how long a request can stay
+      # abandoned-but-unsent after a {#cancel_subscription}.
+      LISTEN_OPEN_TIMEOUT = 10
       # Cap on a listen stream's unterminated-event buffer (peer-controlled).
       LISTEN_MAX_BUFFER_BYTES = 32 * 1024 * 1024
 
@@ -78,6 +83,9 @@ module MCPClient
       end
 
       THREAD_JOIN_TIMEOUT_FOR_LISTEN = 2
+      # How often a cancellation looks again at a session whose socket was
+      # still being opened the last time it looked.
+      LISTEN_CLOSE_POLL_INTERVAL = 0.05
 
       # Stop every listen stream (transport shutdown). Unlike stdio there is no
       # process to re-establish: the host re-listens on a new connection.
@@ -145,18 +153,28 @@ module MCPClient
         :closed
       end
 
-      # Wait for a cancelled stream's thread to end. A first close that found
-      # the socket still opening had nothing to close; by the time the join
-      # has timed out the request is on the wire, and closing the response
-      # stream is what tells the server the subscription is gone.
+      # Wait for a cancelled stream's thread to end, closing its response
+      # stream as soon as there is one to close.
+      #
+      # A close that finds the socket still opening has nothing to close, and
+      # the socket can open at any point inside {LISTEN_OPEN_TIMEOUT} — longer
+      # than anything worth blocking a {Subscription#close} for. So the close
+      # is attempted again after every short join instead of once, and the
+      # thread is left in {#listen_threads} throughout: it removes itself when
+      # it ends, and until then a stream this gave up on is still one a later
+      # {#close_listen_streams} can find and close. Nothing can be sent on it
+      # meanwhile — {#arm_listen_session} has already refused the request.
       # @param subscription [MCPClient::Subscription]
       # @return [void]
       def await_listen_stream(subscription)
-        thread = listen_threads_mutex.synchronize { listen_threads.delete(subscription) }
-        return if thread.nil? || thread == Thread.current
-        return if thread.join(THREAD_JOIN_TIMEOUT_FOR_LISTEN)
+        thread = listen_threads_mutex.synchronize { listen_threads[subscription] }
+        return if thread.nil? || thread.equal?(Thread.current)
 
-        close_listen_session(subscription)
+        deadline = Process.clock_gettime(Process::CLOCK_MONOTONIC) + THREAD_JOIN_TIMEOUT_FOR_LISTEN
+        while close_listen_session(subscription) == :opening
+          return if thread.join(LISTEN_CLOSE_POLL_INTERVAL)
+          return if Process.clock_gettime(Process::CLOCK_MONOTONIC) >= deadline
+        end
         thread.join(THREAD_JOIN_TIMEOUT_FOR_LISTEN)
       end
 
@@ -173,7 +191,30 @@ module MCPClient
         listen_threads_mutex.synchronize do
           raise ListenStreamClosed if subscription.closed?
 
+          refuse_listen_send_once_closed(subscription, http)
           listen_sessions[subscription] = http
+        end
+      end
+
+      # Stop the request of a subscription that was closed while this session
+      # was still opening its socket.
+      #
+      # This is the one point a cancellation cannot otherwise reach: Net::HTTP
+      # opens the socket in `start` and sends the request only afterwards, and
+      # a session that has not finished starting cannot be closed — so a close
+      # that lands in that window has nothing to act on, and the connect can
+      # go on to POST a subscription the host has already ended, leaving the
+      # server holding a stream nothing will ever read. The check sits between
+      # the two, on the session itself, so it holds however long the connect
+      # takes and whether or not anything is still waiting for it.
+      # @param subscription [MCPClient::Subscription]
+      # @param http [Net::HTTP] the session Faraday is about to use
+      # @return [void]
+      def refuse_listen_send_once_closed(subscription, http)
+        http.define_singleton_method(:request) do |*args, &block|
+          raise MCPClient::HttpTransportBase::ListenStream::ListenStreamClosed if subscription.closed?
+
+          super(*args, &block)
         end
       end
 
@@ -505,11 +546,11 @@ module MCPClient
       def listen_connection(subscription)
         conn = Faraday.new(url: @base_url) do |f|
           f.request :retry, max: 0
-          f.options.open_timeout = 10
+          f.options.open_timeout = LISTEN_OPEN_TIMEOUT
           f.options.timeout = LISTEN_STREAM_TIMEOUT
           f.adapter :net_http do |http|
             http.read_timeout = LISTEN_STREAM_TIMEOUT
-            http.open_timeout = 10
+            http.open_timeout = LISTEN_OPEN_TIMEOUT
             # Runs on the stream's own thread, just before the socket is
             # opened: the last point at which a cancellation can still stop
             # the request, and the first at which it can close it.
