@@ -6,6 +6,7 @@ require_relative 'schema_validator/normalization'
 require_relative 'schema_validator/references'
 require_relative 'schema_validator/keyword_scan'
 require_relative 'schema_validator/composition'
+require_relative 'schema_validator/scalars'
 
 module MCPClient
   # Self-contained JSON Schema validator used to check a tool call result's
@@ -59,6 +60,7 @@ module MCPClient
     extend References
     extend KeywordScan
     extend Composition
+    extend Scalars
 
     # Raised inside a validation to abandon it (time budget, resource bound).
     class Aborted < StandardError; end
@@ -85,6 +87,19 @@ module MCPClient
     MAX_NODE_VISITS = 100_000
     MAX_ERRORS = 100
     MAX_VALUE_INSPECT = 64
+
+    # How deeply {.validate_node} may nest. The walk is plain recursion, so
+    # its depth is the interpreter's stack depth: the instance nests a level
+    # per array item or property, and a recursive `$ref` follows it down
+    # without bound (the hop budget restarts at every value, so that a
+    # recursive schema can describe deep data at all). A validation that
+    # outgrew the stack would raise SystemStackError past every bound this
+    # validator applies; nesting is counted instead, so the deepest instance
+    # aborts with one error like any other exhausted budget. The bound sits
+    # well above what a peer can send — `JSON.parse` refuses more than 100
+    # levels of nesting by default — and well below what the smallest stack
+    # this library runs on (a transport's reader thread) can carry.
+    MAX_NODE_DEPTH = 512
 
     # JSON Schema keywords that affect validation but that this validator
     # does not evaluate: assertion keywords (multipleOf, uniqueItems,
@@ -186,7 +201,7 @@ module MCPClient
     end
 
     # Per-validation state.
-    Context = Struct.new(:root, :deadline, :dialect, :visits, :errors, :speculative, :anchors, :undecided,
+    Context = Struct.new(:root, :deadline, :dialect, :visits, :errors, :speculative, :anchors, :undecided, :depth,
                          keyword_init: true)
 
     # Raised while normalizing a schema whose structure exceeds the bounds,
@@ -576,7 +591,8 @@ module MCPClient
       # subtrees its references adopted): a second one would make what a
       # reference resolves to depend on the order this instance applies them.
       ctx = Context.new(root: root, deadline: deadline, dialect: canonical_dialect(dialect(root)),
-                        visits: 0, errors: 0, speculative: 0, anchors: preflight[:anchors], undecided: 0)
+                        visits: 0, errors: 0, speculative: 0, anchors: preflight[:anchors], undecided: 0,
+                        depth: 0)
       validate_node(data, root, path, ctx, 0)
     rescue TooLarge => e
       ["#{path}: #{e.message}"]
@@ -584,7 +600,11 @@ module MCPClient
       ["#{path}: validation aborted: #{e.message}"]
     end
 
-    # Validate one value against one (sub)schema.
+    # Validate one value against one (sub)schema, under the bounds on the
+    # walk itself: one more node visited, one level deeper. The nesting is
+    # counted here rather than passed down, so every recursion into the walk
+    # is bounded — an instance nesting a level per item, a subschema, and a
+    # `$ref` followed from either.
     # @param data [Object] the value
     # @param schema [Object] a subschema (Hash or boolean)
     # @param path [String] location for error messages
@@ -594,6 +614,18 @@ module MCPClient
     # @raise [Aborted] when a bound is hit
     def self.validate_node(data, schema, path, ctx, ref_depth)
       count_visit(ctx)
+      ctx.depth += 1
+      raise Aborted, "instance or schema nesting deeper than #{MAX_NODE_DEPTH}" if ctx.depth > MAX_NODE_DEPTH
+
+      validate_node_keywords(data, schema, path, ctx, ref_depth)
+    ensure
+      ctx.depth -= 1
+    end
+
+    # Apply one (sub)schema's keywords to one value, the walk's own bounds
+    # already accounted for by {.validate_node}.
+    # @return [Array<String>] validation errors
+    def self.validate_node_keywords(data, schema, path, ctx, ref_depth)
       return [] if schema == true
       return count_errors(ctx, ["#{path}: schema false accepts no value"]) if schema == false
       return [] unless schema.is_a?(Hash)
@@ -845,97 +877,6 @@ module MCPClient
         errors.concat(validate_node(item, item_schema, "#{path}/#{idx}", ctx, 0))
       end
       errors.concat(validate_contains(data, schema, path, dialect))
-    end
-
-    # Validate a string against minLength/maxLength/pattern.
-    # @param data [String] the string
-    # @param schema [Hash] string-keyed schema
-    # @param path [String] location for error messages
-    # @return [Array<String>] validation errors
-    def self.validate_string(data, schema, path, deadline = nil)
-      errors = []
-      min_length = schema['minLength']
-      max_length = schema['maxLength']
-      if min_length.is_a?(Numeric) && data.length < min_length
-        errors << "#{path}: string is shorter than minLength #{min_length}"
-      end
-      if max_length.is_a?(Numeric) && data.length > max_length
-        errors << "#{path}: string is longer than maxLength #{max_length}"
-      end
-      errors.concat(validate_pattern(data, schema['pattern'], path, deadline))
-      errors
-    end
-
-    # Validate a string against a regular-expression pattern.
-    # Invalid patterns are not enforced.
-    #
-    # The pattern comes from the tool's outputSchema, i.e. from the remote
-    # server, so matching runs against the validation-wide deadline: neither a
-    # single expensive expression nor many cheap-looking ones can pin the
-    # calling thread. A match that exceeds the budget aborts the validation
-    # rather than silently accepting the value — the value was never shown
-    # to satisfy the schema.
-    # @param data [String] the string
-    # @param pattern [Object] the pattern keyword value
-    # @param path [String] location for error messages
-    # @param deadline [Float, nil] monotonic deadline for the whole validation
-    # @return [Array<String>] validation errors
-    # @raise [Aborted] when the budget is exhausted
-    def self.validate_pattern(data, pattern, path, deadline = nil)
-      return [] unless pattern.is_a?(String)
-
-      remaining = pattern_budget_remaining(deadline)
-      raise Aborted, "validation time budget exhausted before pattern #{clip(pattern.inspect)}" if remaining.zero?
-
-      return [] if data.match?(Regexp.new(pattern, timeout: remaining))
-
-      ["#{path}: string does not match pattern #{clip(pattern.inspect)}"]
-    rescue Regexp::TimeoutError
-      raise Aborted, "pattern #{clip(pattern.inspect)} exceeded the #{PATTERN_MATCH_TIMEOUT}s matching budget"
-    rescue RegexpError
-      []
-    end
-
-    # Time left in the validation-wide budget.
-    # @param deadline [Float, nil] monotonic deadline, or nil for a lone match
-    # @return [Float] seconds available; 0.0 when exhausted
-    def self.pattern_budget_remaining(deadline)
-      return PATTERN_MATCH_TIMEOUT unless deadline
-
-      remaining = deadline - Process.clock_gettime(Process::CLOCK_MONOTONIC)
-      return 0.0 if remaining <= 0
-
-      [remaining, MIN_PATTERN_MATCH_TIMEOUT].max
-    end
-
-    # Validate a number against its bounds. `minimum` / `maximum` and
-    # `exclusiveMinimum` / `exclusiveMaximum` are four independent numeric
-    # assertions in every supported dialect (draft-07 validation Sections
-    # 6.2.2-6.2.5); each present one is applied.
-    # @param data [Numeric] the number
-    # @param schema [Hash] string-keyed schema
-    # @param path [String] location for error messages
-    # @return [Array<String>] validation errors
-    def self.validate_number(data, schema, path, _dialect = nil)
-      errors = []
-      minimum = schema['minimum']
-      maximum = schema['maximum']
-      exclusive_min = schema['exclusiveMinimum']
-      exclusive_max = schema['exclusiveMaximum']
-      shown = clip_value(data)
-      if minimum.is_a?(Numeric) && data < minimum
-        errors << "#{path}: value #{shown} is less than minimum #{clip_value(minimum)}"
-      end
-      if maximum.is_a?(Numeric) && data > maximum
-        errors << "#{path}: value #{shown} is greater than maximum #{clip_value(maximum)}"
-      end
-      if exclusive_min.is_a?(Numeric) && data <= exclusive_min
-        errors << "#{path}: value #{shown} must be greater than exclusiveMinimum #{clip_value(exclusive_min)}"
-      end
-      if exclusive_max.is_a?(Numeric) && data >= exclusive_max
-        errors << "#{path}: value #{shown} must be less than exclusiveMaximum #{clip_value(exclusive_max)}"
-      end
-      errors
     end
 
     # Bound a piece of peer-derived text destined for a message.

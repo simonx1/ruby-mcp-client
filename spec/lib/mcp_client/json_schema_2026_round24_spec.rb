@@ -107,7 +107,11 @@ RSpec.describe 'MCP 2026-07-28 JSON Schema handling — round 24' do
 
     it 'still leaves a contains the length cannot settle unevaluated' do
       expect(validator.validate([1, 2], { 'contains' => { 'type' => 'string' } })).to be_empty
-      expect(validator.validate([1, 2], { 'contains' => { 'type' => 'string' }, 'maxContains' => 0 })).to be_empty
+      # `maxContains: 0` alone is unsatisfiable beside the default
+      # `minContains: 1` (round 25); with the lower bound switched off, how
+      # many items match is still the item schema's business.
+      expect(validator.validate([1, 2], { 'contains' => { 'type' => 'string' },
+                                          'minContains' => 0, 'maxContains' => 0 })).to be_empty
     end
   end
 

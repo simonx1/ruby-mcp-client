@@ -75,9 +75,11 @@ module MCPClient
 
         # What a reference reaches is scanned under its own resource's dialect
         # and at its own lexical depth, so member order and reference fan-out
-        # cannot hide its keywords.
+        # cannot hide its keywords. A target that is not a schema object has
+        # no lexical depth at all — nil, never `false`, so the depth the
+        # opaque-pointer branch compares stays a number.
         scan[:depths] ||= lexical_depths(root, scan[:dialect])
-        lexical = target.is_a?(Hash) && scan[:depths][target]
+        lexical = scan[:depths][target] if target.is_a?(Hash)
         position, opaque = pointer_position(ref, root, scan[:dialect], scan, schema)
         target_depth = if opaque
                          [position, lexical].compact.max || (depth + 1)
