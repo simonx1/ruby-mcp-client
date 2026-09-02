@@ -21,8 +21,12 @@ module MCPClient
       def partial_keywords?(schema, dialect, data)
         applicable = UNSUPPORTED_ASSERTIONS_ANY_TYPE +
                      UNSUPPORTED_ASSERTIONS_BY_TYPE.select { |type, _| data.is_a?(type) }.values.flatten
+        # draft-07 `format` asserts (Validation Section 7.2); the validator
+        # does not evaluate formats, so a string branch carrying one is
+        # undecided there, while 2019-09 / 2020-12 only annotate.
+        applicable += ['format'] if dialect == DRAFT_07 && data.is_a?(String)
         (schema.keys & applicable).any? do |keyword|
-          keyword_known?(keyword, dialect) && effective_assertion?(schema, keyword, data)
+          keyword_known?(keyword, dialect) && effective_assertion?(schema, keyword, data, dialect)
         end
       end
 
@@ -36,11 +40,11 @@ module MCPClient
       # cannot fail (additionalProperties true, uniqueItems false,
       # minProperties 0, an empty dependency map) decides nothing.
       # @return [Boolean]
-      def effective_assertion?(schema, keyword, data)
+      def effective_assertion?(schema, keyword, data, dialect = nil)
         value = schema[keyword]
         case keyword
         when 'contains', 'minContains', 'maxContains', 'additionalItems'
-          effective_array_assertion?(schema, keyword, value, data)
+          effective_array_assertion?(schema, keyword, value, data, dialect)
         when 'additionalProperties', 'unevaluatedProperties', 'unevaluatedItems', 'propertyNames'
           ![true, {}].include?(value)
         when 'uniqueItems' then value == true
@@ -55,9 +59,11 @@ module MCPClient
       # The array assertions whose effect depends on a companion keyword or
       # on the instance's length.
       # @return [Boolean]
-      def effective_array_assertion?(schema, keyword, value, data)
+      # A companion the dialect does not define (`minContains` under
+      # draft-07) changes nothing.
+      def effective_array_assertion?(schema, keyword, value, data, dialect = nil)
         case keyword
-        when 'contains' then schema['minContains'] != 0
+        when 'contains' then !(keyword_known?('minContains', dialect) && schema['minContains'].eql?(0))
         when 'minContains' then schema.key?('contains') && value.is_a?(Numeric) && value.positive?
         when 'maxContains' then schema.key?('contains')
         else

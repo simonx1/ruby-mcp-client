@@ -7,6 +7,15 @@ metadata). Each feature lands in its own PR; this section accumulates them.
 
 ### JSON Schema handling
 
+- **Dialect-opaque pointers and charged booleans (round 17).** A pointer
+  step through a keyword the dialect in force does not define
+  (`prefixItems` under draft-07) is opaque data, so it cannot undercount a
+  target's depth; every distinct boolean a `$ref` reaches counts once
+  toward `MAX_SUBSCHEMAS`; under draft-07 `format` is an unevaluated
+  assertion (a string branch carrying one is undecided) while 2019-09 and
+  2020-12 keep it an annotation; a companion keyword the dialect does not
+  define (`minContains` under draft-07) changes nothing.
+
 - **Round 12.** A `$id` resource the anchor index could not reach (beyond
   the depth bound) counts as truncation and a reference from a schema the
   index does not know is unresolvable, never resolved against the document

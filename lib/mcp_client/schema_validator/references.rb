@@ -229,7 +229,7 @@ module MCPClient
 
           if mode == :schema
             depth = depths[node] if node.is_a?(Hash) && depths.key?(node)
-            mode = pointer_step_mode(node, token)
+            mode = pointer_step_mode(node, token, dialect)
             depth += 1 unless %i[map array].include?(mode)
           else
             depth += 1
@@ -262,8 +262,10 @@ module MCPClient
       # How a keyword of a schema object holds what its pointer token reaches.
       # @return [Symbol] :schema (one subschema), :map, :array, or :opaque
       #   (data or unknown keyword: every token below is a step)
-      def pointer_step_mode(node, token)
-        return :opaque unless node.is_a?(Hash)
+      # A keyword the dialect in force does not define (`prefixItems` under
+      # draft-07, `additionalItems` under 2020-12) is opaque data there.
+      def pointer_step_mode(node, token, dialect)
+        return :opaque unless node.is_a?(Hash) && keyword_known?(token, dialect)
         return :map if SUBSCHEMA_MAP_KEYWORDS.include?(token)
         return :array if SUBSCHEMA_ARRAY_KEYWORDS.include?(token) || (token == 'items' && node[token].is_a?(Array))
         return :schema if SUBSCHEMA_KEYWORDS.include?(token)
