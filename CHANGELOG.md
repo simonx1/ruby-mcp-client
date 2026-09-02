@@ -7,6 +7,16 @@ metadata). Each feature lands in its own PR; this section accumulates them.
 
 ### Tasks extension (`io.modelcontextprotocol/tasks`)
 
+- **Abandoned handlers (round 22).** A handler round that outlived the
+  wait spends no input round (retries of a timed-out wait cannot exhaust
+  the per-task budget on one outstanding request), and the keys an
+  abandoned handler still presents stay reserved until it finishes, so a
+  retry polls instead of asking the host again. A `-32602` on
+  `tasks/update` or `tasks/cancel` is `TaskNotFound` only on an explicit
+  indication; a terminal-task or invalid-response rejection stays a
+  `TaskError`. A nested result whose `resultType` is present but not
+  `"complete"` is invalid.
+
 - **Task shape (round 16).** A task timestamp (`createdAt`,
   `lastUpdatedAt`) that is not an ISO 8601 timestamp is an
   `InvalidResultError` — in a `tasks/get` result and in a

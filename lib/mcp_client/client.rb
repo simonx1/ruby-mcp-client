@@ -1620,13 +1620,9 @@ module MCPClient
     #   unknown task for tasks/get, while tasks/update and tasks/cancel may use it for bad params too
     def task_error_from(error, task_id, action, modern: false, method: nil)
       shown = sanitize_peer_log_text(task_id.to_s)
-      # A rejection of the supplied inputResponses (tasks/update) is about
-      # the params, whatever else the message says: the task still exists.
-      about_params = method != 'tasks/get' && error.message.match?(/inputResponses|params/i)
-      not_found = !about_params &&
-                  (error.message.match?(/not found|unknown task|expired/i) ||
-                   (modern && error.respond_to?(:code) && error.code == MCPClient::Errors::Codes::INVALID_PARAMS))
-      return MCPClient::Errors::TaskNotFound.new("Task '#{shown}' not found") if not_found
+      if task_not_found_error?(error, method, modern)
+        return MCPClient::Errors::TaskNotFound.new("Task '#{shown}' not found")
+      end
 
       MCPClient::Errors::TaskError.new("Error #{action} task '#{shown}': #{sanitize_peer_log_text(error.message)}")
     end

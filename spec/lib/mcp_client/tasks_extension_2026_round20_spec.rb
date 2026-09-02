@@ -107,7 +107,10 @@ RSpec.describe 'MCP 2026-07-28 tasks extension — round 20' do
     expect { client.wait_for_task(task, timeout: 0.1) }.to raise_error(MCPClient::Errors::TaskError, /timed out/i)
     expect(Process.clock_gettime(Process::CLOCK_MONOTONIC) - started).to be < 1
     expect(sent.count { |r| r['method'] == 'tasks/update' }).to eq(0)
-    # The key is free again for the next wait.
+    # The key stays reserved while the abandoned handler still presents it,
+    # and is free again once that handler finished (round 22).
+    expect(client.send(:answered_task_keys, stdio, 'task-1')).to include('k1')
+    Kernel.sleep(2.1)
     expect(client.send(:answered_task_keys, stdio, 'task-1')).to be_empty
   end
 
