@@ -38,7 +38,7 @@ module MCPClient
       # @param scan [Hash] :count of subschemas seen so far, the canonical
       #   :dialect, the :walked objects and the memoized :anchors index
       # @return [void]
-      def collect_unsupported_keywords(schema, root, found, depth, scan)
+      def collect_unsupported_keywords(schema, root, found, depth, scan, dialect = scan[:dialect])
         return unless schema.is_a?(Hash) && depth <= MAX_SCHEMA_DEPTH
         return if scan[:walked].key?(schema)
 
@@ -46,27 +46,36 @@ module MCPClient
         scan[:count] += 1
         return if scan[:count] > MAX_SUBSCHEMAS
 
-        dialect = scan[:dialect]
-        collect_referenced_keywords(schema, root, found, depth, scan) if schema['$ref'].is_a?(String)
+        # An embedded resource declaring its own $schema is scanned under it.
+        dialect = embedded_dialect(schema, dialect) || dialect
+        collect_referenced_keywords(schema, root, found, depth, scan, dialect) if schema['$ref'].is_a?(String)
         if dialect == DRAFT_07 && schema.key?('$ref')
           # Nothing beside the $ref is applied; the definitions stay reachable.
-          each_definition(schema, dialect) { |sub| collect_unsupported_keywords(sub, root, found, depth + 1, scan) }
+          each_definition(schema, dialect) do |sub|
+            collect_unsupported_keywords(sub, root, found, depth + 1, scan, dialect)
+          end
           return
         end
 
         found.concat((schema.keys & UNSUPPORTED_KEYWORDS).select { |k| keyword_known?(k, dialect) })
-        each_subschema(schema, dialect) { |sub| collect_unsupported_keywords(sub, root, found, depth + 1, scan) }
+        each_subschema(schema, dialect) do |sub|
+          collect_unsupported_keywords(sub, root, found, depth + 1, scan, dialect)
+        end
       end
 
       # Scan what a local `$ref` applies (unresolvable or external references
       # are the preflight's business).
       # @return [void]
-      def collect_referenced_keywords(schema, root, found, depth, scan)
+      def collect_referenced_keywords(schema, root, found, depth, scan, dialect)
         ref = schema['$ref']
         return if external_ref?(ref)
 
         target = resolve_reference(root, ref, scan[:dialect], scan, from: schema)
-        collect_unsupported_keywords(target, root, found, depth + 1, scan) unless target.equal?(UNRESOLVED)
+        return if target.equal?(UNRESOLVED)
+
+        # What a reference reaches is scanned under its own resource's dialect.
+        collect_unsupported_keywords(target, root, found, depth + 1, scan,
+                                     (target.is_a?(Hash) && indexed_dialect(target, scan)) || dialect)
       end
     end
   end

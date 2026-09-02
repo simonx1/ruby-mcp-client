@@ -51,37 +51,70 @@ module MCPClient
 
       # Every plain-name anchor in the document, per schema resource:
       # `$anchor` (and `$dynamicAnchor`) in 2019-09 / 2020-12, `$id: "#name"`
-      # in draft-07. The walk is bounded like the preflight walk. Both
-      # definition bags are walked whatever the dialect: they are reachable
-      # through JSON pointers, and an anchor's resource is lexical.
+      # in draft-07. The walk is bounded like the preflight walk and follows
+      # the dialect of each resource (an embedded resource may declare its
+      # own `$schema`). Identifiers are taken only from schema positions the
+      # dialect walks (JSON Schema 2020-12 Core Sections 8.2.2 and 4.3.1: an
+      # identifier belongs to a schema object, and the value of a keyword
+      # the dialect does not define is not a schema): a definition bag the
+      # dialect does not define stays reachable through JSON pointers, and
+      # its objects are attributed to their lexical resource, but it is
+      # never a source of names — nor is anything beside a draft-07 `$ref`
+      # apart from its `definitions`.
       # @return [Hash] :resources (schema object => its resource root, by
-      #   identity) and :anchors (resource root => name => subschema, first
-      #   occurrence, by identity)
+      #   identity), :anchors (resource root => name => subschema, first
+      #   occurrence, by identity) and :dialects (resource root => dialect)
       def anchor_index(root, dialect)
-        index = { resources: {}.compare_by_identity, anchors: {}.compare_by_identity }
-        pending = [[root, root, 0]]
+        index = { resources: {}.compare_by_identity, anchors: {}.compare_by_identity,
+                  dialects: {}.compare_by_identity }
+        index[:dialects][root] = dialect
+        pending = [[root, root, 0, dialect, true]]
         visited = 0
         until pending.empty? || visited >= MAX_SUBSCHEMAS
-          schema, resource, depth = pending.shift
+          schema, resource, depth, dialect, named = pending.shift
           next unless schema.is_a?(Hash) && depth <= MAX_SCHEMA_DEPTH
+          next if index[:resources].key?(schema)
 
           visited += 1
-          # draft-07: everything beside a $ref is ignored, identifiers
-          # included; only the definitions bag stays reachable.
-          if dialect == DRAFT_07 && schema.key?('$ref')
-            index[:resources][schema] = resource
-            each_definition(schema, nil) { |sub| pending << [sub, resource, depth + 1] }
-            next
+          if resource_start?(schema)
+            resource = schema
+            dialect = embedded_dialect(schema, dialect) || dialect
+            index[:dialects][resource] = dialect
           end
-
-          resource = schema if resource_start?(schema)
           index[:resources][schema] = resource
-          names = (index[:anchors][resource] ||= {})
-          anchor_names(schema, dialect).each { |name| names[name] ||= schema }
-          each_subschema(schema, dialect) { |sub| pending << [sub, resource, depth + 1] }
-          each_foreign_definition(schema, dialect) { |sub| pending << [sub, resource, depth + 1] }
+          if named && !(dialect == DRAFT_07 && schema.key?('$ref'))
+            names = (index[:anchors][resource] ||= {})
+            anchor_names(schema, dialect).each { |name| names[name] ||= schema }
+          end
+          each_walked_position(schema, dialect) { |sub| pending << [sub, resource, depth + 1, dialect, named] }
+          each_foreign_definition(schema, dialect) { |sub| pending << [sub, resource, depth + 1, dialect, false] }
         end
         index
+      end
+
+      # Yield the schema positions the dialect walks under a schema object:
+      # under a draft-07 `$ref` only the `definitions` bag, else every
+      # subschema (the dialect's definition bag included).
+      # @return [void]
+      def each_walked_position(schema, dialect, &)
+        if dialect == DRAFT_07 && schema.key?('$ref')
+          each_definition(schema, dialect, &)
+        else
+          each_subschema(schema, dialect, &)
+        end
+      end
+
+      # The dialect the memoized anchor index recorded for a schema object's
+      # resource, or nil when the object was not indexed.
+      # @param schema [Hash]
+      # @param resolver [Hash, Context] holder of the memoized anchor index
+      # @return [String, nil]
+      def indexed_dialect(schema, resolver)
+        index = resolver[:anchors]
+        return nil unless index
+
+        resource = index[:resources][schema]
+        resource && index[:dialects][resource]
       end
 
       # Whether a schema object starts a new schema resource: its `$id` is a

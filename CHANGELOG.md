@@ -73,6 +73,18 @@ metadata). Each feature lands in its own PR; this section accumulates them.
   presence is decided by the `structuredContent` key, and the value —
   object, array, scalar or null — is validated against the output schema.
   The `x-mcp-header` annotation is ignored by the validator.
+- **Resources and anchors (round 9).** Plain-name anchors come only from
+  schema positions the dialect walks: a definition bag the dialect does
+  not define (`definitions` under 2020-12, `$defs` under draft-07) stays
+  pointer-addressable but is never a source of names, and nothing beside a
+  draft-07 `$ref` but its `definitions` is. An embedded resource root (a
+  subschema whose `$id` is a URI) may declare its own `$schema`, which is
+  the dialect for that resource at preflight, in the anchor index, in the
+  keyword scan and during validation (a malformed or unsupported embedded
+  `$schema` makes the schema unusable like at the root; a `$schema` that is
+  not at a resource root is ignored). The structural bound counts array
+  members too, so a wide array of boolean schemas is rejected before it is
+  copied, and numeric bound errors clip the values they quote.
 
 ### Authorization (RFC 9207 issuer validation, client registration)
 

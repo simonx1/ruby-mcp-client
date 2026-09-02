@@ -1,0 +1,49 @@
+# frozen_string_literal: true
+
+module MCPClient
+  module SchemaValidator
+    # The bounded, string-keyed copy of a peer-supplied schema document.
+    # Extended into SchemaValidator, so the methods are its own.
+    module Normalization
+      # A copy of the schema with every structural Hash key as a String, so
+      # keyword lookups and JSON pointers see one key form. Data-carrying
+      # keywords (enum, const, default, examples) are left exactly as given,
+      # the walk stops at the nesting bound, and — given a budget — the copy
+      # stops as soon as the document holds more structural elements (objects
+      # and array members, boolean subschemas included) than
+      # MAX_STRUCTURAL_OBJECTS, before the rest is ever read.
+      # @param node [Object]
+      # @param depth [Integer]
+      # @param budget [Hash, nil] :objects copied so far
+      # @return [Object]
+      # @raise [TooLarge] when the budget is exceeded
+      def deep_stringify(node, depth = 0, budget = nil)
+        return node if depth > MAX_SCHEMA_DEPTH + 1
+
+        case node
+        when Hash
+          charge_structure(budget, 1)
+          node.to_h do |key, value|
+            name = key.to_s
+            [name, DATA_KEYWORDS.include?(name) ? value : deep_stringify(value, depth + 1, budget)]
+          end
+        when Array
+          charge_structure(budget, node.length + 1)
+          node.map { |value| deep_stringify(value, depth + 1, budget) }
+        else node
+        end
+      end
+
+      # Account for structural elements about to be copied.
+      # @raise [TooLarge] when the budget is exceeded
+      def charge_structure(budget, count)
+        return unless budget
+
+        budget[:objects] += count
+        return if budget[:objects] <= MAX_STRUCTURAL_OBJECTS
+
+        raise TooLarge, "schema has more than #{MAX_STRUCTURAL_OBJECTS} structural elements"
+      end
+    end
+  end
+end
