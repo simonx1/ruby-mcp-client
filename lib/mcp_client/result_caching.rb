@@ -131,18 +131,18 @@ module MCPClient
       return nil if entries.empty?
 
       combined = bind_authorization_context(MCPClient::CachedResult.combine(entries, value, now: now))
-      # A private list whose pages were fetched under different credentials
-      # belongs to no single context; a list invalidated while it was being
-      # fetched is already stale.
+      # A list invalidated while it was being fetched is already stale and
+      # never replaces what is installed now (the invalidation's placeholder
+      # or a newer fetch); a private list whose pages were fetched under
+      # different credentials belongs to no single context.
       mixed = combined.cache_scope == 'private' && contexts && contexts.uniq.size > 1
       cache_entries_mutex.synchronize do
-        if mixed
+        if epoch && epoch != (@cache_epoch || 0)
+          combined = MCPClient::CachedResult.stale(now: now, like: combined)
+        elsif mixed
           combined = MCPClient::CachedResult.stale(now: now, like: combined)
           combined.authorization_context = MCPClient::CachedResult::MIXED_CONTEXT
           cache_entries[kind] = combined
-        elsif epoch && epoch != (@cache_epoch || 0)
-          # Invalidated while in flight: the current entry stays.
-          combined = MCPClient::CachedResult.stale(now: now, like: combined)
         else
           cache_entries[kind] = combined
         end
@@ -234,7 +234,7 @@ module MCPClient
     # @return [MCPClient::CachedResult, nil]
     def private_entry_for_current_context(kind)
       entry = cache_entries_mutex.synchronize { cache_entries[kind] }
-      return entry if entry_in_current_context?(entry)
+      return entry if entry_in_current_context?(entry, kind: kind)
 
       # Another context's private entry reads as known-and-stale, never as
       # "nothing cached" (which would count as fresh) and never as a value.
@@ -244,13 +244,15 @@ module MCPClient
     # @param entry [MCPClient::CachedResult, nil]
     # @return [Boolean] whether the entry may be served in the current authorization context
     # @param context [String, nil, :current, :unknown] the authorization context to check against
-    #   (:current asks the transport which credentials it would send now; :unknown means the
-    #   credentials are not known, so no private entry matches)
-    def entry_in_current_context?(entry, context: :current)
+    #   (:current asks the transport which credentials it would send now for the operation of
+    #   `kind`; :unknown means the credentials are not known, so no private entry matches)
+    # @param kind [Symbol, String, nil] the cache kind, so the transport models the request of
+    #   that very operation (middleware may pick credentials by method or body)
+    def entry_in_current_context?(entry, context: :current, kind: nil)
       return true unless entry&.cache_scope == 'private' && respond_to?(:current_authorization_context, true)
       return false if entry.authorization_context.equal?(MCPClient::CachedResult::MIXED_CONTEXT)
 
-      context = current_authorization_context if context == :current
+      context = current_authorization_context(kind) if context == :current
       entry.authorization_context == context
     end
 
@@ -295,14 +297,14 @@ module MCPClient
     # belongs to the authorization context (checked against the credentials
     # the failed request actually used, when the caller knows them) — an
     # entry installed meanwhile by another request never vouches for it.
-    # @param _kind [Symbol]
+    # @param kind [Symbol]
     # @param entry [MCPClient::CachedResult, nil] the entry captured before the re-fetch
     # @param context [String, nil, :current] the authorization context to check against
     # @return [Object, nil]
-    def stale_fallback_for(_kind, entry, context: :current)
+    def stale_fallback_for(kind, entry, context: :current)
       return nil unless entry.is_a?(MCPClient::CachedResult) && entry.value
 
-      entry_in_current_context?(entry, context: context) ? entry.value : nil
+      entry_in_current_context?(entry, context: context, kind: kind) ? entry.value : nil
     end
 
     # The freshness hint recorded for an operation.

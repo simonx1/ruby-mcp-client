@@ -543,8 +543,9 @@ module MCPClient
     # cacheScope "private"): HTTP+SSE sends the static Authorization header
     # it was configured with, so that header is both what the next request
     # would carry and what the last one carried.
+    # @param _kind [Symbol, String, nil] the cache kind (every request carries the same header)
     # @return [String, nil]
-    def current_authorization_context
+    def current_authorization_context(_kind = nil)
       authorization_fingerprint(@headers['Authorization'] || @headers['authorization'])
     end
 

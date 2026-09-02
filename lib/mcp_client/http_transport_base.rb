@@ -490,7 +490,13 @@ module MCPClient
 
       begin
         response = send_http_request(request, timeout: timeout, extra_headers: extra_headers)
-        parse_response(response, request)
+        result = parse_response(response, request)
+        # Parsing an SSE-framed response dispatches the notifications it
+        # carries; a callback may have sent a request of its own on this
+        # thread. The result stays bound to the credentials of its own
+        # request (MCP 2026-07-28 caching), not to that nested request's.
+        note_sent_authorization(response)
+        result
       rescue MCPClient::Errors::ConnectionError, MCPClient::Errors::TransportError, MCPClient::Errors::ServerError
         raise
       rescue JSON::ParserError => e
