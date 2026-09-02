@@ -88,18 +88,31 @@ module MCPClient
     MAX_ERRORS = 100
     MAX_VALUE_INSPECT = 64
 
-    # How deeply {.validate_node} may nest. The walk is plain recursion, so
-    # its depth is the interpreter's stack depth: the instance nests a level
-    # per array item or property, and a recursive `$ref` follows it down
-    # without bound (the hop budget restarts at every value, so that a
-    # recursive schema can describe deep data at all). A validation that
-    # outgrew the stack would raise SystemStackError past every bound this
-    # validator applies; nesting is counted instead, so the deepest instance
-    # aborts with one error like any other exhausted budget. The bound sits
-    # well above what a peer can send — `JSON.parse` refuses more than 100
-    # levels of nesting by default — and well below what the smallest stack
-    # this library runs on (a transport's reader thread) can carry.
-    MAX_NODE_DEPTH = 512
+    # How deeply the walk may descend into the instance. The walk is plain
+    # recursion, so this drives the interpreter's stack: the instance nests a
+    # level per array item or property, and a recursive `$ref` follows it
+    # down without bound (the hop budget restarts at every value, so that a
+    # recursive schema can describe deep data at all). Counting the descent
+    # lets the deepest instance abort with one error like any other
+    # exhausted budget.
+    #
+    # Only a step into a child value — an array item or a property value —
+    # counts. The frames a schema spends on one value (a `$ref` hop, an
+    # allOf/anyOf/oneOf/if branch) do not: a recursive schema composed
+    # through a few `$defs` mixins applies several of them per instance
+    # level, and counting those would make the budget a fraction of the
+    # instance depth it names, so data a peer can legitimately send — its
+    # nesting under `JSON.parse`'s default limit of 100 — would abort. Those
+    # frames stay bounded by MAX_REF_DEPTH and MAX_NODE_VISITS instead, which
+    # is what already stops a schema recursing on one value forever.
+    #
+    # The bound therefore sits well above the deepest instance a peer can
+    # send, and below the number of levels the smallest stack this library
+    # runs on (a transport's reader thread) carries for a plain recursive
+    # schema. It cannot on its own promise the stack holds, since it does not
+    # bound what one level costs; {.validate} catches SystemStackError for
+    # the schema that spends more per level than the stack has to give.
+    MAX_NODE_DEPTH = 256
 
     # JSON Schema keywords that affect validation but that this validator
     # does not evaluate: assertion keywords (multipleOf, uniqueItems,
@@ -598,13 +611,22 @@ module MCPClient
       ["#{path}: #{e.message}"]
     rescue Aborted => e
       ["#{path}: validation aborted: #{e.message}"]
+    rescue SystemStackError
+      # MAX_NODE_DEPTH bounds how deep the instance may nest, but not what
+      # one level costs: a schema is free to spend a `$ref` chain and a stack
+      # of composition branches on every value, and the stack this runs on
+      # may be a transport reader thread's. The walk is plain recursion with
+      # no state outside `ctx`, so the unwound stack leaves nothing behind —
+      # the validation ends the way an exhausted budget does, as one error,
+      # never as a crash out of a tool call.
+      ["#{path}: validation aborted: schema too deeply recursive for this stack"]
     end
 
-    # Validate one value against one (sub)schema, under the bounds on the
-    # walk itself: one more node visited, one level deeper. The nesting is
-    # counted here rather than passed down, so every recursion into the walk
-    # is bounded — an instance nesting a level per item, a subschema, and a
-    # `$ref` followed from either.
+    # Validate one value against one (sub)schema, under the bound on the walk
+    # itself: one more node visited. Applying another schema to the same
+    # value does not nest the instance, so it is the `$ref` hop budget and
+    # the visit cap that bound it; {.validate_child} accounts for the steps
+    # that do nest.
     # @param data [Object] the value
     # @param schema [Object] a subschema (Hash or boolean)
     # @param path [String] location for error messages
@@ -614,10 +636,24 @@ module MCPClient
     # @raise [Aborted] when a bound is hit
     def self.validate_node(data, schema, path, ctx, ref_depth)
       count_visit(ctx)
-      ctx.depth += 1
-      raise Aborted, "instance or schema nesting deeper than #{MAX_NODE_DEPTH}" if ctx.depth > MAX_NODE_DEPTH
-
       validate_node_keywords(data, schema, path, ctx, ref_depth)
+    end
+
+    # Validate a child of the value being validated — an array item or a
+    # property value — against the subschema for it. This is the one step
+    # that nests the instance, so it is where the walk's depth is counted and
+    # where the `$ref` hop budget starts over (see {.validate_object}).
+    # @param data [Object] the child value
+    # @param schema [Object] the subschema for it (Hash or boolean)
+    # @param path [String] location for error messages
+    # @param ctx [Context] the validation context
+    # @return [Array<String>] validation errors
+    # @raise [Aborted] when a bound is hit
+    def self.validate_child(data, schema, path, ctx)
+      ctx.depth += 1
+      raise Aborted, "instance nested deeper than #{MAX_NODE_DEPTH}" if ctx.depth > MAX_NODE_DEPTH
+
+      validate_node(data, schema, path, ctx, 0)
     ensure
       ctx.depth -= 1
     end
@@ -831,7 +867,8 @@ module MCPClient
         # A property is a smaller instance, so the hops taken to reach this
         # schema cannot repeat forever below it: the budget counts a chain
         # of references applied to one value, not how deep the data nests.
-        errors.concat(validate_node(data[key], prop_schema, "#{path}/#{name}", ctx, 0))
+        # The step down is what the depth bound counts.
+        errors.concat(validate_child(data[key], prop_schema, "#{path}/#{name}", ctx))
       end
       errors
     end
@@ -871,10 +908,10 @@ module MCPClient
                       end
         next unless schema_value?(item_schema)
 
-        # An item is a smaller instance: the hop budget starts over, so a
-        # recursive schema describes data of any depth (see
-        # {.validate_object}).
-        errors.concat(validate_node(item, item_schema, "#{path}/#{idx}", ctx, 0))
+        # An item is a smaller instance: the hop budget starts over and the
+        # depth bound counts the step, so a recursive schema describes data
+        # of any depth up to it (see {.validate_object}).
+        errors.concat(validate_child(item, item_schema, "#{path}/#{idx}", ctx))
       end
       errors.concat(validate_contains(data, schema, path, dialect))
     end

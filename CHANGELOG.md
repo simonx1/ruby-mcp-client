@@ -7,6 +7,25 @@ metadata). Each feature lands in its own PR; this section accumulates them.
 
 ### JSON Schema handling
 
+- **The instance-depth bound counts descents into the instance (round 26).**
+  The depth budget the walk applies (round 25) counted every frame of the
+  walk, `$ref` hops and `allOf` / `anyOf` / `oneOf` / `if` branches applied to
+  the *same* instance value included. A recursive schema composed through a
+  handful of `$defs` mixins spends several such frames per instance level, so
+  the count ran up at a multiple of the data's depth and JSON a peer can
+  legitimately send — nesting under `JSON.parse`'s default `max_nesting` of
+  100 — aborted with `validation aborted: instance or schema nesting deeper
+  than 512`: a `SchemaValidationError` under `:strict`, a false mismatch
+  under `:warn`. Only a step into a child value — an array item or a property
+  value — is counted now, the way the validate-time `$ref` hop budget already
+  works, and same-instance recursion stays bounded by `MAX_REF_DEPTH` and
+  `MAX_NODE_VISITS` as before. The bound is 256 levels of instance nesting,
+  and because it cannot bound what a single level costs on the stack,
+  `SchemaValidator.validate` also catches `SystemStackError` and reports it as
+  one aborted validation: an instance nested past what the stack can carry
+  still ends as a validation error rather than an exception escaping a tool
+  call, on a transport's reader thread as much as on the main one.
+
 - **A `$ref` to a non-schema member, unsatisfiable `contains` bounds and a
   depth-bounded walk (round 25).** The keyword scan no longer raises
   `ArgumentError` when a local `$ref` points at a member that is not a schema
@@ -24,7 +43,8 @@ metadata). Each feature lands in its own PR; this section accumulates them.
   the interpreter's stack allows — reachable through the public
   `SchemaValidator.validate`, which unlike the wire path is not gated by
   `JSON.parse`'s `max_nesting` — aborts with a single validation error
-  instead of a `SystemStackError` that escapes the validator.
+  instead of a `SystemStackError` that escapes the validator. (What that
+  bound counts, and its value, are corrected in round 26 above.)
 
 - **Malformed percent escapes, contains bounds the length settles and the
   `$ref` hop budget (round 24).** A `$ref` fragment holding a malformed
