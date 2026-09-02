@@ -42,17 +42,78 @@ module MCPClient
         return UNRESOLVED if from.is_a?(Hash) && !index[:resources].key?(from)
 
         resource = (from && index[:resources][from]) || root
-        fragment = ref.delete_prefix('#')
-        if fragment.empty? || fragment.start_with?('/', '%2F', '%2f')
-          return adopt_reached_target(resolve_pointer(resource, ref), resource, index)
-        end
+        raw = ref.delete_prefix('#')
+        return resolve_adopted_pointer(resource, ref, index) if raw.empty? || raw.start_with?('/', '%2F', '%2f')
 
         # A plain-name fragment is percent-decoded like a pointer fragment
         # (RFC 3986 Section 2.1): "#foo%2Dbar" names the anchor "foo-bar".
-        fragment = URI.decode_uri_component(fragment) rescue fragment # rubocop:disable Style/RescueModifier
-        return UNRESOLVED unless fragment.match?(ANCHOR_NAME)
+        fragment = decoded_fragment(ref)
+        return UNRESOLVED unless fragment&.match?(ANCHOR_NAME)
 
         index[:anchors].fetch(resource, {}).fetch(fragment, UNRESOLVED)
+      end
+
+      # The decoded fragment of a reference (RFC 3986 Section 2.1), or nil
+      # when what the peer wrote does not decode to readable text: escapes
+      # that are not valid UTF-8 name nothing in this document, and reading
+      # them must never raise out of the validation.
+      # @param ref [String] the `$ref` value
+      # @return [String, nil]
+      def decoded_fragment(ref)
+        fragment = ref.delete_prefix('#')
+        decoded = URI.decode_uri_component(fragment) rescue fragment # rubocop:disable Style/RescueModifier
+        decoded if decoded.valid_encoding?
+      end
+
+      # Resolve a JSON pointer within a schema resource, adopting on the way
+      # whatever subtree the pointer enters through a data keyword (`default`
+      # and the rest): that subtree is normalized and indexed once — memoized
+      # by the identity of the object the document holds — and the remaining
+      # tokens are walked through the copy. So every pointer into it lands on
+      # the objects the index already knows, with the resource, dialect and
+      # subschema charge it gave them: a nested pointer is not a second copy
+      # attributed to the referrer (JSON Schema 2020-12 Core Sections 8.1.1
+      # and 8.2.1: a schema belongs to the resource of its nearest `$id`
+      # ancestor, wherever a reference reached it from).
+      # @param resource [Hash] the resource root the pointer starts at
+      # @param ref [String] the `$ref` value
+      # @param index [Hash] the anchor index
+      # @return [Object] the referenced value, or UNRESOLVED
+      def resolve_adopted_pointer(resource, ref, index)
+        fragment = decoded_fragment(ref)
+        return UNRESOLVED unless fragment
+        return adopt_reached_target(resource, resource, index) if fragment.empty?
+        return UNRESOLVED unless fragment.start_with?('/')
+
+        node = resource
+        mode = :schema
+        fragment[1..].split('/', -1).each do |token|
+          # RFC 6901 Section 3: "~" is only ever followed by "0" or "1".
+          return UNRESOLVED if token.match?(/~(?![01])/)
+
+          node, resource, mode = adopt_step(node, resource, index, mode)
+          token = token.gsub('~1', '/').gsub('~0', '~')
+          child = pointer_child(node, token)
+          return UNRESOLVED if child.equal?(UNRESOLVED)
+
+          mode = member_mode(token, child, mode)
+          node = child
+        end
+        adopt_reached_target(node, resource, index, raw: mode == :data)
+      end
+
+      # Adopt the object a pointer is about to step through when the document
+      # holds it as data, and follow the resource the index attributes it to.
+      # @return [Array(Object, Hash, Symbol)] the node to step through, the
+      #   resource it belongs to, and the mode it is read in
+      def adopt_step(node, resource, index, mode)
+        return [node, resource, mode] unless node.is_a?(Hash)
+
+        if mode == :data
+          node = adopt_reached_target(node, resource, index, raw: true)
+          mode = :schema
+        end
+        [node, index[:resources][node] || resource, mode]
       end
 
       # A schema a pointer reaches outside every indexed position (inside
@@ -60,29 +121,41 @@ module MCPClient
       # the resource it was reached from: it (and what it holds) is indexed
       # on arrival, so a `$ref` written anywhere in it resolves within that
       # resource and its nested schemas follow the dialect it adopts, and
-      # the document it holds is normalized like everywhere else (data
-      # values are kept as given for equality; a target resolved as a schema
-      # gets one string-keyed copy, memoized by identity).
+      # what the document holds as data is normalized like everywhere else
+      # (values are kept as given for equality; a subtree resolved as a
+      # schema gets one string-keyed copy, memoized by identity).
+      # @param raw [Boolean] whether the document holds the target as data,
+      #   so it still needs its string-keyed copy
       # @return [Object] the target (or its normalized copy)
-      def adopt_reached_target(target, resource, index)
+      def adopt_reached_target(target, resource, index, raw: false)
         return target unless target.is_a?(Hash)
-        # An indexed position was already walked, charged and attributed.
-        return target if index[:resources].key?(target)
 
         # Copied under the same structural budget as the root document,
         # whatever key form it arrived in (over the wire every key is a
         # string): a data keyword may not hide an unbounded map behind a
         # pointer.
-        copies = (index[:normalized] ||= {}.compare_by_identity)
-        index[:budget] ||= { objects: 0, deadline: nil }
-        target = copies[target] ||= deep_stringify(target, 0, index[:budget])
+        target = normalized_copy(target, index) if raw && !index[:resources].key?(target)
+        # An indexed position was already walked, charged and attributed.
         return target if index[:resources].key?(target)
 
         # The adopted target is indexed like any schema position, so its own
         # `$id` / `$schema` and the positions below it are seen: within the
-        # bounds the index already runs under.
-        index_positions(index, [[target, resource, 0, index[:dialects][resource], true]])
+        # bounds the index already runs under. It declares no names of its
+        # own — `resource_root?` turns naming on where an `$id` really starts
+        # a resource — since a data keyword is not a schema position and an
+        # `$anchor` written inside one names nothing in the document (Core
+        # Sections 8.2.2 and 4.3.1).
+        index_positions(index, [[target, resource, 0, index[:dialects][resource], false]])
         target
+      end
+
+      # The one string-keyed copy of a subtree the document holds as data,
+      # memoized by the identity of the object it holds.
+      # @return [Hash]
+      def normalized_copy(target, index)
+        copies = (index[:normalized] ||= {}.compare_by_identity)
+        index[:budget] ||= { objects: 0, deadline: nil }
+        copies[target] ||= deep_stringify(target, 0, index[:budget])
       end
 
       # Every plain-name anchor in the document, per schema resource:
@@ -312,9 +385,8 @@ module MCPClient
       # The decoded RFC 6901 tokens of a fragment pointer.
       # @return [Array<String>, nil] nil unless the reference is a pointer
       def pointer_tokens(ref)
-        fragment = ref.delete_prefix('#')
-        fragment = URI.decode_uri_component(fragment) rescue fragment # rubocop:disable Style/RescueModifier
-        return nil unless fragment.start_with?('/')
+        fragment = decoded_fragment(ref)
+        return nil unless fragment&.start_with?('/')
 
         fragment[1..].split('/', -1).map { |token| token.gsub('~1', '/').gsub('~0', '~') }
       end
@@ -351,37 +423,6 @@ module MCPClient
           next if keyword_known?(keyword, dialect)
 
           schema[keyword].each_value(&block) if schema[keyword].is_a?(Hash)
-        end
-      end
-
-      # Resolve a fragment JSON pointer (`#`, `#/$defs/x`, `#/a~1b`, with
-      # percent-encoding per RFC 6901 Section 6) within a schema resource.
-      # @param root [Hash] the resource root (string keys)
-      # @param ref [String] the `$ref` value
-      # @return [Object] the referenced value, or UNRESOLVED
-      def resolve_pointer(root, ref)
-        fragment = ref.delete_prefix('#')
-        fragment = URI.decode_uri_component(fragment) rescue fragment # rubocop:disable Style/RescueModifier
-        return root if fragment.empty?
-        return UNRESOLVED unless fragment.start_with?('/')
-
-        fragment[1..].split('/', -1).reduce(root) do |node, token|
-          # RFC 6901 Section 3: "~" is only ever followed by "0" or "1".
-          return UNRESOLVED if token.match?(/~(?![01])/)
-
-          key = token.gsub('~1', '/').gsub('~0', '~')
-          case node
-          when Hash
-            return UNRESOLVED unless node.key?(key)
-
-            node[key]
-          when Array
-            return UNRESOLVED unless key.match?(/\A(0|[1-9]\d*)\z/) && key.to_i < node.length
-
-            node[key.to_i]
-          else
-            return UNRESOLVED
-          end
         end
       end
     end

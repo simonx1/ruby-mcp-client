@@ -415,6 +415,7 @@ module MCPClient
       # each transport takes its own.
       servers.each do |server|
         CACHED_LIST_KINDS.each { |kind| refresh_server_cache(server, kind) }
+        forget_schema_checks
       end
     end
 
@@ -824,6 +825,7 @@ module MCPClient
         drop_cached_entries(cache, server)
         # This server's slice now stands for its whole list, empty or not.
         (@cache_filled[kind] ||= {}.compare_by_identity)[server] = true
+        forget_schema_checks(server) if kind == :tools
         if server.respond_to?(:current_params_fingerprint, true)
           # The slice is tied to the very transport entry its list came
           # from — its identity and the parameters that entry is bound to
@@ -969,6 +971,7 @@ module MCPClient
           @tool_cache.clear
           @cache_params.delete(:tools)
           @cache_filled.delete(:tools)
+          forget_schema_checks
         end
       when 'notifications/prompts/list_changed'
         logger.warn("[#{server_id}] Prompt list has changed, clearing prompt cache")
@@ -1410,6 +1413,26 @@ module MCPClient
     def drop_cached_entries(cache, server)
       prefix = "#{server.object_id}:"
       cache.delete_if { |key, _| key.start_with?(prefix) }
+    end
+
+    # Forget the once-per-definition schema checks of the tool definitions a
+    # cache slice no longer holds. Their keys name a tool definition, so a
+    # server that keeps renaming its tools would otherwise grow both memos
+    # without bound; a definition still served is checked again on its next
+    # use, which its identity token decides anyway.
+    # @param server [MCPClient::ServerBase, nil] the server whose entries go,
+    #   or nil for every server
+    # @return [void]
+    def forget_schema_checks(server = nil)
+      [@input_schema_warnings, @output_schema_coverage].each do |memo|
+        next unless memo
+
+        if server
+          memo.delete_if { |(server_id, _name), _| server_id == server.object_id }
+        else
+          memo.clear
+        end
+      end
     end
 
     # Generate a cache key for server-specific items

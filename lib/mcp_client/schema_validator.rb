@@ -225,8 +225,11 @@ module MCPClient
     end
 
     # {.check_schema} on an already normalized schema.
+    # @param counter [Hash] filled in with the preflight state (the memoized
+    #   anchor index included), so a caller going on to validate reads the
+    #   document the way the preflight read it
     # @return [Array<String>] problems
-    def self.check_normalized(root)
+    def self.check_normalized(root, counter = {})
       return [] if [true, false].include?(root)
       return ["schema must be an object or a boolean, got #{json_type(root)}"] unless root.is_a?(Hash)
 
@@ -238,8 +241,8 @@ module MCPClient
       end
 
       problems = []
-      counter = { count: 0, dialect: canonical_dialect(declared), walked: {}.compare_by_identity,
-                  depths: lexical_depths(root, canonical_dialect(declared)) }
+      counter.update(count: 0, dialect: canonical_dialect(declared), walked: {}.compare_by_identity,
+                     depths: lexical_depths(root, canonical_dialect(declared)))
       walk_schema(root, root, 0, counter, problems)
       problems.concat(anchor_index_problems(root, counter)) if problems.empty?
       problems.uniq
@@ -564,11 +567,16 @@ module MCPClient
       # document included.
       deadline ||= Process.clock_gettime(Process::CLOCK_MONOTONIC) + PATTERN_MATCH_TIMEOUT
       root = normalize_schema(schema, deadline: deadline)
-      problems = check_normalized(root)
+      # `preflight` comes back holding the state the check read the schema under.
+      problems = check_normalized(root, preflight = {})
       return problems.map { |problem| "#{path}: #{problem}" } unless problems.empty?
 
+      # The index the preflight built is the one this validation reads (the
+      # resources, dialects and anchors a schema was accepted under, and the
+      # subtrees its references adopted): a second one would make what a
+      # reference resolves to depend on the order this instance applies them.
       ctx = Context.new(root: root, deadline: deadline, dialect: canonical_dialect(dialect(root)),
-                        visits: 0, errors: 0, speculative: 0, anchors: nil, undecided: 0)
+                        visits: 0, errors: 0, speculative: 0, anchors: preflight[:anchors], undecided: 0)
       validate_node(data, root, path, ctx, 0)
     rescue TooLarge => e
       ["#{path}: #{e.message}"]
@@ -596,9 +604,6 @@ module MCPClient
       dialect = node_dialect(schema, ctx)
       return validate_ref(data, schema, path, ctx, ref_depth) if schema.key?('$ref') && dialect == DRAFT_07
 
-      # A keyword the validator does not evaluate makes this node's verdict
-      # partial: a pass here is not a proof for not / oneOf / if.
-      ctx.undecided += 1 if partial_keywords?(schema, dialect, data, ctx.deadline)
       errors = []
       counted_before = ctx.errors
       errors.concat(validate_ref(data, schema, path, ctx, ref_depth)) if schema.key?('$ref')
@@ -611,6 +616,13 @@ module MCPClient
       when Numeric then errors.concat(validate_number(data, schema, path, dialect))
       end
       errors.concat(validate_composition(data, schema, path, ctx, ref_depth))
+      # A keyword the validator does not evaluate makes this node's verdict
+      # partial: a pass here is not a proof for not / oneOf / if. A node its
+      # supported assertions already rejected is decided whatever else it
+      # holds, and pays for no such measurement: the coverage checks match
+      # server-controlled patterns, which must not be able to abort a
+      # validation the branch has settled.
+      ctx.undecided += 1 if errors.empty? && partial_keywords?(schema, dialect, data, ctx.deadline)
       # Errors raised by nested nodes were counted when they were produced;
       # only this node's own errors are new.
       count_errors(ctx, errors, already_counted: ctx.errors - counted_before)
