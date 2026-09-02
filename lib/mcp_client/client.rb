@@ -66,10 +66,12 @@ module MCPClient
     # @param logger [Logger, nil] optional logger, defaults to STDOUT
     # @param elicitation_handler [Proc, nil] optional handler for elicitation requests (MCP 2025-06-18)
     # @param roots [Array<MCPClient::Root, Hash>, nil] optional list of roots (MCP 2025-06-18).
-    #   Deprecated since MCP 2026-07-28 (SEP-2577): pass directories or files through tool
-    #   parameters, resource URIs or server configuration instead.
+    #   Deprecated since MCP 2026-07-28 (SEP-2577); earliest removal is the first revision
+    #   released on or after 2027-07-28. Pass directories or files through tool parameters,
+    #   resource URIs or server configuration instead.
     # @param sampling_handler [Proc, nil] optional handler for sampling requests (MCP 2025-11-25).
-    #   Deprecated since MCP 2026-07-28 (SEP-2577): integrate directly with the LLM provider API.
+    #   Deprecated since MCP 2026-07-28 (SEP-2577); earliest removal is the first revision
+    #   released on or after 2027-07-28. Integrate directly with the LLM provider API instead.
     # @param sampling_supports_tools [Boolean] whether the sampling handler supports tool use
     #   (MCP 2025-11-25 / SEP-1577); declares the sampling.tools capability and forwards
     #   tools/toolChoice params to the handler instead of rejecting tool-enabled requests

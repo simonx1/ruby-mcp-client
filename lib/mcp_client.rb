@@ -55,7 +55,9 @@ module MCPClient
   # - ping [Integer] Ping interval for SSE (default: 10)
   # - endpoint [String] JSON-RPC endpoint path (default: '/rpc')
   # - transport [Symbol] Force transport type (:stdio, :sse, :http, :streamable_http)
-  # - sampling_handler [Proc] Handler for sampling requests
+  # - sampling_handler [Proc] Handler for sampling requests. Deprecated since MCP
+  #   2026-07-28 (SEP-2577); earliest removal is the first revision released on or
+  #   after 2027-07-28. Integrate directly with the LLM provider API instead.
   # @yield [Faraday::Connection] Optional block for Faraday customization
   # @return [MCPClient::Client] Connected client ready to use
   # @raise [MCPClient::Errors::ConnectionError] if connection fails

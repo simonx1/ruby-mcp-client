@@ -719,11 +719,12 @@ module MCPClient
         return
       end
 
-      # Serving roots/list means this transport declared, and is using, the
-      # deprecated Roots capability (SEP-2577) — with or without a Client.
-      warn_roots_deprecated
       # Call the registered callback
       result = @roots_list_request_callback.call(request_id, params)
+      # Serving a roots/list answer that carries a root means this host
+      # declared, and is using, the deprecated Roots capability (SEP-2577) —
+      # with or without a Client. An empty answer is not use of it.
+      warn_roots_deprecated(result)
 
       # Send the response back to the server (echoing related-task _meta)
       send_roots_list_response(request_id, merge_related_task_meta(result, params))

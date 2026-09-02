@@ -473,12 +473,20 @@ migration:
 
 | Feature | Deprecated since | Earliest removal | Migration |
 |---------|------------------|------------------|-----------|
-| Roots (`roots:`, `Client#roots=`) | 2026-07-28 (SEP-2577) | the first revision released on or after 2027-07-28 | Pass directories or files through tool parameters, resource URIs or server configuration |
-| Sampling (`sampling_handler:`) | 2026-07-28 (SEP-2577) | the first revision released on or after 2027-07-28 | Integrate directly with the LLM provider API |
+| Roots (`roots:`, `Client#roots=`, or answering a `roots/list` request with a non-empty list) | 2026-07-28 (SEP-2577) | the first revision released on or after 2027-07-28 | Pass directories or files through tool parameters, resource URIs or server configuration |
+| Sampling (`sampling_handler:` on `Client.new` or `MCPClient.connect`) | 2026-07-28 (SEP-2577) | the first revision released on or after 2027-07-28 | Integrate directly with the LLM provider API |
 | Logging (`log_level=` on the client or a server, `notifications/message`) | 2026-07-28 (SEP-2577) | the first revision released on or after 2027-07-28 | Log to stderr (stdio) or use OpenTelemetry |
 | HTTP+SSE transport (`MCPClient::ServerSSE`, warned once it is connected) | 2025-03-26 (reclassified by SEP-2596) | three months after SEP-2596 reaches Final | Migrate the server to Streamable HTTP |
 | `includeContext` `"thisServer"` / `"allServers"` in sampling requests | 2025-11-25 (reclassified by SEP-2596) | follows Sampling (SEP-2577) | Servers omit the field or send `"none"` |
 | OAuth Dynamic Client Registration | 2026-07-28 (PR #2858) | the first revision released on or after 2027-07-28 | Client ID Metadata Documents or pre-registered credentials |
+
+A client that never adopted Roots is never warned about them. It registers a
+`roots/list` handler on every server unconditionally, so that a later
+`client.roots = [...]` is served without reconnecting, and until a root is set
+it answers `roots/list` with an empty list — an empty answer exposes nothing
+deprecated, so it raises no notice. The notice fires when the host configures
+`roots:`, calls `Client#roots=`, or serves an answer that actually carries a
+root (including from a transport driven directly, without a `Client`).
 
 `MCPClient::Deprecations::REGISTRY` lists them, each with its
 `earliest_removal`; set
