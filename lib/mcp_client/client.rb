@@ -425,6 +425,7 @@ module MCPClient
       # each transport takes its own.
       servers.each do |server|
         CACHED_LIST_KINDS.each { |kind| refresh_server_cache(server, kind) }
+        forget_schema_checks
       end
     end
 
@@ -1286,6 +1287,25 @@ module MCPClient
       server.send(:take_called_tool_definition, tool_name.to_s)&.first
     end
 
+    # Forget the once-per-definition schema checks of the tool definitions a
+    # cache slice no longer holds. Their keys name a tool definition, so a
+    # server that keeps renaming its tools would otherwise grow both memos
+    # without bound; a definition still served is checked again on its next
+    # use, which its identity token decides anyway.
+    # @param server [MCPClient::ServerBase, nil] the server whose entries go,
+    #   or nil for every server
+    # @return [void]
+    def forget_schema_checks(server = nil)
+      [@input_schema_warnings, @output_schema_coverage].each do |memo|
+        next unless memo
+
+        if server
+          memo.delete_if { |(server_id, _name), _| server_id == server.object_id }
+        else
+          memo.clear
+        end
+      end
+    end
     # Generate a cache key for server-specific items
     # @param server [MCPClient::ServerBase] the server
     # @param item_id [String] the item identifier (name or URI)

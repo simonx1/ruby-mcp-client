@@ -128,6 +128,7 @@ module MCPClient
           drop_cached_entries(cache, server)
           # This server's slice now stands for its whole list, empty or not.
           (@cache_filled[kind] ||= {}.compare_by_identity)[server] = true
+          forget_schema_checks(server) if kind == :tools
           if server.respond_to?(:current_params_fingerprint, true)
             # The slice is tied to the very transport entry its list came
             # from — its identity and the parameters that entry is bound to

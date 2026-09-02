@@ -7,6 +7,26 @@ metadata). Each feature lands in its own PR; this section accumulates them.
 
 ### JSON Schema handling
 
+- **Adopted subtrees, data-keyword identifiers and readable fragments
+  (round 22).** A subtree a pointer enters through a data keyword
+  (`default`, `enum`, `const`, `examples`) is normalized and indexed once,
+  memoized by the identity of what the document holds, and the rest of the
+  pointer is walked through that copy: a nested pointer such as
+  `#/default/$defs/i` lands on the object the index already knows, with the
+  resource, dialect and subschema charge it gave it, instead of a second
+  copy attributed to the referrer. Such a subtree declares no anchors of
+  its own unless an `$id` really starts a resource there, so an `$anchor`
+  written inside a data keyword no longer collides with the document's
+  names or makes `#name` resolvable depending on member order; `validate`
+  reuses the index the preflight built, so an accepted schema validates the
+  way it was checked. A `$ref` fragment whose percent-escapes are not valid
+  UTF-8 resolves to nothing instead of raising. A property, definition or
+  pattern named `enum`, `const`, `default` or `examples` is a schema
+  position like any other. A composition branch its supported assertions
+  already rejected is not measured for the keywords the validator does not
+  evaluate. The once-per-definition input-schema and coverage checks are
+  forgotten with the tool-cache entries they name.
+
 - **Bounded coverage matching and adopted targets (round 21).** The pattern
   matching behind the `patternProperties` / `additionalProperties` /
   `unevaluatedProperties` coverage checks runs under the validation
