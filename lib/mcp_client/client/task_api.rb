@@ -70,7 +70,10 @@ module MCPClient
       # @raise [MCPClient::Errors::TaskNotFound] if the task does not exist
       # @raise [MCPClient::Errors::TaskError] if retrieving the task fails
       # @param timeout [Numeric, nil] request timeout in seconds (the transport default when nil)
-      def get_task(task_id, server: nil, timeout: nil)
+      # @param state [Hash, nil] the task bookkeeping this poll belongs to (internal): a poll a
+      #   wait abandoned on its wall clock forgets only what it was polling, never what a new
+      #   session — or a new lifetime of a reused task id — recorded since
+      def get_task(task_id, server: nil, timeout: nil, state: nil)
         srv = select_task_server(task_id, server, 'get_task')
         task_id = task_identifier(task_id)
         ensure_task_capability!(srv, 'get')
@@ -88,13 +91,13 @@ module MCPClient
           end
           # A terminal task is done with its input bookkeeping (answered keys,
           # pending answers): a reused id must never inherit it.
-          forget_task_keys(srv, task_id) if task.terminal?
+          forget_task_keys(srv, task_id, state: state) if task.terminal?
           task
         rescue MCPClient::Errors::ServerError => e
           raise if e.protocol_error?
 
           error = task_error_from(e, task_id, 'getting', modern: modern_server?(srv), method: 'tasks/get')
-          forget_task_keys(srv, task_id) if error.is_a?(MCPClient::Errors::TaskNotFound)
+          forget_task_keys(srv, task_id, state: state) if error.is_a?(MCPClient::Errors::TaskNotFound)
           raise error
         rescue MCPClient::Errors::TransportError, MCPClient::Errors::ConnectionError => e
           raise MCPClient::Errors::TaskError, "Error getting task '#{sanitize_peer_log_text(task_id.to_s)}': " \
@@ -364,10 +367,12 @@ module MCPClient
       # takes its bookkeeping with it (answered keys, pending answers,
       # rounds — in-flight holds excepted), like the tasks/get path, so a
       # later task reusing the id is not treated as already answered.
+      # @param state [Hash, nil] the bookkeeping the failed request was working on; only that
+      #   state is dropped, so a late failure cannot touch a reused task id's (see #forget_task_keys)
       # @return [MCPClient::Errors::TaskError]
-      def task_failure(error, srv, task_id, action, modern: true, method: nil)
+      def task_failure(error, srv, task_id, action, modern: true, method: nil, state: nil)
         mapped = task_error_from(error, task_id, action, modern: modern, method: method)
-        forget_task_keys(srv, task_id) if mapped.is_a?(MCPClient::Errors::TaskNotFound)
+        forget_task_keys(srv, task_id, state: state) if mapped.is_a?(MCPClient::Errors::TaskNotFound)
         mapped
       end
 
