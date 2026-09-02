@@ -66,8 +66,12 @@ module MCPClient
     # @param server [MCPClient::ServerBase, nil] optional server reference
     # @param detailed [Boolean] whether the hash is a DetailedTask (see #detailed?)
     # @return [Task]
+    # @raise [MCPClient::Errors::InvalidResultError] when the peer data is not
+    #   an object or names a status that is not a task status
     def self.from_json(json, server: nil, detailed: false)
       data = json || {}
+      raise MCPClient::Errors::InvalidResultError, 'Invalid task: not an object' unless data.is_a?(Hash)
+
       modern = modern_shape?(data)
       new(
         task_id: extract_field(data, 'taskId', :task_id),
@@ -88,6 +92,8 @@ module MCPClient
         detailed: detailed,
         server: server
       )
+    rescue ArgumentError => e
+      raise MCPClient::Errors::InvalidResultError, "Invalid task: #{e.message}"
     end
 
     # A task that never left the client: the server answered the request

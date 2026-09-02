@@ -661,7 +661,10 @@ module MCPClient
         problem = task_shape_problem(result)
         raise MCPClient::Errors::InvalidResultError, "Invalid CreateTaskResult: #{problem}" if problem
 
-        MCPClient::Task.from_create_result(result, server: srv)
+        # The handle is the object just validated: a 2026-07-28
+        # CreateTaskResult is the flat Task itself, and an extra `task`
+        # property (the legacy 2025 wrapper) must not replace it.
+        MCPClient::Task.from_json(result, server: srv)
       end
 
       # @param result [Object] a JSON-RPC result

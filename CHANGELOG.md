@@ -14,6 +14,12 @@ metadata). Each feature lands in its own PR; this section accumulates them.
   explicit `ttlMs` null does; `Client#get_task` also requires the payload a
   status implies (`completed` ⇒ an object `result`, `failed` ⇒ a JSON-RPC
   error object, `input_required` ⇒ an `inputRequests` object).
+- **The validated task is the handle (round 18).** A 2026-07-28
+  `CreateTaskResult` builds the task handle from the flat Task it was
+  validated as; an extra `task` property (the legacy 2025 wrapper) never
+  replaces it, and a task object that is not an object or names an
+  unknown status is an `InvalidResultError` (`Task.from_json`), never a
+  `NoMethodError` or `ArgumentError`.
 - **Waits and lookups (round 17).** The caller's `timeout:` bounds the
   whole `wait_for_task`, capability probe (initialization, discovery)
   included; a task request never outlives the transport's configured
