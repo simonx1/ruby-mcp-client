@@ -1282,15 +1282,17 @@ module MCPClient
     def warn_unusable_input_schema(tool)
       return if tool.schema.nil?
 
-      # Keyed by the schema itself as well, so a refreshed tool definition
-      # (list_changed, cache expiry, HeaderMismatch recovery) is re-checked.
+      # Keyed by the schema object itself as well, so a refreshed tool
+      # definition (list_changed, cache expiry, HeaderMismatch recovery) is
+      # re-checked. The object, not its hash: hashing a peer-supplied
+      # document walks it whole (or overflows the stack) before the bounded
+      # check could reject it.
       @input_schema_warnings ||= {}
       key = [tool.server&.object_id, tool.name]
-      identity = tool.schema.hash
-      return if @input_schema_warnings[key] == identity
+      return if @input_schema_warnings[key].equal?(tool.schema)
 
       problems = MCPClient::SchemaValidator.check_schema(tool.schema)
-      @input_schema_warnings[key] = identity
+      @input_schema_warnings[key] = tool.schema
       return if problems.empty?
 
       @logger.warn("Tool '#{sanitize_peer_log_text(tool.name.to_s)}' input schema is not usable for validation: " \
@@ -1306,11 +1308,10 @@ module MCPClient
     def warn_partial_schema_coverage(tool)
       @output_schema_coverage ||= {}
       key = [tool.server&.object_id, tool.name]
-      identity = tool.output_schema.hash
-      return if @output_schema_coverage[key] == identity
+      return if @output_schema_coverage[key].equal?(tool.output_schema)
 
       unsupported = MCPClient::SchemaValidator.unsupported_keywords(tool.output_schema)
-      @output_schema_coverage[key] = identity
+      @output_schema_coverage[key] = tool.output_schema
       return if unsupported.empty?
 
       @logger.warn(

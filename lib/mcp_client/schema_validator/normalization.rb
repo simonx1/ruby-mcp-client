@@ -17,10 +17,15 @@ module MCPClient
       # @param depth [Integer]
       # @param budget [Hash, nil] :objects copied so far, :deadline (optional)
       # @return [Object]
-      # @raise [TooLarge] when the budget is exceeded
+      # @raise [TooLarge] when the budget is exceeded, or the document is
+      #   nested beyond what MAX_SCHEMA_DEPTH schema levels can hold (a
+      #   subtree is never kept unread)
       # @raise [Aborted] when the deadline passed
       def deep_stringify(node, depth = 0, budget = nil)
-        return node if depth > MAX_SCHEMA_DEPTH + 1
+        # Each schema level takes at most two document levels (a keyword map
+        # or array, then the subschema), so a deeper document holds more
+        # schema levels than the preflight walk admits.
+        raise TooLarge, "schema nesting depth exceeds #{MAX_SCHEMA_DEPTH}" if depth > (MAX_SCHEMA_DEPTH * 2) + 2
 
         case node
         when Hash

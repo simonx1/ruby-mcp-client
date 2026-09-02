@@ -77,7 +77,7 @@ module MCPClient
           next if index[:resources].key?(schema)
 
           visited += 1
-          if resource_start?(schema)
+          if resource_root?(schema, dialect)
             # A resource is a schema wherever it sits: one reached through
             # a bag the dialect does not walk names its own anchors, though
             # nothing outside it can see them.
@@ -94,6 +94,9 @@ module MCPClient
           each_walked_position(schema, dialect) { |sub| pending << [sub, resource, depth + 1, dialect, named] }
           each_foreign_definition(schema, dialect) { |sub| pending << [sub, resource, depth + 1, dialect, false] }
         end
+        # Objects left unindexed at the bound would resolve and validate
+        # under guesses; the index says so and the schema is unusable.
+        index[:truncated] = pending.any? { |schema, *| schema.is_a?(Hash) && !index[:resources].key?(schema) }
         index
       end
 
@@ -144,6 +147,18 @@ module MCPClient
         id.is_a?(String) && !id.empty? && !id.start_with?('#')
       end
 
+      # {#resource_start?} in the dialect in force: under draft-07 a `$ref`
+      # replaces its whole schema object, `$id` and `$schema` included, so
+      # nothing beside it starts a resource.
+      # @param schema [Hash]
+      # @param dialect [String, nil]
+      # @return [Boolean]
+      def resource_root?(schema, dialect)
+        return false if dialect == DRAFT_07 && schema.key?('$ref')
+
+        resource_start?(schema)
+      end
+
       # @return [Array<String>] the plain names a schema object declares
       def anchor_names(schema, dialect)
         names = if dialect == DRAFT_07
@@ -181,6 +196,9 @@ module MCPClient
         return UNRESOLVED unless fragment.start_with?('/')
 
         fragment[1..].split('/', -1).reduce(root) do |node, token|
+          # RFC 6901 Section 3: "~" is only ever followed by "0" or "1".
+          return UNRESOLVED if token.match?(/~(?![01])/)
+
           key = token.gsub('~1', '/').gsub('~0', '~')
           case node
           when Hash

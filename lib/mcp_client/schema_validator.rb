@@ -5,6 +5,7 @@ require_relative 'schema_validator/dialects'
 require_relative 'schema_validator/normalization'
 require_relative 'schema_validator/references'
 require_relative 'schema_validator/keyword_scan'
+require_relative 'schema_validator/composition'
 
 module MCPClient
   # Self-contained JSON Schema validator used to check a tool call result's
@@ -57,6 +58,7 @@ module MCPClient
     extend Normalization
     extend References
     extend KeywordScan
+    extend Composition
 
     # Raised inside a validation to abandon it (time budget, resource bound).
     class Aborted < StandardError; end
@@ -165,7 +167,8 @@ module MCPClient
     end
 
     # Per-validation state.
-    Context = Struct.new(:root, :deadline, :dialect, :visits, :errors, :speculative, :anchors, keyword_init: true)
+    Context = Struct.new(:root, :deadline, :dialect, :visits, :errors, :speculative, :anchors, :undecided,
+                         keyword_init: true)
 
     # Raised while normalizing a schema whose structure exceeds the bounds,
     # so a peer-supplied document is never copied whole.
@@ -218,19 +221,25 @@ module MCPClient
       problems = []
       counter = { count: 0, dialect: canonical_dialect(declared), walked: {}.compare_by_identity }
       walk_schema(root, root, 0, counter, problems)
-      problems.concat(duplicate_anchor_problems(root, counter)) if problems.empty?
+      problems.concat(anchor_index_problems(root, counter)) if problems.empty?
       problems.uniq
     end
 
-    # Anchor names must be unique within a schema resource (JSON Schema
-    # 2020-12 Core Section 8.2.2): a name declared twice would bind a
-    # reference to whichever declaration the walk met first, so the schema
-    # is unusable instead.
+    # Problems the anchor index reveals: anchor names must be unique within
+    # a schema resource (JSON Schema 2020-12 Core Section 8.2.2) — a name
+    # declared twice would bind a reference to whichever declaration the
+    # walk met first — and an index that stopped at its bound before
+    # reaching every object leaves references and resource dialects
+    # undecided, so either makes the schema unusable.
     # @param resolver [Hash] holder of the memoized anchor index
     # @return [Array<String>]
-    def self.duplicate_anchor_problems(root, resolver)
+    def self.anchor_index_problems(root, resolver)
       index = (resolver[:anchors] ||= anchor_index(root, resolver[:dialect]))
-      index[:duplicates].map { |name| "anchor #{clip(name.inspect)} is declared more than once in a schema resource" }
+      problems = index[:duplicates].map do |name|
+        "anchor #{clip(name.inspect)} is declared more than once in a schema resource"
+      end
+      problems << "schema has too many objects to index its anchors (more than #{MAX_SUBSCHEMAS})" if index[:truncated]
+      problems
     end
 
     # Walk every subschema position, checking bounds and references. A
@@ -243,7 +252,7 @@ module MCPClient
       return unless problems.empty? && schema_value?(schema)
       return unless admit_schema?(schema, depth, counter, problems)
 
-      if resource_start?(schema) && schema.key?('$schema')
+      if resource_root?(schema, dialect) && schema.key?('$schema')
         problem = embedded_dialect_problem(schema)
         return problems << problem if problem
 
@@ -499,7 +508,7 @@ module MCPClient
       return problems.map { |problem| "#{path}: #{problem}" } unless problems.empty?
 
       ctx = Context.new(root: root, deadline: deadline, dialect: canonical_dialect(dialect(root)),
-                        visits: 0, errors: 0, speculative: 0, anchors: nil)
+                        visits: 0, errors: 0, speculative: 0, anchors: nil, undecided: 0)
       validate_node(data, root, path, ctx, 0)
     rescue TooLarge => e
       ["#{path}: #{e.message}"]
@@ -527,6 +536,9 @@ module MCPClient
       dialect = node_dialect(schema, ctx)
       return validate_ref(data, schema, path, ctx, ref_depth) if schema.key?('$ref') && dialect == DRAFT_07
 
+      # A keyword the validator does not evaluate makes this node's verdict
+      # partial: a pass here is not a proof for not / oneOf / if.
+      ctx.undecided += 1 if partial_keywords?(schema, dialect)
       errors = []
       counted_before = ctx.errors
       errors.concat(validate_ref(data, schema, path, ctx, ref_depth)) if schema.key?('$ref')
@@ -610,48 +622,6 @@ module MCPClient
       end
 
       validate_node(data, target, path, ctx, ref_depth + 1)
-    end
-
-    # allOf / anyOf / oneOf / not / if-then-else.
-    # @return [Array<String>] validation errors
-    def self.validate_composition(data, schema, path, ctx, ref_depth)
-      errors = []
-      if schema['allOf'].is_a?(Array)
-        schema['allOf'].each_with_index do |sub, idx|
-          sub_errors = validate_node(data, sub, path, ctx, ref_depth)
-          errors << "#{path}: does not satisfy allOf/#{idx} (#{clip(sub_errors.first.to_s)})" unless sub_errors.empty?
-        end
-      end
-      if schema['anyOf'].is_a?(Array) &&
-         schema['anyOf'].none? { |sub| speculative(ctx) { validate_node(data, sub, path, ctx, ref_depth).empty? } }
-        errors << "#{path}: does not satisfy any schema in anyOf"
-      end
-      if schema['oneOf'].is_a?(Array)
-        matches = schema['oneOf'].count do |sub|
-          speculative(ctx) do
-            validate_node(data, sub, path, ctx, ref_depth).empty?
-          end
-        end
-        errors << "#{path}: satisfies #{matches} schemas in oneOf, expected exactly one" unless matches == 1
-      end
-      if schema.key?('not') && speculative(ctx) { validate_node(data, schema['not'], path, ctx, ref_depth).empty? }
-        errors << "#{path}: value satisfies the schema in not"
-      end
-      errors.concat(validate_conditional(data, schema, path, ctx, ref_depth))
-      errors
-    end
-
-    # if / then / else.
-    # @return [Array<String>] validation errors
-    def self.validate_conditional(data, schema, path, ctx, ref_depth)
-      # An `if` without `then` or `else` asserts nothing (JSON Schema 2020-12
-      # Section 10.2.2.1) and is not evaluated.
-      return [] unless schema.key?('if') && (schema.key?('then') || schema.key?('else'))
-
-      branch = speculative(ctx) { validate_node(data, schema['if'], path, ctx, ref_depth).empty? } ? 'then' : 'else'
-      return [] unless schema.key?(branch)
-
-      validate_node(data, schema[branch], path, ctx, ref_depth)
     end
 
     # Validate the JSON type of a value.

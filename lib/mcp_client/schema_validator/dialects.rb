@@ -46,7 +46,7 @@ module MCPClient
       # @return [String, nil] the canonical dialect, or nil when the embedded
       #   declaration is malformed or unsupported
       def embedded_dialect(schema, inherited)
-        return inherited unless resource_start?(schema) && schema.key?('$schema')
+        return inherited unless resource_root?(schema, inherited) && schema.key?('$schema')
 
         declared = dialect(schema)
         declared && canonical_dialect(declared)
