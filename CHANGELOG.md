@@ -7,6 +7,13 @@ metadata). Each feature lands in its own PR; this section accumulates them.
 
 ### Tasks extension (`io.modelcontextprotocol/tasks`)
 
+- **Retransmissions and sessions (round 14).** A retransmitted
+  `tasks/update` carries only what is still pending once the task's update
+  lock is held, so an answer a concurrent, confirmed update superseded is
+  never sent again (an explicit answer is newer than a pending one for the
+  same key and wins); the bookkeeping of a previous server session is
+  dropped when the session ends, and `Client#cleanup` forgets every task.
+
 - **Opt-in extension.** `MCPClient::Client.new(extensions:
   ['io.modelcontextprotocol/tasks'])` (or a `identifier => settings` Hash)
   declares extensions in every request's `clientCapabilities`;

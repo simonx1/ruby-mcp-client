@@ -173,11 +173,11 @@ module MCPClient
       # back, so the next wait presents the requests again).
       # @return [void]
       def retransmit_pending_update(wait)
-        state = task_state(wait[:srv], wait[:task_id])
-        pending = answered_keys_mutex.synchronize { state[:pending_update] }
-        return unless pending
-
-        send_task_update(wait[:srv], wait[:task_id], pending, timeout: request_timeout(wait_deadline(wait)))
+        # Only what is still pending once the task's update lock is held is
+        # sent: a snapshot taken before the lock could resend an answer a
+        # concurrent, confirmed update has just superseded.
+        send_task_update(wait[:srv], wait[:task_id], nil, timeout: request_timeout(wait_deadline(wait)),
+                                                          pending_only: true)
       rescue MCPClient::Errors::TaskError => e
         raise unless ambiguous_update_failure?(e)
 
@@ -216,11 +216,21 @@ module MCPClient
       # keyed by the transport's session epoch too and dies with it.
       # @return [Hash]
       def task_state(srv, task_id)
+        key = task_state_key(srv, task_id)
         answered_keys_mutex.synchronize do
           @task_states ||= {}
-          @task_states[task_state_key(srv, task_id)] ||= { answered: Set.new, submitted: Set.new, rounds: 0,
-                                                           pending_update: nil, update_mutex: Mutex.new }
+          # A previous session of this server is over: its state (answered
+          # keys, pending answers) is dropped, not left behind.
+          @task_states.delete_if { |other, _| other[0] == key[0] && other[1] != key[1] }
+          @task_states[key] ||= { answered: Set.new, submitted: Set.new, rounds: 0,
+                                  pending_update: nil, update_mutex: Mutex.new }
         end
+      end
+
+      # Forget every task's bookkeeping (the client is being cleaned up).
+      # @return [void]
+      def clear_task_states
+        answered_keys_mutex.synchronize { @task_states = nil }
       end
 
       # @return [Array] the registry key of a task's state
@@ -315,17 +325,22 @@ module MCPClient
       # or connection failure, 5xx, untyped server error) keeps it pending
       # for retransmission.
       # @param timeout [Numeric, nil] request timeout, bounded by the wait when there is one
+      # @param pending_only [Boolean] send whatever is pending under the lock and nothing else
+      #   (a retransmission; nothing pending sends nothing)
       # @return [true]
       # @raise [MCPClient::Errors::TaskError, MCPClient::Errors::ServerError]
-      def send_task_update(srv, task_id, input_responses, timeout: nil)
+      def send_task_update(srv, task_id, input_responses, timeout: nil, pending_only: false)
         shown = shown_task_id(task_id)
         state = task_state(srv, task_id)
         # One update at a time per task: a concurrent update that read an
         # empty pending slot could otherwise confirm and wipe an answer
-        # another delivery had just left pending.
+        # another delivery had just left pending. An explicit answer is
+        # newer than a pending one for the same key and wins the merge.
         state[:update_mutex].synchronize do
           pending = answered_keys_mutex.synchronize { state[:pending_update] }
-          input_responses = pending.merge(input_responses) if pending
+          input_responses = pending_only ? pending : pending&.merge(input_responses) || input_responses
+          return true if input_responses.nil?
+
           keys = input_responses.keys.map(&:to_s)
           remember_answered_keys(srv, task_id, keys)
           begin
