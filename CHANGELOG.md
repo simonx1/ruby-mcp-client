@@ -79,19 +79,55 @@ metadata). Each feature lands in its own PR; this section accumulates them.
   outright: the claiming caller blocked inside a broken logger, the
   contender holding a working one saw the slot taken and stood down, and the
   claim's later failure left the notice owed to a use that might never come.
-  A feature is now `:pending` while a caller is inside `logger.warn` and
-  `:emitted` only once one succeeded, so a contender waits for the outcome
-  and takes the notice over when the reservation fails. The wait is bounded
-  by `Deprecations::PENDING_WAIT_SECONDS`: a notice never holds up the
-  deprecated operation, so a logger that blocks forever costs the contender
-  the notice, not its progress. `Deprecations.emitted?` reports notices that
-  actually went out, never one still in flight.
+  A notice is now spent only once a `logger.warn` came back without raising,
+  so a caller that arrives while another is inside the logger either finds
+  the notice out (and stands down) or takes it over when that attempt
+  failed. `Deprecations.emitted?` reports notices that actually went out,
+  never one still in flight. (Round 10 kept that outcome and replaced the
+  reservation states, condition variable and bounded wait that carried it
+  with a per-feature emission gate.)
 - **HTTP+SSE marked in the last places it was offered (round 9).**
   Continuing the round 8 sweep: the README's Advanced Configuration
   `sse_config` example and the auto-detect fallback row of the
   transport-detection table, and, in `MCPClient.connect`'s YARD, the
   "Other HTTP URLs" fallback text; the multiple-server `@example` no longer
   reaches for an `/sse` URL at all.
+- **What a notice costs its caller, said honestly (round 10).** The
+  reservation machinery bounded the wait of a caller that met a notice in
+  flight, on the strength of a promise this path cannot keep — that a notice
+  never holds up the deprecated operation. The bound constrained the
+  contenders, never the caller actually stuck in the logger: a first use
+  whose logger blocks forever (a synchronous remote logger, stalled I/O)
+  never returned from `warn` at all, so the client construction, SSE
+  connection or incoming request that triggered it never completed either.
+  And the contenders bought nothing with their wait: a reservation that
+  hangs is never released, so every later first use of Sampling, Logging or
+  the HTTP+SSE transport — all features whose trigger points are hit
+  repeatedly — waited the timeout out again and still came away without the
+  notice. Keeping the stronger promise would have meant a detached emission
+  thread (which loses the ordering between the notice and the operation it
+  describes) or `Timeout.timeout` around a host's logger (which raises
+  inside arbitrary third-party code, during its own IO, ensure blocks or
+  locking). So the promise is narrowed to the one the rest of the library
+  already makes: a notice costs its caller what one `logger.warn` costs it,
+  and no more — every other `logger.warn` here blocks its caller the same
+  way, and a logger that blocks forever blocks the library everywhere, not
+  only in this path. `Deprecations::PENDING_WAIT_SECONDS`, the `:pending`
+  state and the condition variable are gone; an attempt is serialized on a
+  gate held only for the feature being logged, so nothing is timed, no
+  caller comes away from a wait with the notice neither emitted nor its own
+  to write, and a notice in flight still never delays another feature's
+  notice, `Deprecations.emitted?` or `Deprecations.reset!`. Everything the
+  earlier rounds established stands: one notice per feature per process, a
+  logger that raises or drops warnings neither breaks the deprecated
+  operation nor spends the notice, and the bookkeeping (gates included) is
+  rebuilt after a fork.
+- **HTTP+SSE marked in the `ServerHTTP` elicitation note (round 10).** The
+  note listing the transports that do support server-initiated elicitation
+  still offered `ServerSSE` as an ordinary alternative; it now leads with
+  `ServerStreamableHTTP` and marks the HTTP+SSE entry with SEP-2596 and its
+  earliest removal, like the README, `MCPClient.connect` and
+  `MCPClient.sse_config`.
 - **`protocol:` and `discover_timeout:` documented as they behave.** The
   README offered both on `MCPClient.connect` without qualification, but
   `MCPClient::ServerSSE` accepts neither and `MCPClient.connect` drops them

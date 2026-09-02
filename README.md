@@ -497,7 +497,11 @@ root (including from a transport driven directly, without a `Client`).
 `MCPClient::Deprecations.enabled = false` (before constructing clients) to
 silence the notices. Notices go to the logger the client or server was
 given; without one they go to the default `$stdout` logger like every other
-warning.
+warning. A notice costs the deprecated operation exactly what one
+`logger.warn` costs it, and no more: a logger that raises or drops the notice
+is swallowed, so the feature keeps working and the notice stays owed to a
+later use — but a logger that blocks, blocks its caller here just as it does
+everywhere else in the library.
 
 ## MCP 2025-11-25 Features
 
