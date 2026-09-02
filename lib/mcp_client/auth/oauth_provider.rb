@@ -222,11 +222,7 @@ module MCPClient
                 'so it cannot be bound to an authorization server; restart the authorization'
         end
         server_metadata = discover_authorization_server
-        unless server_metadata.issuer == pkce.issuer
-          raise MCPClient::Errors::ConnectionError,
-                'Authorization response rejected: the authorization server changed during the flow ' \
-                "(recorded #{safe_error_text(pkce.issuer)}); restart the authorization"
-        end
+        raise_authorization_server_changed!(pkce.issuer) unless server_metadata.issuer == pkce.issuer
         validate_authorization_response_issuer!(iss, pkce.issuer, iss_parameter_supported_for?(pkce, server_metadata))
         # The credentials that redeem the code are the ones the request was
         # made with: a record swapped in shared storage meanwhile (another
@@ -421,6 +417,7 @@ module MCPClient
       # @param pkce [PKCE, nil] the record of the authorization request
       # @param cached [ServerMetadata, nil] cached metadata of the same issuer, if any
       # @return [Boolean] whether the request's authorization server advertises iss
+      # @raise [MCPClient::Errors::ConnectionError] when rediscovery names another authorization server
       def iss_advertised_for_response?(pkce, cached)
         recorded = pkce&.iss_parameter_supported
         return recorded == true unless recorded.nil?
@@ -434,9 +431,29 @@ module MCPClient
         rescue MCPClient::Errors::ConnectionError
           nil
         end
-        return true unless rediscovered&.issuer == pkce.issuer
+        # An answer that could not be obtained is unknown, not "no".
+        return true if rediscovered.nil?
+
+        # A rediscovery naming ANOTHER authorization server says nothing about
+        # this request's `iss`: it is the very "the authorization server
+        # changed during the flow" that {#complete_authorization_flow} rejects.
+        # Reducing it to "iss is advertised" would let a callback carrying the
+        # recorded issuer pass this check, and a browser flow would show a
+        # success page for a response the completion then refuses.
+        raise_authorization_server_changed!(pkce.issuer) unless rediscovered.issuer == pkce.issuer
 
         rediscovered.iss_parameter_supported?
+      end
+
+      # The authorization server of a pending flow is no longer the one the
+      # request went to, so the code can never be redeemed: end the flow.
+      # @param recorded [String] the issuer recorded when the flow started
+      # @return [void]
+      # @raise [MCPClient::Errors::ConnectionError]
+      def raise_authorization_server_changed!(recorded)
+        raise MCPClient::Errors::ConnectionError,
+              'Authorization response rejected: the authorization server changed during the flow ' \
+              "(recorded #{safe_error_text(recorded)}); restart the authorization"
       end
 
       # Resolve the scope for authorization/registration requests using the
@@ -743,12 +760,22 @@ module MCPClient
         resource_metadata = challenge_or_well_known_resource_metadata
         return nil unless resource_metadata
 
-        validate_resource_matches!(resource_metadata)
+        # A document that is not this resource's — or that names no
+        # authorization server — is rejected whole, and the copy
+        # {#fetch_resource_metadata} kept for scope resolution goes with it:
+        # otherwise a later flow (the path 404s, the origin is its own
+        # authorization server) would request the scopes of a document this
+        # discovery refused, exactly the leftover already closed for a refused
+        # authorization server URL.
+        begin
+          validate_resource_matches!(resource_metadata)
+        rescue MCPClient::Errors::ConnectionError => e
+          refuse_resource_metadata!(e.message)
+        end
 
         auth_server_url = Array(resource_metadata.authorization_servers).first
         unless auth_server_url
-          raise MCPClient::Errors::ConnectionError,
-                'Protected resource metadata does not advertise any authorization_servers'
+          refuse_resource_metadata!('Protected resource metadata does not advertise any authorization_servers')
         end
 
         # authorization_servers is untrusted PRM content: validate the
@@ -895,8 +922,8 @@ module MCPClient
         end
       end
 
-      # Require HTTPS for all discovered authorization server endpoints, with a
-      # localhost exception for local development.
+      # Require HTTPS for all discovered authorization server endpoints, with
+      # the local-development exception for a local stack.
       # @param server_metadata [ServerMetadata]
       def enforce_https_endpoints!(server_metadata)
         enforce_https!(server_metadata.authorization_endpoint, 'authorization endpoint')
@@ -906,24 +933,34 @@ module MCPClient
         enforce_https!(server_metadata.registration_endpoint, 'registration endpoint')
       end
 
+      # An endpoint discovered in authorization server metadata is as
+      # peer-controlled as a URL a challenge or a protected resource document
+      # advertises — the code, the verifier and the client id are POSTed to
+      # the token endpoint — so it is classified by exactly the same rules:
+      # HTTPS unless this is a local stack (a loopback target advertised to a
+      # client whose configured server is loopback too), never a loopback,
+      # private or link-local address otherwise, and always a host a resolver
+      # could look up. Without that, metadata from any public authorization
+      # server could name `http://app.localhost:3000/steal` or an internal
+      # address and collect the authorization code there. The refusal is not
+      # latched: only a 401 challenge is authoritative enough for that.
       # @param url [String, nil] endpoint URL
       # @param label [String] human-readable endpoint name for errors
-      # @raise [MCPClient::Errors::ConnectionError] if the URL is not HTTPS (non-localhost)
+      # @raise [MCPClient::Errors::ConnectionError] if the URL is not acceptable
       def enforce_https!(url, label)
         return if url.nil?
 
-        uri = URI.parse(url)
-        return if uri.scheme == 'https'
-        # Dev exception is only for plain HTTP on a loopback host — not any other
-        # scheme (e.g. ftp://localhost). The host is read the way every other
-        # loopback check in this provider reads it (loopback_address?), so a
-        # shorthand, fully qualified, IPv4-mapped or RFC 6761 '*.localhost'
-        # spelling of the local stack is the local stack here too.
-        return if uri.scheme == 'http' && loopback_address?(uri.hostname.to_s)
+        validate_peer_advertised_url!(url, label, latch: false)
+      end
 
-        raise MCPClient::Errors::ConnectionError, "OAuth #{label} must use HTTPS: #{url}"
-      rescue URI::InvalidURIError
-        raise MCPClient::Errors::ConnectionError, "OAuth #{label} is not a valid URL: #{url}"
+      # Forget the protected resource document and refuse: a document rejected
+      # as not this resource's must not go on supplying scopes.
+      # @param message [String] why the document was refused
+      # @return [void]
+      # @raise [MCPClient::Errors::ConnectionError] always
+      def refuse_resource_metadata!(message)
+        @resource_metadata = nil
+        raise MCPClient::Errors::ConnectionError, message
       end
 
       # Validate the PRM `resource` identifies this server (RFC 9728 confused
@@ -1182,7 +1219,15 @@ module MCPClient
 
       # @return [Token, nil]
       def stored_token
-        normalize_record(storage.get_token(server_url), Token)
+        token = normalize_record(storage.get_token(server_url), Token)
+        # A backend without delete_token is asked to store nil, and one that
+        # persists plain hashes writes `nil.to_h` — `{}`. Read back that is a
+        # record without token bytes, whose header would be a bare "Bearer "
+        # attributed to whatever authorization server is current now. It is
+        # not a token: it is the absence storage meant to express.
+        return nil if token.respond_to?(:access_token) && token.access_token.to_s.empty?
+
+        token
       end
 
       # @param record [Object, Hash, nil]

@@ -127,7 +127,9 @@ class DatabaseTokenStorage
   end
 
   def set_token(server_url, token)
-    # Store token
+    # Store token. A nil token means "forget it": remove the record rather
+    # than serializing nil (a hash-persisting backend would otherwise store
+    # an empty hash, which reads back as a token without bytes).
   end
 
   def get_client_info(server_url)

@@ -119,9 +119,16 @@ class FileTokenStorage
     token_data ? MCPClient::Auth::Token.from_h(token_data) : nil
   end
 
+  # A nil record means "forget this token": store nothing rather than
+  # `nil.to_h` (an empty hash), which would read back as a token without
+  # bytes. A backend that can delete should implement delete_token(server_url).
   def set_token(server_url, token)
     @data['tokens'] ||= {}
-    @data['tokens'][server_url] = token.to_h
+    if token.nil?
+      @data['tokens'].delete(server_url)
+    else
+      @data['tokens'][server_url] = token.to_h
+    end
     save_data
   end
 
@@ -132,7 +139,11 @@ class FileTokenStorage
 
   def set_client_info(server_url, client_info)
     @data['clients'] ||= {}
-    @data['clients'][server_url] = client_info.to_h
+    if client_info.nil?
+      @data['clients'].delete(server_url)
+    else
+      @data['clients'][server_url] = client_info.to_h
+    end
     save_data
   end
 
