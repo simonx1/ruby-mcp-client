@@ -592,10 +592,16 @@ module MCPClient
     # header collapse into a single entry and a later write of any spelling
     # (an OAuth provider's canonical `Authorization`) replaces it rather
     # than leaving the older one behind.
+    #
+    # The table is always a detached copy: its caller hands it to the OAuth
+    # provider, which writes the Authorization it would apply into it, and
+    # that must never reach the headers the transport builds its requests
+    # from (a probed token would outlive the credentials it came from).
     # @param headers [Hash, #each_pair, nil]
     # @return [Faraday::Utils::Headers]
     def self.faraday_headers(headers)
-      return headers if headers.is_a?(Faraday::Utils::Headers)
+      # Faraday's own table dups its case-insensitive name index with it.
+      return headers.dup if headers.is_a?(Faraday::Utils::Headers)
       return Faraday::Utils::Headers.new unless headers.respond_to?(:each_pair)
 
       Faraday::Utils::Headers.new(headers.to_h)

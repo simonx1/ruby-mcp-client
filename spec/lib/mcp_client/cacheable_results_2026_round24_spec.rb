@@ -110,8 +110,9 @@ RSpec.describe 'MCP 2026-07-28 cacheable results — round 24' do
       end
     end
 
-    # Reads a holder the host keeps: every instance of it answers alike, so
-    # the probe can still predict the next request's credentials.
+    # Reads a holder the host keeps and cannot change: every instance of it
+    # answers alike and the probe changes nothing by running, so it can
+    # still predict the next request's credentials.
     def holder_middleware
       Class.new(Faraday::Middleware) do
         def initialize(app, holder)
@@ -143,9 +144,9 @@ RSpec.describe 'MCP 2026-07-28 cacheable results — round 24' do
         .to eq(MCPClient::HttpTransportBase::CacheSupport::UNKNOWN_CONTEXT)
     end
 
-    it 'still serves the private entry of middleware that only reads shared state' do
+    it 'still serves the private entry of middleware that only reads immutable shared state' do
       bearers = stub_tools_by_bearer
-      holder = { value: 'alice' }
+      holder = { value: 'alice' }.freeze
       server = streamable(faraday_config: ->(f) { f.use holder_middleware, holder })
 
       expect(server.list_tools.map(&:name)).to eq(['alice-tool'])
