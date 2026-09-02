@@ -7,6 +7,38 @@ metadata). Each feature lands in its own PR; this section accumulates them.
 
 ### Cacheable results (`ttlMs` / `cacheScope`)
 
+- **Host middleware is never run by the freshness probe (round 29).** Four
+  rounds of reflection could not tell a middleware that vends a one-time
+  credential apart from an inert one: the rotating state can sit in a
+  constant, a global, a thread-local or the binding of a method, and none of
+  those are left behind by building a copy. So the probe no longer runs any
+  host code. It answers from what the transport itself knows — the
+  configured headers plus the OAuth provider — and treats a `faraday_config`
+  block as an unknown context (no private entry served) unless every
+  middleware it installs is either framework middleware that sets no
+  Authorization header, middleware with no request phase at all, or
+  Faraday's own Authorization middleware installed with literal
+  configuration. A statically configured bearer, with or without that
+  middleware, still gets its private cache hit. The prediction machinery
+  this replaces (`probe_stands_in_for?`, `probe_inert_middleware_class?`,
+  the `RubyVM::InstructionSequence` inspection and the reachable-state walk)
+  is gone; the rounds below describe the prediction rules it supersedes.
+- **`baggage` is application context (round 29).** W3C `baggage` carries
+  host-defined values such as a tenant, so it is no longer treated as a
+  per-request identifier: a result cached under one `baggage` is never
+  served to a request carrying another. `progressToken`, `traceparent` and
+  `tracestate` stay neutral.
+- **Metadata held for a request is released only when a value is served
+  (round 29).** A freshness check that matched an entry but found it stale
+  used to drop the `request_meta` evaluation it had made, so the request it
+  then sent read the host's callable again and a rotating trace id or nonce
+  was spent without ever going out. The evaluation is now released at the
+  points where a cached value really is handed back.
+- **An invalidated template list is dropped (round 29).**
+  `resources/list_changed` and `cleanup` now clear the transport's
+  `resources/templates/list` alongside the other lists, instead of keeping
+  the old list alive for the life of the connection.
+
 - **Only provably inert middleware is probed (round 28).** A middleware
   copy shares its class, and a `define_method` request hook keeps the
   binding it was defined in, so comparing two instances could never see a
@@ -263,13 +295,10 @@ metadata). Each feature lands in its own PR; this section accumulates them.
   the effective request parameters its request went out with — the host's
   `request_meta` (vendor keys such as a tenant) without the reserved
   protocol fields and the per-request identifiers (`progressToken`,
-  `traceparent`, `tracestate`, `baggage`) — and is served, fresh or as a
+  `traceparent`, `tracestate`) — and is served, fresh or as a
   stale fallback, only to a request that would carry the same
   (`CachedResult#params_fingerprint`); a result's binding survives a
-  nested request made by a notification callback. The freshness probe is
-  built like a real request (`build_jsonrpc_request`, its effective `_meta`
-  included), so host middleware that picks credentials by the body's
-  metadata answers as it would for the next request.
+  nested request made by a notification callback.
 
 ### Subscriptions (`subscriptions/listen`)
 

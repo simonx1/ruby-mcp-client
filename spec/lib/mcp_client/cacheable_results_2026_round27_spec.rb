@@ -108,19 +108,14 @@ RSpec.describe 'MCP 2026-07-28 cacheable results — round 27' do
       expect(vendor.used).to eq(2)
     end
 
-    it 'treats two equal containers as different state when they share a mutable' do
+    it 'reads literal configuration but never a vendor of its own' do
       server = streamable
       vendor = nonce_vendor
 
-      expect(server.send(:same_middleware_state?, { vendor: vendor }, { vendor: vendor })).to be false
-      expect(server.send(:same_middleware_state?, [[vendor]], [[vendor]])).to be false
-    end
-
-    it 'still stands in for two equal containers of immutable state' do
-      server = streamable
-
-      expect(server.send(:same_middleware_state?, { token: 'abc' }, { token: 'abc' })).to be true
-      expect(server.send(:same_middleware_state?, [1, :two, 'three'], [1, :two, 'three'])).to be true
+      expect(server.send(:probe_static_value?, { token: 'abc' })).to be true
+      expect(server.send(:probe_static_value?, [1, :two, 'three'])).to be true
+      expect(server.send(:probe_static_value?, { vendor: vendor })).to be false
+      expect(server.send(:probe_static_value?, -> { 'abc' })).to be false
     end
   end
 

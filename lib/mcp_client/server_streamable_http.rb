@@ -664,6 +664,7 @@ module MCPClient
         @resources = nil
         @resources_data = nil
         @resources_result = nil
+        @templates_result = nil
         @buffer = +''
         @buffer_scanned = 0
 

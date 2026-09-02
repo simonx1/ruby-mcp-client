@@ -101,15 +101,6 @@ RSpec.describe 'MCP 2026-07-28 cacheable results — round 13' do
   end
 
   describe 'the freshness probe' do
-    # Host middleware that authenticates by the routing header of the request.
-    def header_aware_middleware
-      Class.new(Faraday::Middleware) do
-        def on_request(env)
-          env.request_headers['Authorization'] = 'Bearer lister' if env.request_headers['Mcp-Method'] == 'tools/list'
-        end
-      end
-    end
-
     it 'carries the routing headers of a real modern request' do
       tools_requests = 0
       stub_request(:post, url).to_return do |request|
@@ -121,7 +112,9 @@ RSpec.describe 'MCP 2026-07-28 cacheable results — round 13' do
           json_response(body['id'], discover_result)
         end
       end
-      server = streamable(faraday_config: ->(f) { f.use header_aware_middleware })
+      # Faraday's own Authorization middleware is the one stack the probe
+      # models a request for, so the request it models is inspectable here.
+      server = streamable(faraday_config: ->(f) { f.request :authorization, 'Bearer', 'lister' })
 
       expect(server.list_tools.map(&:name)).to eq(['t'])
       expect(server.list_tools.map(&:name)).to eq(['t'])
@@ -131,6 +124,7 @@ RSpec.describe 'MCP 2026-07-28 cacheable results — round 13' do
       expect(probe['MCP-Protocol-Version']).to eq('2026-07-28')
       expect(probe['Mcp-Method']).to eq('resources/read')
       expect(probe['Mcp-Name']).to eq('file:///x')
+      expect(probe['Authorization']).to eq('Bearer lister')
     ensure
       server&.cleanup
     end

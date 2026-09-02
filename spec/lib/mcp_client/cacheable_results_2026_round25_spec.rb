@@ -112,21 +112,6 @@ RSpec.describe 'MCP 2026-07-28 cacheable results — round 25' do
       end
     end
 
-    # Reads a holder that cannot change: every instance of it answers alike,
-    # and running the probe leaves nothing behind.
-    def holder_middleware
-      Class.new(Faraday::Middleware) do
-        def initialize(app, holder)
-          super(app)
-          @holder = holder
-        end
-
-        def on_request(env)
-          env.request_headers['Authorization'] = "Bearer #{@holder[:value]}"
-        end
-      end
-    end
-
     it 'reports the unknown context instead of spending a shared nonce' do
       stub_tools_by_bearer
       counter = { used: 0 }
@@ -149,10 +134,9 @@ RSpec.describe 'MCP 2026-07-28 cacheable results — round 25' do
       expect(counter[:used]).to eq(2)
     end
 
-    it 'still serves a private entry when the shared state cannot change' do
+    it 'still serves a private entry behind pure framework middleware' do
       bearers = stub_tools_by_bearer
-      holder = { value: 'alice' }.freeze
-      server = streamable(faraday_config: ->(f) { f.use holder_middleware, holder })
+      server = streamable(faraday_config: ->(f) { f.request :authorization, 'Bearer', 'alice' })
 
       expect(server.list_tools.map(&:name)).to eq(['alice-tool'])
       expect(server.list_tools.map(&:name)).to eq(['alice-tool'])
