@@ -28,6 +28,15 @@ module MCPClient
     # its conversion failed) is not a cache that may be served.
     LIST_VALUE_KINDS = %i[tools prompts resources].freeze
 
+    # Every list kind that gets a stale placeholder when the cache is
+    # cleared, recorded or not, so a copy stored while the clear happened is
+    # never served as an unhinted (legacy) list.
+    PLACEHOLDER_KINDS = %i[tools prompts resources templates].freeze
+
+    # The served-entry identity of a list that carried no cache hint at all
+    # (a legacy server): nothing was recorded, and nothing was rejected.
+    LEGACY_ENTRY = :legacy
+
     # How many resources/read results are kept at once: iterating many
     # resources must not grow memory with every URI ever read.
     MAX_CACHED_READS = 64
@@ -264,6 +273,14 @@ module MCPClient
       (Thread.current[served_entries_key] ||= {})[kind] = entry && [entry.fetch_token, entry.params_fingerprint]
     end
 
+    # Note that this thread's last list of a kind carried no hint at all.
+    # @param kind [Symbol]
+    # @return [Symbol] LEGACY_ENTRY
+    def note_legacy_served(kind)
+      (Thread.current[served_entries_key] ||= {})[kind] = [LEGACY_ENTRY, nil]
+      LEGACY_ENTRY
+    end
+
     # @param kind [Symbol]
     # @return [Object, nil] the identity of the entry this thread's last
     #   list of the kind came from
@@ -327,7 +344,7 @@ module MCPClient
     def fresh_list_value(kind)
       entry = private_entry_for_current_context(kind)
       if entry.nil?
-        note_served_entry(kind, nil)
+        note_legacy_served(kind)
         return block_given? ? yield : nil
       end
       return nil unless entry.value && entry.fresh?(now: monotonic_now)
@@ -415,7 +432,10 @@ module MCPClient
     def attach_list_value(kind, value, entry: nil)
       token = entry ? entry.fetch_token : Thread.current[recorded_entries_key]&.delete(kind)
       note_served_entry(kind, nil)
-      return false unless token
+      # Nothing recorded for this fetch: a legacy list without a hint, which
+      # the transport keeps until a list_changed notification. A recorded
+      # hint whose entry is gone or replaced is a rejection (false).
+      return note_legacy_served(kind) unless token
 
       context = respond_to?(:request_authorization_context, true) ? request_authorization_context : nil
       cache_entries_mutex.synchronize do
@@ -492,6 +512,7 @@ module MCPClient
         # connection must not read an empty entry as "fresh"); reads are
         # simply forgotten, they are only ever served with a value.
         cache_entries.delete_if { |key, _| key.is_a?(String) }
+        PLACEHOLDER_KINDS.each { |kind| cache_entries[kind] ||= nil }
         cache_entries.each_key { |key| cache_entries[key] = MCPClient::CachedResult.stale(now: now, like: cache_entries[key]) }
         bump_cache_epoch
       end

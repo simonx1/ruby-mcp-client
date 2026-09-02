@@ -7,6 +7,14 @@ metadata). Each feature lands in its own PR; this section accumulates them.
 
 ### Cacheable results (`ttlMs` / `cacheScope`)
 
+- **Cleanup placeholders and slice identity (round 19).** Clearing the
+  cache installs a stale placeholder for every list kind, recorded or
+  not, and a transport keeps a fetched list only when its hint was
+  attached (or the list carried none), so cleanup racing a first fetch
+  never leaves a hintless copy to serve — `ttlMs` 0 re-fetches on every
+  access; a client-level slice is identified by the very transport entry
+  it came from, never by "no entry" (a legacy list stays a hit only while
+  the transport still holds no entry).
 - **Client slices, per-key invalidation, capabilities (round 18).** A
   client-level cache slice is tied to the very transport entry its list
   came from (identity and the parameters that entry is bound to), so a
