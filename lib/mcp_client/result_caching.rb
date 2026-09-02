@@ -26,7 +26,7 @@ module MCPClient
     # Kinds whose cached list lives in the entry itself: a hint recorded for
     # one of them without its list (the list is still being converted, or
     # its conversion failed) is not a cache that may be served.
-    LIST_VALUE_KINDS = %i[tools prompts resources].freeze
+    LIST_VALUE_KINDS = %i[tools prompts resources templates].freeze
 
     # Every list kind that gets a stale placeholder when the cache is
     # cleared, recorded or not, so a copy stored while the clear happened is
@@ -315,6 +315,18 @@ module MCPClient
 
     # @param kind [Symbol]
     # @return [Object, nil] the identity of the entry currently holding the kind
+    # Whether the entry a client-level slice came from is still fresh by its
+    # own hint — a lock-safe re-check (no probe, no host callable) for the
+    # moment a snapshot is handed out. No entry means nothing bounds it.
+    # @param kind [Symbol]
+    # @return [Boolean]
+    def cache_entry_fresh?(kind)
+      cache_entries_mutex.synchronize do
+        entry = cache_entries[kind]
+        entry.nil? || (!entry.value.nil? && entry.fresh?(now: monotonic_now))
+      end
+    end
+
     def cache_entry_token(kind)
       # A placeholder (an invalidation, a cleanup) identifies nothing.
       cache_entries_mutex.synchronize do
