@@ -97,17 +97,25 @@ module MCPClient
         # (the wait passes the session it polls in itself). A bare id names
         # what the session live at this call knows, and is pinned to it.
         epoch ||= handle_session_epoch(task_id, srv, 'getting') || invocation_session_epoch(srv)
-        check_handle_lifetime!(task_id, srv, epoch, 'getting')
         # A refreshed handle names the task the caller asked about, not
         # whatever the id means when the answer comes back: without the
-        # source handle's lifetime it would pass the guard above unchecked
+        # source handle's lifetime it would pass the guard below unchecked
         # and could later update, cancel or be waited on for a replacement.
         generation = handle_task_generation(task_id, srv)
+        handle = task_id
         task_id = task_identifier(task_id)
+        # The request is about one lifetime of the id: the transport refuses
+        # to ask about it once a creation has taken the id (a handle), and
+        # what the answer forgets is that lifetime's bookkeeping and never
+        # the live occupancy of a task that replaced it.
+        pin = task_lifetime_pin(handle, task_id, srv, epoch, 'getting')
         ensure_task_capability!(srv, 'get')
 
         begin
-          result = task_rpc(srv, 'tasks/get', { taskId: task_id }, timeout: timeout, epoch: epoch)
+          result = task_rpc(srv, 'tasks/get', { taskId: task_id }, timeout: timeout, epoch: epoch, lifetime: pin)
+          # The answer describes the task that was asked about only while
+          # that task is still what the id names.
+          verify_task_lifetime!(pin)
           validate_detailed_task_shape!(result) if modern_server?(srv)
           # The handle is about the session the request was pinned to: one
           # that ended while the answer was in flight (or just after it came
@@ -125,13 +133,15 @@ module MCPClient
           # pending answers): a reused id must never inherit it. What is
           # forgotten is the bookkeeping of the session that was asked, never
           # what the session replacing it has recorded under the same id.
-          forget_task_keys(srv, task_id, state: state, epoch: epoch) if task.terminal?
+          forget_task_keys(srv, task_id, state: state, epoch: epoch, pin: pin) if task.terminal?
           task
         rescue MCPClient::Errors::ServerError => e
           raise if e.protocol_error?
 
           error = task_error_from(e, task_id, 'getting', modern: modern_server?(srv), method: 'tasks/get')
-          forget_task_keys(srv, task_id, state: state, epoch: epoch) if error.is_a?(MCPClient::Errors::TaskNotFound)
+          if error.is_a?(MCPClient::Errors::TaskNotFound)
+            forget_task_keys(srv, task_id, state: state, epoch: epoch, pin: pin)
+          end
           raise error
         rescue MCPClient::Errors::SessionChangedError => e
           # Nothing was asked: the session this request is about has ended,
@@ -183,11 +193,16 @@ module MCPClient
         # in: the request is pinned to that session and refused once it has
         # ended, where the reused id would hand back another task's result.
         epoch = handle_session_epoch(task_id, srv, 'getting result for') || invocation_session_epoch(srv)
-        check_handle_lifetime!(task_id, srv, epoch, 'getting result for')
+        handle = task_id
         task_id = task_identifier(task_id)
+        pin = task_lifetime_pin(handle, task_id, srv, epoch, 'getting result for')
 
         begin
-          task_rpc(srv, 'tasks/result', { taskId: task_id }, epoch: epoch)
+          result = task_rpc(srv, 'tasks/result', { taskId: task_id }, epoch: epoch, lifetime: pin)
+          # The result of the task that was asked for, not of the one a
+          # creation gave the id to while it was in flight.
+          verify_task_lifetime!(pin)
+          result
         rescue MCPClient::Errors::ServerError => e
           raise if e.protocol_error?
 
@@ -254,10 +269,14 @@ module MCPClient
         # the replacement session named with the same id. A bare id cancels
         # what the session live at this call knows, and nothing else.
         epoch = handle_session_epoch(task, srv, 'cancelling') || invocation_session_epoch(srv)
-        check_handle_lifetime!(task, srv, epoch, 'cancelling')
+        # A cancel is written for one lifetime of the id and no other: the
+        # transport refuses it once a creation under the id has replaced the
+        # task the handle names, rather than cancelling that replacement.
+        pin = task_lifetime_pin(task, task_id, srv, epoch, 'cancelling')
 
         begin
-          result = task_rpc(srv, 'tasks/cancel', { taskId: task_id }, epoch: epoch)
+          result = task_rpc(srv, 'tasks/cancel', { taskId: task_id }, epoch: epoch, lifetime: pin)
+          verify_task_lifetime!(pin)
           return cancelled_task_handle(task, task_id, srv, epoch) if modern_server?(srv)
 
           MCPClient::Task.from_json(result, server: srv, session_epoch: epoch)
@@ -270,7 +289,7 @@ module MCPClient
                                                 "#{sanitize_peer_log_text(e.message)}"
           end
 
-          raise task_failure(e, srv, task_id, 'cancelling', epoch: epoch,
+          raise task_failure(e, srv, task_id, 'cancelling', epoch: epoch, pin: pin,
                                                             method: 'tasks/cancel', modern: modern_server?(srv))
         rescue MCPClient::Errors::TransportError, MCPClient::Errors::ConnectionError => e
           raise MCPClient::Errors::TaskError, "Error cancelling task '#{sanitize_peer_log_text(task_id.to_s)}': " \
@@ -433,10 +452,15 @@ module MCPClient
       # @param epoch [Integer, nil] the session the failed request was pinned to; without a captured
       #   state it is that session's bookkeeping that dies with the task, never the bookkeeping a
       #   session which replaced it under the request has recorded under the same, reusable id
+      # @param pin [Hash, nil] the lifetime the failed request was bound to: a task the server
+      #   reports gone takes its own bookkeeping with it, never that of a lifetime which replaced
+      #   it under the same id while the request was in flight
       # @return [MCPClient::Errors::TaskError]
-      def task_failure(error, srv, task_id, action, modern: true, method: nil, state: nil, epoch: nil)
+      def task_failure(error, srv, task_id, action, modern: true, method: nil, state: nil, epoch: nil, pin: nil)
         mapped = task_error_from(error, task_id, action, modern: modern, method: method)
-        forget_task_keys(srv, task_id, state: state, epoch: epoch) if mapped.is_a?(MCPClient::Errors::TaskNotFound)
+        return mapped unless mapped.is_a?(MCPClient::Errors::TaskNotFound)
+
+        forget_task_keys(srv, task_id, state: state, epoch: epoch, pin: pin)
         mapped
       end
 

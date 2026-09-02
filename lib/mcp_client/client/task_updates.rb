@@ -225,10 +225,22 @@ module MCPClient
             return ended_session_update_result(shown, strict_session)
           end
 
+          # And held to at the wire, where a creation that lands while the
+          # session is being established is already visible: the check above
+          # cannot see one, and these answers would then be written for the
+          # task that replaced their own.
           task_rpc(srv, 'tasks/update', { taskId: task_id, inputResponses: input_responses },
-                   timeout: timeout, epoch: epoch)
+                   timeout: timeout, epoch: epoch, lifetime: state_lifetime_pin(state, task_id))
           clear_pending_update(state, lock, keys)
           true
+        rescue MCPClient::Errors::TaskReplacedError
+          # Nothing went out: the transport refused to write answers of a task
+          # the server has replaced (in the new one the keys are a different
+          # request's).
+          logger.warn("Task #{shown}: the server created a new task with this id before the answers were " \
+                      'sent; they are discarded')
+          drop_ended_session_update(state, lock, keys)
+          ended_session_update_result(shown, strict_session, replaced: true)
         rescue MCPClient::Errors::SessionChangedError
           # The transport refused to write into the session that replaced the
           # answers' own: nothing went out, and in the new session these keys
@@ -251,6 +263,16 @@ module MCPClient
           raise MCPClient::Errors::TaskError,
                 "Error updating task '#{shown}': #{sanitize_peer_log_text(e.message)}"
         end
+      end
+
+      # The lifetime an update is bound to: the one its answers were built in
+      # (see {#task_lifetime_current?}), named so that the transport holds the
+      # write to it as well.
+      # @param state [Hash] the bookkeeping the answers belong to
+      # @return [Hash] the lifetime pin
+      def state_lifetime_pin(state, task_id)
+        { lookup: state[:lookup], generation: state[:generation], named: true,
+          task_id: task_id, operation: 'updating' }
       end
 
       # What a delivery the session guard (or the pin at the wire) dropped

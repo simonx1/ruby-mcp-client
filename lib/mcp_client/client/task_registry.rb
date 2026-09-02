@@ -1,5 +1,7 @@
 # frozen_string_literal: true
 
+require_relative 'task_lifetimes'
+
 module MCPClient
   class Client
     # The per-task bookkeeping of the tasks extension: the answered and
@@ -8,20 +10,13 @@ module MCPClient
     # session and reusable, so every entry dies with its session — and every
     # request that names a task carries the session it is about. Inside one
     # session an id is reusable too: every CreateTaskResult starts a fresh
-    # lifetime under it (see {#start_task_lifetime}), and a wait, a hold or an
-    # answer of one lifetime never reaches another. Mixed into
+    # lifetime under it, and a wait, a hold or an answer of one lifetime never
+    # reaches another — which lifetime a task id names, and which one a
+    # request is bound to, lives in {TaskLifetimes}. Mixed into
     # {MCPClient::Client} through {TaskSupport}.
     module TaskRegistry
-      # How many task ids one client keeps a lifetime counter for. The counter
-      # has to outlive the task's own bookkeeping — that is the point: a
-      # creation under an id this client has already seen is a different task,
-      # whether or not anything of the previous one is still around — so on a
-      # sessionless connection, where the epoch never moves and nothing else
-      # prunes it, the map would otherwise grow with every task ever created.
-      MAX_TRACKED_TASK_LIFETIMES = 4096
-      # How far a prune goes once the cap is passed: dropping a batch keeps the
-      # scan amortized instead of walking the map on every creation.
-      TRACKED_TASK_LIFETIMES_LOW_WATER = (MAX_TRACKED_TASK_LIFETIMES * 3) / 4
+      # Which task a reusable id names, and how a request is bound to it.
+      include TaskLifetimes
 
       private
 
@@ -70,130 +65,7 @@ module MCPClient
       # @return [void] (callers hold answered_keys_mutex)
       def drop_ended_session_state(lookup)
         @task_states.delete_if { |other, _| other[0] == lookup[0] && other[1] < lookup[1] }
-        @task_lifetimes&.delete_if { |other, _| other[0] == lookup[0] && other[1] < lookup[1] }
-      end
-
-      # How many times the server has already handed this task id out inside
-      # this session; 0 for an id no reuse was ever seen for.
-      # @param lookup [Array] server, session epoch and task id
-      # @return [Integer] (callers hold answered_keys_mutex)
-      def task_lifetime(lookup)
-        @task_lifetimes&.fetch(lookup, nil) || 0
-      end
-
-      # Begin the lifetime a CreateTaskResult just created. A task id is
-      # unique within a session, so a server that answers with an id it has
-      # already handed out in this session has ended that task and started
-      # another: the bookkeeping of the previous lifetime is dropped and the
-      # id's generation moves, which gives the new task an answered set, an
-      # in-flight registry entry and a pending update entirely of its own.
-      # Without the move, an input key a handler of the previous task is
-      # still presenting would be suppressed as already in flight on the new
-      # one, and that handler's answer would be delivered to the new task.
-      #
-      # Every creation this client observed counts, whether or not anything
-      # of the previous one is still around: a second CreateTaskResult that
-      # arrives before any wait allocated state, or after a terminal poll (or
-      # a TTL expiry) forgot it, is just as much a different task, and two
-      # handles that named the same lifetime would let the older one update
-      # or cancel the task that replaced it. The id goes on the books at its
-      # first creation, at generation 0, so nothing is recorded for the
-      # single-creation case every well-behaved server produces.
-      # @return [void]
-      def start_task_lifetime(srv, task_id, epoch)
-        answered_keys_mutex.synchronize do
-          lookup = [srv.object_id, epoch, task_id]
-          previous = @task_states&.delete(lookup)
-          lifetimes = (@task_lifetimes ||= {})
-          replaces = lifetimes.key?(lookup) || previous || presenting_earlier_lifetime?(lookup)
-          generation = replaces ? task_lifetime(lookup) + 1 : 0
-          # Re-inserted, so the ids created most recently are the last a prune
-          # reaches (a Hash keeps a rewritten key where it was).
-          lifetimes.delete(lookup)
-          lifetimes[lookup] = generation
-          prune_task_lifetimes(lifetimes)
-        end
-      end
-
-      # Forget the counters of the task ids created longest ago, once more of
-      # them are kept than {MAX_TRACKED_TASK_LIFETIMES}. An id nothing holds
-      # any more is one no live request can name: a creation under it later
-      # starts its count over, exactly as an id this client never saw does.
-      # An id whose bookkeeping is still live — or whose keys a handler is
-      # still presenting — is never dropped: its counter is what tells that
-      # state, and the handles built from it, which task they belong to.
-      # @return [void] (callers hold answered_keys_mutex)
-      def prune_task_lifetimes(lifetimes)
-        return if lifetimes.size <= MAX_TRACKED_TASK_LIFETIMES
-
-        # A snapshot: the entries are deleted as the scan walks them.
-        tracked = lifetimes.keys
-        tracked.each do |lookup|
-          break if lifetimes.size <= TRACKED_TASK_LIFETIMES_LOW_WATER
-          next if @task_states&.key?(lookup) || presenting_earlier_lifetime?(lookup)
-
-          lifetimes.delete(lookup)
-        end
-      end
-
-      # Whether a handler is still presenting the input keys of some lifetime
-      # of this task id (an abandoned handler outlives its state).
-      # @return [Boolean] (callers hold answered_keys_mutex)
-      def presenting_earlier_lifetime?(lookup)
-        return false unless @in_flight_keys
-
-        @in_flight_keys.any? { |key, held| key.first(3) == lookup && !held.empty? }
-      end
-
-      # The lifetime a task id has now in a given session.
-      # @return [Integer]
-      def current_task_lifetime(srv, task_id, epoch)
-        answered_keys_mutex.synchronize { task_lifetime([srv.object_id, epoch, task_id]) }
-      end
-
-      # Refuse a request whose task handle names a task the server has since
-      # replaced. A task id is unique within a session, so a fresh
-      # CreateTaskResult under it ended the task the handle was built for: the
-      # request must not be sent for the task that answers to the id now. A
-      # bare id, a handle from another server, and a handle that never came
-      # from a creation all name whatever the id means now and are let
-      # through, exactly as before.
-      # @param task [Object] what the caller named the task with
-      # @param epoch [Integer, nil] the session the request is pinned to
-      # @param operation [String] for the error message ('updating', 'waiting for')
-      # @return [void]
-      # @raise [MCPClient::Errors::TaskError] if the handle's task was replaced
-      def check_handle_lifetime!(task, srv, epoch, operation)
-        return unless task.is_a?(MCPClient::Task) && task.server.equal?(srv) && task.task_generation
-        return if current_task_lifetime(srv, task.task_id, epoch) == task.task_generation
-
-        raise MCPClient::Errors::TaskError,
-              "Error #{operation} task '#{shown_task_id(task.task_id)}': the server has created a new task with " \
-              'this id since, so the task this handle names was replaced and is gone'
-      end
-
-      # The lifetime a handle refreshed from another one keeps: the one the
-      # source handle named, when that handle is this server's. A request
-      # that named its task with a bare id (or with another server's handle)
-      # asks about whatever the id means now and produces a handle that says
-      # the same, exactly as before — but a handle built from one that named
-      # a definite task must keep naming it, or a later creation under the id
-      # would silently move it to the task that replaced it.
-      # @param task [Object] what the caller named the task with
-      # @return [Integer, nil]
-      def handle_task_generation(task, srv)
-        return nil unless task.is_a?(MCPClient::Task) && task.server.equal?(srv)
-
-        task.task_generation
-      end
-
-      # Whether the bookkeeping a request was built from is still what its
-      # task id names: a CreateTaskResult that handed the id out again since
-      # started a different task, and the request belongs to the previous one.
-      # @param state [Hash] the bookkeeping the request captured
-      # @return [Boolean]
-      def task_lifetime_current?(state)
-        answered_keys_mutex.synchronize { task_lifetime(state[:lookup]) == state[:generation] }
+        drop_ended_lifetimes(lookup)
       end
 
       # Forget every task's bookkeeping (the client is being cleaned up).
@@ -204,6 +76,7 @@ module MCPClient
           @in_flight_keys = nil
           @task_session_epochs = nil
           @task_lifetimes = nil
+          @task_lifetime_counters = nil
         end
       end
 
@@ -293,11 +166,19 @@ module MCPClient
       #   is dropped (the current one when that session is not known either).
       # @param epoch [Integer, nil] the session the request that reported the
       #   task gone (or terminal) was pinned to
+      # @param pin [Hash, nil] the lifetime the request was bound to, when no
+      #   state was captured: a creation that landed while the answer was in
+      #   flight made the task the answer describes a past one, and what the
+      #   id keys now belongs to the task that replaced it — a live occupancy
+      #   a terminal (or missing) answer about its predecessor must not wipe
       # @return [void]
-      def forget_task_keys(srv, task_id, state: nil, epoch: nil)
+      def forget_task_keys(srv, task_id, state: nil, epoch: nil, pin: nil)
         answered_keys_mutex.synchronize do
           unless state
-            @task_states&.delete(epoch.nil? ? task_state_lookup(srv, task_id) : [srv.object_id, epoch, task_id])
+            lookup = epoch.nil? ? task_state_lookup(srv, task_id) : [srv.object_id, epoch, task_id]
+            next if pin && task_lifetime(lookup) != pin[:generation]
+
+            @task_states&.delete(lookup)
             next
           end
           next unless @task_states && @task_states[state[:lookup]].equal?(state)
