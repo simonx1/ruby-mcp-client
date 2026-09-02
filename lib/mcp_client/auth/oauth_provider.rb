@@ -119,7 +119,10 @@ module MCPClient
         return nil unless token
 
         # A token from another authorization server is never presented
-        # (MCP 2026-07-28: registration state and tokens are per AS).
+        # (MCP 2026-07-28: registration state and tokens are per AS). Retired
+        # bytes are refused before any binding could attribute them anew.
+        return nil if retired_token?(token)
+
         token = bind_token_issuer(token)
         return nil unless token && token_for_current_issuer?(token)
 
@@ -234,7 +237,9 @@ module MCPClient
         return false if recorded && recorded != client_info.client_id
         return true if portable_client?(client_info)
 
-        !client_info.respond_to?(:issuer) || client_info.issuer.nil? || client_info.issuer == pkce.issuer
+        # A started flow binds its non-portable client, so an unbound record
+        # here was put in storage by someone else meanwhile.
+        !client_info.respond_to?(:issuer) || client_info.issuer == pkce.issuer
       end
 
       # Check a success response before anything is shown or exchanged: the
@@ -259,7 +264,21 @@ module MCPClient
         end
 
         cached = stored_server_metadata
-        cached = nil unless cached && cached.issuer == pkce.issuer
+        # A challenge received meanwhile that names another authorization
+        # server, or cached metadata for another one, ends this flow here —
+        # not after a success page was shown.
+        advertised = Array(@challenge_resource_metadata&.authorization_servers).first
+        if (advertised && advertised != pkce.issuer) || (cached && cached.issuer != pkce.issuer)
+          raise MCPClient::Errors::ConnectionError,
+                'Authorization response rejected: the authorization server changed during the flow; ' \
+                'restart the authorization'
+        end
+        client_info = stored_client_info
+        unless client_info && client_for_request?(client_info, pkce)
+          raise MCPClient::Errors::ConnectionError,
+                'Authorization response rejected: the client credentials changed during the flow; ' \
+                'restart the authorization'
+        end
         validate_authorization_response_issuer!(iss, pkce.issuer, iss_parameter_supported_for?(pkce, cached))
       end
 
@@ -1195,8 +1214,10 @@ module MCPClient
         # Whatever the backend manages, this token is never presented again.
         current = stored_token
         if current.respond_to?(:access_token) && current.access_token
-          (@retired_tokens ||= {})[current.access_token] =
-            true
+          # Opaque tokens are unique only within an issuer: the marker names
+          # the issuer the bytes were retired for, so another provider
+          # sharing the storage may store the same bytes for a new server.
+          (@retired_tokens ||= {})[retirement_key(current, bind_to)] = true
         end
         if bind_to && current.respond_to?(:with_issuer) && (current.issuer.nil? || bind_to == Token::RETIRED_ISSUER)
           begin
@@ -1252,8 +1273,34 @@ module MCPClient
       # @param token [Token]
       # @return [void]
       def store_token(token)
-        @retired_tokens&.delete(token.access_token) if token.respond_to?(:access_token)
+        @retired_tokens&.delete(retirement_key(token, nil)) if token.respond_to?(:access_token)
         storage.set_token(server_url, token)
+      end
+
+      # Whether a token was retired in this process: a bound token when its
+      # bytes were retired for its issuer, an unbound one when its bytes
+      # were retired for any issuer (it cannot say which one it came from).
+      # @param token [Token]
+      # @return [Boolean]
+      def retired_token?(token)
+        return true if token.respond_to?(:retired?) && token.retired?
+        return false unless token.respond_to?(:access_token) && @retired_tokens
+
+        issuer = token.respond_to?(:issuer) ? token.issuer : nil
+        return @retired_tokens.key?([issuer, token.access_token]) if issuer
+
+        @retired_tokens.keys.any? { |_issuer, bytes| bytes == token.access_token }
+      end
+
+      # The in-process retirement marker of a token: its bytes together with
+      # the issuer they were retired for (the recorded issuer, else the
+      # issuer the token was bound to at retirement).
+      # @param token [Token]
+      # @param bind_to [String, nil]
+      # @return [Array(String, String)]
+      def retirement_key(token, bind_to)
+        issuer = token.respond_to?(:issuer) ? token.issuer : nil
+        [issuer || bind_to || Token::RETIRED_ISSUER, token.access_token]
       end
 
       # Whether a stored token belongs to the authorization server currently
@@ -1262,8 +1309,7 @@ module MCPClient
       # @param token [Token]
       # @return [Boolean]
       def token_for_current_issuer?(token)
-        return false if token.respond_to?(:access_token) && @retired_tokens&.key?(token.access_token)
-        return false if token.respond_to?(:retired?) && token.retired?
+        return false if retired_token?(token)
         return true unless token.respond_to?(:issuer)
 
         current = stored_server_metadata&.issuer
