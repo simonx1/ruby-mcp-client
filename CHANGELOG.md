@@ -97,6 +97,20 @@ metadata). Each feature lands in its own PR; this section accumulates them.
   them); the structural bound counts object entries too, so a wide map of
   leaf values is rejected before it is copied, and the copy runs under the
   validation deadline.
+- **Undecided branches and bounds (round 11).** A branch the validator
+  can only partly evaluate (it carries an unsupported assertion such as
+  `multipleOf`) is no verdict for `not`, `oneOf` or `if`: it is neither a
+  match nor a mismatch, so `{"not": {"multipleOf": 2}}` never rejects a
+  value (anyOf / allOf keep treating a partial pass as a pass, the
+  permissive direction). A document nested deeper than
+  `MAX_SCHEMA_DEPTH` schema levels can hold is rejected while it is
+  copied instead of keeping the rest raw; the client keys its once-per
+  schema checks by the schema object, never by hashing a peer document
+  whole. Under draft-07 a URI `$id` beside a `$ref` is ignored with the
+  other siblings (it starts no resource); an anchor index that stopped at
+  its bound before reaching every object makes the schema unusable; a JSON
+  Pointer token with `~` not followed by `0` or `1` is unresolvable (RFC
+  6901).
 
 ### Authorization (RFC 9207 issuer validation, client registration)
 
