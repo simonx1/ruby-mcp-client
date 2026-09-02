@@ -98,6 +98,10 @@ module MCPClient
       # cache was filled under (MCP 2026-07-28 caching: a result is served
       # only to a request that would carry the same parameters).
       @cache_params = Hash.new { |h, k| h[k] = {}.compare_by_identity }
+      # One lock for the list caches and their parameter tags: a freshness
+      # check and the copy it approves are one snapshot, and the notification
+      # thread's clears wait for it.
+      @cache_mutex = Mutex.new
       # Active progressToken -> callback registrations (MCP progress utility)
       @progress_callbacks = {}
       @progress_mutex = Mutex.new
@@ -143,19 +147,21 @@ module MCPClient
     # @raise [MCPClient::Errors::ConnectionError] on authorization failures
     # @raise [MCPClient::Errors::PromptGetError] if no prompts could be retrieved from any server
     def list_prompts(cache: true)
-      return cached_copies(@prompt_cache) if cache && !@prompt_cache.empty? && caches_fresh?(:prompts)
+      if cache && (snapshot = cached_snapshot(:prompts, @prompt_cache))
+        return snapshot
+      end
 
       prompts = []
       connection_errors = []
 
       servers.each do |server|
+        fingerprint = params_fingerprint_for(server)
         server_prompts = server.list_prompts
-        drop_cached_entries(@prompt_cache, server)
-        note_cache_params(:prompts, server)
-        server_prompts.each do |prompt|
-          cache_key = cache_key_for(server, prompt.name)
-          @prompt_cache[cache_key] = prompt
-          prompts << prompt
+        replace_cached_slice(:prompts, @prompt_cache, server, fingerprint) do
+          server_prompts.each do |prompt|
+            @prompt_cache[cache_key_for(server, prompt.name)] = MCPClient::DeepCopy.copy(prompt)
+            prompts << prompt
+          end
         end
       rescue MCPClient::Errors::ConnectionError => e
         # Fast-fail on authorization errors for better user experience
@@ -237,23 +243,22 @@ module MCPClient
       end
 
       # Use cache if available and no cursor
-      if cache && !@resource_cache.empty? && caches_fresh?(:resources)
-        return { 'resources' => cached_copies(@resource_cache), 'nextCursor' => nil }
+      if cache && (snapshot = cached_snapshot(:resources, @resource_cache))
+        return { 'resources' => snapshot, 'nextCursor' => nil }
       end
 
       resources = []
       connection_errors = []
 
       servers.each do |server|
+        fingerprint = params_fingerprint_for(server)
         result = server.list_resources
         resource_list = result['resources'] || []
-        drop_cached_entries(@resource_cache, server)
-        note_cache_params(:resources, server)
-
-        resource_list.each do |resource|
-          cache_key = cache_key_for(server, resource.uri)
-          @resource_cache[cache_key] = MCPClient::DeepCopy.copy(resource)
-          resources << resource
+        replace_cached_slice(:resources, @resource_cache, server, fingerprint) do
+          resource_list.each do |resource|
+            @resource_cache[cache_key_for(server, resource.uri)] = MCPClient::DeepCopy.copy(resource)
+            resources << resource
+          end
         end
       rescue MCPClient::Errors::ConnectionError => e
         # Fast-fail on authorization errors for better user experience
@@ -293,21 +298,25 @@ module MCPClient
     # @raise [MCPClient::Errors::ConnectionError] on authorization failures
     # @raise [MCPClient::Errors::ToolCallError] if no tools could be retrieved from any server
     def list_tools(cache: true)
-      return cached_copies(@tool_cache) if cache && !@tool_cache.empty? && caches_fresh?(:tools)
+      if cache && (snapshot = cached_snapshot(:tools, @tool_cache))
+        return snapshot
+      end
 
       tools = []
       connection_errors = []
 
       servers.each do |server|
+        # The parameters this fetch will carry are read before it goes out:
+        # whatever request ran last on this thread says nothing about it.
+        fingerprint = params_fingerprint_for(server)
         server_tools = server.list_tools
         # Replace this server's slice: an item the refreshed list no longer
         # carries must not linger from the previous fetch.
-        drop_cached_entries(@tool_cache, server)
-        note_cache_params(:tools, server)
-        server_tools.each do |tool|
-          cache_key = cache_key_for(server, tool.name)
-          @tool_cache[cache_key] = MCPClient::DeepCopy.copy(tool)
-          tools << tool
+        replace_cached_slice(:tools, @tool_cache, server, fingerprint) do
+          server_tools.each do |tool|
+            @tool_cache[cache_key_for(server, tool.name)] = MCPClient::DeepCopy.copy(tool)
+            tools << tool
+          end
         end
       rescue MCPClient::Errors::ConnectionError => e
         # Fast-fail on authorization errors for better user experience
@@ -415,9 +424,11 @@ module MCPClient
     # Clear the cached tools so that next list_tools will fetch fresh data
     # @return [void]
     def clear_cache
-      @tool_cache.clear
-      @prompt_cache.clear
-      @resource_cache.clear
+      @cache_mutex.synchronize do
+        @tool_cache.clear
+        @prompt_cache.clear
+        @resource_cache.clear
+      end
     end
 
     # Register a callback for JSON-RPC notifications from servers
@@ -777,17 +788,44 @@ module MCPClient
       end
     end
 
-    # Remember the effective parameters a server's slice of a list cache was
-    # fetched under, so a later fetch on the transport (or a callback) under
-    # other parameters cannot make the client cache a false hit.
-    # @param kind [Symbol]
+    # The effective-parameter fingerprint a server's next request would
+    # carry, read before a fetch so its slice of the cache is tagged with
+    # the parameters of the list it holds (never with a leftover of whatever
+    # request ran last on this thread).
     # @param server [MCPClient::ServerBase]
-    # @return [void]
-    def note_cache_params(kind, server)
-      return unless server.respond_to?(:current_params_fingerprint, true)
+    # @return [String, nil]
+    def params_fingerprint_for(server)
+      return nil unless server.respond_to?(:current_params_fingerprint, true)
 
-      fingerprint = server.respond_to?(:request_params_fingerprint, true) && server.send(:request_params_fingerprint)
-      @cache_params[kind][server] = fingerprint || server.send(:current_params_fingerprint)
+      server.send(:current_params_fingerprint)
+    end
+
+    # The cache's items as one snapshot taken under the lock, when the cache
+    # holds something and every server's slice is fresh for the parameters
+    # its next request would carry.
+    # @param kind [Symbol]
+    # @param cache [Hash]
+    # @return [Array, nil]
+    def cached_snapshot(kind, cache)
+      @cache_mutex.synchronize do
+        cached_copies(cache) if !cache.empty? && caches_fresh?(kind)
+      end
+    end
+
+    # Replace one server's slice of a list cache under the lock: its previous
+    # entries go, the fingerprint the fetch was made under is recorded, and
+    # the block inserts the new entries.
+    # @param kind [Symbol]
+    # @param cache [Hash]
+    # @param server [MCPClient::ServerBase]
+    # @param fingerprint [String, nil]
+    # @return [void]
+    def replace_cached_slice(kind, cache, server, fingerprint)
+      @cache_mutex.synchronize do
+        drop_cached_entries(cache, server)
+        @cache_params[kind][server] = fingerprint if server.respond_to?(:current_params_fingerprint, true)
+        yield
+      end
     end
 
     # @return [Boolean] whether the server's next request would carry the
@@ -915,13 +953,13 @@ module MCPClient
       case method
       when 'notifications/tools/list_changed'
         logger.warn("[#{server_id}] Tool list has changed, clearing tool cache")
-        @tool_cache.clear
+        @cache_mutex.synchronize { @tool_cache.clear }
       when 'notifications/prompts/list_changed'
         logger.warn("[#{server_id}] Prompt list has changed, clearing prompt cache")
-        @prompt_cache.clear
+        @cache_mutex.synchronize { @prompt_cache.clear }
       when 'notifications/resources/list_changed'
         logger.warn("[#{server_id}] Resource list has changed, clearing resource cache")
-        @resource_cache.clear
+        @cache_mutex.synchronize { @resource_cache.clear }
       end
     end
 

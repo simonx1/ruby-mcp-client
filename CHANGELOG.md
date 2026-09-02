@@ -7,6 +7,19 @@ metadata). Each feature lands in its own PR; this section accumulates them.
 
 ### Cacheable results (`ttlMs` / `cacheScope`)
 
+- **Client caches and queued responses (round 17).** The client-level
+  tool, prompt and resource caches are tagged with the parameters of the
+  list they hold — read before the fetch, never the leftover of whatever
+  request ran last on the thread — so a transport hit under another
+  tenant cannot mislabel the slice; prompts are cached as copies like
+  tools and resources; the client maps and their tags live under one lock,
+  so a freshness check and the copy it approves are one snapshot and a
+  `list_changed` clear waits for it; an outer request's credentials and
+  parameters are restored even when parsing its response raises, so a
+  failed re-fetch is judged by its own context; a response queued by the
+  stdio reader or the SSE stream is dated from its arrival, not from when
+  the waiter woke.
+
 - **Client caches and receipt times (round 16).** `MCPClient::Client`'s
   own tool, prompt and resource caches are bound to the effective
   parameters each server's slice was filled under, so a later transport

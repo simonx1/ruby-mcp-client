@@ -116,6 +116,8 @@ module MCPClient
             return true
           end
 
+          # Dated from arrival: the waiter polls and may wake much later.
+          (@sse_result_arrivals ||= {})[data['id']] = monotonic_now if respond_to?(:monotonic_now, true)
           @sse_results[data['id']] =
             if data['error']
               # JSON-RPC error response: store the error under a Symbol key

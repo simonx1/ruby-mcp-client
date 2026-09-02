@@ -663,9 +663,12 @@ module MCPClient
           # Remove the response and the awaiting marker on both success and
           # timeout so neither @pending nor @awaiting accumulates entries.
           msg = @pending.delete(id)
+          arrival = (@response_arrivals ||= {}).delete(id)
           @awaiting.delete(id)
           raise MCPClient::Errors::RequestTimeoutError, "Timeout waiting for JSONRPC response id=#{id}" unless msg
 
+          # The response's receipt time is the reader's, not this wake-up.
+          note_response_received_at(arrival || monotonic_now) if respond_to?(:note_response_received_at, true)
           msg
         end
       end
@@ -752,7 +755,6 @@ module MCPClient
         send_request(req)
         begin
           res = wait_response(req_id, timeout: timeout)
-          note_response_received_at if respond_to?(:note_response_received_at, true)
         rescue MCPClient::Errors::RequestTimeoutError
           # MCP lifecycle: on timeout the sender SHOULD issue a cancellation
           # notification for the abandoned request and stop waiting.

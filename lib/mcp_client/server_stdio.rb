@@ -323,6 +323,8 @@ module MCPClient
         # responses are dropped so @pending cannot grow without bound.
         if @awaiting.key?(id)
           @pending[id] = msg
+          # Dated from arrival: the waiter may wake much later.
+          (@response_arrivals ||= {})[id] = monotonic_now if respond_to?(:monotonic_now, true)
           @cond.broadcast
         else
           @logger.debug("Discarding response for unknown or expired request id=#{id}")
@@ -912,6 +914,7 @@ module MCPClient
       # Release any buffered responses / awaiting markers
       @mutex.synchronize do
         @pending.clear
+        @response_arrivals&.clear
         @awaiting.clear
       end
       # The process this session was is gone, whatever else went wrong above.
