@@ -1988,15 +1988,25 @@ module MCPClient
       end
 
       # Extract redirect_uri mismatch details from an OAuth error response
+      #
+      # The description is a peer's bytes, and nothing about them guarantees
+      # valid UTF-8: `String#match` raises `ArgumentError` on a lone `\xFF`,
+      # out of the very rescue path that exists to turn a 400 into a
+      # ConnectionError. It is made decodable before it is matched — the
+      # bounded, printable form of {#safe_error_text} would do for a message
+      # but not for a pattern, which has to see the URIs the peer actually
+      # wrote.
       # @param body [String] Raw HTTP response body
       # @return [Hash, nil] Hash with :sent and :expected URIs if mismatch detected
       def extract_redirect_mismatch(body)
-        data = JSON.parse(body)
+        data = JSON.parse(body.to_s)
+        return nil unless data.is_a?(Hash)
+
         error = data['error'] || data[:error]
         return nil unless error == 'unauthorized_client'
 
-        description = data['error_description'] || data[:error_description]
-        return nil unless description.is_a?(String)
+        description = matchable_peer_text(data['error_description'] || data[:error_description])
+        return nil unless description
 
         match = description.match(%r{You sent\s+(https?://\S+)[,.]?\s+and we expected\s+(https?://\S+)}i)
         return nil unless match

@@ -78,8 +78,15 @@ The implementation follows the standard OAuth 2.1 authorization code flow with P
      protection), and every authorization-server endpoint must use HTTPS (plain HTTP is allowed on the
      loopback interface — `localhost`, a `*.localhost` name, or any spelling of 127.0.0.0/8 or
      `::1` — for local development).
-   - Both documents are read against the types their RFCs give their fields. A protected resource
-     document (RFC 9728 §2) has a string `resource` and arrays of strings for
+   - Both documents must carry what their RFCs make REQUIRED, and are read against the types those
+     RFCs give their fields. A protected resource document (RFC 9728 §2) must carry `resource`; an
+     authorization server document (RFC 8414 §2) must carry `issuer`, `authorization_endpoint`
+     and `token_endpoint`. A document that omits one is refused at discovery with a
+     `ConnectionError` and is neither cached nor used for scope resolution — rather than being
+     accepted, cached, and then crashing with a `URI::InvalidURIError` inside
+     `start_authorization_flow` or `complete_authorization_flow`, after a dynamic client
+     registration has already created a client at the authorization server.
+   - A protected resource document (RFC 9728 §2) has a string `resource` and arrays of strings for
      `authorization_servers` and `scopes_supported`; an authorization server document (RFC 8414 §2)
      has string endpoints (`issuer`, `authorization_endpoint`, `token_endpoint`,
      `registration_endpoint`) and arrays of strings for `scopes_supported`,
@@ -277,6 +284,12 @@ not "no expiry" — read that way a mangled lifetime would make a token that nev
 record reads as expired, through a storage round trip too, and is refreshed or re-authorized
 instead of raising a `TypeError` out of `access_token`.
 
+A record that carries an `expires_at` is answered by that `expires_at` alone. `expires_in` is the
+lifetime of a token at the moment it was *issued* (RFC 6749 §5.1), and a record read back from
+storage was not issued now, so it is never substituted for a stored expiry that cannot be read:
+`Token.from_h(expires_in: 3600, expires_at: 'not a time')` — the shape `to_h` persists, with the
+one field this client depends on mangled — reads as expired, not as an hour of fresh lifetime.
+
 ### Client Metadata
 
 ```ruby
@@ -354,6 +367,15 @@ This implementation follows OAuth 2.1 security best practices:
   The sanitizers are total — bytes that are not valid UTF-8 (a raw response body, an
   `error_description=%FF` a callback carries, the undecodable fragment a JSON parser quotes back) are
   replaced rather than raising `ArgumentError` out of the rescue path that was reporting them
+- **Peer bytes are made decodable before they are parsed**, not only before they are printed.
+  `String#gsub`, `String#match`, `Regexp#match?`, `String#split` and `String#strip` all raise
+  `ArgumentError: invalid byte sequence in UTF-8`, so every place that reads a peer's bytes as text
+  — the `unauthorized_client` body matched for a `redirect_uri` mismatch, the `WWW-Authenticate`
+  header masked and matched for its `Bearer` challenge segment (in the provider and in the HTTP
+  transports), the callback query string percent-decoded by `CGI.unescape` — scrubs them first.
+  A token endpoint `400` with an undecodable `error_description`, a `401`/`403` challenge with an
+  undecodable parameter, and a callback of `?code=%FF&state=%FE` all surface as the authorization
+  error they are, not as an `ArgumentError` from the code that was reading them
 - **Credentials never reach a log** at any level: the `Authorization` header is not logged even
   truncated, and the browser callback logs the request path without the query string that carries
   `code=`

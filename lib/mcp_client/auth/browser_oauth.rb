@@ -270,19 +270,37 @@ module MCPClient
         e.message
       end
 
-      # Parse URL query parameters
+      # Parse URL query parameters.
+      #
+      # `CGI.unescape` tags its result UTF-8 whatever the escapes decoded to,
+      # so a callback of `?error_description=%FF` yields a String that
+      # `strip`, `match` and `split` all raise `ArgumentError` on. The query
+      # of a callback is the peer's bytes as much as a response body is, so
+      # every name and value is made decodable here, once, at the point it
+      # stops being bytes and starts being text — nothing downstream (the
+      # state comparison, the log line, the error page) can then choke on it.
       # @param query_string [String] Query string from URL
       # @return [Hash] Parsed parameters
       # @private
       def parse_query_params(query_string)
         params = {}
-        query_string.split('&').each do |param|
+        PeerText.decodable(query_string).split('&').each do |param|
           next if param.empty?
 
           key, value = param.split('=', 2)
-          params[CGI.unescape(key)] = CGI.unescape(value || '')
+          params[decoded_parameter(key)] = decoded_parameter(value || '')
         end
         params
+      end
+
+      # One percent-decoded callback parameter, as text.
+      # @param value [String] a raw name or value from the query string
+      # @return [String] the decoded value as valid UTF-8
+      # @private
+      def decoded_parameter(value)
+        PeerText.decodable(CGI.unescape(value))
+      rescue StandardError
+        PeerText::UNREADABLE_TEXT
       end
 
       # Send HTTP response to client

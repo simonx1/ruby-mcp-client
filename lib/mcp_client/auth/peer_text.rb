@@ -47,6 +47,49 @@ module MCPClient
       # A helper here never raises, so there is always something to say.
       UNREADABLE_TEXT = '(unreadable)'
 
+      # Peer bytes as valid UTF-8, and nothing else changed: no control
+      # characters removed, no truncation. This is the form peer text has to
+      # be in BEFORE it is parsed rather than printed — a WWW-Authenticate
+      # header matched for its Bearer segment, an OAuth error description
+      # matched for a redirect_uri mismatch, a callback parameter that is
+      # about to be compared, logged or rendered. `String#gsub`,
+      # `String#match`, `Regexp#match?`, `String#split` and `String#strip` all
+      # raise `ArgumentError` on bytes that are not valid UTF-8, so a peer
+      # that sends `%FF` turns the code that reads its error into the error.
+      # Making the bytes decodable is not enough on its own — the printable,
+      # bounded form is still what reaches a message — but it is what has to
+      # happen first, and it must happen at the point the bytes stop being
+      # bytes and start being text.
+      #
+      # A module function, not only a private instance method, because the
+      # transports read the same WWW-Authenticate header and do not (and must
+      # not) take on the rest of this module: {MCPClient::JsonRpcCommon}
+      # already defines helpers of the same names.
+      # @param text [Object] peer-supplied bytes
+      # @return [String] the same text as valid UTF-8
+      def self.decodable(text)
+        return UNREADABLE_TEXT unless text.is_a?(String)
+
+        utf8 = text.encoding == Encoding::UTF_8 ? text : text.dup.force_encoding(Encoding::UTF_8)
+        utf8.valid_encoding? ? utf8 : utf8.scrub(UNDECODABLE_BYTE)
+      rescue StandardError
+        UNREADABLE_TEXT
+      end
+
+      # Whether a peer's bytes are already text: a String that reads as valid
+      # UTF-8 as it stands. What {.decodable} returns for anything else is a
+      # rewriting of what the peer sent — fine for a message, wrong for a
+      # value that is about to be used as a URL.
+      # @param text [Object] peer-supplied bytes
+      # @return [Boolean]
+      def self.decodable?(text)
+        return false unless text.is_a?(String)
+
+        (text.encoding == Encoding::UTF_8 ? text : text.dup.force_encoding(Encoding::UTF_8)).valid_encoding?
+      rescue StandardError
+        false
+      end
+
       private
 
       # @param value [Object] peer-supplied text
@@ -80,6 +123,17 @@ module MCPClient
         UNREADABLE_TEXT
       end
 
+      # Peer text a Regexp, #split or #strip can be run over: valid UTF-8 and
+      # otherwise unchanged, so a parser reads the value the peer sent rather
+      # than a truncated, control-stripped rendering of it.
+      # @param value [Object] peer-supplied text
+      # @return [String, nil] valid UTF-8; nil unless a String was given
+      def matchable_peer_text(value)
+        return nil unless value.is_a?(String)
+
+        PeerText.decodable(value)
+      end
+
       # The same bytes as valid UTF-8. A string in another encoding (a binary
       # response body, a UTF-16 message) is read as UTF-8 and scrubbed rather
       # than transcoded: the point is text that cannot raise, not a faithful
@@ -87,10 +141,7 @@ module MCPClient
       # @param text [String]
       # @return [String] valid UTF-8
       def decodable_text(text)
-        utf8 = text.encoding == Encoding::UTF_8 ? text : text.dup.force_encoding(Encoding::UTF_8)
-        utf8.valid_encoding? ? utf8 : utf8.scrub(UNDECODABLE_BYTE)
-      rescue StandardError
-        UNREADABLE_TEXT
+        PeerText.decodable(text)
       end
 
       # A log-safe description of a JSON parse failure: where it failed and
