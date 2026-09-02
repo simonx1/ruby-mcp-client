@@ -7,6 +7,22 @@ metadata). Each feature lands in its own PR; this section accumulates them.
 
 ### JSON Schema handling
 
+- **Malformed percent escapes, contains bounds the length settles and the
+  `$ref` hop budget (round 24).** A `$ref` fragment holding a malformed
+  percent escape (`#/$defs/a%ZZ`, `#/$defs/a%`) decodes to nothing and is
+  unresolvable (RFC 3986 Section 2.1), instead of falling back to the
+  undecoded text and resolving onto a member literally spelled that way, so
+  such a schema is reported unusable. The number of items a `contains` can
+  match is between none and the array's length whatever its item schema
+  says, so every bound that range settles is now decided rather than left
+  open: any `contains` rejects an array shorter than `minContains` (the
+  empty array by default), and a `contains` of `false` matches nothing — so
+  `not` / `if` / `oneOf` / `anyOf` no longer fail open on them. The
+  validation-time `$ref` hop budget counts the references applied to one
+  instance value and starts over below each property and item, so a
+  recursive schema (`{"items": {"$ref": "#"}}`) describes data nested deeper
+  than 32 levels instead of aborting on it.
+
 - **The pointer to an empty-named member, decided `contains` and satisfied
   dependencies (round 23).** The JSON pointer `/` (`#/`, `#%2F`) addresses
   the member named `""` (RFC 6901 Section 5) instead of the whole document,

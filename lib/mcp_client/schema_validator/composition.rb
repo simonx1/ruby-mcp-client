@@ -68,7 +68,7 @@ module MCPClient
         return false unless data.is_a?(Array)
 
         case keyword
-        when 'contains' then effective_contains?(schema, dialect)
+        when 'contains' then effective_contains?(schema, data, dialect)
         when 'minContains', 'maxContains' then effective_contains_bound?(schema, keyword, value, data, dialect)
         when 'uniqueItems' then value == true && data.length > 1
         else
@@ -86,25 +86,54 @@ module MCPClient
         keyword_known?('contains', dialect) && [true, {}].include?(schema['contains'])
       end
 
-      # Whether `contains` can still change the result: not when its
-      # companion switches it off (minContains 0), and not when a
-      # tautological schema (true / {}) matches every item, since the count
-      # it asserts on is then the array's own length and
-      # {SchemaValidator.validate_contains} decides the keyword outright.
+      # @return [Boolean] whether a contains schema in force matches no item
+      def contains_nothing?(schema, dialect)
+        keyword_known?('contains', dialect) && schema['contains'] == false
+      end
+
+      # Whether the number of matching items is known without evaluating the
+      # item schema: the array's own length when `contains` matches every
+      # item, zero when it matches none.
       # @return [Boolean]
-      def effective_contains?(schema, dialect)
-        !contains_everything?(schema, dialect) && contains_min(schema, dialect).positive?
+      def contains_count_known?(schema, dialect)
+        contains_everything?(schema, dialect) || contains_nothing?(schema, dialect)
+      end
+
+      # The range the number of matching items lies in, read off the array's
+      # length alone (JSON Schema 2020-12 Validation Section 6.4.4: the
+      # count is between none and all of the items).
+      # @return [Array(Integer, Integer)] the lowest and highest count
+      def contains_count_range(data, schema, dialect)
+        return [data.length, data.length] if contains_everything?(schema, dialect)
+        return [0, 0] if contains_nothing?(schema, dialect)
+
+        [0, data.length]
+      end
+
+      # Whether `contains` can still change the result: not when its
+      # companion switches it off (minContains 0), not when the count is
+      # known from the array's length (a tautological schema matches every
+      # item, `false` none), and not when the array is too short to reach
+      # minContains whatever its items are, since
+      # {SchemaValidator.validate_contains} then decides the keyword outright.
+      # @return [Boolean]
+      def effective_contains?(schema, data, dialect)
+        return false if contains_count_known?(schema, dialect)
+
+        min = contains_min(schema, dialect)
+        min.positive? && data.length >= min
       end
 
       # A `contains` bound asserts only beside a `contains` this validator
-      # leaves unevaluated: a lower bound that requires a match, an upper
-      # bound the instance can exceed.
+      # leaves unevaluated, and only where the array's length does not
+      # already settle it: a lower bound that requires a match the array is
+      # long enough to hold, an upper bound the instance can exceed.
       # @return [Boolean]
       def effective_contains_bound?(schema, keyword, value, data, dialect)
         return false unless schema.key?('contains') && value.is_a?(Numeric) &&
-                            !contains_everything?(schema, dialect)
+                            !contains_count_known?(schema, dialect)
 
-        keyword == 'minContains' ? value.positive? : data.length > value
+        keyword == 'minContains' ? value.positive? && data.length >= value : data.length > value
       end
 
       # The number of matching items `contains` requires: its companion
@@ -123,28 +152,42 @@ module MCPClient
         max if max.is_a?(Numeric)
       end
 
-      # Apply a `contains` whose schema matches every item (`true` / `{}`):
-      # the number of matching items is then the array's own length, so the
-      # keyword and its companions are assertions this validator decides
-      # rather than ones that only leave a branch undecided (JSON Schema
-      # 2020-12 Validation Section 6.4.4: the default minContains is 1, so a
-      # tautological contains rejects the empty array). A contains whose
-      # schema has to be matched item by item stays unevaluated.
+      # Apply the part of `contains` the array's length alone decides. The
+      # number of matching items is never more than the array holds and
+      # never less than none, so a bound outside that range is an assertion
+      # this validator settles whatever the item schema says (JSON Schema
+      # 2020-12 Validation Sections 6.4.4-6.4.5: the default minContains is
+      # 1, so any contains rejects the empty array). A tautological schema
+      # (`true` / `{}`) matches every item and `false` none, which pins the
+      # count exactly; a contains that has to be matched item by item leaves
+      # only the bounds its length cannot reach decided, and the rest
+      # unevaluated.
       # @param data [Array] the instance
       # @param schema [Hash] string-keyed schema
       # @param path [String] location for error messages
       # @param dialect [String, nil] the dialect in force
       # @return [Array<String>] validation errors
       def validate_contains(data, schema, path, dialect)
-        return [] unless contains_everything?(schema, dialect)
+        return [] unless keyword_known?('contains', dialect) && schema_value?(schema['contains'])
 
-        errors = []
+        low, high = contains_count_range(data, schema, dialect)
         min = contains_min(schema, dialect)
         max = contains_max(schema, dialect)
-        count = data.length
-        errors << "#{path}: expected at least #{min} items matching contains, got #{count}" if count < min
-        errors << "#{path}: expected at most #{max} items matching contains, got #{count}" if max && count > max
+        errors = []
+        errors << "#{path}: expected at least #{min} items matching contains, got #{contains_seen(low, high, high)}" \
+          if high < min
+        errors << "#{path}: expected at most #{max} items matching contains, got #{contains_seen(low, high, low)}" \
+          if max && low > max
         errors
+      end
+
+      # How the count reads in an error: the number itself when the array's
+      # length pins it, else the bound the error rests on.
+      # @return [String]
+      def contains_seen(low, high, bound)
+        return bound.to_s if low == high
+
+        "#{bound == high ? 'at most' : 'at least'} #{bound}"
       end
 
       # How many leading items the tuple keywords in force evaluate, or
