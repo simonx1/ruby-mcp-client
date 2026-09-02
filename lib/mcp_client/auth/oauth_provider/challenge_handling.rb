@@ -209,9 +209,14 @@ module MCPClient
         # configured and therefore tolerates plain-HTTP loopback for local
         # development. Applying that exception to peer-supplied input would
         # leave the reported SSRF intact against the most sensitive targets of
-        # all — services listening only on localhost. The loopback exception is
-        # honored here only when the configured MCP server is itself loopback,
-        # i.e. the developer is already pointed at a local stack.
+        # all — services listening only on localhost. It is honored here only
+        # for a loopback MCP server naming a loopback target: the developer is
+        # already pointed at a local stack, and that stack may advertise
+        # another port of itself over plain HTTP. Nothing wider qualifies. A
+        # server on a private network ('10.0.0.5', 'app.internal') is remote
+        # as far as this check is concerned, and even a loopback server may not
+        # send us to a link-local or private address — '169.254.169.254' is our
+        # cloud metadata endpoint, not the MCP server's.
         #
         # A refusal of a CHALLENGE-advertised URL is recorded (latch: true) so a
         # later discovery fails closed instead of silently reusing cached
@@ -233,7 +238,11 @@ module MCPClient
           uri = URI.parse(url)
           host = uri.hostname.to_s.downcase
 
-          if uri.scheme != 'https' && !(uri.scheme == 'http' && local_development?)
+          # The whole development exception, in one predicate: a loopback
+          # target advertised to a client whose configured server is loopback.
+          local_stack = loopback_address?(host) && loopback_server?
+
+          if uri.scheme != 'https' && !(uri.scheme == 'http' && local_stack)
             refuse_peer_url!("OAuth #{label} must use HTTPS: #{safe_error_text(url)}", latch: latch)
           end
           # An authority-less URL ('https:foo', 'https:///foo') has an acceptable
@@ -241,7 +250,7 @@ module MCPClient
           # below and be treated as a validated authorization server — enough to
           # retire the stored token before discovery can only fail.
           refuse_peer_url!("OAuth #{label} must name a host: #{safe_error_text(url)}", latch: latch) if host.empty?
-          if local_address?(host) && !local_development?
+          if local_address?(host) && !local_stack
             refuse_peer_url!("OAuth #{label} must not target a loopback or private address: #{safe_error_text(url)}",
                              latch: latch)
           end
@@ -290,20 +299,47 @@ module MCPClient
           raise MCPClient::Errors::ConnectionError, message
         end
 
-        # @return [Boolean] whether the configured MCP server is itself local,
-        #   in which case local discovery targets are expected
-        def local_development?
-          local_address?(URI.parse(server_url).hostname.to_s.downcase)
+        # The development exception is for a developer pointed at a local
+        # stack, so it asks for loopback and nothing else: a server on the
+        # office network ('10.0.0.5', 'app.internal', 'printer.local') is as
+        # remote as a public one, and its 401 must not be able to name the
+        # client's own localhost or the cloud metadata endpoint.
+        # @return [Boolean] whether the configured MCP server is on the
+        #   loopback interface, in which case loopback discovery targets are
+        #   expected
+        def loopback_server?
+          loopback_address?(URI.parse(server_url).hostname.to_s.downcase)
         rescue URI::InvalidURIError
           false
         end
 
-        # @param host [String] a downcased hostname
+        # The one definition of "loopback" in this client: 'localhost' and its
+        # subdomains, which RFC 6761 reserves for the loopback interface and
+        # every resolver answers as 127.0.0.1 / ::1, plus any loopback address
+        # (127.0.0.0/8, ::1) in any spelling the resolver accepts. Shared by
+        # the SSRF classifier, the registered application_type and the
+        # plain-HTTP exception for configured and discovered endpoints, so all
+        # three agree on what a local stack is.
+        # @param host [String] a hostname
+        # @return [Boolean] whether it names the loopback interface
+        def loopback_address?(host)
+          host = normalize_host(host)
+          return true if LOOPBACK_HOSTS.include?(host) || host.end_with?('.localhost')
+
+          ip = parse_address(host)
+          return false unless ip
+
+          ip = ip.native if ip.ipv6? && (ip.ipv4_mapped? || ip.ipv4_compat?)
+          ip.loopback?
+        end
+
+        # @param host [String] a hostname
         # @return [Boolean] whether it names a loopback, private or link-local address
         def local_address?(host)
+          return true if loopback_address?(host)
+
           host = normalize_host(host)
-          return true if host == 'localhost'
-          return true if host.end_with?('.localhost', '.local', '.internal')
+          return true if host.end_with?('.local', '.internal')
 
           local_ip?(host)
         end
@@ -314,11 +350,14 @@ module MCPClient
         # reach 127.0.0.1 / the metadata endpoint and must classify as those.
         # Decoding comes first; then the brackets of an IPv6 literal, which are
         # punctuation, and a single trailing dot, which only marks the name as
-        # fully qualified.
-        # @param host [String] a downcased hostname
-        # @return [String] the decoded host, brackets and one trailing dot removed
+        # fully qualified. Case folding comes last: decoding can put letters
+        # back that the caller's downcase already passed over ('%4Cocalhost'
+        # decodes to 'Localhost'), and hostnames are case-insensitive.
+        # @param host [String] a hostname as it was written in the URL
+        # @return [String] the decoded, downcased host, brackets and one
+        #   trailing dot removed
         def normalize_host(host)
-          percent_decode_host(host.to_s).delete_prefix('[').delete_suffix(']').delete_suffix('.')
+          percent_decode_host(host.to_s).delete_prefix('[').delete_suffix(']').delete_suffix('.').downcase
         end
 
         # Decoding is repeated until the host stops changing so a doubly encoded

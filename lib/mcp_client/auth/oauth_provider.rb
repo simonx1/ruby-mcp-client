@@ -59,7 +59,7 @@ module MCPClient
       # OIDC application types accepted for Dynamic Client Registration.
       APPLICATION_TYPES = %w[native web].freeze
 
-      # Loopback hosts whose redirect URIs mark a native application.
+      # Literal names of the loopback interface (see #loopback_address?).
       LOOPBACK_HOSTS = %w[localhost 127.0.0.1 ::1 [::1]].freeze
 
       # @return [String, nil] the explicit application_type for Dynamic Client Registration
@@ -915,9 +915,11 @@ module MCPClient
         uri = URI.parse(url)
         return if uri.scheme == 'https'
         # Dev exception is only for plain HTTP on a loopback host — not any other
-        # scheme (e.g. ftp://localhost). Use #hostname (not #host) so an IPv6
-        # loopback like http://[::1]:9292 matches without the surrounding brackets.
-        return if uri.scheme == 'http' && %w[localhost 127.0.0.1 ::1].include?(uri.hostname)
+        # scheme (e.g. ftp://localhost). The host is read the way every other
+        # loopback check in this provider reads it (loopback_address?), so a
+        # shorthand, fully qualified, IPv4-mapped or RFC 6761 '*.localhost'
+        # spelling of the local stack is the local stack here too.
+        return if uri.scheme == 'http' && loopback_address?(uri.hostname.to_s)
 
         raise MCPClient::Errors::ConnectionError, "OAuth #{label} must use HTTPS: #{url}"
       rescue URI::InvalidURIError
@@ -1506,24 +1508,18 @@ module MCPClient
         'native'
       end
 
-      # Whether a redirect URI host is a loopback interface: localhost or any
-      # loopback address (127.0.0.0/8, ::1, in any spelling). The host is read
-      # the way a resolver reads it — decoded, unbracketed, undotted, and
-      # through the shorthand IPv4 parser — so '127.1', '0x7f.0.0.1',
-      # '127.0.0.1.' and '::ffff:127.0.0.1' register as native like the plain
-      # spelling, instead of being sent for registration as a web client whose
-      # HTTP redirect URI the authorization server may then reject.
+      # Whether a redirect URI host is a loopback interface: 'localhost', an
+      # RFC 6761 '*.localhost' name (puma-dev, Caddy), or any loopback address
+      # (127.0.0.0/8, ::1, in any spelling). The host is read the way a
+      # resolver reads it — decoded, unbracketed, undotted, and through the
+      # shorthand IPv4 parser — so '127.1', '0x7f.0.0.1', '127.0.0.1.' and
+      # 'app.localhost' register as native like the plain spelling, instead of
+      # being sent for registration as a web client whose HTTP redirect URI the
+      # authorization server may then reject.
       # @param host [String, nil]
       # @return [Boolean]
       def loopback_host?(host)
-        host = normalize_host(host.to_s.downcase)
-        return true if LOOPBACK_HOSTS.include?(host)
-
-        ip = parse_address(host)
-        return false unless ip
-
-        ip = ip.native if ip.ipv6? && (ip.ipv4_mapped? || ip.ipv4_compat?)
-        ip.loopback?
+        loopback_address?(host.to_s)
       end
 
       # The RFC 7591 error of a failed registration response, sanitized for
