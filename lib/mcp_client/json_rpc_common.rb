@@ -426,7 +426,12 @@ module MCPClient
     def with_request_meta(params, claim: :none)
       params = merge_meta_spellings(params)
       defaults = host_request_meta(claim)
-      return params if defaults.empty? && !modern? && !reserved_meta_supplied?(params)
+      if defaults.empty? && !modern? && !reserved_meta_supplied?(params)
+        # Legacy traffic is passed through untouched — a `_meta` the caller
+        # supplied goes out as it stands, unless it names a transport-owned key.
+        warn_request_log_level_deprecated(params.is_a?(Hash) ? (params['_meta'] || params[:_meta]) : nil)
+        return params
+      end
 
       params = params.is_a?(Hash) ? params.dup : {}
       supplied = params.delete('_meta')
@@ -453,6 +458,7 @@ module MCPClient
       # server/utilities/caching: a result is bound to the parameters of the
       # request that produced it).
       params['_meta'] = MCPClient::DeepCopy.copy(meta)
+      warn_request_log_level_deprecated(meta)
       params
     end
 
