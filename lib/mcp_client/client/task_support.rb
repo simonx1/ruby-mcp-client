@@ -20,6 +20,10 @@ module MCPClient
       # turning the wait into a busy loop.
       DEFAULT_TASK_POLL_INTERVAL = 1.0
       MIN_TASK_POLL_INTERVAL = 0.05
+      # Longest pause between two polls, whatever pollIntervalMs says: a
+      # peer-supplied interval the clock cannot represent (or that is merely
+      # enormous) is bounded rather than handed to sleep.
+      MAX_TASK_POLL_INTERVAL = 3600.0
       MIN_TASK_REQUEST_TIMEOUT = 0.001
       # The longest a single poll request may wait, whatever the TTL: a hung
       # tasks/get must not block the wait for the task's whole lifetime.
@@ -934,7 +938,9 @@ module MCPClient
       def task_poll_delay(task, deadline)
         interval = task.poll_interval_ms
         delay = interval.is_a?(Numeric) && interval >= 0 ? interval / 1000.0 : DEFAULT_TASK_POLL_INTERVAL
-        delay = [delay, MIN_TASK_POLL_INTERVAL].max
+        # Infinity (an integer too large for a Float) and NaN land on the bound.
+        delay = MAX_TASK_POLL_INTERVAL unless delay.finite?
+        delay = delay.clamp(MIN_TASK_POLL_INTERVAL, MAX_TASK_POLL_INTERVAL)
         remaining = [deadline && (deadline - monotonic_time), task.ttl_remaining].compact.min
         remaining ? delay.clamp(0.0, [remaining, 0.0].max) : delay
       end
