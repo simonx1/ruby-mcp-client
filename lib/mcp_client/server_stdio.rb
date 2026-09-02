@@ -1078,6 +1078,10 @@ module MCPClient
       @transport_lock.synchronize do
         return nil unless @stdin && generation == @transport_generation
 
+        # Past this point the reader threads speak for a transport that is
+        # being dismantled on purpose: their EOF must not retire whatever
+        # replaces it.
+        bump_session_epoch
         @transport_generation += 1
         claimed = TornDownTransport.new(generation: @transport_generation, stdin: @stdin, stdout: @stdout,
                                         stderr: @stderr, wait_thread: @wait_thread, reader_thread: @reader_thread,
