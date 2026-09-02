@@ -38,7 +38,19 @@ module MCPClient
 
           @initialized = true
           reopen_subscriptions
+          note_session_ready
         end
+      end
+
+      # Stamp the moment this process became a usable session: its handshake
+      # was answered and the subscriptions the host still holds were re-sent.
+      # Only a session that {#restart_for_open_subscriptions} spawned is
+      # stamped for the crash-loop bound — a session the host established
+      # some other way was never a restart to count against it.
+      # @return [void]
+      def note_session_ready
+        @subscription_restart_ready_at =
+          (Process.clock_gettime(Process::CLOCK_MONOTONIC) if @restarting_for_subscriptions)
       end
 
       # @return [void]
@@ -131,11 +143,12 @@ module MCPClient
       # next request.
       #
       # A server that keeps exiting must not be respawned in a loop, so a
-      # second exit inside
-      # {MCPClient::ServerStdio::SUBSCRIPTION_RESTART_MIN_INTERVAL} ends the
-      # subscriptions with an error instead — as does a restart that fails.
-      # Either way the host learns from `closed?`/`error` rather than waiting
-      # on a stream that is never coming back.
+      # process that was restarted for its subscriptions and then stayed up
+      # for less than
+      # {MCPClient::ServerStdio::SUBSCRIPTION_RESTART_MIN_INTERVAL} ends them
+      # with an error instead — as does a restart that fails. Either way the
+      # host learns from `closed?`/`error` rather than waiting on a stream
+      # that is never coming back.
       # @return [void]
       def restart_for_open_subscriptions
         pending = (@reconnecting_subscriptions || []).select(&:reconnectable?)
@@ -148,22 +161,45 @@ module MCPClient
           )
         end
 
-        @last_subscription_restart = Process.clock_gettime(Process::CLOCK_MONOTONIC)
         @logger.info("Re-establishing the server process for #{pending.size} open subscription(s)")
-        ensure_initialized
+        restart_session
       rescue StandardError => e
         @logger.warn("Could not re-establish the server process: #{e.message}")
         fail_reconnecting_subscriptions(e)
       end
 
-      # @return [Boolean] whether the process exited again too soon after the
-      #   restart that followed its previous exit
-      def restarting_too_often?
-        last = @last_subscription_restart
-        return false unless last
+      # Re-establish the process, marked as a restart so the session it
+      # produces is stamped for the crash-loop bound.
+      # @return [void]
+      def restart_session
+        @restarting_for_subscriptions = true
+        @subscription_restart_ready_at = nil
+        ensure_initialized
+      ensure
+        @restarting_for_subscriptions = false
+      end
 
-        elapsed = Process.clock_gettime(Process::CLOCK_MONOTONIC) - last
-        elapsed < MCPClient::ServerStdio::SUBSCRIPTION_RESTART_MIN_INTERVAL
+      # Whether the process that just exited was one this restarted for its
+      # subscriptions and did not stay up long enough for another exit to be
+      # anything but a crash loop.
+      #
+      # Uptime is measured from the moment that process became ready — its
+      # handshake answered and its subscriptions re-sent — and not from the
+      # moment the restart was attempted. A server that takes longer than
+      # {MCPClient::ServerStdio::SUBSCRIPTION_RESTART_MIN_INTERVAL} to
+      # initialise (an `npx -y …` command fetching its package, say) and then
+      # exits at once would otherwise be credited with the whole handshake,
+      # read as healthy every time, and respawned for ever.
+      # @return [Boolean]
+      def restarting_too_often?
+        ready_at = @subscription_restart_ready_at
+        # nil means the process that just died was not one this restarted:
+        # a restart that never reached a usable session raised instead, and
+        # ended its subscriptions on the way out.
+        return false unless ready_at
+
+        uptime = Process.clock_gettime(Process::CLOCK_MONOTONIC) - ready_at
+        uptime < MCPClient::ServerStdio::SUBSCRIPTION_RESTART_MIN_INTERVAL
       end
 
       # End the subscriptions waiting for a process that is not coming back.

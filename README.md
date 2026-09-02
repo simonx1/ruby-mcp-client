@@ -150,25 +150,37 @@ not arrive within the transport's `read_timeout`). On a 2025-11-25 server the
 confirmation is the `resources/subscribe` response; on a 2026-07-28 one it is
 the `subscriptions/listen` acknowledgment naming that URI, which the call
 waits for. Updates then arrive as `notifications/resources/updated` through
-`on_notification`.
+`on_notification`. Every later acknowledgment of that stream is rechecked too:
+a stream re-opened after a dropped HTTP connection or a stdio restart is a new
+listen request the server may acknowledge more narrowly, so one that comes back
+without the URI closes the subscription instead of leaving the resource
+reported as watched while nothing watches it.
 
 On a 2026-07-28 server a host can also open a stream of its own with
 `server.listen(notifications: { tools_list_changed: true }) { |method, params| … }`
 and end it with `subscription.close`. The block runs on the subscription's own
 dispatcher thread, never on the transport's reader, so a listener may issue
-requests of its own; the notifications waiting for it are bounded
-(`MCPClient::Subscription::MAX_PENDING_NOTIFICATIONS`). A listener that cannot
-keep up with the server loses **repeats**, not signals: a full queue gives up
-the oldest notification about the same thing as the one arriving (same method
-and same `uri`/`taskId`), or failing that the oldest of whichever thing has the
+requests of its own; the notifications waiting for it are bounded both in
+number (`MCPClient::Subscription::MAX_PENDING_NOTIFICATIONS`) and in the bytes
+they retain (`MCPClient::Subscription::MAX_PENDING_NOTIFICATION_BYTES`) — a
+count alone is not a memory bound when the peer chooses how big each payload
+is. A listener that cannot keep up with the server loses **repeats**, not
+signals: whichever ceiling the arriving notification would breach, the queue
+gives up the oldest notification about the same thing as it (same method and
+same `uri`/`taskId`), or failing that the oldest of whichever thing has the
 most queued, so a stream watching several resources or tasks never loses the
 only queued update for a quiet one to make room for a busy one. Every MCP
 notification is a "look again" signal about state the host re-reads for itself,
 so a later notice of the same thing carries what the dropped one said, while
-the only notice of another thing carries what nothing else would.
-`pending_notifications` / `dropped_notifications` report how far behind a
-listener fell. `active?` answers false while a dropped stream waits to
-re-open, and a closing response the client cannot recognize (an unknown
+the only notice of another thing carries what nothing else would. A single
+notification larger than the whole byte budget is still delivered, alone.
+`pending_notifications` / `pending_notification_bytes` /
+`dropped_notifications` report how far behind a listener fell. Caches are
+dropped *before* a notification reaches the listeners, so a listener reacting
+to a `list_changed` notification by calling `list_tools` (or the prompt or
+resource equivalents) always re-fetches rather than reading the entry the
+notification just invalidated. `active?` answers false while a dropped stream
+waits to re-open, and a closing response the client cannot recognize (an unknown
 `resultType`, a missing or scalar result) fails the subscription instead of
 closing it gracefully. On Streamable HTTP closing the SSE response stream *is*
 the cancellation, including against a connection that is still opening its
@@ -178,8 +190,12 @@ subscription, however long its connect takes — or its response stream has been
 closed. On stdio a server process that exits on its own is restarted at once
 while subscriptions are open, since a host that is only waiting for
 notifications never makes the request that would otherwise restart it, and the
-subscriptions are re-sent on the new process; if it cannot be restarted, or
-exits again immediately, they end with that error rather than waiting for ever.
+subscriptions are re-sent on the new process; if it cannot be restarted, or if
+the restarted process stays up for less than
+`MCPClient::ServerStdio::SUBSCRIPTION_RESTART_MIN_INTERVAL` — counted from the
+moment it became ready, so a server whose handshake alone takes longer than
+that and which then exits is not respawned for ever — they end with that error
+rather than waiting for ever.
 
 ## MCP 2025-11-25 Features
 

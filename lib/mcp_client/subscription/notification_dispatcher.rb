@@ -1,5 +1,7 @@
 # frozen_string_literal: true
 
+require 'json'
+
 module MCPClient
   class Subscription
     # One subscription's notification dispatcher: the queue the transport
@@ -14,8 +16,13 @@ module MCPClient
     # and never waits for a listener.
     #
     # The queue is filled by the peer and drained by the host, so it needs a
-    # ceiling ({MCPClient::Subscription::MAX_PENDING_NOTIFICATIONS}), and
-    # overflow has to discard something. What it discards is chosen by
+    # ceiling, and overflow has to discard something. There are two ceilings,
+    # because a queue bounded by count alone is not bounded in memory: the
+    # params of every queued notification are retained until its listener has
+    # run, and the peer chooses how big they are. Overflow therefore starts at
+    # whichever of {MCPClient::Subscription::MAX_PENDING_NOTIFICATIONS} and
+    # {MCPClient::Subscription::MAX_PENDING_NOTIFICATION_BYTES} the arriving
+    # notification would breach. What it discards is chosen by
     # identity — the notification's method together with the resource URI or
     # task id it names — never by arrival order alone: one stream can carry a
     # mixed filter, and dropping the oldest entry would throw away the only
@@ -33,13 +40,23 @@ module MCPClient
     #    spare;
     # 3. only when every queued notification names a different thing, the
     #    oldest — the queue is then full of distinct signals and one must go.
+    #
+    # A notification whose payload is larger than the whole byte budget is
+    # still queued once the buffer has been emptied for it: the peer can hold
+    # one payload behind a stalled listener, never a queueful of them, and a
+    # signal is never lost merely for being large.
     class NotificationDispatcher
+      # One queued notification: what it is about, who wants it, what it says,
+      # and what it costs to hold on to.
+      Queued = Struct.new(:key, :listeners, :method_name, :params, :bytes)
+
       # @param owner [MCPClient::Subscription] the subscription it serves
       def initialize(owner)
         @owner = owner
         @mutex = Mutex.new
         @ready = ConditionVariable.new
         @buffer = []
+        @bytes = 0
         @dropped = 0
         @warned_about_drops = false
         @stopped = false
@@ -49,6 +66,12 @@ module MCPClient
       # @return [Integer] notifications waiting for the listeners
       def pending
         @mutex.synchronize { @buffer.size }
+      end
+
+      # @return [Integer] bytes retained by the notifications waiting for the
+      #   listeners
+      def pending_bytes
+        @mutex.synchronize { @bytes }
       end
 
       # @return [Integer] notifications discarded because the listeners could
@@ -63,12 +86,15 @@ module MCPClient
       # @param params [Hash, nil] notification params
       # @return [void]
       def deliver(listeners, method, params)
+        # Measured before the lock is taken: sizing a large payload must not
+        # hold up the reader thread that is delivering the next one.
+        entry = Queued.new(identity(method, params), listeners, method, params, payload_bytesize(params))
         @mutex.synchronize do
           return if @stopped
 
-          key = identity(method, params)
-          make_room(key)
-          @buffer << [key, listeners, method, params]
+          make_room(entry)
+          @buffer << entry
+          @bytes += entry.bytes
           @ready.signal
         end
       end
@@ -95,19 +121,51 @@ module MCPClient
         [method, named]
       end
 
+      # What holding a notification costs, measured as the JSON the peer sent:
+      # the parsed objects are larger but proportional, and the peer decides
+      # the size either way.
+      # @param params [Hash, nil] notification params
+      # @return [Integer] bytes
+      def payload_bytesize(params)
+        return 0 if params.nil?
+
+        JSON.generate(params).bytesize
+      rescue StandardError
+        # Params always come from a parsed JSON message; if one somehow cannot
+        # be re-encoded, charge for it rather than letting it slip the budget.
+        params.to_s.bytesize
+      end
+
       # @return [Integer] the ceiling, read at each delivery so a host can
       #   change it for a transport it knows is chatty
       def capacity
         MCPClient::Subscription::MAX_PENDING_NOTIFICATIONS
       end
 
-      # Make room for one more notification of `key`. Called with the lock held.
-      # @param key [Array] the arriving notification's identity
+      # @return [Integer] the byte ceiling, read at each delivery for the same
+      #   reason as {#capacity}
+      def byte_capacity
+        MCPClient::Subscription::MAX_PENDING_NOTIFICATION_BYTES
+      end
+
+      # Whether queuing `entry` would breach either ceiling. Called with the
+      # lock held.
+      # @param entry [Queued] the arriving notification
+      # @return [Boolean]
+      def overflowing?(entry)
+        @buffer.size >= capacity || (@bytes + entry.bytes) > byte_capacity
+      end
+
+      # Make room for one more notification. Called with the lock held.
+      # @param entry [Queued] the arriving notification
       # @return [void]
-      def make_room(key)
+      def make_room(entry)
         dropped = 0
-        while @buffer.size >= capacity && (index = droppable_index(key))
-          @buffer.delete_at(index)
+        # `droppable_index` answers nil only for an empty buffer, so a payload
+        # bigger than the whole budget empties the queue and is then queued
+        # alone rather than lost.
+        while overflowing?(entry) && (index = droppable_index(entry.key))
+          @bytes -= @buffer.delete_at(index).bytes
           dropped += 1
         end
         return if dropped.zero?
@@ -123,17 +181,17 @@ module MCPClient
       def droppable_index(key)
         return nil if @buffer.empty?
 
-        same = @buffer.index { |entry| entry[0] == key }
+        same = @buffer.index { |entry| entry.key == key }
         return same if same
 
         redundant = most_queued_identity
-        redundant ? @buffer.index { |entry| entry[0] == redundant } : 0
+        redundant ? @buffer.index { |entry| entry.key == redundant } : 0
       end
 
       # @return [Array, nil] the identity with more than one queued
       #   notification, nil when every queued notification names its own thing
       def most_queued_identity
-        counts = @buffer.each_with_object(Hash.new(0)) { |entry, tally| tally[entry[0]] += 1 }
+        counts = @buffer.each_with_object(Hash.new(0)) { |entry, tally| tally[entry.key] += 1 }
         identity, count = counts.max_by { |_key, queued| queued }
         count > 1 ? identity : nil
       end
@@ -151,8 +209,8 @@ module MCPClient
         else
           @warned_about_drops = true
           logger.warn("Subscription #{@owner.id} is receiving notifications faster than its listeners handle " \
-                      "them; dropping repeats of what is already queued (at most #{capacity}, see " \
-                      'MCPClient::Subscription#dropped_notifications)')
+                      "them; dropping repeats of what is already queued (at most #{capacity} notifications " \
+                      "or #{byte_capacity} bytes, see MCPClient::Subscription#dropped_notifications)")
         end
       end
 
@@ -162,17 +220,19 @@ module MCPClient
           Thread.current.name = 'MCP-subscription'
           Thread.current.report_on_exception = false
           while (entry = next_entry)
-            call_listeners(entry[1], entry[2], entry[3])
+            call_listeners(entry.listeners, entry.method_name, entry.params)
           end
         end
       end
 
-      # @return [Array, nil] the next notification to deliver, nil once the
+      # @return [Queued, nil] the next notification to deliver, nil once the
       #   subscription has ended and everything queued has been delivered
       def next_entry
         @mutex.synchronize do
           @ready.wait(@mutex) while @buffer.empty? && !@stopped
-          @buffer.shift
+          entry = @buffer.shift
+          @bytes -= entry.bytes if entry
+          entry
         end
       end
 

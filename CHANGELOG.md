@@ -26,9 +26,15 @@ metadata). Each feature lands in its own PR; this section accumulates them.
   transport's reader: a listener may issue requests of its own (re-reading
   the resource that changed, say) without blocking the stdio reader that
   would have to deliver its response. That queue is filled by the peer, so it
-  is bounded (`Subscription::MAX_PENDING_NOTIFICATIONS`), and once it is full
-  what it gives up is chosen by **identity** — the notification's method with
-  the `uri` or `taskId` it names — rather than by arrival order: the oldest
+  is bounded in both dimensions the peer controls: the number of queued
+  notifications (`Subscription::MAX_PENDING_NOTIFICATIONS`) and the bytes
+  they retain (`Subscription::MAX_PENDING_NOTIFICATION_BYTES`). A count on
+  its own is not a memory bound — a Streamable HTTP listen event may approach
+  32 MiB and a stdio line has no inbound limit at all, so a thousand of them
+  behind one slow listener is tens of gigabytes. Overflow starts at whichever
+  ceiling the arriving notification would breach; what it gives up is
+  unchanged, and chosen by **identity** — the notification's method with the
+  `uri` or `taskId` it names — rather than by arrival order: the oldest
   notification about the same thing as the arriving one, or failing that the
   oldest of whichever thing has the most queued. One stream can carry a mixed
   filter, and dropping the oldest entry would throw away the only queued
@@ -36,15 +42,27 @@ metadata). Each feature lands in its own PR; this section accumulates them.
   left to tell the listener to re-read it — the loss the ceiling exists to
   prevent. Every MCP notification is a "look again" signal about state the
   host re-reads for itself, so a later notice of the same thing still carries
-  what the dropped one said; the only notice of another thing does not.
-  Blocking the reader instead would restore the deadlock the dispatcher
-  exists to prevent, and dropping the newest would leave the host acting on a
-  stale view for good. Drops are counted in `dropped_notifications` and named
-  once in the log, with `pending_notifications` reporting the current depth.
-  A closing response the client cannot recognize (an unknown `resultType`, a
-  missing result, a scalar) fails the subscription with an
+  what the dropped one said; the only notice of another thing does not. A
+  notification larger than the whole byte budget is still delivered, alone —
+  the peer can hold one payload behind a stalled listener, never a queueful
+  of them, and no signal is lost merely for being large. Blocking the reader
+  instead would restore the deadlock the dispatcher exists to prevent, and
+  dropping the newest would leave the host acting on a stale view for good.
+  Drops are counted in `dropped_notifications` and named once in the log,
+  with `pending_notifications` and `pending_notification_bytes` reporting the
+  current depth. A closing response the client cannot recognize (an unknown
+  `resultType`, a missing result, a scalar) fails the subscription with an
   `InvalidResultError` rather than ending it gracefully, the way every other
   response is checked.
+- **Caches are invalidated before the notification reaches the listeners.**
+  A listener runs on the subscription's dispatcher thread, so queuing its
+  delivery makes the notification visible at once: a listener reacting to
+  `notifications/tools/list_changed` (or the prompts/resources equivalents)
+  by calling a cached list method could run before the transport and client
+  caches that notification invalidates had been dropped, and read the very
+  entry it says is stale. Routing now drops both caches first and delivers
+  afterwards, making that a guarantee rather than a race the scheduler
+  usually happens to win.
 - **Transports.** On Streamable HTTP (and plain HTTP) the listen POST runs
   on its own thread; a stream that ends without the closing response is
   re-opened with a new id (backoff 1 s → 30 s, which a cancellation
@@ -76,9 +94,16 @@ metadata). Each feature lands in its own PR; this section accumulates them.
   the next request: a subscription is a standing request the host does not
   repeat, so a host that is only waiting for notifications would otherwise
   leave every one of them `:reconnecting` for ever. A restart that fails, or
-  a process that exits again immediately (a crash loop), closes those
+  a restarted process that exits again without staying up for
+  `SUBSCRIPTION_RESTART_MIN_INTERVAL` (a crash loop), closes those
   subscriptions with the error instead, so the host learns from
   `closed?`/`error` rather than waiting on a stream that is not coming back.
+  That uptime is measured from the moment the restarted process became
+  *ready* — handshake answered, subscriptions re-sent — not from the moment
+  the restart was attempted: a server whose start-up alone outlasts the
+  interval (an `npx -y …` command fetching its package, say) and which then
+  exits immediately would otherwise be credited with its whole handshake,
+  read as healthy every time, and respawned for ever.
   Taking a new id is atomic with closure on both, so a `close` racing with a
   re-open either stops it or cancels the id that went out — never leaving
   the server holding a stream the client can no longer cancel. Events are
@@ -95,9 +120,17 @@ metadata). Each feature lands in its own PR; this section accumulates them.
   a stream the server closes before acknowledging, an acknowledgment that
   omits the URI, or no answer within the transport's `read_timeout` raises
   (the server's own error, otherwise `ResourceReadError`) instead of
-  reporting a subscription that was never established. Opening and closing
-  the stream for one URI is serialized, so concurrent subscribers share a
-  single stream that `unsubscribe_resource` really closes.
+  reporting a subscription that was never established. Every *later*
+  acknowledgment of that stream is rechecked against the URIs it is mapped
+  to as well: a stream re-opened after a dropped HTTP connection or a stdio
+  restart is a new listen request the server holds no state for and MAY
+  acknowledge more narrowly, so one that comes back without the URI closes
+  the subscription and drops the mapping instead of leaving
+  `live_resource_subscription` reporting a watch nothing is honouring; a
+  later `subscribe_resource` then opens a fresh stream and raises if that
+  one is refused too. Opening and closing the stream for one URI is
+  serialized, so concurrent subscribers share a single stream that
+  `unsubscribe_resource` really closes.
 
 ### Multi round-trip requests (InputRequiredResult)
 

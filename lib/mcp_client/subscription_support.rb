@@ -77,39 +77,73 @@ module MCPClient
       subscription_by_id(meta[MCPClient::JsonRpcCommon::META_SUBSCRIPTION_ID])
     end
 
+    # Notifications that are subscription bookkeeping rather than something a
+    # subscription's listeners are watching for.
+    CONTROL_NOTIFICATIONS = %w[notifications/subscriptions/acknowledged notifications/cancelled].freeze
+
     # Route an incoming notification: subscription bookkeeping
-    # (acknowledgment, server-side teardown), delivery to the owning
-    # subscription's listeners, transport cache invalidation, and finally the
-    # general notification callback (so hosts see subscription-delivered
-    # notifications exactly like request-scoped ones).
+    # (acknowledgment, server-side teardown), then transport and host cache
+    # invalidation, and only then delivery to the owning subscription's
+    # listeners (so hosts see subscription-delivered notifications exactly
+    # like request-scoped ones).
+    #
+    # The invalidations come first on purpose. A listener runs on the
+    # subscription's own dispatcher thread, so queuing its delivery makes the
+    # notification visible at once — and a listener that reacts to a
+    # list_changed notification by calling a cached list method
+    # (`client.list_tools`, say) would then read the very entry the
+    # notification says is stale. Dropping the caches before the delivery is
+    # queued makes "the caches are already invalid when a listener sees the
+    # notification" a guarantee instead of a race the scheduler usually wins.
     # @param method [String] notification method
     # @param params [Hash, nil] notification params
     # @return [void]
     def route_notification(method, params)
+      handle_subscription_control(method, params)
+      invalidate_cache_for_notification(method) if respond_to?(:invalidate_cache_for_notification, true)
+      @notification_callback&.call(method, params)
+      deliver_subscription_notification(method, params) unless CONTROL_NOTIFICATIONS.include?(method)
+    end
+
+    # Subscription bookkeeping carried by a notification: the server's
+    # acknowledgment of a listen request, and its teardown of one.
+    # @param method [String] notification method
+    # @param params [Hash, nil] notification params
+    # @return [void]
+    def handle_subscription_control(method, params)
       case method
       when 'notifications/subscriptions/acknowledged'
-        subscription = subscription_for_notification(params)
-        if subscription
-          subscription.acknowledge(params['notifications'])
-        else
-          @logger.debug('Acknowledgment for an unknown subscription ignored')
-        end
+        handle_subscription_acknowledgment(params)
       when 'notifications/cancelled'
         # Servers MUST send notifications/cancelled only to tear down a
         # subscriptions/listen stream (basic/patterns/cancellation).
-        subscription = subscription_by_id(params.is_a?(Hash) ? params['requestId'] : nil)
-        if subscription
-          reason = params['reason'].is_a?(String) ? params['reason'] : nil
-          @logger.info("Server cancelled subscription #{subscription.id}: " \
-                       "#{sanitize_log_text(reason || 'no reason given')}")
-          unregister_subscription(subscription)
-          subscription.finish(gracefully: false, reason: reason)
-        end
-      else
-        deliver_subscription_notification(method, params)
+        handle_server_cancellation(params)
       end
-      invalidate_cache_for_notification(method) if respond_to?(:invalidate_cache_for_notification, true)
-      @notification_callback&.call(method, params)
+    end
+
+    # Record what the server agreed to honour, and recheck the resource
+    # subscriptions this stream carries against it.
+    # @param params [Hash, nil] notification params
+    # @return [void]
+    def handle_subscription_acknowledgment(params)
+      subscription = subscription_for_notification(params)
+      return @logger.debug('Acknowledgment for an unknown subscription ignored') unless subscription
+
+      subscription.acknowledge(params['notifications'])
+      drop_unacknowledged_resource_subscriptions(subscription)
+    end
+
+    # @param params [Hash, nil] notification params
+    # @return [void]
+    def handle_server_cancellation(params)
+      subscription = subscription_by_id(params.is_a?(Hash) ? params['requestId'] : nil)
+      return unless subscription
+
+      reason = params['reason'].is_a?(String) ? params['reason'] : nil
+      @logger.info("Server cancelled subscription #{subscription.id}: " \
+                   "#{sanitize_log_text(reason || 'no reason given')}")
+      unregister_subscription(subscription)
+      subscription.finish(gracefully: false, reason: reason)
     end
 
     # @param method [String] notification method
@@ -185,6 +219,38 @@ module MCPClient
 
         open_resource_subscription(uri)
       end
+    end
+
+    # Close the streams whose mapped URI the server's latest acknowledgment
+    # left out.
+    #
+    # Every acknowledgment is checked, not just the first: a stream re-opened
+    # after an HTTP drop or a stdio restart is a new listen request, the
+    # server holds no subscription state across it, and it MAY acknowledge a
+    # smaller subset the second time. {#confirm_resource_subscription} only
+    # guards the acknowledgment the subscriber waited for, so without this a
+    # narrowed re-acknowledgment left `resource_subscriptions` mapping a URI
+    # to a stream that no longer carried it, and
+    # {#live_resource_subscription} kept reporting success for a resource
+    # nothing was watching.
+    # @param subscription [MCPClient::Subscription] the acknowledged stream
+    # @return [void]
+    def drop_unacknowledged_resource_subscriptions(subscription)
+      missing = subscription.unacknowledged_resource_uris
+      return if missing.empty?
+
+      mapped = subscriptions_mutex.synchronize do
+        resource_subscriptions.select { |uri, sub| sub.equal?(subscription) && missing.include?(uri) }.keys
+      end
+      return if mapped.empty?
+
+      @logger.warn("Server re-acknowledged subscription #{subscription.id} without " \
+                   "#{mapped.map { |uri| sanitize_log_text(uri) }.join(', ')}; closing it so the resource " \
+                   'subscription no longer reports a watch the server is not honouring')
+      # Closing drops the mapping itself (the transport's cancel_subscription
+      # clears every URI pointing at this stream), so a later subscribe_resource
+      # opens a fresh stream and raises if that one is refused too.
+      subscription.close
     end
 
     # @param uri [String] the resource URI

@@ -28,9 +28,10 @@ module MCPClient
     # for the server to exit, send SIGTERM, then SIGKILL if it still runs.
     SHUTDOWN_GRACE_PERIOD = 2
 
-    # Seconds a process restarted for its subscriptions must stay up before
-    # another unexpected exit counts as a crash rather than a crash loop
-    # (see {JsonRpcTransport#restart_for_open_subscriptions}).
+    # Seconds a process restarted for its subscriptions must stay up — counted
+    # from the moment it became ready, not from the moment it was spawned —
+    # before another unexpected exit counts as a crash rather than a crash
+    # loop (see {JsonRpcTransport#restart_for_open_subscriptions}).
     SUBSCRIPTION_RESTART_MIN_INTERVAL = 5
 
     # Chunk size (bytes) used when draining the subprocess stderr pipe
@@ -102,6 +103,11 @@ module MCPClient
       # thread only ever speaks for the transport it was started for.
       @transport_generation = 0
       @transport_retired = false
+      # Crash-loop bookkeeping for a process restarted to keep subscriptions
+      # alive: whether a restart is in flight, and when the process it spawned
+      # became ready (see JsonRpcTransport#restarting_too_often?).
+      @restarting_for_subscriptions = false
+      @subscription_restart_ready_at = nil
     end
 
     # Server info from the initialize response

@@ -49,6 +49,21 @@ module MCPClient
     # is waiting for a response only that reader can deliver.
     MAX_PENDING_NOTIFICATIONS = 1024
 
+    # Ceiling on the bytes the queued notifications retain, because a count is
+    # not a memory bound: the params of every queued notification are held
+    # until its listener has run, one Streamable HTTP listen event may approach
+    # {MCPClient::HttpTransportBase::ListenStream::LISTEN_MAX_BUFFER_BYTES} and
+    # a stdio line has no inbound limit at all — so a peer facing a slow
+    # listener could put tens of gigabytes behind a nominally bounded queue.
+    #
+    # This changes when overflow starts, not what it discards: whichever
+    # ceiling the arriving notification would breach, the entry that goes is
+    # still chosen by identity. A single notification larger than the whole
+    # budget is still delivered, alone — the queue empties for it — so the
+    # retained total is at worst one peer-sized payload rather than
+    # {MAX_PENDING_NOTIFICATIONS} of them, and no signal is lost to its size.
+    MAX_PENDING_NOTIFICATION_BYTES = 8 * 1024 * 1024
+
     # The states {#wait_until_settled} waits for: the server has answered the
     # listen request one way or the other.
     SETTLED_STATES = %i[active closed].freeze
@@ -119,8 +134,18 @@ module MCPClient
       dispatcher ? dispatcher.pending : 0
     end
 
+    # Bytes retained by the notifications queued for this subscription's
+    # listeners, measured as the JSON the peer sent (see
+    # {MAX_PENDING_NOTIFICATION_BYTES}).
+    # @return [Integer]
+    def pending_notification_bytes
+      dispatcher = @mutex.synchronize { @dispatcher }
+      dispatcher ? dispatcher.pending_bytes : 0
+    end
+
     # Notifications dropped because the listeners could not keep up with the
-    # server (see {MAX_PENDING_NOTIFICATIONS}).
+    # server (see {MAX_PENDING_NOTIFICATIONS} and
+    # {MAX_PENDING_NOTIFICATION_BYTES}).
     # @return [Integer]
     def dropped_notifications
       dispatcher = @mutex.synchronize { @dispatcher }
