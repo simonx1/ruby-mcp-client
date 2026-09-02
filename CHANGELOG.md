@@ -7,6 +7,25 @@ metadata). Each feature lands in its own PR; this section accumulates them.
 
 ### Tasks extension (`io.modelcontextprotocol/tasks`)
 
+- **An ended session's observation is discarded, the epoch holds at the
+  send (round 30).** A `tasks/get` answer that came back after the server
+  session ended is no longer acted on: the wait joins the replacement
+  session and polls it again instead of presenting the dead session's
+  `inputRequests` to the host, enforcing its TTL backstop (which also
+  forgot the new session's bookkeeping) or pacing the next poll by its
+  `pollIntervalMs`; a task handle a host kept across a restart no longer
+  seeds a wait with the TTL and pace of a task that no longer exists. The
+  session a `tasks/update` belongs to is now enforced at the wire: the
+  request is pinned to it, so a reconnect inside `rpc_request`'s own
+  `ensure_initialized` / `ensure_connected` makes the transport drop the
+  payload instead of writing an ended session's answers into the next one,
+  and a failure to establish the session is no longer swallowed. Answers
+  queued behind an update that hangs are recorded as pending before the
+  task's update lock is taken (so a wait that gives up while queued leaves
+  them retransmittable) and a confirmed delivery clears only the keys it
+  carried; a handler's keys, its in-flight hold and its input round are
+  reserved in the state the wait captured; and the session epoch is read
+  under the registry lock everywhere.
 - **The epoch guard reaches the wire (round 29).** A `tasks/update`
   establishes the transport's session *before* it compares the session
   epoch, so a reconnect inside `rpc_request` (`ensure_initialized`) can no

@@ -84,12 +84,17 @@ RSpec.describe 'MCP 2026-07-28 tasks extension — round 15' do
                                                       'inputRequests' => { 'k1' => elicit_request }) },
                           { 'result' => {} },
                           lambda { |_req|
-                            # The process restarted between two polls; the new
-                            # process reused the task id and the key.
+                            # The process restarted while this poll was
+                            # outstanding: what came back describes the ended
+                            # session and is discarded.
                             stdio.send(:bump_session_epoch)
                             { 'result' => detailed_task(status: 'input_required',
                                                         'inputRequests' => { 'k1' => elicit_request }) }
                           },
+                          # The new process reused the task id and the key, and
+                          # presents the request again.
+                          { 'result' => detailed_task(status: 'input_required',
+                                                      'inputRequests' => { 'k1' => elicit_request }) },
                           { 'result' => {} },
                           { 'result' => detailed_task(status: 'completed', 'result' => call_result) }
                         ])

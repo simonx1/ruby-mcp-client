@@ -116,6 +116,7 @@ RSpec.describe 'MCP 2026-07-28 tasks extension — round 30' do
     it 'leaves the keys the new session answered alone' do
       client = client_for(stdio)
       epoch = client.send(:current_session_epoch, stdio)
+      allow(stdio).to receive(:ensure_session_ready)
       allow(stdio).to receive(:rpc_request) do
         stdio.send(:bump_session_epoch)
         # The new session answered the same key for what is a new task.
@@ -132,6 +133,7 @@ RSpec.describe 'MCP 2026-07-28 tasks extension — round 30' do
     it 'forgets only the bookkeeping the update captured when the task is reported gone' do
       client = client_for(stdio)
       epoch = client.send(:current_session_epoch, stdio)
+      allow(stdio).to receive(:ensure_session_ready)
       allow(stdio).to receive(:rpc_request) do
         stdio.send(:bump_session_epoch)
         client.send(:remember_answered_keys, stdio, 't', ['k1'])

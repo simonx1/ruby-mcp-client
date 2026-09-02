@@ -20,7 +20,7 @@ module MCPClient
     TERMINAL_STATUSES = %w[completed failed cancelled].freeze
 
     attr_reader :task_id, :status, :status_message, :created_at, :last_updated_at, :ttl, :poll_interval, :server,
-                :input_requests, :result, :error
+                :input_requests, :result, :error, :session_epoch
 
     # 2026-07-28 names of the retention and polling hints (milliseconds).
     alias ttl_ms ttl
@@ -60,6 +60,11 @@ module MCPClient
       @ttl_reported = ttl_reported.nil? ? !ttl.nil? : ttl_reported
       @poll_interval = poll_interval
       @server = server
+      # The server session this handle was seen in: task ids are per session
+      # and reusable, so what a handle kept across a restart says (its TTL
+      # backstop, its polling interval) is about a task that no longer
+      # exists. nil for a server that reports no session.
+      @session_epoch = server.respond_to?(:session_epoch) ? server.session_epoch : nil
       @input_requests = input_requests
       @result = result
       @error = error

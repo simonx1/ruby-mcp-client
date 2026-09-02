@@ -100,36 +100,64 @@ module MCPClient
       def send_task_update(srv, task_id, input_responses, timeout: nil, pending_only: false, epoch: nil, state: nil)
         shown = shown_task_id(task_id)
         state ||= task_state(srv, task_id)
+        # The answers are pending — and their keys answered — from the moment
+        # this delivery is queued, before it waits for the task's update
+        # lock: a wait that gives up while queued behind a hanging update
+        # (its wall clock ran out) must leave answers the next wait can
+        # retransmit, not keys marked answered with nothing to send. An
+        # explicit answer is newer than a pending one for the same key and
+        # wins the merge.
+        queue_task_update(state, input_responses) unless pending_only
         # One update at a time per task: a concurrent update that read an
         # empty pending slot could otherwise confirm and wipe an answer
-        # another delivery had just left pending. An explicit answer is
-        # newer than a pending one for the same key and wins the merge.
+        # another delivery had just left pending.
         lock = state[:update_mutex]
         lock.synchronize do
-          return true unless task_update_session_current?(srv, shown, epoch)
+          payload = answered_keys_mutex.synchronize { state[:pending_update] }
+          # An explicit answer goes out even when it adds nothing to send
+          # (#update_task with no responses is the caller's request, not a
+          # retransmission).
+          payload = input_responses if payload.nil? && !pending_only
+          return true if payload.nil?
 
-          pending = answered_keys_mutex.synchronize { state[:pending_update] }
-          input_responses = pending_only ? pending : pending&.merge(input_responses) || input_responses
-          return true if input_responses.nil?
-
-          dispatch_task_update(srv, task_id, input_responses, shown: shown, state: state, lock: lock,
-                                                              timeout: timeout)
+          dispatch_task_update(srv, task_id, payload, shown: shown, state: state, lock: lock,
+                                                      timeout: timeout, epoch: epoch)
         end
+      end
+
+      # Record a delivery's answers before it queues for the task's update
+      # lock: answered (so no handler is asked again) and pending (so any
+      # wait can deliver them).
+      # @return [void]
+      def queue_task_update(state, input_responses)
+        return if input_responses.nil? || input_responses.empty?
+
+        remember_answered_keys_in(state, input_responses.keys.map(&:to_s))
+        keep_pending_update(state, input_responses)
       end
 
       # Whether the answers may still go out: the session they were produced
       # in must be the one the request is about to reach. The connection is
       # established first, because the built-in rpc_request initializes (and
       # so may reconnect, ending the session) inside the very call this
-      # guards — the epoch is then compared after that reconnect, as late as
-      # the payload can still be held back. Task ids and input keys are
+      # guards; the request itself is then pinned to the session (see
+      # {MCPClient::JsonRpcCommon#pinned_to_session}), so a reconnect between
+      # this compare and the write drops the payload at the wire rather than
+      # sending it into the next session. Task ids and input keys are
       # session-scoped and reusable, so an answer that arrives in the wrong
       # session could answer an unrelated request.
       # @return [Boolean]
       def task_update_session_current?(srv, shown, epoch)
         return true unless epoch
 
-        establish_session(srv)
+        begin
+          establish_session(srv)
+        rescue StandardError
+          # Not swallowed, only overtaken by the session it ended: with the
+          # session still the answers', the caller surfaces the failure
+          # (nothing was sent, the answers stay pending for the next poll).
+          raise if answered_keys_mutex.synchronize { current_session_epoch(srv) } == epoch
+        end
         return true if answered_keys_mutex.synchronize { current_session_epoch(srv) } == epoch
 
         logger.warn("Task #{shown}: the session restarted before the answers were sent; they are discarded")
@@ -138,13 +166,13 @@ module MCPClient
 
       # Bring the transport's session up before the epoch is compared, so a
       # reconnect happens on this side of the guard. A failure is not
-      # handled here: the request that follows raises it through its own
-      # error path.
+      # swallowed: nothing is sent, and the caller (which has already
+      # recorded the answers as pending) surfaces it as the ambiguous
+      # delivery failure it is, so the next poll delivers them again.
       # @return [void]
+      # @raise [MCPClient::Errors::ConnectionError, MCPClient::Errors::TransportError]
       def establish_session(srv)
         srv.ensure_session_ready if srv.respond_to?(:ensure_session_ready)
-      rescue StandardError => e
-        logger.debug("Could not establish the session before a tasks/update: #{sanitize_peer_log_text(e.message)}")
       end
 
       # The wire part of {#send_task_update}: the keys are answered and the
@@ -156,27 +184,50 @@ module MCPClient
       # wait abandoned this send, the retry that took the lock over owns the
       # bookkeeping.
       # @return [true]
-      def dispatch_task_update(srv, task_id, input_responses, shown:, state:, lock:, timeout:)
+      def dispatch_task_update(srv, task_id, input_responses, shown:, state:, lock:, timeout:, epoch: nil)
         keys = input_responses.keys.map(&:to_s)
-        remember_answered_keys_in(state, keys)
-        keep_pending_update(state, input_responses)
         begin
-          task_rpc(srv, 'tasks/update', { taskId: task_id, inputResponses: input_responses }, timeout: timeout)
-          clear_pending_update(state, lock)
+          unless task_update_session_current?(srv, shown, epoch)
+            drop_ended_session_update(state, lock, keys)
+            return true
+          end
+
+          task_rpc(srv, 'tasks/update', { taskId: task_id, inputResponses: input_responses },
+                   timeout: timeout, epoch: epoch)
+          clear_pending_update(state, lock, keys)
+          true
+        rescue MCPClient::Errors::SessionChangedError
+          # The transport refused to write into the session that replaced the
+          # answers' own: nothing went out, and in the new session these keys
+          # would answer a different request.
+          logger.warn("Task #{shown}: the session restarted before the answers were sent; they are discarded")
+          drop_ended_session_update(state, lock, keys)
           true
         rescue MCPClient::Errors::ServerError => e
           if definite_rejection?(e) && update_lock_current?(state, lock)
             release_answered_keys_in(state, keys)
-            clear_pending_update(state, lock)
+            clear_pending_update(state, lock, keys)
           end
           raise if e.protocol_error?
 
           raise task_failure(e, srv, task_id, 'updating', method: 'tasks/update', state: state)
         rescue MCPClient::Errors::TransportError, MCPClient::Errors::ConnectionError => e
-          # Ambiguous: the payload stays pending for the next poll.
+          # Ambiguous (a failure to establish the session included): the
+          # payload stays pending for the next poll.
           raise MCPClient::Errors::TaskError,
                 "Error updating task '#{shown}': #{sanitize_peer_log_text(e.message)}"
         end
+      end
+
+      # Nothing was written: the keys go back and the payload is dropped, in
+      # the state the answers were built from (the ended session's, which
+      # dies with it).
+      # @return [void]
+      def drop_ended_session_update(state, lock, keys)
+        return unless update_lock_current?(state, lock)
+
+        release_answered_keys_in(state, keys)
+        clear_pending_update(state, lock, keys)
       end
 
       # @return [void]
@@ -186,12 +237,24 @@ module MCPClient
         end
       end
 
-      # Drop the pending payload of a delivery that is settled — unless the
-      # wait abandoned this send and a retry holds the task's update lock
-      # now: what that retry left pending is not this send's to clear.
+      # Drop from the pending payload what this delivery settled — its own
+      # keys and no others: an answer another delivery queued while this one
+      # was on the wire never went out and must stay deliverable. Nothing is
+      # dropped when the wait abandoned this send and a retry holds the
+      # task's update lock now: what that retry left pending is not this
+      # send's to clear.
+      # @param keys [Array<String>] the keys this delivery carried
       # @return [void]
-      def clear_pending_update(state, lock)
-        answered_keys_mutex.synchronize { state[:pending_update] = nil if state[:update_mutex].equal?(lock) }
+      def clear_pending_update(state, lock, keys)
+        answered_keys_mutex.synchronize do
+          next unless state[:update_mutex].equal?(lock)
+
+          pending = state[:pending_update]
+          next if pending.nil?
+
+          remaining = pending.reject { |key, _| keys.include?(key.to_s) }
+          state[:pending_update] = remaining.empty? ? nil : remaining
+        end
       end
 
       # @return [Boolean] whether this send still holds the task's update lock
