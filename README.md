@@ -158,12 +158,19 @@ reported as watched while nothing watches it — including one that arrives in
 the window between the acknowledgment `subscribe_resource` waited for and the
 URI being mapped to the stream, which is checked once more with the mapping in
 place before the call answers. A stream already mapped to the URI is reused
-only while the server's word on that URI stands: one whose replacement request
-is in flight — after its HTTP connection dropped, or the stdio process it was
-on restarted — is waited for rather than reported as a watch, because that
-request is a new listen the server holds no state for and may reject or
-acknowledge without the URI. Only a stream the server is actively honouring
-counts as a live watch.
+only while the server is honouring that URI on it *now*: one that has dropped
+is waited for — through the HTTP re-open backoff or the stdio handshake, and
+on past the replacement request until the server answers it — rather than
+reported as a watch on the strength of what the stream that is gone had been
+granted, because no server-side subscription exists between listen attempts
+and the request that replaces one is a new listen the server holds no state
+for and may reject or acknowledge without the URI. Only a stream the server is
+actively honouring counts as a live watch. The subscriber waiting on its own
+listen request is a different matter and still gets its answer: a connection
+that drops the moment the acknowledgment arrives does not unanswer it, so the
+call does not wait out its acknowledgment timeout for a grant it already
+has — while a replacement request that has actually gone out is unanswered
+until the server answers *it*.
 
 On a 2026-07-28 server a host can also open a stream of its own with
 `server.listen(notifications: { tools_list_changed: true }) { |method, params| … }`
@@ -173,9 +180,13 @@ requests of its own; the notifications waiting for it are bounded both in
 number (`MCPClient::Subscription::MAX_PENDING_NOTIFICATIONS`) and in the bytes
 they retain (`MCPClient::Subscription::MAX_PENDING_NOTIFICATION_BYTES`) — a
 count alone is not a memory bound when the peer chooses how big each payload
-is. A listener that cannot keep up with the server loses **repeats**, not
-signals: whichever ceiling the arriving notification would breach, the queue
-gives up the oldest notification about the same thing as it (same method and
+is. Everything a queued notification retains is charged, its method name as
+well as its params: a peer tagging `{}` params with a multi-megabyte method
+name would otherwise pay two bytes apiece and put a thousand of them behind a
+slow listener without touching the byte ceiling. A listener that cannot keep
+up with the server loses **repeats**, not signals: whichever ceiling the
+arriving notification would breach, the queue gives up the oldest notification
+about the same thing as it (same method and
 same `uri`/`taskId`), or failing that the oldest of whichever thing has the
 most queued, so a stream watching several resources or tasks never loses the
 only queued update for a quiet one to make room for a busy one. Every MCP
@@ -224,7 +235,11 @@ notifications never makes the request that would otherwise restart it, and the
 subscriptions are re-sent on the new process; if it cannot be restarted, or if
 the process they were last re-sent to died less than
 `MCPClient::ServerStdio::SUBSCRIPTION_RESTART_MIN_INTERVAL` after receiving
-them, they end with that error rather than waiting for ever. That interval runs
+them, they end with that error rather than waiting for ever. The record of
+that process answers only that one question, and asking it spends it: a
+subscription opened directly on the replacement, after a refusal had already
+closed the ones the corpse carried, is judged on its own process's uptime
+rather than refused for a crash it had no part in. That interval runs
 from the moment that process received them, not from the moment a restart was
 attempted, so a server whose start-up alone takes longer is not credited with
 its own handshake and respawned for ever; both moments are recorded on the
@@ -234,9 +249,12 @@ the reader's own restart interleave — whichever of them re-establishes the
 process. A restarted process that negotiates a pre-2026-07-28 version cannot
 carry them either, and ends them with a `CapabilityError` rather than leaving
 them `:reconnecting`. A listen write that fails after the process is gone
-leaves the subscription to the restart that is already queued to re-send it,
-and one that fails after a newer stream replaced it raises only if that newer
-stream has itself failed.
+leaves the subscription for the next process to be re-sent to instead of
+closing it — including when it fails on the hand-over itself, where taking the
+new listen id has already moved the subscription off `:reconnecting` and the
+stream being torn down would have been the very one the restart was
+re-establishing. One that fails after a newer stream replaced it raises only
+if that newer stream has itself failed.
 
 ## MCP 2025-11-25 Features
 

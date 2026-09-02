@@ -96,11 +96,16 @@ module MCPClient
       #   attempt to its own. It only says so in the log — unless that newer
       #   stream has itself already failed, in which case the caller must be
       #   told rather than handed a closed handle with no explanation.
-      # * the subscription is :reconnecting: {#cleanup} moved it to the queue
-      #   the next session re-sends, so a write that failed because the
-      #   process was gone (stdin closed under it, or a nested restart holding
-      #   the init lock) must leave it there. Finishing it would close a
-      #   stream the restart was about to re-establish.
+      # * the subscription is one a session is being handed
+      #   ({MCPClient::Subscription#reestablishing?}): it is a stream the spec
+      #   requires to be re-sent, not one this caller asked for, so a write
+      #   that failed because the process was gone (stdin closed under it, an
+      #   EPIPE to a child that exited on sight, or a nested restart holding
+      #   the init lock) leaves it for the next session instead of ending it.
+      #   The question is asked of the subscription rather than of its state:
+      #   taking the new listen id has already moved it from :reconnecting to
+      #   :pending by the time the write raises, so the state says "being
+      #   opened" for the very hand-over that is failing.
       # @param subscription [MCPClient::Subscription]
       # @param id [Integer, String] the listen id this attempt sent under
       # @param error [StandardError] why it failed
@@ -110,15 +115,35 @@ module MCPClient
         return fail_superseded_attempt(subscription, id, error) unless subscription.open_as?(id)
 
         unregister_subscription_id(subscription, id)
-        if subscription.reconnecting?
-          return @logger.debug("subscriptions/listen #{id} failed while the subscription was already waiting " \
-                               "for a new process (#{error.message}); it will be re-sent to that one")
-        end
+        return defer_reestablished_attempt(subscription, id, error) if subscription.reestablishing?
 
         subscription.finish(
           error: error.is_a?(MCPClient::Errors::MCPError) ? error : MCPClient::Errors::TransportError.new(error.message)
         )
         raise error
+      end
+
+      # Put a subscription whose hand-over could not be written back on the
+      # queue the next session drains, and say so.
+      #
+      # It has just been taken off that queue by {#reopen_subscriptions} and
+      # out of the registry above, so leaving it alone would strand it: no
+      # session would re-send it and no `cleanup` would find it again. The
+      # queue is where a subscription waiting for a process belongs, and the
+      # process that could not be written to is on its way out — its reader
+      # reaches EOF and restarts, and the crash-loop bound then decides
+      # whether another one is worth spawning.
+      # @param subscription [MCPClient::Subscription]
+      # @param id [Integer, String] the listen id this attempt sent under
+      # @param error [StandardError] why it failed
+      # @return [void]
+      def defer_reestablished_attempt(subscription, id, error)
+        subscription.mark_reconnecting
+        queue = (@reconnecting_subscriptions ||= [])
+        # `cleanup` may have queued it already, racing this write.
+        queue << subscription unless queue.any? { |queued| queued.equal?(subscription) }
+        @logger.debug("subscriptions/listen #{id} failed while the subscription was being handed to a new " \
+                      "process (#{error.message}); it will be re-sent to the next one")
       end
 
       # A failure the subscription has already moved on from: harmless while
@@ -170,9 +195,26 @@ module MCPClient
       # @return [void]
       def reopen_subscriptions(session = @session)
         pending = take_reconnecting_subscriptions
+        # A session handed nothing asks nothing, and must not spend the record
+        # either: the subscriptions are still open on the session this one
+        # replaced (a nested restart re-establishes the process between a
+        # hand-over and the next exit), and the process that carried them is
+        # still what the next hand-over has to be judged against.
         return if pending.empty?
 
-        refusal = reopen_refusal
+        # The record of the process that last carried subscriptions answers
+        # exactly one question — whether handing them over again would only
+        # respawn the same corpse — and this is the moment it is asked. Asking
+        # spends it, whatever the answer: the loop it recorded is either
+        # broken here (these subscriptions are closed and never handed on) or
+        # replaced below by the record of the process that takes them. Left
+        # standing it outlived the loop it described, and the next hand-over —
+        # of a subscription opened directly on the replacement, which then ran
+        # healthily for hours — was refused for a crash it had no part in.
+        carrier = @subscription_carrier
+        @subscription_carrier = nil
+
+        refusal = reopen_refusal(carrier)
         return fail_subscriptions(pending, refusal) if refusal
 
         # Stamped on the process before the writes go out: one that exits
@@ -217,15 +259,17 @@ module MCPClient
 
       # Why this session must not be given the open subscriptions, if it must
       # not (see {#reopen_subscriptions}).
+      # @param carrier [MCPClient::ServerStdio::ChildSession, nil] the record
+      #   of the process that last carried them
       # @return [StandardError, nil]
-      def reopen_refusal
+      def reopen_refusal(carrier)
         unless modern?
           return MCPClient::Errors::CapabilityError.new(
             'the re-established server process negotiated ' \
             "#{protocol_version || 'no version'}, which cannot carry a subscriptions/listen stream"
           )
         end
-        return nil unless crash_looping?
+        return nil unless crash_looping?(carrier)
 
         @logger.error('MCP server process exited again right after it was given its subscriptions; closing them')
         MCPClient::Errors::TransportError.new('MCP server process exited again right after a restart')
@@ -236,9 +280,11 @@ module MCPClient
       # The two moments are stamped on that process's own record, by its own
       # lifecycle, so this answer cannot be spoiled by whatever another thread
       # is doing to another process.
+      # @param carrier [MCPClient::ServerStdio::ChildSession, nil] the record
+      #   of the process that last carried them
       # @return [Boolean]
-      def crash_looping?
-        @subscription_carrier&.died_carrying_subscriptions?(
+      def crash_looping?(carrier)
+        carrier&.died_carrying_subscriptions?(
           MCPClient::ServerStdio::SUBSCRIPTION_RESTART_MIN_INTERVAL
         ) || false
       end

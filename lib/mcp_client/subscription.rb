@@ -50,8 +50,9 @@ module MCPClient
     MAX_PENDING_NOTIFICATIONS = 1024
 
     # Ceiling on the bytes the queued notifications retain, because a count is
-    # not a memory bound: the params of every queued notification are held
-    # until its listener has run, one Streamable HTTP listen event may approach
+    # not a memory bound: the method name and params of every queued
+    # notification are held until its listener has run, one Streamable HTTP
+    # listen event may approach
     # {MCPClient::HttpTransportBase::ListenStream::LISTEN_MAX_BUFFER_BYTES} and
     # a stdio line has no inbound limit at all — so a peer facing a slow
     # listener could put tens of gigabytes behind a nominally bounded queue.
@@ -136,7 +137,15 @@ module MCPClient
       @closed_gracefully = false
       @closed_by_client = false
       @dispatcher = nil
+      # Whether the server has answered the listen request this subscription
+      # is on — or the last one it was on, while no replacement has gone out.
+      # Written where those two things happen ({#acknowledge} and the two
+      # methods that take a new listen id), never inferred from how far a
+      # transport has got through a reconnect.
       @answered = false
+      # Whether a transport is handing this subscription to a new session:
+      # see {#reestablishing?}.
+      @reestablishing = false
     end
 
     # @return [Integer] notifications queued for this subscription's listeners
@@ -146,8 +155,8 @@ module MCPClient
     end
 
     # Bytes retained by the notifications queued for this subscription's
-    # listeners, measured as the JSON the peer sent (see
-    # {MAX_PENDING_NOTIFICATION_BYTES}).
+    # listeners, measured as the JSON the peer sent for them — their method
+    # names as well as their params (see {MAX_PENDING_NOTIFICATION_BYTES}).
     # @return [Integer]
     def pending_notification_bytes
       dispatcher = @mutex.synchronize { @dispatcher }
@@ -240,34 +249,51 @@ module MCPClient
       @mutex.synchronize { @state == :active && acknowledges_resource?(uri) }
     end
 
-    # Block until the server's word on this URI stands, and report what it is.
+    # Block until the server has answered the listen request this subscription
+    # is waiting on, and report what it said about this URI.
     #
-    # The word that stands is the acknowledgment of the listen request the
-    # subscription is *currently* on: a re-open clears it (see {#with_open_id})
-    # because the server holds no subscription state across one and has to
-    # grant the filter again, while a connection that merely dropped leaves
-    # the last answer standing until the client asks again. So this waits when
-    # a request is in flight with nothing granted yet — the case that used to
-    # read as success, since a subscription with no acknowledgment has no
-    # unacknowledged URIs either — and answers at once when the server has
-    # already spoken.
+    # This is the question the subscriber that *opened* the stream asks: it is
+    # waiting for the answer to its own listen request, and it gets it. A
+    # connection that merely drops does not unask that question and does not
+    # unanswer it — the server did grant the filter, and making the caller
+    # wait out its whole acknowledgment timeout for an answer it had already
+    # been given would be the transport's problem told as the subscriber's. A
+    # replacement request that has actually gone out is another matter: the
+    # server holds no subscription state across one and has to grant the
+    # filter again, so the answer to it is waited for rather than assumed —
+    # which is why {#with_open_id} and {#assign_id} unanswer it explicitly,
+    # instead of that turning on whether the reconnect has got as far as
+    # taking an id.
+    #
+    # Waiting is also the right answer for a request in flight with nothing
+    # granted yet, which used to read as success: a subscription with no
+    # acknowledgment has no unacknowledged URIs either.
     # @param uri [String] the resource URI
     # @param timeout [Numeric] seconds to wait for an answer
     # @return [Symbol] :watching, :not_watching (answered without the URI),
     #   :closed, or :timeout
     def await_resource_watch(uri, timeout)
-      deadline = Process.clock_gettime(Process::CLOCK_MONOTONIC) + timeout
-      @mutex.synchronize do
-        loop do
-          return :closed if @state == :closed
-          return acknowledges_resource?(uri) ? :watching : :not_watching if @acknowledged
+      await_watch(uri, timeout) { @answered }
+    end
 
-          remaining = deadline - Process.clock_gettime(Process::CLOCK_MONOTONIC)
-          return :timeout if remaining <= 0
-
-          @settled.wait(@mutex, remaining)
-        end
-      end
+    # Block until this subscription is a running watch of the URI, and report
+    # whether it is.
+    #
+    # This is the other question, and the one a `subscribe_resource` looking
+    # for a stream to *reuse* asks: not "what did the server say" but "is the
+    # server watching this, now". Only a running stream answers it. An
+    # acknowledgment left on record by a stream that has dropped is not a
+    # grant — no server-side subscription exists between listen attempts, the
+    # request that replaces it is a new one the server may reject or
+    # acknowledge more narrowly, and reading the old record as the current
+    # grant reported a watch for the whole of an HTTP backoff or a stdio
+    # handshake. So a stream between attempts is waited for instead.
+    # @param uri [String] the resource URI
+    # @param timeout [Numeric] seconds to wait for the stream to be granted
+    # @return [Symbol] :watching, :not_watching (granted without the URI),
+    #   :closed, or :timeout
+    def await_live_resource_watch(uri, timeout)
+      await_watch(uri, timeout) { @state == :active }
     end
 
     # Block until the server has settled the subscription: acknowledged it,
@@ -306,6 +332,8 @@ module MCPClient
       @mutex.synchronize do
         @id = id
         @acknowledged = nil
+        # A request the server has not seen is a question it has not answered.
+        @answered = false
         # A subscription the host closed stays closed, whatever a racing
         # reconnect does.
         @state = :pending unless @state == :closed
@@ -326,6 +354,9 @@ module MCPClient
 
         @id = id
         @acknowledged = nil
+        # The request that went out is a new one: whatever the server said
+        # about the last, it has not answered this.
+        @answered = false
         @state = :pending
         yield
         true
@@ -364,6 +395,8 @@ module MCPClient
         @acknowledged = detached
         @state = :active
         @answered = true
+        # A stream the server has granted is no longer one being handed over.
+        @reestablishing = false
         @settled.broadcast
       end
     end
@@ -396,7 +429,28 @@ module MCPClient
 
     # @api private
     def mark_reconnecting
-      @mutex.synchronize { @state = :reconnecting unless @state == :closed }
+      @mutex.synchronize do
+        next if @state == :closed
+
+        @state = :reconnecting
+        @reestablishing = true
+      end
+    end
+
+    # Whether a transport is handing this subscription to a new session: it
+    # was {#mark_reconnecting}ed and no server has acknowledged it since.
+    #
+    # Unlike {#reconnecting?} this survives the :pending that taking the new
+    # listen id moves it to, which is the whole point: a transport whose
+    # re-send fails on the write has to tell a stream it is handing over —
+    # which MUST be re-sent, and belongs to the next session — from one it is
+    # opening for a caller, which is the caller's to hear about. The state
+    # alone cannot: by the time the write raises, the re-send has already
+    # moved it off :reconnecting.
+    # @return [Boolean]
+    # @api private
+    def reestablishing?
+      @mutex.synchronize { @reestablishing && @state != :closed }
     end
 
     # @api private
@@ -427,6 +481,29 @@ module MCPClient
 
     private
 
+    # Wait for the condition the caller is asking about to hold, then read the
+    # acknowledgment on record for this URI. The block is evaluated with the
+    # lock held and decides *when* the record may be read; what it then says
+    # about the URI is the same question either way.
+    # @param uri [String] the resource URI
+    # @param timeout [Numeric] seconds to wait
+    # @yieldreturn [Boolean] whether the record may be read yet
+    # @return [Symbol] :watching, :not_watching, :closed or :timeout
+    def await_watch(uri, timeout)
+      deadline = Process.clock_gettime(Process::CLOCK_MONOTONIC) + timeout
+      @mutex.synchronize do
+        loop do
+          return :closed if @state == :closed
+          return acknowledges_resource?(uri) ? :watching : :not_watching if yield
+
+          remaining = deadline - Process.clock_gettime(Process::CLOCK_MONOTONIC)
+          return :timeout if remaining <= 0
+
+          @settled.wait(@mutex, remaining)
+        end
+      end
+    end
+
     # Whether the value the server acknowledged for a requested field grants
     # anything: a flag has to come back true, and a list of URIs or task ids
     # has to name at least one of those asked for. Anything else is the server
@@ -455,10 +532,13 @@ module MCPClient
       granted.is_a?(Array) && granted.include?(uri)
     end
 
-    # The answer {#wait_until_settled} reports. Settling is one-way: once the
-    # server has acknowledged the listen request it has answered it, and a
-    # later drop — which puts the stream back to :reconnecting until it is
-    # acknowledged again — does not unask the question the waiter asked.
+    # The answer {#wait_until_settled} reports. A drop does not unask the
+    # question the waiter asked: the server acknowledged the listen request,
+    # and putting the stream back to :reconnecting until it is acknowledged
+    # again does not unanswer it. A replacement request that has gone out
+    # does — that one is unanswered until the server answers it, which is a
+    # different thing from a connection that merely dropped and is recorded
+    # as such rather than left to whichever the reconnect reached first.
     # Called with the lock held.
     # @return [Symbol, nil] :closed, :active, or nil while it is still pending
     def settled_state

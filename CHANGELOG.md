@@ -42,8 +42,13 @@ metadata). Each feature lands in its own PR; this section accumulates them.
   discarding it cannot relieve. (Earlier revisions decided the two by rules
   that disagreed — a payload exempt from the charge but not from eviction —
   and the queue could give up the only notice of a resource and still be over
-  budget.) *Which* of the candidates goes is chosen by **identity** — the
-  notification's method with the `uri` or `taskId` it names — rather than by
+  budget.) What a notification retains includes its method name, and the
+  charge counts it: serializing the params alone let a peer tag `{}` with a
+  multi-megabyte method name for two bytes apiece and put
+  `MAX_PENDING_NOTIFICATIONS` of them behind a slow listener without ever
+  reaching the byte ceiling. *Which* of the candidates goes is chosen by
+  **identity** — the notification's method with the `uri` or `taskId` it
+  names — rather than by
   arrival order: the oldest candidate about the same thing as the arriving
   one, or failing that the oldest of whichever thing has the most queued. One
   stream can carry a mixed filter, and dropping the oldest entry would throw
@@ -130,6 +135,12 @@ metadata). Each feature lands in its own PR; this section accumulates them.
   after the subscriptions were re-sent to it (a crash loop), closes those
   subscriptions with the error instead, so the host learns from
   `closed?`/`error` rather than waiting on a stream that is not coming back.
+  The record of the process that carried them answers that one question and
+  is spent by asking it: it used to outlive the loop it described, so a
+  subscription opened directly on the replacement — a process that then ran
+  healthily for hours — was closed as another crash loop the moment that
+  process exited. A session that is handed nothing asks nothing and spends
+  nothing, since the subscriptions are still open on the session it replaced.
   That interval runs from the moment the process *received* them — not from
   the moment the restart was attempted, or a server whose start-up alone
   outlasts the interval (an `npx -y …` command fetching its package, say)
@@ -147,11 +158,15 @@ metadata). Each feature lands in its own PR; this section accumulates them.
   host never told. A listen write that fails only *after* a restart has
   re-opened the same subscription under a new id no longer tears that healthy
   stream down — the failure cleanup names the id the write went out with —
-  and one that fails while the subscription is already queued for the next
-  process leaves it there rather than closing a stream the restart was about
-  to re-send; a superseded failure is reported to the caller when the stream
-  that replaced it has itself failed, instead of handing back a closed handle
-  with no exception.
+  and one that fails on a subscription a session is being handed leaves it for
+  the next process rather than closing a stream the restart was in the middle
+  of re-sending. That question is asked of the subscription, not of its
+  state: taking the new listen id has already moved it from `:reconnecting`
+  to `:pending` by the time an EPIPE (or a nil stdin) raises, so the guard
+  keyed on the state never fired on the hand-over itself — the one case the
+  spec says MUST be re-sent. A superseded failure is reported to the caller
+  when the stream that replaced it has itself failed, instead of handing back
+  a closed handle with no exception.
   Taking a new id is atomic with closure on both, so a `close` racing with a
   re-open either stops it or cancels the id that went out — never leaving
   the server holding a stream the client can no longer cancel. Events are
@@ -187,9 +202,22 @@ metadata). Each feature lands in its own PR; this section accumulates them.
   was on restarted — counted as live merely for not being closed, so
   `subscribe_resource` answered `true` before that request had been
   acknowledged, or rejected. A subscription with no acknowledgment has no
-  unacknowledged URIs either, which is how the recheck read one as a watch. Opening and closing the
-  stream for one URI is serialized, so concurrent subscribers share a single
-  stream that `unsubscribe_resource` really closes.
+  unacknowledged URIs either, which is how the recheck read one as a watch.
+  Reuse now asks whether the server is honouring the URI on that stream
+  *now*, not what the stream that dropped had been granted: the last
+  acknowledgment stays on record until the replacement takes a new id after
+  the backoff, and reading it as the current grant reported a watch for the
+  whole of an HTTP re-open backoff or a stdio handshake, on a stream the
+  server no longer held and whose replacement might reject the URI. The
+  subscriber waiting on its own listen request still gets its answer — a
+  connection that drops the instant the acknowledgment lands does not unanswer
+  it, or the call would wait out its acknowledgment timeout for a grant it
+  already had — and "nothing re-sent yet" is told from "re-sent and not yet
+  acknowledged" by a flag written at the acknowledgment and at the taking of
+  each new listen id, rather than by which of them a reconnect reaches first.
+  Opening and closing the stream for one URI is serialized, so concurrent
+  subscribers share a single stream that `unsubscribe_resource` really
+  closes.
 
 ### Multi round-trip requests (InputRequiredResult)
 
