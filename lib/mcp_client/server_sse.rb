@@ -18,11 +18,16 @@ module MCPClient
   #   client responds via HTTP POST to the RPC endpoint. This provides full elicitation
   #   capability for remote servers.
   class ServerSSE < ServerBase
+    require_relative 'request_authorization'
     require_relative 'server_sse/sse_parser'
     require_relative 'server_sse/json_rpc_transport'
 
     include SseParser
     include JsonRpcTransport
+    # The credentials of the request this thread last sent, kept in the same
+    # slot, with the same empty-slot semantics, as on the other transports:
+    # {#cleanup} drops it with the rest of what this transport left behind.
+    include MCPClient::RequestAuthorization
 
     require_relative 'server_sse/reconnect_monitor'
 
@@ -563,21 +568,6 @@ module MCPClient
       # the header in the configured hash resolve to the one value a
       # request would actually carry.
       authorization_fingerprint(authorization_header_value(faraday_headers(@headers)))
-    end
-
-    # The context the request this thread last sent went out with (noted
-    # when the headers were applied), so a result is bound to the
-    # credentials of its own request rather than to the headers of the
-    # moment it was recorded.
-    # @return [String, nil]
-    def request_authorization_context
-      Thread.current[:"mcp_client_request_authorization_#{object_id}"]
-    end
-
-    # @param authorization [String, nil] the Authorization header of an outgoing request
-    # @return [void]
-    def note_request_authorization(authorization)
-      Thread.current[:"mcp_client_request_authorization_#{object_id}"] = authorization_fingerprint(authorization)
     end
 
     # Remember the Authorization a request actually carried once it was sent.

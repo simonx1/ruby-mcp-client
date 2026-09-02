@@ -203,7 +203,7 @@ RSpec.describe 'MCP 2026-07-28 cacheable results — round 28' do
       sent = []
       stub_request(:post, url).to_return do |request|
         body = JSON.parse(request.body)
-        sent << body.dig('params', '_meta', 'traceparent')
+        sent << [body['method'], body.dig('params', '_meta', 'traceparent')]
         json_response(body['id'],
                       if body['method'] == 'tools/list'
                         { 'tools' => [tool('t')], 'ttlMs' => 60_000 }
@@ -224,8 +224,10 @@ RSpec.describe 'MCP 2026-07-28 cacheable results — round 28' do
 
       # The hit sends nothing and reads the host's callable once for the
       # whole decision: the freshness check reuses what reading the
-      # parameters of the next request already evaluated.
-      expect(sent).to eq(%w[t1 t2])
+      # parameters of the next request already evaluated. The list carries
+      # the evaluation its own decision was made on (t1); the connect that
+      # decision triggered reads the host for its server/discover.
+      expect(sent).to eq([['server/discover', 't2'], ['tools/list', 't1']])
       expect(spent - before).to eq(1)
     ensure
       client&.cleanup

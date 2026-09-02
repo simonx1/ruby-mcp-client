@@ -213,7 +213,7 @@ RSpec.describe 'MCP 2026-07-28 cacheable results — round 26' do
       sent = []
       stub_request(:post, url).to_return do |request|
         body = JSON.parse(request.body)
-        sent << body.dig('params', '_meta', 'nonce')
+        sent << [body['method'], body.dig('params', '_meta', 'nonce')]
         json_response(body['id'],
                       body['method'] == 'tools/list' ? { 'tools' => [tool('t')], 'ttlMs' => 60_000 } : discover_result)
       end
@@ -229,10 +229,13 @@ RSpec.describe 'MCP 2026-07-28 cacheable results — round 26' do
       client.list_tools
       client.list_tools
 
-      # Every evaluation went out on the wire, in order and exactly once:
-      # nothing was spent on a cache decision that sent nothing, and each
-      # request carried the metadata its own decision was made on.
-      expect(sent).to eq((1..spent).map { |i| "n#{i}" })
+      # Every evaluation went out on the wire exactly once: nothing was
+      # spent on a cache decision that sent nothing, and each request
+      # carried the metadata its own decision was made on. The wire order is
+      # not the order of evaluation: the first list's decision holds n1, and
+      # the server/discover of the connect that decision triggered reads the
+      # host for itself rather than spending what the list is holding.
+      expect(sent).to eq([['server/discover', 'n2'], ['tools/list', 'n1'], ['tools/list', 'n3']])
       expect(spent).to eq(3)
     end
   end
