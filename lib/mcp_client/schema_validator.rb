@@ -101,6 +101,25 @@ module MCPClient
       unevaluatedProperties unevaluatedItems
     ].freeze
 
+    # Unsupported keywords that are annotations, not assertions (`format`
+    # is annotation-only in the default 2020-12 vocabulary, `contentSchema`
+    # only annotates): their presence decides nothing about an instance.
+    ANNOTATION_KEYWORDS = %w[format contentSchema].freeze
+
+    # Unsupported assertions by the instance type they apply to; an
+    # assertion of another type is a no-op for the instance (JSON Schema
+    # 2020-12 Validation Section 6: keywords apply only to their type), so
+    # it cannot leave a branch undecided.
+    UNSUPPORTED_ASSERTIONS_BY_TYPE = {
+      Hash => %w[additionalProperties patternProperties propertyNames dependentSchemas dependencies
+                 dependentRequired minProperties maxProperties unevaluatedProperties],
+      Array => %w[additionalItems contains minContains maxContains uniqueItems unevaluatedItems],
+      Numeric => %w[multipleOf]
+    }.freeze
+
+    # Unsupported keywords that apply to every instance.
+    UNSUPPORTED_ASSERTIONS_ANY_TYPE = %w[$dynamicRef $recursiveRef].freeze
+
     # Wall-clock budget for a single validate call (pattern matching and the
     # walk itself). Schemas come from the remote server, so an expensive
     # expression or a huge composition must not be able to monopolize the
@@ -238,7 +257,10 @@ module MCPClient
       problems = index[:duplicates].map do |name|
         "anchor #{clip(name.inspect)} is declared more than once in a schema resource"
       end
-      problems << "schema has too many objects to index its anchors (more than #{MAX_SUBSCHEMAS})" if index[:truncated]
+      if index[:truncated]
+        problems << 'schema has too many or too deeply nested objects to index its anchors ' \
+                    "(more than #{MAX_SUBSCHEMAS}, or deeper than #{MAX_SCHEMA_DEPTH})"
+      end
       problems
     end
 
@@ -538,7 +560,7 @@ module MCPClient
 
       # A keyword the validator does not evaluate makes this node's verdict
       # partial: a pass here is not a proof for not / oneOf / if.
-      ctx.undecided += 1 if partial_keywords?(schema, dialect)
+      ctx.undecided += 1 if partial_keywords?(schema, dialect, data)
       errors = []
       counted_before = ctx.errors
       errors.concat(validate_ref(data, schema, path, ctx, ref_depth)) if schema.key?('$ref')

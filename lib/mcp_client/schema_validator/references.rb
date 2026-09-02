@@ -37,6 +37,10 @@ module MCPClient
       # @return [Object] the referenced value, or UNRESOLVED
       def resolve_reference(root, ref, dialect, resolver, from: nil)
         index = (resolver[:anchors] ||= anchor_index(root, dialect))
+        # A referring schema the index never reached has no known resource:
+        # resolving against the document root would apply the wrong `#`.
+        return UNRESOLVED if from.is_a?(Hash) && !index[:resources].key?(from)
+
         resource = (from && index[:resources][from]) || root
         fragment = ref.delete_prefix('#')
         return resolve_pointer(resource, ref) if fragment.empty? || fragment.start_with?('/', '%2F', '%2f')
@@ -71,10 +75,15 @@ module MCPClient
         index[:dialects][root] = dialect
         pending = [[root, root, 0, dialect, true]]
         visited = 0
+        index[:truncated] = false
         until pending.empty? || visited >= MAX_SUBSCHEMAS
           schema, resource, depth, dialect, named = pending.shift
-          next unless schema.is_a?(Hash) && depth <= MAX_SCHEMA_DEPTH
+          next unless schema.is_a?(Hash)
           next if index[:resources].key?(schema)
+          # A schema below the depth bound is left unindexed just like one
+          # beyond the visit bound: a reference from it (or an `$id` there)
+          # would otherwise resolve under guesses.
+          (index[:truncated] = true) && next if depth > MAX_SCHEMA_DEPTH
 
           visited += 1
           if resource_root?(schema, dialect)
@@ -96,7 +105,7 @@ module MCPClient
         end
         # Objects left unindexed at the bound would resolve and validate
         # under guesses; the index says so and the schema is unusable.
-        index[:truncated] = pending.any? { |schema, *| schema.is_a?(Hash) && !index[:resources].key?(schema) }
+        index[:truncated] ||= pending.any? { |schema, *| schema.is_a?(Hash) && !index[:resources].key?(schema) }
         index
       end
 

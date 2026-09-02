@@ -7,6 +7,15 @@ metadata). Each feature lands in its own PR; this section accumulates them.
 
 ### JSON Schema handling
 
+- **Round 12.** A `$id` resource the anchor index could not reach (beyond
+  the depth bound) counts as truncation and a reference from a schema the
+  index does not know is unresolvable, never resolved against the document
+  root; a branch of `not` / `oneOf` / `if` is undecided only while an
+  unevaluated assertion that applies to the instance remains — annotations
+  (`format`, `contentSchema`) and assertions of another instance type
+  decide nothing, so a branch settled by its evaluated keywords is a full
+  verdict (`ANNOTATION_KEYWORDS`, `UNSUPPORTED_ASSERTIONS_BY_TYPE`).
+
 - **Dialects.** `MCPClient::SchemaValidator` treats a schema without
   `$schema` as JSON Schema 2020-12, accepts 2020-12, 2019-09 and draft-07
   (`SUPPORTED_DIALECTS`), and reports any other declared dialect as an
