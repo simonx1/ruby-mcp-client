@@ -238,7 +238,8 @@ module MCPClient
       end
 
       problems = []
-      counter = { count: 0, dialect: canonical_dialect(declared), walked: {}.compare_by_identity }
+      counter = { count: 0, dialect: canonical_dialect(declared), walked: {}.compare_by_identity,
+                  depths: lexical_depths(root, canonical_dialect(declared)) }
       walk_schema(root, root, 0, counter, problems)
       problems.concat(anchor_index_problems(root, counter)) if problems.empty?
       problems.uniq
@@ -303,8 +304,9 @@ module MCPClient
       each_subschema(schema, dialect) { |sub| walk_schema(sub, root, depth + 1, counter, problems, dialect) }
     end
 
-    # Account for a schema object about to be walked: once per object, and
-    # within the subschema and nesting bounds.
+    # Account for a schema (object or boolean) about to be walked: once per
+    # object, and within the subschema and nesting bounds — a boolean is a
+    # subschema too and obeys the depth bound.
     # @return [Boolean] whether the object's keywords are to be walked
     def self.admit_schema?(schema, depth, counter, problems)
       return false if schema.is_a?(Hash) && counter[:walked].key?(schema)
@@ -315,13 +317,32 @@ module MCPClient
         problems << "schema has more than #{MAX_SUBSCHEMAS} subschemas"
         return false
       end
-      return false unless schema.is_a?(Hash)
-
       if depth > MAX_SCHEMA_DEPTH
         problems << "schema nesting depth exceeds #{MAX_SCHEMA_DEPTH}"
         return false
       end
-      true
+      schema.is_a?(Hash)
+    end
+
+    # The lexical nesting depth of every schema object reachable from the
+    # root (subschema positions, definition bags of any dialect), so a
+    # referenced target is bounded by where it is written, not by where it
+    # is referenced from: neither member order nor reference fan-out can
+    # change the verdict.
+    # @return [Hash{Hash => Integer}] identity-keyed
+    def self.lexical_depths(root, dialect)
+      depths = {}.compare_by_identity
+      pending = [[root, 0]]
+      while (schema, depth = pending.shift)
+        next unless schema.is_a?(Hash) && !depths.key?(schema)
+
+        depths[schema] = depth
+        break if depths.size > MAX_SUBSCHEMAS * 2
+
+        each_subschema(schema, dialect) { |sub| pending << [sub, depth + 1] }
+        each_foreign_definition(schema, dialect) { |sub| pending << [sub, depth + 1] }
+      end
+      depths
     end
 
     # Every applicator value must be a schema (object or boolean), an array
@@ -445,8 +466,13 @@ module MCPClient
       end
 
       problem = ref_chain_problem(ref, root, counter[:dialect], counter, from: schema) do |target|
-        # What a reference reaches is walked under its own resource's dialect.
-        walk_schema(target, root, depth + 1, counter, problems, indexed_dialect(target, counter) || dialect)
+        # What a reference reaches is walked under its own resource's dialect
+        # and at its own lexical depth; a boolean target needs no preflight
+        # and is not charged per reference.
+        next unless target.is_a?(Hash)
+
+        target_depth = (counter[:depths] || {})[target] || (depth + 1)
+        walk_schema(target, root, target_depth, counter, problems, indexed_dialect(target, counter) || dialect)
       end
       problems << problem if problem
     end
