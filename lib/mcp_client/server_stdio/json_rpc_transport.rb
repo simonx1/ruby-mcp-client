@@ -21,6 +21,10 @@ module MCPClient
           release_retired_transport if transport_retired?
           return if @initialized
 
+          # Whether this session is one a subscription restart is establishing
+          # is decided before it exists and carried through: a restart that
+          # overlaps this one must not answer the question on its behalf.
+          restart = restarting_for_subscriptions?
           begin
             connect
             start_reader
@@ -37,20 +41,30 @@ module MCPClient
           end
 
           @initialized = true
+          note_session_ready(restart)
           reopen_subscriptions
-          note_session_ready
         end
       end
 
       # Stamp the moment this process became a usable session: its handshake
-      # was answered and the subscriptions the host still holds were re-sent.
-      # Only a session that {#restart_for_open_subscriptions} spawned is
-      # stamped for the crash-loop bound — a session the host established
-      # some other way was never a restart to count against it.
+      # was answered, so it can serve requests and carry subscriptions. Only a
+      # session that {#restart_for_open_subscriptions} spawned is stamped for
+      # the crash-loop bound — a session the host established some other way
+      # was never a restart to count against it.
+      #
+      # The stamp is taken before the subscriptions are re-sent, not after:
+      # the process can exit while they are going out, and the exit handler
+      # that then asks {#restarting_too_often?} must not read a missing stamp
+      # as "this process was not a restart" and respawn it for ever.
+      # @param restart [Boolean] whether a restart established this session
       # @return [void]
-      def note_session_ready
-        @subscription_restart_ready_at =
-          (Process.clock_gettime(Process::CLOCK_MONOTONIC) if @restarting_for_subscriptions)
+      def note_session_ready(restart)
+        @subscription_restart_ready_at = (Process.clock_gettime(Process::CLOCK_MONOTONIC) if restart)
+      end
+
+      # @return [Boolean] whether a restart for open subscriptions is in flight
+      def restarting_for_subscriptions?
+        @mutex.synchronize { @restarting_for_subscriptions.positive? }
       end
 
       # @return [void]
@@ -79,17 +93,59 @@ module MCPClient
         send_request(request)
         send_subscription_cancellation(id) if subscription.closed_by_client?
       rescue StandardError => e
-        unregister_subscription(subscription)
-        subscription.finish(error: e.is_a?(MCPClient::Errors::MCPError) ? e : MCPClient::Errors::TransportError.new(e.message))
-        raise
+        fail_open_attempt(subscription, id, e)
+      end
+
+      # Undo the listen attempt that just failed — but only while the
+      # subscription is still the one this attempt opened.
+      #
+      # A write can block long enough for the child to exit, for the reader to
+      # restart the process, and for {#reopen_subscriptions} to re-open this
+      # very subscription on the new one. The registry is keyed by listen id,
+      # so unregistering "the subscription" would then delete the *new*
+      # registration, and finishing it would close a stream the fresh process
+      # is serving. The cleanup therefore names the id the write went out
+      # with, and a failure that has already been superseded only says so in
+      # the log: the subscription the caller asked for is open, on the session
+      # that replaced this one.
+      # @param subscription [MCPClient::Subscription]
+      # @param id [Integer, String] the listen id this attempt sent under
+      # @param error [StandardError] why it failed
+      # @return [void]
+      # @raise [StandardError] the failure, when it was still this attempt's
+      def fail_open_attempt(subscription, id, error)
+        unless subscription.open_as?(id)
+          return @logger.debug("subscriptions/listen #{id} failed after the subscription was re-opened " \
+                               "(#{error.message}); the newer stream stands")
+        end
+
+        unregister_subscription_id(subscription, id)
+        subscription.finish(
+          error: error.is_a?(MCPClient::Errors::MCPError) ? error : MCPClient::Errors::TransportError.new(error.message)
+        )
+        raise error
       end
 
       # After the process was re-established, re-send subscriptions/listen
       # for every subscription the host still holds open ("the server holds
       # no subscription state across reconnections").
+      #
+      # A re-established session that turns out to be legacy cannot carry any
+      # of them: on `protocol: :auto` the restarted process may negotiate an
+      # older revision than the one that died, and {#cleanup} has already
+      # moved the open subscriptions out of the registry. Returning would
+      # leave them :reconnecting for ever with the host never told, so they
+      # end with the capability error instead.
       # @return [void]
       def reopen_subscriptions
-        return unless modern?
+        unless modern?
+          return fail_reconnecting_subscriptions(
+            MCPClient::Errors::CapabilityError.new(
+              'the re-established server process negotiated ' \
+              "#{protocol_version || 'no version'}, which cannot carry a subscriptions/listen stream"
+            )
+          )
+        end
 
         pending = (@reconnecting_subscriptions || []).select(&:reconnectable?)
         @reconnecting_subscriptions = []
@@ -170,13 +226,21 @@ module MCPClient
 
       # Re-establish the process, marked as a restart so the session it
       # produces is stamped for the crash-loop bound.
+      #
+      # The mark is a depth, not a flag: the process a restart spawns can exit
+      # while that restart is still inside {#ensure_initialized}, so a second
+      # restart begins (on the new process's reader thread) before the first
+      # has returned. With a flag, whichever finished first cleared it, and
+      # the session the other one established then stamped nothing — leaving
+      # {#restarting_too_often?} to read every later exit as a healthy server
+      # and respawn a crash-looping one for ever.
       # @return [void]
       def restart_session
-        @restarting_for_subscriptions = true
+        @mutex.synchronize { @restarting_for_subscriptions += 1 }
         @subscription_restart_ready_at = nil
         ensure_initialized
       ensure
-        @restarting_for_subscriptions = false
+        @mutex.synchronize { @restarting_for_subscriptions -= 1 }
       end
 
       # Whether the process that just exited was one this restarted for its

@@ -150,6 +150,22 @@ RSpec.describe 'MCP 2026-07-28 subscriptions/listen — round 6' do
 
       expect(order).to eq(%i[transport_cache host_callback listeners])
     end
+
+    # The host callback sits between the invalidation and the delivery, so the
+    # order only means something if a callback that raises can stop neither.
+    it 'keeps that order when the host callback raises' do
+      order = []
+      allow(server).to receive(:invalidate_cache_for_notification) { order << :transport_cache }
+      allow(server).to receive(:deliver_subscription_notification) { order << :listeners }
+      server.on_notification do |_method, _params|
+        order << :host_callback
+        raise 'host handler exploded'
+      end
+
+      expect { server.route_notification('notifications/tools/list_changed', {}) }.not_to raise_error
+
+      expect(order).to eq(%i[transport_cache host_callback listeners])
+    end
   end
 
   # codex [P2] subscription_support.rb:93: an acknowledgment only recorded the

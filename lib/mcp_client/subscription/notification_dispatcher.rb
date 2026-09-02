@@ -42,9 +42,11 @@ module MCPClient
     #    oldest — the queue is then full of distinct signals and one must go.
     #
     # A notification whose payload is larger than the whole byte budget is
-    # still queued once the buffer has been emptied for it: the peer can hold
-    # one payload behind a stalled listener, never a queueful of them, and a
-    # signal is never lost merely for being large.
+    # still queued once the buffer has been emptied for it, and it is not then
+    # charged against the budget it exceeds on its own: the peer can hold one
+    # such payload behind a stalled listener, never a queueful of them, while
+    # a signal is neither lost merely for being large nor evicted by the next
+    # notice of something else.
     class NotificationDispatcher
       # One queued notification: what it is about, who wants it, what it says,
       # and what it costs to hold on to.
@@ -153,7 +155,29 @@ module MCPClient
       # @param entry [Queued] the arriving notification
       # @return [Boolean]
       def overflowing?(entry)
-        @buffer.size >= capacity || (@bytes + entry.bytes) > byte_capacity
+        @buffer.size >= capacity || charged_bytes(entry) > byte_capacity
+      end
+
+      # The bytes queuing `entry` would charge against the byte ceiling: what
+      # the queue would retain, less the one payload that is larger than the
+      # whole budget, if it holds such a payload.
+      #
+      # That payload is admitted alone by design, and charging it would leave
+      # the queue permanently over budget: every notification that followed
+      # would find it overflowing, and with nothing redundant queued the
+      # oversized entry, being the oldest, would be the first discarded — the
+      # only notice of its resource lost to make room for a notice of
+      # something else, which is exactly the loss this policy exists to
+      # prevent. Only one payload is ever exempt, so a peer sending oversized
+      # notifications back to back still keeps just one of them queued and the
+      # retained total stays within the budget plus one peer-sized payload.
+      # Called with the lock held.
+      # @param entry [Queued] the arriving notification
+      # @return [Integer] bytes
+      def charged_bytes(entry)
+        total = @bytes + entry.bytes
+        largest = [@buffer.max_by(&:bytes)&.bytes || 0, entry.bytes].max
+        largest > byte_capacity ? total - largest : total
       end
 
       # Make room for one more notification. Called with the lock held.
@@ -162,8 +186,9 @@ module MCPClient
       def make_room(entry)
         dropped = 0
         # `droppable_index` answers nil only for an empty buffer, so a payload
-        # bigger than the whole budget empties the queue and is then queued
-        # alone rather than lost.
+        # too big to be made room for is queued rather than lost — and a
+        # payload bigger than the whole budget needs no room made for it at
+        # all (see {#charged_bytes}).
         while overflowing?(entry) && (index = droppable_index(entry.key))
           @bytes -= @buffer.delete_at(index).bytes
           dropped += 1
