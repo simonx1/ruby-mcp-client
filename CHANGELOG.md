@@ -205,6 +205,10 @@ metadata). Each feature lands in its own PR; this section accumulates them.
   is enforced before delivery; a wait reads the server's session epoch and
   the answered set it points at in one step; `mcp_client/task` requires the
   error definitions it raises.
+- **Bounded pace (round 28).** A `pollIntervalMs` the clock cannot
+  represent, or that is merely enormous, is bounded to
+  `MAX_TASK_POLL_INTERVAL` (one hour) rather than handed to `sleep`, and
+  still clamped to what is left of the caller's timeout and the TTL.
 
 ### Cacheable results (`ttlMs` / `cacheScope`)
 
