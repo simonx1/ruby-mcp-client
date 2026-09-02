@@ -73,10 +73,38 @@ metadata). Each feature lands in its own PR; this section accumulates them.
   `transport:` entries of `MCPClient.connect`, its SSE `@example`, and
   `MCPClient.sse_config`, which gains a `@deprecated` tag pointing at
   `MCPClient.streamable_http_config`.
+- **A reservation is not a notice (round 9).** `MCPClient::Deprecations`
+  used to mark a feature spent the moment a caller claimed the right to log
+  it, so two first uses racing with different loggers could lose the notice
+  outright: the claiming caller blocked inside a broken logger, the
+  contender holding a working one saw the slot taken and stood down, and the
+  claim's later failure left the notice owed to a use that might never come.
+  A feature is now `:pending` while a caller is inside `logger.warn` and
+  `:emitted` only once one succeeded, so a contender waits for the outcome
+  and takes the notice over when the reservation fails. The wait is bounded
+  by `Deprecations::PENDING_WAIT_SECONDS`: a notice never holds up the
+  deprecated operation, so a logger that blocks forever costs the contender
+  the notice, not its progress. `Deprecations.emitted?` reports notices that
+  actually went out, never one still in flight.
+- **HTTP+SSE marked in the last places it was offered (round 9).**
+  Continuing the round 8 sweep: the README's Advanced Configuration
+  `sse_config` example and the auto-detect fallback row of the
+  transport-detection table, and, in `MCPClient.connect`'s YARD, the
+  "Other HTTP URLs" fallback text; the multiple-server `@example` no longer
+  reaches for an `/sse` URL at all.
+- **`protocol:` and `discover_timeout:` documented as they behave.** The
+  README offered both on `MCPClient.connect` without qualification, but
+  `MCPClient::ServerSSE` accepts neither and `MCPClient.connect` drops them
+  for an `/sse` URL. The deprecated transport has no era of its own, so the
+  documentation now names the three transports that carry the options
+  (stdio, HTTP, Streamable HTTP) and says HTTP+SSE is not one of them,
+  rather than adding era support to a transport on its way out.
 - **Documentation.** README documents the 2026-07-28 support (discovery
   and per-request metadata, multi round-trip requests, `x-mcp-header`,
   subscriptions, cacheable results, the tasks extension, authorization) and
-  the deprecated features with their earliest removals and migrations; the
+  the deprecated features with their earliest removals and migrations —
+  each row naming what actually triggers the notice, Sampling's
+  transport-level `on_sampling_request` included; the
   2026-07-28 section flags `log_level=` as deprecated where it presents it,
   rather than only in the table further down, and states what actually
   triggers the Roots notice (a configured list, a `roots=` call or a
