@@ -124,8 +124,9 @@ metadata). Each feature lands in its own PR; this section accumulates them.
   not); only an expired token whose refresh fails yields none; metadata
   bodies that are not JSON objects are a discovery failure. While a
   challenge's metadata URL is pending and unresolved no cached token is
-  presented; the next access retries that URL first and judges the token
-  by what it names.
+  presented; the next access retries that URL first — before the token is
+  read, so a record that retry retired is never written back — and judges
+  the token by what the document names.
 
 ### Tasks extension (`io.modelcontextprotocol/tasks`)
 

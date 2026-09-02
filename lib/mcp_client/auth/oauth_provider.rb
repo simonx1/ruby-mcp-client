@@ -117,6 +117,10 @@ module MCPClient
       # Get current access token (refresh if needed)
       # @return [Token, nil] Current valid access token or nil
       def access_token
+        # A challenge still to be fetched decides which authorization server
+        # is current, and may retire the stored token: it is resolved before
+        # the token is read, so a record it deleted is never written back.
+        resolve_pending_challenge
         token = stored_token
         logger.debug("OAuth access_token: retrieved token=#{token ? 'present' : 'nil'} for #{server_url}")
         return nil unless token
@@ -126,7 +130,6 @@ module MCPClient
         # bytes are refused before any binding could attribute them anew.
         return nil if retired_token?(token)
 
-        resolve_pending_challenge
         token = bind_token_issuer(token)
         return nil unless token && token_for_current_issuer?(token)
 
