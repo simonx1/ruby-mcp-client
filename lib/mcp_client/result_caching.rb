@@ -316,7 +316,11 @@ module MCPClient
     # @param kind [Symbol]
     # @return [Object, nil] the identity of the entry currently holding the kind
     def cache_entry_token(kind)
-      cache_entries_mutex.synchronize { cache_entries[kind]&.fetch_token }
+      # A placeholder (an invalidation, a cleanup) identifies nothing.
+      cache_entries_mutex.synchronize do
+        entry = cache_entries[kind]
+        entry&.value.nil? ? nil : entry.fetch_token
+      end
     end
 
     # @return [Symbol] the thread-local key of this server's served entries
@@ -491,6 +495,9 @@ module MCPClient
     # @return [Object, nil]
     def stale_fallback_for(kind, entry, context: :current)
       return nil unless entry.is_a?(MCPClient::CachedResult) && entry.value
+      # An entry a cleanup or an invalidation replaced while the re-fetch
+      # was in flight is forgotten: only the entry still in the slot serves.
+      return nil unless cache_entries_mutex.synchronize { cache_entries[kind].equal?(entry) }
 
       note_served_entry(kind, entry)
 
@@ -531,7 +538,12 @@ module MCPClient
         # simply forgotten, they are only ever served with a value.
         cache_entries.delete_if { |key, _| key.is_a?(String) }
         PLACEHOLDER_KINDS.each { |kind| cache_entries[kind] ||= nil }
-        cache_entries.each_key { |key| cache_entries[key] = MCPClient::CachedResult.stale(now: now, like: cache_entries[key]) }
+        cache_entries.each_key do |key|
+          # Whoever still holds the replaced object (a re-fetch in flight)
+          # must not serve its list either.
+          cache_entries[key]&.value = nil
+          cache_entries[key] = MCPClient::CachedResult.stale(now: now, like: cache_entries[key])
+        end
         bump_cache_epoch
       end
     end

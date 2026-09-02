@@ -422,6 +422,8 @@ module MCPClient
     # Clean up all server connections
     def cleanup
       servers.each(&:cleanup)
+      # The transports forgot their results; the slices built from them go too.
+      clear_cache
     end
 
     # Clear the cached tools so that next list_tools will fetch fresh data
@@ -818,7 +820,26 @@ module MCPClient
       return nil if cache.empty? || !caches_fresh?(kind)
 
       @cache_mutex.synchronize do
-        cached_copies(cache) if version == @cache_version && !cache.empty?
+        # A cleanup that landed after the verdict replaced the transport
+        # entries the slices came from; that check touches only the
+        # transport's cache lock, so it can run under this one.
+        cached_copies(cache) if version == @cache_version && !cache.empty? && slices_still_current?(kind)
+      end
+    end
+
+    # Whether every server's slice of a kind still comes from the transport
+    # entry it was recorded against (a cleanup or a replaced entry ends it).
+    # @param kind [Symbol]
+    # @return [Boolean]
+    def slices_still_current?(kind)
+      servers.all? do |server|
+        next true unless server.respond_to?(:cache_entry_token, true)
+
+        _fingerprint, token = @cache_params[kind][server]
+        current = server.send(:cache_entry_token, kind)
+        next current.nil? if token == MCPClient::ResultCaching::LEGACY_ENTRY
+
+        !token.nil? && !current.nil? && current.equal?(token)
       end
     end
 

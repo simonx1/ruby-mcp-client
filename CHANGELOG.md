@@ -17,6 +17,14 @@ metadata). Each feature lands in its own PR; this section accumulates them.
   no longer makes every private entry look foreign; a queued stdio line or
   SSE event is dated from its arrival, before it is decoded.
 
+- **Snapshots and stale fallbacks never outlive cleanup (round 22).** A
+  client-level snapshot is served only while every slice still comes from
+  the transport entry it was recorded against (re-checked under the cache
+  lock right before the copy; a placeholder identifies nothing), and
+  `Client#cleanup` clears the client caches; a stale list served on a
+  failed re-fetch must still be the entry in the slot — an entry a cleanup
+  replaced while the re-fetch was in flight is forgotten (its value is
+  dropped too).
 - **Cleanup placeholders and slice identity (round 19).** Clearing the
   cache installs a stale placeholder for every list kind, recorded or
   not, and a transport keeps a fetched list only when its hint was
