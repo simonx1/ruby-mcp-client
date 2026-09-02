@@ -795,6 +795,8 @@ module MCPClient
     # @param req [Faraday::Request] HTTP request
     # @param _request [Hash] JSON-RPC request
     def apply_request_headers(req, request)
+      # The freshness probe models its request on the last method sent.
+      @probe_method = request['method'] if request.is_a?(Hash) && request['method'].is_a?(String)
       # Apply all headers including custom ones
       @headers.each { |k, v| req.headers[k] = v }
 

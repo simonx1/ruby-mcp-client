@@ -54,6 +54,17 @@ metadata). Each feature lands in its own PR; this section accumulates them.
   and template lists from receipt. `server.cache_info(:tools | :prompts |
   :resources | :templates | :discover)` and `cache_info(:read, uri)` expose
   `ttl_ms`, `cache_scope`, `received_at` and `fresh`.
+- **Review round 11.** The freshness probe models its request on a real
+  JSON-RPC POST (endpoint, body of the last method sent) so path- or
+  body-aware host middleware answers as it would for the request, and it
+  gives up rather than guess (no private entry is served) when host
+  middleware overrides `call` and cannot be run without sending; the
+  read-cache epoch is taken once the session exists, so the first read on
+  a fresh connection is cached; a fetch that completes after its entry was
+  invalidated never overwrites the newer entry installed meanwhile; the
+  per-URI read cache keeps only results that are fresh on arrival, drops
+  expired ones as new ones are stored and holds at most `MAX_CACHED_READS`
+  (oldest evicted first).
 
 ### Subscriptions (`subscriptions/listen`)
 

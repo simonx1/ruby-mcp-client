@@ -28,6 +28,10 @@ module MCPClient
     # its conversion failed) is not a cache that may be served.
     LIST_VALUE_KINDS = %i[tools prompts resources].freeze
 
+    # How many resources/read results are kept at once: iterating many
+    # resources must not grow memory with every URI ever read.
+    MAX_CACHED_READS = 64
+
     # Paginated list methods and their cache kind.
     LIST_METHOD_KINDS = {
       'tools/list' => :tools,
@@ -74,8 +78,14 @@ module MCPClient
       now = monotonic_now
       entry = cache_entry_for(result, value, now: now)
       cache_entries_mutex.synchronize do
-        entry = MCPClient::CachedResult.stale(now: now, like: entry) if epoch && epoch != (@cache_epoch || 0)
-        cache_entries[kind] = entry
+        if epoch && epoch != (@cache_epoch || 0)
+          # Invalidated while in flight: whatever is installed now (the
+          # invalidation's placeholder, or a newer fetch) stays; this result
+          # is reported stale and never stored.
+          entry = MCPClient::CachedResult.stale(now: now, like: entry)
+        else
+          cache_entries[kind] = entry
+        end
       end
       remember_recorded_entry(kind, entry)
     end
@@ -126,12 +136,16 @@ module MCPClient
       # fetched is already stale.
       mixed = combined.cache_scope == 'private' && contexts && contexts.uniq.size > 1
       cache_entries_mutex.synchronize do
-        if mixed || (epoch && epoch != (@cache_epoch || 0))
-          combined = MCPClient::CachedResult.stale(now: now,
-                                                   like: combined)
+        if mixed
+          combined = MCPClient::CachedResult.stale(now: now, like: combined)
+          combined.authorization_context = MCPClient::CachedResult::MIXED_CONTEXT
+          cache_entries[kind] = combined
+        elsif epoch && epoch != (@cache_epoch || 0)
+          # Invalidated while in flight: the current entry stays.
+          combined = MCPClient::CachedResult.stale(now: now, like: combined)
+        else
+          cache_entries[kind] = combined
         end
-        combined.authorization_context = MCPClient::CachedResult::MIXED_CONTEXT if mixed
-        cache_entries[kind] = combined
       end
       remember_recorded_entry(kind, combined)
     end
@@ -398,18 +412,38 @@ module MCPClient
 
       contents = (result['contents'] || []).map { |content| MCPClient::ResourceContent.from_json(content) }
       entry = cache_entry_for(result, contents, now: received_at)
-      # A read is cached only on an explicit ttlMs: "if ttlMs is absent,
-      # clients SHOULD assume 0" — and reads were never cached before this
-      # revision, so a legacy server keeps that behaviour. A result reached
-      # through a multi round-trip retry MUST NOT be cached either, nor one
-      # whose entry was invalidated while the request was in flight.
-      if last_result_from_round_trip? || !entry.hint?
-        invalidate_read_cache(uri)
-      else
-        cache_entries_mutex.synchronize { cache_entries[key] = entry if epoch == (@cache_epoch || 0) }
+      # A read is cached only on an explicit, positive ttlMs: "if ttlMs is
+      # absent, clients SHOULD assume 0" — and reads were never cached
+      # before this revision, so a legacy server keeps that behaviour; a
+      # result that is stale on arrival would only take up memory. A result
+      # reached through a multi round-trip retry MUST NOT be cached either,
+      # nor one whose entry was invalidated while the request was in flight.
+      cache_entries_mutex.synchronize do
+        if last_result_from_round_trip? || !entry.hint? || !entry.fresh?(now: received_at)
+          cache_entries.delete(key)
+        elsif epoch == (@cache_epoch || 0)
+          prune_read_entries(now: received_at)
+          cache_entries[key] = entry
+        end
       end
       # The caller gets its own copies; the cached ones stay untouched.
       contents.map(&:dup)
+    end
+
+    # Drop expired reads and, past {MAX_CACHED_READS}, the oldest ones, so
+    # a long-lived connection does not accumulate every URI ever read.
+    # (call while holding cache_entries_mutex)
+    # @param now [Float] monotonic time
+    # @return [void]
+    def prune_read_entries(now:)
+      reads = cache_entries.select { |k, _| k.is_a?(String) && k.start_with?('read:') }
+      reads.each { |k, entry| cache_entries.delete(k) unless entry.fresh?(now: now) }
+      reads = cache_entries.select { |k, _| k.is_a?(String) && k.start_with?('read:') }
+      while reads.size >= MAX_CACHED_READS
+        oldest = reads.min_by { |_, entry| entry.received_at }.first
+        cache_entries.delete(oldest)
+        reads.delete(oldest)
+      end
     end
 
     # Keep caches in step with the server's change notifications: a list

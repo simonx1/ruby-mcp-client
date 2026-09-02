@@ -371,6 +371,10 @@ module MCPClient
     # @return [Array<MCPClient::ResourceContent>] array of resource contents
     # @raise [MCPClient::Errors::ResourceReadError] if resource reading fails
     def read_resource(uri)
+      # The session exists before the cache epoch is snapshotted: a
+      # reconnect inside the request would otherwise advance it and drop
+      # the first read's entry.
+      ensure_connected
       read_resource_with_cache(uri) { rpc_request('resources/read', { uri: uri }) }
     rescue MCPClient::Errors::ServerError => e
       raise if e.protocol_error?
@@ -433,6 +437,7 @@ module MCPClient
     def list_resource_templates(cursor: nil)
       params = {}
       params['cursor'] = cursor if cursor
+      ensure_connected
       epoch = cache_epoch
       result = rpc_request('resources/templates/list', params)
       record_cache_hint(:templates, result, epoch: epoch) unless cursor

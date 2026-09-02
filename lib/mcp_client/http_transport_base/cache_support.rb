@@ -15,6 +15,15 @@ module MCPClient
       # without a request (the freshness probe).
       NOOP_APP = ->(_env) {}
 
+      # Context that matches no cached entry: the credentials the next
+      # request would carry cannot be determined without sending it.
+      UNKNOWN_CONTEXT = :unknown
+
+      # Middleware that overrides `call` outright (the retry middleware of the
+      # default stack) but never touches the request headers, so the probe
+      # may skip it.
+      PROBE_TRANSPARENT_MIDDLEWARE = %w[Faraday::Retry::Middleware Faraday::Request::Retry].freeze
+
       # Last request middleware on the JSON-RPC connection: records the
       # Authorization a request carries once every host middleware
       # (faraday_config) has run, right before the adapter sends it. A
@@ -120,17 +129,22 @@ module MCPClient
         :"mcp_client_request_authorization_#{object_id}"
       end
 
-      # @return [String, nil] the Authorization header the next request would carry
+      # @return [String, nil, Symbol] the Authorization header the next request would carry,
+      #   or {UNKNOWN_CONTEXT} when host middleware makes that impossible to tell
       def current_authorization_context
         # The probe starts from the configured headers, as a real request
         # does: a provider without a token leaves a static header in place.
         probe = HeaderProbe.new(@headers.to_h.dup)
         @oauth_provider&.apply_authorization(probe)
         headers = probe.headers
-        # Faraday middleware installed by the host (faraday_config) may add
-        # or replace the header after the request block ran: the probe runs
-        # that stack too, without sending anything.
-        headers = middleware_request_headers(headers) if @faraday_config
+        if @faraday_config
+          # Faraday middleware installed by the host (faraday_config) may
+          # add or replace the header after the request block ran: the probe
+          # runs that stack too, without sending anything — and gives up
+          # rather than guess when it cannot run it faithfully.
+          headers = middleware_request_headers(headers)
+          return UNKNOWN_CONTEXT if headers.nil?
+        end
         authorization_fingerprint(headers['Authorization'] || headers['authorization'])
       end
 
@@ -139,30 +153,45 @@ module MCPClient
       HeaderProbe = Struct.new(:headers)
 
       # Run the request phase of the connection's middleware over a request
-      # that is never sent, and return the headers it would go out with.
-      # Only `on_request` hooks run: response middleware (raise_error, a
-      # parser) never sees a response here, and the recorder must not note
-      # the probe as a sent request.
+      # shaped like a real JSON-RPC POST (endpoint, JSON body of the last
+      # method sent) that is never sent, and return the headers it would go
+      # out with. Only `on_request` hooks run: response middleware
+      # (raise_error, a parser) never sees a response here, and the recorder
+      # must not note the probe as a sent request. Middleware that overrides
+      # `call` cannot be run without sending, so the answer is then unknown.
       # @param headers [Hash] the headers before middleware
-      # @return [Hash] the headers after middleware (as far as it got on failure)
+      # @return [Hash, nil] the headers after middleware, or nil when they cannot be determined
       def middleware_request_headers(headers)
         conn = http_connection
-        request = conn.build_request(:post) { |req| headers.each { |k, v| req.headers[k] = v } }
+        request = conn.build_request(:post) do |req|
+          req.url(@endpoint)
+          headers.each { |k, v| req.headers[k] = v }
+          req.headers['Content-Type'] = 'application/json'
+          req.body = JSON.generate('jsonrpc' => '2.0', 'id' => 0, 'method' => @probe_method || 'ping',
+                                   'params' => {})
+        end
         env = request.to_env(conn)
-        begin
-          conn.builder.handlers.each do |handler|
-            next if handler.klass == AuthorizationRecorder
+        conn.builder.handlers.each do |handler|
+          next if handler.klass == AuthorizationRecorder
+          return nil unless probe_runnable_middleware?(handler.klass)
 
-            middleware = handler.build(NOOP_APP)
-            middleware.on_request(env) if middleware.respond_to?(:on_request)
-          end
-        rescue StandardError => e
-          @logger.debug("Could not run the Faraday middleware to probe the Authorization header: #{e.class}")
+          middleware = handler.build(NOOP_APP)
+          middleware.on_request(env) if middleware.respond_to?(:on_request)
         end
         env.request_headers
       rescue StandardError => e
-        @logger.debug("Could not build a request to probe the Authorization header: #{e.class}")
-        headers
+        @logger.debug("Could not run the Faraday middleware to probe the Authorization header: #{e.class}")
+        nil
+      end
+
+      # @param klass [Class] a middleware class on the connection
+      # @return [Boolean] whether its request phase can be run without sending (it relies on
+      #   Faraday::Middleware#call, or is known not to touch the headers)
+      def probe_runnable_middleware?(klass)
+        return true if PROBE_TRANSPARENT_MIDDLEWARE.include?(klass.name)
+        return false unless klass.method_defined?(:call)
+
+        klass.instance_method(:call).owner == Faraday::Middleware
       end
 
       # Remember the Authorization a request actually carried once it was
