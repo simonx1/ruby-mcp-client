@@ -76,11 +76,7 @@ module MCPClient
         ensure_task_capability!(srv, 'get')
 
         begin
-          result = if timeout
-                     srv.rpc_request('tasks/get', { taskId: task_id }, timeout: timeout)
-                   else
-                     srv.rpc_request('tasks/get', { taskId: task_id })
-                   end
+          result = task_rpc(srv, 'tasks/get', { taskId: task_id }, timeout: timeout)
           validate_detailed_task_shape!(result) if modern_server?(srv)
           task = MCPClient::Task.from_json(result, server: srv, detailed: true)
           # The answer must be about the task that was asked for: its state
