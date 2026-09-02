@@ -666,6 +666,7 @@ module MCPClient
       # @return [MCPClient::Task] the server's task, or a locally completed one
       def call_tool_as_modern_task(tool_name, parameters, srv, tool: nil)
         ensure_tasks_extension!(srv)
+        generation_before = tools_generation_of(srv)
         result = begin
           srv.call_tool(tool_name, parameters)
         rescue MCPClient::Errors::ServerError => e
@@ -685,8 +686,12 @@ module MCPClient
         return created_task(result, srv) if task_result?(result)
 
         # Answered synchronously: the result is validated against the tool's
-        # outputSchema exactly as #call_tool would.
-        result = validate_structured_content!(tool, result) if tool
+        # outputSchema exactly as #call_tool would — against the definition
+        # a mid-call HeaderMismatch refresh replaced, when it did.
+        if tool
+          tool = refreshed_tool(tool) || tool if tools_generation_of(srv) != generation_before
+          result = validate_structured_content!(tool, result)
+        end
         MCPClient::Task.completed_locally(result, server: srv)
       end
 

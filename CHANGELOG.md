@@ -16,6 +16,11 @@ metadata). Each feature lands in its own PR; this section accumulates them.
   synchronous answer to `call_tool_as_task` on a 2026-07-28 server is
   validated against the tool's `outputSchema` like `call_tool`; an
   overflowing `ttlMs` means no backstop rather than a raw exception.
+- **Synchronous answers and overflow (round 27).** A synchronous answer to
+  `call_tool_as_task` on a 2026-07-28 server is validated against the tool
+  definition a mid-call HeaderMismatch refresh replaced, exactly like
+  `call_tool`; `Task#ttl_elapsed?` treats an overflowing `ttlMs` as no
+  backstop instead of raising, like `ttl_remaining`.
 - **In-flight holds survive forgets (round 23).** The keys an abandoned
   input handler is still presenting stay reserved apart from the task's
   bookkeeping, so the TTL backstop, a gone task or a terminal lookup
