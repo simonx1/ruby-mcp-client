@@ -359,6 +359,7 @@ module MCPClient
       ensure_initialized
       pages = []
       received_ats = []
+      fingerprints = []
       epoch = cache_epoch
       prompts = collect_paginated('prompts') do |cursor|
         params = {}
@@ -366,10 +367,11 @@ module MCPClient
         result = rpc_request('prompts/list', params) || {}
         pages << result
         received_ats << monotonic_now
+        fingerprints << request_params_fingerprint
         prompts = (result['prompts'] || []).map { |td| MCPClient::Prompt.from_json(td, server: self) }
         [prompts, result['nextCursor']]
       end
-      record_list_cache_hint('prompts/list', pages, received_ats, epoch: epoch)
+      record_list_cache_hint('prompts/list', pages, received_ats, params: fingerprints, epoch: epoch)
       attach_list_value(:prompts, prompts)
       prompts
     rescue MCPClient::Errors::ServerError => e
@@ -536,6 +538,7 @@ module MCPClient
       ensure_initialized
       pages = []
       received_ats = []
+      fingerprints = []
       epoch = cache_epoch
       tools = collect_paginated('tools') do |cursor|
         params = {}
@@ -543,10 +546,11 @@ module MCPClient
         result = rpc_request('tools/list', params) || {}
         pages << result
         received_ats << monotonic_now
+        fingerprints << request_params_fingerprint
         tools = (result['tools'] || []).map { |td| MCPClient::Tool.from_json(td, server: self) }
         [tools, result['nextCursor']]
       end
-      record_list_cache_hint('tools/list', pages, received_ats, epoch: epoch)
+      record_list_cache_hint('tools/list', pages, received_ats, params: fingerprints, epoch: epoch)
       attach_list_value(:tools, tools)
       tools
     rescue MCPClient::Errors::ServerError => e

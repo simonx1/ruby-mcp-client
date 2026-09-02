@@ -322,6 +322,7 @@ module MCPClient
       pages = []
       received_ats = []
       contexts = []
+      fingerprints = []
       epoch = cache_epoch if respond_to?(:cache_epoch, true)
       items = collect_paginated(key) do |cursor|
         params = cursor ? { cursor: cursor } : {}
@@ -329,6 +330,7 @@ module MCPClient
         pages << result
         received_ats << monotonic_now if respond_to?(:monotonic_now, true)
         contexts << (respond_to?(:request_authorization_context, true) ? request_authorization_context : nil)
+        fingerprints << (respond_to?(:request_params_fingerprint, true) ? request_params_fingerprint : nil)
         case result
         when Hash
           [result[key] || [], result['nextCursor']]
@@ -340,9 +342,10 @@ module MCPClient
         end
       end
       # MCP 2026-07-28 caching: every page carries its own ttlMs; the list is
-      # fresh only as long as its shortest-lived page.
+      # fresh only as long as its shortest-lived page, and pages fetched
+      # under differing credentials or parameters are never served combined.
       if respond_to?(:record_list_cache_hint, true)
-        record_list_cache_hint(method, pages, received_ats, contexts: contexts, epoch: epoch)
+        record_list_cache_hint(method, pages, received_ats, contexts: contexts, params: fingerprints, epoch: epoch)
       end
       items
     end

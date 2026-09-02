@@ -120,7 +120,8 @@ module MCPClient
     # @param received_ats [Array<Float>, nil] each page's monotonic receipt time (defaults to now)
     # @param contexts [Array<String, nil>, nil] each page's request authorization context
     # @param epoch [Integer, nil] the cache epoch when the first page was requested
-    def record_paginated_cache_hint(kind, page_results, value = nil, received_ats: nil, contexts: nil, epoch: nil)
+    def record_paginated_cache_hint(kind, page_results, value = nil, received_ats: nil, contexts: nil, params: nil,
+                                    epoch: nil)
       now = monotonic_now
       entries = page_results.each_with_index.map do |result, index|
         # A bare array page (accepted for compatibility) carries no hint:
@@ -135,20 +136,39 @@ module MCPClient
       # A list invalidated while it was being fetched is already stale and
       # never replaces what is installed now (the invalidation's placeholder
       # or a newer fetch); a private list whose pages were fetched under
-      # different credentials belongs to no single context.
-      mixed = combined.cache_scope == 'private' && contexts && contexts.uniq.size > 1
+      # different credentials belongs to no single context, and a list whose
+      # pages were fetched under differing effective parameters (the host's
+      # request_meta changed between pages) matches no request's parameters,
+      # whatever its scope.
+      combined = mixed_pages_placeholder(combined, now, contexts: contexts, params: params)
       cache_entries_mutex.synchronize do
         if epoch && epoch != (@cache_epoch || 0)
           combined = MCPClient::CachedResult.stale(now: now, like: combined)
-        elsif mixed
-          combined = MCPClient::CachedResult.stale(now: now, like: combined)
-          combined.authorization_context = MCPClient::CachedResult::MIXED_CONTEXT
-          cache_entries[kind] = combined
         else
           cache_entries[kind] = combined
         end
       end
       remember_recorded_entry(kind, combined)
+    end
+
+    # The entry to record for a combined list: the list itself, or — when
+    # its pages were fetched under differing credentials (a private list)
+    # or differing effective parameters (any list) — a stale placeholder
+    # that no context or parameters match.
+    # @param combined [MCPClient::CachedResult]
+    # @param now [Float]
+    # @param contexts [Array, nil] the pages' authorization contexts
+    # @param params [Array, nil] the pages' params fingerprints
+    # @return [MCPClient::CachedResult]
+    def mixed_pages_placeholder(combined, now, contexts:, params:)
+      mixed = combined.cache_scope == 'private' && contexts && contexts.uniq.size > 1
+      mixed_params = params && params.uniq.size > 1
+      return combined unless mixed || mixed_params
+
+      placeholder = MCPClient::CachedResult.stale(now: now, like: combined)
+      placeholder.authorization_context = MCPClient::CachedResult::MIXED_CONTEXT if mixed
+      placeholder.params_fingerprint = MCPClient::CachedResult::MIXED_PARAMS if mixed_params
+      placeholder
     end
 
     # Stamp the entry this thread's fetch recorded with a fresh identity and
@@ -176,11 +196,12 @@ module MCPClient
     # @param received_ats [Array<Float>, nil] each page's monotonic receipt time
     # @param contexts [Array<String, nil>, nil] each page's request authorization context
     # @param epoch [Integer, nil] the cache epoch when the first page was requested
-    def record_list_cache_hint(method, page_results, received_ats = nil, contexts: nil, epoch: nil)
+    def record_list_cache_hint(method, page_results, received_ats = nil, contexts: nil, params: nil, epoch: nil)
       kind = LIST_METHOD_KINDS[method]
       return unless kind
 
-      record_paginated_cache_hint(kind, page_results, received_ats: received_ats, contexts: contexts, epoch: epoch)
+      record_paginated_cache_hint(kind, page_results, received_ats: received_ats, contexts: contexts, params: params,
+                                                      epoch: epoch)
     end
 
     # Whether the cached response for a kind may still be served. No entry
@@ -267,6 +288,7 @@ module MCPClient
     # @param context [String, nil, :current, :unknown]
     # @return [Boolean]
     def entry_for_current_params?(entry, context)
+      return false if entry.params_fingerprint.equal?(MCPClient::CachedResult::MIXED_PARAMS)
       return true unless entry.params_fingerprint && respond_to?(:current_params_fingerprint, true)
 
       expected = context == :current ? current_params_fingerprint : request_params_fingerprint
