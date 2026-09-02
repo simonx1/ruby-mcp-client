@@ -299,9 +299,13 @@ module MCPClient
       def anchor_names(schema, dialect)
         names = if dialect == DRAFT_07
                   # draft-07 Core Section 8.2.3: only an $id that is exactly a
-                  # fragment is a plain-name identifier.
+                  # fragment is a plain-name identifier. An $id is a URI
+                  # reference, so its fragment is percent-decoded (RFC 3986
+                  # Section 2.1) exactly as a $ref's is: `$id: "#foo%2Dbar"`
+                  # declares the name "foo-bar", which is what
+                  # `$ref: "#foo%2Dbar"` — decoded the same way — looks for.
                   id = schema['$id']
-                  [id.is_a?(String) && id.start_with?('#') ? id.delete_prefix('#') : nil]
+                  [id.is_a?(String) && id.start_with?('#') ? decoded_fragment(id) : nil]
                 else
                   %w[$anchor $dynamicAnchor].map { |k| schema[k] if keyword_known?(k, dialect) }
                 end

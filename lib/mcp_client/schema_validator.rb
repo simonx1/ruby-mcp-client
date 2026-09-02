@@ -6,6 +6,7 @@ require_relative 'schema_validator/normalization'
 require_relative 'schema_validator/references'
 require_relative 'schema_validator/keyword_scan'
 require_relative 'schema_validator/composition'
+require_relative 'schema_validator/evaluation'
 require_relative 'schema_validator/scalars'
 
 module MCPClient
@@ -60,6 +61,7 @@ module MCPClient
     extend References
     extend KeywordScan
     extend Composition
+    extend Evaluation
     extend Scalars
 
     # Raised inside a validation to abandon it (time budget, resource bound).
@@ -88,30 +90,32 @@ module MCPClient
     MAX_ERRORS = 100
     MAX_VALUE_INSPECT = 64
 
-    # How deeply the walk may descend into the instance. The walk is plain
-    # recursion, so this drives the interpreter's stack: the instance nests a
-    # level per array item or property, and a recursive `$ref` follows it
-    # down without bound (the hop budget restarts at every value, so that a
-    # recursive schema can describe deep data at all). Counting the descent
-    # lets the deepest instance abort with one error like any other
-    # exhausted budget.
+    # How deeply the walk may descend into the instance. The descent into a
+    # child value is the walk's only recursion, so this is what drives the
+    # interpreter's stack: the instance nests a level per array item or
+    # property, and a recursive `$ref` follows it down without bound (the hop
+    # budget restarts at every value, so that a recursive schema can describe
+    # deep data at all). Counting the descent lets the deepest instance abort
+    # with one error like any other exhausted budget.
     #
     # Only a step into a child value — an array item or a property value —
-    # counts. The frames a schema spends on one value (a `$ref` hop, an
-    # allOf/anyOf/oneOf/if branch) do not: a recursive schema composed
-    # through a few `$defs` mixins applies several of them per instance
-    # level, and counting those would make the budget a fraction of the
-    # instance depth it names, so data a peer can legitimately send — its
-    # nesting under `JSON.parse`'s default limit of 100 — would abort. Those
-    # frames stay bounded by MAX_REF_DEPTH and MAX_NODE_VISITS instead, which
-    # is what already stops a schema recursing on one value forever.
+    # counts, and only such a step costs a frame. The schemas a node applies
+    # to one value (a `$ref` hop, an allOf/anyOf/oneOf/not/if branch) neither
+    # count nor recurse: a recursive schema composed through a few `$defs`
+    # mixins applies several of them per instance level, and both counting
+    # and recursing on those would scale with the mixin count, so data a peer
+    # can legitimately send — its nesting under `JSON.parse`'s default limit
+    # of 100 — would abort. {.validate_node} applies them iteratively (see
+    # {Evaluation}), bounded by MAX_REF_DEPTH and MAX_NODE_VISITS, which is
+    # what already stops a schema recursing on one value forever.
     #
     # The bound therefore sits well above the deepest instance a peer can
     # send, and below the number of levels the smallest stack this library
-    # runs on (a transport's reader thread) carries for a plain recursive
-    # schema. It cannot on its own promise the stack holds, since it does not
-    # bound what one level costs; {.validate} catches SystemStackError for
-    # the schema that spends more per level than the stack has to give.
+    # runs on (a transport's reader thread) carries — a figure that no longer
+    # depends on how a schema is composed, since what one level costs is now
+    # fixed. {.validate} still catches SystemStackError, as a backstop for a
+    # stack smaller than any this has been measured on rather than for
+    # anything a schema can provoke.
     MAX_NODE_DEPTH = 256
 
     # JSON Schema keywords that affect validation but that this validator
@@ -612,21 +616,31 @@ module MCPClient
     rescue Aborted => e
       ["#{path}: validation aborted: #{e.message}"]
     rescue SystemStackError
-      # MAX_NODE_DEPTH bounds how deep the instance may nest, but not what
-      # one level costs: a schema is free to spend a `$ref` chain and a stack
-      # of composition branches on every value, and the stack this runs on
-      # may be a transport reader thread's. The walk is plain recursion with
-      # no state outside `ctx`, so the unwound stack leaves nothing behind —
+      # A backstop, not a working bound: the `$ref` chain and the composition
+      # branches a schema spends on one value are applied iteratively, so
+      # what one instance level costs is fixed and MAX_NODE_DEPTH bounds the
+      # stack. Should some stack still be smaller than that — the walk holds
+      # no state outside `ctx` — the unwound stack leaves nothing behind, and
       # the validation ends the way an exhausted budget does, as one error,
       # never as a crash out of a tool call.
       ["#{path}: validation aborted: schema too deeply recursive for this stack"]
     end
 
-    # Validate one value against one (sub)schema, under the bound on the walk
-    # itself: one more node visited. Applying another schema to the same
-    # value does not nest the instance, so it is the `$ref` hop budget and
-    # the visit cap that bound it; {.validate_child} accounts for the steps
-    # that do nest.
+    # Validate one value against one (sub)schema, and against every schema
+    # that one leads to for the same value: a `$ref` hop, an
+    # allOf/anyOf/oneOf/not/if branch, a then/else. Applying another schema
+    # to the same value does not nest the instance, so it is the `$ref` hop
+    # budget and the visit cap that bound it; {.validate_child} accounts for
+    # the steps that do nest.
+    #
+    # Those same-instance applications run on the `pending` list here rather
+    # than on the Ruby stack (see {Evaluation}): a schema composed through N
+    # `$defs` mixins applies N of them to every instance level, and spending
+    # a frame on each would make the stack grow with the product of the
+    # instance depth and the mixin count — so data a peer can legitimately
+    # send would overflow the small stack of a transport's reader thread. A
+    # frame is spent only on the step into a child value, which is what
+    # MAX_NODE_DEPTH bounds.
     # @param data [Object] the value
     # @param schema [Object] a subschema (Hash or boolean)
     # @param path [String] location for error messages
@@ -635,8 +649,25 @@ module MCPClient
     # @return [Array<String>] validation errors
     # @raise [Aborted] when a bound is hit
     def self.validate_node(data, schema, path, ctx, ref_depth)
-      count_visit(ctx)
-      validate_node_keywords(data, schema, path, ctx, ref_depth)
+      pending = []
+      step = start_node(data, schema, path, ctx, ref_depth)
+      loop do
+        if step[0] == :apply
+          pending << step
+          # A speculative application's errors are a verdict, not output, and
+          # do not count toward MAX_ERRORS while it runs.
+          ctx.speculative += 1 if step[3]
+          step = start_node(data, step[1], path, ctx, step[2])
+          next
+        end
+
+        errors = step[1]
+        return errors if pending.empty?
+
+        resumed = pending.pop
+        ctx.speculative -= 1 if resumed[3]
+        step = resumed[4].call(errors)
+      end
     end
 
     # Validate a child of the value being validated — an array item or a
@@ -658,44 +689,6 @@ module MCPClient
       ctx.depth -= 1
     end
 
-    # Apply one (sub)schema's keywords to one value, the walk's own bounds
-    # already accounted for by {.validate_node}.
-    # @return [Array<String>] validation errors
-    def self.validate_node_keywords(data, schema, path, ctx, ref_depth)
-      return [] if schema == true
-      return count_errors(ctx, ["#{path}: schema false accepts no value"]) if schema == false
-      return [] unless schema.is_a?(Hash)
-
-      # draft-07: "$ref" replaces the schema it appears in; later drafts
-      # apply it alongside the sibling keywords. The dialect is the one of
-      # the schema resource the node belongs to.
-      dialect = node_dialect(schema, ctx)
-      return validate_ref(data, schema, path, ctx, ref_depth) if schema.key?('$ref') && dialect == DRAFT_07
-
-      errors = []
-      counted_before = ctx.errors
-      errors.concat(validate_ref(data, schema, path, ctx, ref_depth)) if schema.key?('$ref')
-      errors.concat(validate_type(data, schema['type'], path)) if schema.key?('type')
-      errors.concat(validate_enum(data, schema, path))
-      case data
-      when Hash then errors.concat(validate_object(data, schema, path, ctx))
-      when Array then errors.concat(validate_array(data, schema, path, ctx, dialect))
-      when String then errors.concat(validate_string(data, schema, path, ctx.deadline))
-      when Numeric then errors.concat(validate_number(data, schema, path, dialect))
-      end
-      errors.concat(validate_composition(data, schema, path, ctx, ref_depth))
-      # A keyword the validator does not evaluate makes this node's verdict
-      # partial: a pass here is not a proof for not / oneOf / if. A node its
-      # supported assertions already rejected is decided whatever else it
-      # holds, and pays for no such measurement: the coverage checks match
-      # server-controlled patterns, which must not be able to abort a
-      # validation the branch has settled.
-      ctx.undecided += 1 if errors.empty? && partial_keywords?(schema, dialect, data, ctx.deadline)
-      # Errors raised by nested nodes were counted when they were produced;
-      # only this node's own errors are new.
-      count_errors(ctx, errors, already_counted: ctx.errors - counted_before)
-    end
-
     # The dialect in force at a schema object during validation: the one
     # recorded for its resource by the anchor index (built once per
     # validation), else the root's.
@@ -703,17 +696,6 @@ module MCPClient
     def self.node_dialect(schema, ctx)
       ctx.anchors ||= anchor_index(ctx.root, ctx.dialect)
       indexed_dialect(schema, ctx) || ctx.dialect
-    end
-
-    # Run a branch whose errors are only a verdict (anyOf/oneOf candidates,
-    # not, if): they never count toward MAX_ERRORS. Bounds that abort the
-    # whole validation still propagate.
-    # @return [Object] the block's value
-    def self.speculative(ctx)
-      ctx.speculative += 1
-      yield
-    ensure
-      ctx.speculative -= 1
     end
 
     # Account for one node visit (boolean schemas included, so a huge array
@@ -741,27 +723,6 @@ module MCPClient
     # @return [Boolean] whether the validation-wide deadline has passed
     def self.budget_exhausted?(deadline)
       deadline && Process.clock_gettime(Process::CLOCK_MONOTONIC) >= deadline
-    end
-
-    # Apply the local $ref of a schema object.
-    # @param schema [Hash] the schema object holding the `$ref`
-    # @return [Array<String>] validation errors
-    def self.validate_ref(data, schema, path, ctx, ref_depth)
-      ref = schema['$ref']
-      if !ref.is_a?(String) || external_ref?(ref)
-        return count_errors(ctx, ["#{path}: external $ref #{clip(ref.inspect)} is not dereferenced"])
-      end
-      if ref_depth >= MAX_REF_DEPTH
-        raise Aborted, "$ref chain exceeds #{MAX_REF_DEPTH} hops (cycle?) at #{clip(ref.inspect)}"
-      end
-
-      target = resolve_reference(ctx.root, ref, ctx.dialect, ctx, from: schema)
-      return count_errors(ctx, ["#{path}: unresolvable local $ref #{clip(ref.inspect)}"]) if target.equal?(UNRESOLVED)
-      unless schema_value?(target)
-        return count_errors(ctx, ["#{path}: $ref #{clip(ref.inspect)} does not point at a schema"])
-      end
-
-      validate_node(data, target, path, ctx, ref_depth + 1)
     end
 
     # Validate the JSON type of a value.

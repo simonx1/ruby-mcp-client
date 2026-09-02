@@ -7,6 +7,30 @@ metadata). Each feature lands in its own PR; this section accumulates them.
 
 ### JSON Schema handling
 
+- **Schemas applied to one value no longer consume the call stack, and a
+  draft-07 `$id` fragment is percent-decoded (round 27).** Round 26 stopped
+  *counting* the schemas a node applies to the same instance value against
+  the depth bound, but each of them still cost a Ruby stack frame: a
+  recursive schema composed through N `$defs` mixins applied N of them per
+  instance level, so the stack grew with the product of the instance depth
+  and the mixin count. Eight `allOf` mixins aborted a 90-level instance with
+  `validation aborted: schema too deeply recursive for this stack` on the
+  main thread, and four of them aborted a 99-level one on a `Thread` — the
+  stack a transport's reader actually runs on — so a conforming
+  `structuredContent` failed the validation the MCP tools spec says a client
+  SHOULD perform. The same-instance applications — a `$ref` hop, an `allOf`
+  / `anyOf` / `oneOf` / `not` / `if` branch, a `then` / `else` — are now
+  applied iteratively on an explicit stack, so a frame is spent only on a
+  step into a child value and `MAX_NODE_DEPTH` genuinely bounds the stack:
+  every mixin count reaches the full 256 levels the bound names, on a thread
+  as on the main stack, and an instance nested past it aborts as
+  `instance nested deeper than 256` rather than on the stack. The
+  `SystemStackError` rescue stays as a backstop. Separately, a draft-07 `$id`
+  is a URI reference, so the plain name it declares is now percent-decoded
+  (RFC 3986 Section 2.1) exactly as a `$ref`'s fragment already was:
+  `$id: "#foo%2Dbar"` declares the anchor `foo-bar`, and the matching
+  `$ref: "#foo%2Dbar"` resolves instead of being reported unresolvable.
+
 - **The instance-depth bound counts descents into the instance (round 26).**
   The depth budget the walk applies (round 25) counted every frame of the
   walk, `$ref` hops and `allOf` / `anyOf` / `oneOf` / `if` branches applied to
