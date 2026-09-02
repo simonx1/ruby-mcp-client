@@ -283,11 +283,22 @@ module MCPClient
         # @param host [String] a downcased hostname
         # @return [Boolean] whether it names a loopback, private or link-local address
         def local_address?(host)
-          host = host.to_s.delete_prefix('[').delete_suffix(']')
+          host = normalize_host(host)
           return true if host == 'localhost'
           return true if host.end_with?('.localhost', '.local', '.internal')
 
           local_ip?(host)
+        end
+
+        # A host is classified by the name a resolver would look up: the
+        # brackets of an IPv6 literal are punctuation, and a single trailing
+        # dot only marks the name as fully qualified. '169.254.169.254.',
+        # '127.0.0.1.' and 'localhost.' reach exactly what the undotted
+        # spellings reach, so they must classify the same way.
+        # @param host [String] a downcased hostname
+        # @return [String] the host with brackets and one trailing dot removed
+        def normalize_host(host)
+          host.to_s.delete_prefix('[').delete_suffix(']').delete_suffix('.')
         end
 
         # Classify a literal address semantically rather than by spelling: a

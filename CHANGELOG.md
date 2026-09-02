@@ -147,7 +147,16 @@ metadata). Each feature lands in its own PR; this section accumulates them.
   whose authorization server is refused no longer supplies the scopes of
   the next request, and authorization server metadata persisted before
   `authorization_response_iss_parameter_supported` was recorded is
-  rediscovered rather than read as "the server does not send `iss`".
+  rediscovered rather than read as "the server does not send `iss`". A
+  peer-advertised host is classified by the name a resolver would look up,
+  so a fully qualified spelling (`169.254.169.254.`, `127.0.0.1.`,
+  `localhost.`) is refused like the undotted one; and the browser callback
+  precheck (`validate_authorization_response!`) and
+  `authorization_error_message` read an unrecorded `iss` advertisement the
+  way the completion does — rediscovering the answer, and assuming the
+  advertisement when it cannot be had — so a legacy in-flight callback
+  never shows a success page (or the peer's error text) for a response the
+  token exchange then rejects.
 
 ### Tasks extension (`io.modelcontextprotocol/tasks`)
 

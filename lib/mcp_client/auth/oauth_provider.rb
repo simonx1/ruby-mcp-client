@@ -319,7 +319,7 @@ module MCPClient
                 'restart the authorization'
         end
         ensure_client_for_request!(stored_client_info, pkce)
-        validate_authorization_response_issuer!(iss, pkce.issuer, iss_parameter_supported_for?(pkce, cached))
+        validate_authorization_response_issuer!(iss, pkce.issuer, iss_advertised_for_response?(pkce, cached))
       end
 
       # The message to surface for an authorization *error* response, after
@@ -343,7 +343,7 @@ module MCPClient
         # Only the request's own authorization server can say whether iss is
         # expected: a cache that names another server is no guide.
         cached = nil unless pkce && cached && cached.issuer == pkce.issuer
-        validate_authorization_response_issuer!(params['iss'], pkce&.issuer, iss_parameter_supported_for?(pkce, cached))
+        validate_authorization_response_issuer!(params['iss'], pkce&.issuer, iss_advertised_for_response?(pkce, cached))
         safe_error_text((params['error_description'] || params['error'] || 'unknown error').to_s).strip
       end
 
@@ -406,6 +406,37 @@ module MCPClient
         return recorded == true unless recorded.nil?
 
         server_metadata&.iss_parameter_supported? == true
+      end
+
+      # The same question for a check made BEFORE the token exchange (the
+      # browser callback precheck and the error-response path), which reads
+      # cached metadata rather than freshly discovered metadata. Metadata
+      # persisted before this client read RFC 9207 records no answer, and
+      # reading that silence as "not supported" would show a success page (or
+      # the peer's error text) for a response {#complete_authorization_flow}
+      # then rejects. So when neither the PKCE record nor the cache carries an
+      # answer, the answer is rediscovered exactly as the completion does; an
+      # answer that cannot be obtained is unknown, not "no", and the
+      # advertisement is assumed (fail closed) so a missing `iss` is refused.
+      # @param pkce [PKCE, nil] the record of the authorization request
+      # @param cached [ServerMetadata, nil] cached metadata of the same issuer, if any
+      # @return [Boolean] whether the request's authorization server advertises iss
+      def iss_advertised_for_response?(pkce, cached)
+        recorded = pkce&.iss_parameter_supported
+        return recorded == true unless recorded.nil?
+        return cached.iss_parameter_supported? if cached&.iss_parameter_recorded?
+        # Without a recorded issuer nothing can be validated at all; the
+        # caller rejects the response, so no discovery is worth making.
+        return false unless pkce.respond_to?(:issuer) && pkce.issuer.is_a?(String)
+
+        rediscovered = begin
+          discover_authorization_server
+        rescue MCPClient::Errors::ConnectionError
+          nil
+        end
+        return true unless rediscovered&.issuer == pkce.issuer
+
+        rediscovered.iss_parameter_supported?
       end
 
       # Resolve the scope for authorization/registration requests using the
