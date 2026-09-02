@@ -68,9 +68,8 @@ module MCPClient
         return false unless data.is_a?(Array)
 
         case keyword
-        when 'contains' then effective_contains?(schema, value, data, dialect)
-        when 'minContains' then schema.key?('contains') && value.is_a?(Numeric) && value.positive?
-        when 'maxContains' then schema.key?('contains') && value.is_a?(Numeric) && data.length > value
+        when 'contains' then effective_contains?(schema, dialect)
+        when 'minContains', 'maxContains' then effective_contains_bound?(schema, keyword, value, data, dialect)
         when 'uniqueItems' then value == true && data.length > 1
         else
           # additionalItems (beside a tuple only) / unevaluatedItems: only
@@ -89,19 +88,63 @@ module MCPClient
 
       # Whether `contains` can still change the result: not when its
       # companion switches it off (minContains 0), and not when a
-      # tautological schema (true / {}) matches every item and the array
-      # already holds the items it requires (JSON Schema 2020-12 Validation
-      # Section 6.4.4: the default minContains is 1).
+      # tautological schema (true / {}) matches every item, since the count
+      # it asserts on is then the array's own length and
+      # {SchemaValidator.validate_contains} decides the keyword outright.
       # @return [Boolean]
-      def effective_contains?(schema, value, data, dialect)
-        min = 1
-        if keyword_known?('minContains', dialect) && schema['minContains'].is_a?(Numeric)
-          min = schema['minContains']
-          return false if min <= 0
-        end
-        return true unless [true, {}].include?(value)
+      def effective_contains?(schema, dialect)
+        !contains_everything?(schema, dialect) && contains_min(schema, dialect).positive?
+      end
 
-        data.length < min
+      # A `contains` bound asserts only beside a `contains` this validator
+      # leaves unevaluated: a lower bound that requires a match, an upper
+      # bound the instance can exceed.
+      # @return [Boolean]
+      def effective_contains_bound?(schema, keyword, value, data, dialect)
+        return false unless schema.key?('contains') && value.is_a?(Numeric) &&
+                            !contains_everything?(schema, dialect)
+
+        keyword == 'minContains' ? value.positive? : data.length > value
+      end
+
+      # The number of matching items `contains` requires: its companion
+      # where the dialect defines one and gives it a number, else the
+      # default of 1 (JSON Schema 2020-12 Validation Section 6.4.4).
+      # @return [Numeric]
+      def contains_min(schema, dialect)
+        min = schema['minContains'] if keyword_known?('minContains', dialect)
+        min.is_a?(Numeric) ? min : 1
+      end
+
+      # @return [Numeric, nil] the number of matching items `contains`
+      #   allows, when the dialect defines the companion and it is a number
+      def contains_max(schema, dialect)
+        max = schema['maxContains'] if keyword_known?('maxContains', dialect)
+        max if max.is_a?(Numeric)
+      end
+
+      # Apply a `contains` whose schema matches every item (`true` / `{}`):
+      # the number of matching items is then the array's own length, so the
+      # keyword and its companions are assertions this validator decides
+      # rather than ones that only leave a branch undecided (JSON Schema
+      # 2020-12 Validation Section 6.4.4: the default minContains is 1, so a
+      # tautological contains rejects the empty array). A contains whose
+      # schema has to be matched item by item stays unevaluated.
+      # @param data [Array] the instance
+      # @param schema [Hash] string-keyed schema
+      # @param path [String] location for error messages
+      # @param dialect [String, nil] the dialect in force
+      # @return [Array<String>] validation errors
+      def validate_contains(data, schema, path, dialect)
+        return [] unless contains_everything?(schema, dialect)
+
+        errors = []
+        min = contains_min(schema, dialect)
+        max = contains_max(schema, dialect)
+        count = data.length
+        errors << "#{path}: expected at least #{min} items matching contains, got #{count}" if count < min
+        errors << "#{path}: expected at most #{max} items matching contains, got #{count}" if max && count > max
+        errors
       end
 
       # How many leading items the tuple keywords in force evaluate, or
@@ -135,7 +178,7 @@ module MCPClient
           # An instance may carry either key form, so a trigger is present
           # when either form is (like `required` and `properties`).
           value.is_a?(Hash) &&
-            value.any? { |trigger, dep| property_present?(data, trigger) && dependency_can_fail?(dep) }
+            value.any? { |trigger, dep| property_present?(data, trigger) && dependency_can_fail?(dep, data) }
         end
       end
 
@@ -160,11 +203,15 @@ module MCPClient
         end
       end
 
-      # A dependency whose value cannot fail (an empty required list, a
+      # A dependency whose value cannot fail (a required list every name of
+      # which the instance already carries — an empty list included — or a
       # schema of true / {}) decides nothing for a present trigger.
+      # @param data [Hash] the instance
       # @return [Boolean]
-      def dependency_can_fail?(dep)
-        dep.is_a?(Array) ? !dep.empty? : ![true, {}].include?(dep)
+      def dependency_can_fail?(dep, data)
+        return dep.any? { |name| !property_present?(data, name) } if dep.is_a?(Array)
+
+        ![true, {}].include?(dep)
       end
 
       # Whether the instance has a property the schema's own property

@@ -87,7 +87,10 @@ module MCPClient
 
         node = resource
         mode = :schema
-        fragment[1..].split('/', -1).each do |token|
+        # RFC 6901 Section 5: the pointer "/" is the member named "", so the
+        # leading separator is dropped rather than split off ("" splits to no
+        # tokens at all, which would read "#/" as the whole document).
+        fragment.split('/', -1).drop(1).each do |token|
           # RFC 6901 Section 3: "~" is only ever followed by "0" or "1".
           return UNRESOLVED if token.match?(/~(?![01])/)
 
@@ -388,7 +391,7 @@ module MCPClient
         fragment = decoded_fragment(ref)
         return nil unless fragment&.start_with?('/')
 
-        fragment[1..].split('/', -1).map { |token| token.gsub('~1', '/').gsub('~0', '~') }
+        fragment.split('/', -1).drop(1).map { |token| token.gsub('~1', '/').gsub('~0', '~') }
       end
 
       # @return [Object] the member a pointer token selects, or UNRESOLVED

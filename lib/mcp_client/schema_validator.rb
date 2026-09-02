@@ -838,7 +838,7 @@ module MCPClient
 
         errors.concat(validate_node(item, item_schema, "#{path}/#{idx}", ctx, ref_depth))
       end
-      errors
+      errors.concat(validate_contains(data, schema, path, dialect))
     end
 
     # Validate a string against minLength/maxLength/pattern.
