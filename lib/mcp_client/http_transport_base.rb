@@ -488,6 +488,10 @@ module MCPClient
     # @raise [MCPClient::Errors::TransportError] if response isn't valid JSON
     # @raise [MCPClient::Errors::ToolCallError] for other errors during request execution
     def send_jsonrpc_request(request, timeout: nil, extra_headers: {})
+      # As late as a request pinned to a session can be held back: every
+      # reconnect on the way here (ensure_connected, a retry after the
+      # connection dropped) has happened by now.
+      check_session_pin!
       @logger.debug("Sending JSON-RPC request: #{describe_jsonrpc_message(request)}")
 
       begin

@@ -122,6 +122,10 @@ module MCPClient
       # @raise [MCPClient::Errors::TransportError] if response isn't valid JSON
       # @raise [MCPClient::Errors::ToolCallError] for other errors during request execution
       def send_jsonrpc_request(request, timeout: nil)
+        # As late as a request pinned to a session can be held back: every
+        # reconnect on the way here (ensure_initialized, a retry after the
+        # stream dropped) has happened by now.
+        check_session_pin!
         @logger.debug("Sending JSON-RPC request: #{describe_jsonrpc_message(request)}")
         record_activity
         # Register the id BEFORE posting: the SSE stream may deliver the

@@ -11,6 +11,7 @@ require_relative 'result_caching'
 require_relative 'request_metadata'
 require_relative 'round_trip_marker'
 require_relative 'result_completeness'
+require_relative 'session_pin'
 
 module MCPClient
   # Shared retry/backoff logic for JSON-RPC transports
@@ -22,6 +23,8 @@ module MCPClient
     # The `_meta` a request carries, the fingerprint a cached result is bound
     # to, and the evaluation a cache decision holds for the request it leads to.
     include RequestMetadata
+    # Requests may be pinned to the session they belong to (see SessionPin).
+    include SessionPin
 
     # JSON-RPC methods with arbitrary side effects that MUST NOT be re-sent
     # automatically. Even a "transient" failure (5xx, dropped connection,

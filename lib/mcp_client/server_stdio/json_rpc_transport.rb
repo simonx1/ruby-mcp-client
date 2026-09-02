@@ -748,6 +748,10 @@ module MCPClient
       # @yieldparam version [String, nil] the protocol version the request declares
       # @return [Object] result from the JSON-RPC response
       def send_request_and_wait(method, params, timeout)
+        # As late as a request pinned to a session can be held back: every
+        # reconnect on the way here (ensure_initialized, a retry after the
+        # child exited) has happened by now.
+        check_session_pin!
         req_id = next_id
         req = build_registered_request(method, params, req_id)
         clear_response_received_at if respond_to?(:clear_response_received_at, true)

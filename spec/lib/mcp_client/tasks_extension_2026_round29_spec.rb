@@ -92,6 +92,7 @@ RSpec.describe 'MCP 2026-07-28 tasks extension — round 29' do
     it 'still sends the update when the session did not move' do
       client = client_for(stdio)
       epoch = client.send(:current_session_epoch, stdio)
+      allow(stdio).to receive(:ensure_session_ready)
       allow(stdio).to receive(:rpc_request).and_return({})
 
       client.send(:send_task_update, stdio, 't', { 'k1' => { 'action' => 'accept' } }, epoch: epoch)

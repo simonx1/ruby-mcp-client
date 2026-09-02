@@ -105,11 +105,10 @@ module MCPClient
         # still bounds a wait whose polls never come back, and its
         # pollIntervalMs paces them — but only when the handle came from
         # the server being polled: task ids and state are per server, so a
-        # handle from another server says nothing about this one's task.
-        if task.is_a?(MCPClient::Task) && task.server.equal?(srv)
-          seed_ttl_deadline(task, wait)
-          wait[:last] = task
-        end
+        # handle from another server says nothing about this one's task —
+        # and neither does a handle from a session of this server that has
+        # ended, whose task id the new session may have reused.
+        seed_wait_from_handle(task, srv, wait)
         loop do
           # The server may have restarted since the last poll: the task id
           # and its keys then belong to a new session, and so must the
@@ -119,8 +118,13 @@ module MCPClient
           refresh_wait_session(wait)
           current = observe_task(wait)
           # A poll that timed out is no observation: try again at the pace
-          # the server last asked for, unless the wait is over.
+          # the server last asked for, unless the wait is over. The poll may
+          # have timed out because the session ended under it, so the wait
+          # joins the live session first: the ended one's pace (a
+          # pollIntervalMs of up to an hour) must not delay the first poll of
+          # the task that replaced this one.
           unless current
+            refresh_wait_session(wait)
             raise_if_past_deadline!(wait)
             next sleep(wait[:last] ? task_poll_delay(wait[:last], wait_deadline(wait)) : default_poll_delay(wait))
           end
@@ -134,10 +138,16 @@ module MCPClient
             return current
           end
 
-          # The poll itself may have spanned a restart: the wait joins the
-          # new session (dropping the previous one's backstop) before this
-          # observation records the backstop it carries.
-          refresh_wait_session(wait)
+          # The poll itself may have spanned a restart: what came back then
+          # describes the task of a session that has ended. Nothing of it
+          # holds for the session the wait now joins — its TTL backstop and
+          # its pace are another task's, and its inputRequests must not be
+          # presented to the host, let alone answered in the new session
+          # where the same task id may name something else. Poll again.
+          if refresh_wait_session(wait)
+            raise_if_past_deadline!(wait)
+            next sleep(default_poll_delay(wait))
+          end
           wait[:last] = current
           # The TTL backstop comes before any handler runs for the task, and
           # from now on bounds every poll, even ones that time out. A poll
@@ -233,16 +243,19 @@ module MCPClient
       # replacement session has been polled, and its last observation must
       # not pace the polls of a task it knows nothing about.
       # @param wait [Hash]
-      # @return [void]
+      # @return [Boolean] whether the wait moved to another session, so that
+      #   nothing the previous one said (an observation in hand, its TTL, its
+      #   pace) may be acted on
       def refresh_wait_session(wait)
         # The epoch and the state keyed under it are read in one step, so
         # a restart between the two cannot leave the wait pointing at one
         # session's set while recording another's epoch.
         answered_keys_mutex.synchronize do
           epoch = current_session_epoch(wait[:srv])
-          next if wait[:epoch] == epoch && wait[:answered]
+          next false if wait[:epoch] == epoch && wait[:answered]
 
-          unless wait[:epoch].nil? || wait[:epoch] == epoch
+          moved = !wait[:epoch].nil? && wait[:epoch] != epoch
+          if moved
             wait[:ttl_deadline] = nil
             wait[:last] = nil
           end
@@ -250,7 +263,29 @@ module MCPClient
           state = task_state_locked(wait[:srv], wait[:task_id], epoch)
           wait[:state] = state
           wait[:answered] = state[:answered]
+          moved
         end
+      end
+
+      # Take the seed's hints (its TTL backstop and its pace) from a handle
+      # that describes the task this wait is about: the same server, and the
+      # session the wait has joined.
+      # @return [void]
+      def seed_wait_from_handle(task, srv, wait)
+        return unless task.is_a?(MCPClient::Task) && task.server.equal?(srv) && seed_of_session?(task, wait)
+
+        seed_ttl_deadline(task, wait)
+        wait[:last] = task
+      end
+
+      # Whether a task handle may seed the wait: it must come from the
+      # session the wait has joined (a handle a host kept across a restart
+      # describes a task the new session knows nothing about, even when the
+      # id was reused). A server that reports no session (a bare double) is
+      # taken at its word, as before.
+      # @return [Boolean]
+      def seed_of_session?(task, wait)
+        task.session_epoch.nil? || task.session_epoch == wait[:epoch]
       end
 
       # Per-task bookkeeping shared by every wait on the task: the answered
@@ -358,9 +393,13 @@ module MCPClient
       # bookkeeping so no forget lets a retry present them again meanwhile.
       # A read allocates nothing; the reservation that holds keys asks for
       # the set to be created and receives its registry key with it.
+      # @param key [Array, nil] the registry key to use; without one the
+      #   current session's is resolved (a caller working on the state a wait
+      #   captured passes that state's key, so a restart cannot move its
+      #   reservation to the replacement session)
       # @return [Set<String>, Array(Set<String>, Array)] (callers hold answered_keys_mutex)
-      def in_flight_task_keys(srv, task_id, create: false)
-        key = task_state_key(srv, task_id)
+      def in_flight_task_keys(srv, task_id, create: false, key: nil)
+        key ||= task_state_key(srv, task_id)
         return [(@in_flight_keys ||= {})[key] ||= Set.new, key] if create
 
         @in_flight_keys&.fetch(key, nil) || NO_KEYS
@@ -381,10 +420,28 @@ module MCPClient
       # is a per-attempt transport timeout only; the wall-clock bound of a
       # wait comes from {#bounded_by_wait} around the whole call.
       # @return [Object] the JSON-RPC result
-      def task_rpc(srv, method, params, timeout: nil)
-        return srv.rpc_request(method, params) if timeout.nil? || !accepts_timeout?(srv)
+      def task_rpc(srv, method, params, timeout: nil, epoch: nil)
+        pinned_to_session(srv, epoch) do
+          if timeout.nil? || !accepts_timeout?(srv)
+            srv.rpc_request(method, params)
+          else
+            srv.rpc_request(method, params, timeout: timeout)
+          end
+        end
+      end
 
-        srv.rpc_request(method, params, timeout: timeout)
+      # Run the request with the transport refusing to write it once the
+      # session it belongs to has ended: the built-in transports establish
+      # (and so may re-establish) their session inside rpc_request itself, so
+      # a guard that compares before the call cannot cover the request that
+      # actually goes out. A transport that knows no session pin sends as
+      # before.
+      # @param epoch [Integer, nil] the session the request belongs to
+      # @return [Object] the block's value
+      def pinned_to_session(srv, epoch, &block)
+        return block.call if epoch.nil? || !srv.respond_to?(:pinned_to_session)
+
+        srv.pinned_to_session(epoch, &block)
       end
 
       # @return [Boolean] whether the transport's rpc_request takes timeout:
@@ -716,7 +773,11 @@ module MCPClient
         # answer them nor spend the budget twice on one snapshot; a handler
         # that fails gives the keys back, except those answered through
         # #update_task in the meantime.
-        state = task_state(srv, task.task_id)
+        # The bookkeeping of the session the wait joined, not of whatever a
+        # restart has recorded since: the answered set the caller reserves
+        # in belongs to that session, and a round charged to the replacement
+        # session would block a task this observation says nothing about.
+        state = wait[:state] || task_state(srv, task.task_id)
         # The keys a handler presents are in flight from the moment it
         # starts, in the set of the session it starts in — fixed here,
         # before anything runs — so no forget of the task's bookkeeping lets
@@ -751,7 +812,7 @@ module MCPClient
         # A session that restarted while the host was answering may have
         # reused the task id and the keys: the answers belong to the ended
         # session and are not delivered; the next poll asks again.
-        if wait[:epoch] && current_session_epoch(srv) != wait[:epoch]
+        if wait[:epoch] && answered_keys_mutex.synchronize { current_session_epoch(srv) } != wait[:epoch]
           logger.warn("Task #{shown_task_id(task.task_id)}: the server session restarted while its input was " \
                       'being answered; the answers are discarded')
           return []
@@ -822,7 +883,7 @@ module MCPClient
       # @raise [MCPClient::Errors::InputRequiredError] past MAX_TASK_INPUT_ROUNDS
       def reserve_input_requests(task, requests, answered, srv, state)
         answered_keys_mutex.synchronize do
-          keys = requests.except(*answered, *in_flight_task_keys(srv, task.task_id).to_a)
+          keys = requests.except(*answered, *in_flight_task_keys(srv, task.task_id, key: state[:key]).to_a)
           return [keys, nil, nil] if keys.empty?
 
           if state[:rounds] >= MAX_TASK_INPUT_ROUNDS
@@ -832,7 +893,7 @@ module MCPClient
             )
           end
 
-          held, held_key = in_flight_task_keys(srv, task.task_id, create: true)
+          held, held_key = in_flight_task_keys(srv, task.task_id, create: true, key: state[:key])
           held.merge(keys.keys)
           state[:rounds] += 1
           answered.merge(keys.keys)

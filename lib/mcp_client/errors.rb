@@ -40,6 +40,13 @@ module MCPClient
     # Raised when there's a connection error with an MCP server
     class ConnectionError < MCPError; end
 
+    # Raised when a request pinned to a server session (see
+    # {MCPClient::JsonRpcCommon#pinned_to_session}) reaches the wire after that
+    # session ended: nothing was written, so the caller may drop the payload.
+    # A subclass of ConnectionError so existing rescues treat it as the
+    # connection failure it is.
+    class SessionChangedError < ConnectionError; end
+
     # Raised when a request requires a server capability that was not
     # negotiated during initialization (MCP lifecycle: "Only use capabilities
     # that were successfully negotiated")
