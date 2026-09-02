@@ -78,9 +78,13 @@ module MCPClient
 
           visited += 1
           if resource_start?(schema)
+            # A resource is a schema wherever it sits: one reached through
+            # a bag the dialect does not walk names its own anchors, though
+            # nothing outside it can see them.
             resource = schema
             dialect = embedded_dialect(schema, dialect) || dialect
             index[:dialects][resource] = dialect
+            named = true
           end
           index[:resources][schema] = resource
           if named && !(dialect == DRAFT_07 && schema.key?('$ref'))

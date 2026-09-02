@@ -92,7 +92,11 @@ metadata). Each feature lands in its own PR; this section accumulates them.
   is); an `$anchor` / `$dynamicAnchor` (or draft-07 fragment `$id`)
   declared more than once within one schema resource makes the schema
   unusable instead of binding references to whichever declaration was met
-  first.
+  first. A resource (`$id` URI) reached through a definition bag the
+  dialect does not walk names its own anchors (nothing outside it sees
+  them); the structural bound counts object entries too, so a wide map of
+  leaf values is rejected before it is copied, and the copy runs under the
+  validation deadline.
 
 ### Authorization (RFC 9207 issuer validation, client registration)
 
