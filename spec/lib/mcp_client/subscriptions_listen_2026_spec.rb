@@ -24,6 +24,25 @@ RSpec.describe 'MCP 2026-07-28 subscriptions/listen' do
     "#{JSON.generate(message)}\n"
   end
 
+  # Listener callbacks run on the subscription's own dispatcher thread, off
+  # the transport's reader.
+  def wait_for(timeout = 2)
+    deadline = Time.now + timeout
+    sleep 0.002 until yield || Time.now > deadline
+    raise 'condition not met in time' unless yield
+  end
+
+  # Acknowledge each listen as it goes out, the way the reader thread does on
+  # a live session: subscribe_resource waits for that answer.
+  def acknowledge_on_listen(server)
+    allow(server).to receive(:open_subscription).and_wrap_original do |original, subscription|
+      original.call(subscription)
+      server.handle_line(line('jsonrpc' => '2.0', 'method' => 'notifications/subscriptions/acknowledged',
+                              'params' => { '_meta' => { SUB_ID_META => subscription.id },
+                                            'notifications' => subscription.requested }))
+    end
+  end
+
   describe 'on stdio' do
     let(:server) { MCPClient::ServerStdio.new(command: 'echo test', read_timeout: 1) }
     let(:written) { [] }
@@ -86,6 +105,7 @@ RSpec.describe 'MCP 2026-07-28 subscriptions/listen' do
                               'params' => { '_meta' => { SUB_ID_META => sub_a.id } }))
       server.handle_line(line('jsonrpc' => '2.0', 'method' => 'notifications/resources/list_changed',
                               'params' => { '_meta' => { SUB_ID_META => sub_b.id } }))
+      wait_for { received_a.any? && received_b.any? }
 
       expect(received_a.map(&:first)).to eq(['notifications/tools/list_changed'])
       expect(received_b.map(&:first)).to eq(['notifications/resources/list_changed'])
@@ -155,6 +175,7 @@ RSpec.describe 'MCP 2026-07-28 subscriptions/listen' do
     end
 
     it 'maps subscribe_resource/unsubscribe_resource onto a listen stream per URI' do
+      acknowledge_on_listen(server)
       server.subscribe_resource('file:///a')
 
       request = written.find { |m| m['method'] == 'subscriptions/listen' }
@@ -279,6 +300,7 @@ RSpec.describe 'MCP 2026-07-28 subscriptions/listen' do
 
       subscription = server.listen(notifications: { tools_list_changed: true }) { |m, _p| received << m }
       wait_until { subscription.state == :closed }
+      wait_until { received.any? }
 
       listen = requests.find { |r| r[:body]['method'] == 'subscriptions/listen' }
       expect(listen[:headers]['Mcp-Method']).to eq('subscriptions/listen')
@@ -402,6 +424,17 @@ RSpec.describe 'MCP 2026-07-28 subscriptions/listen — review follow-ups' do
       'capabilities' => { 'resources' => { 'subscribe' => true } } }
   end
 
+  # Acknowledge each listen as it goes out: subscribe_resource waits for it.
+  def acknowledge_on_listen(server)
+    allow(server).to receive(:open_subscription).and_wrap_original do |original, subscription|
+      original.call(subscription)
+      ack = { 'jsonrpc' => '2.0', 'method' => 'notifications/subscriptions/acknowledged',
+              'params' => { '_meta' => { SUB_ID_META => subscription.id },
+                            'notifications' => subscription.requested } }
+      server.handle_line("#{JSON.generate(ack)}\n")
+    end
+  end
+
   describe 'on Streamable HTTP' do
     let(:url) { 'https://example.com/mcp' }
 
@@ -498,6 +531,7 @@ RSpec.describe 'MCP 2026-07-28 subscriptions/listen — review follow-ups' do
     end
 
     it 'opens a fresh per-URI subscription after the server closed the previous one' do
+      acknowledge_on_listen(server)
       server.subscribe_resource('file:///a')
       first = written.find { |m| m['method'] == 'subscriptions/listen' }
       server.handle_line("#{JSON.generate('jsonrpc' => '2.0', 'id' => first['id'],

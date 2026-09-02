@@ -836,8 +836,7 @@ module MCPClient
 
       # Past this point the reader threads speak for a transport that is
       # being dismantled on purpose: their EOF must not retire whatever
-      # replaces it. Bumped under the transport lock, so a request that was
-      # judged current is written before this, or not at all.
+      # replaces it.
       #
       # The reader thread will see EOF once stdin closes; that is a shutdown,
       # not an unexpected exit.
@@ -845,14 +844,18 @@ module MCPClient
       #
       # Subscriptions do not survive the process: keep the ones the host still
       # wants so they are re-sent once the process is re-established
-      # (basic/patterns/subscriptions "Graceful Closure"). Marked before the
-      # transport is retired, and never under the transport lock: a re-send
-      # takes the subscriptions mutex first and the transport lock second.
-      subscriptions_mutex.synchronize do
-        subscriptions.each_value(&:mark_reconnecting)
-        (@reconnecting_subscriptions ||= []).concat(subscriptions.values.select(&:reconnectable?))
+      # (basic/patterns/subscriptions "Graceful Closure"). They are moved to
+      # the pending list outside the registry lock, since a subscription being
+      # opened holds its own lock while taking that one.
+      open_subscriptions = subscriptions_mutex.synchronize do
+        live = subscriptions.values
         subscriptions.clear
+        live
       end
+      open_subscriptions.each(&:mark_reconnecting)
+      (@reconnecting_subscriptions ||= []).concat(open_subscriptions.select(&:reconnectable?))
+      # Bumped under the transport lock, so a request that was judged current
+      # is written before this, or not at all.
       @transport_lock.synchronize do
         @transport_generation += 1
         @stdin.close unless @stdin.closed?
@@ -924,13 +927,23 @@ module MCPClient
     # @param subscription [MCPClient::Subscription]
     # @return [void]
     def cancel_subscription(subscription)
-      unregister_subscription(subscription)
+      # Closed first: a re-open in flight holds the subscription's lock until
+      # it has taken its new id, so the id unregistered and cancelled below is
+      # the one the server was actually sent.
       subscription.finish(by_client: true)
+      unregister_subscription(subscription)
       subscriptions_mutex.synchronize { resource_subscriptions.delete_if { |_uri, sub| sub.equal?(subscription) } }
-      return unless @stdin
+      send_subscription_cancellation(subscription.id)
+    end
+
+    # Tell the server the client closed a subscriptions/listen request.
+    # @param id [Integer, String, nil] the listen request id
+    # @return [void]
+    def send_subscription_cancellation(id)
+      return unless @stdin && id
 
       notif = build_jsonrpc_notification('notifications/cancelled',
-                                         { 'requestId' => subscription.id, 'reason' => 'Client closed subscription' })
+                                         { 'requestId' => id, 'reason' => 'Client closed subscription' })
       @stdin.puts(notif.to_json)
     rescue StandardError => e
       @logger.debug("Failed to send subscription cancellation: #{e.message}")

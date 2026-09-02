@@ -75,6 +75,10 @@ RSpec.describe 'MCP 2026-07-28 resource subscriptions on the HTTP transports' do
       listen = wait_for_listen(sent)
       expect(listen['params']['notifications']).to eq({ 'resourceSubscriptions' => ['file:///a'] })
       expect(sent.map { |m| m['method'] }).not_to include('resources/subscribe')
+      # The era, not the configuration: this transport is in :auto mode and
+      # took the modern branch because the server negotiated 2026-07-28.
+      expect(modern_server.protocol_mode).to eq(:auto)
+      expect(modern_server).to be_modern
     end
 
     it 'closes that stream instead of sending resources/unsubscribe' do
@@ -82,11 +86,18 @@ RSpec.describe 'MCP 2026-07-28 resource subscriptions on the HTTP transports' do
       stub_modern(sent)
       modern_server.subscribe_resource('file:///a')
       wait_for_listen(sent)
+      subscription = modern_server.resource_subscriptions['file:///a']
 
       expect(modern_server.unsubscribe_resource('file:///a')).to be(true)
 
       expect(sent.map { |m| m['method'] }).not_to include('resources/unsubscribe')
       expect(modern_server.resource_subscriptions).to be_empty
+      # Dropping the registry entry is not enough: the stream itself has to
+      # be closed, which is what cancels the subscription server-side.
+      expect(subscription).to be_closed_by_client
+      expect(modern_server.send(:listen_threads)).to be_empty
+      sleep 0.2
+      expect(sent.count { |m| m['method'] == 'subscriptions/listen' }).to eq(1)
     end
 
     it 'still sends resources/subscribe and resources/unsubscribe to a 2025-11-25 server' do
@@ -99,6 +110,22 @@ RSpec.describe 'MCP 2026-07-28 resource subscriptions on the HTTP transports' do
       expect(sent.map { |m| m['method'] }).to include('resources/subscribe', 'resources/unsubscribe')
       expect(sent.map { |m| m['method'] }).not_to include('subscriptions/listen')
     end
+
+    it 'keeps resources/subscribe on an auto-mode transport negotiated down to 2025-11-25' do
+      sent = []
+      stub_legacy(sent)
+
+      expect(negotiated_legacy_server.subscribe_resource('file:///a')).to be(true)
+      negotiated_legacy_server.unsubscribe_resource('file:///a')
+
+      # Nothing about this transport is configured legacy: it probed, the
+      # server answered as a 2025-11-25 one, and the era decided the mapping.
+      expect(negotiated_legacy_server.protocol_mode).to eq(:auto)
+      expect(negotiated_legacy_server.protocol_version).to eq('2025-11-25')
+      expect(negotiated_legacy_server).not_to be_modern
+      expect(sent.map { |m| m['method'] }).to include('resources/subscribe', 'resources/unsubscribe')
+      expect(sent.map { |m| m['method'] }).not_to include('subscriptions/listen')
+    end
   end
 
   describe MCPClient::ServerHTTP do
@@ -106,10 +133,15 @@ RSpec.describe 'MCP 2026-07-28 resource subscriptions on the HTTP transports' do
     let(:legacy_server) do
       described_class.new(base_url: 'https://example.com', endpoint: '/mcp', retries: 0, protocol: :legacy)
     end
+    # Same configuration as the modern one: only the server's answer differs.
+    let(:negotiated_legacy_server) do
+      described_class.new(base_url: 'https://example.com', endpoint: '/mcp', retries: 0)
+    end
 
     after do
       modern_server.cleanup
       legacy_server.cleanup
+      negotiated_legacy_server.cleanup
     end
 
     it_behaves_like 'a transport that maps resource subscriptions onto listen'
@@ -123,10 +155,15 @@ RSpec.describe 'MCP 2026-07-28 resource subscriptions on the HTTP transports' do
       described_class.new(base_url: 'https://example.com', endpoint: '/mcp', retries: 0, read_timeout: 2,
                           protocol: :legacy)
     end
+    # Same configuration as the modern one: only the server's answer differs.
+    let(:negotiated_legacy_server) do
+      described_class.new(base_url: 'https://example.com', endpoint: '/mcp', retries: 0, read_timeout: 2)
+    end
 
     after do
       modern_server.cleanup
       legacy_server.cleanup
+      negotiated_legacy_server.cleanup
     end
 
     it_behaves_like 'a transport that maps resource subscriptions onto listen'
