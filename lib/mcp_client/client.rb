@@ -3,11 +3,14 @@
 require 'logger'
 require 'securerandom'
 require_relative 'deep_copy'
+require_relative 'client/list_aggregation'
 
 module MCPClient
   # MCP Client for integrating with the Model Context Protocol
   # This is the main entry point for using MCP tools
   class Client
+    include ListAggregation
+
     # Elicitation modes implemented by this client (MCP 2025-11-25).
     # Requests with a mode outside this set are rejected with -32602.
     SUPPORTED_ELICITATION_MODES = %w[form url].freeze
@@ -155,35 +158,14 @@ module MCPClient
     # @raise [MCPClient::Errors::ConnectionError] on authorization failures
     # @raise [MCPClient::Errors::PromptGetError] if no prompts could be retrieved from any server
     def list_prompts(cache: true)
-      if cache && (snapshot = cached_snapshot(:prompts, @prompt_cache))
-        release_held_request_meta
-        return snapshot
-      end
-
-      prompts = []
-      connection_errors = []
-
-      servers.each do |server|
-        fingerprint = params_fingerprint_for(server)
-        server_prompts = server.list_prompts
-        replace_cached_slice(:prompts, @prompt_cache, server, fingerprint) do
-          server_prompts.each do |prompt|
-            @prompt_cache[cache_key_for(server, prompt.name)] = MCPClient::DeepCopy.copy(prompt)
-            prompts << prompt
-          end
+      holding_request_meta('prompts/list') do
+        if cache && (snapshot = cached_snapshot(:prompts, @prompt_cache))
+          release_held_request_meta
+          return snapshot
         end
-      rescue MCPClient::Errors::ConnectionError => e
-        # Fast-fail on authorization errors for better user experience
-        # If this is the first server or we haven't collected any prompts yet,
-        # raise the auth error directly to avoid cascading error messages
-        raise e if e.message.include?('Authorization failed') && prompts.empty?
 
-        # Store the error and try other servers
-        connection_errors << e
-        @logger.error("Server error: #{e.message}")
+        collect_prompts_from_servers(cache)
       end
-
-      prompts
     end
 
     # Gets a specific prompt by name with the given parameters
@@ -241,48 +223,24 @@ module MCPClient
     # @raise [MCPClient::Errors::ConnectionError] on authorization failures
     # @raise [MCPClient::Errors::ResourceReadError] if no resources could be retrieved from any server
     def list_resources(cache: true, cursor: nil)
-      # If cursor is provided, we can only query one server (the one that provided the cursor)
-      # This is a limitation of aggregating multiple servers
-      if cursor
-        # For now, just use the first server when cursor is provided
-        # In a real implementation, you'd need to track which server the cursor came from
-        return servers.first.list_resources(cursor: cursor) if servers.any?
+      holding_request_meta('resources/list') do
+        # If cursor is provided, we can only query one server (the one that provided the cursor)
+        # This is a limitation of aggregating multiple servers
+        if cursor
+          # For now, just use the first server when cursor is provided
+          return servers.first.list_resources(cursor: cursor) if servers.any?
 
-        return { 'resources' => [], 'nextCursor' => nil }
-      end
-
-      # Use cache if available and no cursor
-      if cache && (snapshot = cached_snapshot(:resources, @resource_cache))
-        release_held_request_meta
-        return { 'resources' => snapshot, 'nextCursor' => nil }
-      end
-
-      resources = []
-      connection_errors = []
-
-      servers.each do |server|
-        fingerprint = params_fingerprint_for(server)
-        result = server.list_resources
-        resource_list = result['resources'] || []
-        replace_cached_slice(:resources, @resource_cache, server, fingerprint) do
-          resource_list.each do |resource|
-            @resource_cache[cache_key_for(server, resource.uri)] = MCPClient::DeepCopy.copy(resource)
-            resources << resource
-          end
+          return { 'resources' => [], 'nextCursor' => nil }
         end
-      rescue MCPClient::Errors::ConnectionError => e
-        # Fast-fail on authorization errors for better user experience
-        # If this is the first server or we haven't collected any resources yet,
-        # raise the auth error directly to avoid cascading error messages
-        raise e if e.message.include?('Authorization failed') && resources.empty?
 
-        # Store the error and try other servers
-        connection_errors << e
-        @logger.error("Server error: #{e.message}")
+        # Use cache if available and no cursor
+        if cache && (snapshot = cached_snapshot(:resources, @resource_cache))
+          release_held_request_meta
+          return { 'resources' => snapshot, 'nextCursor' => nil }
+        end
+
+        collect_resources_from_servers(cache)
       end
-
-      # Return hash format consistent with server methods
-      { 'resources' => resources, 'nextCursor' => nil }
     end
 
     # Reads a specific resource by URI
@@ -308,46 +266,14 @@ module MCPClient
     # @raise [MCPClient::Errors::ConnectionError] on authorization failures
     # @raise [MCPClient::Errors::ToolCallError] if no tools could be retrieved from any server
     def list_tools(cache: true)
-      if cache && (snapshot = cached_snapshot(:tools, @tool_cache))
-        release_held_request_meta
-        return snapshot
-      end
-
-      tools = []
-      connection_errors = []
-
-      servers.each do |server|
-        # The parameters this fetch will carry are read before it goes out:
-        # whatever request ran last on this thread says nothing about it.
-        fingerprint = params_fingerprint_for(server)
-        server_tools = server.list_tools
-        # Replace this server's slice: an item the refreshed list no longer
-        # carries must not linger from the previous fetch.
-        replace_cached_slice(:tools, @tool_cache, server, fingerprint) do
-          server_tools.each do |tool|
-            @tool_cache[cache_key_for(server, tool.name)] = MCPClient::DeepCopy.copy(tool)
-            tools << tool
-          end
+      holding_request_meta('tools/list') do
+        if cache && (snapshot = cached_snapshot(:tools, @tool_cache))
+          release_held_request_meta
+          return snapshot
         end
-      rescue MCPClient::Errors::ConnectionError => e
-        # Fast-fail on authorization errors for better user experience
-        # If this is the first server or we haven't collected any tools yet,
-        # raise the auth error directly to avoid cascading error messages
-        raise e if e.message.include?('Authorization failed') && tools.empty?
 
-        # Store the error and try other servers
-        connection_errors << e
-        @logger.error("Server error: #{e.message}")
+        collect_tools_from_servers(cache)
       end
-
-      # If we didn't get any tools from any server but have servers configured, report failure
-      if tools.empty? && !servers.empty?
-        raise connection_errors.first if connection_errors.any?
-
-        @logger.warn('No tools found from any server.')
-      end
-
-      tools
     end
 
     # Calls a specific tool by name with the given parameters
@@ -818,30 +744,6 @@ module MCPClient
       # thread would go out carrying that decision's tenant, baggage or nonce.
       release_held_request_meta
       raise
-    end
-
-    # A freshness check reads the parameters each server's next request
-    # would carry, which evaluates a host `request_meta` callable; the
-    # transports hold that evaluation for the fetch the check decides on.
-    # Nothing is fetched after a snapshot is served, so the held metadata is
-    # dropped instead of being sent by some later request.
-    # @return [void]
-    def release_held_request_meta
-      servers.each do |server|
-        server.send(:release_held_request_meta) if server.respond_to?(:release_held_request_meta, true)
-      end
-    end
-
-    # The effective-parameter fingerprint a server's next request would
-    # carry, read before a fetch so its slice of the cache is tagged with
-    # the parameters of the list it holds (never with a leftover of whatever
-    # request ran last on this thread).
-    # @param server [MCPClient::ServerBase]
-    # @return [String, nil]
-    def params_fingerprint_for(server)
-      return nil unless server.respond_to?(:current_params_fingerprint, true)
-
-      server.send(:current_params_fingerprint)
     end
 
     # The cache's items as one snapshot taken under the lock, when the cache

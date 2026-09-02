@@ -45,41 +45,113 @@ module MCPClient
       Thread.current[request_params_key] = UNRECORDED_PARAMS
     end
 
-    # Marks metadata that is to be held once it is evaluated: the request a
-    # cache decision leads to carries the very parameters the decision was
-    # made on, and a host callable that vends a one-time value (a nonce) or
-    # rotates is read once for the two of them.
-    HELD_REQUEST_META_PENDING = :pending
+    # The evaluation of the host's `request_meta` that one operation reserves
+    # for the request it leads to: the JSON-RPC method of that request, the
+    # evaluation once it has been made, whether the operation has begun
+    # talking to the server, and whether the request it was held for has
+    # already spent it.
+    #
+    # A reservation is claimed by that one request and by nothing else.
+    # Everything else a transport sends while it is open -- a reconnect's
+    # handshake, the `subscriptions/listen` a reconnect re-opens, the
+    # `notifications/cancelled` for an abandoned request, a nested request a
+    # notification listener issues -- reads the host afresh and leaves the
+    # reservation for the request that holds it.
+    HeldRequestMeta = Struct.new(:request_method, :evaluated, :value, :dispatched, :spent)
+
+    # Reserve the evaluation of the host's `request_meta` for the request
+    # `method` this operation leads to, for the operation's dynamic extent
+    # and no longer: however it ends -- a value returned, a reconnect that
+    # raised, a caller that swallowed the error -- the reservation goes with
+    # it, so no later request on this thread can carry it.
+    # @param method [String] the JSON-RPC method of the request the operation sends
+    # @yield the operation
+    # @return [Object] the block's value
+    def holding_request_meta(method)
+      open_request_meta_hold(method)
+      begin
+        yield
+      ensure
+        close_request_meta_hold
+      end
+    end
+
+    # Open a hold scope without a block, for a caller whose operation spans
+    # several transports (a client listing across its servers). Every opener
+    # closes it from an `ensure`.
+    # @param method [String] the JSON-RPC method of the request the operation sends
+    # @return [void]
+    def open_request_meta_hold(method)
+      stack = (Thread.current[held_request_meta_key] ||= [])
+      top = stack.last
+      # The same operation continuing -- a client asking its transport to run
+      # the very list it just weighed -- shares the reservation, so the
+      # request goes out with the evaluation the decision was made on. An
+      # operation that begins once this one is already talking to the server
+      # is a nested one (a listener called from a response's notification
+      # dispatch): it reserves its own and leaves this one untouched.
+      shared = top && top.request_method == method && !top.dispatched && !top.spent
+      stack.push(shared ? top : HeldRequestMeta.new(method, false, nil, false, false))
+      nil
+    end
+
+    # Close the innermost hold scope.
+    # @return [void]
+    def close_request_meta_hold
+      stack = Thread.current[held_request_meta_key]
+      return nil unless stack.is_a?(Array)
+
+      stack.pop
+      Thread.current[held_request_meta_key] = nil if stack.empty?
+      nil
+    end
+
+    # @return [MCPClient::RequestMetadata::HeldRequestMeta, nil] the
+    #   reservation of the innermost operation open on this thread
+    def held_request_meta
+      stack = Thread.current[held_request_meta_key]
+      stack.last if stack.is_a?(Array)
+    end
+
+    # @return [MCPClient::RequestMetadata::HeldRequestMeta, nil] that
+    #   reservation while the request it was made for may still claim it
+    def claimable_request_meta_hold
+      held = held_request_meta
+      held unless held.nil? || held.spent
+    end
+
+    # Note that the operation holding a reservation has begun talking to the
+    # server, so an operation that begins from here on is a nested one.
+    # @return [void]
+    def mark_request_meta_dispatched
+      held = held_request_meta
+      held.dispatched = true if held
+      nil
+    end
 
     # @return [String] the fingerprint of the effective parameters the next
     #   request on this transport would carry. Reading it evaluates the
-    #   host's request_meta, so the evaluation is held for the request this
-    #   decision leads to instead of being spent on the decision alone.
+    #   host's request_meta, and the open operation holds that evaluation for
+    #   the request the decision leads to instead of spending it on the
+    #   decision alone. Outside any operation nothing is held at all: an
+    #   evaluation that no request is waiting for is never kept.
     def current_params_fingerprint
-      Thread.current[held_request_meta_key] ||= HELD_REQUEST_META_PENDING
-      params_fingerprint_of(with_request_meta({}))
+      params_fingerprint_of(with_request_meta({}, claim: :model))
     end
 
     # Drop a held evaluation of the host's request_meta: the decision that
     # took it leads to no request of its own, so the next one evaluates
-    # afresh rather than sending metadata read some time ago.
+    # afresh rather than sending metadata read some time ago. The scope drops
+    # it too when the operation ends; this is for a decision that settles
+    # before that.
     # @return [void]
     def release_held_request_meta
-      Thread.current[held_request_meta_key] = nil
-    end
+      held = held_request_meta
+      return nil unless held
 
-    # Build a message outside any held evaluation: it reads the host's
-    # request_meta afresh (a callable that vends a one-time value is not
-    # spent twice), and the evaluation held for another request is left
-    # untouched — still held, and still for that request.
-    # @yield builds the message's effective parameters
-    # @return [Object] the block's value
-    def without_held_request_meta
-      held = Thread.current[held_request_meta_key]
-      Thread.current[held_request_meta_key] = nil
-      yield
-    ensure
-      Thread.current[held_request_meta_key] = held
+      held.evaluated = false
+      held.value = nil
+      nil
     end
 
     # @return [Symbol] this transport's thread-local key for held metadata

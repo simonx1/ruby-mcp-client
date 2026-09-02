@@ -334,12 +334,12 @@ module MCPClient
     # receipt time, the credentials and effective parameters of the request
     # this thread last sent through it, and its multi round-trip marker.
     #
-    # The metadata held for the *next* request is deliberately not among
-    # them: a reconnect tears the connection down (`ensure_connected` cleans
-    # up before it connects) in the middle of the very request a cache
-    # decision held its evaluation for, and that request must still carry it.
-    # The handshake that reconnect issues does not spend it either -- it
-    # reads the host afresh ({MCPClient::RequestMetadata#without_held_request_meta}).
+    # The evaluation an open operation reserved for its own request is
+    # deliberately not among them: a reconnect tears the connection down
+    # (`ensure_connected` cleans up before it connects) in the middle of the
+    # very request a cache decision reserved it for, and that request must
+    # still carry it. The reservation belongs to the operation, which drops
+    # it when it ends ({MCPClient::RequestMetaScope}).
     # @return [Array<Symbol>] the keys defined on this transport
     def transport_thread_local_keys
       %i[served_entries_key recorded_entries_key response_received_key

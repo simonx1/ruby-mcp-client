@@ -212,20 +212,35 @@ module MCPClient
       params
     end
 
-    # The messages a transport sends on its own behalf rather than for a
-    # caller: the handshake that establishes a session. A reconnect issues
-    # them from inside the very request whose cache decision is holding an
-    # evaluation of the host's `request_meta` (`ensure_connected` cleans up
-    # and connects before the request goes out), so a handshake must neither
-    # spend that evaluation nor be sent under it -- the request it was held
-    # for carries it, and the handshake reads the host afresh as any request
-    # of its own does.
-    HANDSHAKE_METHODS = %w[server/discover initialize notifications/initialized].freeze
+    # Transports that derive `Mcp-Param-*` headers from their tool list run a
+    # call inside a slot of its own for the definition it goes out under
+    # ({MCPClient::CalledToolDefinition}); the others have nothing to record
+    # and the call runs as it is.
+    # @yield the call
+    # @return [Object] the block value
+    def recording_called_tool_definition
+      yield
+    end
+    private :recording_called_tool_definition
 
-    # @param method [String] a JSON-RPC method name
-    # @return [Boolean] whether it is a message of the session handshake
-    def handshake_method?(method)
-      HANDSHAKE_METHODS.include?(method)
+    # Which claim a message being built makes on the evaluation the open
+    # operation reserved (see {MCPClient::RequestMetadata::HeldRequestMeta}).
+    #
+    # A probe is never sent: it models the reserved request, so it reads that
+    # request's evaluation without spending it. A real request spends the
+    # reservation only when it *is* the request the reservation was made for.
+    # Everything else -- a reconnect's handshake, a re-opened
+    # `subscriptions/listen`, a cancellation, a nested request a notification
+    # listener issues -- reads the host afresh and leaves the reservation for
+    # the request that holds it.
+    # @param method [String] the JSON-RPC method being built
+    # @param note [Boolean] whether the message is really going out
+    # @return [Symbol] :spend, :model or :none
+    def request_meta_claim(method, note)
+      return :model unless note
+
+      held = claimable_request_meta_hold
+      held && held.request_method == method ? :spend : :none
     end
 
     # Build a JSON-RPC request object
@@ -237,15 +252,13 @@ module MCPClient
     #   sent passes false)
     # @return [Hash] the JSON-RPC request object
     def build_jsonrpc_request(method, params, id, note: true)
-      # A handshake goes out for the transport itself; a probe is never sent
-      # at all and models the request the decision leads to, so it keeps
-      # reading (and holding) that request's evaluation.
-      handshake = note && handshake_method?(method)
-      effective = handshake ? without_held_request_meta { with_request_meta(params) } : with_request_meta(params)
-      # This request carries whatever evaluation of the host's request_meta
-      # was held for it; the next one reads the host's callable afresh.
-      release_held_request_meta if note && !handshake
-      note_request_params(effective) if note
+      effective = with_request_meta(params, claim: request_meta_claim(method, note))
+      if note
+        # The operation is talking to the server now, so anything that starts
+        # from here on is a nested operation with a reservation of its own.
+        mark_request_meta_dispatched
+        note_request_params(effective)
+      end
       {
         'jsonrpc' => '2.0',
         'id' => id,
@@ -365,8 +378,8 @@ module MCPClient
     # untouched when there is nothing to add, so legacy traffic is unchanged.
     # @param params [Hash, nil] request params (String or Symbol keys)
     # @return [Hash, nil] params with `_meta` merged under the String key
-    def with_request_meta(params)
-      defaults = host_request_meta
+    def with_request_meta(params, claim: :none)
+      defaults = host_request_meta(claim)
       return params if defaults.empty? && !modern?
 
       params = params.is_a?(Hash) ? params.dup : {}
@@ -401,18 +414,37 @@ module MCPClient
       meta
     end
 
-    # Evaluate the host's request_meta for one request, dropping any
-    # reserved protocol keys it tries to set.
+    # The host's request_meta for one message, with any reserved protocol
+    # keys it tries to set dropped.
+    #
+    # A message that claims the open operation's reservation reads the
+    # evaluation held for it (making it, the first time, and holding it);
+    # `:spend` marks it spent, so the request it was held for carries it and
+    # nothing else ever does. `:none` reads the host afresh and leaves the
+    # reservation alone -- a host callable that vends a one-time value is
+    # never spent twice, and never on the wrong request.
+    # @param claim [Symbol] :spend, :model or :none
     # @return [Hash] String-keyed metadata (possibly empty)
-    def host_request_meta
-      held = Thread.current[held_request_meta_key]
-      return held if held.is_a?(Hash)
+    def host_request_meta(claim = :none)
+      held = claim == :none ? nil : claimable_request_meta_hold
+      return spend_held_request_meta(held, claim) if held&.evaluated
 
       source = request_meta
       source = source.call if source.respond_to?(:call)
       meta = source.is_a?(Hash) ? source.transform_keys(&:to_s).except(*PROTECTED_META_KEYS) : {}
-      Thread.current[held_request_meta_key] = meta if held == HELD_REQUEST_META_PENDING
-      meta
+      return meta unless held
+
+      held.evaluated = true
+      held.value = meta
+      spend_held_request_meta(held, claim)
+    end
+
+    # @param held [MCPClient::RequestMetadata::HeldRequestMeta]
+    # @param claim [Symbol]
+    # @return [Hash] the held evaluation
+    def spend_held_request_meta(held, claim)
+      held.spent = true if claim == :spend
+      held.value
     end
 
     # Apply a DiscoverResult (server/discover): choose the protocol version
@@ -490,13 +522,10 @@ module MCPClient
     # @param params [Hash] parameters for the notification
     # @return [Hash] the JSON-RPC notification object
     def build_jsonrpc_notification(method, params)
-      # The handshake's own notification is the transport's, not the
-      # caller's: it leaves a held evaluation for the request that holds it.
-      effective = if handshake_method?(method)
-                    without_held_request_meta { with_request_meta(params) }
-                  else
-                    with_request_meta(params)
-                  end
+      # A notification is never the request a cache decision was made for: it
+      # reads the host afresh and leaves the reservation for that request.
+      effective = with_request_meta(params, claim: :none)
+      mark_request_meta_dispatched
       {
         'jsonrpc' => '2.0',
         'method' => method,

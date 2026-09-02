@@ -7,6 +7,46 @@ metadata). Each feature lands in its own PR; this section accumulates them.
 
 ### Cacheable results (`ttlMs` / `cacheScope`)
 
+- **A held evaluation belongs to the request it was reserved for, and to no
+  other (round 33).** A cache decision reads the host's `request_meta` once
+  and reserves that evaluation for the request it leads to. The rule used to
+  be "the next message spends it, unless it is one of three handshake
+  methods", and each round found another message that was neither: the
+  `subscriptions/listen` a stdio reconnect re-opens, the
+  `notifications/cancelled` sent for a request that timed out, a request a
+  notification listener issues from inside a response's synchronous
+  dispatch. The reservation also survived its own operation: a list whose
+  reconnect or initialization raised left the evaluation on the thread, and
+  the next unrelated request on that worker went out carrying the aborted
+  decision's tenant, baggage or nonce. The rule is now the other way round
+  and enforced structurally, by `MCPClient::RequestMetaScope`: an operation
+  reserves the evaluation for the JSON-RPC method of the request it sends,
+  only that request claims it, everything else reads the host afresh, and
+  the scope drops the reservation from an `ensure` however the operation
+  ends. An operation that begins while another is already talking to the
+  server — a nested call from a notification listener — reserves its own.
+  The handshake allowlist and the "keep it isolated while the message is
+  built" workaround are gone with it.
+- **The client's listings hold their reservation for the listing only (round
+  33).** `Client#list_tools`, `#list_prompts` and `#list_resources` read the
+  parameters each server's fetch would carry before making it; when
+  `server.list_tools` then failed during a reconnect, the rescue moved on to
+  the next server (or the caller caught the error) with the evaluation still
+  held. The three loops now run inside a scope that opens the reservation on
+  every server and closes it on every exit.
+- **A `tools/call` keeps the definition it went out under against nested
+  calls (round 33).** The round-32 slot was a single per-thread,
+  per-transport entry, so a notification listener that called another tool
+  from inside the outer call's response dispatch overwrote it: the outer
+  call was then validated against the nested definition, or listed again and
+  validated against a newer one. Every call now records into a slot of its
+  own, handed to the caller waiting for it when the call returns.
+- **`cache: false` really re-lists (round 33).** When a modern server bounded
+  a list with a positive `ttlMs`, the transport answered `list_tools` from
+  its own copy without sending anything, so `Client#list_tools(cache: false)`
+  returned a cached list instead of fetching fresh; prompts and resources
+  behaved the same way. A forced refresh now drops the transport's entry for
+  that kind first, so the request reaches the server.
 - **A freshness check that aborts releases every server's held evaluation
   (round 32).** With several cached servers, a check reads each server's
   parameters in turn and each transport holds that evaluation for the fetch
