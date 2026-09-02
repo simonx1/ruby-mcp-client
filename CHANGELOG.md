@@ -7,6 +7,27 @@ metadata). Each feature lands in its own PR; this section accumulates them.
 
 ### Cacheable results (`ttlMs` / `cacheScope`)
 
+- **Unpredictable shared state, and empty legacy lists (round 26).** The
+  freshness probe now treats shared state as predictable only where it can
+  vend nothing but itself: a module or class a host middleware shares is no
+  longer assumed safe (it keeps state of its own that freezing never
+  reaches), and neither is a frozen wrapper — a `Data`, a custom object —
+  built around a mutable member. Anything else reports the unknown context,
+  so probing cannot spend a one-time credential. A logger, a lock and
+  deeply frozen holders stay predictable. An empty client-level snapshot is
+  a hit only where the servers bounded it themselves with a freshness hint;
+  a 2025-11-25 server records none, so its empty list is asked for again
+  instead of being kept for the life of the connection. A host
+  `request_meta` callable is evaluated once for a cache decision and the
+  request that decision leads to, instead of being spent again on the
+  request (a callable vending a one-time value no longer sends metadata the
+  decision never weighed). A cached `resources/read` is copied out under the
+  cache lock and only while its entry is still the one the cache holds, so
+  an invalidation landing during the lookup is never read past. And a
+  fetch identity is remembered on the thread only for the lists that attach
+  one and take it back out, so a discovery leaves nothing behind per
+  transport in long-lived worker threads.
+
 - **A probe that changes nothing, and empty snapshots (round 25).** The
   freshness probe starts from a detached copy of the header table even when
   the transport was configured with Faraday's own, so the `Authorization`

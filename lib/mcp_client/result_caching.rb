@@ -272,6 +272,12 @@ module MCPClient
     # @return [MCPClient::CachedResult] the entry
     def remember_recorded_entry(kind, entry)
       entry.fetch_token = Object.new
+      # Only a list attaches its value afterwards and takes its identity
+      # back out again: remembering any other kind (a discovery, which is
+      # never attached) would leave a token on the thread for the life of
+      # the thread, one per transport a long-lived worker ever built.
+      return entry unless LIST_VALUE_KINDS.include?(kind)
+
       (Thread.current[recorded_entries_key] ||= {})[kind] = entry.fetch_token
       entry
     end
@@ -324,6 +330,20 @@ module MCPClient
       cache_entries_mutex.synchronize do
         entry = cache_entries[kind]
         entry.nil? || (!entry.value.nil? && entry.fresh?(now: monotonic_now))
+      end
+    end
+
+    # Whether the entry holding a kind bounds its own freshness: a server
+    # that sent a ttlMs (or a 2026-07-28 server whose absent ttlMs means 0)
+    # says how long its list may be kept, empty or not. Without a hint the
+    # client's own heuristic applies instead, and an empty list is asked for
+    # again rather than kept for the life of the connection.
+    # @param kind [Symbol]
+    # @return [Boolean]
+    def cache_entry_hinted?(kind)
+      cache_entries_mutex.synchronize do
+        entry = cache_entries[kind]
+        !entry.nil? && !entry.value.nil? && entry.hint?
       end
     end
 
@@ -450,7 +470,13 @@ module MCPClient
       # A failed attempt that never built its request noted no parameters:
       # it matches no entry, whatever the previous request on this thread
       # carried.
-      expected.is_a?(String) && entry.params_fingerprint == expected
+      matched = expected.is_a?(String) && entry.params_fingerprint == expected
+      # Reading the next request's parameters evaluates a host request_meta
+      # callable, and the transport holds that evaluation for the request
+      # this lookup leads to. A match means the entry is served instead, so
+      # the held metadata is dropped rather than sent by a later request.
+      release_held_request_meta if matched && context == :current && respond_to?(:release_held_request_meta, true)
+      matched
     end
 
     # Attach the list a request produced to the very entry that request
@@ -464,7 +490,10 @@ module MCPClient
     #   (defaults to the one recorded on this thread)
     # @return [Boolean] whether the value was attached
     def attach_list_value(kind, value, entry: nil)
-      token = entry ? entry.fetch_token : Thread.current[recorded_entries_key]&.delete(kind)
+      recorded = Thread.current[recorded_entries_key]
+      token = entry ? entry.fetch_token : recorded&.delete(kind)
+      # Nothing of this transport's is outstanding on this thread any more.
+      Thread.current[recorded_entries_key] = nil if recorded && recorded.empty?
       note_served_entry(kind, nil)
       # Nothing recorded for this fetch: a legacy list without a hint, which
       # the transport keeps until a list_changed notification. A recorded
@@ -671,7 +700,16 @@ module MCPClient
     def read_resource_with_cache(uri)
       key = read_cache_key(uri)
       cached = private_entry_for_current_context(key)
-      return cached.value.map(&:dup) if cached&.value && cached.fresh?(now: monotonic_now)
+      # An invalidation (a resources/updated notification, a cleanup) that
+      # lands after the lookup takes the entry out of the map but leaves
+      # this reference intact: the copy is made under the lock, and only
+      # while the entry is still the one the map holds.
+      served = cached && cache_entries_mutex.synchronize do
+        next nil unless cache_entries[key].equal?(cached) && cached.value && cached.fresh?(now: monotonic_now)
+
+        cached.value.map(&:dup)
+      end
+      return served if served
 
       epoch = cache_epoch(key)
       started = monotonic_now
