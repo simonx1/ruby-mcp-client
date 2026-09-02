@@ -455,7 +455,8 @@ module MCPClient
           next
         end
 
-        target_depth = (counter[:depths] || {})[target] || (depth + 1)
+        target_depth = (counter[:depths] || {})[target] ||
+                       referenced_position_depth(hop, root, counter[:dialect], counter, from) || (depth + 1)
         walk_schema(target, root, target_depth, counter, problems, indexed_dialect(target, counter) || dialect)
       end
       problems << problem if problem

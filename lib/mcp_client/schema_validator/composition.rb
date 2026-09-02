@@ -22,23 +22,25 @@ module MCPClient
         applicable = UNSUPPORTED_ASSERTIONS_ANY_TYPE +
                      UNSUPPORTED_ASSERTIONS_BY_TYPE.select { |type, _| data.is_a?(type) }.values.flatten
         (schema.keys & applicable).any? do |keyword|
-          keyword_known?(keyword, dialect) && effective_assertion?(schema, keyword, dialect)
+          keyword_known?(keyword, dialect) && effective_assertion?(schema, keyword, data)
         end
       end
 
-      # Whether an unevaluated assertion can still change the result: a
-      # keyword that has no effect without its companion (minContains /
-      # maxContains without contains, additionalItems beside a non-tuple
-      # items — JSON Schema 2020-12 Validation Sections 6.4.4-6.4.5, draft-07
-      # Section 9.3.1.2) or whose value cannot fail (additionalProperties
-      # true, uniqueItems false, minProperties 0, an empty dependency map)
-      # decides nothing and leaves the verdict whole.
+      # Whether an unevaluated assertion can still change the result for
+      # this instance: a keyword that has no effect without its companion
+      # (minContains / maxContains without contains, additionalItems beside
+      # a non-tuple items — JSON Schema 2020-12 Validation Sections
+      # 6.4.4-6.4.5, draft-07 Section 9.3.1.2), one the instance never
+      # reaches (additionalItems when the tuple covers every item), one its
+      # companion switches off (contains with minContains 0) or whose value
+      # cannot fail (additionalProperties true, uniqueItems false,
+      # minProperties 0, an empty dependency map) decides nothing.
       # @return [Boolean]
-      def effective_assertion?(schema, keyword, _dialect)
+      def effective_assertion?(schema, keyword, data)
         value = schema[keyword]
         case keyword
-        when 'minContains', 'maxContains' then schema.key?('contains')
-        when 'additionalItems' then schema['items'].is_a?(Array) && ![true, {}].include?(value)
+        when 'contains', 'minContains', 'maxContains', 'additionalItems'
+          effective_array_assertion?(schema, keyword, value, data)
         when 'additionalProperties', 'unevaluatedProperties', 'unevaluatedItems', 'propertyNames'
           ![true, {}].include?(value)
         when 'uniqueItems' then value == true
@@ -47,6 +49,20 @@ module MCPClient
         when 'dependentRequired', 'dependentSchemas', 'dependencies', 'patternProperties'
           !(value.is_a?(Hash) && value.empty?)
         else true
+        end
+      end
+
+      # The array assertions whose effect depends on a companion keyword or
+      # on the instance's length.
+      # @return [Boolean]
+      def effective_array_assertion?(schema, keyword, value, data)
+        case keyword
+        when 'contains' then schema['minContains'] != 0
+        when 'minContains' then schema.key?('contains') && value.is_a?(Numeric) && value.positive?
+        when 'maxContains' then schema.key?('contains')
+        else
+          schema['items'].is_a?(Array) && ![true, {}].include?(value) &&
+            data.is_a?(Array) && data.length > schema['items'].length
         end
       end
 

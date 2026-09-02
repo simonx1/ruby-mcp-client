@@ -148,6 +148,17 @@ metadata). Each feature lands in its own PR; this section accumulates them.
 
 ### Authorization (RFC 9207 issuer validation, client registration)
 
+- **Pointer depth and instance-aware assertions (round 16).** The depth
+  of what a pointer `$ref` reaches is counted in schema steps along the
+  percent-decoded pointer (`#/properties/b` and `#/allOf/0` are one below
+  the enclosing schema), so a boolean legal at the bound is not rejected
+  when referenced; every token under a data or unknown keyword
+  (`default`, `enum`, `const`, `examples`, vendor keys) is a step, so a
+  document hidden there obeys `MAX_SCHEMA_DEPTH` too (and an object
+  reached that way is walked at its own position). An unevaluated
+  assertion is uncertainty only when it can still change this instance:
+  `additionalItems: false` decides nothing when the tuple covers every
+  item, and `contains` decides nothing when `minContains` is 0.
 - **Issuer validation.** `OAuthProvider#start_authorization_flow` records
   the selected authorization server's `issuer` with the PKCE record;
   `complete_authorization_flow(code, state, iss:)` (and
