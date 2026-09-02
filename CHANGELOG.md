@@ -102,7 +102,11 @@ metadata). Each feature lands in its own PR; this section accumulates them.
   fails while a refused or still-unfetched challenge is outstanding;
   `Token#to_h` keeps every legacy key and adds `issuer` only when set;
   a retirement marker is lifted only once the replacement token was
-  persisted.
+  persisted. A successfully fetched challenge naming the same
+  authorization server does not fail the callback precheck; a challenge
+  advertising no authorization server is refused; a later validated
+  challenge supersedes a refused one (the refused document is forgotten);
+  peer-controlled metadata values are sanitized in refusals.
 
 ### Tasks extension (`io.modelcontextprotocol/tasks`)
 
