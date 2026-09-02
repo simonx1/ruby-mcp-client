@@ -25,7 +25,10 @@ module MCPClient
       end
 
       # Resolve a local reference: a JSON pointer fragment, or a plain-name
-      # fragment naming an anchor of the referencing schema's resource.
+      # fragment naming an anchor. Both are relative to the schema resource
+      # the referencing schema belongs to (JSON Schema 2020-12 Core Section
+      # 8.2.1): inside an embedded resource `#` is that resource and
+      # `#/$defs/x` its own definitions, never the enclosing document's.
       # @param root [Hash] the root schema (string keys)
       # @param ref [String] the `$ref` value
       # @param dialect [String, nil] the canonical dialect
@@ -33,16 +36,16 @@ module MCPClient
       # @param from [Hash, nil] the schema object holding the reference
       # @return [Object] the referenced value, or UNRESOLVED
       def resolve_reference(root, ref, dialect, resolver, from: nil)
+        index = (resolver[:anchors] ||= anchor_index(root, dialect))
+        resource = (from && index[:resources][from]) || root
         fragment = ref.delete_prefix('#')
-        return resolve_pointer(root, ref) if fragment.empty? || fragment.start_with?('/', '%2F', '%2f')
+        return resolve_pointer(resource, ref) if fragment.empty? || fragment.start_with?('/', '%2F', '%2f')
 
         # A plain-name fragment is percent-decoded like a pointer fragment
         # (RFC 3986 Section 2.1): "#foo%2Dbar" names the anchor "foo-bar".
         fragment = URI.decode_uri_component(fragment) rescue fragment # rubocop:disable Style/RescueModifier
         return UNRESOLVED unless fragment.match?(ANCHOR_NAME)
 
-        index = (resolver[:anchors] ||= anchor_index(root, dialect))
-        resource = (from && index[:resources][from]) || root
         index[:anchors].fetch(resource, {}).fetch(fragment, UNRESOLVED)
       end
 
@@ -117,8 +120,8 @@ module MCPClient
       end
 
       # Resolve a fragment JSON pointer (`#`, `#/$defs/x`, `#/a~1b`, with
-      # percent-encoding per RFC 6901 Section 6) within the root document.
-      # @param root [Hash] the root schema (string keys)
+      # percent-encoding per RFC 6901 Section 6) within a schema resource.
+      # @param root [Hash] the resource root (string keys)
       # @param ref [String] the `$ref` value
       # @return [Object] the referenced value, or UNRESOLVED
       def resolve_pointer(root, ref)

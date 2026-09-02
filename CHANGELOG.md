@@ -46,7 +46,13 @@ metadata). Each feature lands in its own PR; this section accumulates them.
   draft-07 (the other bag is unknown to the dialect and not walked, though
   JSON pointers into it still resolve and what a `$ref` reaches is
   preflighted), and the unsupported-keyword scan stops at the subschema
-  bound and runs once per tool output schema.
+  bound and runs once per tool output schema. Pointer fragments are
+  relative to the schema resource the `$ref` sits in (`#` and `#/$defs/x`
+  inside an embedded resource are that resource's), the unsupported-keyword
+  scan follows local `$ref`s (a target in a definition bag the dialect does
+  not walk is scanned too), an `if` without `then` or `else` is not
+  evaluated, and a document with more than `MAX_STRUCTURAL_OBJECTS` objects
+  is rejected while it is being normalized rather than copied whole.
   The keyword grammar follows the dialect (`DIALECT_KEYWORDS`): a keyword
   the dialect does not define (`prefixItems` or `$dynamicRef` in draft-07,
   `dependencies` or `additionalItems` in 2020-12, ...) is ignored rather
