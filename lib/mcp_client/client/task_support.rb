@@ -352,11 +352,36 @@ module MCPClient
         answered_keys_mutex.synchronize { @task_states&.delete(task_state_key(srv, task_id)) }
       end
 
+      NO_KEYS = Set.new.freeze
+      private_constant :NO_KEYS
+
       # Keys an abandoned handler still presents, kept apart from the task's
       # bookkeeping so no forget lets a retry present them again meanwhile.
+      # A read allocates nothing; the reservation that may need to hold keys
+      # asks for the set to be created.
       # @return [Set<String>] (callers hold answered_keys_mutex)
-      def in_flight_task_keys(srv, task_id)
-        (@in_flight_keys ||= {})[task_state_key(srv, task_id)] ||= Set.new
+      def in_flight_task_keys(srv, task_id, create: false)
+        key = task_state_key(srv, task_id)
+        return (@in_flight_keys ||= {})[key] ||= Set.new if create
+
+        @in_flight_keys&.fetch(key, nil) || NO_KEYS
+      end
+
+      # Send a task request through a transport that may implement only the
+      # documented rpc_request(method, params) interface: the timeout keyword
+      # goes out only when a bound applies and the transport accepts it.
+      # @return [Object] the JSON-RPC result
+      def task_rpc(srv, method, params, timeout: nil)
+        return srv.rpc_request(method, params) if timeout.nil? || !accepts_timeout?(srv)
+
+        srv.rpc_request(method, params, timeout: timeout)
+      end
+
+      # @return [Boolean] whether the transport's rpc_request takes timeout:
+      def accepts_timeout?(srv)
+        srv.method(:rpc_request).parameters.any? { |type, name| type == :keyrest || (type == :key && name == :timeout) }
+      rescue NameError
+        true
       end
 
       # Send the answers a handler produced. An ambiguous delivery (the
@@ -403,15 +428,7 @@ module MCPClient
           keys = input_responses.keys.map(&:to_s)
           remember_answered_keys(srv, task_id, keys)
           begin
-            # The timeout keyword goes out only when a bound applies: the
-            # documented transport interface is rpc_request(method, params).
-            params = { taskId: task_id, inputResponses: input_responses }
-            if timeout.nil?
-              srv.rpc_request('tasks/update',
-                              params)
-            else
-              srv.rpc_request('tasks/update', params, timeout: timeout)
-            end
+            task_rpc(srv, 'tasks/update', { taskId: task_id, inputResponses: input_responses }, timeout: timeout)
             answered_keys_mutex.synchronize { state[:pending_update] = nil }
             true
           rescue MCPClient::Errors::ServerError => e
@@ -666,6 +683,9 @@ module MCPClient
         problem = task_shape_problem(result)
         raise MCPClient::Errors::InvalidResultError, "Invalid CreateTaskResult: #{problem}" if problem
 
+        # A creation is a new task lifetime: whatever an earlier task with
+        # this id left behind (answered keys, an ambiguous update) is not its.
+        forget_task_keys(srv, result['taskId'])
         # The handle is the object just validated: a 2026-07-28
         # CreateTaskResult is the flat Task itself, and an extra `task`
         # property (the legacy 2025 wrapper) must not replace it.
@@ -732,9 +752,14 @@ module MCPClient
         # that fails gives the keys back, except those answered through
         # #update_task in the meantime.
         state = task_state(srv, task.task_id)
+        # The hold a timed-out handler may leave belongs to the session the
+        # handler starts in: its set is fixed here, before anything runs.
+        held = nil
         pending = answered_keys_mutex.synchronize do
           keys = requests.except(*answered, *in_flight_task_keys(srv, task.task_id).to_a)
           next keys if keys.empty?
+
+          held = in_flight_task_keys(srv, task.task_id, create: true)
           if state[:rounds] >= MAX_TASK_INPUT_ROUNDS
             raise MCPClient::Errors::InputRequiredError.new(
               "Task '#{shown_task_id(task.task_id)}' kept requesting input after #{MAX_TASK_INPUT_ROUNDS} rounds",
@@ -752,7 +777,7 @@ module MCPClient
         begin
           responses = bounded_by_wait(wait, on_abandon: lambda { |runner|
             abandoned = true
-            hold_in_flight_keys(runner, state, answered, pending.keys, srv, task.task_id)
+            hold_in_flight_keys(runner, state, answered, pending.keys, held)
           }) { srv.fulfil_input_requests(pending, task.to_h) }
           # The whole deadline (caller timeout and task TTL) is enforced
           # before anything is delivered.
@@ -828,10 +853,13 @@ module MCPClient
       # completed is given back so retries of a timed-out wait cannot spend
       # the per-task budget on one outstanding request.
       # @return [void]
-      def hold_in_flight_keys(runner, state, answered, keys, srv, task_id)
+      def hold_in_flight_keys(runner, state, answered, keys, held)
+        # The hold is the set of the session the handler was started in; the
+        # watcher releases that very set, never one a later session's retry
+        # filled under the same task id and key after a restart.
         answered_keys_mutex.synchronize do
           state[:rounds] -= 1 if state[:rounds].positive?
-          in_flight_task_keys(srv, task_id).merge(keys)
+          held.merge(keys)
         end
         Thread.new do
           Thread.current.report_on_exception = false
@@ -842,7 +870,8 @@ module MCPClient
           end
           answered_keys_mutex.synchronize do
             answered.subtract(keys - state[:submitted].to_a)
-            in_flight_task_keys(srv, task_id).subtract(keys)
+            held.subtract(keys)
+            @in_flight_keys&.delete_if { |_, set| set.empty? }
           end
         end
       end

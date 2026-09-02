@@ -17,6 +17,17 @@ metadata). Each feature lands in its own PR; this section accumulates them.
   payload needs a string `taskId`; `tasks/update` goes out without a
   `timeout:` keyword when no bound applies, so transports implementing
   only `rpc_request(method, params)` keep working. A `tasks/update` or `tasks/cancel` that reports the task gone forgets its bookkeeping like a `tasks/get` that does.
+- **Holds across sessions (round 25).** The watcher of an abandoned input
+  handler releases exactly the hold it took (the in-flight set of the
+  session the handler started in), never one a later session's retry
+  placed under the same task id and key after a restart — the hold's set
+  is fixed when the handler starts, so a handler that times out after a
+  restart holds keys in its own session, not the new one; a read of the
+  registry allocates nothing and emptied entries are dropped; a fresh
+  CreateTaskResult is a new task lifetime (earlier bookkeeping under that
+  id is forgotten); tasks/get and tasks/update go through a transport that
+  implements only `rpc_request(method, params)` (the timeout keyword is
+  sent only to transports that accept it).
 - **Abandoned handlers (round 22).** A handler round that outlived the
   wait spends no input round (retries of a timed-out wait cannot exhaust
   the per-task budget on one outstanding request), and the keys an
