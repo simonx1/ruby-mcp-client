@@ -1201,7 +1201,9 @@ module MCPClient
     # @raise [MCPClient::Errors::ValidationError] when required params are missing
     def validate_params!(tool, parameters)
       schema = tool.schema
-      warn_unusable_input_schema(tool)
+      # An input schema the validator cannot interpret asserts nothing: the
+      # call goes out and the server judges its arguments.
+      return if warn_unusable_input_schema(tool)
       return unless schema.is_a?(Hash)
 
       required = schema['required'] || schema[:required]
@@ -1279,8 +1281,9 @@ module MCPClient
     # host learns that local parameter checks are incomplete.
     # @param tool [MCPClient::Tool]
     # @return [void]
+    # @return [Boolean] whether the input schema is unusable for validation
     def warn_unusable_input_schema(tool)
-      return if tool.schema.nil?
+      return false if tool.schema.nil?
 
       # Keyed by the schema object itself as well, so a refreshed tool
       # definition (list_changed, cache expiry, HeaderMismatch recovery) is
@@ -1289,14 +1292,16 @@ module MCPClient
       # check could reject it.
       @input_schema_warnings ||= {}
       key = [tool.server&.object_id, tool.name]
-      return if @input_schema_warnings[key].equal?(tool.schema)
+      known = @input_schema_warnings[key]
+      return known[:unusable] if known && known[:schema].equal?(tool.schema)
 
       problems = MCPClient::SchemaValidator.check_schema(tool.schema)
-      @input_schema_warnings[key] = tool.schema
-      return if problems.empty?
+      @input_schema_warnings[key] = { schema: tool.schema, unusable: !problems.empty? }
+      return false if problems.empty?
 
       @logger.warn("Tool '#{sanitize_peer_log_text(tool.name.to_s)}' input schema is not usable for validation: " \
                    "#{sanitize_peer_log_text(problems.join('; '))}")
+      true
     end
 
     # Warn (in both :warn and :strict modes) when a tool's output schema uses

@@ -38,7 +38,7 @@ module MCPClient
         value = schema[keyword]
         case keyword
         when 'minContains', 'maxContains' then schema.key?('contains')
-        when 'additionalItems' then schema['items'].is_a?(Array)
+        when 'additionalItems' then schema['items'].is_a?(Array) && ![true, {}].include?(value)
         when 'additionalProperties', 'unevaluatedProperties', 'unevaluatedItems', 'propertyNames'
           ![true, {}].include?(value)
         when 'uniqueItems' then value == true
