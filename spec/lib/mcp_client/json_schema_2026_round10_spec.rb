@@ -37,6 +37,48 @@ RSpec.describe 'MCP 2026-07-28 JSON Schema handling — round 10' do
     end
   end
 
+  describe 'names of a resource reached through a foreign bag' do
+    let(:schema) do
+      {
+        'properties' => { 'a' => { '$ref' => '#/definitions/x' } },
+        'definitions' => {
+          'x' => { '$id' => 'https://example.com/x', '$anchor' => 'trap', 'type' => 'object',
+                   'properties' => { 'v' => { '$ref' => '#trap' } } }
+        }
+      }
+    end
+
+    it 'resolves the resource\'s own anchor even when the resource sits in a bag the dialect does not walk' do
+      expect(validator.check_schema(schema)).to be_empty
+      expect(validator.validate({ 'a' => { 'v' => {} } }, schema)).to be_empty
+      expect(validator.validate({ 'a' => { 'v' => 1 } },
+                                schema)).to contain_exactly(a_string_matching(/expected type object/))
+    end
+
+    it 'still hides that name from the enclosing resource' do
+      schema['properties']['b'] = { '$ref' => '#trap' }
+      expect(validator.check_schema(schema)).to contain_exactly(a_string_matching(/unresolvable local \$ref "#trap"/))
+    end
+  end
+
+  describe 'wide leaf maps' do
+    it 'rejects a wide map of leaf values before copying it' do
+      huge = {}
+      (validator::MAX_STRUCTURAL_OBJECTS + 10).times { |i| huge["k#{i}"] = i }
+      schema = { 'type' => 'integer', 'x-huge' => huge }
+      allow(huge).to receive(:to_h).and_raise('the map must not be copied whole')
+      allow(huge).to receive(:each).and_raise('the map must not be copied whole')
+      expect(validator.check_schema(schema)).to contain_exactly(a_string_matching(/structural elements/))
+      expect(validator.validate(1, schema)).to contain_exactly(a_string_matching(/structural elements/))
+    end
+
+    it 'runs the normalization under the validation deadline' do
+      schema = { 'type' => 'integer', 'x-slow' => { 'k' => 1 } }
+      past = Process.clock_gettime(Process::CLOCK_MONOTONIC) - 1
+      expect(validator.validate(1, schema, deadline: past)).to contain_exactly(a_string_matching(/aborted|time/))
+    end
+  end
+
   describe 'duplicate anchors' do
     it 'rejects an $anchor declared twice in one resource' do
       schema = {

@@ -115,14 +115,22 @@ RSpec.describe 'MCP 2026-07-28 JSON Schema handling — round 7' do
 
   describe 'bounded unsupported-keyword scan' do
     it 'stops walking at MAX_SUBSCHEMAS' do
+      # More subschemas than the walk admits, but within the structural
+      # bound (every object entry counts), so the document is still read.
       huge = { 'type' => 'object', 'properties' => {} }
-      (validator::MAX_SUBSCHEMAS * 3).times do |i|
-        huge['properties']["p#{i}"] = { 'type' => 'string', 'format' => 'x' }
-      end
+      (validator::MAX_SUBSCHEMAS + 500).times { |i| huge['properties']["p#{i}"] = { 'format' => 'x' } }
       allow(validator).to receive(:each_subschema).and_call_original
 
       expect(validator.unsupported_keywords(huge)).to eq(['format'])
       expect(validator).to have_received(:each_subschema).at_most(validator::MAX_SUBSCHEMAS + 1).times
+    end
+
+    it 'reports nothing for a document too wide to read, which check_schema rejects' do
+      huge = { 'type' => 'object', 'properties' => {} }
+      (validator::MAX_STRUCTURAL_OBJECTS + 10).times { |i| huge['properties']["p#{i}"] = { 'format' => 'x' } }
+
+      expect(validator.unsupported_keywords(huge)).to eq([])
+      expect(validator.check_schema(huge)).to contain_exactly(a_string_matching(/structural elements/))
     end
   end
 

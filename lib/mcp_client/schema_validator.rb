@@ -194,10 +194,12 @@ module MCPClient
 
     # A bounded, string-keyed copy of a schema (booleans pass through).
     # @param schema [Object]
+    # @param deadline [Float, nil] monotonic deadline the copy runs under
     # @return [Object]
     # @raise [TooLarge] when the document exceeds MAX_STRUCTURAL_OBJECTS
-    def self.normalize_schema(schema)
-      schema.is_a?(Hash) ? deep_stringify(schema, 0, { objects: 0 }) : schema
+    # @raise [Aborted] when the deadline passed during the copy
+    def self.normalize_schema(schema, deadline: nil)
+      schema.is_a?(Hash) ? deep_stringify(schema, 0, { objects: 0, deadline: deadline }) : schema
     end
 
     # {.check_schema} on an already normalized schema.
@@ -489,12 +491,13 @@ module MCPClient
     # @param deadline [Float, nil] monotonic deadline for the whole validation
     # @return [Array<String>] human-readable validation errors (empty if valid)
     def self.validate(data, schema, path: '#', deadline: nil)
-      root = normalize_schema(schema)
+      # One deadline covers the entire validation, the copy of the peer's
+      # document included.
+      deadline ||= Process.clock_gettime(Process::CLOCK_MONOTONIC) + PATTERN_MATCH_TIMEOUT
+      root = normalize_schema(schema, deadline: deadline)
       problems = check_normalized(root)
       return problems.map { |problem| "#{path}: #{problem}" } unless problems.empty?
 
-      # One deadline covers the entire (recursive) validation.
-      deadline ||= Process.clock_gettime(Process::CLOCK_MONOTONIC) + PATTERN_MATCH_TIMEOUT
       ctx = Context.new(root: root, deadline: deadline, dialect: canonical_dialect(dialect(root)),
                         visits: 0, errors: 0, speculative: 0, anchors: nil)
       validate_node(data, root, path, ctx, 0)
