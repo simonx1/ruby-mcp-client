@@ -5,24 +5,30 @@ require 'uri'
 module MCPClient
   module Auth
     class OAuthProvider
-      # Type checks for the two peer-controlled JSON bodies an authorization
-      # server answers a request with: the token response of RFC 6749
-      # Section 5.1 and the client registration response of RFC 7591
-      # Section 3.2.1 (whose client metadata fields keep the types RFC 7591
-      # Section 2 gives them).
+      # Type checks for the four peer-controlled JSON documents a flow reads:
+      # the token response of RFC 6749 Section 5.1, the client registration
+      # response of RFC 7591 Section 3.2.1 (whose client metadata fields keep
+      # the types RFC 7591 Section 2 gives them), the protected resource
+      # metadata of RFC 9728 Section 2 and the authorization server metadata
+      # of RFC 8414 Section 2.
       #
-      # Both bodies are read field by field and every field ends up somewhere
-      # that assumes its RFC type: `token_type` is capitalized into an
-      # `Authorization` header, `expires_in` is added to a `Time`,
+      # Every document is read field by field and every field ends up
+      # somewhere that assumes its RFC type: `token_type` is capitalized into
+      # an `Authorization` header, `expires_in` is added to a `Time`,
       # `redirect_uris` is asked for its first element,
-      # `client_secret_expires_at` is compared with a Unix timestamp. A peer
-      # that answers with the right names and the wrong JSON types would
-      # therefore crash the client with a `NoMethodError` or a `TypeError`
-      # deep inside the flow — sometimes only after a still-valid token had
-      # been overwritten. A response whose fields are not of their RFC types
-      # is a protocol error and is refused as a whole, exactly as a token
-      # response without an access token is: no partial acceptance, no
-      # coercion of whatever JSON arrived.
+      # `client_secret_expires_at` is compared with a Unix timestamp,
+      # `scopes_supported` is joined into a scope parameter and
+      # `code_challenge_methods_supported` is asked whether it includes
+      # "S256". A peer that answers with the right names and the wrong JSON
+      # types would therefore crash the client with a `NoMethodError` or a
+      # `TypeError` deep inside the flow — sometimes only after a still-valid
+      # token had been overwritten — or, worse, be believed: a
+      # `code_challenge_methods_supported` of `"S256 plain"` is a String, and
+      # a String answers `include?("S256")` with true, so a server that
+      # supports no PKCE at all would read as one that does. A document whose
+      # fields are not of their RFC types is a protocol error and is refused
+      # as a whole, exactly as a token response without an access token is:
+      # no partial acceptance, no coercion of whatever JSON arrived.
       #
       # Mixed into OAuthProvider.
       module ResponseValidation
@@ -72,6 +78,43 @@ module MCPClient
           'application_type' => :string
         }.freeze
 
+        # Where the protected resource document's field types are specified.
+        RESOURCE_METADATA_REFERENCE = 'RFC 9728 Section 2'
+
+        # Where the authorization server document's field types are specified.
+        SERVER_METADATA_REFERENCE = 'RFC 8414 Section 2'
+
+        # The protected resource metadata fields this client reads, and their
+        # RFC 9728 Section 2 types. `resource` is compared with the server
+        # URL, `authorization_servers` supplies the issuer discovery is driven
+        # from, and `scopes_supported` is joined into the `scope` parameter of
+        # the authorization request.
+        RESOURCE_METADATA_FIELDS = {
+          'resource' => :string,
+          'authorization_servers' => :string_array,
+          'scopes_supported' => :string_array
+        }.freeze
+
+        # The authorization server metadata fields this client reads, and
+        # their RFC 8414 Section 2 types. The two boolean advertisements
+        # (`client_id_metadata_document_supported` and
+        # `authorization_response_iss_parameter_supported`) are deliberately
+        # absent: a value that is not a boolean says nothing this client can
+        # act on, and both are already read fail-closed — "not supported" for
+        # the first, "advertised, so a response without `iss` is refused" for
+        # the second (see {MCPClient::Auth::ServerMetadata}) — which is a
+        # safer reading than refusing the document outright.
+        SERVER_METADATA_FIELDS = {
+          'issuer' => :string,
+          'authorization_endpoint' => :string,
+          'token_endpoint' => :string,
+          'registration_endpoint' => :string,
+          'scopes_supported' => :string_array,
+          'response_types_supported' => :string_array,
+          'grant_types_supported' => :string_array,
+          'code_challenge_methods_supported' => :string_array
+        }.freeze
+
         # How each type reads in a failure message.
         TYPE_DESCRIPTIONS = {
           string: 'a string',
@@ -90,6 +133,9 @@ module MCPClient
         # the request.
         HEADER_UNSAFE_BYTE = ->(byte) { byte < 0x20 || byte == 0x7F }
 
+        # Schemes a callback can actually arrive on this client.
+        CALLBACK_SCHEMES = %w[http https].freeze
+
         private
 
         # Why a parsed token endpoint response is not a credential, if it is
@@ -103,7 +149,7 @@ module MCPClient
             return "the token response carries no access_token (#{TOKEN_RESPONSE_REFERENCE})"
           end
 
-          mistyped_field_error(data, TOKEN_RESPONSE_FIELDS, 'token', TOKEN_RESPONSE_REFERENCE)
+          mistyped_field_error(data, TOKEN_RESPONSE_FIELDS, 'token response', TOKEN_RESPONSE_REFERENCE)
         end
 
         # Why a parsed client registration response registers no client, if it
@@ -115,8 +161,28 @@ module MCPClient
             return "the registration response carries no client_id (#{REGISTRATION_RESPONSE_REFERENCE})"
           end
 
-          mistyped_field_error(data, REGISTRATION_RESPONSE_FIELDS, 'registration',
+          mistyped_field_error(data, REGISTRATION_RESPONSE_FIELDS, 'registration response',
                                REGISTRATION_RESPONSE_REFERENCE)
+        end
+
+        # Why a parsed protected resource document is not usable metadata, if
+        # it is not. The document drives discovery and supplies the scopes of
+        # the authorization request, so a field of the wrong JSON type is
+        # refused here rather than asked for `first` or `join` later.
+        # @param data [Hash] the parsed JSON body (its Hash-ness is checked by the caller)
+        # @return [String, nil] the reason, or nil when the document is usable
+        def resource_metadata_error(data)
+          mistyped_field_error(data, RESOURCE_METADATA_FIELDS, 'protected resource metadata',
+                               RESOURCE_METADATA_REFERENCE)
+        end
+
+        # Why a parsed authorization server document is not usable metadata,
+        # if it is not.
+        # @param data [Hash] the parsed JSON body (its Hash-ness is checked by the caller)
+        # @return [String, nil] the reason, or nil when the document is usable
+        def server_metadata_error(data)
+          mistyped_field_error(data, SERVER_METADATA_FIELDS, 'authorization server metadata',
+                               SERVER_METADATA_REFERENCE)
         end
 
         # The first field of a response body that is present and not of the
@@ -125,7 +191,7 @@ module MCPClient
         # are checked by name before this runs.
         # @param data [Hash] the parsed JSON body
         # @param fields [Hash{String => Symbol}] field name to expected type
-        # @param label [String] what the body is, for the message
+        # @param label [String] what the document is, for the message
         # @param reference [String] the RFC section the types come from
         # @return [String, nil]
         def mistyped_field_error(data, fields, label, reference)
@@ -133,7 +199,7 @@ module MCPClient
             value = data[field]
             next if value.nil? || value_of_type?(value, type)
 
-            return "the #{label} response's #{field} is not #{TYPE_DESCRIPTIONS[type]} (#{reference})"
+            return "the #{label}'s #{field} is not #{TYPE_DESCRIPTIONS[type]} (#{reference})"
           end
           nil
         end
@@ -209,17 +275,43 @@ module MCPClient
         # authorization URL the browser is sent to. An empty string is an
         # array element of the right JSON type and no redirect URI at all: it
         # opens the browser with `redirect_uri=`, and the authorization server
-        # rejects the request the user was just sent into. So an array of
-        # strings registers redirect URIs only when every element is one:
-        # absolute, and parseable as a URI.
+        # rejects the request the user was just sent into. Having a scheme is
+        # not enough either — `javascript:alert(1)` and `data:text/html,...`
+        # have one, and a browser that follows them runs the peer's script in
+        # the page instead of delivering a code anywhere; a bare `http:` has
+        # one and no host to deliver to. So an array of strings registers
+        # redirect URIs only when every element is one a callback could
+        # actually arrive on: an http(s) URL with a host (the loopback server
+        # {MCPClient::Auth::BrowserOAuth} runs, or a hosted callback), or an
+        # RFC 8252 Section 7.1 private-use scheme the host application
+        # registered with the operating system — and, either way, without the
+        # fragment RFC 6749 Section 3.1.2 forbids.
         # @param value [Object, nil] a candidate redirect URI
         # @return [Boolean]
         def redirect_uri_bytes?(value)
           return false unless non_empty_string?(value)
 
-          !URI.parse(value).scheme.to_s.empty?
+          uri = URI.parse(value)
+          scheme = uri.scheme.to_s.downcase
+          return false unless uri.fragment.nil?
+          return !uri.host.to_s.empty? if CALLBACK_SCHEMES.include?(scheme)
+
+          private_use_redirect_uri?(uri, scheme)
         rescue URI::InvalidURIError
           false
+        end
+
+        # RFC 8252 Section 7.1: a native application may receive its callback
+        # on a private-use URI scheme, "a scheme based on a domain name under
+        # their control, expressed in reverse order"
+        # (`com.example.app:/oauth2redirect`). Such a URI is hierarchical — it
+        # has a path, not an opaque body — which is what separates it from the
+        # `javascript:` and `data:` URIs that are not redirect targets at all.
+        # @param uri [URI::Generic] the parsed redirect URI
+        # @param scheme [String] its downcased scheme
+        # @return [Boolean]
+        def private_use_redirect_uri?(uri, scheme)
+          scheme.include?('.') && uri.opaque.nil? && uri.path.to_s.start_with?('/')
         end
 
         # @param value [Object, nil] a candidate client id

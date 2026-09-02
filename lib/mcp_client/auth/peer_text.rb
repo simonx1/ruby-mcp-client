@@ -22,9 +22,30 @@ module MCPClient
     # include: a rescue path that calls a helper its object does not have
     # raises NoMethodError out of the very request the rescue existed to keep
     # working.
+    #
+    # Every helper here is TOTAL: no input can raise out of it. Nothing about
+    # a peer's bytes guarantees they are valid UTF-8 — a response body arrives
+    # as whatever the socket carried, a callback parameter as whatever
+    # `CGI.unescape` made of `%FF`, and a `JSON::ParserError` message quotes
+    # the undecodable bytes it choked on — and `String#gsub`, `String#strip`
+    # and `Regexp#match` all raise `ArgumentError: invalid byte sequence in
+    # UTF-8` on them. A sanitizer that raises on the input it exists to
+    # sanitize is worse than none: it turns a peer's `400` body, or an
+    # `error_description=%FF`, into an exception out of the rescue path that
+    # was meant to report it. Undecodable bytes are therefore replaced before
+    # anything else looks at them.
     module PeerText
       # How much peer-supplied text a message may carry.
       PEER_TEXT_LIMIT = 200
+
+      # What an undecodable byte becomes. ASCII, so the result is safe to
+      # write to a log device of any encoding.
+      UNDECODABLE_BYTE = '?'
+
+      # What a helper reports when even the replacement could not be made
+      # (an object whose #to_s raises, a string no encoding handler accepts).
+      # A helper here never raises, so there is always something to say.
+      UNREADABLE_TEXT = '(unreadable)'
 
       private
 
@@ -33,7 +54,7 @@ module MCPClient
       def safe_error_text(value)
         return nil unless value.is_a?(String)
 
-        value.gsub(/[[:cntrl:]]/, ' ')[0, PEER_TEXT_LIMIT]
+        printable_peer_text(value)
       end
 
       # The same, for a value that is not necessarily a String (a response
@@ -41,7 +62,35 @@ module MCPClient
       # @param value [Object] a peer-supplied response body
       # @return [String] printable, bounded text, never nil
       def safe_body_text(value)
-        safe_error_text(value.to_s).to_s
+        return '' if value.nil?
+
+        printable_peer_text(value.is_a?(String) ? value : value.to_s)
+      rescue StandardError
+        UNREADABLE_TEXT
+      end
+
+      # Peer bytes as text that can be logged, matched, sliced and rendered:
+      # valid UTF-8 (undecodable bytes replaced), free of control characters,
+      # and bounded.
+      # @param text [String] peer-supplied bytes
+      # @return [String]
+      def printable_peer_text(text)
+        decodable_text(text).gsub(/[[:cntrl:]]/, ' ')[0, PEER_TEXT_LIMIT].to_s
+      rescue StandardError
+        UNREADABLE_TEXT
+      end
+
+      # The same bytes as valid UTF-8. A string in another encoding (a binary
+      # response body, a UTF-16 message) is read as UTF-8 and scrubbed rather
+      # than transcoded: the point is text that cannot raise, not a faithful
+      # rendering of a peer's mojibake.
+      # @param text [String]
+      # @return [String] valid UTF-8
+      def decodable_text(text)
+        utf8 = text.encoding == Encoding::UTF_8 ? text : text.dup.force_encoding(Encoding::UTF_8)
+        utf8.valid_encoding? ? utf8 : utf8.scrub(UNDECODABLE_BYTE)
+      rescue StandardError
+        UNREADABLE_TEXT
       end
 
       # A log-safe description of a JSON parse failure: where it failed and
@@ -51,10 +100,14 @@ module MCPClient
       # @return [String]
       def describe_parse_error(error, payload = nil)
         parts = ['malformed JSON']
-        location = error.message[/at line \d+ column \d+/]
+        # The parser's own message quotes the bytes it choked on, so it is no
+        # more decodable than the body was: it is made matchable first.
+        location = decodable_text(error.message.to_s)[/at line \d+ column \d+/]
         parts << location if location
         parts << describe_body_size(payload) unless payload.nil?
         parts.join(', ')
+      rescue StandardError
+        'malformed JSON'
       end
 
       # @param body [Object, nil] a response body
@@ -62,6 +115,8 @@ module MCPClient
       def describe_body_size(body)
         text = body.to_s
         text.empty? ? 'empty body' : "#{text.bytesize} byte body"
+      rescue StandardError
+        'body of unknown size'
       end
     end
   end

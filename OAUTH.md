@@ -78,6 +78,21 @@ The implementation follows the standard OAuth 2.1 authorization code flow with P
      protection), and every authorization-server endpoint must use HTTPS (plain HTTP is allowed on the
      loopback interface — `localhost`, a `*.localhost` name, or any spelling of 127.0.0.0/8 or
      `::1` — for local development).
+   - Both documents are read against the types their RFCs give their fields. A protected resource
+     document (RFC 9728 §2) has a string `resource` and arrays of strings for
+     `authorization_servers` and `scopes_supported`; an authorization server document (RFC 8414 §2)
+     has string endpoints (`issuer`, `authorization_endpoint`, `token_endpoint`,
+     `registration_endpoint`) and arrays of strings for `scopes_supported`,
+     `response_types_supported`, `grant_types_supported` and `code_challenge_methods_supported`. A
+     field of any other type refuses the document with a `ConnectionError`, so
+     `{"scopes_supported": "mcp:read"}` is a reported discovery failure rather than a `NoMethodError`
+     out of `start_authorization_flow`, and a `code_challenge_methods_supported` of `"S256 plain"` is
+     never mistaken for PKCE support (a String answers `include?("S256")`; an authorization server
+     that supports no PKCE would otherwise read as one that does). The two boolean advertisements —
+     `client_id_metadata_document_supported` and `authorization_response_iss_parameter_supported` —
+     keep their fail-closed reading instead. The same standard applies to a record read back from a
+     storage backend that persists plain hashes: PKCE support requires an array, and a
+     `scopes_supported` that is not one contributes no scopes.
 2. **Client Registration**: Automatically register OAuth client if dynamic registration is supported
    - A registration response names a client only when it is a JSON object whose `client_id` is a
      non-empty string (RFC 7591 Section 3.2.1). A `201` without one registered nothing, so it raises a
@@ -91,10 +106,21 @@ The implementation follows the standard OAuth 2.1 authorization code flow with P
      same `ConnectionError` — `{"client_id": "c", "redirect_uris": "http://localhost:1/cb"}` is a
      reported registration failure, not a `NoMethodError` — and a `redirect_uris` the server omits or
      echoes back empty falls back to the redirect URI the registration asked for.
-   - An array of strings is not yet an array of redirect URIs: every element must be an absolute,
-     parseable URI, so `{"redirect_uris": [""]}` (or `["/cb"]`) is a reported registration failure
-     rather than a browser opened at `…&redirect_uri=&…`.
+   - An array of strings is not yet an array of redirect URIs: every element must be one a callback
+     could actually arrive on — an `http`/`https` URL with a host (the loopback server `BrowserOAuth`
+     runs, or a hosted callback) or an RFC 8252 §7.1 private-use scheme with a path
+     (`com.example.app:/oauth2redirect`), and in neither case a fragment (RFC 6749 §3.1.2). So
+     `{"redirect_uris": [""]}`, `["/cb"]`, `["javascript:alert(1)"]`, `["data:text/html,…"]` and
+     `["http:"]` are a reported registration failure rather than a browser opened at them.
+   - The registered `token_endpoint_auth_method` is what the client then authenticates with. RFC 7591
+     §2 makes `client_secret_basic` the default, so a registration response that issues a
+     `client_secret` and names no method is recorded as a confidential client using it — not as
+     `none`, which would mean the secret is never sent and every token request goes out
+     unauthenticated. A registration without a secret stays a public client (`none`).
 3. **Authorization**: Redirect user to authorization server with PKCE parameters
+   - The authorization endpoint's own query string is retained and the authorization parameters are
+     appended to it (RFC 6749 §3.1), so an endpoint of `https://as.example/authorize?tenant=acme`
+     keeps its `tenant`.
 4. **Token Exchange**: Exchange authorization code for access token using PKCE verifier
    - A token response carries a credential only when it is a JSON object whose `access_token` is a
      non-empty string (RFC 6749 Section 5.1). Anything else — `200 {}`, `200 []`, `200 null`,
@@ -110,6 +136,13 @@ The implementation follows the standard OAuth 2.1 authorization code flow with P
      is refused instead of being stored and split into two header lines.
    - `refresh_token` is a credential too, so it is bytes or nothing: `refresh_token: ""` fails the
      response rather than being persisted over the refresh token the client already holds.
+   - A confidential client presents its credentials the way the authorization server registered them:
+     `client_secret_basic` (RFC 7591's default) sends them in an `Authorization: Basic` header,
+     form-urlencoded before they are base64-encoded (RFC 6749 §2.3.1); `client_secret_post` sends the
+     secret in the request body; a public client sends neither. A method this client cannot present
+     (`private_key_jwt`, `client_secret_jwt`) is logged and the request is made without client
+     authentication rather than with the secret in a header the server did not ask for. The same
+     applies to a token refresh.
 5. **Token Usage**: Include access token in MCP requests via `Authorization` header
 6. **Token Refresh**: Automatically refresh tokens when they expire
    - A refresh response that carries no such `access_token`, whose fields have the wrong JSON types,
@@ -237,6 +270,13 @@ token.expires_soon? # Boolean (within 5 minutes)
 token.to_header     # "Bearer abc123"
 ```
 
+A record read back from a storage backend that persists plain hashes carries whatever was written
+there, so the expiry is validated before it is used: `expires_in` must be a number and `expires_at`
+a readable instant (a `Time`, or the ISO 8601 string `to_h` writes). An expiry that is neither is
+not "no expiry" — read that way a mangled lifetime would make a token that never expires — so the
+record reads as expired, through a storage round trip too, and is refreshed or re-authorized
+instead of raising a `TypeError` out of `access_token`.
+
 ### Client Metadata
 
 ```ruby
@@ -248,6 +288,13 @@ metadata = MCPClient::Auth::ClientMetadata.new(
   scope: 'mcp:read mcp:write'
 )
 ```
+
+`token_endpoint_auth_method` decides how the client authenticates at the token endpoint:
+`'none'` (a public client — what this library registers as), `'client_secret_post'` (the secret in
+the request body) or `'client_secret_basic'` (the credentials in an `Authorization: Basic` header,
+and RFC 7591's default for a registration that names no method). Pre-registered credentials should
+carry the method the authorization server expects; one stored with a secret and `'none'` is
+presented with HTTP Basic, since a secret and "no authentication" authenticate nowhere.
 
 ### Server Metadata
 
@@ -285,8 +332,9 @@ end
 This implementation follows OAuth 2.1 security best practices:
 
 - **PKCE is mandatory** for all authorization code flows. The client uses `S256` and **verifies the
-  authorization server's `code_challenge_methods_supported`**: it refuses to proceed if the server
-  explicitly advertises methods without `S256`, and warns (but proceeds) if the field is omitted.
+  authorization server's `code_challenge_methods_supported`**: it refuses to proceed if the field is
+  omitted, if it is not an array of strings (a String would answer `include?("S256")` for a server
+  that supports no PKCE at all), or if the array does not contain `S256`.
 - **State parameter** is used to prevent CSRF attacks
 - **Resource parameter** (RFC 8707) ensures token audience binding — sent in both the authorization
   and token requests as the canonical server URI
@@ -302,7 +350,21 @@ This implementation follows OAuth 2.1 security best practices:
 - **Peer text is sanitized** before it reaches a log line or an exception message (which
   `BrowserOAuth` renders on its error page): response bodies and error descriptions are stripped of
   control characters and bounded, and a body that is not JSON is reported by position and size
-  (`malformed JSON, at line 1 column 1, 26 byte body`) rather than by the bytes the parser choked on
+  (`malformed JSON, at line 1 column 1, 26 byte body`) rather than by the bytes the parser choked on.
+  The sanitizers are total — bytes that are not valid UTF-8 (a raw response body, an
+  `error_description=%FF` a callback carries, the undecodable fragment a JSON parser quotes back) are
+  replaced rather than raising `ArgumentError` out of the rescue path that was reporting them
+- **Credentials never reach a log** at any level: the `Authorization` header is not logged even
+  truncated, and the browser callback logs the request path without the query string that carries
+  `code=`
+- **A redirect URI must be one a callback can arrive on**: an `http`/`https` URL with a host, or an
+  RFC 8252 §7.1 private-use scheme with a path, and never with a fragment (RFC 6749 §3.1.2) — so a
+  dynamic registration cannot send the browser to `javascript:alert(1)`, `data:text/html,…` or a
+  bare `http:`
+- **Client credentials go out the way they were registered**: `client_secret_basic` (RFC 7591's
+  default when a registration names no method) in an `Authorization: Basic` header, form-urlencoded
+  before base64 (RFC 6749 §2.3.1); `client_secret_post` in the body; nothing for a public client or
+  for a method this client cannot present
 - **Secure token storage** guidelines should be followed
 
 ## Examples
