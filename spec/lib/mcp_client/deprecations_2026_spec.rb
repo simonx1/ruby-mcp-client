@@ -237,6 +237,12 @@ RSpec.describe 'MCP 2026-07-28 deprecations' do
     expect { MCPClient::Deprecations.warn(:bogus, logger) }.to raise_error(ArgumentError, /bogus/)
   end
 
+  it 'works when loaded on its own' do
+    script = "require 'mcp_client/deprecations'; " \
+             'exit(MCPClient::Deprecations.warn(:roots, Logger.new(File::NULL)) ? 0 : 1)'
+    expect(system(RbConfig.ruby, '-Ilib', '-e', script, out: File::NULL, err: File::NULL)).to be(true)
+  end
+
   it 'is loaded by the standalone client entry point' do
     script = "require 'mcp_client/client'; " \
              'MCPClient::Client.new(mcp_server_configs: [], sampling_handler: ->(*) {}, roots: [], ' \
