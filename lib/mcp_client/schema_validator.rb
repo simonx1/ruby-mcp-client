@@ -2,6 +2,7 @@
 
 require 'uri'
 require_relative 'schema_validator/references'
+require_relative 'schema_validator/keyword_scan'
 
 module MCPClient
   # Self-contained JSON Schema validator used to check a tool call result's
@@ -51,6 +52,7 @@ module MCPClient
   # keywords a schema uses; callers surface them as a warning.
   module SchemaValidator
     extend References
+    extend KeywordScan
 
     # Raised inside a validation to abandon it (time budget, resource bound).
     class Aborted < StandardError; end
@@ -161,6 +163,17 @@ module MCPClient
     # Per-validation state.
     Context = Struct.new(:root, :deadline, :dialect, :visits, :errors, :speculative, :anchors, keyword_init: true)
 
+    # Raised while normalizing a schema whose structure exceeds the bounds,
+    # so a peer-supplied document is never copied whole.
+    class TooLarge < StandardError; end
+
+    # Structural objects (schemas and the keyword maps holding them) a
+    # schema document may contain before it is rejected unread. A usable
+    # schema has at most MAX_SUBSCHEMAS subschemas, each with a handful of
+    # keyword maps at most, so this bound only ever stops documents the
+    # preflight would reject anyway.
+    MAX_STRUCTURAL_OBJECTS = MAX_SUBSCHEMAS * 4
+
     # The dialect a schema declares, or the default.
     # @param schema [Object] the schema
     # @return [String] the `$schema` value (without a trailing `#`), or DEFAULT_DIALECT
@@ -198,10 +211,25 @@ module MCPClient
     # @param schema [Object] the schema (string or symbol keys)
     # @return [Array<String>] problems (empty when the schema is usable)
     def self.check_schema(schema)
-      return [] if [true, false].include?(schema)
-      return ["schema must be an object or a boolean, got #{json_type(schema)}"] unless schema.is_a?(Hash)
+      check_normalized(normalize_schema(schema))
+    rescue TooLarge => e
+      [e.message]
+    end
 
-      root = deep_stringify(schema)
+    # A bounded, string-keyed copy of a schema (booleans pass through).
+    # @param schema [Object]
+    # @return [Object]
+    # @raise [TooLarge] when the document exceeds MAX_STRUCTURAL_OBJECTS
+    def self.normalize_schema(schema)
+      schema.is_a?(Hash) ? deep_stringify(schema, 0, { objects: 0 }) : schema
+    end
+
+    # {.check_schema} on an already normalized schema.
+    # @return [Array<String>] problems
+    def self.check_normalized(root)
+      return [] if [true, false].include?(root)
+      return ["schema must be an object or a boolean, got #{json_type(root)}"] unless root.is_a?(Hash)
+
       declared = dialect(root)
       return ['$schema must be a non-empty string naming the dialect'] if declared.nil?
       unless supported_dialect?(declared)
@@ -452,40 +480,6 @@ module MCPClient
     # value position, so it cannot serve as the marker).
     UNRESOLVED = Object.new.freeze
 
-    # List the unsupported JSON Schema keywords a schema uses (anywhere: at the
-    # top level or nested in subschemas). Property names that merely look like
-    # keywords (e.g. a property called 'not') are not reported, and
-    # data-carrying keywords (enum/const/default/examples) are not scanned.
-    # The scan stops at the same bounds as {.check_schema} (a schema beyond
-    # them is unusable anyway), so a huge server-supplied schema is never
-    # walked whole.
-    # @param schema [Object] the JSON schema (string or symbol keys)
-    # @return [Array<String>] unique unsupported keywords, in discovery order
-    def self.unsupported_keywords(schema)
-      found = []
-      declared = dialect(schema)
-      scan = { count: 0, dialect: declared && canonical_dialect(declared) }
-      collect_unsupported_keywords(schema, found, 0, scan)
-      found.uniq
-    end
-
-    # Recursively collect unsupported keywords from a schema (keywords the
-    # dialect does not define are unknown, not unsupported).
-    # @param schema [Object] a (sub)schema; non-Hash values are ignored
-    # @param found [Array<String>] accumulator
-    # @param scan [Hash] :count of subschemas seen so far and the canonical :dialect
-    # @return [void]
-    def self.collect_unsupported_keywords(schema, found, depth, scan)
-      return unless schema.is_a?(Hash) && depth <= MAX_SCHEMA_DEPTH
-
-      scan[:count] += 1
-      return if scan[:count] > MAX_SUBSCHEMAS
-
-      schema = schema.transform_keys(&:to_s)
-      found.concat((schema.keys & UNSUPPORTED_KEYWORDS).select { |k| keyword_known?(k, scan[:dialect]) })
-      each_subschema(schema, scan[:dialect]) { |sub| collect_unsupported_keywords(sub, found, depth + 1, scan) }
-    end
-
     # Validate data against a schema. An unusable schema (see
     # {.check_schema}) is reported as validation errors, never as a pass,
     # and so is a validation that hit a resource bound.
@@ -496,15 +490,17 @@ module MCPClient
     # @param deadline [Float, nil] monotonic deadline for the whole validation
     # @return [Array<String>] human-readable validation errors (empty if valid)
     def self.validate(data, schema, path: '#', deadline: nil)
-      problems = check_schema(schema)
+      root = normalize_schema(schema)
+      problems = check_normalized(root)
       return problems.map { |problem| "#{path}: #{problem}" } unless problems.empty?
 
       # One deadline covers the entire (recursive) validation.
       deadline ||= Process.clock_gettime(Process::CLOCK_MONOTONIC) + PATTERN_MATCH_TIMEOUT
-      root = schema.is_a?(Hash) ? deep_stringify(schema) : schema
       ctx = Context.new(root: root, deadline: deadline, dialect: canonical_dialect(dialect(root)),
                         visits: 0, errors: 0, speculative: 0, anchors: nil)
       validate_node(data, root, path, ctx, 0)
+    rescue TooLarge => e
+      ["#{path}: #{e.message}"]
     rescue Aborted => e
       ["#{path}: validation aborted: #{e.message}"]
     end
@@ -635,7 +631,9 @@ module MCPClient
     # if / then / else.
     # @return [Array<String>] validation errors
     def self.validate_conditional(data, schema, path, ctx, ref_depth)
-      return [] unless schema.key?('if')
+      # An `if` without `then` or `else` asserts nothing (JSON Schema 2020-12
+      # Section 10.2.2.1) and is not evaluated.
+      return [] unless schema.key?('if') && (schema.key?('then') || schema.key?('else'))
 
       branch = speculative(ctx) { validate_node(data, schema['if'], path, ctx, ref_depth).empty? } ? 'then' : 'else'
       return [] unless schema.key?(branch)
@@ -877,20 +875,28 @@ module MCPClient
     # A copy of the schema with every structural Hash key as a String, so
     # keyword lookups and JSON pointers see one key form. Data-carrying
     # keywords (enum, const, default, examples) are left exactly as given,
-    # and the walk stops at the nesting bound.
+    # the walk stops at the nesting bound, and — given a budget — the copy
+    # stops as soon as the document holds more structural objects than
+    # MAX_STRUCTURAL_OBJECTS, before the rest is ever read.
     # @param node [Object]
     # @param depth [Integer]
+    # @param budget [Hash, nil] :objects copied so far
     # @return [Object]
-    def self.deep_stringify(node, depth = 0)
+    # @raise [TooLarge] when the budget is exceeded
+    def self.deep_stringify(node, depth = 0, budget = nil)
       return node if depth > MAX_SCHEMA_DEPTH + 1
 
       case node
       when Hash
+        if budget && (budget[:objects] += 1) > MAX_STRUCTURAL_OBJECTS
+          raise TooLarge, "schema has more than #{MAX_STRUCTURAL_OBJECTS} objects"
+        end
+
         node.to_h do |key, value|
           name = key.to_s
-          [name, DATA_KEYWORDS.include?(name) ? value : deep_stringify(value, depth + 1)]
+          [name, DATA_KEYWORDS.include?(name) ? value : deep_stringify(value, depth + 1, budget)]
         end
-      when Array then node.map { |value| deep_stringify(value, depth + 1) }
+      when Array then node.map { |value| deep_stringify(value, depth + 1, budget) }
       else node
       end
     end
