@@ -7,6 +7,15 @@ metadata). Each feature lands in its own PR; this section accumulates them.
 
 ### Tasks extension (`io.modelcontextprotocol/tasks`)
 
+- **Every path that replaces an HTTP session moves the session epoch (round
+  35).** The 404 recovery already did (round 32), but it is not the only way
+  a session is replaced without a `cleanup`: `terminate_session` — the
+  host's own DELETE, and the one `cleanup` sends — now ends the epoch too,
+  whatever the server answers, and so does a handshake that lands a
+  different session id on a live one. Anything keyed by the session that
+  ended (task ids, answered and pending input keys) therefore dies with it
+  instead of colouring an id the next session reuses: a task handle from
+  a terminated session is refused rather than sent into its successor.
 - **A task handle carries the session its request was sent in (round 33).**
   A `Task` is now stamped with the session epoch the request that produced
   it was pinned to, instead of sampling the server when the object happens

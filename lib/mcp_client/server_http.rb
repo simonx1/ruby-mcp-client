@@ -243,7 +243,7 @@ module MCPClient
       session_id = response.headers['mcp-session-id'] || response.headers['Mcp-Session-Id']
       if session_id
         if valid_session_id?(session_id)
-          @session_id = session_id
+          capture_session_id(session_id)
           @logger.debug("Captured session ID: #{@session_id}")
         else
           @logger.warn("Invalid session ID format received: #{session_id.inspect}")
