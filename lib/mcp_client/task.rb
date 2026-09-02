@@ -222,7 +222,9 @@ module MCPClient
       return nil unless @ttl.is_a?(Numeric) && @created_at.is_a?(String)
 
       (Time.iso8601(@created_at) + (@ttl / 1000.0)) - now
-    rescue ArgumentError
+    rescue ArgumentError, RangeError, TypeError # FloatDomainError is a RangeError
+      # An unparseable timestamp, or a peer-supplied ttlMs too large for a
+      # Time: no backstop, never a raw exception out of a poll.
       nil
     end
 

@@ -30,7 +30,7 @@ module MCPClient
 
         srv = tool.server
         raise MCPClient::Errors::ServerNotFound, "No server found for tool '#{tool_name}'" unless srv
-        return call_tool_as_modern_task(tool_name, parameters, srv) if modern_server?(srv)
+        return call_tool_as_modern_task(tool_name, parameters, srv, tool: tool) if modern_server?(srv)
 
         unless server_supports_task_tool_call?(srv)
           raise MCPClient::Errors::TaskError,

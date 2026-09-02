@@ -306,7 +306,12 @@ module MCPClient
       # them fails afterwards.
       # @return [void]
       def remember_answered_keys(srv, task_id, keys)
-        state = task_state(srv, task_id)
+        remember_answered_keys_in(task_state(srv, task_id), keys)
+      end
+
+      # @param state [Hash] the task state the update is bound to
+      # @return [void]
+      def remember_answered_keys_in(state, keys)
         answered_keys_mutex.synchronize do
           state[:answered].merge(keys)
           state[:submitted].merge(keys)
@@ -355,16 +360,25 @@ module MCPClient
       NO_KEYS = Set.new.freeze
       private_constant :NO_KEYS
 
-      # Keys an abandoned handler still presents, kept apart from the task's
+      # Keys a running handler presents, kept apart from the task's
       # bookkeeping so no forget lets a retry present them again meanwhile.
-      # A read allocates nothing; the reservation that may need to hold keys
-      # asks for the set to be created.
-      # @return [Set<String>] (callers hold answered_keys_mutex)
+      # A read allocates nothing; the reservation that holds keys asks for
+      # the set to be created and receives its registry key with it.
+      # @return [Set<String>, Array(Set<String>, Array)] (callers hold answered_keys_mutex)
       def in_flight_task_keys(srv, task_id, create: false)
         key = task_state_key(srv, task_id)
-        return (@in_flight_keys ||= {})[key] ||= Set.new if create
+        return [(@in_flight_keys ||= {})[key] ||= Set.new, key] if create
 
         @in_flight_keys&.fetch(key, nil) || NO_KEYS
+      end
+
+      # Drop a registry entry once its own set is empty; another task's or
+      # session's entry is never touched.
+      # @return [void] (callers hold answered_keys_mutex)
+      def release_in_flight_entry(held, held_key)
+        return unless held.empty? && @in_flight_keys && @in_flight_keys[held_key].equal?(held)
+
+        @in_flight_keys.delete(held_key)
       end
 
       # Send a task request through a transport that may implement only the
@@ -426,7 +440,10 @@ module MCPClient
           return true if input_responses.nil?
 
           keys = input_responses.keys.map(&:to_s)
-          remember_answered_keys(srv, task_id, keys)
+          # Bound to the state fetched above: a session that restarts
+          # meanwhile must not split the answered keys from the payload
+          # that would resend them.
+          remember_answered_keys_in(state, keys)
           begin
             task_rpc(srv, 'tasks/update', { taskId: task_id, inputResponses: input_responses }, timeout: timeout)
             answered_keys_mutex.synchronize { state[:pending_update] = nil }
@@ -647,7 +664,7 @@ module MCPClient
       # tools/call on a 2026-07-28 server: the server alone decides whether to
       # answer with a task, so send a plain call and wrap the outcome.
       # @return [MCPClient::Task] the server's task, or a locally completed one
-      def call_tool_as_modern_task(tool_name, parameters, srv)
+      def call_tool_as_modern_task(tool_name, parameters, srv, tool: nil)
         ensure_tasks_extension!(srv)
         result = begin
           srv.call_tool(tool_name, parameters)
@@ -667,6 +684,9 @@ module MCPClient
         end
         return created_task(result, srv) if task_result?(result)
 
+        # Answered synchronously: the result is validated against the tool's
+        # outputSchema exactly as #call_tool would.
+        result = validate_structured_content!(tool, result) if tool
         MCPClient::Task.completed_locally(result, server: srv)
       end
 
@@ -752,32 +772,18 @@ module MCPClient
         # that fails gives the keys back, except those answered through
         # #update_task in the meantime.
         state = task_state(srv, task.task_id)
-        # The hold a timed-out handler may leave belongs to the session the
-        # handler starts in: its set is fixed here, before anything runs.
-        held = nil
-        pending = answered_keys_mutex.synchronize do
-          keys = requests.except(*answered, *in_flight_task_keys(srv, task.task_id).to_a)
-          next keys if keys.empty?
-
-          held = in_flight_task_keys(srv, task.task_id, create: true)
-          if state[:rounds] >= MAX_TASK_INPUT_ROUNDS
-            raise MCPClient::Errors::InputRequiredError.new(
-              "Task '#{shown_task_id(task.task_id)}' kept requesting input after #{MAX_TASK_INPUT_ROUNDS} rounds",
-              data: task.to_h
-            )
-          end
-
-          state[:rounds] += 1
-          answered.merge(keys.keys)
-          keys
-        end
+        # The keys a handler presents are in flight from the moment it
+        # starts, in the set of the session it starts in — fixed here,
+        # before anything runs — so no forget of the task's bookkeeping lets
+        # a retry present them again while the host is still answering.
+        pending, held, held_key = reserve_input_requests(task, requests, answered, srv, state)
         return [] if pending.empty?
 
         abandoned = false
         begin
           responses = bounded_by_wait(wait, on_abandon: lambda { |runner|
             abandoned = true
-            hold_in_flight_keys(runner, state, answered, pending.keys, held)
+            hold_in_flight_keys(runner, state, answered, pending.keys, held, held_key)
           }) { srv.fulfil_input_requests(pending, task.to_h) }
           # The whole deadline (caller timeout and task TTL) is enforced
           # before anything is delivered.
@@ -789,10 +795,14 @@ module MCPClient
             answered_keys_mutex.synchronize do
               answered.subtract(pending.keys - state[:submitted].to_a)
               state[:rounds] -= 1 if state[:rounds].positive?
+              end_in_flight(pending.keys, held, held_key)
             end
           end
           raise
         end
+        # The handler answered: its keys are no longer in flight (the
+        # answered set keeps them deduplicated for this session).
+        answered_keys_mutex.synchronize { end_in_flight(pending.keys, held, held_key) }
         # A session that restarted while the host was answering may have
         # reused the task id and the keys: the answers belong to the ended
         # session and are not delivered; the next poll asks again.
@@ -847,16 +857,41 @@ module MCPClient
         runner.value
       end
 
+      # Reserve, in one step under the registry lock, the requests nobody is
+      # answering yet: they join the answered set, the in-flight set of this
+      # session, and cost one input round.
+      # @return [Array(Hash, Set, Array)] the requests to answer, the in-flight set and its key
+      # @raise [MCPClient::Errors::InputRequiredError] past MAX_TASK_INPUT_ROUNDS
+      def reserve_input_requests(task, requests, answered, srv, state)
+        answered_keys_mutex.synchronize do
+          keys = requests.except(*answered, *in_flight_task_keys(srv, task.task_id).to_a)
+          return [keys, nil, nil] if keys.empty?
+
+          if state[:rounds] >= MAX_TASK_INPUT_ROUNDS
+            raise MCPClient::Errors::InputRequiredError.new(
+              "Task '#{shown_task_id(task.task_id)}' kept requesting input after #{MAX_TASK_INPUT_ROUNDS} rounds",
+              data: task.to_h
+            )
+          end
+
+          held, held_key = in_flight_task_keys(srv, task.task_id, create: true)
+          held.merge(keys.keys)
+          state[:rounds] += 1
+          answered.merge(keys.keys)
+          [keys, held, held_key]
+        end
+      end
+
       # An abandoned handler is still presenting its requests: the keys stay
       # reserved until it finishes (a later wait polls instead of asking the
       # host again, and the late answer is dropped), and the round it never
       # completed is given back so retries of a timed-out wait cannot spend
       # the per-task budget on one outstanding request.
       # @return [void]
-      def hold_in_flight_keys(runner, state, answered, keys, held)
+      def hold_in_flight_keys(runner, state, answered, keys, held, held_key = nil)
         # The hold is the set of the session the handler was started in; the
-        # watcher releases that very set, never one a later session's retry
-        # filled under the same task id and key after a restart.
+        # watcher releases that very set — and drops only its own registry
+        # entry — never one a later session's retry or another task filled.
         answered_keys_mutex.synchronize do
           state[:rounds] -= 1 if state[:rounds].positive?
           held.merge(keys)
@@ -870,10 +905,18 @@ module MCPClient
           end
           answered_keys_mutex.synchronize do
             answered.subtract(keys - state[:submitted].to_a)
-            held.subtract(keys)
-            @in_flight_keys&.delete_if { |_, set| set.empty? }
+            end_in_flight(keys, held, held_key)
           end
         end
+      end
+
+      # The keys a handler presented are no longer in flight.
+      # @return [void] (callers hold answered_keys_mutex)
+      def end_in_flight(keys, held, held_key)
+        return unless held
+
+        held.subtract(keys)
+        release_in_flight_entry(held, held_key) if held_key
       end
 
       # The wait before the next tasks/get: the server's pollIntervalMs

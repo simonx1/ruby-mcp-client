@@ -7,6 +7,15 @@ metadata). Each feature lands in its own PR; this section accumulates them.
 
 ### Tasks extension (`io.modelcontextprotocol/tasks`)
 
+- **In-flight holds per task (round 26).** The keys a running input handler
+  presents are in flight from the moment it starts (not only once it is
+  abandoned) and each watcher touches only the registry entry it owns, so
+  another task's finishing handler can never drop a live reservation and a
+  TTL retry never asks the host twice for one key; a `tasks/update` binds
+  its answered keys and its pending payload to the same session state; a
+  synchronous answer to `call_tool_as_task` on a 2026-07-28 server is
+  validated against the tool's `outputSchema` like `call_tool`; an
+  overflowing `ttlMs` means no backstop rather than a raw exception.
 - **In-flight holds survive forgets (round 23).** The keys an abandoned
   input handler is still presenting stay reserved apart from the task's
   bookkeeping, so the TTL backstop, a gone task or a terminal lookup

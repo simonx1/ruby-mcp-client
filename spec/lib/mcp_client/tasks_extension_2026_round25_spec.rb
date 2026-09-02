@@ -20,8 +20,8 @@ RSpec.describe 'MCP 2026-07-28 tasks extension — round 25' do
     state = client.send(:task_state, srv, 'task-1')
     answered = client.send(:answered_task_keys, srv, 'task-1')
     answered << 'k1'
-    held = client.send(:in_flight_task_keys, srv, 'task-1', create: true)
-    client.send(:hold_in_flight_keys, runner, state, answered, ['k1'], held)
+    held, key = client.send(:in_flight_task_keys, srv, 'task-1', create: true)
+    client.send(:hold_in_flight_keys, runner, state, answered, ['k1'], held, key)
   end
 
   def settled?
@@ -63,10 +63,10 @@ RSpec.describe 'MCP 2026-07-28 tasks extension — round 25' do
     runner = Thread.new { gate.pop }
     state = client.send(:task_state, stdio, 'task-1')
     answered = client.send(:answered_task_keys, stdio, 'task-1')
-    held = client.send(:in_flight_task_keys, stdio, 'task-1', create: true)
+    held, key = client.send(:in_flight_task_keys, stdio, 'task-1', create: true)
 
     stdio.send(:bump_session_epoch)
-    client.send(:hold_in_flight_keys, runner, state, answered, ['k1'], held)
+    client.send(:hold_in_flight_keys, runner, state, answered, ['k1'], held, key)
 
     expect(held).to include('k1')
     expect(client.send(:in_flight_task_keys, stdio, 'task-1')).to be_empty
