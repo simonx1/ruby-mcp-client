@@ -282,7 +282,7 @@ module MCPClient
         # A challenge received meanwhile — refused, still to be fetched, or
         # naming another authorization server — or cached metadata for
         # another server ends this flow here, not after a success page.
-        if @challenge_error || @challenge_metadata_url
+        if @challenge_error || (@challenge_metadata_url && @challenge_resource_metadata.nil?)
           raise MCPClient::Errors::ConnectionError,
                 'Authorization response rejected: a challenge received during the flow must be resolved first; ' \
                 'restart the authorization'
@@ -375,6 +375,8 @@ module MCPClient
         # Metadata discovery would reject is refused now, whole: it neither
         # retires the token nor lingers as an authoritative challenge.
         reject_unacceptable_challenge!(metadata)
+        # A validated challenge supersedes an earlier refused one.
+        @challenge_error = nil
         # Reuse this challenge-advertised metadata during the subsequent OAuth
         # flow instead of re-deriving (and possibly missing) the well-known URL.
         @challenge_resource_metadata = metadata
@@ -411,7 +413,7 @@ module MCPClient
           reject_challenge!(e.message)
         end
         advertised = Array(resource_metadata.authorization_servers).first
-        return unless advertised
+        reject_challenge!('Protected resource metadata does not advertise any authorization_servers') unless advertised
 
         validate_peer_advertised_url!(advertised, 'authorization server URL (from resource metadata)')
       end
@@ -983,12 +985,12 @@ module MCPClient
         host = uri.hostname.to_s.downcase
 
         if uri.scheme != 'https' && !(uri.scheme == 'http' && local_development?)
-          reject_challenge!("OAuth #{label} must use HTTPS: #{url}")
+          reject_challenge!("OAuth #{label} must use HTTPS: #{safe_error_text(url)}")
         end
-        reject_challenge!("OAuth #{label} must not target a loopback or private address: #{url}") if
+        reject_challenge!("OAuth #{label} must not target a loopback or private address: #{safe_error_text(url)}") if
           local_address?(host) && !local_development?
       rescue URI::InvalidURIError
-        reject_challenge!("OAuth #{label} is not a valid URL: #{url}")
+        reject_challenge!("OAuth #{label} is not a valid URL: #{safe_error_text(url)}")
       end
 
       # @param message [String] why the challenge was refused
@@ -999,6 +1001,7 @@ module MCPClient
         @challenge_scope = nil
         @challenge_metadata_url = nil
         @challenge_resource_metadata = nil
+        @resource_metadata = nil
         @challenge_error = message
         raise MCPClient::Errors::ConnectionError, message
       end
@@ -1062,7 +1065,7 @@ module MCPClient
         return if advertised == expected
 
         raise MCPClient::Errors::ConnectionError,
-              "Protected resource metadata resource (#{resource_metadata.resource}) " \
+              "Protected resource metadata resource (#{safe_error_text(resource_metadata.resource.to_s)}) " \
               "does not match the server URL (#{server_url})"
       end
 
@@ -1092,7 +1095,7 @@ module MCPClient
 
         "#{scheme}://#{host}#{":#{port}" if port}#{path}#{query}"
       rescue URI::InvalidURIError
-        raise MCPClient::Errors::ConnectionError, "Invalid resource URL: #{url}"
+        raise MCPClient::Errors::ConnectionError, "Invalid resource URL: #{safe_error_text(url.to_s)}"
       end
 
       # Fetch resource metadata from URL.
