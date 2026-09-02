@@ -9,6 +9,7 @@ require 'logger'
 module MCPClient
   # JSON-RPC implementation of MCP server over stdio.
   class ServerStdio < ServerBase
+    require_relative 'server_stdio/child_session'
     require_relative 'server_stdio/json_rpc_transport'
 
     include JsonRpcTransport
@@ -28,10 +29,10 @@ module MCPClient
     # for the server to exit, send SIGTERM, then SIGKILL if it still runs.
     SHUTDOWN_GRACE_PERIOD = 2
 
-    # Seconds a process restarted for its subscriptions must stay up — counted
-    # from the moment it became ready, not from the moment it was spawned —
-    # before another unexpected exit counts as a crash rather than a crash
-    # loop (see {JsonRpcTransport#restart_for_open_subscriptions}).
+    # Seconds a process must last after the open subscriptions were re-sent to
+    # it — counted from the moment it received them, not from the moment it
+    # was spawned — before another unexpected exit counts as a crash rather
+    # than a crash loop (see {JsonRpcTransport#reopen_subscriptions}).
     SUBSCRIPTION_RESTART_MIN_INTERVAL = 5
 
     # Chunk size (bytes) used when draining the subprocess stderr pipe
@@ -103,12 +104,11 @@ module MCPClient
       # thread only ever speaks for the transport it was started for.
       @transport_generation = 0
       @transport_retired = false
-      # Crash-loop bookkeeping for a process restarted to keep subscriptions
-      # alive: how many restarts are in flight (they can nest — see
-      # JsonRpcTransport#restart_session), and when the process the latest one
-      # spawned became ready (see JsonRpcTransport#restarting_too_often?).
-      @restarting_for_subscriptions = 0
-      @subscription_restart_ready_at = nil
+      # The record of the live child process, and of the one the open
+      # subscriptions were last re-sent to — the crash-loop bound is read from
+      # the latter (see ChildSession and JsonRpcTransport#reopen_subscriptions).
+      @session = nil
+      @subscription_carrier = nil
     end
 
     # Server info from the initialize response
@@ -834,6 +834,11 @@ module MCPClient
         @pending.clear
         @awaiting.clear
       end
+      # The process this session was is gone, whatever else went wrong above.
+      # Its record outlives it: it is what the next session's re-send of the
+      # open subscriptions asks about (JsonRpcTransport#reopen_subscriptions).
+      @session&.ended
+      @session = nil
       @stdin = @stdout = @stderr = @wait_thread = @reader_thread = @stderr_thread = nil
       # The next request re-establishes the process and, on a modern
       # server, re-sends the subscriptions the host still holds.
