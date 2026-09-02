@@ -118,7 +118,9 @@ metadata). Each feature lands in its own PR; this section accumulates them.
   is already bound to (another provider sharing the storage finished the
   switch) retires nothing, and that token is presented at once: a
   validated pending challenge is the authoritative server for tokens, as
-  it already is for discovery.
+  it already is for discovery. A token inside its early-refresh window is
+  presented when the refresh — or the discovery it needs — cannot run;
+  only an expired token whose refresh fails yields none.
 
 ### Tasks extension (`io.modelcontextprotocol/tasks`)
 

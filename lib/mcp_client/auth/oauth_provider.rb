@@ -129,8 +129,21 @@ module MCPClient
         # Return token if still valid
         return token unless token.expired? || token.expires_soon?
 
-        # Try to refresh if we have a refresh token
-        refresh_token(token) if token.refresh_token
+        # Refresh early when possible; a still-valid token is presented when
+        # the refresh (or the discovery it needs) cannot run right now.
+        refreshed = refresh_if_possible(token)
+        refreshed || (token.expired? ? nil : token)
+      end
+
+      # @param token [Token]
+      # @return [Token, nil] the refreshed token, or nil when no refresh could be obtained
+      def refresh_if_possible(token)
+        return nil unless token.refresh_token
+
+        refresh_token(token)
+      rescue MCPClient::Errors::ConnectionError => e
+        logger.warn("Token refresh could not run: #{e.message}")
+        nil
       end
 
       # Return the scopes supported by the authorization server
