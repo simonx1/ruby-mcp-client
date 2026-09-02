@@ -7,6 +7,20 @@ metadata). Each feature lands in its own PR; this section accumulates them.
 
 ### Cacheable results (`ttlMs` / `cacheScope`)
 
+- **A probe that changes nothing, and empty snapshots (round 25).** The
+  freshness probe starts from a detached copy of the header table even when
+  the transport was configured with Faraday's own, so the `Authorization`
+  an OAuth provider applies while probing never lands in the headers real
+  requests are built from (a removed token cannot linger there). Host
+  middleware (`faraday_config`) that shares mutable state with the live
+  stack — a nonce or one-time token counter the fresh copy points at too —
+  is no longer run by the probe: it reports the unknown context instead, so
+  probing can neither spend a credential nor make the next request skip
+  one. Middleware sharing only immutable state is still predicted. The
+  client-level list caches track which servers have filled their slice, so
+  a completed snapshot whose lists are all empty is served while it is
+  fresh instead of re-issuing the list request on every call.
+
 - **One Authorization, and unpredictable middleware (round 24).** The
   freshness probe resolves the `Authorization` a Faraday request would
   really carry: the header table is case-insensitive, so a provider's

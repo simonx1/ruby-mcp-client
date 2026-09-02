@@ -24,6 +24,16 @@ module MCPClient
       # may skip it.
       PROBE_TRANSPARENT_MIDDLEWARE = %w[Faraday::Retry::Middleware Faraday::Request::Retry].freeze
 
+      # Collaborators a middleware may share with the live stack without the
+      # probe changing what a later request sends: they carry no request
+      # state of their own (a logger writes, a lock guards).
+      PROBE_SAFE_SHARED_STATE = [Logger, Mutex, Module].freeze
+
+      # How far into shared state its immutability is checked: a frozen
+      # container may still hold mutable members, and beyond this depth the
+      # state counts as mutable (so the context is unknown).
+      PROBE_IMMUTABLE_DEPTH = 8
+
       # Last request middleware on the JSON-RPC connection: records the
       # Authorization a request carries once every host middleware
       # (faraday_config) has run, right before the adapter sends it. A
@@ -182,9 +192,11 @@ module MCPClient
       # headers it would go out with. Only `on_request` hooks run: response
       # middleware (raise_error, a parser) never sees a response here, and
       # the recorder must not note the probe as a sent request. Middleware
-      # that overrides `call` cannot be run without sending, and middleware
-      # whose own state has moved on since the connection was built cannot
-      # be stood in for by a fresh copy; the answer is then unknown.
+      # that overrides `call` cannot be run without sending, middleware whose
+      # own state has moved on since the connection was built cannot be stood
+      # in for by a fresh copy, and middleware that shares mutable state with
+      # the live stack must not be run at all (the probe would change it);
+      # the answer is then unknown.
       # @param headers [Hash] the headers before middleware
       # @param method [String] the JSON-RPC method the probe models
       # @param params [Hash] its params
@@ -249,9 +261,7 @@ module MCPClient
       # will call would. Middleware that keeps state of its own — a token
       # rotated per request, anything learned from an earlier response —
       # drifts from a fresh copy, and the copy would then keep predicting
-      # credentials the real request has already moved past. State the host
-      # keeps outside the middleware (a holder both instances point at) is
-      # shared, so those stacks stay predictable.
+      # credentials the real request has already moved past.
       # @param fresh [Faraday::Middleware] the instance the probe would run
       # @param live [Faraday::Middleware, nil] the instance Faraday calls
       # @return [Boolean]
@@ -269,10 +279,45 @@ module MCPClient
       end
 
       # @return [Boolean] whether two middleware ivars hold indistinguishable state
+      #   the probe may run against
       def same_middleware_state?(one, other)
-        one.equal?(other) || one == other
+        # State the host keeps outside the middleware (a holder both
+        # instances point at) is not copied by building a fresh middleware:
+        # running the copy's request hook would change the very state the
+        # live instance uses — spending a nonce, advancing a one-time token
+        # the next real request then never sends. Only shared state that
+        # cannot change may be stood in for.
+        return probe_safe_shared_state?(one) if one.equal?(other)
+
+        one == other
       rescue StandardError
         false
+      end
+
+      # @param value [Object] state the fresh and live middleware share
+      # @return [Boolean] whether running the probe against it can change nothing
+      def probe_safe_shared_state?(value)
+        probe_immutable_state?(value) || PROBE_SAFE_SHARED_STATE.any? { |klass| value.is_a?(klass) }
+      end
+
+      # Whether a value cannot be changed at all: a frozen container still
+      # yields mutable members, so they are checked too (to a bounded depth —
+      # deeper than that the state counts as mutable).
+      # @param value [Object]
+      # @param depth [Integer]
+      # @return [Boolean]
+      def probe_immutable_state?(value, depth = 0)
+        return false unless value.frozen?
+
+        case value
+        when Hash
+          depth < PROBE_IMMUTABLE_DEPTH &&
+            value.all? { |k, v| probe_immutable_state?(k, depth + 1) && probe_immutable_state?(v, depth + 1) }
+        when Array, Struct
+          depth < PROBE_IMMUTABLE_DEPTH && value.to_a.all? { |item| probe_immutable_state?(item, depth + 1) }
+        else
+          true
+        end
       end
 
       # @param klass [Class] a middleware class on the connection

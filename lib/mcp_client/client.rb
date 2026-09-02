@@ -98,6 +98,11 @@ module MCPClient
       # cache was filled under (MCP 2026-07-28 caching: a result is served
       # only to a request that would carry the same parameters).
       @cache_params = Hash.new { |h, k| h[k] = {}.compare_by_identity }
+      # Which servers have filled their slice of a list cache, so a snapshot
+      # is known to be complete however few items it holds: a server that
+      # legitimately lists nothing must be served from the cache too, not
+      # asked again on every call.
+      @cache_filled = {}
       # One lock for the list caches and their parameter tags: a freshness
       # check and the copy it approves are one snapshot, and the notification
       # thread's clears wait for it.
@@ -437,6 +442,7 @@ module MCPClient
         # A slice's tag goes with the slice: a leftover tag must not vouch
         # for a server whose slice a later, partial refill never rebuilt.
         @cache_params.clear
+        @cache_filled.clear
       end
     end
 
@@ -820,14 +826,33 @@ module MCPClient
       # middleware), which may clear this cache in turn: it runs outside the
       # lock, and the copy is served only when nothing changed meanwhile.
       version = @cache_mutex.synchronize { @cache_version }
-      return nil if cache.empty? || !caches_fresh?(kind)
+      # An empty snapshot is a hit too: a server may list nothing, and its
+      # entry says so for as long as it is fresh. What makes a hit is that
+      # every server has filled its slice, not that the hash holds items.
+      return nil unless @cache_mutex.synchronize { snapshot_complete?(kind) }
+      return nil unless caches_fresh?(kind)
 
       @cache_mutex.synchronize do
         # A cleanup that landed after the verdict replaced the transport
         # entries the slices came from; that check touches only the
         # transport's cache lock, so it can run under this one.
-        cached_copies(cache) if version == @cache_version && !cache.empty? && slices_still_current?(kind)
+        next unless version == @cache_version && snapshot_complete?(kind) && slices_still_current?(kind)
+
+        cached_copies(cache)
       end
+    end
+
+    # Whether every server this client talks to has filled its slice of a
+    # list cache (an empty list fills a slice as much as a long one does).
+    # Called under {@cache_mutex}.
+    # @param kind [Symbol]
+    # @return [Boolean]
+    def snapshot_complete?(kind)
+      filled = @cache_filled[kind]
+      return false if filled.nil?
+
+      list = servers
+      !list.empty? && list.all? { |server| filled.key?(server) }
     end
 
     # Whether every server's slice of a kind still comes from the transport
@@ -861,6 +886,8 @@ module MCPClient
       @cache_mutex.synchronize do
         @cache_version += 1
         drop_cached_entries(cache, server)
+        # This server's slice now stands for its whole list, empty or not.
+        (@cache_filled[kind] ||= {}.compare_by_identity)[server] = true
         if server.respond_to?(:current_params_fingerprint, true)
           # The slice is tied to the very transport entry its list came
           # from — its identity and the parameters that entry is bound to
@@ -1024,6 +1051,7 @@ module MCPClient
           @cache_version += 1
           @tool_cache.clear
           @cache_params.delete(:tools)
+          @cache_filled.delete(:tools)
         end
       when 'notifications/prompts/list_changed'
         logger.warn("[#{server_id}] Prompt list has changed, clearing prompt cache")
@@ -1031,6 +1059,7 @@ module MCPClient
           @cache_version += 1
           @prompt_cache.clear
           @cache_params.delete(:prompts)
+          @cache_filled.delete(:prompts)
         end
       when 'notifications/resources/list_changed'
         logger.warn("[#{server_id}] Resource list has changed, clearing resource cache")
@@ -1038,6 +1067,7 @@ module MCPClient
           @cache_version += 1
           @resource_cache.clear
           @cache_params.delete(:resources)
+          @cache_filled.delete(:resources)
         end
       end
     end
