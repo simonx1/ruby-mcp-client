@@ -2526,11 +2526,15 @@ metadata). Each feature lands in its own PR; this section accumulates them.
   handler error) or a malformed `inputRequests` raise
   `MCPClient::Errors::InputRequiredError` (exposing `input_requests` and
   `request_state`) without a retry; `input_required` on any other method is
-  an `InvalidResultError`. `server/discover` is not one of the three methods
-  that may be answered with `input_required` either: such an answer is
-  refused before any protocol version or capability it carries is applied or
-  cached, so a probe can never adopt a version out of an unfinished result
-  and hand that result back as the first heartbeat.
+  an `InvalidResultError`.
+  Writing that notice is a courtesy, not part of the decision: a logger that
+  raises costs the notice and never the elicitation, the same isolation
+  `MCPClient::Deprecations.warn` has.
+  `server/discover` is not one of the three methods that may be answered
+  with `input_required` either: such an answer is refused before any
+  protocol version or capability it carries is applied or cached, so a probe
+  can never adopt a version out of an unfinished result and hand that result
+  back as the first heartbeat.
 
 ### Custom headers from tool parameters (`x-mcp-header`)
 

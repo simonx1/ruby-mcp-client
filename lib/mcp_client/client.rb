@@ -1739,10 +1739,16 @@ module MCPClient
       return metadata.merge('elicitationId' => params['elicitationId']) unless modern_server?(server)
 
       if params.key?('elicitationId')
-        # The value is a server-chosen correlation id: name the field, never
-        # quote it.
-        @logger.warn('Ignoring elicitationId on a URL-mode elicitation request: MCP 2026-07-28 removed the field ' \
-                     '(the outcome is learned by retrying the original request; correlate via requestState)')
+        # Dropping the field is the protocol decision; saying so is a
+        # courtesy. A logger that raises costs the notice, never the
+        # elicitation — the value is a server-chosen correlation id, so the
+        # message names the field and never quotes it.
+        begin
+          @logger.warn('Ignoring elicitationId on a URL-mode elicitation request: MCP 2026-07-28 removed the field ' \
+                       '(the outcome is learned by retrying the original request; correlate via requestState)')
+        rescue StandardError
+          nil
+        end
       end
       metadata
     end
