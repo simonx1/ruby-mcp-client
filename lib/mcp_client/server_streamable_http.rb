@@ -613,6 +613,8 @@ module MCPClient
     # Clean up the server connection
     # Properly closes HTTP connections, stops threads, and clears cached state
     def cleanup
+      # A torn-down connection ends the session its tasks lived in.
+      bump_session_epoch
       @mutex.synchronize do
         return unless @connection_established || @initialized
 

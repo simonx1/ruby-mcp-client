@@ -77,8 +77,18 @@ metadata). Each feature lands in its own PR; this section accumulates them.
   handle the server completed synchronously returns its result without
   selecting or probing a server; an answer lost twice is still carried by
   the update that answers the next key; `mcp_client/client/task_support`
-  requires `set` and the task model, so `require 'mcp_client/client'`
-  drives a wait on its own.
+  requires the task model and the JSON-RPC common module, so
+  `require 'mcp_client/client'` drives a wait and answers
+  `tasks_extension?` on its own.
+- **Session-scoped bookkeeping.** Updates to one task are serialized, so a
+  concurrent update that read an empty pending slot can never confirm and
+  wipe an answer another delivery had just left pending. Task bookkeeping
+  (answered keys, pending answers, input rounds) is keyed by the
+  transport's `session_epoch` (bumped by every `cleanup`, including a
+  restarted stdio process) and dropped once the task is gone
+  (`TaskNotFound`) or past its TTL, so a reused task id never inherits
+  it. A poll that times out before the server ever said a pace waits the
+  default interval, not the busy-loop floor.
 
 ### Cacheable results (`ttlMs` / `cacheScope`)
 
