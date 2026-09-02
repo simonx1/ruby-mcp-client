@@ -157,7 +157,8 @@ module MCPClient
         # checked against an authenticated value.
         pkce = PKCE.new(issuer: server_metadata.issuer,
                         iss_parameter_supported: server_metadata.iss_parameter_supported?,
-                        client_id: client_info.client_id)
+                        client_id: client_info.client_id,
+                        redirect_uri: client_info.metadata.redirect_uris.first)
         storage.set_pkce(server_url, pkce)
 
         # Generate state parameter
@@ -769,8 +770,14 @@ module MCPClient
         # (Client ID Metadata Document), and a dynamic registration is
         # discarded so the next flow re-registers.
         @authorization_server_switched = true
-        delete_token(bind_to: previous.issuer)
+        @supported_scopes = nil
+        # Records another provider sharing the storage already bound to the
+        # new server are its: only unbound ones and those of the previous
+        # server are affected.
+        delete_token(bind_to: previous.issuer) unless record_bound_to?(stored_token_or_nil, current.issuer)
         client_info = stored_client_info
+        return if record_bound_to?(client_info, current.issuer)
+
         if client_info.respond_to?(:issuer) && client_info.issuer.nil? && !portable_client?(client_info)
           client_info = client_info.with_issuer(previous.issuer,
                                                 registration_type: resolved_registration_type(client_info))
@@ -778,8 +785,22 @@ module MCPClient
         end
         keep = client_info.respond_to?(:portable?) && (portable_client?(client_info) || client_info.pre_registered?)
         delete_client_info unless keep
+      end
 
-        @supported_scopes = nil
+      # @param record [Token, ClientInfo, Object, nil]
+      # @param issuer [String]
+      # @return [Boolean] whether the record says it belongs to that issuer
+      def record_bound_to?(record, issuer)
+        record.respond_to?(:issuer) && record.issuer == issuer
+      end
+
+      # The stored token, or nil when the backend cannot even be asked
+      # (a minimal backend without get_token, tolerated as before).
+      # @return [Token, nil]
+      def stored_token_or_nil
+        stored_token
+      rescue StandardError
+        nil
       end
 
       # Apply the PKCE-support and HTTPS-endpoint checks to server metadata.
@@ -1670,8 +1691,10 @@ module MCPClient
       def exchange_authorization_code(server_metadata, client_info, code, pkce)
         logger.debug('Exchanging authorization code for access token')
 
-        # Use the redirect_uri that was actually registered, not our requested one
-        registered_redirect_uri = client_info.metadata.redirect_uris.first
+        # The redirect_uri the authorization request was made with (recorded
+        # with the PKCE record), else the registered one
+        registered_redirect_uri = (pkce.respond_to?(:redirect_uri) && pkce.redirect_uri) ||
+                                  client_info.metadata.redirect_uris.first
 
         params = {
           grant_type: 'authorization_code',
