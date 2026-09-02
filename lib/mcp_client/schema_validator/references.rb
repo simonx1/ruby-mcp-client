@@ -204,24 +204,71 @@ module MCPClient
         depths
       end
 
-      # The lexical depth of a value a pointer reference reaches that is not
-      # a schema object (a boolean): one below the nearest enclosing object
-      # whose depth is known, counting each array level in between.
-      # @return [Integer, nil] nil when the position cannot be placed
+      # The lexical depth of the value a pointer reference reaches, counted
+      # in schema steps along the (percent-decoded) pointer from its resource
+      # root: a keyword holding one subschema is one step, a map or array of
+      # subschemas is one step per member (`#/properties/b` and `#/allOf/0`
+      # are both one below the enclosing schema), and every token under a
+      # data or unknown keyword is a step, so a document hidden inside
+      # `default`, `enum`, `const`, `examples` or a vendor keyword obeys the
+      # same bound as one written in a schema position. A schema object whose
+      # depth the lexical index knows resets the count to that depth.
+      # @return [Integer, nil] nil when the pointer cannot be followed
       def referenced_position_depth(ref, root, dialect, counter, from)
-        return nil unless ref.start_with?('#/')
+        tokens = pointer_tokens(ref)
+        return nil unless tokens
 
-        tokens = ref.delete_prefix('#').split('/', -1)[1..]
-        extra = 0
-        while tokens.length > 1
-          tokens = tokens[0...-1]
-          extra += 1
-          parent = resolve_reference(root, "##{tokens.map { |t| "/#{t}" }.join}", dialect, counter, from: from)
-          next unless parent.is_a?(Hash) && (depth = (counter[:depths] || {})[parent])
+        index = (counter[:anchors] ||= anchor_index(root, dialect))
+        node = (from && index[:resources][from]) || root
+        depths = counter[:depths] || {}
+        depth = depths[node] || 0
+        mode = :schema
+        tokens.each do |token|
+          child = pointer_child(node, token)
+          return nil if child.equal?(UNRESOLVED)
 
-          return depth + extra
+          if mode == :schema
+            depth = depths[node] if node.is_a?(Hash) && depths.key?(node)
+            mode = pointer_step_mode(node, token)
+            depth += 1 unless %i[map array].include?(mode)
+          else
+            depth += 1
+            mode = :schema if %i[map array].include?(mode)
+          end
+          node = child
         end
-        nil
+        depth
+      end
+
+      # The decoded RFC 6901 tokens of a fragment pointer.
+      # @return [Array<String>, nil] nil unless the reference is a pointer
+      def pointer_tokens(ref)
+        fragment = ref.delete_prefix('#')
+        fragment = URI.decode_uri_component(fragment) rescue fragment # rubocop:disable Style/RescueModifier
+        return nil unless fragment.start_with?('/')
+
+        fragment[1..].split('/', -1).map { |token| token.gsub('~1', '/').gsub('~0', '~') }
+      end
+
+      # @return [Object] the member a pointer token selects, or UNRESOLVED
+      def pointer_child(node, token)
+        case node
+        when Hash then node.key?(token) ? node[token] : UNRESOLVED
+        when Array then token.match?(/\A(0|[1-9]\d*)\z/) && token.to_i < node.length ? node[token.to_i] : UNRESOLVED
+        else UNRESOLVED
+        end
+      end
+
+      # How a keyword of a schema object holds what its pointer token reaches.
+      # @return [Symbol] :schema (one subschema), :map, :array, or :opaque
+      #   (data or unknown keyword: every token below is a step)
+      def pointer_step_mode(node, token)
+        return :opaque unless node.is_a?(Hash)
+        return :map if SUBSCHEMA_MAP_KEYWORDS.include?(token)
+        return :array if SUBSCHEMA_ARRAY_KEYWORDS.include?(token) || (token == 'items' && node[token].is_a?(Array))
+        return :schema if SUBSCHEMA_KEYWORDS.include?(token)
+
+        :opaque
       end
 
       # Yield the definitions held in the bag the dialect does not define
