@@ -106,7 +106,11 @@ metadata). Each feature lands in its own PR; this section accumulates them.
   authorization server does not fail the callback precheck; a challenge
   advertising no authorization server is refused; a later validated
   challenge supersedes a refused one (the refused document is forgotten);
-  peer-controlled metadata values are sanitized in refusals.
+  peer-controlled metadata values are sanitized in refusals. An
+  authorization server switch leaves records another provider already
+  bound to the new server alone, and the redirect URI an authorization
+  request was made with is recorded with its PKCE record and used for the
+  code exchange.
 
 ### Tasks extension (`io.modelcontextprotocol/tasks`)
 
