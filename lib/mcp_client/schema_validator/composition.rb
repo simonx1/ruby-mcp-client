@@ -66,7 +66,7 @@ module MCPClient
         return false unless data.is_a?(Array)
 
         case keyword
-        when 'contains' then !(keyword_known?('minContains', dialect) && schema['minContains'].eql?(0))
+        when 'contains' then effective_contains?(schema, value, data, dialect)
         when 'minContains' then schema.key?('contains') && value.is_a?(Numeric) && value.positive?
         when 'maxContains' then schema.key?('contains') && value.is_a?(Numeric) && data.length > value
         when 'uniqueItems' then value == true && data.length > 1
@@ -80,13 +80,38 @@ module MCPClient
         end
       end
 
+      # @return [Boolean] whether a contains schema in force matches every item
+      def contains_everything?(schema, dialect)
+        keyword_known?('contains', dialect) && [true, {}].include?(schema['contains'])
+      end
+
+      # Whether `contains` can still change the result: not when its
+      # companion switches it off (minContains 0), and not when a
+      # tautological schema (true / {}) matches every item and the array
+      # already holds the items it requires (JSON Schema 2020-12 Validation
+      # Section 6.4.4: the default minContains is 1).
+      # @return [Boolean]
+      def effective_contains?(schema, value, data, dialect)
+        min = 1
+        if keyword_known?('minContains', dialect) && schema['minContains'].is_a?(Numeric)
+          min = schema['minContains']
+          return false if min <= 0
+        end
+        return true unless [true, {}].include?(value)
+
+        data.length < min
+      end
+
       # How many leading items the tuple keywords in force evaluate, or
-      # infinity when an items schema evaluates them all.
+      # infinity when an items schema (or a contains schema matching every
+      # item — JSON Schema 2020-12 Core Section 10.3.1.3) evaluates them all.
       # @return [Integer, Float]
       def evaluated_item_count(schema, keyword, dialect)
         tuple = schema['prefixItems'] if keyword_known?('prefixItems', dialect) && schema['prefixItems'].is_a?(Array)
         tuple ||= schema['items'] if schema['items'].is_a?(Array)
-        return Float::INFINITY if keyword == 'unevaluatedItems' && schema_value?(schema['items'])
+        if keyword == 'unevaluatedItems' && (schema_value?(schema['items']) || contains_everything?(schema, dialect))
+          return Float::INFINITY
+        end
 
         tuple ? tuple.length : 0
       end
@@ -103,10 +128,28 @@ module MCPClient
         when 'propertyNames' then ![true, {}].include?(value) && !data.empty?
         when 'minProperties' then value.is_a?(Numeric) && data.size < value
         when 'maxProperties' then value.is_a?(Numeric) && data.size > value
-        when 'patternProperties' then value.is_a?(Hash) && !value.empty? && !data.empty?
+        when 'patternProperties' then effective_pattern_properties?(value, data)
         else
-          value.is_a?(Hash) && value.keys.any? { |trigger| data.key?(trigger.to_s) }
+          value.is_a?(Hash) && value.any? { |trigger, dep| data.key?(trigger.to_s) && dependency_can_fail?(dep) }
         end
+      end
+
+      # `patternProperties` asserts only through a pattern some property
+      # name matches whose schema is not a tautology.
+      # @return [Boolean]
+      def effective_pattern_properties?(value, data)
+        return false unless value.is_a?(Hash) && data.is_a?(Hash)
+
+        value.any? do |pattern, sub|
+          ![true, {}].include?(sub) && data.each_key.any? { |name| pattern_matches?(pattern.to_s, name.to_s) }
+        end
+      end
+
+      # A dependency whose value cannot fail (an empty required list, a
+      # schema of true / {}) decides nothing for a present trigger.
+      # @return [Boolean]
+      def dependency_can_fail?(dep)
+        dep.is_a?(Array) ? !dep.empty? : ![true, {}].include?(dep)
       end
 
       # Whether the instance has a property the schema's own property
