@@ -246,6 +246,7 @@ module MCPClient
     # @raise [MCPClient::Errors::ResourceReadError] for other errors during resource reading
     # @raise [MCPClient::Errors::ConnectionError] if server is disconnected
     def read_resource(uri)
+      ensure_initialized
       read_resource_with_cache(uri) { rpc_request('resources/read', { uri: uri }) }
     rescue MCPClient::Errors::ServerError => e
       raise if e.protocol_error?
