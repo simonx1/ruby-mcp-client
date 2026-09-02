@@ -8,13 +8,20 @@ module MCPClient
     # A branch is evaluated speculatively (its errors are a verdict, not
     # output). anyOf and allOf are monotonic, so a branch that passes as far
     # as the validator can evaluate it is accepted; not, oneOf and if are
-    # not, so such a branch is :undecided and never a match.
+    # not, so a branch that still holds an unevaluated assertion applying to
+    # the instance is :undecided and never a match, while one decided by its
+    # evaluated keywords (or carrying only annotations) is a full verdict.
     module Composition
       # Whether a schema object carries an assertion the validator does not
-      # evaluate (in the dialect in force), so its verdict is only partial.
+      # evaluate (in the dialect in force) that applies to this instance, so
+      # its verdict is only partial. Annotations (`format`, `contentSchema`)
+      # and assertions of another instance type decide nothing and leave the
+      # verdict whole.
       # @return [Boolean]
-      def partial_keywords?(schema, dialect)
-        (schema.keys & UNSUPPORTED_KEYWORDS).any? { |keyword| keyword_known?(keyword, dialect) }
+      def partial_keywords?(schema, dialect, data)
+        applicable = UNSUPPORTED_ASSERTIONS_ANY_TYPE +
+                     UNSUPPORTED_ASSERTIONS_BY_TYPE.select { |type, _| data.is_a?(type) }.values.flatten
+        (schema.keys & applicable).any? { |keyword| keyword_known?(keyword, dialect) }
       end
 
       # The verdict of a branch evaluated speculatively: :fail when a

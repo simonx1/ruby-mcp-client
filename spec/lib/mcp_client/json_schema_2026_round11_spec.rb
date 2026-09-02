@@ -22,7 +22,9 @@ RSpec.describe 'MCP 2026-07-28 JSON Schema handling — round 11' do
       # also carries an unsupported one.
       undecided_then_failing = { 'not' => { 'allOf' => [{ 'multipleOf' => 2 }, { 'type' => 'string' }] } }
       expect(validator.validate(3, undecided_then_failing)).to be_empty
-      expect(validator.validate('x', undecided_then_failing)).to be_empty
+      # multipleOf does not apply to a string, so that branch is decided by
+      # its type alone and matches: not rejects the string.
+      expect(validator.validate('x', undecided_then_failing)).to contain_exactly(a_string_matching(/not/))
     end
 
     it 'does not count an undecided oneOf branch as a match' do
