@@ -125,6 +125,19 @@ metadata). Each feature lands in its own PR; this section accumulates them.
   its bound before reaching every object makes the schema unusable; a JSON
   Pointer token with `~` not followed by `0` or `1` is unresolvable (RFC
   6901).
+- **Decided compositions and effective assertions (round 14).** `anyOf`,
+  `oneOf` and `allOf` stop evaluating branches once the outcome is
+  definite (any pass, two passes, the first failure), so a later branch
+  can no longer abort a decided validation (`{"anyOf": [true, {"$ref":
+  "#"}]}` accepts everything); an unevaluated assertion counts as
+  uncertainty under `not` / `oneOf` / `if` only when it can still change
+  the result (`minContains` / `maxContains` need `contains`,
+  `additionalItems` a tuple `items`, and tautological values such as
+  `additionalProperties: true`, `uniqueItems: false`, `minProperties: 0`
+  or an empty dependency map decide nothing); a referenced target is
+  bounded by its own lexical depth, not the referring location, a boolean
+  target is not charged per reference, and boolean subschemas obey the
+  depth bound.
 
 ### Authorization (RFC 9207 issuer validation, client registration)
 

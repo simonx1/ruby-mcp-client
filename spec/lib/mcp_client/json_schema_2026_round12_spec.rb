@@ -20,7 +20,8 @@ RSpec.describe 'MCP 2026-07-28 JSON Schema handling — round 12' do
     end
 
     it 'makes the schema unusable instead of resolving # against the document root' do
-      expect(validator.check_schema(schema)).to include(a_string_matching(/anchors|unresolvable/))
+      # Since round 14 the target is bounded by its own (too deep) position.
+      expect(validator.check_schema(schema)).to include(a_string_matching(/anchors|unresolvable|depth/))
       expect(validator.validate({ 'a' => { 'v' => 'nope' } }, schema)).not_to be_empty
     end
 

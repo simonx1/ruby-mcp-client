@@ -21,7 +21,33 @@ module MCPClient
       def partial_keywords?(schema, dialect, data)
         applicable = UNSUPPORTED_ASSERTIONS_ANY_TYPE +
                      UNSUPPORTED_ASSERTIONS_BY_TYPE.select { |type, _| data.is_a?(type) }.values.flatten
-        (schema.keys & applicable).any? { |keyword| keyword_known?(keyword, dialect) }
+        (schema.keys & applicable).any? do |keyword|
+          keyword_known?(keyword, dialect) && effective_assertion?(schema, keyword, dialect)
+        end
+      end
+
+      # Whether an unevaluated assertion can still change the result: a
+      # keyword that has no effect without its companion (minContains /
+      # maxContains without contains, additionalItems beside a non-tuple
+      # items — JSON Schema 2020-12 Validation Sections 6.4.4-6.4.5, draft-07
+      # Section 9.3.1.2) or whose value cannot fail (additionalProperties
+      # true, uniqueItems false, minProperties 0, an empty dependency map)
+      # decides nothing and leaves the verdict whole.
+      # @return [Boolean]
+      def effective_assertion?(schema, keyword, _dialect)
+        value = schema[keyword]
+        case keyword
+        when 'minContains', 'maxContains' then schema.key?('contains')
+        when 'additionalItems' then schema['items'].is_a?(Array)
+        when 'additionalProperties', 'unevaluatedProperties', 'unevaluatedItems', 'propertyNames'
+          ![true, {}].include?(value)
+        when 'uniqueItems' then value == true
+        when 'minProperties' then value.is_a?(Numeric) && value.positive?
+        when 'maxProperties', 'multipleOf' then value.is_a?(Numeric)
+        when 'dependentRequired', 'dependentSchemas', 'dependencies', 'patternProperties'
+          !(value.is_a?(Hash) && value.empty?)
+        else true
+        end
       end
 
       # The verdict of a branch evaluated speculatively: :fail when a
@@ -43,14 +69,21 @@ module MCPClient
         ctx.undecided == before ? :pass : :undecided
       end
 
-      # The verdicts of every branch. Uncertainty is kept only when it can
-      # change the outcome: once the composition is decided the count is
-      # restored to what it was before the branches ran.
+      # The verdicts of the branches. Evaluation stops as soon as the
+      # branches seen so far settle the composition (`stop`): a branch that
+      # cannot change the outcome is not evaluated, so it cannot abort a
+      # decided validation. Once the composition is decided — early, or
+      # after every branch (`decided`) — the uncertainty count is restored
+      # to what it was before the branches ran.
       # @return [Array<Symbol>]
-      def branch_verdicts(data, subs, path, ctx, ref_depth, decided:)
+      def branch_verdicts(data, subs, path, ctx, ref_depth, stop:, decided:)
         before = ctx.undecided
-        verdicts = subs.map { |sub| verdict(data, sub, path, ctx, ref_depth) }
-        ctx.undecided = before if decided.call(verdicts)
+        verdicts = []
+        subs.each do |sub|
+          verdicts << verdict(data, sub, path, ctx, ref_depth)
+          break if stop.call(verdicts)
+        end
+        ctx.undecided = before if stop.call(verdicts) || decided.call(verdicts)
         verdicts
       end
 
@@ -59,23 +92,28 @@ module MCPClient
       def validate_composition(data, schema, path, ctx, ref_depth)
         errors = []
         if schema['allOf'].is_a?(Array)
+          # The first failing branch decides allOf; later branches are not
+          # evaluated (they cannot change the outcome, but could abort it).
           schema['allOf'].each_with_index do |sub, idx|
             sub_errors = validate_node(data, sub, path, ctx, ref_depth)
-            errors << "#{path}: does not satisfy allOf/#{idx} (#{clip(sub_errors.first.to_s)})" unless sub_errors.empty?
+            next if sub_errors.empty?
+
+            errors << "#{path}: does not satisfy allOf/#{idx} (#{clip(sub_errors.first.to_s)})"
+            break
           end
         end
         # anyOf is monotonic: a definite pass decides it whatever the other
         # branches, and only undecided branches leave it undecided.
         if schema['anyOf'].is_a?(Array)
           verdicts = branch_verdicts(data, schema['anyOf'], path, ctx, ref_depth,
-                                     decided: ->(vs) { vs.include?(:pass) || vs.all?(:fail) })
+                                     stop: ->(vs) { vs.include?(:pass) }, decided: ->(vs) { vs.all?(:fail) })
           errors << "#{path}: does not satisfy any schema in anyOf" if verdicts.all?(:fail)
         end
         if schema['oneOf'].is_a?(Array)
           # Two definite passes decide it; with an undecided branch and at
           # most one pass, "exactly one" cannot be told either way.
           verdicts = branch_verdicts(data, schema['oneOf'], path, ctx, ref_depth,
-                                     decided: ->(vs) { vs.count(:pass) > 1 || vs.none?(:undecided) })
+                                     stop: ->(vs) { vs.count(:pass) > 1 }, decided: ->(vs) { vs.none?(:undecided) })
           matches = verdicts.count(:pass)
           if matches > 1 || (verdicts.none?(:undecided) && matches != 1)
             errors << "#{path}: satisfies #{matches} schemas in oneOf, expected exactly one"
