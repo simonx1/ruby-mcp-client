@@ -73,6 +73,12 @@ metadata). Each feature lands in its own PR; this section accumulates them.
   neither seeds a wait on the server named explicitly (no TTL, no pace) nor
   colours the acknowledgement of a cancel there; symbol-keyed camelCase
   task fields (`ttlMs:`, `pollIntervalMs:`) count as the modern shape.
+- **Local handles and the standalone entry point.** `get_task_result` on a
+  handle the server completed synchronously returns its result without
+  selecting or probing a server; an answer lost twice is still carried by
+  the update that answers the next key; `mcp_client/client/task_support`
+  requires `set` and the task model, so `require 'mcp_client/client'`
+  drives a wait on its own.
 
 ### Cacheable results (`ttlMs` / `cacheScope`)
 

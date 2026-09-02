@@ -659,6 +659,10 @@ module MCPClient
     # @raise [MCPClient::Errors::TaskNotFound] if the task does not exist
     # @raise [MCPClient::Errors::TaskError] if retrieval fails
     def get_task_result(task_id, server: nil)
+      # A handle the server completed synchronously already carries its
+      # result: no server is needed (or probed) to read it.
+      return task_outcome(task_id) if task_id.is_a?(MCPClient::Task) && !task_id.remote?
+
       srv = select_task_server(task_id, server, 'get_task_result')
       # tasks/result must never reach a 2026-07-28 server, so the era has
       # to be known: an initialization failure surfaces here.
