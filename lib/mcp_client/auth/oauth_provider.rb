@@ -153,7 +153,8 @@ module MCPClient
         # in the same per-request record so the `iss` of the response can be
         # checked against an authenticated value.
         pkce = PKCE.new(issuer: server_metadata.issuer,
-                        iss_parameter_supported: server_metadata.iss_parameter_supported?)
+                        iss_parameter_supported: server_metadata.iss_parameter_supported?,
+                        client_id: client_info.client_id)
         storage.set_pkce(server_url, pkce)
 
         # Generate state parameter
@@ -199,6 +200,15 @@ module MCPClient
                 "(recorded #{safe_error_text(pkce.issuer)}); restart the authorization"
         end
         validate_authorization_response_issuer!(iss, pkce.issuer, iss_parameter_supported_for?(pkce, server_metadata))
+        # The credentials that redeem the code are the ones the request was
+        # made with: a record swapped in shared storage meanwhile (another
+        # client id, or credentials of another authorization server) is
+        # never sent to this token endpoint.
+        unless client_for_request?(client_info, pkce)
+          raise MCPClient::Errors::ConnectionError,
+                'Authorization response rejected: the client credentials changed during the flow; ' \
+                'restart the authorization'
+        end
 
         # Exchange authorization code for tokens
         token = exchange_authorization_code(server_metadata, client_info, code, pkce)
@@ -211,6 +221,20 @@ module MCPClient
         storage.delete_state(server_url)
 
         token
+      end
+
+      # Whether stored credentials are the ones an authorization request was
+      # made with: the same client id (when the request recorded one) and,
+      # unless portable, bound to the request's authorization server.
+      # @param client_info [ClientInfo]
+      # @param pkce [PKCE]
+      # @return [Boolean]
+      def client_for_request?(client_info, pkce)
+        recorded = pkce.respond_to?(:client_id) ? pkce.client_id : nil
+        return false if recorded && recorded != client_info.client_id
+        return true if portable_client?(client_info)
+
+        !client_info.respond_to?(:issuer) || client_info.issuer.nil? || client_info.issuer == pkce.issuer
       end
 
       # Check a success response before anything is shown or exchanged: the
