@@ -79,6 +79,12 @@ module MCPClient
     # Longest peer-supplied detail quoted in a notice.
     MAX_DETAIL_LENGTH = 200
 
+    # Marks a thread that is between claiming a feature's gate and coming
+    # back out of the logger. A thread-level variable, not a fiber-local
+    # one: what it guards is a Mutex this thread already holds, which every
+    # fiber of the thread holds with it.
+    EMITTING_KEY = :mcp_client_deprecation_emitting
+
     @enabled = true
     @notices = {}
     @gates = {}
@@ -96,8 +102,10 @@ module MCPClient
 
       # Log the notice for a deprecated feature once per process. The notice
       # counts as emitted only once the logger accepted it: a logger that
-      # drops warnings (level above WARN), fails to report its level or
-      # raises leaves it for a later use. Never raises for a logger failure:
+      # drops warnings (level above WARN), writes nowhere (`Logger.new(nil)`),
+      # fails to report its level or raises leaves it for a later use, and so
+      # does a nested attempt from inside another notice's logger (see
+      # {.emit_once}). Never raises for a logger failure:
       # the deprecated feature keeps working whatever the log does (feature
       # lifecycle policy).
       #
@@ -161,22 +169,52 @@ module MCPClient
       # a caller waits on the gate exactly as long as it would have waited
       # on a shared logger's own lock, and never comes away from that wait
       # with the notice neither emitted nor its own to write.
+      #
+      # A gate is held across host code, so it is never waited for BY host
+      # code running inside one. A logger callback — a formatter, a log
+      # subscriber — may itself reach a deprecated feature, and a thread
+      # already inside a notice that then queued for a gate would deadlock:
+      # against its own gate for the same feature, or (with a logger that
+      # serializes its writes, as ::Logger does) against another thread that
+      # holds the second feature's gate and is waiting for that logger. So a
+      # thread inside a notice never queues: its nested attempt stands down
+      # at once and leaves that notice owed to a later use, exactly as a
+      # dropped one is. The notice it stood down from is not lost — whoever
+      # holds that gate is writing it.
       # @param feature [Symbol] a {REGISTRY} key
       # @yield the emission, called with no lock of this module held
       # @return [Boolean] whether this call emitted the notice
       def emit_once(feature)
+        return false if emitting?
+
         gate = gate_for(feature)
         return false unless gate
 
-        gate.synchronize do
-          return false if emitted?(feature)
+        begin
+          mark_emitting(true)
+          gate.synchronize do
+            return false if emitted?(feature)
 
-          yield
-          mark_emitted(feature)
-          true
+            yield
+            mark_emitted(feature)
+            true
+          end
+        ensure
+          mark_emitting(false)
         end
       rescue StandardError
         false
+      end
+
+      # @return [Boolean] whether this thread is already inside a notice
+      def emitting?
+        Thread.current.thread_variable_get(EMITTING_KEY) ? true : false
+      end
+
+      # @param value [Boolean] whether this thread is inside a notice
+      # @return [void]
+      def mark_emitting(value)
+        Thread.current.thread_variable_set(EMITTING_KEY, value)
       end
 
       # @param feature [Symbol] a {REGISTRY} key
@@ -224,9 +262,28 @@ module MCPClient
       # @param logger [Logger, #warn] the candidate logger
       # @return [Boolean] false when the logger drops warnings or asking failed
       def accepts_warnings?(logger)
-        !(logger.is_a?(::Logger) && logger.level > ::Logger::WARN)
+        return false if logger.is_a?(::Logger) && logger.level > ::Logger::WARN
+
+        !no_output_device?(logger)
       rescue StandardError
         false
+      end
+
+      # `Logger.new(nil)` is the documented no-output logger: it keeps every
+      # level, so the level check passes, and `warn` returns successfully
+      # having written nothing. Counting that as the notice would spend it on
+      # a reader that does not exist and silence every later use — including
+      # one holding a logger that does write. A logger has no device only
+      # when it was built without one: `logger` 1.7 also folds
+      # `Logger.new(File::NULL)` into that (it opens no file), earlier
+      # versions give it a real device, and either reading is safe here —
+      # the notice is written or it stays owed.
+      # @param logger [Logger, #warn] the candidate logger
+      # @return [Boolean] whether the logger provably writes nowhere
+      def no_output_device?(logger)
+        logger.is_a?(::Logger) &&
+          logger.instance_variable_defined?(:@logdev) &&
+          logger.instance_variable_get(:@logdev).nil?
       end
 
       # @return [String] the notice text

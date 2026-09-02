@@ -238,8 +238,11 @@ RSpec.describe 'MCP 2026-07-28 deprecations' do
   end
 
   it 'works when loaded on its own' do
+    # $stdout, not File::NULL: a notice is spent only on a logger that has a
+    # device, and `logger` 1.7 gives `Logger.new(File::NULL)` none. The
+    # subprocess's own stdout is redirected below, so nothing is printed.
     script = "require 'mcp_client/deprecations'; " \
-             'exit(MCPClient::Deprecations.warn(:roots, Logger.new(File::NULL)) ? 0 : 1)'
+             'exit(MCPClient::Deprecations.warn(:roots, Logger.new($stdout)) ? 0 : 1)'
     expect(system(RbConfig.ruby, '-Ilib', '-e', script, out: File::NULL, err: File::NULL)).to be(true)
   end
 

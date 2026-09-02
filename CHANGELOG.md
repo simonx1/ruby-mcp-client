@@ -128,6 +128,43 @@ metadata). Each feature lands in its own PR; this section accumulates them.
   `ServerStreamableHTTP` and marks the HTTP+SSE entry with SEP-2596 and its
   earliest removal, like the README, `MCPClient.connect` and
   `MCPClient.sse_config`.
+- **A notice never queues from inside a notice (round 11).** Round 10's
+  emission gate is held across `logger.warn`, which is host code that may
+  itself reach a deprecated feature — a formatter, a log subscriber. A
+  thread already inside a notice that then queued for a gate could wait
+  forever: for its own gate, when the callback warns for the feature being
+  logged, or (through a logger that serializes its writes, as `::Logger`
+  does) for the gate of a second feature held by a thread that is waiting
+  for that very logger. Both threads then hang, and the sampling request,
+  the log level or the SSE `connect` behind the notice never returns. A
+  thread inside a notice now never queues: its nested attempt stands down
+  at once and leaves that notice owed to a later use, exactly as a dropped
+  one is — the notice it stood down from is being written by whoever holds
+  the gate. Round 10's contract is untouched: one notice per feature per
+  process, and a plain contender still waits for another thread's emission
+  and takes the notice over when that emission fails.
+- **A logger that writes nowhere does not spend a notice (round 11).**
+  `Logger.new(nil)` is a supported no-output logger: it keeps every level,
+  so the level probe passed it, and its `warn` returns successfully having
+  written nothing — which marked the notice emitted and silenced every
+  later use, including one holding a logger that does write. A logger with
+  no device is now treated like one that drops warnings: the deprecated
+  operation is unaffected and the notice stays owed.
+- **The log level in request metadata is Logging too (round 11).** MCP
+  2026-07-28 moved the log level off `logging/setLevel` and onto every
+  request, so `log_level=` and an incoming `notifications/message` are not
+  the only ways into the deprecated Logging utility: a host that puts
+  `io.modelcontextprotocol/logLevel` in `request_meta` or in a per-call
+  `_meta` adopts it just as squarely, and `with_request_meta` forwards the
+  key on the wire. That now raises the Logging notice on first use, on the
+  modern path and on the legacy one that passes a supplied `_meta` through
+  untouched.
+- **HTTP+SSE marked in the last two places it was offered (round 11).** The
+  README's Protocol Support elicitation bullet listed SSE as an ordinary
+  elicitation transport with no mark (it now leads with Streamable HTTP and
+  marks HTTP+SSE), and `MCPClient.connect`'s `transport: :sse` entry named
+  SEP-2596 without its earliest removal (three months after SEP-2596
+  reaches Final), which every other mark carries.
 - **`protocol:` and `discover_timeout:` documented as they behave.** The
   README offered both on `MCPClient.connect` without qualification, but
   `MCPClient::ServerSSE` accepts neither and `MCPClient.connect` drops them

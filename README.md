@@ -42,7 +42,7 @@ revision retires.
 - **Tools**: list, call, streaming, annotations (hint-style), structured outputs validated against `outputSchema` (JSON Schema 2020-12 / 2019-09 / draft-07), title, `x-mcp-header` parameters
 - **Prompts**: list, get with parameters
 - **Resources**: list, read, templates, subscriptions, pagination, ResourceLink content
-- **Elicitation**: Server-initiated user interactions (stdio, SSE, Streamable HTTP) and multi round-trip `input_required` results
+- **Elicitation**: Server-initiated user interactions (stdio, Streamable HTTP, and the *deprecated* HTTP+SSE transport) and multi round-trip `input_required` results
 - **Roots** *(deprecated in 2026-07-28)*: Filesystem scope boundaries with change notifications
 - **Sampling** *(deprecated in 2026-07-28)*: Server-requested LLM completions with modelPreferences
 - **Completion**: Autocomplete for prompts/resources with context
@@ -479,7 +479,7 @@ migration:
 |---------|------------------|------------------|-----------|
 | Roots (`roots:`, `Client#roots=`, or answering a `roots/list` request with a non-empty list) | 2026-07-28 (SEP-2577) | the first revision released on or after 2027-07-28 | Pass directories or files through tool parameters, resource URIs or server configuration |
 | Sampling (`sampling_handler:` on `Client.new` or `MCPClient.connect`, or serving a request through a transport's `on_sampling_request`) | 2026-07-28 (SEP-2577) | the first revision released on or after 2027-07-28 | Integrate directly with the LLM provider API |
-| Logging (`log_level=` on the client or a server, `notifications/message`) | 2026-07-28 (SEP-2577) | the first revision released on or after 2027-07-28 | Log to stderr (stdio) or use OpenTelemetry |
+| Logging (`log_level=` on the client or a server, an `io.modelcontextprotocol/logLevel` in `request_meta` or a per-call `_meta`, `notifications/message`) | 2026-07-28 (SEP-2577) | the first revision released on or after 2027-07-28 | Log to stderr (stdio) or use OpenTelemetry |
 | HTTP+SSE transport (`MCPClient::ServerSSE`, warned once it is connected) | 2025-03-26 (reclassified by SEP-2596) | three months after SEP-2596 reaches Final | Migrate the server to Streamable HTTP |
 | `includeContext` `"thisServer"` / `"allServers"` in sampling requests | 2025-11-25 (reclassified by SEP-2596) | follows Sampling (SEP-2577) | Servers omit the field or send `"none"` |
 | OAuth Dynamic Client Registration | 2026-07-28 (PR #2858) | the first revision released on or after 2027-07-28 | Client ID Metadata Documents or pre-registered credentials |
@@ -498,10 +498,14 @@ root (including from a transport driven directly, without a `Client`).
 silence the notices. Notices go to the logger the client or server was
 given; without one they go to the default `$stdout` logger like every other
 warning. A notice costs the deprecated operation exactly what one
-`logger.warn` costs it, and no more: a logger that raises or drops the notice
-is swallowed, so the feature keeps working and the notice stays owed to a
-later use — but a logger that blocks, blocks its caller here just as it does
-everywhere else in the library.
+`logger.warn` costs it, and no more: a logger that raises, drops the notice
+or writes nowhere (`Logger.new(nil)`) is swallowed, so the feature keeps
+working and the notice stays owed to a later use — but a logger that blocks,
+blocks its caller here just as it does everywhere else in the library. A
+notice raised from inside another notice's logger (a formatter or a log
+subscriber that reaches a deprecated feature itself) stands down rather than
+wait, for the same reason: it is owed to a later use, and never worth a
+deadlock.
 
 ## MCP 2025-11-25 Features
 

@@ -50,6 +50,24 @@ module MCPClient
       MCPClient::Deprecations.warn(:logging, @logger)
     end
 
+    # A request whose effective `_meta` carries the log level. 2026-07-28
+    # moved the level off `logging/setLevel` and onto every request, so
+    # `log_level=` and an incoming `notifications/message` are not the only
+    # ways in: a host that puts `io.modelcontextprotocol/logLevel` in
+    # `request_meta` or in a per-call `_meta` adopts the same deprecated
+    # utility, and {MCPClient::JsonRpcCommon#with_request_meta} deliberately
+    # forwards it on the wire. That is a first use like any other.
+    # @param meta [Hash, nil] the effective outgoing request metadata
+    # @return [void]
+    def warn_request_log_level_deprecated(meta)
+      return unless meta.is_a?(Hash)
+
+      key = MCPClient::JsonRpcCommon::META_LOG_LEVEL
+      return unless meta.key?(key) || meta.key?(key.to_sym)
+
+      warn_logging_deprecated
+    end
+
     # The notice for an input request fulfilled through the multi round-trip
     # pattern, whose handler is the same callback the legacy
     # server-initiated request would have reached. Asking for a sample IS the

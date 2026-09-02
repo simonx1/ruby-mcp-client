@@ -61,7 +61,8 @@ module MCPClient
   # - ping [Integer] Ping interval for SSE (default: 10)
   # - endpoint [String] JSON-RPC endpoint path (default: '/rpc')
   # - transport [Symbol] Force transport type (:stdio, :sse, :http, :streamable_http).
-  #   :sse forces the deprecated HTTP+SSE transport (SEP-2596); prefer
+  #   :sse forces the deprecated HTTP+SSE transport (SEP-2596); earliest
+  #   removal is three months after SEP-2596 reaches Final. Prefer
   #   :streamable_http.
   # - sampling_handler [Proc] Handler for sampling requests. Deprecated since MCP
   #   2026-07-28 (SEP-2577); earliest removal is the first revision released on or
