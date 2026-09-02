@@ -88,7 +88,7 @@ RSpec.describe 'MCP 2026-07-28 cacheable results — round 17' do
     expect(counts['prompts/list']).to eq(1)
   end
 
-  it 'serves one atomic snapshot while a list_changed notification waits for the lock' do
+  it 'misses instead of serving a snapshot a list_changed notification overtook' do
     counts = Hash.new(0)
     stub_tenant_server(counts)
     server = streamable
@@ -113,13 +113,17 @@ RSpec.describe 'MCP 2026-07-28 cacheable results — round 17' do
     end
     hit = Thread.new { client.list_tools }
     inside.pop if reader.alive? && inside.size.positive?
-    sleep 0.05
-    expect(reader).to be_alive # the clear waits for the snapshot
+    # The freshness verdict is reached outside the lock (it consults the
+    # servers), so the clear does not wait for it; the verdict is then
+    # revalidated under the lock and the overtaken hit fetches again
+    # rather than copying what the clear emptied.
+    expect(reader.value).to eq(:cleared)
     release << true
 
     expect(hit.value.map(&:name)).to eq(['tool-a'])
-    expect(reader.value).to eq(:cleared)
-    expect(client.tool_cache).to be_empty
+    # Re-listed through the transport, whose own entry is still fresh.
+    expect(counts['tools/list']).to eq(1)
+    expect(client.tool_cache.values.map(&:name)).to eq(['tool-a'])
   end
 
   it 'restores the outer request context when parsing the response raises' do

@@ -111,6 +111,9 @@ module MCPClient
       # check and the copy it approves are one snapshot, and the notification
       # thread's clears wait for it.
       @cache_mutex = Mutex.new
+      # Bumped by every write under @cache_mutex, so a freshness verdict
+      # reached outside the lock can be revalidated before a copy is served.
+      @cache_version = 0
       # Active progressToken -> callback registrations (MCP progress utility)
       @progress_callbacks = {}
       @progress_mutex = Mutex.new
@@ -444,6 +447,7 @@ module MCPClient
     def clear_cache
       clear_tool_cache
       @cache_mutex.synchronize do
+        @cache_version += 1
         @prompt_cache.clear
         @resource_cache.clear
       end
@@ -855,8 +859,14 @@ module MCPClient
     # @param cache [Hash]
     # @return [Array, nil]
     def cached_snapshot(kind, cache)
+      # Freshness consults the servers (a request_meta callable, host
+      # middleware), which may clear this cache in turn: it runs outside the
+      # lock, and the copy is served only when nothing changed meanwhile.
+      version = @cache_mutex.synchronize { @cache_version }
+      return nil if cache.empty? || !caches_fresh?(kind)
+
       @cache_mutex.synchronize do
-        cached_copies(cache) if !cache.empty? && caches_fresh?(kind)
+        cached_copies(cache) if version == @cache_version && !cache.empty?
       end
     end
 
@@ -873,7 +883,7 @@ module MCPClient
         # An invalidation that landed while the fetch ran already replaced
         # these definitions; writing them back would undo it.
         next if generation && @tool_cache_generation != generation
-
+        @cache_version += 1
         drop_cached_entries(cache, server)
         if server.respond_to?(:current_params_fingerprint, true)
           # The slice is tied to the very transport entry its list came
@@ -1043,10 +1053,16 @@ module MCPClient
         clear_tool_cache
       when 'notifications/prompts/list_changed'
         logger.warn("[#{server_id}] Prompt list has changed, clearing prompt cache")
-        @cache_mutex.synchronize { @prompt_cache.clear }
+        @cache_mutex.synchronize do
+          @cache_version += 1
+          @prompt_cache.clear
+        end
       when 'notifications/resources/list_changed'
         logger.warn("[#{server_id}] Resource list has changed, clearing resource cache")
-        @cache_mutex.synchronize { @resource_cache.clear }
+        @cache_mutex.synchronize do
+          @cache_version += 1
+          @resource_cache.clear
+        end
       end
     end
 
@@ -1431,6 +1447,7 @@ module MCPClient
     # @return [void]
     def clear_tool_cache
       @cache_mutex.synchronize do
+        @cache_version += 1
         @tool_cache.clear
         @tool_cache_generation += 1
       end
