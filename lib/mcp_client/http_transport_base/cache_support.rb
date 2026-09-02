@@ -1,22 +1,16 @@
 # frozen_string_literal: true
 
+require_relative '../request_authorization'
+
 module MCPClient
   module HttpTransportBase
     # MCP 2026-07-28 caching support shared by the HTTP transports: serving
     # a stale list on transient re-fetch failures, and keeping privately
     # scoped cache entries within their authorization context.
     module CacheSupport
-      # Thread-local marker meaning "this attempt has not applied its
-      # headers yet": a failure before that point leaves the credentials of
-      # the attempt unknown, so no private stale copy may be served for it.
-      UNRECORDED_AUTHORIZATION = :unrecorded
-
-      # Thread-local marker for "this attempt went out with no Authorization
-      # at all". The anonymous context is `nil` everywhere else, and an empty
-      # thread-local slot is `nil` too: a request that really was anonymous
-      # is noted with this marker so that a slot a cleanup dropped reads as
-      # unrecorded rather than as an anonymous request that never happened.
-      ANONYMOUS_AUTHORIZATION = :anonymous
+      # The per-thread record of the Authorization a request went out with,
+      # kept exactly as every other transport keeps it.
+      include MCPClient::RequestAuthorization
 
       # Stand-in app for instantiating middleware whose request hook is run
       # without a request (the freshness probe).
@@ -132,24 +126,6 @@ module MCPClient
         stale
       end
 
-      # Remember the Authorization header a request goes out with, on the
-      # thread that sends it, so the result it brings back can be bound to
-      # that context (MCP 2026-07-28 caching, cacheScope "private").
-      # @param authorization [String, nil] the Authorization header of the request
-      # @return [void]
-      def note_request_authorization(authorization)
-        Thread.current[request_authorization_key] =
-          authorization_fingerprint(authorization) || ANONYMOUS_AUTHORIZATION
-      end
-
-      # Forget the header recorded before middleware ran: until the request
-      # is sent (or its error reports the headers) the attempt's context is
-      # unknown, so no private stale copy can be served for it.
-      # @return [void]
-      def note_request_authorization_pending
-        Thread.current[request_authorization_key] = UNRECORDED_AUTHORIZATION
-      end
-
       # A request that failed before returning a response: Faraday errors
       # raised by its middleware keep the request headers, which name the
       # Authorization actually sent; otherwise the context stays unknown.
@@ -163,26 +139,6 @@ module MCPClient
         return unless headers.respond_to?(:[])
 
         note_request_authorization(authorization_header_value(headers))
-      end
-
-      # @return [String, nil] the Authorization header of the request this thread last sent
-      def request_authorization_context
-        context = Thread.current[request_authorization_key]
-        context.is_a?(String) ? context : nil
-      end
-
-      # @return [Boolean] whether the current attempt on this thread applied
-      #   its headers. An empty slot — nothing sent yet on this thread, or a
-      #   cleanup that dropped what this transport left on it — is as
-      #   unrecorded as the pending marker.
-      def request_authorization_recorded?
-        context = Thread.current[request_authorization_key]
-        !context.nil? && context != UNRECORDED_AUTHORIZATION
-      end
-
-      # @return [Symbol] the thread-local key of this transport's request authorization
-      def request_authorization_key
-        :"mcp_client_request_authorization_#{object_id}"
       end
 
       # @param kind [Symbol, String, nil] the cache kind whose next request is modelled

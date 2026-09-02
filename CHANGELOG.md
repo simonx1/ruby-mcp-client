@@ -7,6 +7,26 @@ metadata). Each feature lands in its own PR; this section accumulates them.
 
 ### Cacheable results (`ttlMs` / `cacheScope`)
 
+- **A reconnect's handshake no longer spends the metadata a list holds
+  (round 31).** A cache decision evaluates the host's `request_meta` once and
+  holds that evaluation for the request it leads to. That request reconnects
+  on its way out (`ensure_connected` cleans up and connects first), and the
+  `server/discover`, `initialize` and `notifications/initialized` of the
+  handshake used to consume the held evaluation, so the list itself then went
+  out carrying a different one than the decision weighed — and a callable
+  vending a one-time value had it spent on the handshake. The handshake now
+  reads the host afresh, as any message of its own does, and leaves the held
+  evaluation for the request it was held for.
+- **HTTP+SSE keeps its Authorization slot like every other transport (round
+  31).** `ServerSSE` wrote and read the per-transport authorization
+  thread-local inline instead of through `request_authorization_key`, so
+  `forget_transport_thread_state` did not know about it: a worker thread that
+  created and discarded SSE transports kept one authorization entry per
+  transport for its whole life, and an emptied slot read as an anonymous
+  request rather than as nothing recorded. The slot, its key and its
+  empty-slot semantics now live in one `MCPClient::RequestAuthorization`
+  mixin shared by every HTTP transport, and the round-30 cleanup guarantee is
+  covered on all four transports.
 - **The probe reads the Authorization the connection carries (round 30).**
   A `faraday_config` block may set `conn.headers['Authorization']`, and every
   request Faraday builds on that connection starts from that table. The

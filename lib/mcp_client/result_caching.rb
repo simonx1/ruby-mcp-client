@@ -338,6 +338,8 @@ module MCPClient
     # them: a reconnect tears the connection down (`ensure_connected` cleans
     # up before it connects) in the middle of the very request a cache
     # decision held its evaluation for, and that request must still carry it.
+    # The handshake that reconnect issues does not spend it either -- it
+    # reads the host afresh ({MCPClient::RequestMetadata#without_held_request_meta}).
     # @return [Array<Symbol>] the keys defined on this transport
     def transport_thread_local_keys
       %i[served_entries_key recorded_entries_key response_received_key
