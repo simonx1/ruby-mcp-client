@@ -598,7 +598,7 @@ module MCPClient
 
       # A keyword the validator does not evaluate makes this node's verdict
       # partial: a pass here is not a proof for not / oneOf / if.
-      ctx.undecided += 1 if partial_keywords?(schema, dialect, data)
+      ctx.undecided += 1 if partial_keywords?(schema, dialect, data, ctx.deadline)
       errors = []
       counted_before = ctx.errors
       errors.concat(validate_ref(data, schema, path, ctx, ref_depth)) if schema.key?('$ref')
