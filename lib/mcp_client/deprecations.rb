@@ -79,9 +79,18 @@ module MCPClient
     # Longest peer-supplied detail quoted in a notice.
     MAX_DETAIL_LENGTH = 200
 
+    # How long a caller waits for another caller's in-flight notice to
+    # resolve. A notice must never hold up the deprecated operation, so the
+    # wait is bounded: a logger that blocks forever costs the contender this
+    # much and no more, after which it gives up on the notice (the
+    # reservation still belongs to its owner, which will either emit it or
+    # release it for a later use).
+    PENDING_WAIT_SECONDS = 0.25
+
     @enabled = true
-    @emitted = Set.new
+    @notices = {}
     @mutex = Mutex.new
+    @resolved = ConditionVariable.new
     @owner_pid = Process.pid
 
     class << self
@@ -111,21 +120,24 @@ module MCPClient
         entry = REGISTRY[feature] or raise ArgumentError, "unknown deprecated feature: #{feature.inspect}"
         return false unless enabled? && logger
         return false unless accepts_warnings?(logger)
-        return false unless @mutex.synchronize { emitted_set.add?(feature) }
+        return false unless reserve(feature)
 
         begin
           logger.warn(message(entry, detail))
+          settle(feature, :emitted)
           true
         rescue StandardError
-          @mutex.synchronize { emitted_set.delete(feature) }
+          settle(feature, nil)
           false
         end
       end
 
       # @param feature [Symbol] a {REGISTRY} key
-      # @return [Boolean] whether the notice for the feature was already logged
+      # @return [Boolean] whether a notice for the feature actually went out.
+      #   A reservation still in flight is not one: a caller is inside
+      #   `logger.warn` and may yet fail, which puts the notice back.
       def emitted?(feature)
-        @mutex.synchronize { emitted_set.include?(feature) }
+        @mutex.synchronize { notice_states[feature] == :emitted }
       end
 
       # Forget which notices were emitted (each feature warns again on its
@@ -134,24 +146,84 @@ module MCPClient
       def reset!
         @mutex.synchronize do
           @owner_pid = Process.pid
-          @emitted.clear
+          @notices.clear
+          @resolved.broadcast
         end
       end
 
       private
 
-      # The set of features already warned about IN THIS PROCESS. A prefork
-      # server (Puma, Unicorn) that warns while preloading would otherwise
-      # hand every worker an already-spent set and silence the worker's own
-      # first use, so an inherited set is dropped the first time the owning
-      # PID no longer matches. Callers hold @mutex.
-      # @return [Set<Symbol>]
-      def emitted_set
+      # Claim the right to log a feature's notice. A feature is absent (never
+      # attempted), `:pending` (a caller is inside `logger.warn` for it right
+      # now) or `:emitted` (a notice went out). Only the caller that moves it
+      # from absent to `:pending` may log.
+      #
+      # Reserving is not emitting: marking the feature spent before the logger
+      # had said anything could lose the notice outright. Two first uses that
+      # race with different loggers would have the reserving one block in a
+      # broken logger while the contender — holding a logger that works — saw
+      # the slot taken and gave up, and the reservation's later failure then
+      # left the notice owed to a use that may never come. So a caller that
+      # meets a reservation waits for its outcome, and takes the notice over
+      # if that outcome is a failure. The wait is bounded by
+      # {PENDING_WAIT_SECONDS}: a notice never holds up the deprecated
+      # operation, so a reservation that hangs costs the contender the notice,
+      # not its progress.
+      # @param feature [Symbol] a {REGISTRY} key
+      # @return [Boolean] whether this caller may log the notice
+      def reserve(feature)
+        deadline = nil
+        @mutex.synchronize do
+          loop do
+            case notice_states[feature]
+            when :emitted
+              return false
+            when :pending
+              deadline ||= monotonic_time + PENDING_WAIT_SECONDS
+              remaining = deadline - monotonic_time
+              return false if remaining <= 0
+
+              @resolved.wait(@mutex, remaining)
+            else
+              notice_states[feature] = :pending
+              return true
+            end
+          end
+        end
+      end
+
+      # Record how a reservation ended and wake whoever is waiting on it.
+      # @param feature [Symbol] a {REGISTRY} key
+      # @param state [Symbol, nil] `:emitted`, or nil to release the
+      #   reservation so a contender or a later use can retry it
+      # @return [void]
+      def settle(feature, state)
+        @mutex.synchronize do
+          states = notice_states
+          state ? states[feature] = state : states.delete(feature)
+          @resolved.broadcast
+        end
+      end
+
+      # @return [Float] a clock that cannot jump backwards
+      def monotonic_time
+        Process.clock_gettime(Process::CLOCK_MONOTONIC)
+      end
+
+      # What each feature's notice has reached IN THIS PROCESS: `:pending`
+      # while a caller is inside `logger.warn` for it, `:emitted` once one
+      # went out, absent otherwise. A prefork server (Puma, Unicorn) that
+      # warns while preloading would hand every worker an already-spent map
+      # and silence the worker's own first use, so an inherited map is
+      # dropped the first time the owning PID no longer matches. Callers hold
+      # @mutex.
+      # @return [Hash{Symbol => Symbol}]
+      def notice_states
         if @owner_pid != Process.pid
           @owner_pid = Process.pid
-          @emitted = Set.new
+          @notices = {}
         end
-        @emitted
+        @notices
       end
 
       # Whether the logger would keep a warning. Asking is itself protected:

@@ -107,7 +107,7 @@ protocol meaning, send it unchanged.
 | Ends with `/mcp` | Streamable HTTP |
 | `stdio://command` or Array | stdio |
 | `npx`, `node`, `python`, etc. | stdio |
-| Other HTTP URLs | Auto-detect (Streamable HTTP → SSE → HTTP) |
+| Other HTTP URLs | Auto-detect (Streamable HTTP → SSE → HTTP) — the SSE step is the *deprecated* HTTP+SSE transport, tried only after Streamable HTTP fails ([Deprecated features](#deprecated-features)) |
 
 ## Working with Tools, Prompts & Resources
 
@@ -359,8 +359,12 @@ request then carries `io.modelcontextprotocol/protocolVersion`,
 metadata (a Hash or a callable evaluated per request) is merged into every
 request with `MCPClient::Client.new(request_meta: ...)`. Force an era with
 `protocol: :modern` / `protocol: :legacy` (default `:auto`) and tune the
-probe with `discover_timeout:` on `MCPClient.connect`, `stdio_config`,
-`http_config` and `streamable_http_config` (or the server constructors).
+probe with `discover_timeout:` on `stdio_config`, `http_config` and
+`streamable_http_config` (or the matching server constructors), and on
+`MCPClient.connect` for those same three transports. The deprecated HTTP+SSE
+transport has no era of its own: `MCPClient::ServerSSE` takes neither option,
+so `MCPClient.connect` drops both for an `/sse` URL rather than passing them
+on ([Deprecated features](#deprecated-features)).
 `ping` maps to `server/discover` and `log_level=` to the per-request log
 level on modern servers.
 
@@ -474,7 +478,7 @@ migration:
 | Feature | Deprecated since | Earliest removal | Migration |
 |---------|------------------|------------------|-----------|
 | Roots (`roots:`, `Client#roots=`, or answering a `roots/list` request with a non-empty list) | 2026-07-28 (SEP-2577) | the first revision released on or after 2027-07-28 | Pass directories or files through tool parameters, resource URIs or server configuration |
-| Sampling (`sampling_handler:` on `Client.new` or `MCPClient.connect`) | 2026-07-28 (SEP-2577) | the first revision released on or after 2027-07-28 | Integrate directly with the LLM provider API |
+| Sampling (`sampling_handler:` on `Client.new` or `MCPClient.connect`, or serving a request through a transport's `on_sampling_request`) | 2026-07-28 (SEP-2577) | the first revision released on or after 2027-07-28 | Integrate directly with the LLM provider API |
 | Logging (`log_level=` on the client or a server, `notifications/message`) | 2026-07-28 (SEP-2577) | the first revision released on or after 2027-07-28 | Log to stderr (stdio) or use OpenTelemetry |
 | HTTP+SSE transport (`MCPClient::ServerSSE`, warned once it is connected) | 2025-03-26 (reclassified by SEP-2596) | three months after SEP-2596 reaches Final | Migrate the server to Streamable HTTP |
 | `includeContext` `"thisServer"` / `"allServers"` in sampling requests | 2025-11-25 (reclassified by SEP-2596) | follows Sampling (SEP-2577) | Servers omit the field or send `"none"` |
@@ -817,6 +821,9 @@ For more control, use `create_client` with explicit configs:
 client = MCPClient.create_client(
   mcp_server_configs: [
     MCPClient.stdio_config(command: 'npx server', name: 'local'),
+    # HTTP+SSE is deprecated (SEP-2596): keep this only for an existing SSE
+    # server, and prefer Streamable HTTP (streamable_http_config below) for
+    # anything new. See "Deprecated features".
     MCPClient.sse_config(
       base_url: 'https://api.example.com/sse',
       headers: { 'Authorization' => 'Bearer TOKEN' },

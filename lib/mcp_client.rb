@@ -47,7 +47,9 @@ module MCPClient
   #   - URLs ending in /mcp -> Streamable HTTP transport
   #   - stdio://command or Array commands -> stdio transport
   #   - Commands starting with npx, node, python, ruby, etc. -> stdio transport
-  #   - Other HTTP URLs -> Try Streamable HTTP, fallback to SSE, then HTTP
+  #   - Other HTTP URLs -> Try Streamable HTTP, then the deprecated HTTP+SSE
+  #     transport (SEP-2596), then HTTP. The SSE step is a fallback for an
+  #     existing server, not a choice a new integration should rely on.
   # Accepts keyword arguments for connection options:
   # - headers [Hash] HTTP headers for remote transports
   # - read_timeout [Integer] Request timeout in seconds (default: 30)
@@ -87,7 +89,7 @@ module MCPClient
   #   client = MCPClient.connect(['npx', '-y', '@modelcontextprotocol/server-filesystem', '/home'])
   #
   # @example Connect to multiple servers
-  #   client = MCPClient.connect(['http://server1/mcp', 'http://server2/sse'])
+  #   client = MCPClient.connect(['http://server1/mcp', 'http://server2/mcp'])
   #
   # @example Force transport type
   #   client = MCPClient.connect('http://custom-server.com', transport: :streamable_http)
