@@ -28,6 +28,11 @@ module MCPClient
     # for the server to exit, send SIGTERM, then SIGKILL if it still runs.
     SHUTDOWN_GRACE_PERIOD = 2
 
+    # Seconds a process restarted for its subscriptions must stay up before
+    # another unexpected exit counts as a crash rather than a crash loop
+    # (see {JsonRpcTransport#restart_for_open_subscriptions}).
+    SUBSCRIPTION_RESTART_MIN_INTERVAL = 5
+
     # Chunk size (bytes) used when draining the subprocess stderr pipe
     STDERR_READ_CHUNK_SIZE = 8192
 
@@ -808,7 +813,11 @@ module MCPClient
       terminate_server_process
       @stdout.close unless @stdout.closed?
       @stderr.close unless @stderr.closed?
-      @reader_thread&.kill
+      # The reader calls this itself when the process exits on its own, and a
+      # thread that kills itself here would abandon the rest of the shutdown —
+      # including the restart that a live subscription depends on. It is at
+      # EOF by then and returns on its own.
+      @reader_thread&.kill unless @reader_thread.equal?(Thread.current)
       @stderr_thread&.kill
     rescue StandardError
       # Clean up resources during unexpected termination
@@ -829,13 +838,16 @@ module MCPClient
     # 2026-07-28 stdio "Unexpected Termination": the client SHOULD restart
     # it; in-flight requests are lost and subscriptions must be
     # re-established. Marking the session uninitialized makes the next
-    # request spawn a fresh process and re-open live subscriptions.
+    # request spawn a fresh process and re-open live subscriptions — and a
+    # host that is only waiting for notifications makes no such request, so
+    # an open subscription restarts the process here instead.
     # @return [void]
     def handle_server_exit
       return if @shutting_down
 
-      @logger.warn('MCP server process ended unexpectedly; it will be restarted on the next request')
+      @logger.warn('MCP server process ended unexpectedly')
       cleanup
+      restart_for_open_subscriptions
     end
 
     # Terminate the spawned server process per the MCP 2025-11-25 stdio

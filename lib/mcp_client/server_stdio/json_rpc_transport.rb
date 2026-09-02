@@ -116,6 +116,66 @@ module MCPClient
         @logger.debug("Releasing the stdio transport did not complete cleanly: #{e.message}")
       end
 
+      # Restart the process the reader just watched exit, for the
+      # subscriptions the host still holds.
+      #
+      # A subscription is a standing request the host does not repeat: while
+      # it only waits for notifications there is no RPC for
+      # {#ensure_initialized} to re-establish the process on, so leaving the
+      # restart to "the next request" leaves every subscription
+      # :reconnecting for ever, with the host neither notified nor served.
+      # Restarting is also what MCP 2026-07-28 stdio "Unexpected Termination"
+      # asks of a client, and re-sending the subscriptions afterwards is what
+      # this transport already promises. With no subscription open there is
+      # nothing standing, and the process stays lazily re-established on the
+      # next request.
+      #
+      # A server that keeps exiting must not be respawned in a loop, so a
+      # second exit inside
+      # {MCPClient::ServerStdio::SUBSCRIPTION_RESTART_MIN_INTERVAL} ends the
+      # subscriptions with an error instead — as does a restart that fails.
+      # Either way the host learns from `closed?`/`error` rather than waiting
+      # on a stream that is never coming back.
+      # @return [void]
+      def restart_for_open_subscriptions
+        pending = (@reconnecting_subscriptions || []).select(&:reconnectable?)
+        return if pending.empty?
+
+        if restarting_too_often?
+          @logger.error('MCP server process exited again right after it was restarted; closing its subscriptions')
+          return fail_reconnecting_subscriptions(
+            MCPClient::Errors::TransportError.new('MCP server process exited again right after a restart')
+          )
+        end
+
+        @last_subscription_restart = Process.clock_gettime(Process::CLOCK_MONOTONIC)
+        @logger.info("Re-establishing the server process for #{pending.size} open subscription(s)")
+        ensure_initialized
+      rescue StandardError => e
+        @logger.warn("Could not re-establish the server process: #{e.message}")
+        fail_reconnecting_subscriptions(e)
+      end
+
+      # @return [Boolean] whether the process exited again too soon after the
+      #   restart that followed its previous exit
+      def restarting_too_often?
+        last = @last_subscription_restart
+        return false unless last
+
+        elapsed = Process.clock_gettime(Process::CLOCK_MONOTONIC) - last
+        elapsed < MCPClient::ServerStdio::SUBSCRIPTION_RESTART_MIN_INTERVAL
+      end
+
+      # End the subscriptions waiting for a process that is not coming back.
+      # @param error [StandardError] why it is not
+      # @return [void]
+      def fail_reconnecting_subscriptions(error)
+        pending = @reconnecting_subscriptions || []
+        @reconnecting_subscriptions = []
+        failure = error.is_a?(MCPClient::Errors::MCPError) ? error : MCPClient::Errors::TransportError.new(error.message)
+        pending.each { |subscription| subscription.finish(gracefully: false, error: failure) }
+      end
+
       # Establish the server's protocol era (MCP 2026-07-28
       # basic/transports/stdio "Backward Compatibility"): probe with
       # server/discover unless configured legacy-only, and fall back to the

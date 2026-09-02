@@ -26,27 +26,40 @@ metadata). Each feature lands in its own PR; this section accumulates them.
   transport's reader: a listener may issue requests of its own (re-reading
   the resource that changed, say) without blocking the stdio reader that
   would have to deliver its response. That queue is filled by the peer, so it
-  is bounded (`Subscription::MAX_PENDING_NOTIFICATIONS`): once it is full the
-  **oldest** entry is dropped, counted in `dropped_notifications` and named
-  once in the log, with `pending_notifications` reporting the current depth.
+  is bounded (`Subscription::MAX_PENDING_NOTIFICATIONS`), and once it is full
+  what it gives up is chosen by **identity** — the notification's method with
+  the `uri` or `taskId` it names — rather than by arrival order: the oldest
+  notification about the same thing as the arriving one, or failing that the
+  oldest of whichever thing has the most queued. One stream can carry a mixed
+  filter, and dropping the oldest entry would throw away the only queued
+  update for a quiet resource to keep newer ones for a busy one, with nothing
+  left to tell the listener to re-read it — the loss the ceiling exists to
+  prevent. Every MCP notification is a "look again" signal about state the
+  host re-reads for itself, so a later notice of the same thing still carries
+  what the dropped one said; the only notice of another thing does not.
   Blocking the reader instead would restore the deadlock the dispatcher
   exists to prevent, and dropping the newest would leave the host acting on a
-  stale view for good — every MCP notification is a "look again" signal about
-  state the host re-reads for itself, so the newest one still carries what
-  the dropped ones said. A closing response the client cannot recognize (an
-  unknown `resultType`, a missing result, a scalar) fails the subscription
-  with an `InvalidResultError` rather than ending it gracefully, the way
-  every other response is checked.
+  stale view for good. Drops are counted in `dropped_notifications` and named
+  once in the log, with `pending_notifications` reporting the current depth.
+  A closing response the client cannot recognize (an unknown `resultType`, a
+  missing result, a scalar) fails the subscription with an
+  `InvalidResultError` rather than ending it gracefully, the way every other
+  response is checked.
 - **Transports.** On Streamable HTTP (and plain HTTP) the listen POST runs
   on its own thread; a stream that ends without the closing response is
   re-opened with a new id (backoff 1 s → 30 s, which a cancellation
   interrupts) while the host still wants it, and stops reporting `active?`
   for as long as it is between streams — no server-side subscription exists
   then. Closing the response stream is the cancellation, and it is reliable
-  at both ends of the race now: the stream's HTTP session is handed over
+  at every point of the race now: the stream's HTTP session is handed over
   before its socket is opened, under the same lock the cancellation takes, so
   a `close` either stops the request before it goes out or finds the session
-  it has to close (and comes back for one whose socket was still opening).
+  it has to close — and a session still opening its socket, which cannot be
+  closed at all, refuses to send for a closed subscription however long its
+  connect takes, while the cancellation keeps coming back for it and leaves
+  its thread registered for a later `cleanup` to close. Once `close` or
+  `cleanup` returns, either no listen request went out or the stream is
+  closed.
   A listen answer is framed by its `Content-Type`: the single JSON object a
   server MAY answer with instead of a stream is no longer run through the SSE
   parser, which used to swallow a compact body followed by a blank line and
@@ -57,8 +70,15 @@ metadata). Each feature lands in its own PR; this section accumulates them.
   longer kills the reader threads or waits for them under the transport lock
   they need themselves. On stdio, subscriptions share the channel and are
   correlated by subscription id; when the process is
-  re-established (after `cleanup` or an unexpected exit, which now marks the
-  session for restart) every open subscription is re-sent with a new id.
+  re-established (after `cleanup` or an unexpected exit) every open
+  subscription is re-sent with a new id. A process that exits on its own is
+  re-established straight away while subscriptions are open, rather than on
+  the next request: a subscription is a standing request the host does not
+  repeat, so a host that is only waiting for notifications would otherwise
+  leave every one of them `:reconnecting` for ever. A restart that fails, or
+  a process that exits again immediately (a crash loop), closes those
+  subscriptions with the error instead, so the host learns from
+  `closed?`/`error` rather than waiting on a stream that is not coming back.
   Taking a new id is atomic with closure on both, so a `close` racing with a
   re-open either stops it or cancels the id that went out — never leaving
   the server holding a stream the client can no longer cancel. Events are

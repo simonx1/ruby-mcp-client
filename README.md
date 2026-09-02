@@ -158,16 +158,28 @@ and end it with `subscription.close`. The block runs on the subscription's own
 dispatcher thread, never on the transport's reader, so a listener may issue
 requests of its own; the notifications waiting for it are bounded
 (`MCPClient::Subscription::MAX_PENDING_NOTIFICATIONS`). A listener that cannot
-keep up with the server loses the **oldest** queued notifications rather than
-the newest — every MCP notification is a "look again" signal about state the
-host re-reads for itself, so the newest one still carries what the dropped ones
-said — and `pending_notifications` / `dropped_notifications` report how far
-behind it fell. `active?` answers false while a dropped stream waits to
+keep up with the server loses **repeats**, not signals: a full queue gives up
+the oldest notification about the same thing as the one arriving (same method
+and same `uri`/`taskId`), or failing that the oldest of whichever thing has the
+most queued, so a stream watching several resources or tasks never loses the
+only queued update for a quiet one to make room for a busy one. Every MCP
+notification is a "look again" signal about state the host re-reads for itself,
+so a later notice of the same thing carries what the dropped one said, while
+the only notice of another thing carries what nothing else would.
+`pending_notifications` / `dropped_notifications` report how far behind a
+listener fell. `active?` answers false while a dropped stream waits to
 re-open, and a closing response the client cannot recognize (an unknown
 `resultType`, a missing or scalar result) fails the subscription instead of
 closing it gracefully. On Streamable HTTP closing the SSE response stream *is*
-the cancellation: once `close` returns, either the listen request was never
-sent or its response stream has been closed.
+the cancellation, including against a connection that is still opening its
+socket: once `close` (or the transport's `cleanup`) returns, either the listen
+request was never sent — that session refuses to send one for a closed
+subscription, however long its connect takes — or its response stream has been
+closed. On stdio a server process that exits on its own is restarted at once
+while subscriptions are open, since a host that is only waiting for
+notifications never makes the request that would otherwise restart it, and the
+subscriptions are re-sent on the new process; if it cannot be restarted, or
+exits again immediately, they end with that error rather than waiting for ever.
 
 ## MCP 2025-11-25 Features
 
