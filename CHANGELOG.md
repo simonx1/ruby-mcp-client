@@ -241,7 +241,30 @@ metadata). Each feature lands in its own PR; this section accumulates them.
   token requests to the previous server's endpoints. Retirement markers
   are kept: they name the issuer the bytes were retired for, not the
   resource URL, and stay true when two MCP servers share one
-  authorization server.
+  authorization server. That type-strictness now covers every field of both
+  responses, not only the credential each carries: a token response is read
+  against the types RFC 6749 Section 5.1 gives its fields (`token_type` and
+  `access_token` non-empty strings, `expires_in` an integer,
+  `refresh_token` and `scope` strings) and a registration response against
+  the types RFC 7591 Section 3.2.1 and Section 2 give theirs
+  (`client_secret`, `token_endpoint_auth_method`, `scope`, `client_name`,
+  `client_uri`, `logo_uri`, `tos_uri`, `policy_uri` and `application_type`
+  strings, `client_id_issued_at` and `client_secret_expires_at` integers,
+  `redirect_uris`, `grant_types`, `response_types` and `contacts` arrays of
+  strings). A field of any other type fails the whole response the way a
+  missing `access_token` does — a `ConnectionError` on the code exchange
+  and on registration, a warning that keeps the still-valid token on a
+  refresh — instead of a `NoMethodError` capitalizing
+  `token_type: ["Bearer"]` into a header, a `TypeError` adding
+  `expires_in: "3600"` to a `Time` after the still-valid token was already
+  gone, or a `NoMethodError` asking a `redirect_uris` string for its
+  `first` inside `register_client`. A `null` field still reads as an absent
+  one, and `redirect_uris` the server echoes back empty (or omits) still
+  falls back to the requested redirect URI. A stored client record whose
+  `client_id` is not a non-empty string is likewise no client — the same
+  test the stored token's bytes get — so a hash-persisting backend that
+  reads one back registers a new client before the browser opens instead of
+  starting a flow the callback then rejects.
 
 ### Tasks extension (`io.modelcontextprotocol/tasks`)
 

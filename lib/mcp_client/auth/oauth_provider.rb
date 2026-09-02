@@ -6,6 +6,7 @@ require 'uri'
 require 'ipaddr'
 require_relative '../auth'
 require_relative 'oauth_provider/challenge_handling'
+require_relative 'oauth_provider/response_validation'
 
 module MCPClient
   module Auth
@@ -26,6 +27,7 @@ module MCPClient
       AUTH_PARAMS_RUN = /\A(?:[\s,]*#{AUTH_PARAM})*/
 
       include ChallengeHandling
+      include ResponseValidation
 
       # @!attribute [rw] redirect_uri
       #   @return [String] OAuth redirect URI
@@ -1269,9 +1271,14 @@ module MCPClient
         # that persists plain hashes writes `nil.to_h` — `{}`. Read back that
         # is a record without a client id, which would be bound to the current
         # issuer and reused instead of registering, making an authorization
-        # request with an empty client_id. It is not a client: it is the
-        # absence storage meant to express.
-        return nil if client_info.respond_to?(:client_id) && client_info.client_id.to_s.empty?
+        # request with an empty client_id. A hash-persisting backend can just
+        # as well read back a client_id of any other JSON type, which would go
+        # into the authorization URL `to_s`-mangled and be rejected only on
+        # the way back, after the browser had been opened. Neither is a
+        # client: both are the absence storage meant to express, so
+        # registration happens first. The bytes are required exactly as a
+        # token's are.
+        return nil if client_info.respond_to?(:client_id) && !client_id_bytes?(client_info.client_id)
 
         client_info
       end
@@ -1292,35 +1299,6 @@ module MCPClient
         return nil if token.respond_to?(:access_token) && !token_bytes?(token)
 
         token
-      end
-
-      # RFC 6749 Section 5.1 makes access_token REQUIRED in a successful token
-      # response, and it is a string: the bytes go into an `Authorization`
-      # header verbatim. A record whose access_token is absent, empty or of
-      # any other type is never a credential — its header would be a bare
-      # "Bearer " or, worse, `Bearer ["x"]`, a to_s of whatever JSON arrived,
-      # attributed to whatever authorization server is current. Checked
-      # wherever a token is read, issued or applied.
-      # @param token [Object, nil] a token record
-      # @return [Boolean] whether it carries access token bytes
-      def token_bytes?(token)
-        token.respond_to?(:access_token) && access_token_bytes?(token.access_token)
-      end
-
-      # The same question about a parsed token endpoint response body. The
-      # body is peer-controlled JSON of any shape: `200 []` and `200 null`
-      # parse to an Array and to nil, which cannot be asked for a member at
-      # all, so the shape is established before the value is read.
-      # @param data [Object, nil] the parsed JSON body
-      # @return [Boolean]
-      def issued_access_token?(data)
-        data.is_a?(Hash) && access_token_bytes?(data['access_token'])
-      end
-
-      # @param value [Object, nil] a candidate access token
-      # @return [Boolean] whether it is a non-empty string of token bytes
-      def access_token_bytes?(value)
-        value.is_a?(String) && !value.empty?
       end
 
       # @param record [Object, Hash, nil]
@@ -1553,7 +1531,7 @@ module MCPClient
 
         # Parse registered metadata from server response (may differ from our request)
         registered_metadata = ClientMetadata.new(
-          redirect_uris: data['redirect_uris'] || [redirect_uri],
+          redirect_uris: registered_redirect_uris(data),
           token_endpoint_auth_method: data['token_endpoint_auth_method'] || 'none',
           grant_types: data['grant_types'] || %w[authorization_code refresh_token],
           response_types: data['response_types'] || ['code'],
@@ -1598,24 +1576,34 @@ module MCPClient
         raise MCPClient::Errors::ConnectionError, "Network error during client registration: #{e.message}"
       end
 
-      # RFC 7591 Section 3.2.1 makes client_id REQUIRED in a registration
-      # response, and it is a string: it goes into the authorization URL and
-      # into every token request. A response without usable bytes has
-      # registered nothing — accepting it sends the user to the authorization
-      # endpoint with an empty (or a `to_s`-mangled) client_id, and the flow
-      # only fails on the way back, after the browser has already been opened.
-      # A registration response is refused here exactly as a token response
-      # without an access token is.
+      # The client id of a registration response, once the response has been
+      # checked field by field against the types RFC 7591 gives them: a
+      # response that names no client has registered nothing, and one whose
+      # fields are of other JSON types would be stored and only crash later —
+      # a `redirect_uris` string asked for its `first`, a
+      # `client_secret_expires_at` string compared with a Unix timestamp. A
+      # registration response is refused here exactly as a token response
+      # without an access token is, before the browser is ever opened.
       # @param data [Object, nil] the parsed JSON registration response
       # @return [String] the registered client id
-      # @raise [MCPClient::Errors::ConnectionError] when the response names no client
+      # @raise [MCPClient::Errors::ConnectionError] when the response registers no usable client
       def registered_client_id!(data)
-        client_id = data['client_id'] if data.is_a?(Hash)
-        return client_id if client_id.is_a?(String) && !client_id.empty?
+        if (error = registration_response_error(data))
+          raise MCPClient::Errors::ConnectionError, "Client registration failed: #{error}"
+        end
 
-        raise MCPClient::Errors::ConnectionError,
-              'Client registration failed: the registration response carries no client_id ' \
-              '(RFC 7591 Section 3.2.1)'
+        data['client_id']
+      end
+
+      # The redirect URIs a registration response registered, defaulting to
+      # the one the registration request asked for when the server echoes
+      # none back (RFC 7591 Section 2 makes redirect_uris an array of
+      # strings; its type is checked before this runs).
+      # @param data [Hash] the parsed JSON registration response
+      # @return [Array<String>]
+      def registered_redirect_uris(data)
+        uris = data['redirect_uris']
+        uris.is_a?(Array) && !uris.empty? ? uris : [redirect_uri]
       end
 
       # One Dynamic Client Registration request.
@@ -1783,12 +1771,12 @@ module MCPClient
         end
 
         data = JSON.parse(response.body)
-        # RFC 6749 Section 5.1: access_token is REQUIRED in a successful
-        # response. A 200 without it is a protocol error, not a credential:
-        # storing it would report success and then present a bare "Bearer ".
-        unless issued_access_token?(data)
-          raise MCPClient::Errors::ConnectionError,
-                'Token exchange failed: the token response carries no access_token (RFC 6749 Section 5.1)'
+        # RFC 6749 Section 5.1 gives every field of a successful response a
+        # type; a 200 that breaks one is a protocol error, not a credential.
+        # Storing it would report success and then present a bare "Bearer ",
+        # or crash later capitalizing a token_type that is not a string.
+        if (error = token_response_error(data))
+          raise MCPClient::Errors::ConnectionError, "Token exchange failed: #{error}"
         end
 
         Token.new(
@@ -1843,11 +1831,14 @@ module MCPClient
         end
 
         data = JSON.parse(response.body)
-        # A refresh response without access_token bytes (RFC 6749 Section 5.1)
-        # is a failed refresh: the still-valid token stays in storage rather
-        # than being overwritten with bytes that would go out as "Bearer ".
-        unless issued_access_token?(data)
-          logger.warn('Token refresh failed: the response carries no access_token; keeping the stored token')
+        # A refresh response that breaks RFC 6749 Section 5.1 — no
+        # access_token bytes, or a field of the wrong JSON type — is a failed
+        # refresh: the still-valid token stays in storage rather than being
+        # overwritten with something that would go out as "Bearer ", and
+        # nothing is raised out of the request path that a still-valid token
+        # could have served.
+        if (error = token_response_error(data))
+          logger.warn("Token refresh failed: #{error}; keeping the stored token")
           return nil
         end
 
