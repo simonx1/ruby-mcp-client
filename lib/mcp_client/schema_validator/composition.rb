@@ -152,16 +152,18 @@ module MCPClient
         max if max.is_a?(Numeric)
       end
 
-      # Apply the part of `contains` the array's length alone decides. The
-      # number of matching items is never more than the array holds and
-      # never less than none, so a bound outside that range is an assertion
-      # this validator settles whatever the item schema says (JSON Schema
-      # 2020-12 Validation Sections 6.4.4-6.4.5: the default minContains is
-      # 1, so any contains rejects the empty array). A tautological schema
-      # (`true` / `{}`) matches every item and `false` none, which pins the
-      # count exactly; a contains that has to be matched item by item leaves
-      # only the bounds its length cannot reach decided, and the rest
-      # unevaluated.
+      # Apply the part of `contains` the bounds alone decide. The number of
+      # matching items is never more than the array holds and never less
+      # than none, so a bound outside that range is an assertion this
+      # validator settles whatever the item schema says (JSON Schema 2020-12
+      # Validation Sections 6.4.4-6.4.5: the default minContains is 1, so
+      # any contains rejects the empty array). Bounds that cannot overlap
+      # each other settle it too: `minContains` above `maxContains` admits
+      # no count at all, so the keyword fails before the item schema is
+      # ever consulted. A tautological schema (`true` / `{}`) matches every
+      # item and `false` none, which pins the count exactly; a contains
+      # that has to be matched item by item leaves only what its bounds
+      # decide, and the rest unevaluated.
       # @param data [Array] the instance
       # @param schema [Hash] string-keyed schema
       # @param path [String] location for error messages
@@ -173,6 +175,16 @@ module MCPClient
         low, high = contains_count_range(data, schema, dialect)
         min = contains_min(schema, dialect)
         max = contains_max(schema, dialect)
+        errors = contains_length_errors(path, low, high, min, max)
+        return errors unless errors.empty? && max && min > max
+
+        ["#{path}: contains requires between #{min} and #{max} matching items, which no count satisfies"]
+      end
+
+      # The bounds the array's own length settles: a lower bound above the
+      # highest count the array can reach, an upper bound below the lowest.
+      # @return [Array<String>] validation errors
+      def contains_length_errors(path, low, high, min, max)
         errors = []
         errors << "#{path}: expected at least #{min} items matching contains, got #{contains_seen(low, high, high)}" \
           if high < min

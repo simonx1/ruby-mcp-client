@@ -7,6 +7,25 @@ metadata). Each feature lands in its own PR; this section accumulates them.
 
 ### JSON Schema handling
 
+- **A `$ref` to a non-schema member, unsatisfiable `contains` bounds and a
+  depth-bounded walk (round 25).** The keyword scan no longer raises
+  `ArgumentError` when a local `$ref` points at a member that is not a schema
+  object (`{"$ref": "#/x", "x": true}`, `{"definitions": {}, "x": 1.5,
+  "$ref": "#/x"}`): such a target has no lexical depth at all, so the depth
+  the scan compares stays a number and an accepted schema can no longer turn
+  a successful call into an exception. `contains` bounds that no count can
+  satisfy — `minContains` above `maxContains`, the default `minContains` of 1
+  beside `maxContains: 0` — now fail on the bounds alone, before any appeal
+  to an item schema this validator cannot decide, so `anyOf` / `if` /
+  `oneOf` / `not` no longer fail open on them; bounds the array's length
+  genuinely cannot settle (`minContains: 0, maxContains: 0` over an
+  undecidable item schema) stay unevaluated as before. The walk over an
+  instance is bounded at 512 levels of nesting, so data nested deeper than
+  the interpreter's stack allows — reachable through the public
+  `SchemaValidator.validate`, which unlike the wire path is not gated by
+  `JSON.parse`'s `max_nesting` — aborts with a single validation error
+  instead of a `SystemStackError` that escapes the validator.
+
 - **Malformed percent escapes, contains bounds the length settles and the
   `$ref` hop budget (round 24).** A `$ref` fragment holding a malformed
   percent escape (`#/$defs/a%ZZ`, `#/$defs/a%`) decodes to nothing and is
