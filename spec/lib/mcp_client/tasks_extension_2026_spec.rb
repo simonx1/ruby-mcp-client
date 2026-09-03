@@ -405,10 +405,11 @@ RSpec.describe 'MCP 2026-07-28 tasks extension' do
       received = []
       client.on_notification { |_srv, method, params| received << [method, params['status']] }
 
-      stdio.instance_variable_get(:@notification_callback)
-           .call('notifications/tasks', detailed_task(status: 'completed', 'result' => call_result).tap do |t|
-             t.delete('resultType')
-           end)
+      # Routed the way the transport routes it: the client's own processing
+      # (which logs the status) and the host's listeners hang off two
+      # different hooks now, and this drives both.
+      stdio.send(:route_notification, 'notifications/tasks',
+                 detailed_task(status: 'completed', 'result' => call_result).tap { |t| t.delete('resultType') })
 
       expect(received).to eq([['notifications/tasks', 'completed']])
       expect(output.string).to include('Task task-1 status: completed')
