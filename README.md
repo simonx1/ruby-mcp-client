@@ -165,7 +165,12 @@ reported as a watch on the strength of what the stream that is gone had been
 granted, because no server-side subscription exists between listen attempts
 and the request that replaces one is a new listen the server holds no state
 for and may reject or acknowledge without the URI. Only a stream the server is
-actively honouring counts as a live watch. The subscriber waiting on its own
+actively honouring counts as a live watch, and one that does not become
+one — its replacement is refused, or nothing answers within the
+acknowledgment timeout — is closed as well as unmapped, so it cannot come back
+and deliver the same updates beside the stream that replaces it, and
+`unsubscribe_resource` is never left looking for a subscription the mapping no
+longer names. The subscriber waiting on its own
 listen request is a different matter and still gets its answer: a connection
 that drops the moment the acknowledgment arrives does not unanswer it, so the
 call does not wait out its acknowledgment timeout for a grant it already
@@ -203,14 +208,26 @@ slot of its own, and there is only ever one such slot, so it is neither lost
 for being large nor able to displace anything else, and what the queue retains
 stays within the budget plus one peer-sized payload.
 `pending_notifications` / `pending_notification_bytes` /
-`dropped_notifications` report how far behind a listener fell. Caches are
-dropped *before* a notification reaches the listeners, so a listener reacting
-to a `list_changed` notification by calling `list_tools` (or the prompt or
-resource equivalents) always re-fetches rather than reading the entry the
-notification just invalidated; an `on_notification` callback that raises is
-logged and stops neither the invalidation nor the delivery, and one that edits
-the payload it is handed can neither drop nor redirect it — the subscription a
-notification belongs to is resolved before the callback sees it. The requested
+`dropped_notifications` report how far behind a listener fell. An incoming
+notification is routed in a fixed order: subscription bookkeeping (an
+acknowledgment, a server-side teardown) first, then the transport and client
+cache invalidation, then the delivery to the subscription's listeners, and the
+client's `on_notification` callback **last**. Caches are therefore dropped
+*before* a notification reaches the listeners, so a listener reacting to a
+`list_changed` notification by calling `list_tools` (or the prompt or resource
+equivalents) always re-fetches rather than reading the entry the notification
+just invalidated. The host callback comes last because it is the only step
+that can block: it is host code and it runs on whatever thread is routing — on
+stdio the server process's sole reader — so a callback that issues a
+synchronous request of its own would otherwise hold up the delivery while
+waiting for a response only that reader can deliver. Queueing the delivery is
+all the routing thread does (the listeners themselves run on the
+subscription's dispatcher thread), so nothing host-supplied runs ahead of the
+callback either way. Being last, the callback can prevent nothing: one that
+raises is logged and stops neither the invalidation nor the delivery, and one
+that edits the payload it is handed can neither drop nor redirect it — the
+subscription a notification belongs to is resolved, and the delivery queued,
+before the callback sees it. The requested
 filter is copied and frozen when the subscription is created, so a caller that
 keeps and mutates the array it passed cannot change the request that goes out
 (Streamable HTTP builds it on the stream's own thread) or what a reconnect asks
@@ -229,7 +246,12 @@ the cancellation, including against a connection that is still opening its
 socket: once `close` (or the transport's `cleanup`) returns, either the listen
 request was never sent — that session refuses to send one for a closed
 subscription, however long its connect takes — or its response stream has been
-closed. On stdio a server process that exits on its own is restarted at once
+closed. A listen POST the server answers with a 5xx is treated as a dropped
+stream and re-opened on the usual backoff, the way a connection failure or a
+read timeout on the very same request is: a brief 500 or 503 no longer ends a
+long-lived subscription for good. Only a 4xx, or an authorization challenge,
+is the server refusing this subscription, and those still end it.
+On stdio a server process that exits on its own is restarted at once
 while subscriptions are open, since a host that is only waiting for
 notifications never makes the request that would otherwise restart it, and the
 subscriptions are re-sent on the new process; if it cannot be restarted, or if
@@ -254,7 +276,16 @@ closing it — including when it fails on the hand-over itself, where taking the
 new listen id has already moved the subscription off `:reconnecting` and the
 stream being torn down would have been the very one the restart was
 re-establishing. One that fails after a newer stream replaced it raises only
-if that newer stream has itself failed.
+if that newer stream has itself failed. The subscriptions waiting for a
+process live on a single queue behind one lock, and a handle is on it at most
+once: a `cleanup` moving the open subscriptions onto it overlaps a failed
+hand-over putting one back, and two threads appending to a bare Array can lose
+an entry — stranding a stream the spec requires to be re-sent — or duplicate
+it and send two listen requests for one subscription. `close` cancels what is
+actually outstanding: `notifications/cancelled` names every listen request the
+client wrote for that subscription on the live process, not only the id it
+happens to be on, while ids written to a process that has since gone are
+forgotten rather than cancelled on the one that replaced it.
 
 ## MCP 2025-11-25 Features
 

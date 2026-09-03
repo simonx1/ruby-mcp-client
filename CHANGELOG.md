@@ -83,23 +83,31 @@ metadata). Each feature lands in its own PR; this section accumulates them.
   listeners, and host code editing it in place used to rewrite the
   subscription's own record of the watch — adding a URI the acknowledgment had
   left out was enough to make a waiting `subscribe_resource` report success.
-- **Caches are invalidated before the notification reaches the listeners.**
+- **Routing order: bookkeeping, cache invalidation, delivery, host callback.**
   A listener runs on the subscription's dispatcher thread, so queuing its
   delivery makes the notification visible at once: a listener reacting to
   `notifications/tools/list_changed` (or the prompts/resources equivalents)
   by calling a cached list method could run before the transport and client
   caches that notification invalidates had been dropped, and read the very
-  entry it says is stale. Routing now drops both caches first and delivers
+  entry it says is stale. Routing drops both caches first and delivers
   afterwards, making that a guarantee rather than a race the scheduler
-  usually happens to win. The host's `on_notification` callback runs between
-  the two and can stop neither: it is host code driven by the peer, and an
-  exception escaping it used to take the notification down with it — the
-  subscription's listeners never saw something the host's own handler had
-  already been told about — and, on stdio, the transport's reader thread with
-  it. Such an exception is now logged and routing continues. Nor can the
-  callback stop or redirect a delivery by editing the payload it is given: it
-  is handed the very hash the delivery is routed by, so the subscription each
-  notification belongs to is resolved before the callback sees it.
+  usually happens to win. The host's `on_notification` callback now runs
+  **last**, after the delivery has been queued, because it is the only step
+  that can block: it is host code driven by the peer and it runs on whatever
+  thread is routing — on stdio the process's sole stdout reader — so a
+  callback that issues a synchronous request of its own waits there for a
+  response only that reader can deliver. Running it ahead of the delivery put
+  the queueing back behind exactly that, reinstating for the host callback the
+  block that moving the listeners off the reader had removed; the queueing
+  itself costs nothing to move ahead of it, since the routing thread hands the
+  notification to the dispatcher rather than to the listeners. Being last, the
+  callback can prevent nothing. An exception escaping it used to take the
+  notification down with it — the subscription's listeners never saw something
+  the host's own handler had already been told about — and, on stdio, the
+  transport's reader thread with it; it is now logged. Nor can the callback
+  stop or redirect a delivery by editing the payload it is given: it is handed
+  the very hash the delivery was routed by, and by the time it can touch it
+  the subscription has been resolved and the entry queued.
 - **Transports.** On Streamable HTTP (and plain HTTP) the listen POST runs
   on its own thread; a stream that ends without the closing response is
   re-opened with a new id (backoff 1 s → 30 s, which a cancellation
@@ -115,6 +123,14 @@ metadata). Each feature lands in its own PR; this section accumulates them.
   its thread registered for a later `cleanup` to close. Once `close` or
   `cleanup` returns, either no listen request went out or the stream is
   closed.
+  A listen POST answered with a 5xx is a dropped stream rather than a
+  rejection: the status was already classified `TransientServerError`, but
+  the call site finished the subscription and returned "closed", which the
+  re-open loop does not retry — so a brief 500 or 503 killed a long-lived
+  subscription for good while a connection failure or a read timeout on the
+  same request re-opened it. It now takes the same backoff, through the
+  `raise_error` middleware path as well. A 4xx, and an authorization
+  challenge, still end the subscription.
   A listen answer is framed by its `Content-Type`: the single JSON object a
   server MAY answer with instead of a stream is no longer run through the SSE
   parser, which used to swallow a compact body followed by a blank line and
@@ -167,6 +183,24 @@ metadata). Each feature lands in its own PR; this section accumulates them.
   spec says MUST be re-sent. A superseded failure is reported to the caller
   when the stream that replaced it has itself failed, instead of handing back
   a closed handle with no exception.
+  The subscriptions waiting for a process live on one queue behind one lock
+  and appear on it at most once, by identity. Two paths write to it — a
+  `cleanup` moving the open subscriptions across, and a hand-over whose listen
+  write failed putting one back — and the second lands inside the window the
+  first leaves between taking the registry snapshot and writing it.
+  Concurrent `concat`/`<<` on a bare Array is undefined in MRI: the same
+  window could lose the entry, stranding a stream the spec says MUST be
+  re-sent with no session to re-send it and no `cleanup` to find it again, or
+  duplicate it and send two listen requests for one subscription. Scanning
+  that Array with `equal?` while another thread grew it did not make the
+  append safe.
+  A cancellation now names what is actually outstanding: `close` sends
+  `notifications/cancelled` for every listen request the client wrote for that
+  subscription on the live process, not only the id the subscription happens
+  to be on — a second listen for it left the server serving the first stream
+  with the client no longer able to refer to it — while ids written to a
+  process that has since been torn down are forgotten rather than cancelled on
+  the process that replaced it.
   Taking a new id is atomic with closure on both, so a `close` racing with a
   re-open either stops it or cancels the id that went out — never leaving
   the server holding a stream the client can no longer cancel. Events are
@@ -203,6 +237,13 @@ metadata). Each feature lands in its own PR; this section accumulates them.
   `subscribe_resource` answered `true` before that request had been
   acknowledged, or rejected. A subscription with no acknowledgment has no
   unacknowledged URIs either, which is how the recheck read one as a watch.
+  A mapped stream that is given up on is closed, not merely unmapped: one
+  that never became a live watch — its replacement was refused, or nothing
+  answered within the acknowledgment timeout — was left reconnectable with
+  nothing pointing at it, so it could come back and deliver the same updates
+  beside the stream `subscribe_resource` opened to replace it, and
+  `unsubscribe_resource`, which looks for a stream through the mapping that
+  had just been dropped, could no longer find or cancel it.
   Reuse now asks whether the server is honouring the URI on that stream
   *now*, not what the stream that dropped had been granted: the last
   acknowledgment stays on record until the replacement takes a new id after

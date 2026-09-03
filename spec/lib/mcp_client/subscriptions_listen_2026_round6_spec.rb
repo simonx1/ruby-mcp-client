@@ -140,6 +140,10 @@ RSpec.describe 'MCP 2026-07-28 subscriptions/listen — round 6' do
       subscription.finish
     end
 
+    # Round 10 moved the host callback to the end. It is the only step that
+    # can block — it is host code, running on whatever thread is routing, and
+    # on stdio that is the sole reader — so nothing the transport owes the
+    # subscription waits behind it any more.
     it 'orders every invalidation ahead of the delivery to the listeners' do
       order = []
       allow(server).to receive(:invalidate_cache_for_notification) { order << :transport_cache }
@@ -148,11 +152,11 @@ RSpec.describe 'MCP 2026-07-28 subscriptions/listen — round 6' do
 
       server.route_notification('notifications/tools/list_changed', {})
 
-      expect(order).to eq(%i[transport_cache host_callback listeners])
+      expect(order).to eq(%i[transport_cache listeners host_callback])
     end
 
-    # The host callback sits between the invalidation and the delivery, so the
-    # order only means something if a callback that raises can stop neither.
+    # The order only means something if a callback that raises can stop
+    # nothing, whichever step it is next to.
     it 'keeps that order when the host callback raises' do
       order = []
       allow(server).to receive(:invalidate_cache_for_notification) { order << :transport_cache }
@@ -164,7 +168,7 @@ RSpec.describe 'MCP 2026-07-28 subscriptions/listen — round 6' do
 
       expect { server.route_notification('notifications/tools/list_changed', {}) }.not_to raise_error
 
-      expect(order).to eq(%i[transport_cache host_callback listeners])
+      expect(order).to eq(%i[transport_cache listeners host_callback])
     end
   end
 

@@ -339,13 +339,16 @@ module MCPClient
         return :closed if state[:finished]
         return listen_stream_ended(subscription, response, buffer, state[:framing]) if response.success?
 
-        fail_subscription_from_response(subscription, response, buffer)
-        :closed
+        listen_response_rejected(subscription, response, buffer)
       rescue ListenStreamClosed
         :closed
       rescue Faraday::TimeoutError, Faraday::ConnectionFailed, Net::ReadTimeout, IOError => e
         @logger.debug("Subscription #{subscription.id} stream dropped: #{e.class}")
         :dropped
+      rescue Faraday::ServerError => e
+        # raise_error middleware configured by the host, on the status the
+        # branch below treats as transient: same answer.
+        listen_server_error_dropped(subscription, e.response_status || 'error')
       rescue Faraday::ClientError => e
         # raise_error middleware configured by the host: same pipeline as a
         # plain error response.
@@ -368,6 +371,37 @@ module MCPClient
         unregister_subscription(subscription)
         subscription.finish(gracefully: false, error: MCPClient::Errors::TransportError.new(e.message))
         :closed
+      end
+
+      # A non-2xx answer to the listen POST.
+      #
+      # A 5xx is the server being temporarily unable to serve the stream, not
+      # a refusal of the subscription — {#listen_rejection_error} already
+      # calls it {MCPClient::Errors::TransientServerError}, and every other
+      # request retries it. Ending the subscription on one let a single 500 or
+      # 503 kill a long-lived stream for good, while a connection that failed
+      # or timed out on the very same request re-opened on the usual backoff.
+      # So it takes that path instead. Anything else — a 4xx carrying the
+      # server's typed JSON-RPC error, an authorization challenge — is the
+      # server refusing this subscription, and still ends it.
+      # @param subscription [MCPClient::Subscription]
+      # @param response [Faraday::Response] the non-2xx answer
+      # @param buffer [String] the bytes it delivered
+      # @return [Symbol] :dropped or :closed
+      def listen_response_rejected(subscription, response, buffer)
+        return listen_server_error_dropped(subscription, response.status) if (500..599).cover?(response.status)
+
+        fail_subscription_from_response(subscription, response, buffer)
+        :closed
+      end
+
+      # @param subscription [MCPClient::Subscription]
+      # @param status [Integer, String] the server error the listen POST got
+      # @return [Symbol] :dropped
+      def listen_server_error_dropped(subscription, status)
+        @logger.info("subscriptions/listen #{subscription.id} answered with HTTP #{status}; " \
+                     'treating it as a dropped stream')
+        :dropped
       end
 
       # A 2xx listen response that ended without an SSE-framed closing
@@ -443,7 +477,10 @@ module MCPClient
       # The error for a non-2xx listen response, through the same pipeline
       # as any other request: 401/403 feed the OAuth challenge handling
       # (insufficient_scope surfaces as InsufficientScopeError), 5xx is
-      # transient, other 4xx carry the (possibly typed) JSON-RPC error.
+      # transient, other 4xx carry the (possibly typed) JSON-RPC error. A 5xx
+      # answer to the listen POST itself no longer arrives here — it re-opens
+      # the stream instead of ending it (see {#listen_response_rejected}) —
+      # but middleware that surfaces one as a rejection is still classified.
       # @param response [NormalizedResponse]
       # @return [MCPClient::Errors::MCPError]
       def listen_rejection_error(response)
