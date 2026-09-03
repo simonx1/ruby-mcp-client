@@ -881,6 +881,18 @@ module MCPClient
     # @param method [String] a notification method
     # @param params [Hash, nil] notification params
     # @return [void]
+    # A host layered above the transport (MCPClient::Client) keeps caches of
+    # its own, and they must be gone before a subscription listener runs —
+    # the listener is delivered right after this returns, while the host's
+    # own notification callback runs last, after the delivery, so that host
+    # code cannot hold the delivery up.
+    # @yieldparam method [String] the notification method
+    # @yieldparam params [Hash, nil] the notification params
+    # @return [void]
+    def on_cache_invalidation(&block)
+      @cache_invalidation_callback = block
+    end
+
     def invalidate_cache_for_notification(method, params = nil)
       kinds = LIST_CHANGE_NOTIFICATIONS[method]
       if kinds
@@ -893,6 +905,7 @@ module MCPClient
         uri = params.is_a?(Hash) ? params['uri'] : nil
         invalidate_read_cache(uri) if uri.is_a?(String)
       end
+      @cache_invalidation_callback&.call(method, params)
     end
   end
 end

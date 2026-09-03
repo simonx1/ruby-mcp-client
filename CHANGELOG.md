@@ -7,6 +7,13 @@ metadata). Each feature lands in its own PR; this section accumulates them.
 
 ### Cacheable results (`ttlMs` / `cacheScope`)
 
+- **Client caches are dropped with the transport's.** A transport that
+  carries the caching mixin invalidates before it delivers a notification
+  to a subscription listener, and this client registers its own
+  invalidation there (`on_cache_invalidation`) rather than in the host
+  notification callback, which now runs after the delivery. A listener
+  reacting to `notifications/tools/list_changed` therefore cannot read a
+  stale client-level list.
 - **A reservation is adopted only by the operation it was opened for (round
   34).** A `Client` listing opens a same-method reservation on every server
   up front, and the transports adopted one on the rule "entered before the
