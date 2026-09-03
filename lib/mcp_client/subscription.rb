@@ -146,6 +146,9 @@ module MCPClient
       # Whether a transport is handing this subscription to a new session:
       # see {#reestablishing?}.
       @reestablishing = false
+      # The listen ids the transport has written for this subscription on the
+      # session it is on, and not yet cancelled: see {#record_outstanding_listen}.
+      @outstanding_listens = []
     end
 
     # @return [Integer] notifications queued for this subscription's listeners
@@ -361,6 +364,50 @@ module MCPClient
         yield
         true
       end
+    end
+
+    # Record a listen request the transport has written for this subscription
+    # on the session it is on.
+    #
+    # A cancellation has to name a request the server may be serving, and
+    # that is not always the id the subscription happens to be on: a second
+    # listen written for it on one session (a hand-over that queued it twice,
+    # say) leaves the server holding the first stream, and
+    # `notifications/cancelled` for the newest id alone would never close it —
+    # the stream stays open until the server's own timeout, with the client
+    # unable to name it again.
+    #
+    # An attempt whose write raised is recorded too: the client cannot know
+    # how much of it the peer saw, and cancelling a request the server never
+    # received is ignored, while failing to cancel one it did receive is not.
+    # @param id [Integer, String] the listen request id
+    # @return [void]
+    # @api private
+    def record_outstanding_listen(id)
+      @mutex.synchronize do
+        @outstanding_listens << id unless @outstanding_listens.include?(id)
+      end
+    end
+
+    # The listen ids the server may still be serving for this subscription,
+    # leaving none behind: the caller is cancelling them.
+    # @return [Array] the recorded ids, oldest first
+    # @api private
+    def take_outstanding_listens
+      @mutex.synchronize do
+        outstanding = @outstanding_listens
+        @outstanding_listens = []
+        outstanding
+      end
+    end
+
+    # Forget the recorded listen ids without cancelling them: the session they
+    # were written to is gone, so nothing is outstanding and none of them must
+    # be cancelled on the session that replaces it.
+    # @return [void]
+    # @api private
+    def discard_outstanding_listens
+      @mutex.synchronize { @outstanding_listens = [] }
     end
 
     # Whether this subscription is still the stream a given listen id opened.

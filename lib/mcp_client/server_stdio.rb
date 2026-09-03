@@ -109,6 +109,13 @@ module MCPClient
       # the latter (see ChildSession and JsonRpcTransport#reopen_subscriptions).
       @session = nil
       @subscription_carrier = nil
+      # The subscriptions waiting for a process, and the lock the two paths
+      # that write them share: a `cleanup` moving the open subscriptions onto
+      # the queue overlaps a hand-over whose listen write failed putting one
+      # back (JsonRpcTransport#enqueue_reconnecting_subscriptions). Made here
+      # so no two threads ever race to make it.
+      @reconnecting_mutex = Mutex.new
+      @reconnecting_subscriptions = []
     end
 
     # Server info from the initialize response
@@ -815,7 +822,12 @@ module MCPClient
         live
       end
       open_subscriptions.each(&:mark_reconnecting)
-      (@reconnecting_subscriptions ||= []).concat(open_subscriptions.select(&:reconnectable?))
+      # Enqueued through the one lock a deferred hand-over writes under too,
+      # since a listen write failing on the process being torn down lands in
+      # the window between the snapshot above and this line
+      # (JsonRpcTransport#queue_subscriptions_of_ended_process, which also
+      # forgets the listen ids this process was holding).
+      queue_subscriptions_of_ended_process(open_subscriptions.select(&:reconnectable?))
       @stdin.close unless @stdin.closed?
       terminate_server_process
       @stdout.close unless @stdout.closed?
@@ -890,7 +902,24 @@ module MCPClient
       subscription.finish(by_client: true)
       unregister_subscription(subscription)
       subscriptions_mutex.synchronize { resource_subscriptions.delete_if { |_uri, sub| sub.equal?(subscription) } }
-      send_subscription_cancellation(subscription.id)
+      cancel_outstanding_listens(subscription)
+    end
+
+    # Tell the server the client has stopped reading every listen request it
+    # wrote for this subscription on the live process.
+    #
+    # Not just the one the subscription is on: a second listen written for it
+    # on one process — a hand-over the queue duplicated, say — leaves the
+    # server serving the first stream, and naming only the newest id left that
+    # one open with the client no longer able to refer to it. The
+    # subscription's own id is named as well, so a handle a caller closes
+    # before any write was recorded is still cancelled the way it always was.
+    # @param subscription [MCPClient::Subscription]
+    # @return [void]
+    def cancel_outstanding_listens(subscription)
+      ids = subscription.take_outstanding_listens
+      ids |= [subscription.id] if subscription.id
+      ids.each { |id| send_subscription_cancellation(id) }
     end
 
     # Tell the server the client closed a subscriptions/listen request.

@@ -76,8 +76,13 @@ module MCPClient
         # named again below, once the server has seen the listen.
         return unless subscription.with_open_id(id) { register_subscription(subscription) }
 
+        # Recorded before the write, and whatever the write does: from here on
+        # the server may be serving this listen, and {#cancel_subscription}
+        # has to be able to name it even after a later request has taken the
+        # subscription's own id (see {Subscription#record_outstanding_listen}).
+        subscription.record_outstanding_listen(id)
         send_request(request)
-        send_subscription_cancellation(id) if subscription.closed_by_client?
+        cancel_outstanding_listens(subscription) if subscription.closed_by_client?
       rescue StandardError => e
         fail_open_attempt(subscription, id, e)
       end
@@ -139,9 +144,7 @@ module MCPClient
       # @return [void]
       def defer_reestablished_attempt(subscription, id, error)
         subscription.mark_reconnecting
-        queue = (@reconnecting_subscriptions ||= [])
-        # `cleanup` may have queued it already, racing this write.
-        queue << subscription unless queue.any? { |queued| queued.equal?(subscription) }
+        enqueue_reconnecting_subscriptions([subscription])
         @logger.debug("subscriptions/listen #{id} failed while the subscription was being handed to a new " \
                       "process (#{error.message}); it will be re-sent to the next one")
       end
@@ -289,12 +292,78 @@ module MCPClient
         ) || false
       end
 
+      # Put subscriptions on the queue the next session drains, at most once
+      # each.
+      #
+      # Two paths write to this queue and they overlap: {#cleanup} moves the
+      # open subscriptions onto it, and {#defer_reestablished_attempt} puts
+      # back a hand-over whose write failed — and the second happens inside
+      # the window the first leaves between taking the registry snapshot and
+      # writing it here. An unguarded Array `concat`ed by one and `<<`ed by
+      # the other is undefined in MRI: the same window can lose the entry, and
+      # a subscription no session re-sends and no `cleanup` finds again is a
+      # stream the spec says MUST be re-established, stranded with the host
+      # never told. Scanning that Array with `equal?` while another thread
+      # grows it does not make the append safe either — it only decided,
+      # unreliably, whether to make a second one. So both paths come through
+      # here, under the one lock that also guards the take, and membership is
+      # by identity: a handle appears on the queue once, and one hand-over
+      # goes out for it.
+      # @param subscriptions [Array<MCPClient::Subscription>] to enqueue
+      # @return [Array<MCPClient::Subscription>] the whole queue afterwards
+      def enqueue_reconnecting_subscriptions(subscriptions)
+        reconnecting_mutex.synchronize { enqueue_reconnecting_locked(subscriptions) }
+      end
+
+      # Hand the subscriptions of a process that is being torn down to the
+      # next one, forgetting the listen ids that process was holding: nothing
+      # written to it is outstanding any more, and none of those ids may be
+      # cancelled on the process that replaces it (see
+      # {MCPClient::Subscription#record_outstanding_listen}).
+      #
+      # Both steps happen under the lock a hand-over takes them off the queue
+      # under, so a session that is already re-sending them cannot have the
+      # ids it has just written forgotten by this teardown: it cannot reach
+      # its own writes until this has finished.
+      # @param subscriptions [Array<MCPClient::Subscription>] the ones still open
+      # @return [void]
+      def queue_subscriptions_of_ended_process(subscriptions)
+        reconnecting_mutex.synchronize do
+          enqueue_reconnecting_locked(subscriptions).each(&:discard_outstanding_listens)
+        end
+      end
+
+      # @param subscriptions [Array<MCPClient::Subscription>] to enqueue
+      # @return [Array<MCPClient::Subscription>] the whole queue afterwards
+      def enqueue_reconnecting_locked(subscriptions)
+        queue = (@reconnecting_subscriptions ||= [])
+        subscriptions.each do |subscription|
+          queue << subscription unless queue.any? { |queued| queued.equal?(subscription) }
+        end
+        queue.dup
+      end
+
       # Take the subscriptions waiting for a process, leaving the queue empty.
       # @return [Array<MCPClient::Subscription>]
       def take_reconnecting_subscriptions
-        pending = (@reconnecting_subscriptions || []).select(&:reconnectable?)
-        @reconnecting_subscriptions = []
-        pending
+        reconnecting_mutex.synchronize do
+          pending = (@reconnecting_subscriptions || []).select(&:reconnectable?)
+          @reconnecting_subscriptions = []
+          pending
+        end
+      end
+
+      # @return [Array<MCPClient::Subscription>] the subscriptions on the queue
+      #   that a process could still be re-sent to
+      def reconnecting_subscriptions
+        reconnecting_mutex.synchronize { (@reconnecting_subscriptions || []).select(&:reconnectable?) }
+      end
+
+      # @return [Mutex] guards the queue of subscriptions waiting for a process
+      #   (created by {MCPClient::ServerStdio#initialize}, so no two threads
+      #   ever race to make it)
+      def reconnecting_mutex
+        @reconnecting_mutex ||= Mutex.new
       end
 
       # Restart the process the reader just watched exit, for the
@@ -321,7 +390,7 @@ module MCPClient
       # that is never coming back.
       # @return [void]
       def restart_for_open_subscriptions
-        pending = (@reconnecting_subscriptions || []).select(&:reconnectable?)
+        pending = reconnecting_subscriptions
         return if pending.empty?
 
         @logger.info("Re-establishing the server process for #{pending.size} open subscription(s)")

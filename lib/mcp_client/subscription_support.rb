@@ -94,11 +94,12 @@ module MCPClient
     # subscription's listeners are watching for.
     CONTROL_NOTIFICATIONS = %w[notifications/subscriptions/acknowledged notifications/cancelled].freeze
 
-    # Route an incoming notification: subscription bookkeeping
-    # (acknowledgment, server-side teardown), then transport and host cache
-    # invalidation, and only then delivery to the owning subscription's
-    # listeners (so hosts see subscription-delivered notifications exactly
-    # like request-scoped ones).
+    # Route an incoming notification, in four steps and in this order:
+    # subscription bookkeeping (acknowledgment, server-side teardown), then
+    # transport and host cache invalidation, then the delivery to the owning
+    # subscription's listeners, and last the host's `on_notification` callback
+    # (so hosts still see subscription-delivered notifications exactly like
+    # request-scoped ones).
     #
     # The invalidations come first on purpose. A listener runs on the
     # subscription's own dispatcher thread, so queuing its delivery makes the
@@ -109,24 +110,35 @@ module MCPClient
     # queued makes "the caches are already invalid when a listener sees the
     # notification" a guarantee instead of a race the scheduler usually wins.
     #
-    # The host callback sits between the two and can prevent neither: it is
-    # host code driven by the peer, and an exception escaping it used to take
-    # the notification down with it — the subscription's listeners never saw
-    # something the host's own handler had already been told about — and, on
-    # stdio, the transport's reader thread with it. Nor can it prevent the
-    # delivery by editing the payload: the callback is handed the very hash
-    # the delivery is routed by, so the subscription it belongs to is resolved
-    # *before* the callback sees it. Deleting or rewriting `_meta` afterwards
-    # changes nothing about where it goes.
+    # The host callback comes last, because it is the only step that can
+    # block. It is host code driven by the peer and it runs on whatever thread
+    # is routing — on stdio the process's sole stdout reader — so a callback
+    # that issues a synchronous request of its own waits there for a response
+    # only that reader can deliver. Round 3 moved the subscription's listeners
+    # off that thread for exactly this reason; running the callback ahead of
+    # them put the queueing back behind it, and a host handler that blocked
+    # stalled a delivery the dispatcher would otherwise have made at once.
+    # Queueing costs nothing to move: {#deliver_subscription_notification}
+    # hands the notification to the dispatcher rather than to the listeners,
+    # so nothing host-supplied runs before the callback either way.
+    #
+    # Being last, the callback can prevent nothing. An exception escaping it
+    # used to take the notification down with it — the subscription's
+    # listeners never saw something the host's own handler had already been
+    # told about — and, on stdio, the transport's reader thread with it; it is
+    # now logged and routing is over anyway. Nor can it drop or redirect a
+    # delivery by editing the payload it is handed: that is the very hash the
+    # delivery was routed by, and by the time the callback can touch it the
+    # subscription has already been resolved *and* the entry queued, so
+    # deleting or rewriting `_meta` changes nothing about where it went.
     # @param method [String] notification method
     # @param params [Hash, nil] notification params
     # @return [void]
     def route_notification(method, params)
       handle_subscription_control(method, params)
       invalidate_cache_for_notification(method) if respond_to?(:invalidate_cache_for_notification, true)
-      target = subscription_delivery_target(method, params)
+      deliver_subscription_notification(subscription_delivery_target(method, params), method, params)
       notify_host(method, params)
-      deliver_subscription_notification(target, method, params)
     end
 
     # Hand a notification to the host's callback, surviving whatever it does
@@ -182,7 +194,7 @@ module MCPClient
     end
 
     # The subscription a notification is delivered to, resolved from the
-    # payload before anything else is given the chance to edit it (see
+    # payload before the host's callback is given the chance to edit it (see
     # {#route_notification}).
     # @param method [String] notification method
     # @param params [Hash, nil] notification params
@@ -199,7 +211,7 @@ module MCPClient
     end
 
     # @param subscription [MCPClient::Subscription, nil] the stream it belongs
-    #   to, resolved before the host callback ran
+    #   to, resolved from the payload the peer sent
     # @param method [String] notification method
     # @param params [Hash, nil] notification params
     # @return [void]
@@ -282,8 +294,9 @@ module MCPClient
     # made yet. So this asks whether the server is watching the URI *now*
     # ({MCPClient::Subscription#await_live_resource_watch}), waiting out a
     # stream that is between listen attempts rather than reading what the last
-    # one was granted, and a stream that comes back without the URI stops
-    # being this URI's stream.
+    # one was granted, and a stream that comes back without the URI — or does
+    # not come back at all — stops being this URI's stream and is closed with
+    # it (see {#discard_mapped_resource_subscription}).
     # @param uri [String] the resource URI
     # @return [MCPClient::Subscription, nil]
     def settled_resource_subscription(uri)
@@ -292,8 +305,38 @@ module MCPClient
       return mapped if mapped.watching_resource?(uri)
       return mapped if mapped.await_live_resource_watch(uri, subscription_ack_timeout) == :watching
 
-      unmap_resource_subscription(mapped, uri)
+      discard_mapped_resource_subscription(mapped, uri)
       nil
+    end
+
+    # Give up on a stream that is mapped to a URI the server is not honouring
+    # on it — because it answered without the URI, ended, or never answered at
+    # all within the acknowledgment timeout.
+    #
+    # Dropping the mapping is not enough. A stream that is merely
+    # :reconnecting is still reconnectable, so {#subscribe_resource_via_listen}
+    # would open a replacement beside it and the discarded one could come back
+    # and deliver the same updates a second time — while
+    # {#unsubscribe_resource_via_listen}, which looks for the stream through
+    # the very mapping that was just dropped, could no longer find or cancel
+    # it. Closing it is also what the caller is entitled to: on stdio it sends
+    # the `notifications/cancelled` the spec requires of a client that stops
+    # reading a stream, and on Streamable HTTP it closes the response stream.
+    #
+    # The mapping is dropped first, and the stream is closed only once no
+    # other URI still names it: a stream that is a live watch for a second
+    # resource is not this URI's to end.
+    # @param subscription [MCPClient::Subscription] the discarded stream
+    # @param uri [String] the resource URI it was mapped to
+    # @return [void]
+    def discard_mapped_resource_subscription(subscription, uri)
+      unmap_resource_subscription(subscription, uri)
+      still_mapped = subscriptions_mutex.synchronize do
+        resource_subscriptions.any? { |_mapped_uri, sub| sub.equal?(subscription) }
+      end
+      return if still_mapped
+
+      subscription.close
     end
 
     # Close the streams whose mapped URI the server's latest acknowledgment
