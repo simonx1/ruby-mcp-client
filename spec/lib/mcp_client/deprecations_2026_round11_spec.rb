@@ -17,13 +17,15 @@ require 'spec_helper'
 # on a recursive lock and `emit_once` swallowed it in the rescue that means
 # "the logger failed" — an accident, not a decision.
 #
-# The fix keeps round 10's gate and its contract — one notice per feature per
-# process, a plain contender waits for another thread's emission and takes it
-# over when that emission fails — and adds the one rule that makes holding it
-# safe: a thread that is already inside a notice never waits for a gate. Its
-# nested attempt stands down at once and leaves that notice owed to a later
-# use, which is what the module already does with every notice it could not
-# write.
+# The round 11 fix kept round 10's gate and added the one rule that seemed to
+# make holding it safe: a thread already inside a notice never waits for a
+# gate, its nested attempt standing down at once and leaving that notice owed
+# to a later use — which is what the module already does with every notice it
+# could not write. That rule was not enough, because the thread holding the
+# logger's device lock need not be inside a notice at all (see the
+# verification pass), so no caller waits for a notice any more. The examples
+# below hold either way; what changed is the plain contender, which now
+# stands down where round 10 had it wait.
 #
 # Also in this round: `Logger.new(nil)` is a supported no-output logger whose
 # level sits below WARN, so the level probe accepted it and a notice was
@@ -161,23 +163,24 @@ RSpec.describe 'MCP 2026-07-28 deprecations (round 11)' do
       expect(output.string).to include('Sampling is deprecated')
     end
 
-    it 'still makes a plain contender wait for the emission it is racing' do
-      # Round 10's contract, unchanged: a thread that is not itself inside a
-      # notice waits for the one in flight rather than writing a second copy.
+    it 'has a plain contender stand down instead of waiting for the emission' do
+      # Round 10 had this contender wait; the verification pass took the wait
+      # out, because a thread that queues for a notice cannot know whether it
+      # is holding a lock the emitting thread needs. What it still must not
+      # do is write a second copy.
       logger = serializing_logger_class.new
       emitter = start { MCPClient::Deprecations.warn(:logging, logger) }
       logger.await_entry
       output = StringIO.new
       contender = start { MCPClient::Deprecations.warn(:logging, Logger.new(output)) }
-      settle(contender)
 
-      expect(contender).to be_alive
+      expect(finished?(contender)).to be(true), 'the contender queued behind the emission in flight'
+      expect(contender.value).to be(false)
       logger.release
 
       expect(finished?(emitter)).to be(true)
-      expect(finished?(contender)).to be(true)
       expect(emitter.value).to be(true)
-      expect(contender.value).to be(false)
+      expect(logger.messages.size).to eq(1)
       expect(output.string).not_to include('Logging is deprecated')
     end
   end

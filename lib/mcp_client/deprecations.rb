@@ -79,15 +79,21 @@ module MCPClient
     # Longest peer-supplied detail quoted in a notice.
     MAX_DETAIL_LENGTH = 200
 
-    # Marks a thread that is between claiming a feature's gate and coming
+    # Marks a thread that is between claiming a feature's notice and coming
     # back out of the logger. A thread-level variable, not a fiber-local
-    # one: what it guards is a Mutex this thread already holds, which every
-    # fiber of the thread holds with it.
+    # one: what it guards is a claim this thread holds, which every fiber of
+    # the thread holds with it.
     EMITTING_KEY = :mcp_client_deprecation_emitting
+
+    # A notice claimed by a caller that is inside the logger right now, as
+    # opposed to {EMITTED} for one the logger took.
+    WRITING = :writing
+
+    # A notice that went out.
+    EMITTED = :emitted
 
     @enabled = true
     @notices = {}
-    @gates = {}
     @mutex = Mutex.new
     @owner_pid = Process.pid
 
@@ -104,33 +110,34 @@ module MCPClient
       # counts as emitted only once the logger accepted it: a logger that
       # drops warnings (level above WARN), writes nowhere (`Logger.new(nil)`),
       # fails to report its level or raises leaves it for a later use, and so
-      # does a nested attempt from inside another notice's logger (see
-      # {.emit_once}). Never raises for a logger failure:
-      # the deprecated feature keeps working whatever the log does (feature
-      # lifecycle policy).
+      # do a nested attempt from inside another notice's logger and a caller
+      # that finds the notice already in flight (see {.emit_once}).
+      # Never raises for a logger failure: the deprecated feature
+      # keeps working whatever the log does (feature lifecycle policy).
       #
       # A notice costs its caller what one `logger.warn` costs it, and no
       # more. That is not a promise that it never waits: every other
       # `logger.warn` in this library blocks its caller the same way, so a
       # logger that blocks forever blocks the library everywhere, not only
       # here, and this path claims no exemption the rest of the code cannot
-      # claim. Where it does hold back is the module itself: the logger is
-      # called outside @mutex and under a gate held only for the feature
-      # being logged, so a notice in flight never delays another feature's
-      # notice, {.emitted?} or {.reset!}.
+      # claim. What it does promise is that the waiting is the logger's: no
+      # caller ever waits for a lock of THIS module, which is never held
+      # while calling out, so a notice in flight never delays another
+      # feature's notice, another caller, {.emitted?} or {.reset!}.
       # @param feature [Symbol] a {REGISTRY} key
       # @param logger [Logger, nil] where the notice goes (a nil logger emits nothing)
       # @param detail [String, nil] peer-supplied context quoted in the notice
       #   (control characters are escaped and the text is bounded)
       # @return [Boolean] true when a notice was written, false when it was
-      #   already emitted, notices are disabled, the logger drops warnings or failed
+      #   already emitted or in flight, notices are disabled, the logger drops
+      #   warnings or failed
       # @raise [ArgumentError] for an unknown feature
       def warn(feature, logger, detail: nil)
         entry = REGISTRY[feature] or raise ArgumentError, "unknown deprecated feature: #{feature.inspect}"
         return false unless enabled? && logger
         return false unless accepts_warnings?(logger)
 
-        emit_once(feature) { logger.warn(message(entry, detail)) }
+        emit_once(feature, logger) { logger.warn(message(entry, detail)) }
       end
 
       # @param feature [Symbol] a {REGISTRY} key
@@ -138,7 +145,7 @@ module MCPClient
       #   A caller currently inside `logger.warn` has not emitted one: it may
       #   yet fail, which leaves the notice owed.
       def emitted?(feature)
-        @mutex.synchronize { notice_states.key?(feature) }
+        @mutex.synchronize { notice_states[feature] == EMITTED }
       end
 
       # Forget which notices were emitted (each feature warns again on its
@@ -148,7 +155,6 @@ module MCPClient
         @mutex.synchronize do
           @owner_pid = Process.pid
           @notices.clear
-          @gates.clear
         end
       end
 
@@ -159,51 +165,91 @@ module MCPClient
       #
       # Emitting is what spends the notice, not attempting to: marking the
       # feature spent before the logger had said anything could lose the
-      # notice outright, since two first uses racing with different loggers
-      # would have the first one fail inside a broken logger while the
-      # second — holding a logger that works — saw the slot taken and stood
-      # down. So the attempt is serialized on a gate held only for the
-      # feature being logged, and a caller that arrives while another is
-      # inside the logger either finds the notice emitted (and stands down)
-      # or takes it over (the earlier attempt failed). Nothing is timed:
-      # a caller waits on the gate exactly as long as it would have waited
-      # on a shared logger's own lock, and never comes away from that wait
-      # with the notice neither emitted nor its own to write.
+      # notice outright, since a first use that fails inside a broken logger
+      # would leave every later use looking at a spent slot. So an attempt
+      # is a CLAIM (see {.claim}), released again when the logger did not
+      # take the notice, and the feature is marked emitted only afterwards.
       #
-      # A gate is held across host code, so it is never waited for BY host
-      # code running inside one. A logger callback — a formatter, a log
-      # subscriber — may itself reach a deprecated feature, and a thread
-      # already inside a notice that then queued for a gate would deadlock:
-      # against its own gate for the same feature, or (with a logger that
-      # serializes its writes, as ::Logger does) against another thread that
-      # holds the second feature's gate and is waiting for that logger. So a
-      # thread inside a notice never queues: its nested attempt stands down
-      # at once and leaves that notice owed to a later use, exactly as a
-      # dropped one is. The notice it stood down from is not lost — whoever
-      # holds that gate is writing it.
+      # Nothing is ever waited for. A caller that finds the notice in flight
+      # stands down at once and leaves it to a later use, exactly as a
+      # dropped one is left — it does not queue behind the emission, and it
+      # does not take it over. Queueing is what buys a lock-order inversion,
+      # and no rule about who may queue can avoid it, because the waiter
+      # cannot know what it is holding: `logger.warn` is host code that
+      # serializes its writes (as ::Logger does behind its device lock) and
+      # that may reach a deprecated feature from a formatter, a log
+      # subscriber or an audit hook. A thread writing an ORDINARY log line
+      # holds that device lock and is not inside a notice at all; let it
+      # queue for a notice held by a thread that is waiting for the same
+      # device lock and both stop, taking the sampling request, the log
+      # level or the SSE `connect` behind the notice with them. A claim is
+      # a mark under @mutex instead, taken and released without ever calling
+      # out of this module, so a lock of ours is never held across host code
+      # and never acquired behind one of theirs.
+      #
+      # Standing down loses nothing that was there to lose: whoever holds
+      # the claim is writing that notice, and if their logger fails the
+      # claim is released, so the next use of the feature attempts it again.
+      # A thread already inside a notice stands down too, which keeps a
+      # logger callback from re-entering the host's logger under this
+      # module's own name.
+      #
+      # The logger is asked one more time whether it keeps warnings, next to
+      # the write rather than at the top of {.warn}: `Logger#warn` returns
+      # true whether it wrote or filtered, so a level that went up in
+      # between would otherwise spend the process's one notice on a warning
+      # nobody can read. A level that changes DURING the write is beyond
+      # reach — that race is the host's own, and the same one two of its
+      # threads have with each other.
       # @param feature [Symbol] a {REGISTRY} key
+      # @param logger [Logger, #warn] the logger the emission writes to
       # @yield the emission, called with no lock of this module held
       # @return [Boolean] whether this call emitted the notice
-      def emit_once(feature)
+      def emit_once(feature, logger)
         return false if emitting?
+        return false unless claim(feature)
 
-        gate = gate_for(feature)
-        return false unless gate
-
+        written = false
         begin
           mark_emitting(true)
-          gate.synchronize do
-            return false if emitted?(feature)
-
+          if accepts_warnings?(logger)
             yield
-            mark_emitted(feature)
-            true
+            written = true
           end
+        rescue StandardError
+          written = false
         ensure
           mark_emitting(false)
+          settle(feature, written)
         end
-      rescue StandardError
-        false
+        written
+      end
+
+      # Reserve this process's notice for the caller. The claim is a mark in
+      # the same map that records emitted notices, so a feature is claimable
+      # only while it is neither emitted nor being written right now, and
+      # taking it costs @mutex for the length of a hash lookup.
+      # @param feature [Symbol] a {REGISTRY} key
+      # @return [Boolean] whether the caller may write the notice
+      def claim(feature)
+        @mutex.synchronize do
+          states = notice_states
+          return false if states.key?(feature)
+
+          states[feature] = WRITING
+          true
+        end
+      end
+
+      # Close a claim: spend the notice, or hand it back to a later use.
+      # @param feature [Symbol] a {REGISTRY} key
+      # @param written [Boolean] whether the logger took the notice
+      # @return [void]
+      def settle(feature, written)
+        @mutex.synchronize do
+          states = notice_states
+          written ? states[feature] = EMITTED : states.delete(feature)
+        end
       end
 
       # @return [Boolean] whether this thread is already inside a notice
@@ -217,40 +263,19 @@ module MCPClient
         Thread.current.thread_variable_set(EMITTING_KEY, value)
       end
 
-      # @param feature [Symbol] a {REGISTRY} key
-      # @return [Mutex, nil] the feature's emission gate, or nil when its
-      #   notice has already gone out and no attempt is needed
-      def gate_for(feature)
-        @mutex.synchronize do
-          return nil if notice_states.key?(feature)
-
-          @gates[feature] ||= Mutex.new
-        end
-      end
-
-      # Record that the feature's notice went out and retire its gate.
-      # @param feature [Symbol] a {REGISTRY} key
-      # @return [void]
-      def mark_emitted(feature)
-        @mutex.synchronize do
-          notice_states[feature] = true
-          @gates.delete(feature)
-        end
-      end
-
-      # Which features have had their notice logged IN THIS PROCESS. A
-      # prefork server (Puma, Unicorn) that warned while preloading would
-      # hand every worker an already-spent map and silence the worker's own
-      # first use, so an inherited map is dropped the first time the owning
-      # PID no longer matches — along with the gates, whose Mutexes may have
-      # been left locked by a thread that did not survive the fork. Callers
-      # hold @mutex.
-      # @return [Hash{Symbol => true}]
+      # What this process knows about each feature's notice: {WRITING} while
+      # a caller is inside the logger, {EMITTED} once one came back having
+      # written it, absent otherwise. A prefork server (Puma, Unicorn) that
+      # warned while preloading would hand every worker an already-spent map
+      # and silence the worker's own first use, so an inherited map is
+      # dropped the first time the owning PID no longer matches — including
+      # any claim held by a thread that did not survive the fork, which no
+      # one in the child will ever settle. Callers hold @mutex.
+      # @return [Hash{Symbol => Symbol}]
       def notice_states
         if @owner_pid != Process.pid
           @owner_pid = Process.pid
           @notices = {}
-          @gates = {}
         end
         @notices
       end

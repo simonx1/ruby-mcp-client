@@ -34,7 +34,14 @@ RSpec.describe 'MCP 2026-07-28 URL-mode elicitation — a failing logger' do
   end
 
   it 'still serves the elicitation when the notice cannot be written' do
-    expect { client.send(:handle_elicitation_request, 1, params, modern_server) }.not_to raise_error
+    result = nil
+
+    expect { result = client.send(:handle_elicitation_request, 1, params, modern_server) }.not_to raise_error
+
+    # The handler's own answer, not a cancellation manufactured after it ran:
+    # a failing notice may cost the notice and nothing else. Checking only
+    # that the handler was reached would miss exactly that.
+    expect(result).to eq({ 'action' => 'accept' })
     expect(@seen.first).to eq('Sign in')
     expect(@seen.last).to eq({ 'mode' => 'url', 'url' => 'https://auth.example/start' })
   end

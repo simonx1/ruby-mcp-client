@@ -13,11 +13,14 @@ require 'spec_helper'
 # contender, holding a logger that works, sees the slot taken and returns
 # false; the reserving one then raises and releases the slot, and if there is
 # no later use nothing is ever logged. A reservation and an emitted notice
-# have to be distinguishable so a contender can wait for the outcome and take
-# the notice over when the reservation fails. (Round 10 kept that outcome and
-# dropped the machinery: the contender now waits on the feature's emission
-# gate, with no bounded wait to expire and nothing to hand back a notice that
-# was neither emitted nor owed.)
+# have to be distinguishable, so that a failed reservation leaves the notice
+# owed rather than spent. (Round 10 kept that outcome and dropped the
+# machinery, moving the attempt onto the feature's emission gate; the
+# verification pass then dropped the WAIT as well — a caller that meets a
+# notice in flight stands down instead of queueing behind it, because
+# queueing for a notice is what deadlocks against the logger writing it.
+# What survives every round is this: a notice that was not written is not
+# spent, so the feature's next use still gets it.)
 #
 # Then the places round 8's HTTP+SSE sweep did not reach. Round 8 marked the
 # Overview bullet, the Quick Connect line, the `/sse` detection row and
@@ -141,7 +144,7 @@ RSpec.describe 'MCP 2026-07-28 deprecations (round 9)' do
       expect(MCPClient::Deprecations.emitted?(:roots)).to be(true)
     end
 
-    it 'hands the notice to the contender when the reservation fails' do
+    it 'leaves the notice owed to a later use when the reservation fails' do
       reserver = Thread.new { MCPClient::Deprecations.warn(:roots, gated_logger) }
       gated_logger.await_entry
 
@@ -150,21 +153,28 @@ RSpec.describe 'MCP 2026-07-28 deprecations (round 9)' do
       sleep 0.05
       gated_logger.release(:raise)
 
-      expect(reserver.value).to be(false)
-      expect(contender.value).to be(true)
-      expect(MCPClient::Deprecations.emitted?(:roots)).to be(true)
+      # The contender stands down instead of taking the reservation over: it
+      # cannot know that it is not itself holding a lock the reserving thread
+      # needs (see the verification pass). What it must not do is come away
+      # having spent a notice nobody wrote.
+      expect([reserver.value, contender.value]).to eq([false, false])
+      expect(MCPClient::Deprecations.emitted?(:roots)).to be(false)
+      expect(MCPClient::Deprecations.warn(:roots, working_logger)).to be(true)
       expect(output.string).to match(/Roots is deprecated/)
     end
 
     it 'never loses the only viable notice, whatever the interleaving' do
       # Same race without the sleep: whichever way the two land, a working
-      # logger was present for a first use, so a notice must have gone out.
+      # logger was present for a first use, so the notice is either out or
+      # still owed — never neither.
       reserver = Thread.new { MCPClient::Deprecations.warn(:roots, gated_logger) }
       gated_logger.await_entry
       contender = Thread.new { MCPClient::Deprecations.warn(:roots, working_logger) }
       gated_logger.release(:raise)
 
-      expect([reserver.value, contender.value]).to eq([false, true])
+      expect(reserver.value).to be(false)
+      written = contender.value || MCPClient::Deprecations.warn(:roots, working_logger)
+      expect(written).to be(true)
       expect(output.string).to match(/Roots is deprecated/)
     end
 

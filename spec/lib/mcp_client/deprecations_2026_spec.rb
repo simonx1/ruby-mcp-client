@@ -272,17 +272,35 @@ RSpec.describe 'MCP 2026-07-28 deprecations' do
     register.call
     expect(output.string.scan(/Dynamic Client Registration .*deprecated/).size).to eq(1)
 
+    # Reset before disabling: a notice already spent stays silent whether or
+    # not the switch works, so silence after two registrations would say
+    # nothing about `enabled = false`.
+    MCPClient::Deprecations.reset!
     MCPClient::Deprecations.enabled = false
     output.truncate(0)
     register.call
+    expect(MCPClient::Deprecations.emitted?(:dynamic_client_registration)).to be(false)
     expect(output.string).not_to match(/deprecated/)
+
+    # And the notice really was owed again, so the silence above was the
+    # switch and nothing else.
+    MCPClient::Deprecations.enabled = true
+    register.call
+    expect(output.string).to match(/Dynamic Client Registration .*deprecated/)
   end
 
   it 'never lets peer-controlled detail forge log lines' do
-    MCPClient::Deprecations.warn(:include_context, logger, detail: "allServers\nWARN forged\u2028more")
+    # Assert the notice went out as well: an example that only checks for
+    # what is absent passes on a notice that was never written at all.
+    expect(MCPClient::Deprecations.warn(:include_context, logger,
+                                        detail: "allServers\nWARN forged\u2028more")).to be(true)
 
+    expect(output.string).to include('includeContext values')
+    expect(output.string).to include('Received: allServers\u000AWARN forged\u2028more')
     expect(output.string).not_to include("\nWARN forged")
     expect(output.string).not_to include("\u2028")
+    # One line: the escaping is what keeps the peer's text inside the notice.
+    expect(output.string.lines.size).to eq(1)
   end
 
   it 'bounds the quoted detail' do
