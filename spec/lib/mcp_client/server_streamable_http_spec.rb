@@ -911,7 +911,16 @@ RSpec.describe MCPClient::ServerStreamableHTTP do
       end
     end
 
+    # A legacy session has no re-issue path: an SSE body that carries no
+    # usable JSON-RPC response is reported as-is. (On a modern server the
+    # same body means the response was lost in transit and the request is
+    # re-issued instead — see streamable_http_modern_2026_verify_spec.rb.)
     context 'with invalid JSON in SSE response' do
+      let(:server) do
+        described_class.new(base_url: base_url, endpoint: endpoint, headers: headers, retries: 0,
+                            protocol: :legacy)
+      end
+
       before do
         stub_request(:post, "#{base_url}#{endpoint}")
           .to_return(
@@ -930,6 +939,11 @@ RSpec.describe MCPClient::ServerStreamableHTTP do
     end
 
     context 'with malformed SSE response' do
+      let(:server) do
+        described_class.new(base_url: base_url, endpoint: endpoint, headers: headers, retries: 0,
+                            protocol: :legacy)
+      end
+
       before do
         stub_request(:post, "#{base_url}#{endpoint}")
           .to_return(

@@ -480,7 +480,12 @@ RSpec.describe 'MCP 2026-07-28 Streamable HTTP modern mode' do
         expect(get_stub).not_to have_been_requested
       end
 
-      it 'does not re-issue tools/call when the stream closes without a response' do
+      # Changelog major change 9 states the re-issue rule with no exception
+      # for tools/call, and this revision makes the broken stream itself the
+      # cancellation signal the server MUST act on, so the replacement
+      # request is what the protocol expects. It happens exactly once:
+      # with_retry never retries a non-idempotent method.
+      it 're-issues tools/call once when the stream closes without a response' do
         requests = stub_modern_server(
           'server/discover' => discover_result,
           'tools/call' => lambda do |_body, _req|
@@ -489,8 +494,10 @@ RSpec.describe 'MCP 2026-07-28 Streamable HTTP modern mode' do
         )
 
         expect { server.call_tool('t', {}) }
-          .to raise_error(MCPClient::Errors::ToolCallError, /stream closed before delivering the response/i)
-        expect(requests.count { |r| r[:body]['method'] == 'tools/call' }).to eq(1)
+          .to raise_error(MCPClient::Errors::MCPError, /stream closed before delivering the response/i)
+        expect(requests.count { |r| r[:body]['method'] == 'tools/call' }).to eq(2)
+        ids = requests.select { |r| r[:body]['method'] == 'tools/call' }.map { |r| r[:body]['id'] }
+        expect(ids.uniq.size).to eq(2)
       end
     end
   end

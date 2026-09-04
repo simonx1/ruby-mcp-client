@@ -15,10 +15,24 @@ metadata). Each feature lands in its own PR; this section accumulates them.
   404 carrying -32601 is a modern server without discovery support
   (tolerated, capabilities unknown). Any other 4xx — or a 2xx that is not a
   `DiscoverResult` — is a legacy server: the `initialize` handshake runs as
-  before and the verdict is cached for the transport. 401/403, 5xx and
-  timeouts propagate rather than trigger a fallback. `protocol:` and
-  `discover_timeout:` are accepted by `http_config`, `streamable_http_config`,
-  the factory and `MCPClient.connect`.
+  before. **Both verdicts are cached** for the transport, so a server once
+  found modern never gets `initialize` on a later connection, however a later
+  probe fails. `protocol:` and `discover_timeout:` are accepted by
+  `http_config`, `streamable_http_config`, the factory and `MCPClient.connect`.
+- **Only a genuine rejection settles the era.** A probe whose exchange never
+  completed says nothing about the server: 401/403, 5xx (including a 5xx
+  surfaced as an exception by user-configured `raise_error` middleware, which
+  now raises `TransientServerError` like the default response path), timeouts,
+  an oversized body and a broken response stream all propagate instead of
+  recording a (cached, permanent) legacy verdict. The probe itself goes
+  through the modern re-issue path: a `server/discover` whose response stream
+  dies is re-sent once with a new request id before the failure is reported.
+- **A modern verdict survives the transport detector.** A modern-but-
+  incompatible server now raises `MCPClient::Errors::ModernServerError` (a
+  `ConnectionError` subclass), which `MCPClient.connect` re-raises for an
+  ambiguous URL instead of falling through to the legacy SSE and HTTP+POST
+  transports. `MCPClient.connect(url, protocol: :modern)` likewise no longer
+  falls back to those legacy-only transports.
 - **Request metadata headers.** Every modern POST carries
   `MCP-Protocol-Version` (equal to the body's `_meta`), `Mcp-Method` and, for
   `tools/call`, `prompts/get` and `resources/read`, `Mcp-Name` (also for the
@@ -26,13 +40,25 @@ metadata). Each feature lands in its own PR; this section accumulates them.
   `=?base64?…?=` sentinel encoding (`encode_header_value`).
 - **No protocol-level session.** Modern connections send no
   `Mcp-Session-Id`, open no GET event stream, send no DELETE, and never use
-  `Last-Event-ID`: a response stream that ends without the response is
-  re-issued as a new request (new id) for idempotent methods, while
-  `tools/call` raises so the host decides. Closing the stream is the
-  cancellation signal (no `notifications/cancelled` on timeout). Server-
-  initiated JSON-RPC requests on a response stream are dropped with a
-  warning; SSE comment keep-alives are ignored. `ping` maps to
-  `server/discover` and `log_level=` to the per-request `_meta` level.
+  `Last-Event-ID`. Closing the stream is the cancellation signal (no
+  `notifications/cancelled` on timeout). Server-initiated JSON-RPC requests on
+  a response stream are dropped with a warning; SSE comment keep-alives are
+  ignored. `ping` maps to `server/discover` and `log_level=` to the
+  per-request `_meta` level.
+- **A broken response stream is re-issued, `tools/call` included** (changelog
+  major change 9: "A broken response stream loses the in-flight request;
+  clients **MUST** re-issue it as a new request with a new request ID"). The
+  rule has no per-method exception, and this revision makes the broken stream
+  itself the cancellation signal the server MUST act on — it "**MUST NOT** send
+  any further messages" for the cancelled request — so the replacement request
+  is what the protocol expects rather than a blind replay. Exactly one
+  re-issue is made: `with_retry` still refuses to retry a non-idempotent
+  method, so a second broken stream surfaces as
+  `MCPClient::Errors::ResponseStreamClosedError` instead of looping. The other
+  no-replay guarantees are unchanged — a 5xx, a timeout, an oversized body or
+  an expired session during `tools/call` is never re-sent, because in none of
+  those cases was the server told to stop. A break that lands inside an SSE
+  event's JSON recovers exactly like one that lands between events.
 
 ### Stateless protocol on stdio (server/discover, per-request `_meta`)
 

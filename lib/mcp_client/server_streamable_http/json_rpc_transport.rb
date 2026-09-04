@@ -140,11 +140,15 @@ module MCPClient
         matched = select_sse_response(responses, request_id)
         return matched if matched
 
-        if saw_invalid_json
+        if saw_invalid_json && !modern?
           raise MCPClient::Errors::TransportError,
                 'Invalid JSON response from server: SSE stream contained no valid JSON-RPC response'
         end
 
+        # On a modern server a disconnection that lands inside an event's JSON
+        # is the same loss as one that lands between events, so both take the
+        # re-issue path (2026-07-28 changelog, major change 9). Recovery must
+        # not depend on where the break fell.
         resume_or_fail(events, request_id, retry_ms)
       end
 
