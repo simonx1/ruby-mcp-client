@@ -11,11 +11,11 @@ RSpec.describe 'MCP 2026-07-28 JSON Schema handling — round 9' do
   let(:draft7) { 'http://json-schema.org/draft-07/schema#' }
 
   describe 'anchors only from schema positions' do
-    it 'does not take an $anchor from a definition bag the dialect does not define' do
+    it 'does not take an $anchor from a bag under a keyword no dialect defines' do
       schema = {
         'type' => 'object',
         'properties' => { 'a' => { '$ref' => '#trap' } },
-        'definitions' => { 'x' => { '$anchor' => 'trap', 'type' => 'string' } }
+        'x-defs' => { 'x' => { '$anchor' => 'trap', 'type' => 'string' } }
       }
       expect(validator.check_schema(schema)).to contain_exactly(a_string_matching(/unresolvable local \$ref "#trap"/))
       expect(validator.validate({ 'a' => 'ok' }, schema)).to contain_exactly(a_string_matching(/unresolvable/))

@@ -157,7 +157,7 @@ RSpec.describe 'MCP 2026-07-28 JSON Schema handling — round 22' do
 
     it 'forgets the tools a refreshed list no longer carries' do
       client = client_with([tool('old')])
-      client.send(:warn_unusable_input_schema, tool('old'))
+      client.send(:input_schema_state, tool('old'))
       client.send(:warn_partial_schema_coverage, tool('old'))
       expect(client.instance_variable_get(:@input_schema_warnings)).not_to be_empty
 
@@ -170,7 +170,7 @@ RSpec.describe 'MCP 2026-07-28 JSON Schema handling — round 22' do
 
     it 'forgets them when the whole cache is cleared' do
       client = client_with([tool('old')])
-      client.send(:warn_unusable_input_schema, tool('old'))
+      client.send(:input_schema_state, tool('old'))
       client.send(:warn_partial_schema_coverage, tool('old'))
 
       client.clear_cache

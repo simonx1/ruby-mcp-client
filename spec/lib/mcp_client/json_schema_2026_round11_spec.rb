@@ -34,8 +34,12 @@ RSpec.describe 'MCP 2026-07-28 JSON Schema handling — round 11' do
       expect(validator.validate(3, decided)).to contain_exactly(a_string_matching(/oneOf/))
     end
 
-    it 'skips a conditional whose if it cannot decide' do
-      schema = { 'if' => { 'multipleOf' => 2 }, 'then' => { 'type' => 'string' }, 'else' => { 'type' => 'string' } }
+    it 'skips a conditional whose if it cannot decide, unless the branches agree' do
+      # Neither branch can be selected, but both reject the value, so the
+      # instance is rejected whichever way the condition goes.
+      agreed = { 'if' => { 'multipleOf' => 2 }, 'then' => { 'type' => 'string' }, 'else' => { 'type' => 'string' } }
+      expect(validator.validate(3, agreed)).to contain_exactly(a_string_matching(/expected type string/))
+      schema = { 'if' => { 'multipleOf' => 2 }, 'then' => { 'type' => 'string' }, 'else' => { 'type' => 'integer' } }
       expect(validator.validate(3, schema)).to be_empty
       decided = { 'if' => { 'type' => 'integer' }, 'then' => { 'type' => 'string' } }
       expect(validator.validate(3, decided)).to contain_exactly(a_string_matching(/expected type string/))
@@ -85,11 +89,14 @@ RSpec.describe 'MCP 2026-07-28 JSON Schema handling — round 11' do
     it 'makes a document whose anchors cannot be fully indexed unusable' do
       bag = {}
       validator::MAX_SUBSCHEMAS.times { |i| bag["d#{i}"] = { 'type' => 'string' } }
+      # The bag sits under the container this dialect does not define, so
+      # the preflight walk never reads it while the index still must.
       schema = {
-        'properties' => { 'a' => { '$ref' => '#/$defs/holder/$defs/t' } },
-        '$defs' => { 'holder' => { '$defs' => { 't' => { '$id' => 'https://example.com/t', '$schema' => draft7,
-                                                         'items' => [{ 'type' => 'integer' }] } } } },
-        'definitions' => bag
+        '$schema' => draft7,
+        'properties' => { 'a' => { '$ref' => '#/definitions/holder/definitions/t' } },
+        'definitions' => { 'holder' => { 'definitions' => { 't' => { '$id' => 'https://example.com/t',
+                                                                     'items' => [{ 'type' => 'integer' }] } } } },
+        '$defs' => bag
       }
       expect(validator.check_schema(schema)).to contain_exactly(a_string_matching(/index/))
       expect(validator.validate({ 'a' => ['x'] }, schema)).to contain_exactly(a_string_matching(/index/))
@@ -127,7 +134,7 @@ RSpec.describe 'MCP 2026-07-28 JSON Schema handling — round 11' do
       client = client_with([tool])
       allow(mock_server).to receive(:call_tool).and_return({ 'content' => [], 'structuredContent' => {} })
 
-      expect { client.send(:warn_unusable_input_schema, tool) }.not_to raise_error
+      expect { client.send(:input_schema_state, tool) }.not_to raise_error
       expect { client.call_tool('t', {}) }.not_to raise_error
       expect(log_output.string).to include('not usable')
     end
@@ -139,11 +146,11 @@ RSpec.describe 'MCP 2026-07-28 JSON Schema handling — round 11' do
       client = client_with([tool])
       allow(validator).to receive(:check_schema).and_call_original
 
-      2.times { client.send(:warn_unusable_input_schema, tool) }
+      2.times { client.send(:input_schema_state, tool) }
       expect(validator).to have_received(:check_schema).once
 
       refreshed = MCPClient::Tool.new(name: 't', description: 'd', schema: schema.dup, server: mock_server)
-      client.send(:warn_unusable_input_schema, refreshed)
+      client.send(:input_schema_state, refreshed)
       expect(validator).to have_received(:check_schema).twice
     end
   end

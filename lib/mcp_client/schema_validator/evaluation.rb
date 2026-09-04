@@ -91,7 +91,9 @@ module MCPClient
       def ref_target(app)
         ctx = app.ctx
         ref = app.schema['$ref']
-        return ref_problem(app, "external $ref #{clip(ref.inspect)} is not dereferenced") if unusable_ref?(ref)
+        if unusable_ref?(ref, ctx, app.schema)
+          return ref_problem(app, "external $ref #{clip(ref.inspect)} is not dereferenced")
+        end
         if app.ref_depth >= MAX_REF_DEPTH
           raise Aborted, "$ref chain exceeds #{MAX_REF_DEPTH} hops (cycle?) at #{clip(ref.inspect)}"
         end
@@ -104,9 +106,11 @@ module MCPClient
       end
 
       # @param ref [Object] the `$ref` value
+      # @param ctx [Context] the validation context
+      # @param from [Hash] the schema object holding the reference
       # @return [Boolean] whether it is a reference this validator never follows
-      def unusable_ref?(ref)
-        !ref.is_a?(String) || external_ref?(ref)
+      def unusable_ref?(ref, ctx, from)
+        !ref.is_a?(String) || external_ref?(ref, ctx.root, ctx.dialect, ctx, from: from)
       end
 
       # @param app [Application]
@@ -234,7 +238,8 @@ module MCPClient
 
       # if / then / else. An `if` without `then` or `else` asserts nothing
       # (JSON Schema 2020-12 Section 10.2.2.1) and is not evaluated; an
-      # undecided condition applies neither branch.
+      # undecided condition applies neither branch, but may still be settled
+      # by the branches agreeing ({#unconditional_conditional}).
       # @param app [Application]
       # @return [Array] a step
       def compose_conditional(app, &cont)
@@ -243,13 +248,51 @@ module MCPClient
 
         branch_verdict(app, schema['if']) do |verdict|
           branch = { pass: 'then', fail: 'else' }[verdict]
-          next cont.call if branch.nil? || !schema.key?(branch)
+          next unconditional_conditional(app, cont) if branch.nil?
+          next cont.call unless schema.key?(branch)
 
           [:apply, schema[branch], app.ref_depth, false, lambda do |errors|
             app.errors.concat(errors)
             cont.call
           end]
         end
+      end
+
+      # A condition this validator cannot decide still settles the instance
+      # when both outcomes reject it: exactly one of `then` and `else` is
+      # applied (JSON Schema 2020-12 Section 10.2.2.2 and 10.2.2.3), so a
+      # value both of them reject is invalid whichever way the condition
+      # goes. Reporting nothing there would turn a definite failure into a
+      # pass — and, under :strict, accept a result the schema rejects. Only
+      # a definite rejection counts on each side; what a branch could not
+      # evaluate leaves the conditional undecided as before.
+      # @param app [Application]
+      # @param cont [Proc] what follows the conditional
+      # @return [Array] a step
+      def unconditional_conditional(app, cont)
+        schema = app.schema
+        return cont.call unless schema.key?('then') && schema.key?('else')
+
+        undecided = app.ctx.undecided
+        [:apply, schema['then'], app.ref_depth, true, lambda do |then_errors|
+          next resume_conditional(app, undecided, cont) if then_errors.empty?
+
+          [:apply, schema['else'], app.ref_depth, true, lambda do |else_errors|
+            unless else_errors.empty?
+              app.errors << "#{app.path}: fails both then and else of an if this validator cannot decide " \
+                            "(#{clip(then_errors.first.to_s)})"
+            end
+            resume_conditional(app, undecided, cont)
+          end]
+        end]
+      end
+
+      # Resume after measuring the branches: what they could not evaluate is
+      # not this node's uncertainty (the condition's already is).
+      # @return [Array] a step
+      def resume_conditional(app, undecided, cont)
+        app.ctx.undecided = undecided
+        cont.call
       end
 
       # The verdicts of a keyword's branches. Evaluation stops as soon as the

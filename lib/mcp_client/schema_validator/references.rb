@@ -15,13 +15,42 @@ module MCPClient
     # referencing schema belongs to — never one of an embedded resource, and
     # never one of the enclosing document from inside an embedded resource.
     module References
-      # A reference that does not point inside this document: an absolute URI
-      # (http, https, urn, file, ...), a relative document, or anything that
-      # is not a bare fragment. None of these is ever fetched.
+      # A reference that does not point inside this document, so using it
+      # would need a retrieval that never happens. A bare fragment is always
+      # local; anything else is resolved against the base URI of the
+      # resource holding it (RFC 3986 Section 5.2) and is local when the
+      # document bundles a resource whose `$id` is that URI (JSON Schema
+      # 2020-12 Core Section 9.3.1) -- the empty reference, which names the
+      # base itself, included. Without the document and its index only the
+      # syntactic answer is available, and a reference outside the fragment
+      # space is external.
       # @param ref [String]
+      # @param root [Hash, nil] the normalized root schema
+      # @param dialect [String, nil] the canonical dialect
+      # @param resolver [Hash, Context, nil] holder of the memoized index
+      # @param from [Hash, nil] the schema object holding the reference
       # @return [Boolean]
-      def external_ref?(ref)
-        !ref.start_with?('#')
+      def external_ref?(ref, root = nil, dialect = nil, resolver = nil, from: nil)
+        return false if ref.start_with?('#')
+        return true unless root.is_a?(Hash) && resolver
+
+        index = (resolver[:anchors] ||= anchor_index(root, dialect))
+        return true if from.is_a?(Hash) && !index[:resources].key?(from)
+
+        retarget_reference(index, (from && index[:resources][from]) || root, ref).first.nil?
+      end
+
+      # The bundled resource a reference outside the fragment space names,
+      # with the bare fragment left to resolve inside it.
+      # @param index [Hash] the anchor index
+      # @param resource [Hash] the resource the reference is written in
+      # @param ref [String] the `$ref` value
+      # @return [Array(Hash, String), Array(nil, nil)]
+      def retarget_reference(index, resource, ref)
+        uri, fragment = ref.split('#', 2)
+        base = merge_uri(index[:bases][resource] || '', uri.to_s)
+        target = base && index[:by_base][base]
+        target ? [target, "##{fragment}"] : [nil, nil]
       end
 
       # Resolve a local reference: a JSON pointer fragment, or a plain-name
@@ -42,13 +71,20 @@ module MCPClient
         return UNRESOLVED if from.is_a?(Hash) && !index[:resources].key?(from)
 
         resource = (from && index[:resources][from]) || root
+        # A reference outside the fragment space names a resource by URI:
+        # the document may bundle it, and then the fragment applies there.
+        unless ref.start_with?('#')
+          resource, ref = retarget_reference(index, resource, ref)
+          return UNRESOLVED unless resource
+        end
         raw = ref.delete_prefix('#')
         return resolve_adopted_pointer(resource, ref, index) if raw.empty? || raw.start_with?('/', '%2F', '%2f')
 
         # A plain-name fragment is percent-decoded like a pointer fragment
         # (RFC 3986 Section 2.1): "#foo%2Dbar" names the anchor "foo-bar".
+        # What counts as a name is the target resource's dialect's business.
         fragment = decoded_fragment(ref)
-        return UNRESOLVED unless fragment&.match?(ANCHOR_NAME)
+        return UNRESOLVED unless anchor_name?(fragment, index[:dialects][resource] || dialect)
 
         index[:anchors].fetch(resource, {}).fetch(fragment, UNRESOLVED)
       end
@@ -190,10 +226,28 @@ module MCPClient
       #   :duplicates (names declared more than once within one resource)
       def anchor_index(root, dialect)
         index = { resources: {}.compare_by_identity, anchors: {}.compare_by_identity,
-                  dialects: {}.compare_by_identity, duplicates: [], visited: 0, truncated: false }
+                  dialects: {}.compare_by_identity, bases: {}.compare_by_identity, by_base: {},
+                  duplicates: [], visited: 0, truncated: false }
         index[:dialects][root] = dialect
+        # The document's own base: the root's `$id` where it declares one,
+        # else the empty reference. Relative references resolve against each
+        # other either way, which is what a bundled document needs.
+        register_resource_base(index, root, '', declared: root.is_a?(Hash) && resource_root?(root, dialect))
         index_positions(index, [[root, root, 0, dialect, true]])
         index
+      end
+
+      # Record the base URI a schema resource establishes (RFC 3986 Section
+      # 5.1.1: an `$id` is resolved against the base in force where it is
+      # written), and the resource that base names. The first declaration of
+      # a base wins, as the first declaration of an anchor name does.
+      # @param declared [Boolean] whether the resource declares an `$id`
+      # @return [void]
+      def register_resource_base(index, resource, parent_base, declared: true)
+        id = declared && resource.is_a?(Hash) ? resource['$id'] : nil
+        base = (id.is_a?(String) ? merge_uri(parent_base, id) : parent_base) || parent_base
+        index[:bases][resource] = base
+        index[:by_base][base] ||= resource
       end
 
       # Index every schema position reachable from the pending seeds, within
@@ -214,15 +268,7 @@ module MCPClient
           (index[:truncated] = true) && next if depth > MAX_SCHEMA_DEPTH
 
           index[:visited] += 1
-          if resource_root?(schema, dialect)
-            # A resource is a schema wherever it sits: one reached through
-            # a bag the dialect does not walk names its own anchors, though
-            # nothing outside it can see them.
-            resource = schema
-            dialect = embedded_dialect(schema, dialect) || dialect
-            index[:dialects][resource] = dialect
-            named = true
-          end
+          resource, dialect, named = enter_resource(index, schema, resource, dialect, named)
           index[:resources][schema] = resource
           if named && !(dialect == DRAFT_07 && schema.key?('$ref'))
             record_anchor_names(index, resource, schema,
@@ -234,6 +280,23 @@ module MCPClient
         # Objects left unindexed at the bound would resolve and validate
         # under guesses; the index says so and the schema is unusable.
         index[:truncated] ||= pending.any? { |schema, *| schema.is_a?(Hash) && !index[:resources].key?(schema) }
+      end
+
+      # Enter the schema resource a position starts, if it starts one: a
+      # resource is a schema wherever it sits (one reached through a bag the
+      # dialect does not walk names its own anchors, though nothing outside
+      # it can see them), it may declare its own dialect, and its `$id`
+      # establishes the base its references resolve against.
+      # @return [Array(Hash, String, Boolean)] the resource in force, its
+      #   dialect, and whether the position may declare names
+      def enter_resource(index, schema, resource, dialect, named)
+        return [resource, dialect, named] unless resource_root?(schema, dialect)
+
+        parent_base = index[:bases][resource] || ''
+        dialect = embedded_dialect(schema, dialect) || dialect
+        index[:dialects][schema] = dialect
+        register_resource_base(index, schema, parent_base)
+        [schema, dialect, true]
       end
 
       # Record the plain names a schema object declares for its resource; a
@@ -309,7 +372,7 @@ module MCPClient
                 else
                   %w[$anchor $dynamicAnchor].map { |k| schema[k] if keyword_known?(k, dialect) }
                 end
-        names.select { |name| name.is_a?(String) && name.match?(ANCHOR_NAME) }
+        names.select { |name| anchor_name?(name, dialect) }
       end
 
       # The lexical nesting depth of every schema object reachable from the
@@ -433,8 +496,8 @@ module MCPClient
       end
 
       # Yield the definitions held in the bag the dialect does not define
-      # (`definitions` under 2019-09 / 2020-12, `$defs` under draft-07):
-      # unknown to the dialect, but pointer-addressable all the same.
+      # (`$defs` under draft-07, which predates it): unknown to the dialect,
+      # but pointer-addressable all the same.
       # @return [void]
       def each_foreign_definition(schema, dialect, &block)
         %w[$defs definitions].each do |keyword|

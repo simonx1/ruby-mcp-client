@@ -94,7 +94,7 @@ RSpec.describe 'MCP 2026-07-28 JSON Schema handling — round 2' do
     end
 
     it 'rejects a $ref that points at something that is not a schema' do
-      schema = { '$ref' => '#/$defs/name', '$defs' => { 'name' => 'not a schema' } }
+      schema = { '$ref' => '#/x-name', 'x-name' => 'not a schema' }
       expect(validator.check_schema(schema)).to contain_exactly(a_string_matching(/does not point at a schema/))
       expect(validator.validate(1, schema)).to contain_exactly(a_string_matching(/does not point at a schema/))
     end
