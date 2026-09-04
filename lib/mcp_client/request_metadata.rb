@@ -40,6 +40,14 @@ module MCPClient
     # of the previous request on this thread say nothing about it.
     UNRECORDED_PARAMS = :unrecorded
 
+    # Marks a request whose effective parameters the transport cannot read:
+    # host middleware may rewrite the body after the transport built it, so
+    # the parameters the server answers are not the ones a fingerprint of the
+    # request would describe. It is not a fingerprint and matches none, so no
+    # result is served across it whatever its `cacheScope` — "public" permits
+    # sharing across callers, not across result-affecting parameters.
+    OPAQUE_PARAMS = :opaque
+
     # @return [void]
     def note_request_params_pending
       Thread.current[request_params_key] = UNRECORDED_PARAMS

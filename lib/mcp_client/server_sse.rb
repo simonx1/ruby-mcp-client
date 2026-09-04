@@ -219,7 +219,7 @@ module MCPClient
         params = {}
         params['cursor'] = cursor if cursor
         epoch = cache_epoch(:resources)
-        result = rpc_request('resources/list', params)
+        result = fetching_list_page(:resources, cursor) { rpc_request('resources/list', params) }
         # MCP 2026-07-28 caching: the first page's hint decides how long the
         # cached list may be served, counted from receipt (the list is
         # attached once converted).
@@ -275,14 +275,18 @@ module MCPClient
     # @raise [MCPClient::Errors::ServerError] if server returns an error
     # @raise [MCPClient::Errors::ResourceReadError] for other errors during resource template listing
     def list_resource_templates(cursor: nil)
-      cached = cursor ? nil : fresh_list_value(:templates) { @mutex.synchronize { @templates_result } }
+      # Only a list the server itself bounded is served from here: a
+      # positive ttlMs means no second request, while a list with no hint
+      # (a 2025-11-25 server) is asked for again, as it was before this
+      # transport cached anything (MCP 2026-07-28 caching).
+      cached = cursor ? nil : hinted_list_value(:templates)
       return cached if cached
 
       ensure_initialized
       params = {}
       params['cursor'] = cursor if cursor
       epoch = cache_epoch(:templates)
-      result = rpc_request('resources/templates/list', params)
+      result = fetching_list_page(:templates, cursor) { rpc_request('resources/templates/list', params) }
       # MCP 2026-07-28 caching: the first page's hint decides freshness,
       # counted from receipt (the list is attached once converted).
       record_cache_hint(:templates, result, epoch: epoch) unless cursor
@@ -575,10 +579,17 @@ module MCPClient
       authorization_fingerprint(authorization_header_value(faraday_headers(@headers)))
     end
 
-    # Remember the Authorization a request actually carried once it was sent.
+    # Remember the Authorization a request actually carried once it was sent,
+    # for a request that recorded none of its own. What binds the result is
+    # what the request was built with: `response.env` is mutable and the
+    # response phase may rewrite it (a redaction, a redirect that strips the
+    # header), which would file an authenticated result under the anonymous
+    # context.
     # @param response [Faraday::Response, nil]
     # @return [void]
     def note_sent_authorization(response)
+      return if request_authorization_recorded?
+
       env = response.respond_to?(:env) ? response.env : nil
       return unless env.respond_to?(:request_headers) && env.request_headers
 

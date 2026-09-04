@@ -242,18 +242,11 @@ module MCPClient
         conn = http_connection
         pure = []
         conn.builder.handlers.each do |handler|
-          # The recorder is the probe's own, and middleware that sets no
-          # Authorization header changes no answer here.
-          next if handler.klass == AuthorizationRecorder
-          # A callback the host supplied is host code Faraday hands the
-          # mutable request env: nothing about the middleware class it was
-          # given to says what a request would then carry.
-          return nil unless probe_host_callback_free?(handler)
-          next if PROBE_AUTHORIZATION_NEUTRAL_MIDDLEWARE.include?(handler.klass.name)
-          next if probe_response_only_middleware?(handler.klass)
-          return nil unless probe_pure_middleware?(handler)
-
-          pure << handler
+          case probe_handler_class(handler)
+          when :neutral then next
+          when :pure then pure << handler
+          else return nil
+          end
         end
         # Nothing on the stack can change the header: no request is modelled
         # at all, so the host's request_meta is not read for one either.
@@ -265,6 +258,85 @@ module MCPClient
       rescue StandardError => e
         @logger.debug("Could not tell which Authorization header a request would carry: #{e.class}")
         nil
+      end
+
+      # What one handler on the connection is, as far as the probe can tell
+      # without running a line of the host's code:
+      #
+      # * `:neutral` — it cannot change what a request carries: the probe's
+      #   own recorder, framework middleware that never sets an Authorization
+      #   header ({PROBE_AUTHORIZATION_NEUTRAL_MIDDLEWARE}) or middleware with
+      #   no request phase at all;
+      # * `:pure` — framework middleware whose header is a pure function of
+      #   the literal configuration it was installed with, which the probe may
+      #   therefore run ({PROBE_PURE_MIDDLEWARE});
+      # * `:unknown` — anything else, including every handler carrying a
+      #   callback the host supplied: Faraday hands it the mutable request
+      #   env, and nothing about the middleware class it was given to says
+      #   what the request would then carry, or contain.
+      # @param handler [Faraday::RackBuilder::Handler]
+      # @return [Symbol] :neutral, :pure or :unknown
+      def probe_handler_class(handler)
+        return :neutral if handler.klass == AuthorizationRecorder
+        return :unknown unless probe_host_callback_free?(handler)
+        return :neutral if PROBE_AUTHORIZATION_NEUTRAL_MIDDLEWARE.include?(handler.klass.name)
+        return :neutral if probe_response_only_middleware?(handler.klass)
+
+        probe_pure_middleware?(handler) ? :pure : :unknown
+      end
+
+      # Whether the JSON-RPC body this transport builds is the body the server
+      # answers. A `faraday_config` block may install middleware that rewrites
+      # it — a locale, a tenant, a nonce written into `params._meta` — and the
+      # effective parameters a result is bound to would then describe a
+      # request that was never sent.
+      # @return [Boolean]
+      def probe_request_body_faithful?
+        return true unless @faraday_config
+
+        http_connection.builder.handlers.all? { |handler| probe_body_neutral_handler?(handler) }
+      rescue StandardError => e
+        @logger.debug("Could not tell whether a request reaches the server as built: #{e.class}")
+        false
+      end
+
+      # Whether one handler provably leaves the JSON-RPC body alone: the
+      # probe's own recorder, framework middleware that touches no body
+      # ({PROBE_AUTHORIZATION_NEUTRAL_MIDDLEWARE}), middleware with no request
+      # phase at all, or {PROBE_PURE_MIDDLEWARE} — whose request hook writes
+      # one header and never hands its configuration the env.
+      #
+      # What such a handler was configured with does not matter here, which is
+      # where this parts company with the Authorization question: a credential
+      # that rotates changes the header a request carries, never the
+      # parameters the server answers. A handler carrying a host callback is
+      # unknown all the same — Faraday hands it the mutable env, body included.
+      # @param handler [Faraday::RackBuilder::Handler]
+      # @return [Boolean]
+      def probe_body_neutral_handler?(handler)
+        return true if handler.klass == AuthorizationRecorder
+        return true if PROBE_PURE_MIDDLEWARE.include?(handler.klass)
+        return false unless probe_host_callback_free?(handler)
+
+        PROBE_AUTHORIZATION_NEUTRAL_MIDDLEWARE.include?(handler.klass.name) ||
+          probe_response_only_middleware?(handler.klass)
+      end
+
+      # The effective parameters the next request would carry, or
+      # {MCPClient::RequestMetadata::OPAQUE_PARAMS} when host middleware may
+      # rewrite its body: no fingerprint then describes the request the server
+      # would answer, so no cached result is served for it — whatever its
+      # `cacheScope`, since sharing across callers is not sharing across
+      # result-affecting parameters (MCP 2026-07-28 server/utilities/caching).
+      # @return [String, Symbol]
+      def current_params_fingerprint
+        probe_request_body_faithful? ? super : MCPClient::RequestMetadata::OPAQUE_PARAMS
+      end
+
+      # @return [String, Symbol, nil] the parameters of the request this
+      #   thread last sent, opaque for the same reason
+      def request_params_fingerprint
+        probe_request_body_faithful? ? super : MCPClient::RequestMetadata::OPAQUE_PARAMS
       end
 
       # The Faraday env of a request shaped like the real JSON-RPC POST of
@@ -397,10 +469,6 @@ module MCPClient
         tools.map { |t| [t.name, t.description, t.schema, t.output_schema, t.annotations] }
       end
 
-      # Remember the Authorization a request actually carried once it was
-      # sent (middleware may have changed it after the request block).
-      # @param response [Faraday::Response, nil]
-      # @return [void]
       # Send a JSON-RPC request and parse its response, keeping the result
       # bound to its own request: parsing an SSE-framed response dispatches
       # the notifications it carries, and a callback may send a nested
@@ -413,6 +481,12 @@ module MCPClient
         clear_response_received_at if respond_to?(:clear_response_received_at, true)
         response = send_http_request(request, timeout: timeout, extra_headers: extra_headers)
         received_at = monotonic_now if respond_to?(:monotonic_now, true)
+        # A connection that recorded nothing of its own still names the
+        # credentials it sent in the response's environment.
+        note_sent_authorization(response)
+        # The credentials this request went out with, taken before the parse:
+        # a nested request would otherwise leave its own behind here.
+        sent_authorization = recorded_request_authorization
         begin
           result = parse_response(response, request)
         ensure
@@ -420,14 +494,29 @@ module MCPClient
           # response carried did on this thread — and whether or not the
           # parse succeeded, so a failed re-fetch is judged by its own
           # credentials and parameters.
-          note_sent_authorization(response)
+          restore_request_authorization(sent_authorization)
           note_request_params(request['params'])
         end
         note_response_received_at(received_at) if respond_to?(:note_response_received_at, true)
         result
       end
 
+      # Remember the Authorization a request actually carried once it was
+      # sent, for a connection that recorded none of its own.
+      #
+      # What binds the result is what the {AuthorizationRecorder} saw
+      # immediately before the adapter sent the request. `response.env` is a
+      # mutable structure the response phase may rewrite — a host `on_complete`
+      # that redacts `Authorization` for logging, a redirect handler that
+      # strips it — and reading it back afterwards would file an authenticated
+      # result under the anonymous context, where the next anonymous request
+      # would be served Alice's private data. So the env answers only when
+      # nothing was recorded at all.
+      # @param response [Faraday::Response, nil]
+      # @return [void]
       def note_sent_authorization(response)
+        return if request_authorization_recorded?
+
         env = response.respond_to?(:env) ? response.env : nil
         return unless env.respond_to?(:request_headers) && env.request_headers
 

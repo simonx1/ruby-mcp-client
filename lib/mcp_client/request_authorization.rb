@@ -44,6 +44,22 @@ module MCPClient
       Thread.current[request_authorization_key] = UNRECORDED_AUTHORIZATION
     end
 
+    # The record this thread holds for the request it is sending, exactly as
+    # it stands. Taken before a response is parsed and put back afterwards
+    # ({MCPClient::HttpTransportBase::CacheSupport#exchange_jsonrpc}): the
+    # parse dispatches the notifications the response carried, and a request
+    # host code nests inside it would otherwise leave its own record here.
+    # @return [String, Symbol, nil]
+    def recorded_request_authorization
+      Thread.current[request_authorization_key]
+    end
+
+    # @param record [String, Symbol, nil] a record {#recorded_request_authorization} handed out
+    # @return [void]
+    def restore_request_authorization(record)
+      Thread.current[request_authorization_key] = record
+    end
+
     # @return [String, nil] the Authorization header of the request this thread last sent
     def request_authorization_context
       context = Thread.current[request_authorization_key]

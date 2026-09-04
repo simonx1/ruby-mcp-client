@@ -223,6 +223,14 @@ module MCPClient
     end
     private :recording_called_tool_definition
 
+    # @see MCPClient::CalledToolDefinition#outside_called_tool_definition
+    # @yield the host code
+    # @return [Object] the block value
+    def outside_called_tool_definition
+      yield
+    end
+    private :outside_called_tool_definition
+
     # Which claim a message being built makes on the evaluation the open
     # operation reserved (see {MCPClient::RequestMetadata::HeldRequestMeta}).
     #

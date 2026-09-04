@@ -416,7 +416,7 @@ module MCPClient
       params = {}
       params['cursor'] = cursor if cursor
       epoch = cache_epoch(:resources)
-      result = rpc_request('resources/list', params)
+      result = fetching_list_page(:resources, cursor) { rpc_request('resources/list', params) }
       record_cache_hint(:resources, result, epoch: epoch) unless cursor
 
       resources = (result['resources'] || []).map do |resource_data|
@@ -464,7 +464,11 @@ module MCPClient
     # @return [Hash] result containing resourceTemplates array and optional nextCursor
     # @raise [MCPClient::Errors::ResourceReadError] for other errors during resource template listing
     def list_resource_templates(cursor: nil)
-      cached = cursor ? nil : fresh_list_value(:templates) { @mutex.synchronize { @templates_result } }
+      # Only a list the server itself bounded is served from here: a
+      # positive ttlMs means no second request, while a list with no hint
+      # (a 2025-11-25 server) is asked for again, as it was before this
+      # transport cached anything (MCP 2026-07-28 caching).
+      cached = cursor ? nil : hinted_list_value(:templates)
       return cached if cached
 
       begin
@@ -490,7 +494,7 @@ module MCPClient
       params = {}
       params['cursor'] = cursor if cursor
       epoch = cache_epoch(:templates)
-      result = rpc_request('resources/templates/list', params)
+      result = fetching_list_page(:templates, cursor) { rpc_request('resources/templates/list', params) }
       record_cache_hint(:templates, result, epoch: epoch) unless cursor
 
       templates = (result['resourceTemplates'] || []).map do |template_data|

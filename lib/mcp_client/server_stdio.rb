@@ -430,7 +430,7 @@ module MCPClient
       params = {}
       params['cursor'] = cursor if cursor
       epoch = cache_epoch(:resources)
-      result = rpc_request('resources/list', params) || {}
+      result = fetching_list_page(:resources, cursor) { rpc_request('resources/list', params) } || {}
       record_cache_hint(:resources, result, epoch: epoch) unless cursor
       resources = (result['resources'] || []).map { |td| MCPClient::Resource.from_json(td, server: self) }
       resources_result = { 'resources' => resources, 'nextCursor' => result['nextCursor'] }
@@ -484,7 +484,7 @@ module MCPClient
       params = {}
       params['cursor'] = cursor if cursor
       epoch = cache_epoch(:templates)
-      result = rpc_request('resources/templates/list', params) || {}
+      result = fetching_list_page(:templates, cursor) { rpc_request('resources/templates/list', params) } || {}
       record_cache_hint(:templates, result, epoch: epoch) unless cursor
       templates = (result['resourceTemplates'] || []).map { |td| MCPClient::ResourceTemplate.from_json(td, server: self) }
       templates_result = { 'resourceTemplates' => templates, 'nextCursor' => result['nextCursor'] }

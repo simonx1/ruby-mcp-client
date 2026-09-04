@@ -109,29 +109,35 @@ module MCPClient
     # in flight while its own entry was invalidated is not written back —
     # while an invalidation of another key (a resource updated during a
     # tools/list) leaves it alone. Every key shares a base bumped when the
-    # whole cache goes (cleanup, a new authorization context); each key adds
+    # whole cache goes (cleanup, a new authorization context); each key keeps
     # its own count, and every read shares one more.
+    #
+    # The three are compared side by side rather than added up: a cleanup
+    # bumps the base *and* clears the other counts, so a sum would carry a
+    # key an invalidation had already bumped (0 + 1) straight through the
+    # cleanup unchanged (1 + 0), and the response of a request the cleanup
+    # overtook would install itself as fresh.
     # @param key [Symbol, String, nil] the cache key; nil for the base alone
-    # @return [Integer]
+    # @return [Array<Integer>] an identity, only ever compared for equality
     def cache_epoch(key = nil)
       cache_entries_mutex.synchronize { cache_generation(key) }
     end
 
     # @param method [String] a list method, e.g. 'tools/list'
-    # @return [Integer] the generation of that list's cache key
+    # @return [Array<Integer>] the generation of that list's cache key
     def list_cache_epoch(method)
       cache_epoch(LIST_METHOD_KINDS[method])
     end
 
-    # @return [Integer] (call while holding cache_entries_mutex)
+    # @return [Array<Integer>] (call while holding cache_entries_mutex)
     def cache_generation(key)
       base = @cache_epoch || 0
-      return base if key.nil?
+      return [base] if key.nil?
 
       gens = @cache_generations || {}
       own = gens[key] || 0
       reads = key.is_a?(String) && key.start_with?('read:') ? (gens[:'read:*'] || 0) : 0
-      base + own + reads
+      [base, own, reads]
     end
 
     # @return [void] (call while holding cache_entries_mutex)
@@ -665,6 +671,44 @@ module MCPClient
         cache_entries[kind] = MCPClient::CachedResult.stale(now: now, like: cache_entries[kind])
         bump_cache_generation(kind)
       end
+    end
+
+    # The JSON-RPC code a server answers a cursor it no longer accepts with
+    # (MCP pagination: an invalid cursor SHOULD be an -32602 Invalid params).
+    # @param error [Exception] the failure a page request raised
+    # @return [Boolean]
+    def invalid_cursor_error?(error)
+      error.is_a?(MCPClient::Errors::ServerError) && error.code == MCPClient::Errors::Codes::INVALID_PARAMS
+    end
+
+    # Run one page request of a paginated list, dropping the pages cached for
+    # that list when the server rejects the cursor it carried. A cursor names
+    # a position in one sequence of pages: once the server has forgotten it,
+    # the first page cached from that sequence is gone with it, and serving
+    # that page again would hand the caller the same dead cursor to follow.
+    # A rejection of the *first* page's request carries no cursor and says
+    # nothing about the cache, so it leaves it alone.
+    # @param kind [Symbol, nil] the list kind
+    # @param cursor [String, nil] the cursor this page request carries
+    # @yield sends the page request
+    # @return [Object] the block's value
+    def fetching_list_page(kind, cursor)
+      yield
+    rescue MCPClient::Errors::ServerError => e
+      raise unless kind && cursor && invalid_cursor_error?(e)
+
+      discard_paginated_list(kind)
+      raise
+    end
+
+    # Forget everything cached for a paginated list: the entry that bounds it
+    # and the transport's own copy, so the next access really re-fetches from
+    # the first page.
+    # @param kind [Symbol] the list kind
+    # @return [void]
+    def discard_paginated_list(kind)
+      invalidate_cache(kind)
+      invalidate_list_cache(kind) if respond_to?(:invalidate_list_cache, true)
     end
 
     # Forget every cached result and hint (the connection, and with it the

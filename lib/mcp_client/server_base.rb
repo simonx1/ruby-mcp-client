@@ -319,14 +319,49 @@ module MCPClient
     # @return [Array<Hash>] all raw item hashes collected across pages
     # @raise [MCPClient::Errors::TransportError] if a page result is not a Hash or Array
     def request_paginated_list(method, key)
+      # The cursor the page request now in flight carries, so a rejection can
+      # be told apart from an -32602 the first page's request earned.
+      page = { cursor: nil }
+      restarted = false
+      begin
+        collect_list_pages(method, key, page)
+      rescue MCPClient::Errors::ServerError => e
+        # MCP pagination: a cursor the server no longer accepts (-32602) ends
+        # the sequence the pages collected so far belong to, so the list is
+        # collected once more from the first page rather than failing a caller
+        # who only asked for a list. A second rejection is the server's answer
+        # and is raised.
+        raise if restarted || !page[:cursor] || !cursor_rejected?(e)
+
+        @logger.warn("Pagination for #{key} restarted: the server rejected a cursor it had issued")
+        restarted = true
+        retry
+      end
+    end
+
+    # @param error [MCPClient::Errors::ServerError] a page request's failure
+    # @return [Boolean] whether it rejects the cursor the request carried
+    def cursor_rejected?(error)
+      respond_to?(:invalid_cursor_error?, true) && invalid_cursor_error?(error)
+    end
+
+    # Collect every page of a list, recording what each page was answered
+    # under so the cache can bind the combined list to it.
+    # @param method [String] the list method
+    # @param key [String] the result array key
+    # @param page [Hash] holds the cursor of the request in flight
+    # @return [Array<Hash>] all raw item hashes collected across pages
+    def collect_list_pages(method, key, page)
       pages = []
       received_ats = []
       contexts = []
       fingerprints = []
+      page[:cursor] = nil
       epoch = list_cache_epoch(method) if respond_to?(:list_cache_epoch, true)
       items = collect_paginated(key) do |cursor|
         params = cursor ? { cursor: cursor } : {}
         started = respond_to?(:monotonic_now, true) ? monotonic_now : nil
+        page[:cursor] = cursor
         result = rpc_request(method, params)
         pages << result
         received_ats << response_received_at(since: started) if respond_to?(:response_received_at, true)

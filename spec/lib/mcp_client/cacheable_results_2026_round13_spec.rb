@@ -194,7 +194,7 @@ RSpec.describe 'MCP 2026-07-28 cacheable results — round 13' do
       mixed = [{ 'tools' => [], 'ttlMs' => 60_000, 'cacheScope' => 'private' }] * 2
 
       server.send(:record_paginated_cache_hint, :tools, mixed, ['mixed'], contexts: %w[alice bob],
-                                                                          epoch: server.cache_epoch)
+                                                                          epoch: server.cache_epoch(:tools))
 
       expect(server.cache_info(:tools)[:fresh]).to be(false)
       expect(server.send(:stale_fallback_for, :tools, server.send(:stale_list_entry, :tools), context: 'alice'))
