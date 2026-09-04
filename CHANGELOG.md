@@ -172,6 +172,43 @@ metadata). Each feature lands in its own PR; this section accumulates them.
   documentation now names the three transports that carry the options
   (stdio, HTTP, Streamable HTTP) and says HTTP+SSE is not one of them,
   rather than adding era support to a transport on its way out.
+- **No caller waits for a notice (verification pass).** Round 11 stopped a
+  thread that is already inside a notice from queueing for an emission gate,
+  but the thread holding the logger's lock need not be inside a notice at
+  all: an ordinary `logger.info` holds `::Logger`'s device lock for the
+  length of the write, and the device — a formatter, a log subscriber, an
+  audit hook — may itself reach a deprecated feature. That thread then
+  queued for the gate of a second thread which was waiting for the very
+  device lock the first one held, and neither moved again; round 11's
+  `emitting?` guard could not see it, because the first thread was doing
+  ordinary logging rather than writing a notice. No rule about who may queue
+  fixes that, since a waiter cannot know what it is holding, so the gates
+  are gone: the once-per-process accounting is an atomic claim, taken and
+  released under a mutex this module never holds while calling out, and a
+  caller that meets a notice in flight stands down at once instead of
+  queueing behind it. What that gives up is round 9's takeover — a contender
+  no longer writes the notice a failed emission owed — and what it keeps is
+  what mattered: one notice per feature per process, and a notice that was
+  not written is not spent, so the feature's next use raises it again.
+- **A notice is not spent on a warning the logger filtered (verification
+  pass).** `Logger#warn` returns true whether it wrote the line or dropped
+  it for its level, so the level probe was the only evidence a notice was
+  readable — and a contender that waited behind a failing emission carried a
+  probe taken before the wait: with its logger's level raised to ERROR in
+  the meantime, its warning was filtered, the process's one notice was
+  marked emitted having been written nowhere, and lowering the level again
+  did not bring it back. Nothing waits any more, and the probe now sits next
+  to the write rather than at the top of `Deprecations.warn`.
+- **`Root`, `Client#roots` and `declare_sampling_tools` marked (verification
+  pass).** The marking checks counted `@deprecated` tags, which cannot show
+  that a given API carries one, and accepted any window from the registry,
+  which cannot show that a tag names its own. An explicit API-to-feature
+  inventory replaces both, and it named three surfaces that carried no mark:
+  `MCPClient::Root`, the `Client#roots` reader, and `declare_sampling_tools`
+  (the sampling.tools sub-capability, which goes with the capability it
+  refines). Each now cites its feature's SEP and its own earliest removal,
+  none of them warns where it did not warn before, and every `@deprecated`
+  tag in the library is accounted for by the inventory.
 - **Documentation.** README documents the 2026-07-28 support (discovery
   and per-request metadata, multi round-trip requests, `x-mcp-header`,
   subscriptions, cacheable results, the tasks extension, authorization) and

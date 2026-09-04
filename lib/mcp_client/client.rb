@@ -36,6 +36,12 @@ module MCPClient
     #   @return [Logger] logger for client operations
     # @!attribute [r] roots
     #   @return [Array<MCPClient::Root>] list of MCP roots (MCP 2025-06-18)
+    #   @deprecated Roots is deprecated since MCP 2026-07-28 (SEP-2577); earliest
+    #     removal is the first revision released on or after 2027-07-28. Reading the
+    #     list is not itself a first use of the feature — the notice follows
+    #     configuring a root or serving one — but the list is a deprecated feature's
+    #     state, and a host reading it is holding one. Pass directories or files
+    #     through tool parameters, resource URIs or server configuration instead.
     attr_reader :servers, :tool_cache, :prompt_cache, :resource_cache, :logger, :roots
 
     # Supported modes for structuredContent validation (MCP 2025-11-25):

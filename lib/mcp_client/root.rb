@@ -5,6 +5,12 @@ require 'uri'
 module MCPClient
   # Represents an MCP Root - a URI that defines a boundary where servers can operate
   # Roots are declared by clients to inform servers about relevant resources and their locations
+  #
+  # @deprecated Roots is deprecated since MCP 2026-07-28 (SEP-2577); earliest
+  #   removal is the first revision released on or after 2027-07-28. The class
+  #   keeps working for as long as the feature does, and building one raises no
+  #   notice — using the list does. Pass directories or files through tool
+  #   parameters, resource URIs or server configuration instead.
   class Root
     attr_reader :uri, :name, :meta
 

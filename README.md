@@ -516,11 +516,17 @@ warning. A notice costs the deprecated operation exactly what one
 `logger.warn` costs it, and no more: a logger that raises, drops the notice
 or writes nowhere (`Logger.new(nil)`) is swallowed, so the feature keeps
 working and the notice stays owed to a later use — but a logger that blocks,
-blocks its caller here just as it does everywhere else in the library. A
-notice raised from inside another notice's logger (a formatter or a log
-subscriber that reaches a deprecated feature itself) stands down rather than
-wait, for the same reason: it is owed to a later use, and never worth a
-deadlock.
+blocks its caller here just as it does everywhere else in the library.
+Nothing ever waits for a notice. A caller that meets one already in flight —
+another thread's first use, or a formatter, log subscriber or audit hook that
+reaches a deprecated feature from inside the notice being written — stands
+down at once instead of queueing behind it. Queueing would be worth a
+deadlock, since the thread writing a notice holds the logger and the thread
+that would queue may be holding a lock that logger needs (an ordinary
+`logger.info` holds exactly such a lock while its device runs). And it would
+buy nothing: whoever holds the notice is writing it, and if their logger
+fails or filters the warning the notice is owed again, so the feature's next
+use raises it.
 
 ## MCP 2025-11-25 Features
 

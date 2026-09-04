@@ -113,11 +113,14 @@ RSpec.describe 'MCP 2026-07-28 deprecations (round 10)' do
       gated_logger.release(:raise)
 
       expect(owner.value).to be(false)
-      # Neither later use came away empty-handed: one of them logged the
-      # notice the failed one owed, the other stood down because it was
-      # already out. Under the timed-out reservation both got nothing.
-      expect([second.value, third.value].count(true)).to eq(1)
-      expect(MCPClient::Deprecations.emitted?(:logging)).to be(true)
+      # Neither later use queued behind the stuck emission — the
+      # verification pass took that wait out, since a thread cannot know
+      # whether it holds a lock the stuck one needs — and neither spent the
+      # notice. Under the timed-out reservation they waited and still got
+      # nothing; here the wait is what goes, not the notice.
+      expect([second.value, third.value]).to eq([false, false])
+      expect(MCPClient::Deprecations.emitted?(:logging)).to be(false)
+      expect(MCPClient::Deprecations.warn(:logging, working_logger)).to be(true)
       expect(output.string.scan('Logging is deprecated').size).to eq(1)
     end
 

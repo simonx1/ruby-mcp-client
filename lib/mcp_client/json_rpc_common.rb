@@ -661,6 +661,13 @@ module MCPClient
     # before connect so the initialize request advertises it; it only takes
     # effect when a sampling request callback is also registered, since
     # sampling.tools is a sub-capability of sampling.
+    #
+    # @deprecated Sampling is deprecated since MCP 2026-07-28 (SEP-2577);
+    #   earliest removal is the first revision released on or after
+    #   2027-07-28, and this sub-capability goes with the capability it
+    #   refines. Declaring it raises no notice of its own — serving a
+    #   sampling/createMessage request does. Integrate directly with the LLM
+    #   provider API instead.
     # @return [void]
     def declare_sampling_tools
       @sampling_tools_supported = true
