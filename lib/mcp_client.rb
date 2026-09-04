@@ -183,7 +183,17 @@ module MCPClient
       begin
         logger.debug("MCPClient.connect: Attempting Streamable HTTP connection to #{url}")
         return connect_streamable_http(url, **options, &)
+      rescue Errors::ModernServerError
+        # The probe identified a modern (2026-07-28+) MCP server. The era is
+        # settled, so the legacy SSE and HTTP+POST fallbacks cannot do better
+        # — and trying them would hide the real, actionable failure.
+        raise
       rescue Errors::ConnectionError, Errors::TransportError => e
+        # protocol: :modern rules out the initialize handshake, and both
+        # remaining fallbacks are legacy-only transports that silently ignore
+        # the option.
+        raise if modern_only?(options)
+
         errors << "Streamable HTTP: #{e.message}"
         logger.debug("MCPClient.connect: Streamable HTTP failed: #{e.message}")
       end
@@ -208,6 +218,14 @@ module MCPClient
 
       raise Errors::ConnectionError,
             "Failed to connect to #{url}. Tried all transports:\n  #{errors.join("\n  ")}"
+    end
+
+    # Whether the caller demanded a modern (2026-07-28+) server, which rules
+    # out falling back to the legacy-only transports.
+    # @param options [Hash] the connect options
+    # @return [Boolean]
+    def modern_only?(options)
+      options[:protocol].respond_to?(:to_sym) && options[:protocol].to_sym == :modern
     end
 
     # Detect transport type from target

@@ -430,6 +430,19 @@ an expired-session 404, the client starts a fresh session but does **not** re-se
 the call — it raises so you can decide. Idempotent requests are re-sent against
 the new session as before.
 
+**One exception: a broken response stream on a modern (MCP 2026-07-28)
+Streamable HTTP connection.** That revision removed SSE resumability and requires
+that a broken response stream loses the in-flight request, which clients **MUST**
+re-issue as a new request with a new request ID — with no exception for
+`tools/call`. It can require that safely because closing the response stream *is*
+the cancellation signal: the server **MUST** treat the break as a cancellation of
+that request, stop work as soon as practical, and send nothing further for it. So
+when a modern response stream ends without the result, the client sends the call
+again once with a fresh request id; if that stream breaks too, it raises
+`MCPClient::Errors::ResponseStreamClosedError` rather than trying again. Every
+other ambiguous failure is unchanged and still never re-sent, because in none of
+those cases was the server told to stop.
+
 ### Response Size Limits (Streamable HTTP)
 
 A gzip-encoded response is decompressed incrementally and abandoned once it
