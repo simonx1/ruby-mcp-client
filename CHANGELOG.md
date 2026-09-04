@@ -7,6 +7,63 @@ metadata). Each feature lands in its own PR; this section accumulates them.
 
 ### Cacheable results (`ttlMs` / `cacheScope`)
 
+- **A private entry is bound to the credentials its request was sent with, not
+  to what the response phase left behind (verification round).** The
+  Authorization was recorded before the adapter sent the request and then read
+  back out of `response.env.request_headers` afterwards — a mutable structure
+  the response phase may rewrite. A host `on_complete` that deletes
+  `Authorization` for redaction, or a redirect handler that strips it, filed an
+  authenticated result under the anonymous context: Alice's `resources/read`
+  was then handed to the next request that carried no token at all, without
+  another wire read. What the recorder saw immediately before transmission is
+  now what binds the entry, and the environment answers only for a connection
+  that recorded nothing of its own. The context of the outer request is
+  restored after its response is parsed by putting that record back, rather
+  than by re-deriving it from an environment a nested request may have touched.
+- **A result is never reused across parameters host middleware may have
+  rewritten (verification round).** The parameters fingerprint describes the
+  request the transport built, before Faraday middleware can change its body.
+  Unknown request middleware already blocked *private* reuse through the
+  authorization check, but a `"public"` entry bypassed it: middleware writing a
+  changing locale into `params._meta` had an English read answer a French one,
+  with only the English request reaching the server. A stack the transport
+  cannot read off its own configuration now makes the effective parameters
+  opaque, and an opaque fingerprint matches nothing — `"public"` permits
+  sharing across callers, not across result-affecting parameters. What such
+  middleware was *configured* with does not matter here, so Faraday's own
+  `:authorization` middleware keeps caching on however its credential rotates:
+  it changes a header, never the body.
+- **A cleanup gives the cache a generation no request in flight can match
+  (verification round).** Generations were `base + per-key count + shared-read
+  count`, and a cleanup bumped the base while clearing the other counts — so a
+  key one invalidation had already bumped went from `0 + 1` to `1 + 0`,
+  unchanged. A read that started before the cleanup and arrived after it
+  therefore installed itself as fresh and answered the next read. The three
+  counts are now compared side by side instead of added up.
+- **A `tools/call` host code nests inside a call records into a slot of its own
+  (verification round).** Only the `call_tool` wrapper opened a definition
+  slot, so a raw `rpc_request('tools/call', ...)` a notification listener
+  issued while the outer call's response was being parsed overwrote the
+  definition that call went out under — and a host re-resolving the tool to
+  validate the result checked it against a newer definition it was never
+  answered under. The boundary a transport crosses to reach host code now opens
+  a definition slot as well as dropping the `request_meta` reservation.
+- **A cursor the server rejects takes the pages cached under it with it
+  (verification round).** A `-32602` for a cursor left the first page of that
+  sequence in the cache, so the next list handed the caller the same dead
+  cursor to follow. The pages cached for the list are now dropped when a
+  cursor-bearing page request is rejected; an automatically paginated list
+  restarts once from the first page rather than failing a caller who only asked
+  for a list, and an explicit `list_resources(cursor:)` /
+  `list_resource_templates(cursor:)` still raises, with the stale first page
+  gone.
+- **An unhinted template list is fetched again (verification round).** The HTTP,
+  Streamable HTTP and SSE transports served `resources/templates/list` through
+  `fresh_list_value`, under which a legacy list with no hint stays fresh for the
+  life of the connection — a compatibility regression, since template listing
+  fetched every time before results were cached at all. They now use
+  `hinted_list_value`, as stdio already did: only a list the server itself
+  bounded with a positive `ttlMs` is answered without a request.
 - **Client caches are dropped with the transport's.** A transport that
   carries the caching mixin invalidates before it delivers a notification
   to a subscription listener, and this client registers its own

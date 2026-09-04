@@ -58,14 +58,19 @@ module MCPClient
     # code asks of the transport is an operation of its own -- a raw
     # `rpc_request`, a `send_rpc`, a public `fetch_prompts_list`, a nested
     # list -- so it never reaches the reservation the operation it
-    # interrupted is holding, whatever method it names.
+    # interrupted is holding, whatever method it names. A `tools/call` it
+    # issues records the definition it goes out under into a slot of its own
+    # for the same reason ({MCPClient::CalledToolDefinition}): the call whose
+    # response is still being parsed keeps its own.
     HOST_CALLBACKS = %i[route_notification handle_server_request].freeze
 
     HOST_CALLBACKS.each do |callback|
       define_method(callback) do |*args, **kwargs, &block|
         raise NoMethodError, "undefined method '#{callback}' for #{self.class}" unless defined?(super)
 
-        outside_request_meta_hold { super(*args, **kwargs, &block) }
+        outside_request_meta_hold do
+          outside_called_tool_definition { super(*args, **kwargs, &block) }
+        end
       end
     end
   end

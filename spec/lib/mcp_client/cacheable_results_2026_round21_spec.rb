@@ -45,8 +45,14 @@ RSpec.describe 'MCP 2026-07-28 cacheable results — round 21' do
 
     (MCPClient::ResultCaching::MAX_READ_GENERATIONS + 5).times { |i| server.send(:invalidate_read_cache, "file:///r#{i}") }
 
-    expect(server.send(:cache_epoch, 'read:file:///a')).to be > before
-    expect(server.send(:cache_epoch, 'read:file:///never')).to be > untouched_before
+    folded = server.send(:cache_epoch, 'read:file:///a')
+    expect(folded).not_to eq(before)
+    expect(server.send(:cache_epoch, 'read:file:///never')).not_to eq(untouched_before)
+
+    # And nothing the fold left behind can come back: a read still in flight
+    # captured one of these, and no later invalidation may hand it out again.
+    server.send(:invalidate_read_cache, 'file:///a')
+    expect([before, untouched_before, folded]).not_to include(server.send(:cache_epoch, 'read:file:///a'))
   end
 
   spellings = [{ Authorization: 'Bearer alice' }, { 'AUTHORIZATION' => 'Bearer alice' },
