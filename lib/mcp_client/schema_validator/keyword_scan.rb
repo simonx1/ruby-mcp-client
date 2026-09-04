@@ -19,26 +19,42 @@ module MCPClient
         found = []
         root = normalize_schema(schema)
         declared = dialect(root)
-        scan = { count: 0, dialect: declared && canonical_dialect(declared), walked: {}.compare_by_identity,
-                 anchors: nil }
-        collect_unsupported_keywords(root, root, found, 0, scan)
+        canonical = declared && canonical_dialect(declared)
+        scan = { count: 0, dialect: canonical, walked: {}.compare_by_identity, anchors: nil,
+                 pending: [[root, 0, canonical]] }
+        scan_positions(root, found, scan)
         found.uniq
       rescue TooLarge
         # Unusable anyway: check_schema reports it.
         found.uniq
       end
 
-      # Recursively collect unsupported keywords from a schema (keywords the
-      # dialect does not define are unknown, not unsupported). What a local
-      # `$ref` applies is scanned too, wherever it lives (a definition bag the
-      # dialect does not walk included); each object is scanned once.
+      # Read every queued position. Like the preflight walk, the scan runs on
+      # a stack of its own rather than on the interpreter's: a shallow
+      # document whose `$ref`s chain through hundreds of schemas is walked in
+      # constant stack space, so scanning one cannot overflow the thread a
+      # transport reads on.
+      # @return [void]
+      def scan_positions(root, found, scan)
+        until scan[:pending].empty?
+          schema, depth, dialect = scan[:pending].pop
+          scan_position(schema, root, found, depth, scan, dialect)
+        end
+      end
+
+      # Collect the unsupported keywords one schema position uses (keywords
+      # the dialect does not define are unknown, not unsupported) and queue
+      # what it leads to. What a local `$ref` applies is scanned too, wherever
+      # it lives (a definition bag the dialect does not walk included); each
+      # object is scanned once.
       # @param schema [Object] a (sub)schema; non-Hash values are ignored
       # @param root [Hash] the normalized root schema
       # @param found [Array<String>] accumulator
       # @param scan [Hash] :count of subschemas seen so far, the canonical
-      #   :dialect, the :walked objects and the memoized :anchors index
+      #   :dialect, the :walked objects, the memoized :anchors index and the
+      #   :pending positions
       # @return [void]
-      def collect_unsupported_keywords(schema, root, found, depth, scan, dialect = scan[:dialect])
+      def scan_position(schema, root, found, depth, scan, dialect = scan[:dialect])
         return unless schema.is_a?(Hash) && depth <= MAX_SCHEMA_DEPTH
         return if scan[:walked].key?(schema)
 
@@ -48,30 +64,36 @@ module MCPClient
 
         # An embedded resource declaring its own $schema is scanned under it.
         dialect = embedded_dialect(schema, dialect) || dialect
-        collect_referenced_keywords(schema, root, found, depth, scan, dialect) if schema['$ref'].is_a?(String)
+        referenced = referenced_position(schema, root, depth, scan, dialect) if schema['$ref'].is_a?(String)
         if dialect == DRAFT_07 && schema.key?('$ref')
           # Nothing beside the $ref is applied; the definitions stay reachable.
-          each_definition(schema, dialect) do |sub|
-            collect_unsupported_keywords(sub, root, found, depth + 1, scan, dialect)
-          end
-          return
+          return queue_scan(scan, schema, depth, dialect, referenced, :each_definition)
         end
 
         found.concat((schema.keys & UNSUPPORTED_KEYWORDS).select { |k| keyword_known?(k, dialect) })
-        each_subschema(schema, dialect) do |sub|
-          collect_unsupported_keywords(sub, root, found, depth + 1, scan, dialect)
-        end
+        queue_scan(scan, schema, depth, dialect, referenced, :each_subschema)
       end
 
-      # Scan what a local `$ref` applies (unresolvable or external references
-      # are the preflight's business).
+      # Queue the positions under a schema object (in document order, the
+      # stack being read from its end), then what its reference reaches.
+      # @param walker [Symbol] :each_subschema or :each_definition
       # @return [void]
-      def collect_referenced_keywords(schema, root, found, depth, scan, dialect)
+      def queue_scan(scan, schema, depth, dialect, referenced, walker)
+        positions = []
+        send(walker, schema, dialect) { |sub| positions << [sub, depth + 1, dialect] }
+        scan[:pending].concat(positions.reverse)
+        scan[:pending] << referenced if referenced
+      end
+
+      # The position what a local `$ref` applies is scanned at (unresolvable
+      # or external references are the preflight's business).
+      # @return [Array, nil]
+      def referenced_position(schema, root, depth, scan, dialect)
         ref = schema['$ref']
-        return if external_ref?(ref)
+        return nil if external_ref?(ref, root, scan[:dialect], scan, from: schema)
 
         target = resolve_reference(root, ref, scan[:dialect], scan, from: schema)
-        return if target.equal?(UNRESOLVED)
+        return nil if target.equal?(UNRESOLVED)
 
         # What a reference reaches is scanned under its own resource's dialect
         # and at its own lexical depth, so member order and reference fan-out
@@ -86,8 +108,7 @@ module MCPClient
                        else
                          lexical || position || (depth + 1)
                        end
-        collect_unsupported_keywords(target, root, found, target_depth, scan,
-                                     (target.is_a?(Hash) && indexed_dialect(target, scan)) || dialect)
+        [target, target_depth, (target.is_a?(Hash) && indexed_dialect(target, scan)) || dialect]
       end
     end
   end

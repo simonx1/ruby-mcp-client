@@ -388,6 +388,37 @@ that is the one it is validated against. A `tools/list_changed` that merely
 arrives while the call is in flight never changes the definition the result is
 checked against — the server never saw the replacement.
 
+#### JSON Schema dialects and references
+
+The built-in validator reads JSON Schema 2020-12 (the MCP default), 2019-09
+and draft-07. Per MCP 2026-07-28 an unsupported dialect must be reported as
+an error, so a tool whose `inputSchema` declares one this client does not
+implement is refused before the request is sent:
+
+```ruby
+# inputSchema: {"$schema": "urn:unknown-dialect", ...}
+client.call_tool('t', {})
+# => raises MCPClient::Errors::ValidationError:
+#    "...input schema declares the JSON Schema dialect \"urn:unknown-dialect\":
+#     that dialect is not supported (supported: ...)"
+```
+
+An unsupported dialect in an `outputSchema` is reported the way every other
+structured-content violation is: a warning by default, a `ValidationError`
+under `validate_structured_content: :strict`. An input schema that is merely
+unusable for another reason (a `$ref` that would need a network fetch, a
+document past the resource bounds, a malformed keyword value) is warned about
+and the call still goes out, since the server owns argument validation.
+
+References are resolved inside the document only — nothing is ever fetched —
+but a document that bundles the resources it uses is resolved in full: a
+`$ref` naming an embedded `$id` (`"urn:example:s"`, a relative URI against the
+base an enclosing `$id` established, or the empty reference `""`) resolves to
+that resource, and only a reference to a resource the document does not carry
+is reported as external. Under 2020-12 and 2019-09 `definitions` behaves as
+the `$defs` it was renamed from, as the meta-schema of both dialects retains
+it.
+
 ### Roots
 
 ```ruby

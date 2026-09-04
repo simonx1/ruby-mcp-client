@@ -3,7 +3,9 @@
 require 'uri'
 require_relative 'schema_validator/dialects'
 require_relative 'schema_validator/normalization'
+require_relative 'schema_validator/uri_references'
 require_relative 'schema_validator/references'
+require_relative 'schema_validator/shapes'
 require_relative 'schema_validator/keyword_scan'
 require_relative 'schema_validator/composition'
 require_relative 'schema_validator/evaluation'
@@ -28,7 +30,8 @@ module MCPClient
   #   `#/definitions/x`, any JSON pointer, or a plain-name fragment `#name`
   #   naming an `$anchor` / a draft-07 `$id: "#name"` of the referencing
   #   schema's own resource — a subschema whose `$id` is a URI starts a new
-  #   resource), with $defs (2019-09, 2020-12) / definitions (draft-07);
+  #   resource), with $defs (2019-09, 2020-12) and definitions, which the
+  #   modern dialects keep as the deprecated spelling of $defs;
   #   under draft-07 a $ref replaces its siblings, under 2019-09 and 2020-12
   #   it applies alongside them
   # - boolean schemas (true / false), at the root or as subschemas
@@ -58,7 +61,9 @@ module MCPClient
   module SchemaValidator
     extend Dialects
     extend Normalization
+    extend UriReferences
     extend References
+    extend Shapes
     extend KeywordScan
     extend Composition
     extend Evaluation
@@ -203,12 +208,29 @@ module MCPClient
       'minContains' => [DEFAULT_DIALECT, DRAFT_2019_09],
       'maxContains' => [DEFAULT_DIALECT, DRAFT_2019_09],
       '$anchor' => [DEFAULT_DIALECT, DRAFT_2019_09],
-      '$defs' => [DEFAULT_DIALECT, DRAFT_2019_09],
-      'definitions' => [DRAFT_07]
+      '$defs' => [DEFAULT_DIALECT, DRAFT_2019_09]
     }.freeze
 
-    # Plain-name fragment syntax (JSON Schema 2020-12 Section 8.2.2).
-    ANCHOR_NAME = /\A[A-Za-z_][-A-Za-z0-9._]*\z/
+    # Plain-name fragment syntax, per dialect: 2020-12 Core Section 8.2.2
+    # admits a leading underscore and no colon, while 2019-09 Core Section
+    # 8.2.3 and draft-07 Core Section 8.2.3 admit a colon and require a
+    # leading letter. A name legal in one dialect is not one in the other,
+    # and the dialect in force at the resource decides.
+    ANCHOR_NAME_BY_DIALECT = {
+      DEFAULT_DIALECT => /\A[A-Za-z_][-A-Za-z0-9._]*\z/,
+      DRAFT_2019_09 => /\A[A-Za-z][-A-Za-z0-9.:_]*\z/,
+      DRAFT_07 => /\A[A-Za-z][-A-Za-z0-9.:_]*\z/
+    }.freeze
+
+    # The 2020-12 plain-name syntax, the default when no dialect is known.
+    ANCHOR_NAME = ANCHOR_NAME_BY_DIALECT.fetch(DEFAULT_DIALECT)
+
+    # @param name [Object] the candidate plain name
+    # @param dialect [String, nil] the canonical dialect in force
+    # @return [Boolean] whether the dialect admits the name as a plain name
+    def self.anchor_name?(name, dialect)
+      name.is_a?(String) && name.match?(ANCHOR_NAME_BY_DIALECT.fetch(dialect, ANCHOR_NAME))
+    end
 
     # @param keyword [String]
     # @param dialect [String, nil] a canonical dialect, or nil for "any"
@@ -220,6 +242,11 @@ module MCPClient
     # Per-validation state.
     Context = Struct.new(:root, :deadline, :dialect, :visits, :errors, :speculative, :anchors, :undecided, :depth,
                          keyword_init: true)
+
+    # Per-preflight state: the document, the counter the walk accounts to,
+    # the problems it found, and the positions it has still to read (a
+    # stack, so the walk needs no interpreter frame of its own).
+    Walk = Struct.new(:root, :counter, :problems, :pending, keyword_init: true)
 
     # Raised while normalizing a schema whose structure exceeds the bounds,
     # so a peer-supplied document is never copied whole.
@@ -239,11 +266,28 @@ module MCPClient
     # otherwise external reference is never dereferenced and makes the
     # schema unusable rather than permissive).
     # @param schema [Object] the schema (string or symbol keys)
+    # @param counter [Hash] filled in with the preflight state, so a caller
+    #   can tell one kind of problem from another (`:unsupported_dialect`)
     # @return [Array<String>] problems (empty when the schema is usable)
-    def self.check_schema(schema)
-      check_normalized(normalize_schema(schema))
+    def self.check_schema(schema, counter = {})
+      check_normalized(normalize_schema(schema), counter)
     rescue TooLarge => e
       [e.message]
+    end
+
+    # The dialect a schema declares (at its root or at an embedded resource
+    # root) that this validator does not implement. MCP 2026-07-28 basic
+    # "Implementation Requirements": a client "MUST handle unsupported
+    # dialects gracefully by returning an appropriate error indicating the
+    # dialect is not supported", which a caller can only do once it can tell
+    # an unsupported dialect from every other reason a schema is unusable.
+    # @param schema [Object] the schema (string or symbol keys)
+    # @return [String, nil] the declared dialect, or nil when every dialect
+    #   the document declares is supported
+    def self.unsupported_dialect(schema)
+      state = {}
+      check_schema(schema, state)
+      state[:unsupported_dialect]
     end
 
     # A bounded, string-keyed copy of a schema (booleans pass through).
@@ -267,7 +311,9 @@ module MCPClient
 
       declared = dialect(root)
       return ['$schema must be a non-empty string naming the dialect'] if declared.nil?
+
       unless supported_dialect?(declared)
+        counter[:unsupported_dialect] = declared
         return ["schema dialect #{clip(declared.inspect)} is not supported " \
                 "(supported: #{SUPPORTED_DIALECTS.join(', ')})"]
       end
@@ -307,36 +353,91 @@ module MCPClient
     # walked under its own dialect.
     # @return [void]
     def self.walk_schema(schema, root, depth, counter, problems, dialect = counter[:dialect])
-      return unless problems.empty? && schema_value?(schema)
-      return unless admit_schema?(schema, depth, counter, problems)
+      walk = Walk.new(root: root, counter: counter, problems: problems,
+                      pending: [[schema, depth, dialect]])
+      until walk.pending.empty?
+        return unless problems.empty?
+
+        walk_position(walk, *walk.pending.pop)
+      end
+    end
+
+    # Walk one schema position and queue the positions it leads to. The
+    # queue is a stack and children are pushed in reverse, so a document is
+    # read depth-first and in document order, exactly as a recursive walk
+    # would read it — but a `$ref` chain hundreds of schemas long costs
+    # queue entries rather than interpreter frames, so a shallow document
+    # whose references chain deeply can no longer overflow the (small) stack
+    # of the thread a transport reads on. A reference is followed before the
+    # position's own subschemas, so it is pushed last.
+    # @return [void]
+    def self.walk_position(walk, schema, depth, dialect)
+      return unless schema_value?(schema)
+      return unless admit_schema?(schema, depth, walk.counter, walk.problems)
 
       if resource_root?(schema, dialect) && schema.key?('$schema')
         problem = embedded_dialect_problem(schema)
-        return problems << problem if problem
+        return record_embedded_dialect_problem(walk, schema, problem) if problem
 
         dialect = embedded_dialect(schema, dialect)
       end
-      check_ref(schema, root, depth, problems, dialect, counter) if schema.key?('$ref')
+      referenced = schema.key?('$ref') ? check_ref(walk, schema, depth, dialect) : []
       # draft-07: the $ref replaces its siblings, so the applicators next to
       # it are never applied and are not preflighted either; definitions are
       # a bag of reusable schemas, not applicators, and stay reachable
       # through references.
-      if dialect == DRAFT_07 && schema.key?('$ref')
-        each_definition(schema, dialect) { |sub| walk_schema(sub, root, depth + 1, counter, problems, dialect) }
-        return
-      end
+      return queue_definitions(walk, schema, depth, dialect, referenced) if dialect == DRAFT_07 && schema.key?('$ref')
 
+      check_keyword_shapes(walk, schema, dialect)
+      queue_subschemas(walk, schema, depth, dialect, referenced)
+    end
+
+    # @return [void]
+    def self.record_embedded_dialect_problem(walk, schema, problem)
+      declared = dialect(schema)
+      walk.counter[:unsupported_dialect] ||= declared if declared && !supported_dialect?(declared)
+      walk.problems << problem
+    end
+
+    # Queue the reusable schemas beside a draft-07 `$ref`, then what the
+    # reference reaches (walked first, so pushed last).
+    # @return [void]
+    def self.queue_definitions(walk, schema, depth, dialect, referenced)
+      positions = []
+      each_definition(schema, dialect) { |sub| positions << [sub, depth + 1, dialect] }
+      queue_positions(walk, positions, referenced)
+    end
+
+    # Queue every subschema position under a schema object, then what its
+    # reference reaches.
+    # @return [void]
+    def self.queue_subschemas(walk, schema, depth, dialect, referenced)
+      positions = []
+      each_subschema(schema, dialect) { |sub| positions << [sub, depth + 1, dialect] }
+      queue_positions(walk, positions, referenced)
+    end
+
+    # @return [void]
+    def self.queue_positions(walk, positions, referenced)
+      walk.pending.concat(positions.reverse)
+      walk.pending.concat(referenced.reverse)
+    end
+
+    # Every check a schema object's own keywords get.
+    # @return [void]
+    def self.check_keyword_shapes(walk, schema, dialect)
+      problems = walk.problems
       %w[$dynamicRef $recursiveRef].each do |keyword|
         next unless schema.key?(keyword) && keyword_known?(keyword, dialect)
 
-        check_dynamic_ref(keyword, schema[keyword], problems)
+        check_dynamic_ref(walk, schema, keyword, dialect)
       end
       if dialect == DEFAULT_DIALECT && schema['items'].is_a?(Array)
         problems << 'items must be a schema in JSON Schema 2020-12 (positional schemas go in prefixItems)'
       end
       check_applicator_shapes(schema, dialect, problems)
+      check_assertion_shapes(schema, problems)
       check_exclusive_bounds(schema, dialect, problems)
-      each_subschema(schema, dialect) { |sub| walk_schema(sub, root, depth + 1, counter, problems, dialect) }
     end
 
     # Account for a schema (object or boolean) about to be walked: once per
@@ -357,70 +458,6 @@ module MCPClient
         return false
       end
       schema.is_a?(Hash)
-    end
-
-    # Every applicator value must be a schema (object or boolean), an array
-    # of schemas or a map of schemas; anything else is not silently read as
-    # "true". Keywords the dialect does not define are ignored.
-    # @return [void]
-    def self.check_applicator_shapes(schema, dialect, problems)
-      schema.each do |keyword, value|
-        next unless keyword_known?(keyword, dialect)
-
-        problem = applicator_shape_problem(keyword, value)
-        problems << problem if problem
-      end
-    end
-
-    # @return [String, nil] why an applicator value is malformed
-    def self.applicator_shape_problem(keyword, value)
-      if SUBSCHEMA_KEYWORDS.include?(keyword)
-        tuple = keyword == 'items' && all_schemas?(value)
-        "#{keyword} must be a schema" unless schema_value?(value) || tuple
-      elsif keyword == 'dependencies'
-        dependencies_shape_problem(value)
-      elsif SUBSCHEMA_MAP_KEYWORDS.include?(keyword) && !%w[$defs definitions].include?(keyword)
-        # $defs / definitions are a bag of reusable values: an entry that is
-        # not a schema only matters once a $ref points at it.
-        "#{keyword} must be an object of schemas" unless value.is_a?(Hash) && all_schemas?(value.values)
-      elsif SUBSCHEMA_ARRAY_KEYWORDS.include?(keyword)
-        "#{keyword} must be an array of schemas" unless all_schemas?(value)
-      end
-    end
-
-    # draft-07: each dependencies entry is a schema or an array of property
-    # names.
-    # @return [String, nil]
-    def self.dependencies_shape_problem(value)
-      return if value.is_a?(Hash) && value.each_value.all? { |v| schema_value?(v) || property_names?(v) }
-
-      'dependencies entries must be schemas or arrays of property names'
-    end
-
-    # @param value [Object]
-    # @return [Boolean] whether value is an array of property names
-    def self.property_names?(value)
-      value.is_a?(Array) && value.all?(String)
-    end
-
-    # exclusiveMinimum / exclusiveMaximum are numbers in every supported
-    # dialect (draft-07 validation Sections 6.2.3 and 6.2.5, kept by 2019-09
-    # and 2020-12); the boolean modifier form belongs to draft-04, which is
-    # not supported, and is not silently ignored (it would turn a bound
-    # into a pass).
-    # @return [void]
-    def self.check_exclusive_bounds(schema, _dialect, problems)
-      %w[exclusiveMinimum exclusiveMaximum].each do |keyword|
-        next if !schema.key?(keyword) || schema[keyword].is_a?(Numeric)
-
-        problems << "#{keyword} must be a number (the draft-04 boolean form is not supported)"
-      end
-    end
-
-    # @param values [Object]
-    # @return [Boolean] whether values is an array of schemas
-    def self.all_schemas?(values)
-      values.is_a?(Array) && values.all? { |v| schema_value?(v) }
     end
 
     # Yield every subschema directly under a schema object (skipping the
@@ -452,8 +489,9 @@ module MCPClient
     end
 
     # Yield the reusable schemas under the definition bag(s) the dialect
-    # defines (`$defs` in 2019-09 / 2020-12, `definitions` in draft-07; both
-    # when no dialect is given).
+    # defines: `definitions` everywhere (2020-12 Validation Appendix A keeps
+    # it as the deprecated spelling of `$defs`) and `$defs` in 2019-09 and
+    # 2020-12; both when no dialect is given.
     # @return [void]
     def self.each_definition(schema, dialect = nil, &block)
       %w[$defs definitions].each do |keyword|
@@ -463,46 +501,58 @@ module MCPClient
       end
     end
 
-    # Check the `$ref` of a schema object and preflight what it reaches: a
-    # pointer may lead into a bag the dialect does not walk (`definitions`
-    # under 2020-12), and what a reference applies must be usable too.
-    # @return [void]
-    def self.check_ref(schema, root, depth, problems, dialect, counter)
+    # Check the `$ref` of a schema object and queue what it reaches: a
+    # pointer may lead into a bag the dialect does not walk (`$defs` under
+    # draft-07), and what a reference applies must be usable too.
+    # @return [Array<Array>] the positions the reference reaches
+    def self.check_ref(walk, schema, depth, dialect)
+      root = walk.root
+      counter = walk.counter
+      problems = walk.problems
       ref = schema['$ref']
       unless ref.is_a?(String)
         problems << "$ref must be a string, got #{json_type(ref)}"
-        return
+        return []
       end
-      if external_ref?(ref)
+      if external_ref?(ref, root, counter[:dialect], counter, from: schema)
         problems << "external $ref #{clip(ref.inspect)} is not dereferenced (only references inside the schema " \
                     'document are resolved; network $ref resolution is disabled)'
-        return
+        return []
       end
 
+      positions = []
       problem = ref_chain_problem(ref, root, counter[:dialect], counter, from: schema) do |target, hop, from|
-        # What a reference reaches is walked under its own resource's dialect
-        # and at its own lexical depth; a boolean target needs no preflight
-        # and is charged once per distinct position (not per reference),
-        # and that position still obeys the depth bound.
-        position, opaque, visited = pointer_position(hop, root, counter[:dialect], counter, from)
-        unless target.is_a?(Hash)
-          problems << "schema nesting depth exceeds #{MAX_SCHEMA_DEPTH}" if position && position > MAX_SCHEMA_DEPTH
-          # A boolean in a position the walk visits was admitted there; one
-          # the walk never reaches (behind an opaque keyword, or beside a
-          # draft-07 $ref) is charged here, once per position.
-          charge_boolean_target(hop, root, from, counter, problems) unless visited
-          next
-        end
-
-        lexical = (counter[:depths] || {})[target]
-        target_depth = if opaque
-                         [position, lexical].compact.max || (depth + 1)
-                       else
-                         lexical || position || (depth + 1)
-                       end
-        walk_schema(target, root, target_depth, counter, problems, indexed_dialect(target, counter) || dialect)
+        position = referenced_target_position(walk, target, hop, from, depth, dialect)
+        positions << position if position
       end
       problems << problem if problem
+      positions
+    end
+
+    # The position a reference's target is walked at: under its own
+    # resource's dialect and at its own lexical depth. A boolean target
+    # needs no preflight and is charged once per distinct position (not per
+    # reference), and that position still obeys the depth bound.
+    # @return [Array, nil] the position to walk, or nil for a boolean target
+    def self.referenced_target_position(walk, target, hop, from, depth, dialect)
+      counter = walk.counter
+      position, opaque, visited = pointer_position(hop, walk.root, counter[:dialect], counter, from)
+      unless target.is_a?(Hash)
+        walk.problems << "schema nesting depth exceeds #{MAX_SCHEMA_DEPTH}" if position && position > MAX_SCHEMA_DEPTH
+        # A boolean in a position the walk visits was admitted there; one
+        # the walk never reaches (behind an opaque keyword, or beside a
+        # draft-07 $ref) is charged here, once per position.
+        charge_boolean_target(hop, walk.root, from, counter, walk.problems) unless visited
+        return nil
+      end
+
+      lexical = (counter[:depths] || {})[target]
+      target_depth = if opaque
+                       [position, lexical].compact.max || (depth + 1)
+                     else
+                       lexical || position || (depth + 1)
+                     end
+      [target, target_depth, indexed_dialect(target, counter) || dialect]
     end
 
     # Count a boolean a reference reaches toward the subschema bound, once
@@ -528,10 +578,12 @@ module MCPClient
     # outside the document would need a fetch, which never happens: the
     # schema is unusable.
     # @return [void]
-    def self.check_dynamic_ref(keyword, ref, problems)
-      return unless ref.is_a?(String) && external_ref?(ref)
+    def self.check_dynamic_ref(walk, schema, keyword, _dialect)
+      ref = schema[keyword]
+      return unless ref.is_a?(String)
+      return unless external_ref?(ref, walk.root, walk.counter[:dialect], walk.counter, from: schema)
 
-      problems << "external #{keyword} #{clip(ref.inspect)} is not dereferenced"
+      walk.problems << "external #{keyword} #{clip(ref.inspect)} is not dereferenced"
     end
 
     # Follow a local reference (and the references it leads to) at
@@ -571,7 +623,9 @@ module MCPClient
         from = target
         current = target['$ref']
         return "$ref must be a string, got #{json_type(current)}" unless current.is_a?(String)
-        return "external $ref #{clip(current.inspect)} is not dereferenced" if external_ref?(current)
+        if external_ref?(current, root, dialect, resolver, from: from)
+          return "external $ref #{clip(current.inspect)} is not dereferenced"
+        end
       end
     end
 

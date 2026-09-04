@@ -7,6 +7,76 @@ metadata). Each feature lands in its own PR; this section accumulates them.
 
 ### JSON Schema handling
 
+- **The preflight runs off the call stack, an unsupported input dialect is an
+  error, bundled references resolve, and `definitions` is the modern `$defs`
+  (verification round).** Seven fixes:
+
+  - *The preflight and the coverage scan no longer recurse.* Round 27 made
+    validation iterative, but `check_schema` and `unsupported_keywords` — both
+    of which the client runs *before* `validate`, so its `SystemStackError`
+    rescue could not cover them — still spent an interpreter frame per `$ref`
+    hop. A shallow document below every structural bound whose references
+    chain through 400 schemas (`{"$ref": "#/$defs/0", "$defs": {"0": {"allOf":
+    [{"$ref": "#/$defs/1"}]}, ...}}`) raised `SystemStackError` out of
+    `Client#call_tool` on a transport's reader thread, as its input or its
+    output schema. Both now read the document from an explicit stack, in the
+    same depth-first document order, so only the resource bounds decide.
+  - *An unsupported input dialect is an error the caller sees.* A tool whose
+    `inputSchema` declared, say, `{"$schema": "urn:unknown-dialect"}` had its
+    parameter check silently skipped: the request went out and its result came
+    back successfully, in `:strict` mode as much as in `:warn`. MCP 2026-07-28
+    basic "Implementation Requirements" says a client "MUST handle unsupported
+    dialects gracefully by returning an appropriate error indicating the
+    dialect is not supported", so `call_tool` now raises
+    `MCPClient::Errors::ValidationError` naming the dialect and refuses to
+    send the call. SEP-2106 assigns no JSON-RPC code to this, so it is a
+    library error rather than an invented wire one. An input schema that is
+    unusable for any *other* reason is still only warned about, and the call
+    still goes out.
+  - *A reference to a resource the document bundles resolves inside it.*
+    `{"$defs": {"s": {"$id": "urn:example:s", "type": "string"}}, "$ref":
+    "urn:example:s"}` was rejected as an external reference although its
+    target is right there; so were relative references resolving against the
+    base an enclosing `$id` establishes, and the empty reference `""`, which
+    names the current resource. References are now resolved as URI references
+    (RFC 3986 Section 5.2) against the base of the resource holding them, and
+    only one naming a resource the document does not carry is external —
+    which is what bundling (JSON Schema 2020-12 Core Section 9.3.1) needs.
+    Nothing is fetched, as before.
+  - *`definitions` is the deprecated `$defs` of the modern dialects.* Under
+    2020-12 and 2019-09 it was treated as an unknown container: an `$anchor`
+    declared in it named nothing (`{"definitions": {"x": {"$anchor": "x",
+    "type": "integer"}}, "$ref": "#x"}` rejected `1` as unresolvable), and
+    what it held was neither preflighted nor scanned for unsupported
+    keywords. The meta-schema of both dialects retains `definitions`, and
+    2020-12 Validation Appendix A asks implementations to give it the
+    behaviour of `$defs`; it now has it. `$defs` remains unknown to draft-07,
+    which does not define it.
+  - *2019-09 and draft-07 anchor names admit a colon.* Both spell a plain
+    name `[A-Za-z][-A-Za-z0-9.:_]*`, where 2020-12 spells it
+    `[A-Za-z_][-A-Za-z0-9._]*`. The 2020-12 syntax was applied to every
+    dialect, so a legal `{"$anchor": "a:b"}` under 2019-09 named nothing and
+    `"#a:b"` was reported unresolvable. Each dialect's own syntax now
+    applies, at the resource the reference resolves in.
+  - *Malformed keyword values are rejected at preflight.* `{"allOf": []}` and
+    `{"prefixItems": []}` were accepted and then read as permissive, though
+    both keywords are defined to hold a non-empty array; a `$defs` entry that
+    is not a schema was exempted unless a reference reached it; and the
+    assertion keywords the validator evaluates (`type`, `enum`, `required`,
+    `pattern`, `minLength` / `maxLength`, `minItems` / `maxItems`, `minimum` /
+    `maximum`) were read whatever they held. All of them now make the schema
+    unusable, naming the keyword at fault, rather than passing data off as
+    checked.
+  - *An undecidable condition still reports a failure both branches agree
+    on.* `validate(3, {"if" => {"multipleOf" => 2}, "then" => false, "else"
+    => false})` returned no errors, and so did validating `4`: the `if` uses a
+    keyword this validator does not evaluate, so neither branch was applied.
+    Exactly one of `then` and `else` is applied whichever way the condition
+    goes (JSON Schema 2020-12 Section 10.2.2), so a value both of them reject
+    is invalid — and is now reported, under `:strict` as a raised violation.
+    A conditional whose branches genuinely disagree, or that writes only one
+    of them, stays undecided as before.
+
 - **Schemas applied to one value no longer consume the call stack, and a
   draft-07 `$id` fragment is percent-decoded (round 27).** Round 26 stopped
   *counting* the schemas a node applies to the same instance value against

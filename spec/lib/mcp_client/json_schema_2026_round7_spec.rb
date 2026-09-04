@@ -83,12 +83,16 @@ RSpec.describe 'MCP 2026-07-28 JSON Schema handling — round 7' do
   end
 
   describe 'dialect-scoped definition containers' do
-    it 'does not walk definitions under 2020-12 nor $defs under draft-07' do
+    it 'walks definitions under 2020-12, where it is the deprecated $defs' do
+      # JSON Schema 2020-12 Validation Appendix A: `definitions` is retained
+      # by the meta-schema and behaves as `$defs` does.
       modern = { 'type' => 'integer', 'definitions' => { 'hidden' => { '$ref' => 'https://example.com/x' } } }
-      expect(validator.check_schema(modern)).to be_empty
-      expect(validator.validate(1, modern)).to be_empty
+      expect(validator.check_schema(modern)).to contain_exactly(a_string_matching(/external \$ref/))
+    end
 
-      legacy = { '$schema' => draft7, 'type' => 'integer', '$defs' => { 'hidden' => { '$ref' => 'https://example.com/x' } } }
+    it 'does not walk $defs under draft-07, which does not define it' do
+      legacy = { '$schema' => draft7, 'type' => 'integer',
+                 '$defs' => { 'hidden' => { '$ref' => 'https://example.com/x' } } }
       expect(validator.check_schema(legacy)).to be_empty
       expect(validator.validate(1, legacy)).to be_empty
     end

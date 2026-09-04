@@ -49,10 +49,12 @@ RSpec.describe 'MCP 2026-07-28 JSON Schema handling — round 15' do
   end
 
   it 'treats a tautological additionalItems beside a tuple as decided' do
+    # Two items against a one-schema tuple, so `additionalItems` really does
+    # apply to the second: a tautological one still decides the branch.
     schema = { '$schema' => draft7, 'not' => { 'items' => [true], 'additionalItems' => true } }
-    expect(validator.validate([1], schema)).to contain_exactly(a_string_matching(/not/))
+    expect(validator.validate([1, 2], schema)).to contain_exactly(a_string_matching(/not/))
     empty_schema = { '$schema' => draft7, 'not' => { 'items' => [true], 'additionalItems' => {} } }
-    expect(validator.validate([1], empty_schema)).to contain_exactly(a_string_matching(/not/))
+    expect(validator.validate([1, 2], empty_schema)).to contain_exactly(a_string_matching(/not/))
     real = { '$schema' => draft7, 'not' => { 'items' => [true], 'additionalItems' => false } }
     expect(validator.validate([1, 2], real)).to be_empty
   end
@@ -62,7 +64,12 @@ RSpec.describe 'MCP 2026-07-28 JSON Schema handling — round 15' do
     let(:mock_server) { instance_double(MCPClient::ServerBase, name: 'server1') }
 
     it 'sends the call when the input schema is unusable, whatever it claims to require' do
-      schema = { '$schema' => 'urn:unknown-dialect', 'type' => 'object', 'required' => ['x'] }
+      # An unusable schema asserts nothing, so the server judges the
+      # arguments; an unsupported *dialect* is an error instead (MCP
+      # 2026-07-28 "Implementation Requirements"), covered in the
+      # verification round.
+      schema = { 'type' => 'object', 'required' => ['x'],
+                 'properties' => { 'x' => { '$ref' => 'https://example.com/x' } } }
       tool = MCPClient::Tool.new(name: 't', description: 'd', schema: schema, server: mock_server)
       allow(MCPClient::ServerFactory).to receive(:create).and_return(mock_server)
       allow(mock_server).to receive(:on_notification)

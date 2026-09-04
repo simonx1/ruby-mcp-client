@@ -293,6 +293,9 @@ module MCPClient
     # @param parameters [Hash] the parameters to pass to the tool
     # @param server [String, Symbol, Integer, MCPClient::ServerBase, nil] optional server to use
     # @return [Object] the result of the tool invocation
+    # @raise [MCPClient::Errors::ValidationError] when the parameters miss a
+    #   required property, or the tool's inputSchema declares a JSON Schema
+    #   dialect this client does not support (MCP 2026-07-28)
     def call_tool(tool_name, parameters, server: nil, progress: nil)
       tool = resolve_tool(tool_name, server: server)
 
@@ -1198,15 +1201,20 @@ module MCPClient
       end
     end
 
-    # Validate parameters against tool JSON schema (checks required properties)
+    # Validate parameters against tool JSON schema (checks required properties).
+    # A schema declaring a dialect this client does not implement is refused
+    # outright, so the call is never sent under a schema nothing could read.
     # @param tool [MCPClient::Tool] tool definition with schema
     # @param parameters [Hash] parameters to validate
-    # @raise [MCPClient::Errors::ValidationError] when required params are missing
+    # @raise [MCPClient::Errors::ValidationError] when required params are
+    #   missing, or the schema's dialect is not supported
     def validate_params!(tool, parameters)
       schema = tool.schema
+      state = input_schema_state(tool)
+      reject_unsupported_input_dialect!(tool, state)
       # An input schema the validator cannot interpret asserts nothing: the
       # call goes out and the server judges its arguments.
-      return if warn_unusable_input_schema(tool)
+      return if state[:unusable]
       return unless schema.is_a?(Hash)
 
       required = schema['required'] || schema[:required]
@@ -1277,16 +1285,17 @@ module MCPClient
       result
     end
 
-    # Warn once per tool when its inputSchema cannot be used as a JSON
-    # Schema (MCP 2026-07-28: an unsupported dialect, a network `$ref` that
-    # is never dereferenced, or a schema beyond the resource bounds). The
-    # call still goes out — the server owns argument validation — but the
-    # host learns that local parameter checks are incomplete.
+    # What the preflight made of a tool's inputSchema, checked once per tool
+    # definition. A schema the validator cannot use is warned about (MCP
+    # 2026-07-28: an unsupported dialect, a network `$ref` that is never
+    # dereferenced, or a schema beyond the resource bounds); for everything
+    # but an unsupported dialect the call still goes out — the server owns
+    # argument validation — and the host learns that local parameter checks
+    # are incomplete.
     # @param tool [MCPClient::Tool]
-    # @return [void]
-    # @return [Boolean] whether the input schema is unusable for validation
-    def warn_unusable_input_schema(tool)
-      return false if tool.schema.nil?
+    # @return [Hash] :unusable and the :dialect that is not supported, if any
+    def input_schema_state(tool)
+      return {} if tool.schema.nil?
 
       # Keyed by the definition's identity as well, so a refreshed tool
       # definition (list_changed, cache expiry, HeaderMismatch recovery) is
@@ -1297,15 +1306,44 @@ module MCPClient
       @input_schema_warnings ||= {}
       key = [tool.server&.object_id, tool.name]
       known = @input_schema_warnings[key]
-      return known[:unusable] if known && known[:identity].equal?(tool_definition_identity(tool))
+      return known if known && known[:identity].equal?(tool_definition_identity(tool))
 
-      problems = MCPClient::SchemaValidator.check_schema(tool.schema)
-      @input_schema_warnings[key] = { identity: tool_definition_identity(tool), unusable: !problems.empty? }
-      return false if problems.empty?
+      preflight = {}
+      problems = MCPClient::SchemaValidator.check_schema(tool.schema, preflight)
+      state = { identity: tool_definition_identity(tool), unusable: !problems.empty?,
+                dialect: preflight[:unsupported_dialect] }
+      @input_schema_warnings[key] = state
+      warn_unusable_input_schema(tool, problems)
+      state
+    end
+
+    # @param problems [Array<String>] why the input schema is unusable
+    # @return [void]
+    def warn_unusable_input_schema(tool, problems)
+      return if problems.empty?
 
       @logger.warn("Tool '#{sanitize_peer_log_text(tool.name.to_s)}' input schema is not usable for validation: " \
                    "#{sanitize_peer_log_text(problems.join('; '))}")
-      true
+    end
+
+    # MCP 2026-07-28 basic "Implementation Requirements": a client "MUST
+    # handle unsupported dialects gracefully by returning an appropriate
+    # error indicating the dialect is not supported". A dialect this client
+    # does not implement is not a schema it may quietly skip — it cannot
+    # know what the arguments must look like, and the caller must be able to
+    # see that — so the call is refused before it is sent. SEP-2106 assigns
+    # no JSON-RPC code to this, so it is a library error, not a wire one.
+    # @param state [Hash] the memoized preflight state
+    # @return [void]
+    # @raise [MCPClient::Errors::ValidationError] when the dialect is unsupported
+    def reject_unsupported_input_dialect!(tool, state)
+      dialect = state[:dialect]
+      return unless dialect
+
+      raise MCPClient::Errors::ValidationError,
+            "Tool '#{sanitize_peer_log_text(tool.name.to_s)}' input schema declares the JSON Schema dialect " \
+            "#{sanitize_peer_log_text(dialect.inspect)[0, MAX_VIOLATION_TEXT]}: that dialect is not supported " \
+            "(supported: #{MCPClient::SchemaValidator::SUPPORTED_DIALECTS.join(', ')})"
     end
 
     # The token naming a tool definition ({MCPClient::Tool#schema_identity});
