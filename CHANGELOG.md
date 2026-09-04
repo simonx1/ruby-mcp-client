@@ -373,7 +373,37 @@ metadata). Each feature lands in its own PR; this section accumulates them.
   `Token.from_h(expires_in: 3600, expires_at: 'not a time')` — the shape
   `to_h` persists, with the one field this client depends on mangled — reads
   as expired and is refreshed, where before it came back with an hour of
-  fresh lifetime.
+  fresh lifetime. A refresh is now re-checked when its *response* arrives, not
+  only when it is sent: a token refreshed at authorization server A that comes
+  back after protected-resource metadata (or a `401` challenge) moved the
+  resource to B is discarded — it is neither written over B's token in storage
+  (which also resurrected a token the challenge had just retired) nor handed to
+  the caller, who used to receive it and present `Authorization: Bearer` with
+  A's bytes. Registration state became per authorization server, as SEP-2352
+  requires: credentials are kept under the MCP server URL — the registration in
+  use, where every storage backend and every record written by an earlier
+  version already has them — *and* under a key of the issuing authorization
+  server, `OAuthProvider#client_registration_key(issuer)`, so two authorization
+  servers behind one MCP server no longer share one slot. Configuring the
+  second no longer replaces the first, and returning to the first finds its
+  registration instead of raising "these credentials belong to another
+  authorization server"; a dynamic registration discarded on an authorization
+  server change is kept under its own server's key, since it is still valid
+  there, and reused if that server comes back. Storage keys stay opaque strings
+  and nothing is migrated or moved, so a backend that treats the key as a
+  string needs no change and a downgrade still finds every record. `token_type`
+  must now name a type this client can present (RFC 6749 §7.1: "the client MUST
+  NOT use an access token if it does not understand the token type"): a `DPoP`
+  or `mac` token fails the code exchange, fails a refresh (keeping the
+  still-valid token) and presents nothing when a storage backend reads one
+  back, instead of going out as a bearer credential without the proof its type
+  requires — and spelled `Dpop` by `String#capitalize` at that. The comparison
+  is case-insensitive and an absent `token_type` still reads as the `Bearer`
+  RFC 6749 §5.1 describes. And a browser callback may carry each parameter only
+  once (RFC 6749 §3.1): the parsed parameters are a Hash, where the last value
+  of a repeated name silently won, so `?iss=attacker&iss=recorded` passed every
+  check this client makes while a reader that takes the first value saw another
+  authorization server; a callback repeating any parameter is now refused.
 
 ### Tasks extension (`io.modelcontextprotocol/tasks`)
 

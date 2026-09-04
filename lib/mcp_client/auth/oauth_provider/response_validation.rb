@@ -43,14 +43,17 @@ module MCPClient
         # end up in an `Authorization` header, so they must be bytes a header
         # can carry: an empty string is no more usable than a JSON array, and
         # a CR or an LF would not be part of the value at all but the start of
-        # another header line. refresh_token is OPTIONAL but is a credential
+        # another header line. token_type must moreover name a type this
+        # client can present (see {SUPPORTED_TOKEN_TYPE}); an absent one is
+        # the "Bearer" this client asked for and RFC 6749 Section 5.1
+        # describes. refresh_token is OPTIONAL but is a credential
         # too: bytes or nothing, because "" would be persisted over the
         # refresh token the client already holds. scope is free text.
         # Fields the RFC does not name are ignored: an authorization server
         # may return anything else it likes.
         TOKEN_RESPONSE_FIELDS = {
           'access_token' => :header_value,
-          'token_type' => :header_value,
+          'token_type' => :token_type,
           'expires_in' => :integer,
           'refresh_token' => :non_empty_string,
           'scope' => :string
@@ -137,11 +140,26 @@ module MCPClient
         # server. What the RFC requires is required here, at discovery.
         REQUIRED_SERVER_METADATA_FIELDS = %w[issuer authorization_endpoint token_endpoint].freeze
 
+        # The one access token type this client can present. RFC 6749 Section
+        # 7.1: "the client MUST NOT use an access token if it does not
+        # understand the token type". A bearer token is presented as it
+        # stands (RFC 6750 Section 2.1) and is what MCP 2026-07-28 requires;
+        # every other type is a credential this client cannot form a request
+        # with — a DPoP token needs a proof JWT of its own, a MAC token a
+        # signature — so putting its bytes behind `Authorization: DPoP` would
+        # present a credential in a way its authorization server never
+        # authorized. (It would not even be spelled right: the header is
+        # built with `String#capitalize`, which makes "DPoP" "Dpop".) The
+        # comparison is case-insensitive: RFC 6749 Section 5.1 makes the
+        # value case-insensitive, and servers do answer "bearer".
+        SUPPORTED_TOKEN_TYPE = 'bearer'
+
         # How each type reads in a failure message.
         TYPE_DESCRIPTIONS = {
           string: 'a string',
           non_empty_string: 'a non-empty string',
           header_value: 'a non-empty string of bytes an HTTP header can carry',
+          token_type: 'a token type this client can present ("Bearer")',
           integer: 'an integer',
           string_array: 'an array of strings',
           redirect_uri_array: 'an array of usable redirect URIs'
@@ -253,6 +271,7 @@ module MCPClient
           when :string then value.is_a?(String)
           when :non_empty_string then non_empty_string?(value)
           when :header_value then header_value_bytes?(value)
+          when :token_type then presentable_token_type?(value)
           # `true` and `false` are not Integers, so booleans are rejected here.
           when :integer then value.is_a?(Integer)
           when :string_array then value.is_a?(Array) && value.all?(String)
@@ -277,7 +296,18 @@ module MCPClient
         def token_bytes?(token)
           return false unless token.respond_to?(:access_token) && access_token_bytes?(token.access_token)
 
-          token.respond_to?(:token_type) && header_value_bytes?(token.token_type)
+          token.respond_to?(:token_type) && presentable_token_type?(token.token_type)
+        end
+
+        # Whether an access token of this type can be presented at all: bytes
+        # an HTTP header can carry, and a type this client understands
+        # (RFC 6749 Section 7.1). A record read back from storage is asked the
+        # same question as a token response is, so a type this client cannot
+        # honour is never presented, whichever side it came from.
+        # @param value [Object, nil] a candidate token type
+        # @return [Boolean]
+        def presentable_token_type?(value)
+          header_value_bytes?(value) && value.casecmp(SUPPORTED_TOKEN_TYPE).zero?
         end
 
         # The same question about a parsed token endpoint response body.

@@ -875,6 +875,26 @@ See [OAUTH.md](OAUTH.md) for full documentation.
 - **PKCE** — authorization refuses to proceed when the authorization server
   does not advertise `code_challenge_methods_supported` including `S256`.
 
+### Authorization server binding (2026-07-28)
+
+- **Registration state is per authorization server (SEP-2352)** — credentials
+  are stored under the MCP server URL (the registration in use) *and* under
+  `provider.client_registration_key(issuer)`, so two authorization servers
+  behind one MCP server each keep their own registration instead of replacing
+  one another. Seed pre-registered credentials for a specific authorization
+  server with `storage.set_client_info(provider.client_registration_key(issuer), creds)`.
+- **A refresh is re-checked when its response arrives** — a refreshed token
+  from an authorization server that stopped being this resource's while the
+  request was in flight is discarded rather than stored over the current
+  server's token or presented.
+- **Only a token type the client understands is presented** — `token_type`
+  must be `Bearer` (RFC 6749 §7.1); a `DPoP` or `mac` token is refused where
+  it is issued and where it is read back. An absent `token_type` still reads
+  as `Bearer`.
+- **A callback parameter may appear once** — RFC 6749 §3.1: `BrowserOAuth`
+  refuses a callback that repeats `iss`, `state`, `code` or any other
+  parameter instead of silently taking the last value.
+
 ## Cacheable Results (MCP 2026-07-28)
 
 A 2026-07-28 server may bound a result with `ttlMs` (how long the client MAY

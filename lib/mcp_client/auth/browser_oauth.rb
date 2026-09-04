@@ -203,7 +203,7 @@ module MCPClient
 
         # Update result and signal waiting thread
         mutex.synchronize do
-          record_callback(result, params)
+          record_callback(result, params, query_string.to_s)
           result[:completed] = true
 
           condition.signal
@@ -226,8 +226,14 @@ module MCPClient
       # "successful".
       # @param result [Hash] the shared result
       # @param params [Hash] callback parameters
+      # @param query_string [String] the raw query the parameters were parsed from
       # @return [void]
-      def record_callback(result, params)
+      def record_callback(result, params, query_string = '')
+        if (repeated = repeated_parameter(query_string))
+          return result[:error] = "Invalid callback: the #{repeated} parameter is included more than once " \
+                                  '(RFC 6749 Section 3.1)'
+        end
+
         code = params['code']
         state = params['state']
         if params['error']
@@ -268,6 +274,35 @@ module MCPClient
         @oauth_provider.authorization_error_message(params)
       rescue MCPClient::Errors::ConnectionError => e
         e.message
+      end
+
+      # The name of the first callback parameter that appears more than once,
+      # or nil when each appears at most once.
+      #
+      # RFC 6749 Section 3.1: "Request and response parameters MUST NOT be
+      # included more than once." The parsed parameters are a Hash, where the
+      # last value of a repeated name silently wins — so
+      # `?iss=attacker&iss=recorded` passes every check this client makes
+      # while a reader that takes the first value (a proxy, a log pipeline, a
+      # differently written client sharing the redirect URI) sees another
+      # authorization server entirely. That disagreement is the whole reason
+      # the RFC forbids the repetition, and there is nothing to reconcile
+      # here: the response is refused, whether the values conflict or not,
+      # and whichever parameter was repeated.
+      # @param query_string [String] the raw query string of the callback
+      # @return [String, nil] the repeated parameter's name
+      # @private
+      def repeated_parameter(query_string)
+        seen = {}
+        PeerText.decodable(query_string).split('&').each do |param|
+          next if param.empty?
+
+          name = decoded_parameter(param.split('=', 2).first.to_s)
+          return safe_error_text(name) if seen.key?(name)
+
+          seen[name] = true
+        end
+        nil
       end
 
       # Parse URL query parameters.

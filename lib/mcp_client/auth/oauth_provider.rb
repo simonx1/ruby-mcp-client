@@ -8,6 +8,7 @@ require_relative '../auth'
 require_relative 'peer_text'
 require_relative 'oauth_provider/challenge_handling'
 require_relative 'oauth_provider/client_authentication'
+require_relative 'oauth_provider/registration_store'
 require_relative 'oauth_provider/response_validation'
 
 module MCPClient
@@ -31,6 +32,7 @@ module MCPClient
       include ChallengeHandling
       include ClientAuthentication
       include PeerText
+      include RegistrationStore
       include ResponseValidation
 
       # @!attribute [rw] redirect_uri
@@ -151,9 +153,11 @@ module MCPClient
         return token unless token.expired? || token.expires_soon?
 
         # Refresh early when possible; a still-valid token is presented when
-        # the refresh (or the discovery it needs) cannot run right now.
+        # the refresh (or the discovery it needs) cannot run right now. What
+        # comes back is judged against the authorization server that is
+        # current NOW, not the one the refresh was started with.
         refreshed = refresh_if_possible(token)
-        return refreshed if token_bytes?(refreshed)
+        return refreshed if token_bytes?(refreshed) && token_for_current_issuer?(refreshed)
         # The discovery a refresh ran may have retired this very token.
         return nil if token.expired? || retired_token?(token) || !token_for_current_issuer?(token)
 
@@ -769,10 +773,16 @@ module MCPClient
         if client_info.respond_to?(:issuer) && client_info.issuer.nil? && !portable_client?(client_info)
           client_info = client_info.with_issuer(previous.issuer,
                                                 registration_type: resolved_registration_type(client_info))
-          storage.set_client_info(server_url, client_info)
+          store_client_info(client_info)
         end
         keep = client_info.respond_to?(:portable?) && (portable_client?(client_info) || client_info.pre_registered?)
-        delete_client_info unless keep
+        return if keep
+
+        # The registration itself is still valid at the server that made it,
+        # so it is kept under that server's own key; only the answer to
+        # "which credentials does this resource use now" is discarded.
+        preserve_client_registration(client_info)
+        delete_client_info
       end
 
       # @param record [Token, ClientInfo, Object, nil]
@@ -1166,90 +1176,6 @@ module MCPClient
               "Network error fetching server metadata: #{safe_error_text(e.message)}"
       end
 
-      # Get or register OAuth client, following the MCP 2025-11-25 client
-      # registration priority order: pre-registered/cached client information
-      # first, then Client ID Metadata Documents (SEP-991) when the
-      # authorization server advertises support and a metadata URL is
-      # configured, then Dynamic Client Registration as a fallback.
-      # @param server_metadata [ServerMetadata] Authorization server metadata
-      # @return [ClientInfo] Client information
-      # @raise [MCPClient::Errors::ConnectionError] if registration fails
-      def get_or_register_client(server_metadata)
-        # 1. Pre-registered or previously registered client info from storage,
-        # provided it belongs to the authorization server in use.
-        if (client_info = stored_client_info) && !client_info.client_secret_expired?
-          bound = client_info_for_issuer(client_info, server_metadata.issuer, server_metadata)
-          if bound
-            logger.debug("Using cached OAuth client for #{server_url}")
-            return bound
-          end
-        end
-
-        # 2. Client ID Metadata Documents (SEP-991): the HTTPS metadata URL is
-        # itself the client_id — no registration request is needed.
-        if client_id_metadata_url && server_metadata.supports_client_id_metadata_documents?
-          return client_info_from_metadata_url
-        end
-
-        # 3. Dynamic Client Registration (RFC 7591) fallback
-        logger.debug('No cached client found, registering new OAuth client...')
-        if server_metadata.supports_registration?
-          register_client(server_metadata)
-        else
-          raise MCPClient::Errors::ConnectionError,
-                'Dynamic client registration not supported and no client credentials found'
-        end
-      end
-
-      # MCP 2026-07-28 "Authorization Server Binding": credentials are keyed
-      # by the issuer that produced them. A Client ID Metadata Document
-      # client id is portable; unbound credentials are bound to the current
-      # issuer on first use; pre-registered credentials for another issuer
-      # are an error rather than silently reused; a dynamic registration for
-      # another issuer is discarded so the caller re-registers.
-      # @param client_info [ClientInfo] the cached credentials
-      # @param issuer [String] the issuer of the authorization server in use
-      # @return [ClientInfo, nil] usable credentials, or nil when a new registration is needed
-      # @raise [MCPClient::Errors::ConnectionError] for pre-registered credentials of another issuer
-      # @param server_metadata [ServerMetadata, nil] the authorization server in use
-      def client_info_for_issuer(client_info, issuer, server_metadata = nil)
-        return client_info unless client_info.respond_to?(:issuer)
-
-        if portable_client?(client_info)
-          # A portable id is only usable where Client ID Metadata Documents
-          # are accepted; elsewhere the caller registers or reports that no
-          # credentials exist.
-          return nil if server_metadata && !server_metadata.supports_client_id_metadata_documents?
-          # A Client ID Metadata Document client persisted before the type
-          # was recorded is migrated so later checks need no inference.
-          return client_info if client_info.registration_type == 'cimd'
-
-          migrated = client_info.with_issuer(client_info.issuer, registration_type: 'cimd')
-          storage.set_client_info(server_url, migrated)
-          return migrated
-        end
-
-        if client_info.issuer.nil?
-          bound = client_info.with_issuer(issuer, registration_type: resolved_registration_type(client_info))
-          storage.set_client_info(server_url, bound)
-          return bound
-        end
-        return client_info if client_info.issuer == issuer
-
-        if client_info.pre_registered?
-          raise MCPClient::Errors::ConnectionError,
-                'Pre-registered OAuth client credentials belong to authorization server ' \
-                "#{safe_error_text(client_info.issuer)}, but the server now uses #{safe_error_text(issuer)}; " \
-                'register the client with the new authorization server'
-        end
-
-        logger.warn("Discarding the OAuth client registered with #{safe_error_text(client_info.issuer)}: " \
-                    "the authorization server is now #{safe_error_text(issuer)}")
-        delete_client_info
-        delete_token(bind_to: client_info.issuer)
-        nil
-      end
-
       # Forget the stored token (the authorization server it came from is no
       # longer the one in use). Storage backends may implement the optional
       # delete_token(server_url); otherwise set_token(server_url, nil) is
@@ -1317,25 +1243,6 @@ module MCPClient
       # @return [ServerMetadata, nil]
       def stored_server_metadata
         normalize_record(storage.get_server_metadata(server_url), ServerMetadata) || @discovered_server_metadata
-      end
-
-      # @return [ClientInfo, nil]
-      def stored_client_info
-        client_info = normalize_record(storage.get_client_info(server_url), ClientInfo)
-        # A backend without delete_client_info is asked to store nil, and one
-        # that persists plain hashes writes `nil.to_h` — `{}`. Read back that
-        # is a record without a client id, which would be bound to the current
-        # issuer and reused instead of registering, making an authorization
-        # request with an empty client_id. A hash-persisting backend can just
-        # as well read back a client_id of any other JSON type, which would go
-        # into the authorization URL `to_s`-mangled and be rejected only on
-        # the way back, after the browser had been opened. Neither is a
-        # client: both are the absence storage meant to express, so
-        # registration happens first. The bytes are required exactly as a
-        # token's are.
-        return nil if client_info.respond_to?(:client_id) && !client_id_bytes?(client_info.client_id)
-
-        client_info
       end
 
       # @return [PKCE, nil]
@@ -1464,67 +1371,6 @@ module MCPClient
         bound
       end
 
-      # The registration type of stored credentials, recognizing a Client
-      # ID Metadata Document client persisted before the type was recorded
-      # by its client id (the configured metadata URL).
-      # @param client_info [ClientInfo]
-      # @return [String]
-      def resolved_registration_type(client_info)
-        return client_info.registration_type if client_info.registration_type
-        return 'cimd' if client_id_metadata_url && client_info.client_id == client_id_metadata_url
-
-        client_info.effective_registration_type
-      end
-
-      # @param client_info [ClientInfo]
-      # @return [Boolean] whether the client id is portable across authorization servers
-      def portable_client?(client_info)
-        resolved_registration_type(client_info) == 'cimd'
-      end
-
-      # @return [void]
-      def delete_client_info
-        # Prefer an explicit delete; fall back to the always-available
-        # set_client_info(nil) so custom storage backends are handled too.
-        # A backend that refuses either must not stop the authorization
-        # server switch: the credentials stay bound to the previous issuer
-        # and are discarded again by the next flow.
-        if storage.respond_to?(:delete_client_info)
-          storage.delete_client_info(server_url)
-        else
-          storage.set_client_info(server_url, nil)
-        end
-      rescue StandardError => e
-        logger.warn('The OAuth client registration for the previous authorization server could not be removed ' \
-                    "from storage (#{e.class}); implement delete_client_info(server_url) on the storage backend.")
-      end
-
-      # Build client information for a Client ID Metadata Document client
-      # (SEP-991): the configured HTTPS metadata URL is used directly as the
-      # client_id in authorization and token requests, without a dynamic
-      # registration POST. Serving the metadata JSON at that URL is the
-      # application's responsibility, not this library's.
-      # @return [ClientInfo] Client information with the metadata URL as client_id
-      def client_info_from_metadata_url
-        logger.debug("Using Client ID Metadata Document URL as client_id: #{client_id_metadata_url}")
-
-        metadata = ClientMetadata.new(
-          redirect_uris: [redirect_uri],
-          token_endpoint_auth_method: 'none', # Public client
-          grant_types: %w[authorization_code refresh_token],
-          response_types: ['code'],
-          scope: resolved_scope,
-          **@extra_client_metadata
-        )
-
-        client_info = ClientInfo.new(client_id: client_id_metadata_url, metadata: metadata, registration_type: 'cimd')
-
-        # Persist so complete_authorization_flow and token refresh can find it
-        storage.set_client_info(server_url, client_info)
-
-        client_info
-      end
-
       # Validate a Client ID Metadata Document URL (SEP-991): "The client_id
       # URL MUST use the 'https' scheme and contain a path component, e.g.
       # https://example.com/client.json". Per the Client ID Metadata Document
@@ -1620,7 +1466,7 @@ module MCPClient
         )
 
         # Store client info
-        storage.set_client_info(server_url, client_info)
+        store_client_info(client_info)
 
         client_info
       rescue JSON::ParserError => e
@@ -1877,7 +1723,9 @@ module MCPClient
         logger.debug('Refreshing access token')
 
         server_metadata = discover_authorization_server
-        client_info = stored_client_info
+        # Registration state is per authorization server (SEP-2352): the
+        # credentials of the server being refreshed at, wherever they are kept.
+        client_info = registration_for_issuer(server_metadata&.issuer) || stored_client_info
 
         return nil unless server_metadata && client_info
         return nil unless refresh_permitted?(token, client_info, server_metadata)
@@ -1924,14 +1772,55 @@ module MCPClient
           issuer: server_metadata.issuer
         )
 
-        store_token(new_token)
-        new_token
+        accept_refreshed_token(new_token, server_metadata.issuer)
       rescue JSON::ParserError => e
         logger.warn("Invalid token refresh response: #{describe_parse_error(e, response&.body)}")
         nil
       rescue Faraday::Error => e
         logger.warn("Network error during token refresh: #{safe_error_text(e.message)}")
         nil
+      end
+
+      # A refresh is two events with an unbounded gap between them: the
+      # request goes to the authorization server the token came from, and the
+      # response arrives at a client whose authorization server may have
+      # changed meanwhile — updated protected resource metadata, a 401
+      # challenge, another provider sharing the storage. So the check
+      # {#refresh_permitted?} made before the request is made again over the
+      # response, and it covers the write as much as the presentation: bytes
+      # issued by a server that is no longer this resource's would otherwise
+      # be stored over the token of the server that IS in use (resurrecting,
+      # in the challenge case, a token that was just retired) and be handed
+      # straight back to the caller without ever passing the issuer check the
+      # stored-token path makes.
+      # @param new_token [Token] the token the refresh response carried
+      # @param issuer [String] the authorization server the refresh was made with
+      # @return [Token, nil] the token, or nil when it is no longer this resource's to keep
+      def accept_refreshed_token(new_token, issuer)
+        unless refresh_target_current?(issuer)
+          logger.warn('Discarding the refreshed token: the authorization server changed while the refresh ' \
+                      'was in flight')
+          return nil
+        end
+
+        store_token(new_token)
+        new_token
+      end
+
+      # Whether a refresh made with an authorization server is still this
+      # resource's: that server is the one in use now (an unresolved or
+      # refused challenge means it is unknown, which is not "still A"), and
+      # the token slot the response would be written to does not already hold
+      # a token of another server.
+      # @param issuer [String] the authorization server the refresh was made with
+      # @return [Boolean]
+      def refresh_target_current?(issuer)
+        return false unless current_issuer_for_tokens == issuer
+
+        stored = stored_token_or_nil
+        return true unless stored.respond_to?(:issuer) && stored.issuer
+
+        stored.issuer == issuer
       end
 
       # A refresh token (and a client secret) is only ever presented to the
