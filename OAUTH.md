@@ -124,6 +124,26 @@ The implementation follows the standard OAuth 2.1 authorization code flow with P
      `client_secret` and names no method is recorded as a confidential client using it — not as
      `none`, which would mean the secret is never sent and every token request goes out
      unauthenticated. A registration without a secret stays a public client (`none`).
+   - **Registration state is per authorization server** (MCP 2026-07-28, SEP-2352). A `client_id`
+     (and any secret with it) is issued by one authorization server and means nothing at another, and
+     one MCP server can be served by more than one over its lifetime, so credentials are stored twice:
+     under the resource URL — the registration *in use*, where every backend and every record written
+     by an earlier version already keeps it — and under a key of the issuing authorization server,
+     `provider.client_registration_key(issuer)`. Two authorization servers behind one MCP server
+     therefore each keep their own registration: configuring the second no longer replaces the first,
+     and coming back to the first finds its registration instead of reporting "these credentials
+     belong to another authorization server". A host that pre-registers credentials with several
+     authorization servers can seed them directly:
+
+     ```ruby
+     storage.set_client_info(provider.client_registration_key('https://as-a.example.com'), creds_a)
+     storage.set_client_info(provider.client_registration_key('https://as-b.example.com'), creds_b)
+     ```
+
+     Nothing is migrated or moved: the resource-URL slot keeps answering as before, and a per-issuer
+     copy is written the first time a record is used or stored. When an authorization server change
+     discards the registration in use, the per-issuer record is deliberately kept — that registration
+     is still valid at the server that made it.
 3. **Authorization**: Redirect user to authorization server with PKCE parameters
    - The authorization endpoint's own query string is retained and the authorization parameters are
      appended to it (RFC 6749 §3.1), so an endpoint of `https://as.example/authorize?tenant=acme`
@@ -141,6 +161,15 @@ The implementation follows the standard OAuth 2.1 authorization code flow with P
    - `access_token` and `token_type` must carry bytes an HTTP header can hold: both are non-empty
      strings free of control characters, so a token containing CR/LF (`"fresh\r\nX-Injected: 1"`)
      is refused instead of being stored and split into two header lines.
+   - `token_type` must moreover name a type this client can present. RFC 6749 §7.1: "the client MUST
+     NOT use an access token if it does not understand the token type". A bearer token is presented
+     as it stands (RFC 6750 §2.1, and what MCP requires); a `DPoP` or `mac` token needs a proof or a
+     signature this client does not produce, so putting its bytes behind `Authorization: DPoP` would
+     present a credential in a way its authorization server never authorized. Such a response fails
+     the exchange with a `ConnectionError` and fails a refresh (keeping the still-valid token), and a
+     stored record of such a type presents no token at all. The comparison is case-insensitive
+     (`bearer`, `BEARER`), and an **absent** `token_type` still reads as the `Bearer` this client
+     asked for.
    - `refresh_token` is a credential too, so it is bytes or nothing: `refresh_token: ""` fails the
      response rather than being persisted over the refresh token the client already holds.
    - A confidential client presents its credentials the way the authorization server registered them:
@@ -161,6 +190,14 @@ The implementation follows the standard OAuth 2.1 authorization code flow with P
      was given: a record whose `access_token` or `token_type` is missing, empty, of another type or
      carrying control bytes presents no token at all (and a new authorization flow starts) instead
      of crashing while the `Authorization` header is built.
+   - A refresh is two events with a gap between them: the request goes to the authorization server
+     the token came from, and the response arrives at a client whose authorization server may have
+     changed meanwhile (updated protected-resource metadata, a `401` challenge, another provider
+     sharing the storage). The issuer check made before the request is therefore made again over the
+     response: a refreshed token from a server that is no longer this resource's is neither stored —
+     where it would overwrite the token of the server now in use, or resurrect one a challenge had
+     just retired — nor handed to the caller. `access_token` returns `nil` and the next call presents
+     the current server's token.
 
 ## Configuration Options
 
@@ -218,11 +255,18 @@ class DatabaseTokenStorage
     # an empty hash, which reads back as a token without bytes).
   end
 
-  def get_client_info(server_url)
-    # Return MCPClient::Auth::ClientInfo or nil
+  def get_client_info(key)
+    # Return MCPClient::Auth::ClientInfo or nil.
+    #
+    # The key is an opaque string: the MCP server URL for the registration in
+    # use, and provider.client_registration_key(issuer) — the server URL plus
+    # the authorization server's issuer — for the registration state of one
+    # authorization server (MCP 2026-07-28, SEP-2352). A backend that treats
+    # the key as a string (a Hash, a column, a hashed filename) needs no
+    # change; one that parses it as a URL should not.
   end
 
-  def set_client_info(server_url, client_info)
+  def set_client_info(key, client_info)
     # Store client info. A nil client_info means "forget it": remove the
     # record rather than serializing nil, for the same reason as set_token
     # (a record whose client_id is not a non-empty string reads back as no
@@ -244,7 +288,10 @@ class DatabaseTokenStorage
 
   # Optional (MCP 2026-07-28): called when a dynamic registration made with
   # the previous authorization server is discarded. Without it,
-  # set_client_info(server_url, nil) is attempted.
+  # set_client_info(server_url, nil) is attempted. Only the registration in
+  # use (the server-URL key) is deleted; the per-issuer record of the
+  # authorization server that made it is kept, since that registration is
+  # still valid there.
   def delete_client_info(server_url)
     # Remove the stored client registration
   end
@@ -376,6 +423,18 @@ This implementation follows OAuth 2.1 security best practices:
   A token endpoint `400` with an undecodable `error_description`, a `401`/`403` challenge with an
   undecodable parameter, and a callback of `?code=%FF&state=%FE` all surface as the authorization
   error they are, not as an `ArgumentError` from the code that was reading them
+- **A callback parameter may appear once**: RFC 6749 §3.1 forbids a request or response parameter
+  more than once, precisely because the readers of a query string disagree about which value counts —
+  a `Hash` takes the last, other parsers take the first. `BrowserOAuth` refuses a callback that
+  repeats any parameter, so `?iss=attacker&iss=recorded` (or a repeated `state` or `code`) is an
+  error page rather than a flow that validates the recorded value and acts on the attacker's
+- **An access token is only ever presented as the type it was issued as**: `token_type` must be
+  `Bearer` (RFC 6749 §7.1 — "the client MUST NOT use an access token if it does not understand the
+  token type"), so a `DPoP` or `mac` token is refused where it is issued and where it is read back
+  instead of going out as a bearer credential without the proof its type requires
+- **A refresh is re-checked against the authorization server in use when its response arrives**, not
+  only when it is sent, so a response that crosses an authorization server change is neither
+  presented nor written over the token of the server now in use
 - **Credentials never reach a log** at any level: the `Authorization` header is not logged even
   truncated, and the browser callback logs the request path without the query string that carries
   `code=`
