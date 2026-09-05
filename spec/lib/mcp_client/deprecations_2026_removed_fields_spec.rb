@@ -265,6 +265,71 @@ RSpec.describe 'MCP 2026-07-28 removed fields' do
 
       expect(seen).to include('elicitationId' => 'elic-1')
     end
+
+    # One client, two servers of different eras. A single-server client cannot
+    # tell "the era of the server that asked" from "the era of some server
+    # this client has": both readings give the same answer. Only a client
+    # holding both can, and a host talking to a modern and a legacy server at
+    # once is the ordinary case this contract exists for.
+    context 'with a modern and a legacy server on the same client' do
+      # The registered callbacks, in the order their servers were configured.
+      def registered_callbacks_for(*servers)
+        captured = {}
+        servers.each do |server|
+          allow(server).to receive(:on_elicitation_request) { |&block| captured[server.name] = block }
+          allow(server).to receive(:on_notification)
+          allow(server).to receive(:respond_to?).with(:on_elicitation_request).and_return(true)
+          allow(server).to receive(:respond_to?).with(:on_roots_list_request).and_return(false)
+          allow(server).to receive(:respond_to?).with(:on_sampling_request).and_return(false)
+          allow(server).to receive(:respond_to?).with(:modern?).and_return(true)
+        end
+        allow(MCPClient::ServerFactory).to receive(:create).and_return(*servers)
+
+        MCPClient::Client.new(
+          mcp_server_configs: servers.map { { type: 'stdio', command: 'true' } },
+          elicitation_handler: @handler
+        )
+        captured
+      end
+
+      # Both servers ask, interleaved, through the one handler the host
+      # registered: each request is answered on its own server's contract.
+      it 'gives each server\'s request the contract of that server' do
+        seen = []
+        @handler = lambda do |_message, metadata|
+          seen << metadata
+          { 'action' => 'accept' }
+        end
+
+        callbacks = registered_callbacks_for(modern_server, legacy_server)
+        request = url_params.merge('elicitationId' => 'elic-1')
+        callbacks['modern'].call(1, request)
+        callbacks['legacy'].call(2, request)
+        callbacks['modern'].call(3, request)
+
+        expect(seen[0]).to eq({ 'mode' => 'url', 'url' => 'https://example.com/auth' })
+        expect(seen[1]).to include('elicitationId' => 'elic-1')
+        expect(seen[2]).to eq({ 'mode' => 'url', 'url' => 'https://example.com/auth' })
+      end
+
+      # The same client with the eras the other way round: an implementation
+      # that reads one fixed server's era passes the order above by accident.
+      it 'does so whichever era the client configured first' do
+        seen = []
+        @handler = lambda do |_message, metadata|
+          seen << metadata
+          { 'action' => 'accept' }
+        end
+
+        callbacks = registered_callbacks_for(legacy_server, modern_server)
+        request = url_params.merge('elicitationId' => 'elic-1')
+        callbacks['legacy'].call(1, request)
+        callbacks['modern'].call(2, request)
+
+        expect(seen[0]).to include('elicitationId' => 'elic-1')
+        expect(seen[1]).to eq({ 'mode' => 'url', 'url' => 'https://example.com/auth' })
+      end
+    end
   end
 
   # The other field 2026-07-28 removed that a server could still try to push

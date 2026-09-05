@@ -29,18 +29,51 @@ RSpec.describe 'MCP 2026-07-28 deprecations' do
     [{ uri: 'file:///tmp', name: 'tmp' }]
   end
 
+  # What the published registry says about each feature, written down here so
+  # a wrong revision or a wrong SEP in the production table has to disagree
+  # with an expected value rather than merely with itself. `since` is the
+  # revision in which the feature ENTERED the Deprecated state, which for the
+  # two features SEP-2596 reclassified is older than 2026-07-28.
+  # `earliest_removal` and `migration` are pinned against the registry's own
+  # wording in the round 5 and round 6 specs.
+  let(:expected_registry) do
+    {
+      roots: { feature: 'Roots', since: '2026-07-28', reference: 'SEP-2577' },
+      sampling: { feature: 'Sampling', since: '2026-07-28', reference: 'SEP-2577' },
+      logging: { feature: 'Logging', since: '2026-07-28', reference: 'SEP-2577' },
+      http_sse_transport: { feature: 'The HTTP+SSE transport', since: '2025-03-26',
+                            reference: 'reclassified by SEP-2596 in 2026-07-28' },
+      include_context: { feature: 'The includeContext values "thisServer" and "allServers"',
+                         since: '2025-11-25', reference: 'reclassified by SEP-2596 in 2026-07-28' },
+      dynamic_client_registration: { feature: 'OAuth 2.0 Dynamic Client Registration (RFC 7591)',
+                                     since: '2026-07-28', reference: 'MCP PR #2858' }
+    }
+  end
+
   it 'lists every feature the revision placed in the Deprecated state' do
-    expect(MCPClient::Deprecations::REGISTRY.keys)
-      .to contain_exactly(:roots, :sampling, :logging, :http_sse_transport, :include_context,
-                          :dynamic_client_registration)
+    expect(MCPClient::Deprecations::REGISTRY.keys).to match_array(expected_registry.keys)
     MCPClient::Deprecations::REGISTRY.each_value do |entry|
-      expect(entry.keys).to include(:feature, :since, :reference, :migration)
+      expect(entry.keys).to include(:feature, :since, :reference, :earliest_removal, :migration)
     end
-    # The registry records when each feature entered the Deprecated state,
-    # not the revision that reclassified it.
-    expect(MCPClient::Deprecations::REGISTRY[:http_sse_transport][:since]).to eq('2025-03-26')
-    expect(MCPClient::Deprecations::REGISTRY[:include_context][:since]).to eq('2025-11-25')
-    expect(MCPClient::Deprecations::REGISTRY[:roots][:since]).to eq('2026-07-28')
+  end
+
+  it 'records the name, the deprecating revision and the SEP of each one' do
+    expected_registry.each do |key, expected|
+      entry = MCPClient::Deprecations::REGISTRY.fetch(key)
+      expect(entry.slice(:feature, :since, :reference)).to eq(expected), key.to_s
+    end
+  end
+
+  it 'names the feature and its own revision in the notice it writes' do
+    expected_registry.each do |key, expected|
+      MCPClient::Deprecations.reset!
+      output.truncate(output.rewind)
+
+      expect(MCPClient::Deprecations.warn(key, logger)).to be(true)
+
+      sentence = "#{expected[:feature]} is deprecated since MCP #{expected[:since]} (#{expected[:reference]})"
+      expect(output.string).to include(sentence), key.to_s
+    end
   end
 
   it 'warns once when roots are configured' do
@@ -191,6 +224,45 @@ RSpec.describe 'MCP 2026-07-28 deprecations' do
     allow(server).to receive(:wait_for_connection)
     allow(server).to receive(:start_activity_monitor)
     expect(server.connect).to be(true)
+  end
+
+  # `log_level=` on a client with no servers reaches no transport at all, so
+  # it cannot show that Logging still WORKS behind a failing logger — only
+  # that the call returns. Drive a server of each era instead: the legacy one
+  # must still send logging/setLevel, and the modern one must still record the
+  # level every later request carries. Neither notice can be written, so both
+  # stay owed.
+  it 'still sets the log level on the wire when the logger fails' do
+    broken = Logger.new(StringIO.new)
+    def broken.warn(*) = raise(IOError, 'closed stream')
+
+    legacy = MCPClient::ServerStdio.new(command: 'true', logger: broken)
+    legacy.instance_variable_set(:@protocol_version, '2025-06-18')
+    allow(legacy).to receive(:ensure_initialized)
+    allow(legacy).to receive(:require_capability!)
+    calls = []
+    allow(legacy).to receive(:rpc_request) { |method, params| calls << [method, params] }
+
+    legacy.send(:log_level=, 'debug')
+
+    expect(calls).to eq([['logging/setLevel', { 'level' => 'debug' }]])
+    expect(MCPClient::Deprecations.emitted?(:logging)).to be(false)
+  end
+
+  it 'still carries the log level on a modern request when the logger fails' do
+    broken = Logger.new(StringIO.new)
+    def broken.warn(*) = raise(IOError, 'closed stream')
+
+    modern = MCPClient::ServerStdio.new(command: 'true', logger: broken)
+    modern.instance_variable_set(:@protocol_version, '2026-07-28')
+    allow(modern).to receive(:ensure_initialized)
+    expect(modern).to be_modern
+
+    modern.send(:log_level=, 'debug')
+    params = modern.with_request_meta({ 'name' => 'tool' })
+
+    expect(params['_meta']['io.modelcontextprotocol/logLevel']).to eq('debug')
+    expect(MCPClient::Deprecations.emitted?(:logging)).to be(false)
   end
 
   it 'does not call warn? on a strict Logger double' do

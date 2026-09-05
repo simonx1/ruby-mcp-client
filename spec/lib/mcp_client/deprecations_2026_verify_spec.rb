@@ -389,7 +389,7 @@ RSpec.describe 'MCP 2026-07-28 deprecations (verification)' do
       end + [
         ['MCPClient.sse_config', 'mcp_client.rb', /^\s*def self\.sse_config\b/, :http_sse_transport],
         ['MCPClient::ServerSSE', 'mcp_client/server_sse.rb', /^\s*class ServerSSE\b/, :http_sse_transport],
-        ['MCPClient::Client#roots', 'mcp_client/client.rb', /^\s*attr_reader :servers\b/, :roots],
+        ['MCPClient::Client#roots', 'mcp_client/client.rb', /^\s*attr_reader :roots\b/, :roots],
         ['MCPClient::Client#roots=', 'mcp_client/client.rb', /^\s*def roots=/, :roots],
         ['MCPClient::Client#log_level=', 'mcp_client/client.rb', /^\s*def log_level=/, :logging],
         ['MCPClient::Root', 'mcp_client/root.rb', /^\s*class Root\b/, :roots],
@@ -470,6 +470,72 @@ RSpec.describe 'MCP 2026-07-28 deprecations (verification)' do
       # A mark the inventory does not know about is an API nothing checks the
       # SEP or the window of.
       expect((marked - claimed).sort).to eq([])
+    end
+
+    # The examples above read the SOURCE, which is where a tag is written but
+    # not where a host reads it. What a host reads is the generated API
+    # documentation, and a comment that sits in the right place in the file
+    # can still fail to reach it: `@!attribute` directives are one such case
+    # — YARD drops the docstring of the LAST directive in a block preceding a
+    # combined `attr_reader`, so `Client#roots` documented that way came out
+    # with no tags at all while every source-text check above passed. So ask
+    # YARD for the objects it publishes and read the tags off those.
+    describe 'as YARD publishes them' do
+      # Parsing the library is the expensive part; one registry serves every
+      # example here. YARD's registry is process-global, so it is restored
+      # afterwards for anything else that may rely on it.
+      before(:context) do
+        require 'yard'
+        @saved_registry = YARD::Registry.all.dup
+        YARD::Registry.clear
+        YARD.parse([File.expand_path('../../../lib/**/*.rb', __dir__)], [], YARD::Logger::ERROR)
+      end
+
+      after(:context) do
+        YARD::Registry.clear
+        @saved_registry.each { |object| YARD::Registry.register(object) }
+      end
+
+      # The path YARD knows the API by. The transports are listed unqualified.
+      def yard_path(label)
+        label.start_with?('MCPClient') ? label : "MCPClient::#{label}"
+      end
+
+      def documented
+        inventory.map do |label, _file, _definition, feature|
+          path = yard_path(label)
+          [path, feature, YARD::Registry.at(path)]
+        end
+      end
+
+      it 'publishes an object for every API in the inventory' do
+        documented.each do |path, _feature, object|
+          expect(object).not_to(be_nil, "YARD publishes no object at #{path}")
+        end
+      end
+
+      it 'carries a deprecated tag on each of them' do
+        documented.each do |path, _feature, object|
+          tags = object ? object.tags(:deprecated) : []
+          expect(tags.size).to(eq(1), "#{path} is published with #{tags.size} deprecated tags, expected 1")
+        end
+      end
+
+      it "cites the SEP and that feature's own earliest removal" do
+        windows = registry.each_value.map { |entry| entry[:earliest_removal] }.uniq
+        documented.each do |path, feature, object|
+          # YARD hard-wraps a tag's text, so the line breaks it chose are not
+          # part of what the tag says.
+          tag = object&.tags(:deprecated)&.first
+          text = tag ? tag.text.to_s.gsub(/\s+/, ' ') : ''
+          entry = registry[feature]
+          expect(text).to include(entry[:reference][/SEP-\d+|PR #\d+/]), path
+          expect(text).to include(entry[:earliest_removal]), path
+          (windows - [entry[:earliest_removal]]).each do |other|
+            expect(text).not_to include(other), "#{path} names another feature's window: #{other}"
+          end
+        end
+      end
     end
   end
 end

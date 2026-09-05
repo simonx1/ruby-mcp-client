@@ -79,10 +79,12 @@ module MCPClient
     # Longest peer-supplied detail quoted in a notice.
     MAX_DETAIL_LENGTH = 200
 
-    # Marks a thread that is between claiming a feature's notice and coming
-    # back out of the logger. A thread-level variable, not a fiber-local
-    # one: what it guards is a claim this thread holds, which every fiber of
-    # the thread holds with it.
+    # Marks a thread that is inside a notice: from the moment it first asks
+    # the logger anything until it comes back out of the write. It covers
+    # the level probe as well as the write, because both are host code and
+    # either can reach a deprecated feature and come straight back in. A
+    # thread-level variable, not a fiber-local one: what it guards is a
+    # claim this thread holds, which every fiber of the thread holds with it.
     EMITTING_KEY = :mcp_client_deprecation_emitting
 
     # A notice claimed by a caller that is inside the logger right now, as
@@ -108,12 +110,14 @@ module MCPClient
 
       # Log the notice for a deprecated feature once per process. The notice
       # counts as emitted only once the logger accepted it: a logger that
-      # drops warnings (level above WARN), writes nowhere (`Logger.new(nil)`),
-      # fails to report its level or raises leaves it for a later use, and so
-      # do a nested attempt from inside another notice's logger and a caller
-      # that finds the notice already in flight (see {.emit_once}).
-      # Never raises for a logger failure: the deprecated feature
-      # keeps working whatever the log does (feature lifecycle policy).
+      # drops warnings (level above WARN), writes nowhere (`Logger.new(nil)`,
+      # or a device that was closed), fails to report its level or raises
+      # leaves it for a later use, and so do a nested attempt from inside
+      # another notice's logger — its `level` accessor as much as its `warn`
+      # — and a caller that finds the notice already in flight (see
+      # {.emit_once}). Never raises for a logger failure: the deprecated
+      # feature keeps working whatever the log does (feature lifecycle
+      # policy).
       #
       # A notice costs its caller what one `logger.warn` costs it, and no
       # more. That is not a promise that it never waits: every other
@@ -135,9 +139,23 @@ module MCPClient
       def warn(feature, logger, detail: nil)
         entry = REGISTRY[feature] or raise ArgumentError, "unknown deprecated feature: #{feature.inspect}"
         return false unless enabled? && logger
-        return false unless accepts_warnings?(logger)
+        # Asking the logger anything is already calling out to the host, so
+        # the reentrancy guard goes up here rather than around the write
+        # alone: `level` is host code too, and a host whose accessor reaches
+        # a deprecated feature (a formatter, a log subscriber, an audit hook
+        # reading the client's configuration) comes straight back into this
+        # method. Guarding only `logger.warn` leaves that probe recursing
+        # until the stack ends, and SystemStackError is not a StandardError,
+        # so it escapes the rescues that exist to keep the deprecated
+        # operation working and takes the host's `roots=` down with it.
+        return false if emitting?
 
-        emit_once(feature, logger) { logger.warn(message(entry, detail)) }
+        mark_emitting(true)
+        begin
+          accepts_warnings?(logger) && emit_once(feature, logger) { logger.warn(message(entry, detail)) }
+        ensure
+          mark_emitting(false)
+        end
       end
 
       # @param feature [Symbol] a {REGISTRY} key
@@ -190,9 +208,9 @@ module MCPClient
       # Standing down loses nothing that was there to lose: whoever holds
       # the claim is writing that notice, and if their logger fails the
       # claim is released, so the next use of the feature attempts it again.
-      # A thread already inside a notice stands down too, which keeps a
-      # logger callback from re-entering the host's logger under this
-      # module's own name.
+      # A thread already inside a notice stands down too — {.warn} turns it
+      # away before it reaches here — which keeps a logger callback from
+      # re-entering the host's logger under this module's own name.
       #
       # The logger is asked one more time whether it keeps warnings, next to
       # the write rather than at the top of {.warn}: `Logger#warn` returns
@@ -201,17 +219,18 @@ module MCPClient
       # nobody can read. A level that changes DURING the write is beyond
       # reach — that race is the host's own, and the same one two of its
       # threads have with each other.
+      #
+      # The caller ({.warn}) has already marked this thread as emitting, so
+      # both that second probe and the write itself run guarded.
       # @param feature [Symbol] a {REGISTRY} key
       # @param logger [Logger, #warn] the logger the emission writes to
       # @yield the emission, called with no lock of this module held
       # @return [Boolean] whether this call emitted the notice
       def emit_once(feature, logger)
-        return false if emitting?
         return false unless claim(feature)
 
         written = false
         begin
-          mark_emitting(true)
           if accepts_warnings?(logger)
             yield
             written = true
@@ -219,7 +238,6 @@ module MCPClient
         rescue StandardError
           written = false
         ensure
-          mark_emitting(false)
           settle(feature, written)
         end
         written
@@ -303,12 +321,30 @@ module MCPClient
       # `Logger.new(File::NULL)` into that (it opens no file), earlier
       # versions give it a real device, and either reading is safe here —
       # the notice is written or it stays owed.
+      #
+      # A CLOSED device reads the same way, and needs asking for separately:
+      # `Logger::LogDevice#write` rescues the failure of a write to a closed
+      # IO and reports it through `Kernel#warn`, so `Logger#warn` returns
+      # exactly as it does after a successful write and the caller cannot
+      # tell from its answer that the line went nowhere. Only the absence of
+      # a device is visible without asking, so a closed one would otherwise
+      # spend the process's notice on a stream nobody can read.
       # @param logger [Logger, #warn] the candidate logger
       # @return [Boolean] whether the logger provably writes nowhere
       def no_output_device?(logger)
-        logger.is_a?(::Logger) &&
-          logger.instance_variable_defined?(:@logdev) &&
-          logger.instance_variable_get(:@logdev).nil?
+        return false unless logger.is_a?(::Logger) && logger.instance_variable_defined?(:@logdev)
+
+        logdev = logger.instance_variable_get(:@logdev)
+        return true if logdev.nil?
+
+        device = logdev.respond_to?(:dev) ? logdev.dev : nil
+        return true if device.nil?
+
+        # A device that cannot say whether it is closed is taken as open: a
+        # notice written to a working stream is the point, and treating an
+        # unknown device as dead would suppress every notice a host with a
+        # custom log device should see.
+        device.respond_to?(:closed?) && device.closed?
       end
 
       # @return [String] the notice text

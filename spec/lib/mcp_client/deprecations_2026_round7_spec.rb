@@ -108,6 +108,25 @@ RSpec.describe 'MCP 2026-07-28 deprecations (round 7)' do
 
         expect(MCPClient::Deprecations.emitted?(:roots)).to be(true)
       end
+
+      # The handler is host code and its answer is a plain Ruby Hash that
+      # nothing converted, so a host that writes `{ roots: [...] }` — the
+      # natural Ruby spelling — is using Roots exactly as much as one that
+      # writes the string key. Reading only the string key makes the notice
+      # depend on how the host happened to type the literal.
+      it 'warns for a handler that answers with a symbol-keyed root' do
+        server.on_roots_list_request { |_id, _params| { roots: [{ 'uri' => 'file:///workspace' }] } }
+        server.send(:handle_server_request, { 'id' => 1, 'method' => 'roots/list', 'params' => {} })
+
+        expect(MCPClient::Deprecations.emitted?(:roots)).to be(true)
+      end
+
+      it 'stays silent for a symbol-keyed answer that carries no root' do
+        server.on_roots_list_request { |_id, _params| { roots: [] } }
+        server.send(:handle_server_request, { 'id' => 1, 'method' => 'roots/list', 'params' => {} })
+
+        expect(MCPClient::Deprecations.emitted?(:roots)).to be(false)
+      end
     end
 
     context 'with the multi round-trip pattern' do
