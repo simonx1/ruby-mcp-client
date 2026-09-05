@@ -314,6 +314,45 @@ RSpec.describe 'MCP 2026-07-28 stateless protocol (stdio)' do
       expect(server.server_info).to eq({ 'name' => 'legacy-server', 'version' => '1.0' })
     end
 
+    # The stdio backward-compatibility rules key the fallback to the server
+    # answering the probe with an error, not to one code: a legacy server
+    # rejects a pre-initialize request with whatever its framework produces.
+    {
+      -32_601 => 'method not found',
+      -32_600 => 'invalid request',
+      -32_602 => 'invalid params',
+      -32_603 => 'internal error',
+      -32_000 => 'an implementation-defined server error'
+    }.each do |code, label|
+      it "falls back to the initialize handshake when the probe is refused with #{code} (#{label})" do
+        sent = script_stdio(server, [{ 'error' => { 'code' => code, 'message' => label } },
+                                     { 'result' => legacy_init_result },
+                                     { 'result' => { 'tools' => [] } }])
+
+        server.list_tools
+
+        expect(sent.map { |r| r['method'] }).to eq(%w[server/discover initialize tools/list])
+        expect(server.protocol_era).to eq(:legacy)
+        expect(server.protocol_version).to eq('2025-11-25')
+      end
+    end
+
+    # -32022 identifies a modern server only when its data carries the
+    # versions the client is told to retry with; without them there is
+    # nothing to act on, so it is just another error answer from a legacy
+    # server.
+    it 'treats a -32022 without a supported list as a legacy answer, not a modern rejection' do
+      sent = script_stdio(server, [{ 'error' => { 'code' => -32_022, 'message' => 'Unsupported protocol version',
+                                                  'data' => { 'requested' => '2026-07-28' } } },
+                                   { 'result' => legacy_init_result },
+                                   { 'result' => { 'tools' => [] } }])
+
+      server.list_tools
+
+      expect(sent.map { |r| r['method'] }).to eq(%w[server/discover initialize tools/list])
+      expect(server.protocol_era).to eq(:legacy)
+    end
+
     it 'falls back to initialize when the probe times out' do
       sent = script_stdio(server, [MCPClient::Errors::RequestTimeoutError.new('timeout'),
                                    { 'result' => legacy_init_result },
@@ -436,6 +475,37 @@ RSpec.describe 'MCP 2026-07-28 stateless protocol (stdio)' do
       expect(sent[2]['params']['_meta'][META_VERSION]).to eq('2026-07-28')
       expect(sent[1]['id']).not_to eq(sent[2]['id'])
       expect(server.protocol_version).to eq('2026-07-28')
+    end
+
+    # "Retry the request" once, not renegotiate: a server that keeps
+    # rejecting must end the exchange, not drive an unbounded round of
+    # version proposals.
+    it 'retries an inline version rejection exactly once and surfaces a second rejection' do
+      stub_const('MCPClient::MODERN_PROTOCOL_VERSIONS', %w[2027-01-01 2026-07-28])
+      stub_const('MCPClient::LATEST_PROTOCOL_VERSION', '2027-01-01')
+      sent = script_stdio(server, [
+                            { 'result' => discover_result(versions: %w[2027-01-01]) },
+                            { 'error' => { 'code' => -32_022, 'message' => 'Unsupported protocol version',
+                                           'data' => { 'supported' => ['2026-07-28'], 'requested' => '2027-01-01' } } },
+                            { 'error' => { 'code' => -32_022, 'message' => 'Unsupported protocol version',
+                                           'data' => { 'supported' => ['2027-01-01'], 'requested' => '2026-07-28' } } },
+                            # Only a client that renegotiated instead of
+                            # retrying once would ever reach this.
+                            { 'result' => { 'content' => [{ 'type' => 'text', 'text' => 'ok' }] } }
+                          ])
+      server.request_meta = { 'traceparent' => '00-abc-def-01' }
+
+      expect { server.call_tool('echo', { 'a' => 1 }) }
+        .to raise_error(MCPClient::Errors::UnsupportedProtocolVersionError)
+
+      expect(sent.map { |r| r['method'] }).to eq(%w[server/discover tools/call tools/call])
+      # The retry re-sends the same call: same arguments, same host metadata,
+      # a fresh id and the version the server named.
+      expect(sent[2]['params']['arguments']).to eq({ 'a' => 1 })
+      expect(sent[2]['params']['_meta']['traceparent']).to eq('00-abc-def-01')
+      expect(sent[1]['params']['_meta'][META_VERSION]).to eq('2027-01-01')
+      expect(sent[2]['params']['_meta'][META_VERSION]).to eq('2026-07-28')
+      expect(sent[1]['id']).not_to eq(sent[2]['id'])
     end
 
     it 'raises the UnsupportedProtocolVersionError when no advertised version is usable' do

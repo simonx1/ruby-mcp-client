@@ -106,6 +106,16 @@ RSpec.describe 'MCP 2026-07-28 stateless protocol (stdio) — verification round
     transcript_lines(path).grep(/\Apid /).map { |line| Integer(line.split.last) }
   end
 
+  # Poll a condition until it holds, failing the example if it never does.
+  # @param what [String] what is being waited for, for the failure message
+  # @param timeout [Numeric] seconds to wait
+  # @return [void]
+  def wait_for(what, timeout: 5)
+    deadline = Time.now + timeout
+    sleep 0.02 until yield || Time.now > deadline
+    raise "timed out after #{timeout}s waiting for #{what}" unless yield
+  end
+
   # @param pid [Integer]
   # @return [Boolean] whether the process still exists (a reaped child does not)
   def process_alive?(pid)
@@ -422,6 +432,38 @@ RSpec.describe 'MCP 2026-07-28 stateless protocol (stdio) — verification round
       server&.cleanup
     end
 
+    # MCP 2026-07-28 stdio "Unexpected Termination": a client SHOULD restart a
+    # server that terminated unexpectedly. A completed handshake describes a
+    # process that no longer exists, so it must not keep the transport writing
+    # to that process's pipes for the rest of the session.
+    it 'restarts a modern subprocess that exited unexpectedly, on the next request' do
+      server = MCPClient::ServerStdio.new(command: fixture_command('modern-one-shot', transcript),
+                                          read_timeout: 2, discover_timeout: 2)
+
+      expect(server.list_tools.map(&:name)).to eq(['echo'])
+      first_pid = transcript_pids(transcript).first
+      wait_for('the subprocess to exit') { !process_alive?(first_pid) }
+      # The reader thread notices the closed stdout and retires the
+      # handshake; waiting on that keeps the restart deterministic.
+      wait_for('the transport to be retired') { server.transport_retired? }
+      dead_pipes = %i[@stdin @stdout @stderr].map { |ivar| server.instance_variable_get(ivar) }
+      dead_reader = server.instance_variable_get(:@reader_thread)
+
+      expect(server.list_tools.map(&:name)).to eq(['echo'])
+
+      # The dead process's handles were released rather than overwritten.
+      expect(dead_pipes.map(&:closed?)).to eq([true, true, true])
+      wait_for('the old reader thread to finish') { !dead_reader.alive? }
+      expect(server.instance_variable_get(:@stdin)).not_to be(dead_pipes.first)
+      pids = transcript_pids(transcript)
+      expect(pids.size).to eq(2)
+      expect(pids.uniq.size).to eq(2)
+      expect(server.protocol_era).to eq(:modern)
+      expect(transcript_methods(transcript, 4)).to eq(%w[server/discover tools/list server/discover tools/list])
+    ensure
+      server&.cleanup
+    end
+
     it 'leaves no subprocess behind when discovery fails, twice in a row' do
       stub_const('MCPClient::ServerStdio::SHUTDOWN_GRACE_PERIOD', 0.25)
       server = MCPClient::ServerStdio.new(command: fixture_command('future-only', transcript),
@@ -496,6 +538,120 @@ RSpec.describe 'MCP 2026-07-28 stateless protocol (stdio) — verification round
     it 'forwards both through extract_stdio_options' do
       options = MCPClient.send(:extract_stdio_options, { protocol: :legacy, discover_timeout: 7 })
       expect(options).to include(protocol: :legacy, discover_timeout: 7)
+    end
+  end
+
+  # Second verification round (codex). Four more defects in the modern stdio
+  # path — each one invisible to the first round's examples:
+  #   5. modern-only mode answered a server-initiated request while its probe
+  #      was still in flight. The era is unknown then, but the configuration
+  #      is not: this client will never fall back to legacy, so running a host
+  #      roots/sampling callback and writing a JSON-RPC response is
+  #      prohibited traffic;
+  #   6. a subprocess that exited after a successful handshake left the
+  #      handshake standing, so every later request wrote to the dead pipes of
+  #      a process that no longer existed, forever;
+  #   7. a host request_meta provider that raised leaked one @awaiting entry
+  #      per attempt: the id is registered before the request is built;
+  #   8. the inline version-retry guard compared the server's advertised
+  #      version against the one read before the request was built, not
+  #      against the one the request actually declared.
+  describe 'modern-only mode is never a legacy peer' do
+    let(:server) { MCPClient::ServerStdio.new(command: 'echo test', protocol: :modern, read_timeout: 1) }
+
+    # The era is unknown while the probe is unanswered — but protocol: :modern
+    # has already ruled out the legacy fallback that the accommodation exists
+    # for, and MCP 2026-07-28 stdio says the client MUST NOT write JSON-RPC
+    # responses to a modern server.
+    it 'ignores a server-initiated roots/list that arrives while the probe is in flight' do
+      sent, written = script_stdio(server, [{ 'result' => discover_result }, { 'result' => tool_list_result }])
+      roots_calls = []
+      server.on_roots_list_request do |id, _params|
+        roots_calls << id
+        { 'roots' => [{ 'uri' => 'file:///private-project' }] }
+      end
+      allow(server).to receive(:send_request) do |req|
+        sent << req
+        next unless req['method'] == 'server/discover'
+
+        server.handle_line(JSON.generate('jsonrpc' => '2.0', 'id' => 'srv-roots', 'method' => 'roots/list',
+                                         'params' => {}))
+      end
+
+      expect(server.list_tools.map(&:name)).to eq(['echo'])
+
+      expect(roots_calls).to be_empty
+      expect(written).to be_empty
+      expect(sent.map { |req| req['method'] }).to eq(%w[server/discover tools/list])
+    end
+
+    it 'does not answer an unsupported server-initiated method with an error either' do
+      _sent, written = script_stdio(server, [{ 'result' => discover_result }, { 'result' => tool_list_result }])
+
+      server.handle_line(JSON.generate('jsonrpc' => '2.0', 'id' => 'srv-1', 'method' => 'sampling/createMessage'))
+      server.list_tools
+
+      expect(written).to be_empty
+    end
+  end
+
+  describe 'a request that is never built leaves no outstanding entry' do
+    let(:server) { MCPClient::ServerStdio.new(command: 'echo test', read_timeout: 1) }
+
+    it 'drops the awaiting marker when the host metadata provider raises, and recovers afterwards' do
+      responses = [{ 'result' => discover_result }, { 'result' => tool_list_result }]
+      sent, = script_stdio(server, responses)
+      server.list_tools
+
+      # script_stdio stubs wait_response, which is what clears a marker on a
+      # real transport, so only the growth the failures cause is meaningful.
+      outstanding = -> { server.instance_variable_get(:@awaiting).size }
+      settled = outstanding.call
+
+      server.request_meta = -> { raise 'trace provider unavailable' }
+      3.times do
+        expect { server.list_tools }.to raise_error(MCPClient::Errors::ToolCallError, /trace provider/)
+      end
+
+      # Nothing was sent and nothing will ever answer: an id registered for a
+      # request that was never built must not stay outstanding.
+      expect(outstanding.call).to eq(settled)
+      expect(sent.map { |req| req['method'] }).to eq(%w[server/discover tools/list])
+
+      server.request_meta = nil
+      responses << { 'result' => tool_list_result }
+      expect(server.list_tools.map(&:name)).to eq(['echo'])
+    end
+  end
+
+  describe 'the inline version retry compares against the version actually sent' do
+    let(:server) { MCPClient::ServerStdio.new(command: 'echo test', read_timeout: 1) }
+
+    # A concurrent request can move the transport on between the guard reading
+    # protocol_version and build_jsonrpc_request stamping _meta with it. The
+    # metadata provider stands in for that interleaving: it is evaluated
+    # inside the build, so what it does to the shared version is what the
+    # request goes out declaring.
+    it 'retries when another request changed the version between the guard and the build' do
+      stub_const('MCPClient::MODERN_PROTOCOL_VERSIONS', %w[2027-01-01 2026-07-28])
+      stub_const('MCPClient::LATEST_PROTOCOL_VERSION', '2027-01-01')
+      sent, = script_stdio(server, [{ 'result' => discover_result(versions: %w[2027-01-01 2026-07-28]) },
+                                    unsupported_version_error(['2027-01-01'], '2026-07-28'),
+                                    { 'result' => tool_list_result }])
+      builds = 0
+      server.request_meta = lambda {
+        builds += 1
+        # Build 2 is the first tools/list: another request settled the
+        # transport on 2026-07-28 a moment before this one stamped its _meta.
+        server.instance_variable_set(:@protocol_version, '2026-07-28') if builds == 2
+        {}
+      }
+
+      expect(server.list_tools.map(&:name)).to eq(['echo'])
+
+      expect(sent.map { |req| req['method'] }).to eq(%w[server/discover tools/list tools/list])
+      expect(sent[1]['params']['_meta'][ERA_META::META_PROTOCOL_VERSION]).to eq('2026-07-28')
+      expect(sent[2]['params']['_meta'][ERA_META::META_PROTOCOL_VERSION]).to eq('2027-01-01')
     end
   end
 end
