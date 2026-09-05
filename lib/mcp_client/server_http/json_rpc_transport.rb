@@ -93,6 +93,17 @@ module MCPClient
       # @param message [Hash] a JSON-RPC request or notification
       # @return [void]
       def dispatch_sse_message(message)
+        # Host code reached from here -- a notification listener -- may issue a
+        # tools/call of its own while the response that carried this message is
+        # still being parsed. Give it a slot of its own for the definition that
+        # call goes out under, so the call still waiting for this response keeps
+        # its own (MCPClient::CalledToolDefinition).
+        called_tool_definition_slot { dispatch_sse_message_now(message) }
+      end
+
+      # @param message [Hash] a JSON-RPC request or notification
+      # @return [void]
+      def dispatch_sse_message_now(message)
         unless message.key?('id')
           invalidate_cache_for_notification(message['method'])
           @notification_callback&.call(message['method'], message['params'])

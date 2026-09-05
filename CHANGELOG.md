@@ -35,7 +35,11 @@ metadata). Each feature lands in its own PR; this section accumulates them.
   one `tools/list` refresh and a single retry with recomputed headers; the
   refresh is announced upward as a `tools/list_changed` notification so the
   client-level cache picks up the new definition, and a refresh that fails
-  keeps the original rejection. Transport list caches now follow
+  keeps the original rejection. It composes with the modern re-issue of a
+  request whose response stream broke, in either order: a HeaderMismatch
+  retry whose stream closes is re-issued, and a re-issue rejected for its
+  headers still refreshes `tools/list`. Each recovery is spent once, so a
+  call is sent at most three times. Transport list caches now follow
   `list_changed` notifications, and a refresh cannot be overwritten by a
   stale concurrent fetch.
 - **A result is validated against the definition its call went out under.**
