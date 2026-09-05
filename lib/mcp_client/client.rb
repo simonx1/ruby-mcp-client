@@ -647,18 +647,26 @@ module MCPClient
       resolve = tasks_extension? && modern_server?(server)
       Enumerator.new do |yielder|
         pinned_to_session(server, epoch) do
-          stream.each do |chunk|
-            # MCP 2026-07-28 tasks extension: a chunk may be a task; resolve
-            # it to the call's result, validated as #call_tool does — against
-            # the definition a mid-stream refresh (HeaderMismatch recovery)
-            # may have replaced.
-            next yielder << chunk unless resolve && task_result?(chunk)
+          # The call and the re-resolve that follows it share one slot for the
+          # definition the request went out under (see #call_tool). The call
+          # happens inside this enumeration, so the slot is opened here:
+          # without it the transport's record dies with its own call_tool and
+          # the re-resolve would list again, validating the result against a
+          # definition newer than the one the call carried.
+          with_called_tool_definition(server) do
+            stream.each do |chunk|
+              # MCP 2026-07-28 tasks extension: a chunk may be a task; resolve
+              # it to the call's result, validated as #call_tool does — against
+              # the definition a mid-stream refresh (HeaderMismatch recovery)
+              # may have replaced.
+              next yielder << chunk unless resolve && task_result?(chunk)
 
-            # The definition in force when the chunk arrived, captured
-            # before the task is waited for (see #call_tool).
-            current = tools_generation_of(server) == generation ? tool : (refreshed_tool(tool) || tool)
-            result = complete_task_result(tool_name, server, chunk, epoch)
-            yielder << validate_structured_content!(current, result)
+              # The definition in force when the chunk arrived, captured
+              # before the task is waited for (see #call_tool).
+              current = tools_generation_of(server) == generation ? tool : (refreshed_tool(tool) || tool)
+              result = complete_task_result(tool_name, server, chunk, epoch)
+              yielder << validate_structured_content!(current, result)
+            end
           end
         end
       end

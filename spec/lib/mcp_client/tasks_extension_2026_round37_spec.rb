@@ -185,7 +185,12 @@ RSpec.describe 'MCP 2026-07-28 tasks extension — round 37' do
       client = client_for
       negotiated
 
-      (cap + 1).times { |i| creation(client, result: create_result('taskId' => "task-#{i}")) }
+      # Tasks that ran and ended: what a prune may forget is the lifetime of
+      # an id whose task this client no longer tracks.
+      (cap + 1).times do |i|
+        creation(client, result: create_result('taskId' => "task-#{i}"))
+        client.send(:forget_task_keys, stdio, "task-#{i}")
+      end
 
       expect(client.instance_variable_get(:@task_lifetimes).size).to be <= cap
     end

@@ -335,6 +335,25 @@ module MCPClient
         data.is_a?(Hash) ? (data['requestState'] || data[:requestState]) : nil
       end
 
+      # The answers this client had already produced when the round trip
+      # failed part way through. An input request answered before the failure
+      # was put to the host — and, through it, possibly to a person — so a
+      # caller that can hold on to it (the tasks extension's poll loop keeps
+      # it pending for the next tasks/update) never asks for it twice. Empty
+      # unless a partial fulfilment recorded any.
+      # @return [Hash{String => Hash}] key => InputResponse
+      def answered_so_far
+        @answered_so_far || {}
+      end
+
+      # Record the answers produced before this failure.
+      # @param responses [Hash] key => InputResponse
+      # @return [self]
+      def with_answered_so_far(responses)
+        @answered_so_far = responses.is_a?(Hash) ? responses.dup.freeze : nil
+        self
+      end
+
       # @return [Boolean] always true: a protocol-level condition, never wrapped
       def protocol_error?
         true

@@ -1005,7 +1005,11 @@ than the peer's:
   chunks. Server configurations are logged with credential-bearing keys redacted.
 - **Host exceptions are not reflected to the server.** A raising elicitation,
   sampling or roots handler yields a constant JSON-RPC error message; the detail
-  stays in your local log.
+  stays in your local log. When a server asks for several inputs at once (MCP
+  2026-07-28 multi round-trip requests) and one of them fails, the answers your
+  handler already produced are kept rather than thrown away: a task's poll loop
+  sends them with its next `tasks/update` and never puts an answered request to
+  your handler a second time.
 
 ## Requirements
 
