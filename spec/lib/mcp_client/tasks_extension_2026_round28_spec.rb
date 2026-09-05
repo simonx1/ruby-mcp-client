@@ -5,8 +5,9 @@ require 'spec_helper'
 TASKS_EXT = MCPClient::JsonRpcCommon::TASKS_EXTENSION unless defined?(TASKS_EXT)
 
 # MCP 2026-07-28 tasks extension, twenty-eighth round: a pollIntervalMs the
-# clock cannot represent (or that is merely enormous) is bounded, so a wait
-# without a caller timeout keeps polling instead of raising from sleep.
+# clock cannot represent is bounded, so a wait without a caller timeout keeps
+# polling instead of raising from sleep — while one it can represent is kept,
+# whatever its size.
 RSpec.describe 'MCP 2026-07-28 tasks extension — round 28' do
   def discover_result
     { 'resultType' => 'complete', 'supportedVersions' => ['2026-07-28'],
@@ -58,18 +59,31 @@ RSpec.describe 'MCP 2026-07-28 tasks extension — round 28' do
     client
   end
 
-  [10**400, 10**12].each do |interval|
-    it "bounds a pollIntervalMs of #{interval.to_s[0, 6]}… to the maximum pace" do
-      client = client_for(stdio)
-      script_stdio(stdio, [{ 'result' => discover_result }, tool_list, { 'result' => task_result(interval) },
-                           { 'result' => detailed_task(status: 'working', poll_ms: interval) },
-                           { 'result' => detailed_task(status: 'completed', poll_ms: interval,
-                                                       'result' => call_result) }])
+  def polling(interval)
+    client = client_for(stdio)
+    script_stdio(stdio, [{ 'result' => discover_result }, tool_list, { 'result' => task_result(interval) },
+                         { 'result' => detailed_task(status: 'working', poll_ms: interval) },
+                         { 'result' => detailed_task(status: 'completed', poll_ms: interval,
+                                                     'result' => call_result) }])
 
-      expect(client.call_tool('slow', {})['isError']).to be(false)
-      expect(client).to have_received(:sleep).with(MCPClient::Client::TaskSupport::MAX_TASK_POLL_INTERVAL).at_least(:once)
-      expect(client).not_to have_received(:sleep).with(Float::INFINITY)
-    end
+    expect(client.call_tool('slow', {})['isError']).to be(false)
+    client
+  end
+
+  it 'bounds a pollIntervalMs the clock cannot represent' do
+    client = polling(10**400)
+
+    expect(client).to have_received(:sleep).with(MCPClient::Client::TaskSupport::MAX_TASK_POLL_INTERVAL).at_least(:once)
+    expect(client).not_to have_received(:sleep).with(Float::INFINITY)
+  end
+
+  # The bound is there for what sleep would refuse, not to overrule a server:
+  # an interval of eleven and a half days is a pace, and it is kept.
+  it 'keeps a pollIntervalMs the clock can represent, however long' do
+    client = polling(1_000_000_000)
+
+    expect(client).to have_received(:sleep).with(1_000_000.0).at_least(:once)
+    expect(client).not_to have_received(:sleep).with(86_400.0)
   end
 
   it 'still clamps the pace to what is left of the caller timeout' do

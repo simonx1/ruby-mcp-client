@@ -257,8 +257,8 @@ RSpec.describe 'MCP 2026-07-28 tasks extension' do
 
     it 'answers input_required tasks through tasks/update without repeating answered keys' do
       seen = []
-      client = client_for(stdio, elicitation_handler: lambda { |message, _schema|
-        seen << message
+      client = client_for(stdio, elicitation_handler: lambda { |message, schema|
+        seen << [message, schema]
         { action: 'accept', content: { 'name' => 'octocat' } }
       })
       sent = script_stdio(stdio, [
@@ -283,7 +283,11 @@ RSpec.describe 'MCP 2026-07-28 tasks extension' do
       expect(wire_params(updates[0])['inputResponses']['k1'])
         .to eq({ 'action' => 'accept', 'content' => { 'name' => 'octocat' } })
       expect(wire_params(updates[1])['inputResponses'].keys).to eq(['k2'])
-      expect(seen.size).to eq(2)
+      # Each inputRequests entry is put to the host as the standalone request
+      # it carries — the elicitation's own message and requestedSchema, not
+      # the key it was filed under.
+      expect(seen).to eq([['Name?', elicit_request['params']['requestedSchema']],
+                          ['Name?', elicit_request['params']['requestedSchema']]])
     end
 
     it 'surfaces an unfulfillable task input request as InputRequiredError' do
@@ -536,7 +540,10 @@ RSpec.describe 'MCP 2026-07-28 tasks extension — round 2' do
     expect(client.send(:task_poll_delay, ttl_bound, nil)).to be_between(0.0, 0.5)
   end
 
-  it 'honours a long pollIntervalMs without capping it' do
+  # The pace itself, whatever its size, is round 28's and round 40's; this is
+  # the plain case: three minutes is what the server asked for and what the
+  # wait sleeps.
+  it 'honours the pace the server asked for' do
     client = client_for(stdio)
     script_stdio(stdio, [{ 'result' => discover_result }, tool_list,
                          { 'result' => task_result(poll_ms: 180_000, ttl_ms: nil) },

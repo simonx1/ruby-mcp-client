@@ -378,9 +378,11 @@ client = MCPClient::Client.new(
   validate_structured_content: :strict # raises MCPClient::Errors::ValidationError on violation
 )
 # A task-delivered result (get_task_result) is validated the same way when the
-# task is named with the Task handle call_tool_as_task returned: the handle
-# carries the definition its creating call went out under. A bare task ID
-# identifies no tool, so a result fetched by ID is not validated.
+# task is named with a Task handle: the handle call_tool_as_task returns carries
+# the definition its creating call went out under, and every handle of that task
+# keeps it — the one a get_task refresh returns, and the one a wait_for_task
+# hands back. A bare task ID identifies no tool, so a result fetched by ID is
+# not validated.
 ```
 
 A result is checked against the tool definition the request that produced it

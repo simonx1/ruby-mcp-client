@@ -125,6 +125,11 @@ module MCPClient
           # back) must not stamp it with the session that replaced it.
           task = MCPClient::Task.from_json(result, server: srv, detailed: true, session_epoch: epoch,
                                                    task_generation: generation)
+          # A refreshed handle names the same task, so it names the tool the
+          # task is running too: what the task delivers is validated against
+          # the definition its creating call went out under (see
+          # #get_task_result), whichever handle of that task the caller kept.
+          task = task.with_called_tool(called_tool_of(handle))
           # The answer must be about the task that was asked for: its state
           # drives result delivery and tasks/update.
           if modern_server?(srv) && task.task_id != task_id.to_s
@@ -216,7 +221,14 @@ module MCPClient
         rescue MCPClient::Errors::ServerError => e
           raise if e.protocol_error?
 
-          raise task_error_from(e, task_id, 'getting result for')
+          # A task the server has no result for because it is gone (expired,
+          # unknown) takes its bookkeeping with it, exactly as it does on the
+          # tasks/get path: what is left behind would otherwise keep the id's
+          # lifetime on the books for good, since the prune spares the ids of
+          # tasks this client still tracks. A failure that says nothing about
+          # the task existing leaves both alone.
+          raise task_failure(e, srv, task_id, 'getting result for', modern: false, method: 'tasks/result',
+                                                                    epoch: epoch, pin: pin)
         rescue MCPClient::Errors::TransportError, MCPClient::Errors::ConnectionError => e
           raise MCPClient::Errors::TaskError, "Error getting result for task '#{shown_task_id(task_id)}': " \
                                               "#{sanitize_peer_log_text(e.message)}"

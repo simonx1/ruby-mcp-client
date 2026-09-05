@@ -39,6 +39,28 @@ module MCPClient
         error.code.is_a?(Integer) && !error.is_a?(MCPClient::Errors::TransientServerError)
       end
 
+      # Give back the keys a definite rejection did not carry away, and drop
+      # what they left pending: one step, so an answer another delivery
+      # queues meanwhile keeps both its marker and its payload — deciding
+      # ownership and acting on it apart would let a newer answer land in
+      # between and be unmarked by this one. Nothing is given back once the
+      # wait abandoned this send and a retry holds the task's update lock:
+      # what that retry left is not this send's to release.
+      # @param state [Hash] the task state the rejected update was bound to
+      # @param lock [Mutex] the update lock this send holds
+      # @param input_responses [Hash] what the rejected update carried
+      # @return [void]
+      def release_rejected_update(state, lock, input_responses)
+        answered_keys_mutex.synchronize do
+          next unless state[:update_mutex].equal?(lock)
+
+          keys = rejected_keys_of(state, input_responses)
+          state[:answered].subtract(keys)
+          state[:submitted].subtract(keys)
+          drop_pending_keys(state, keys)
+        end
+      end
+
       # Which of a rejected delivery's keys it still owns: the ones whose
       # pending value is still the very value it carried. A key another
       # update answered while this one was on the wire belongs to that
@@ -47,13 +69,11 @@ module MCPClient
       # would put the same input request to the host again.
       # @param state [Hash] the task state the rejected update was bound to
       # @param input_responses [Hash] what that update carried
-      # @return [Array<String>] the keys to give back
+      # @return [Array<String>] the keys to give back (callers hold answered_keys_mutex)
       def rejected_keys_of(state, input_responses)
-        answered_keys_mutex.synchronize do
-          pending = state[:pending_update] || {}
-          input_responses.reject { |key, value| pending.key?(key) && !pending[key].equal?(value) }
-                         .keys.map(&:to_s)
-        end
+        pending = state[:pending_update] || {}
+        input_responses.reject { |key, value| pending.key?(key) && !pending[key].equal?(value) }
+                       .keys.map(&:to_s)
       end
 
       # Give back keys the server definitely did not take, in the state the
@@ -249,11 +269,7 @@ module MCPClient
           drop_ended_session_update(state, lock, keys)
           ended_session_update_result(shown, strict_session)
         rescue MCPClient::Errors::ServerError => e
-          if definite_rejection?(e) && update_lock_current?(state, lock)
-            rejected = rejected_keys_of(state, input_responses)
-            release_answered_keys_in(state, rejected)
-            clear_pending_update(state, lock, rejected)
-          end
+          release_rejected_update(state, lock, input_responses) if definite_rejection?(e)
           raise if e.protocol_error?
 
           raise task_failure(e, srv, task_id, 'updating', method: 'tasks/update', state: state)
@@ -328,12 +344,18 @@ module MCPClient
         answered_keys_mutex.synchronize do
           next unless state[:update_mutex].equal?(lock)
 
-          pending = state[:pending_update]
-          next if pending.nil?
-
-          remaining = pending.reject { |key, _| keys.include?(key.to_s) }
-          state[:pending_update] = remaining.empty? ? nil : remaining
+          drop_pending_keys(state, keys)
         end
+      end
+
+      # @param keys [Array<String>] the keys to drop from the pending payload
+      # @return [void] (callers hold answered_keys_mutex)
+      def drop_pending_keys(state, keys)
+        pending = state[:pending_update]
+        return if pending.nil?
+
+        remaining = pending.reject { |key, _| keys.include?(key.to_s) }
+        state[:pending_update] = remaining.empty? ? nil : remaining
       end
 
       # @return [Boolean] whether this send still holds the task's update lock

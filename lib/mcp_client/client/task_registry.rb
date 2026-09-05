@@ -68,23 +68,38 @@ module MCPClient
         drop_ended_lifetimes(lookup)
       end
 
-      # Forget every task's bookkeeping (the client is being cleaned up).
+      # Forget the bookkeeping of the sessions a cleanup ended.
       #
-      # What an id names is not bookkeeping and does not go with it. Ending a
-      # connection is not ending a session — a 2026-07-28 HTTP transport is
-      # sessionless, and its tasks outlive a cleanup — so the lifetimes and,
-      # above all, the session counters that number them stay: restarting a
-      # counter would hand a task created after the cleanup the number a
-      # handle from before it still names, and that handle would then update
-      # or cancel the task that replaced its own. A session that does end
-      # takes its lifetimes with it as before (see {#drop_ended_session_state}),
-      # and the ids of tasks nothing tracks any more are pruned (see
-      # {#prune_task_lifetimes}), so what is kept stays bounded.
+      # Ending a connection is not ending a session — a 2026-07-28 HTTP
+      # transport is sessionless, and its tasks outlive a cleanup — and the
+      # bookkeeping of a task that survives survives with it: the keys it has
+      # already answered are still answered (a wait resumed after the cleanup
+      # would otherwise put the same input request to the host a second time)
+      # and an update the server never acknowledged is still owed to it. What
+      # a session that did end left behind goes now rather than on the next
+      # lookup, so a cleanup still releases what nothing can reach.
+      #
+      # What an id names is not bookkeeping and does not go with either. The
+      # lifetimes and, above all, the session counters that number them stay:
+      # restarting a counter would hand a task created after the cleanup the
+      # number a handle from before it still names, and that handle would then
+      # update or cancel the task that replaced its own. A session that does
+      # end takes its lifetimes with it as before (see
+      # {#drop_ended_session_state}), and the ids of tasks nothing tracks any
+      # more are pruned (see {#prune_task_lifetimes}), so what is kept stays
+      # bounded.
       # @return [void]
       def clear_task_states
         answered_keys_mutex.synchronize do
-          @task_states = nil
-          @in_flight_keys = nil
+          # Read after the transports cleaned up: a session the cleanup ended
+          # has moved the epoch by now, and its state is what goes.
+          live = servers.to_h { |srv| [srv.object_id, current_session_epoch(srv)] }
+          @task_states&.delete_if { |lookup, _| live[lookup[0]] != lookup[1] }
+          # The keys a handler is still presenting belong to a lifetime of a
+          # session, and are kept exactly as long as that session is.
+          @in_flight_keys&.delete_if { |key, _| live[key[0]] != key[1] }
+          @task_states = nil if @task_states.is_a?(Hash) && @task_states.empty?
+          @in_flight_keys = nil if @in_flight_keys.is_a?(Hash) && @in_flight_keys.empty?
         end
       end
 

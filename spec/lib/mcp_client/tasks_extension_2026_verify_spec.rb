@@ -48,6 +48,27 @@ RSpec.describe 'MCP 2026-07-28 tasks extension — verification round' do
     allow(server).to receive(:ensure_session_ready)
   end
 
+  let(:legacy) { MCPClient::ServerStdio.new(command: 'echo test', read_timeout: 1, name: 'legacy') }
+
+  # A 2025-11-25 server whose tools/call creates a task (the wrapped
+  # CreateTaskResult of that revision) and whose tasks/get reports it working.
+  def legacy_tasks
+    tool = MCPClient::Tool.new(name: 'slow', description: 'd', schema: { 'type' => 'object' },
+                               task_support: 'optional', server: legacy)
+    allow(legacy).to receive_messages(
+      modern?: false, list_tools: [tool],
+      capabilities: { 'tools' => {}, 'tasks' => { 'get' => true, 'requests' => { 'tools' => { 'call' => {} } } } }
+    )
+    allow(legacy).to receive(:ensure_session_ready)
+    created = 0
+    allow(legacy).to receive(:rpc_request) do |method, _params|
+      now = Time.now.utc.iso8601(3)
+      task = { 'taskId' => "task-#{created += 1}", 'status' => 'working', 'createdAt' => now,
+               'lastUpdatedAt' => now, 'ttl' => 60_000, 'pollInterval' => 1 }
+      method == 'tools/call' ? { 'task' => task } : task.merge('taskId' => 'task-1')
+    end
+  end
+
   # One CreateTaskResult, as the server would answer it in the live session.
   def creation(client, id = 'task-1', srv: stdio)
     client.send(:created_task, create_result(id: id), srv, client.send(:current_session_epoch, srv))
@@ -89,19 +110,16 @@ RSpec.describe 'MCP 2026-07-28 tasks extension — verification round' do
     end
 
     it 'keeps a handle the legacy creation API produced usable too' do
-      client = client_for
-      negotiated
-      epoch = client.send(:current_session_epoch, stdio)
       # The 2025 path unwraps the `task` member first, so it counts the
-      # lifetime of a handle that already exists.
-      handle = client.send(:started_task_lifetime,
-                           MCPClient::Task.new(task_id: 'task-1', status: 'working', server: stdio,
-                                               session_epoch: epoch),
-                           stdio, epoch)
-      (1..cap).each { |i| creation(client, "other-#{i}") }
-      allow(stdio).to receive(:rpc_request).and_return(detailed_task(status: 'working'))
+      # lifetime of a handle that already exists: that handle is a handle of
+      # a running task like any other.
+      client = client_for(legacy)
+      legacy_tasks
+      handle = client.call_tool_as_task('slow', {})
+      (1..cap).each { |i| creation(client, "other-#{i}", srv: legacy) }
 
       expect(client.get_task(handle).status).to eq('working')
+      expect(handle.task_id).to eq('task-1')
     end
 
     it 'still forgets the lifetimes of task ids whose tasks have ended' do

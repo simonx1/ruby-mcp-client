@@ -32,14 +32,15 @@ module MCPClient
       # turning the wait into a busy loop.
       DEFAULT_TASK_POLL_INTERVAL = 1.0
       MIN_TASK_POLL_INTERVAL = 0.05
-      # Longest pause between two polls, whatever pollIntervalMs says: a
-      # peer-supplied interval the clock cannot represent (or that is merely
-      # enormous) is bounded rather than handed to sleep. It is a backstop
-      # against nonsense and not a pace of this client's own: an interval a
-      # server can plausibly mean for a long-running task is kept, because
+      # Longest pause between two polls, whatever pollIntervalMs says: an
+      # interval the clock cannot represent (Infinity, an integer too large
+      # for a Float, NaN) is bounded rather than handed to sleep, which
+      # refuses it. It is that backstop and nothing more — every pace a
+      # server could mean is finite and far below it, and is kept, because
       # polling faster than the server asked for is what the spec's polling
-      # SHOULD is there to prevent.
-      MAX_TASK_POLL_INTERVAL = 86_400.0
+      # SHOULD is there to prevent. What bounds a wait is the caller's
+      # timeout and the task's TTL, never a pace of this client's own.
+      MAX_TASK_POLL_INTERVAL = 1.0e18
       MIN_TASK_REQUEST_TIMEOUT = 0.001
       # The longest a single poll request may wait, whatever the TTL: a hung
       # tasks/get must not block the wait for the task's whole lifetime.
@@ -93,6 +94,12 @@ module MCPClient
       # input_required states through tasks/update using the registered
       # handlers (each inputRequests key is answered once), and give up when
       # the task's TTL backstop or the caller's timeout elapses.
+      #
+      # Giving up ends the wait and nothing else: the task keeps running,
+      # since only the host knows whether its result is still wanted. The
+      # handle stays usable — wait again, read it with {Client#get_task}, or
+      # end the task with {Client#cancel_task} (tasks/cancel; a task is never
+      # cancelled with notifications/cancelled).
       # @param task [String, MCPClient::Task] the task or its id
       # @param server [Integer, String, Symbol, MCPClient::ServerBase, nil] server selector
       # @param timeout [Numeric, nil] seconds to wait before giving up (nil = until the TTL, if any)
@@ -111,8 +118,12 @@ module MCPClient
         # it) while the caller's timeout never moves. The deadline exists
         # before anything is sent, so a capability probe (initialization,
         # discovery) counts against it too.
+        # The wait carries the definition the creating call went out under, so
+        # every handle it hands back names the tool the task is running (see
+        # #validated_task_result); a bare task id names no request, and so no
+        # tool.
         wait = { task_id: task_id, srv: srv, deadline: timeout && (monotonic_time + timeout), ttl_deadline: nil,
-                 answered: nil, state: nil, epoch: nil, last: nil }
+                 answered: nil, state: nil, epoch: nil, last: nil, called_tool: called_tool_of(task) }
         probe_task_capability!(wait)
         unless modern_server?(srv)
           raise MCPClient::Errors::TaskError, 'wait_for_task requires an MCP 2026-07-28 server (tasks extension)'
@@ -222,7 +233,9 @@ module MCPClient
         return nil unless current
 
         validate_terminal_task!(current) if current.terminal?
-        current
+        # A poll asks by task id, which names no tool: the observation is the
+        # same task the wait was handed, so it keeps that handle's definition.
+        current.with_called_tool(wait[:called_tool])
       end
 
       # Answer this poll's outstanding input requests, bounding how many
@@ -664,6 +677,17 @@ module MCPClient
         validate_structured_content!(task.called_tool, result)
       end
 
+      # The definition a handle carries, if the caller named the task with a
+      # handle at all: the one its creating call went out under. Every handle
+      # of that task keeps it — a refreshed one (see {Client#get_task}) and
+      # the one a wait hands back name the same task, and so the same tool —
+      # while a bare task id identifies no request and no tool.
+      # @param task [Object] what the caller named the task with
+      # @return [MCPClient::Tool, nil]
+      def called_tool_of(task)
+        task.is_a?(MCPClient::Task) ? task.called_tool : nil
+      end
+
       # The handle for a CreateTaskResult, which MUST carry a taskId.
       # @param epoch [Integer, nil] the session the creating call was sent in;
       #   without one the session live at this call is taken
@@ -1023,16 +1047,19 @@ module MCPClient
       end
 
       # The wait before the next tasks/get: the server's pollIntervalMs
-      # (never capped, never below MIN_TASK_POLL_INTERVAL), clamped to what
-      # is left of the caller's timeout and of the task's TTL so neither can
-      # be overshot by a whole polling interval.
+      # (kept whatever its size, as long as the clock can represent it, and
+      # never below MIN_TASK_POLL_INTERVAL), clamped to what is left of the
+      # caller's timeout and of the task's TTL so neither can be overshot by
+      # a whole polling interval.
       # @param task [MCPClient::Task]
       # @param deadline [Float, nil] monotonic deadline of the wait
       # @return [Float] seconds
       def task_poll_delay(task, deadline)
         interval = task.poll_interval_ms
         delay = interval.is_a?(Numeric) && interval >= 0 ? interval / 1000.0 : DEFAULT_TASK_POLL_INTERVAL
-        # Infinity (an integer too large for a Float) and NaN land on the bound.
+        # Infinity (an integer too large for a Float) and NaN land on the
+        # bound, and so does a finite interval beyond it, which sleep would
+        # refuse just the same.
         delay = MAX_TASK_POLL_INTERVAL unless delay.finite?
         delay = delay.clamp(MIN_TASK_POLL_INTERVAL, MAX_TASK_POLL_INTERVAL)
         remaining = [deadline && (deadline - monotonic_time), task.ttl_remaining].compact.min

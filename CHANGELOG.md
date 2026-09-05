@@ -7,6 +7,54 @@ metadata). Each feature lands in its own PR; this section accumulates them.
 
 ### Tasks extension (`io.modelcontextprotocol/tasks`)
 
+- **Every handle of a task carries the definition its creation went out under
+  (round 40).** Round 39 gave the handle `call_tool_as_task` returns the tool
+  definition its `tools/call` was answered under, so `get_task_result`
+  validates what the task delivers. A handle of the same task obtained any
+  other way — the one `get_task` refreshes, the terminal one `wait_for_task`
+  hands back — was built from the answer alone and named no tool, so the
+  documented `task = client.get_task(task)` pattern silently turned
+  `validate_structured_content: :strict` off: a `structuredContent` the tool's
+  `outputSchema` forbids came back unchecked, where the creation handle raised
+  `ValidationError`. A refreshed handle names the same task, and now names the
+  same tool, on the legacy `tasks/result` path too. A bare task id still
+  identifies no tool and is returned unvalidated.
+- **A cleanup keeps the answers a surviving task is still owed (round 40).**
+  Round 39 kept the task-id lifetimes across `Client#cleanup`, because closing
+  a sessionless 2026-07-28 HTTP connection ends no session and its tasks
+  outlive it; the answered keys, pending answers and in-flight holds were
+  still dropped for every server. A wait resumed after a cleanup therefore put
+  an input request the host had already answered to the handler a second time,
+  and an unconfirmed `tasks/update` was never retransmitted — its answers were
+  simply lost. The cleanup now drops the bookkeeping of the sessions it ended
+  (a stdio child, a session-bearing HTTP connection) and keeps what a session
+  that survived still owes the server.
+- **A rejected update decides and releases in one step (round 40).** A
+  definite JSON-RPC rejection gives back only the keys whose pending answer is
+  still the one it carried, so an answer another delivery queued meanwhile
+  keeps its marker. The ownership check, the release of the keys and the drop
+  of the pending payload each took the registry lock separately, so an answer
+  queued between them was unmarked and dropped by the older delivery: it went
+  out, nothing recorded it as answered, and the next poll put the same input
+  request to the host again. The three steps are now one critical section.
+- **A legacy `tasks/result` that reports the task gone releases it (round
+  40).** Round 39 released a task's bookkeeping when `tasks/result` succeeded,
+  but `{"code":-32602,"message":"Task has expired"}` — the answer that says
+  the task no longer exists — left it registered as live, and the lifetime
+  prune spares the ids of tasks whose bookkeeping is live. A 2025-11-25 host
+  that only creates tasks and fetches their results grew the registry with
+  every expired or unknown task. A failure that says nothing about the task
+  existing (a transient or internal error) still leaves both alone.
+- **The pace a server asks for is kept, whatever its size (round 40).** Round
+  39 raised the polling bound from an hour to a day, so a task paced at two
+  days was still polled twice as often as its server asked. The bound is there
+  only because `sleep` refuses an interval the clock cannot represent, and it
+  now sits far beyond any pace a server could mean: `pollIntervalMs` is
+  honoured as sent, and what bounds a wait is the caller's timeout and the
+  task's TTL, never a pace of this client's own. A wait that ends on the
+  caller's timeout still leaves the task running: the handle stays usable, and
+  ending the task is `cancel_task`'s business (`tasks/cancel` — never
+  `notifications/cancelled`), not the timeout's.
 - **A cleanup no longer restarts the lifetime counters (round 39).**
   `Client#cleanup` dropped everything the task registry held, the per-session
   counter that numbers task lifetimes included. Ending a connection is not

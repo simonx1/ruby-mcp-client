@@ -124,6 +124,8 @@ RSpec.describe 'MCP 2026-07-28 tasks extension — round 26' do
                                        'lastUpdatedAt' => now, 'ttlMs' => 10**400 }, server: stdio)
 
     expect { task.ttl_remaining }.not_to raise_error
-    expect(task.ttl_remaining).to be_nil.or be_a(Float)
+    # No backstop at all, not an infinite one: a bound the clock cannot
+    # represent bounds nothing.
+    expect(task.ttl_remaining).to be_nil
   end
 end
