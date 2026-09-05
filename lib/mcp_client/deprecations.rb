@@ -79,6 +79,11 @@ module MCPClient
     # Longest peer-supplied detail quoted in a notice.
     MAX_DETAIL_LENGTH = 200
 
+    # How many wrappers deep the logger the host passed is looked through
+    # (see {.underlying_logger}). One or two is what a host actually builds;
+    # the bound is only there so a delegator that holds itself cannot spin.
+    MAX_UNWRAP_DEPTH = 8
+
     # Marks a thread that is inside a notice: from the moment it first asks
     # the logger anything until it comes back out of the write. It covers
     # the level probe as well as the write, because both are host code and
@@ -110,7 +115,8 @@ module MCPClient
 
       # Log the notice for a deprecated feature once per process. The notice
       # counts as emitted only once the logger accepted it: a logger that
-      # drops warnings (level above WARN), writes nowhere (`Logger.new(nil)`,
+      # drops warnings (its own level above WARN, or that of a logger it
+      # wraps), writes nowhere (`Logger.new(nil)`, a wrapper around one,
       # or a device that was closed), fails to report its level or raises
       # leaves it for a later use, and so do a nested attempt from inside
       # another notice's logger — its `level` accessor as much as its `warn`
@@ -305,11 +311,37 @@ module MCPClient
       # @param logger [Logger, #warn] the candidate logger
       # @return [Boolean] false when the logger drops warnings or asking failed
       def accepts_warnings?(logger)
-        return false if logger.is_a?(::Logger) && logger.level > ::Logger::WARN
+        return false if drops_warnings?(logger)
 
         !no_output_device?(logger)
       rescue StandardError
         false
+      end
+
+      # Whether the logger says it would drop a WARN record.
+      #
+      # A host's logger is rarely a bare ::Logger: Rails hands out a tagged
+      # or a broadcast logger, and an application that routes its own
+      # deprecation output wraps one itself. Every such wrapper answers
+      # `warn` without writing when the logger underneath is above WARN, so
+      # reading `level` off a ::Logger and nothing else spends the process's
+      # one notice on a line nobody can read — and silences the host's own
+      # working logger for good, since the slot is then marked emitted.
+      # `warn?` is the same question in the form a wrapper forwards, and it
+      # is asked only of an object that offers it: a minimal host logger
+      # implementing `warn` and nothing else is still taken at its word.
+      #
+      # A wrapper that filters on something a level cannot express — a tag,
+      # a source allow-list — cannot be asked at all, and does spend the
+      # notice. That is the boundary of what this can promise; what it may
+      # not do is fail the deprecated operation trying to establish more
+      # (see {.accepts_warnings?}).
+      # @param logger [Logger, #warn] the candidate logger
+      # @return [Boolean] whether a warning written now would be dropped
+      def drops_warnings?(logger)
+        return !logger.warn? if logger.respond_to?(:warn?)
+
+        logger.is_a?(::Logger) && logger.level > ::Logger::WARN
       end
 
       # `Logger.new(nil)` is the documented no-output logger: it keeps every
@@ -332,6 +364,7 @@ module MCPClient
       # @param logger [Logger, #warn] the candidate logger
       # @return [Boolean] whether the logger provably writes nowhere
       def no_output_device?(logger)
+        logger = underlying_logger(logger)
         return false unless logger.is_a?(::Logger) && logger.instance_variable_defined?(:@logdev)
 
         logdev = logger.instance_variable_get(:@logdev)
@@ -345,6 +378,23 @@ module MCPClient
         # unknown device as dead would suppress every notice a host with a
         # custom log device should see.
         device.respond_to?(:closed?) && device.closed?
+      end
+
+      # The logger under whatever the host wrapped it in. A Delegator
+      # forwards `warn` and `warn?` to the logger it holds, but not the
+      # question above: `instance_variable_defined?` is Object's own method
+      # and answers for the WRAPPER, so a wrapped `Logger.new(nil)` would
+      # read as some unknown logger that writes somewhere and spend the
+      # notice on a device that does not exist.
+      # @param logger [Logger, #warn] the logger the host passed
+      # @return [Object] the logger that would take the write
+      def underlying_logger(logger)
+        MAX_UNWRAP_DEPTH.times do
+          break unless defined?(::Delegator) && logger.is_a?(::Delegator)
+
+          logger = logger.__getobj__
+        end
+        logger
       end
 
       # @return [String] the notice text

@@ -520,7 +520,12 @@ warning. A notice costs the deprecated operation exactly what one
 or writes nowhere (`Logger.new(nil)`, or one whose device has been closed) is
 swallowed, so the feature keeps working and the notice stays owed to a later
 use — but a logger that blocks, blocks its caller here just as it does
-everywhere else in the library.
+everywhere else in the library. A logger the host wrapped is asked through
+the wrapper (`warn?`, and the device of the `Delegator` it holds), so a
+tagged, broadcast or hand-rolled wrapper above WARN leaves the notice owed
+rather than spending it on a line nobody reads; a wrapper that filters on
+something a level cannot express — a tag, a source allow-list — cannot be
+asked, and does spend it.
 Nothing ever waits for a notice. A caller that meets one already in flight —
 another thread's first use, or a formatter, log subscriber, audit hook or
 `level` accessor that reaches a deprecated feature from inside the notice
@@ -942,8 +947,12 @@ In form mode the handler may return the content on its own (`{ 'field' =>
 `accept`, `decline` or `cancel` — any other value is answered `cancel`, since
 it is not consent the user gave.
 
-In URL mode the handler's second argument is
-`{ 'mode' => 'url', 'url' => ..., 'elicitationId' => ... }` and its answer is
+In URL mode the handler's second argument is `{ 'mode' => 'url', 'url' => ... }`
+on a **2026-07-28** server and
+`{ 'mode' => 'url', 'url' => ..., 'elicitationId' => ... }` on a **2025-11-25**
+one: the newer revision removed `elicitationId`, so a host must not expect that
+key from a modern server (see
+[URL-mode elicitation](#url-mode-elicitation)). Its answer is
 consent, not data: only an explicit `action` of `accept`, `decline` or `cancel`
 (or a literal `true` for accept) counts — anything else is answered `cancel`.
 `content` is dropped, since it is form-mode only, while a handler-supplied

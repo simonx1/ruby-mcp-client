@@ -106,7 +106,13 @@ RSpec.describe 'MCP 2026-07-28 deprecations' do
 
   %w[thisServer allServers].each do |value|
     it "warns when a sampling request asks for #{value} context but still serves it" do
-      handler = lambda { |_messages, _prefs, _system, _max|
+      # A five-argument handler, so "still serves it" is the request the
+      # handler was given and not merely a result that came back: the
+      # deprecation is a warning, and SEP-2596 leaves the wire alone, so the
+      # value the server asked for must still reach the host untouched.
+      seen = nil
+      handler = lambda { |_messages, _prefs, _system, _max, request|
+        seen = request
         { 'role' => 'assistant', 'content' => { 'type' => 'text', 'text' => 'ok' }, 'model' => 'm' }
       }
       c = client(sampling_handler: handler)
@@ -114,6 +120,7 @@ RSpec.describe 'MCP 2026-07-28 deprecations' do
 
       result = c.send(:handle_sampling_request, 1, params)
 
+      expect(seen).to include('includeContext' => value)
       expect(result['content']['text']).to eq('ok')
       expect(output.string).to include("Received: includeContext #{value}")
       expect(MCPClient::Deprecations.emitted?(:include_context)).to be(true)

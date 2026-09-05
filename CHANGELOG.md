@@ -209,6 +209,36 @@ metadata). Each feature lands in its own PR; this section accumulates them.
   refines). Each now cites its feature's SEP and its own earliest removal,
   none of them warns where it did not warn before, and every `@deprecated`
   tag in the library is accounted for by the inventory.
+- **A logger the host wrapped does not spend a notice it dropped (round
+  12).** The level probe asked `logger.level`, which only a bare `::Logger`
+  answers — and a host's logger is rarely one: Rails hands out a tagged or a
+  broadcast logger, and an application that routes its own deprecation
+  output wraps one itself. A `SimpleDelegator` around an ERROR-level
+  `::Logger` forwarded `warn`, returned as if it had written, and marked the
+  process's one notice emitted having printed nothing — silencing the host's
+  own working logger for good. The probe now asks `warn?`, the form a
+  wrapper forwards, of any logger that offers it, and looks through
+  `Delegator` wrappers for the missing device that `Logger.new(nil)` has.
+  A logger implementing `warn` and nothing else is still taken at its word,
+  and asking still cannot fail the deprecated operation: a predicate that
+  raises leaves the notice owed, exactly as a raising `warn` does. A wrapper
+  that filters on something a level cannot express — a tag, a source
+  allow-list — remains beyond reach.
+- **The Logging notice fires on a transport-direct HTTP+SSE session (round
+  12).** The notice for an incoming `notifications/message` was raised in
+  the routing every other transport shares, but `ServerSSE` carries no
+  subscriptions/listen stream and parses its own notifications, so a host
+  driving a `ServerSSE` with `on_notification` — the case the
+  transport-level notices exist for — received log messages and was never
+  told that Logging is deprecated. `Client` + SSE was unaffected (it warns
+  on its own log-message handler).
+- **The elicitation section states the URL-mode contract of both revisions
+  (round 12).** The section introducing elicitation still gave the
+  2025-11-25 hash as universal, so a host reading it looked for
+  `metadata['elicitationId']` on a 2026-07-28 server, found nothing, and
+  correlated against a completion notification the revision removed as well.
+  Both places the README shows that hash now split the two revisions, and a
+  spec pins that they do.
 - **Documentation.** README documents the 2026-07-28 support (discovery
   and per-request metadata, multi round-trip requests, `x-mcp-header`,
   subscriptions, cacheable results, the tasks extension, authorization) and

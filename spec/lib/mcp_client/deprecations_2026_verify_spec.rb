@@ -274,16 +274,79 @@ RSpec.describe 'MCP 2026-07-28 deprecations (verification)' do
         end
 
         it 'warns for a sampling request and its includeContext, and still answers it' do
-          server.on_sampling_request { |_id, _params| sampling_answer }
+          # The notice runs before the handler and is handed the very params
+          # the handler is about to get, so "still serves it" has to be read
+          # off THOSE params: SEP-2596 deprecates the two values, it does not
+          # change what the transport passes on.
+          served = nil
+          server.on_sampling_request do |_id, request_params|
+            served = request_params
+            sampling_answer
+          end
           params = { 'messages' => [], 'maxTokens' => 5, 'includeContext' => 'allServers' }
 
           route(server, { 'id' => 9, 'method' => 'sampling/createMessage', 'params' => params })
 
+          expect(served).to include('includeContext' => 'allServers')
           expect(MCPClient::Deprecations.emitted?(:sampling)).to be(true)
           expect(output.string).to match(/Sampling .*deprecated/)
           expect(output.string).to include('Received: includeContext allServers')
           expect(posted.last).to include('jsonrpc' => '2.0', 'id' => 9)
           expect(posted.last['result']).to eq(sampling_answer)
+        end
+
+        # The notice is once per process; the feature is not. A second
+        # request after the notice is spent is served exactly as the first.
+        it 'keeps serving sampling after the notice has been spent' do
+          server.on_sampling_request { |_id, _params| sampling_answer }
+
+          2.times do |i|
+            route(server, { 'id' => 20 + i, 'method' => 'sampling/createMessage',
+                            'params' => { 'messages' => [], 'maxTokens' => 5 } })
+          end
+
+          expect(posted.map { |response| response['id'] }).to eq([20, 21])
+          expect(posted.map { |response| response['result'] }).to eq([sampling_answer, sampling_answer])
+          expect(output.string.scan(/Sampling .*deprecated/).size).to eq(1)
+        end
+
+        # Serving the request is the use, so a handler that then fails does
+        # not get the notice back — and the peer gets the transport's own
+        # constant error, not something the notice changed.
+        it 'answers the error of a sampling handler that raises, notice spent' do
+          server.on_sampling_request { |_id, _params| raise 'handler exploded' }
+
+          route(server, { 'id' => 10, 'method' => 'sampling/createMessage',
+                          'params' => { 'messages' => [], 'maxTokens' => 5 } })
+
+          expect(MCPClient::Deprecations.emitted?(:sampling)).to be(true)
+          expect(posted.last['error']).to eq({ 'code' => -32_603, 'message' => 'Internal error' })
+          expect(posted.last).not_to have_key('result')
+          # The handler's text is host-internal: logged here, never posted.
+          expect(output.string).to include('handler exploded')
+          expect(JSON.generate(posted.last)).not_to include('handler exploded')
+        end
+
+        # A capability this host never registered for is not a deprecated
+        # feature it uses: the rejection goes out and the notice stays owed.
+        it 'stays silent when it has no sampling handler to serve with' do
+          route(server, { 'id' => 11, 'method' => 'sampling/createMessage',
+                          'params' => { 'messages' => [], 'maxTokens' => 5, 'includeContext' => 'thisServer' } })
+
+          expect(MCPClient::Deprecations.emitted?(:sampling)).to be(false)
+          expect(MCPClient::Deprecations.emitted?(:include_context)).to be(false)
+          expect(posted.last['error']).to include('message' => 'Sampling not supported')
+        end
+
+        # Roots counts as used only once an answer carries a root, and an
+        # answer that never came carries none.
+        it 'stays silent when the roots handler raises' do
+          server.on_roots_list_request { |_id, _params| raise 'no roots today' }
+
+          route(server, { 'id' => 12, 'method' => 'roots/list', 'params' => {} })
+
+          expect(MCPClient::Deprecations.emitted?(:roots)).to be(false)
+          expect(posted.last['error']).to eq({ 'code' => -32_603, 'message' => 'Internal error' })
         end
       end
     end

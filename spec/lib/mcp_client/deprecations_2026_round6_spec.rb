@@ -41,6 +41,47 @@ RSpec.describe 'MCP 2026-07-28 deprecations (round 6)' do
     end
   end
 
+  # The lifecycle policy's mark-and-warn obligation is to point the host at
+  # the replacement, so the migration text is a requirement and not a
+  # decoration. Written down here rather than read back off the production
+  # table: an example that compares REGISTRY[...][:migration] with the notice
+  # it produced agrees with an empty string just as happily.
+  describe 'the replacement the registry names for each feature' do
+    # What the published registry's "Migration" column tells a host to do,
+    # one distinguishing phrase per row.
+    let(:replacements) do
+      {
+        roots: ['tool parameters', 'resource URIs', 'server configuration'],
+        sampling: ['LLM provider'],
+        logging: %w[stderr OpenTelemetry],
+        http_sse_transport: ['Streamable HTTP'],
+        include_context: ['omit includeContext', '"none"'],
+        dynamic_client_registration: ['Client ID Metadata Document', 'pre-registered credentials']
+      }
+    end
+
+    it 'says what to use instead, in the registry and in the notice it writes' do
+      expect(replacements.keys).to match_array(registry.keys)
+      replacements.each do |key, phrases|
+        MCPClient::Deprecations.reset!
+        output.truncate(output.rewind)
+        expect(MCPClient::Deprecations.warn(key, logger)).to be(true)
+
+        phrases.each do |phrase|
+          expect(registry[key][:migration]).to include(phrase), key.to_s
+          expect(output.string).to include(phrase), key.to_s
+        end
+      end
+    end
+
+    it 'never leaves a feature without one' do
+      registry.each do |key, entry|
+        expect(entry[:migration]).to be_a(String)
+        expect(entry[:migration].split.size).to be >= 4, key.to_s
+      end
+    end
+  end
+
   describe 'the runtime notice' do
     it 'names the earliest removal alongside the SEP and the migration' do
       MCPClient::Deprecations.warn(:roots, logger)

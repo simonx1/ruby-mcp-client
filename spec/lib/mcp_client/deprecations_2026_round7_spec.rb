@@ -88,6 +88,66 @@ RSpec.describe 'MCP 2026-07-28 deprecations (round 7)' do
 
         expect(MCPClient::Deprecations.emitted?(:roots)).to be(true)
       end
+
+      # The notice may not stand between the host and the wire. The rest of
+      # the suite runs with notices OFF, so the examples that pin
+      # list_changed elsewhere cannot catch a `roots=` that warned and
+      # returned: only an example with notices ON can.
+      it 'still tells a legacy server the list changed, and still spares a modern one' do
+        client = MCPClient::Client.new(mcp_server_configs: [client_config, client_config], logger: logger)
+        legacy, modern = client.servers
+        legacy.instance_variable_set(:@protocol_version, '2025-11-25')
+        modern.instance_variable_set(:@protocol_version, '2026-07-28')
+        notified = []
+        { legacy: legacy, modern: modern }.each do |era, server|
+          allow(server).to receive(:rpc_notify) { |method, params| notified << [era, method, params] }
+        end
+
+        client.roots = [{ uri: 'file:///workspace' }]
+
+        expect(notified).to eq([[:legacy, 'notifications/roots/list_changed', {}]])
+        expect(MCPClient::Deprecations.emitted?(:roots)).to be(true)
+      end
+
+      # Emptying the list is not use of Roots, and the server that asks next
+      # is answered with the list the host actually left it.
+      it 'answers roots/list with the emptied list after the last root is cleared' do
+        client = MCPClient::Client.new(mcp_server_configs: [client_config], logger: logger,
+                                       roots: [{ uri: 'file:///workspace' }])
+        server = stdio_server(client)
+        allow(server).to receive(:rpc_notify)
+        sent = []
+        allow(server).to receive(:send_message) { |message| sent << message }
+
+        client.roots = []
+        server.send(:handle_server_request, { 'id' => 1, 'method' => 'roots/list', 'params' => {} })
+
+        expect(sent.last['result']).to eq({ 'roots' => [] })
+      end
+    end
+
+    # 2026-07-28 asks for roots through the multi round-trip pattern instead
+    # of a server-initiated request, and that path reaches the same Client
+    # handler. A modern server is the only kind that can ask this way, so
+    # nothing else in this file covers it.
+    context 'with a Client answering the multi round-trip roots request' do
+      it 'still returns the configured roots, and warns for them' do
+        client = MCPClient::Client.new(mcp_server_configs: [client_config], logger: logger,
+                                       roots: [{ uri: 'file:///workspace', name: 'Workspace' }])
+        # The constructor's own notice is not what this example is about.
+        MCPClient::Deprecations.reset!
+        output.truncate(output.rewind)
+        server = stdio_server(client)
+        server.instance_variable_set(:@protocol_version, '2026-07-28')
+        expect(server).to be_modern
+
+        responses = server.send(:fulfil_input_requests,
+                                { 'r1' => { 'method' => 'roots/list', 'params' => {} } }, {})
+
+        expect(responses['r1']).to eq({ 'roots' => [{ 'uri' => 'file:///workspace', 'name' => 'Workspace' }] })
+        expect(MCPClient::Deprecations.emitted?(:roots)).to be(true)
+        expect(output.string).to match(/Roots .*deprecated/)
+      end
     end
 
     context 'with a transport driven directly' do

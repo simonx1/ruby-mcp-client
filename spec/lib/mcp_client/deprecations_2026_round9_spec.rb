@@ -149,8 +149,14 @@ RSpec.describe 'MCP 2026-07-28 deprecations (round 9)' do
       gated_logger.await_entry
 
       contender = Thread.new { MCPClient::Deprecations.warn(:roots, working_logger) }
-      # Let the contender reach the in-flight reservation before it resolves.
-      sleep 0.05
+      # The contender runs to COMPLETION while the reservation is still held:
+      # the reserver is parked inside its logger and cannot settle until this
+      # example releases it. So the interleaving under test is the one that
+      # happened, rather than the one a sleep hoped for — a contender that
+      # was not scheduled inside 50ms used to meet a released slot, claim it
+      # legitimately and fail this example for being right. Bounded, so a
+      # regression fails the example instead of wedging the suite.
+      expect(contender.join(10)).not_to be_nil
       gated_logger.release(:raise)
 
       # The contender stands down instead of taking the reservation over: it

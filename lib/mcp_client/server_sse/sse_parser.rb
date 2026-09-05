@@ -90,6 +90,14 @@ module MCPClient
       def process_notification?(data)
         return false unless data['method'] && !data.key?('id')
 
+        # notifications/message is the Logging utility, Deprecated as a whole
+        # in 2026-07-28 (SEP-2577). The notice belongs to the transport, not
+        # to MCPClient::Client: a host that registered on_notification on a
+        # ServerSSE receives log messages without a Client ever existing. It
+        # is raised here rather than only in
+        # {MCPClient::SubscriptionSupport#route_notification} because this
+        # transport is the one that does not go through it — see below.
+        warn_logging_deprecated if data['method'] == 'notifications/message'
         # The legacy SSE transport carries no subscriptions/listen stream, so
         # there is no delivery to run ahead of — but the transport's own caches
         # and a host that registered its invalidation on the dedicated hook
