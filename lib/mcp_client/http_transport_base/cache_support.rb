@@ -109,10 +109,33 @@ module MCPClient
       # @return [Faraday::Connection]
       def record_sent_authorization(conn)
         conn.builder.use(AuthorizationRecorder, self)
+        @authorization_recorder_installed = true
         conn
       rescue StandardError => e
+        # A host that built its own middleware stack locked it, and nothing
+        # can be added any more. Private reuse stays off rather than falling
+        # back to a guess: see {#sent_authorization_known?}.
         @logger.debug("Could not install the Authorization recorder middleware: #{e.class}")
+        @authorization_recorder_installed = false
         conn
+      end
+
+      # Whether what a request on this connection went out with is known.
+      #
+      # A connection carrying no host middleware answers for itself: the
+      # transport applies the headers and nothing else touches them. Once a
+      # `faraday_config` block is in play only the recorder, installed
+      # innermost, sees what the adapter is handed -- host middleware may put
+      # an Authorization on the request afterwards, and take it off the
+      # response environment again before anything reads it back. Without the
+      # recorder there is nothing to trust, and a result whose credentials
+      # are unknown is not an anonymous result (MCP 2026-07-28 caching:
+      # private results "MUST NOT be shared across authorization contexts").
+      # @return [Boolean]
+      def sent_authorization_known?
+        return true unless @faraday_config
+
+        @authorization_recorder_installed && request_authorization_recorded?
       end
 
       # Re-fetch a list that has gone stale, or serve the stale copy when the
@@ -487,14 +510,32 @@ module MCPClient
       end
 
       # Send a JSON-RPC request and parse its response, keeping the result
-      # bound to its own request: parsing an SSE-framed response dispatches
-      # the notifications it carries, and a callback may send a nested
-      # request on this thread, so the credentials, effective parameters and
-      # receipt time (taken before parsing) of the outer request are re-noted
-      # afterwards (MCP 2026-07-28 caching).
+      # bound to its own request.
+      #
+      # A request nested inside this one runs on this very thread and records
+      # credentials and parameters of its own: parsing an SSE-framed response
+      # dispatches the notifications it carries, and host middleware may send
+      # a request from the response phase, before this exchange has bound its
+      # result or failed. The exchange therefore holds its own record
+      # throughout ({MCPClient::RequestAuthorization#recording_one_exchange})
+      # and puts back the parameters its request was built with — however it
+      # ends, so a failed re-fetch is judged by what it carried itself
+      # (MCP 2026-07-28 caching).
       # @param request [Hash] the JSON-RPC request
       # @return [Object] the parsed result
       def exchange_jsonrpc(request, timeout: nil, extra_headers: {})
+        sent_params = recorded_request_params
+        recording_one_exchange do
+          perform_jsonrpc_exchange(request, timeout: timeout, extra_headers: extra_headers)
+        ensure
+          restore_request_params(sent_params)
+        end
+      end
+
+      # One exchange, from the POST to the parsed result.
+      # @param request [Hash] the JSON-RPC request
+      # @return [Object] the parsed result
+      def perform_jsonrpc_exchange(request, timeout: nil, extra_headers: {})
         clear_response_received_at if respond_to?(:clear_response_received_at, true)
         response = send_http_request(request, timeout: timeout, extra_headers: extra_headers)
         # When the innermost middleware had the response, not when the host's
@@ -513,11 +554,8 @@ module MCPClient
           result = parse_response(response, request)
         ensure
           # The outer request's own context, whatever a notification the
-          # response carried did on this thread — and whether or not the
-          # parse succeeded, so a failed re-fetch is judged by its own
-          # credentials and parameters.
+          # response carried did on this thread.
           restore_request_authorization(sent_authorization)
-          note_request_params(request['params'])
         end
         note_response_received_at(received_at) if received_at && respond_to?(:note_response_received_at, true)
         result
@@ -564,7 +602,10 @@ module MCPClient
       # strips it — and reading it back afterwards would file an authenticated
       # result under the anonymous context, where the next anonymous request
       # would be served Alice's private data. So the env answers only when
-      # nothing was recorded at all.
+      # nothing was recorded at all -- and what it answers binds nothing on a
+      # connection where the recorder could not be installed, which is the one
+      # case where a host's response phase had the environment first
+      # ({#sent_authorization_known?}).
       # @param response [Faraday::Response, nil]
       # @return [void]
       def note_sent_authorization(response)

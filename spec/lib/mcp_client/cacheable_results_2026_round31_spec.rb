@@ -145,17 +145,37 @@ RSpec.describe 'MCP 2026-07-28 cacheable results — round 31' do
       Thread.current[server.send(:response_received_key)] = 1.0
     end
 
+    # The slots a finished request leaves behind. The record of an exchange
+    # is not one of them: it exists only while an exchange is open, and is
+    # gone again the moment it ends (the example below cleans up inside one).
+    def settled_thread_slots(server)
+      exchanges = server.send(:exchange_records_key) if server.respond_to?(:exchange_records_key, true)
+      server.send(:transport_thread_local_keys) - [exchanges]
+    end
+
     %i[streamable http sse stdio].each do |kind|
       it "are all dropped by #{kind}'s cleanup" do
         server = build_transport(kind)
         fill_thread_slots(server)
-        expect(server.send(:transport_thread_local_keys).map { |key| Thread.current[key] }).to all(be_truthy)
+        expect(settled_thread_slots(server).map { |key| Thread.current[key] }).to all(be_truthy)
 
         server.cleanup
 
         # Every slot named after this transport, whatever its prefix.
         expect(Thread.current.keys.grep(/_#{server.object_id}\z/)).to be_empty
       end
+    end
+
+    it 'include the record of an exchange a host cleaned the transport up from inside' do
+      server = build_transport(:streamable)
+      key = server.send(:exchange_records_key)
+
+      server.send(:recording_one_exchange) do
+        expect(Thread.current[key]).not_to be_nil
+        server.cleanup
+      end
+
+      expect(Thread.current.keys.grep(/_#{server.object_id}\z/)).to be_empty
     end
 
     it 'include the authorization slot on HTTP+SSE, as on the other HTTP transports' do

@@ -5,6 +5,7 @@ require 'digest'
 require 'json'
 require 'zlib'
 require 'stringio'
+require_relative 'deep_copy'
 require_relative 'header_params'
 require_relative 'json_rpc_common/envelopes'
 require_relative 'json_rpc_common/error_bodies'
@@ -434,7 +435,15 @@ module MCPClient
         meta[META_LOG_LEVEL] = @log_level if defined?(@log_level) && @log_level && !meta.key?(META_LOG_LEVEL)
         meta.merge!(required_request_meta)
       end
-      params['_meta'] = meta
+      # The request carries a copy, never the host's own objects. `request_meta`
+      # is read from whatever the host keeps -- a string it may rewrite in
+      # place, a container it may add to -- and a merge is shallow, so a
+      # request built from it would otherwise go on changing after it was
+      # built: the body one fingerprint describes is not the body the next
+      # one does, and neither need be the body that was sent (MCP 2026-07-28
+      # server/utilities/caching: a result is bound to the parameters of the
+      # request that produced it).
+      params['_meta'] = MCPClient::DeepCopy.copy(meta)
       params
     end
 

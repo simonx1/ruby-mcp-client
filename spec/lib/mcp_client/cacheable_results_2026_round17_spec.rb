@@ -128,8 +128,10 @@ RSpec.describe 'MCP 2026-07-28 cacheable results — round 17' do
 
   it 'restores the outer request context when parsing the response raises' do
     server = streamable(headers: { 'Authorization' => 'Bearer alice' })
-    outer = { '_meta' => { 'tenant' => 'a' } }
-    request = { 'jsonrpc' => '2.0', 'id' => 7, 'method' => 'tools/list', 'params' => outer }
+    # Built the way a real caller builds one, which is where the parameters
+    # of the request being sent are recorded.
+    request = server.send(:build_jsonrpc_request, 'tools/list', { '_meta' => { 'tenant' => 'a' } }, 7)
+    outer = request['params']
     response = instance_double(Faraday::Response,
                                env: double('env', request_headers: { 'Authorization' => 'Bearer alice' }))
     allow(server).to receive(:send_http_request).and_return(response)

@@ -32,8 +32,7 @@ module MCPClient
     # @param authorization [String, nil] the Authorization header of the request
     # @return [void]
     def note_request_authorization(authorization)
-      Thread.current[request_authorization_key] =
-        authorization_fingerprint(authorization) || ANONYMOUS_AUTHORIZATION
+      file_request_authorization(authorization_fingerprint(authorization) || ANONYMOUS_AUTHORIZATION)
     end
 
     # Forget the header recorded before middleware ran: until the request is
@@ -41,7 +40,47 @@ module MCPClient
     # unknown, so no private stale copy can be served for it.
     # @return [void]
     def note_request_authorization_pending
-      Thread.current[request_authorization_key] = UNRECORDED_AUTHORIZATION
+      file_request_authorization(UNRECORDED_AUTHORIZATION)
+    end
+
+    # Run one exchange with a record of its own.
+    #
+    # A record is filed against the innermost exchange open on this thread,
+    # and when that exchange ends the record it made stands again — over
+    # anything a request nested inside it left behind. A host `on_complete`
+    # may send a request of its own, under credentials of its own, before the
+    # exchange it is nested in has bound its result or failed; the failing
+    # request must still be judged by what it carried itself (MCP 2026-07-28
+    # caching, cacheScope "private").
+    #
+    # A resend the exchange makes for itself — the one after a session
+    # restart — is not nested: it opens no exchange of its own, so its
+    # credentials are this exchange's, exactly as they were before.
+    # @yield the exchange
+    # @return [Object] the block's value
+    def recording_one_exchange
+      stack = (Thread.current[exchange_records_key] ||= [])
+      own = []
+      stack.push(own)
+      begin
+        yield
+      ensure
+        stack.pop
+        Thread.current[exchange_records_key] = nil if stack.empty?
+        # Written straight to the slot, never filed: this record is this
+        # exchange's, and filing it would make it the enclosing exchange's
+        # too — which is the very confusion the frame exists to prevent.
+        Thread.current[request_authorization_key] = own.first unless own.empty?
+      end
+    end
+
+    # @param record [String, Symbol, nil] the record to file for the request being sent
+    # @return [void]
+    def file_request_authorization(record)
+      Thread.current[request_authorization_key] = record
+      own = Thread.current[exchange_records_key]&.last
+      own&.replace([record])
+      nil
     end
 
     # The record this thread holds for the request it is sending, exactly as
@@ -57,7 +96,7 @@ module MCPClient
     # @param record [String, Symbol, nil] a record {#recorded_request_authorization} handed out
     # @return [void]
     def restore_request_authorization(record)
-      Thread.current[request_authorization_key] = record
+      file_request_authorization(record)
     end
 
     # @return [String, nil] the Authorization header of the request this thread last sent
@@ -78,6 +117,12 @@ module MCPClient
     # @return [Symbol] the thread-local key of this transport's request authorization
     def request_authorization_key
       :"mcp_client_request_authorization_#{object_id}"
+    end
+
+    # @return [Symbol] the thread-local key of the exchanges open on this
+    #   thread, innermost last
+    def exchange_records_key
+      :"mcp_client_exchange_records_#{object_id}"
     end
   end
 end

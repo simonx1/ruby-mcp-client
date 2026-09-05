@@ -7,6 +7,38 @@ metadata). Each feature lands in its own PR; this section accumulates them.
 
 ### Cacheable results (`ttlMs` / `cacheScope`)
 
+- **A result is bound to the parameters its own request went out with, not to
+  the ones the host holds by the time the answer is in (round 36).** The
+  host's `request_meta` was merged into `params._meta` shallowly, so a request
+  went on carrying the host's own objects — a tenant string, a container of
+  scope — and the parameters were fingerprinted again once the response had
+  been parsed. A host that rewrote either in place while the request was in
+  flight had Alice's read filed under Bob's tenant, and Bob was then handed her
+  contents without a wire read. A built request now carries a copy of the
+  metadata, and the exchange puts back the fingerprint taken when it was built
+  rather than deriving one from a request object anything may have touched
+  since.
+- **A failed re-fetch is judged by the credentials it carried, never by a
+  request sent on its behalf (round 36).** A stale list may be served when a
+  re-fetch fails, but only to the context the failed request itself went out
+  with. Two requests could restate that context on the same thread first: the
+  `notifications/cancelled` a legacy transport sends for a request it
+  abandoned, which goes out after it with whatever the host holds by then, and
+  a request a host `on_complete` nests inside an exchange that then fails
+  before returning. Either one left Bob's fingerprint standing when Alice's
+  refresh gave up, and Bob's private list answered her. A cancellation now
+  leaves the abandoned request's record alone, and an exchange holds a record
+  of its own throughout, so a nested request's credentials stay the nested
+  request's.
+- **A connection that cannot say what a request went out with caches nothing
+  privately reusable (round 36).** Installing the Authorization recorder can
+  fail — a `faraday_config` block that builds the stack itself locks it — and
+  the failure was swallowed. The transport then read the credentials back out
+  of the response environment, which the host's own middleware had already
+  redacted, and filed Alice's private read under the anonymous context, where
+  the next request carrying no token at all was served it. An entry whose
+  request nothing could record now belongs to no authorization context rather
+  than to the anonymous one, and is served to none.
 - **A result is bound to its own exchange, not to a request the response phase
   nested inside it (round 35).** The credentials and the receipt time of an
   HTTP exchange were both taken after `send_http_request` returned — after

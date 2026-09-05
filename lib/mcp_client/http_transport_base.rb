@@ -133,12 +133,25 @@ module MCPClient
 
     # Best-effort notifications/cancelled for a request the client stopped
     # waiting on. Failures are swallowed.
+    #
+    # It is sent for the abandoned request, on that request's own thread and
+    # after it, and it brings nothing back to cache: the credentials it
+    # carries are whatever the host holds by now -- a rotation, a refresh --
+    # and they must not stand in for the ones the abandoned request went out
+    # with, which are what its failure is judged by (MCP 2026-07-28 caching,
+    # cacheScope "private": a stale copy may be served only to the context
+    # the failed request itself carried).
     # @param request_id [Integer] id of the abandoned request
     # @return [void]
     def send_cancellation_notification(request_id)
       notif = build_jsonrpc_notification('notifications/cancelled',
                                          { 'requestId' => request_id, 'reason' => 'Request timed out' })
-      send_http_request(notif)
+      abandoned = recorded_request_authorization
+      begin
+        send_http_request(notif)
+      ensure
+        restore_request_authorization(abandoned)
+      end
     rescue StandardError => e
       @logger.debug("Failed to send cancellation notification: #{e.message}")
     end

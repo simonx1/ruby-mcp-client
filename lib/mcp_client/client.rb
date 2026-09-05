@@ -885,6 +885,7 @@ module MCPClient
         # An invalidation that landed while the fetch ran already replaced
         # these definitions; writing them back would undo it.
         next if generation && @tool_cache_generation != generation
+
         @cache_version += 1
         drop_cached_entries(cache, server)
         # This server's slice now stands for its whole list, empty or not.

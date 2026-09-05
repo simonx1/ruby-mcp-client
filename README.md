@@ -942,7 +942,10 @@ the request that produced it did:
   `request_meta` and its `baggage`, the client identity and capabilities) is
   part of what a result is bound to, whatever its scope: `"public"` permits
   sharing across callers, not across parameters a server may vary its answer
-  by.
+  by. A request carries a copy of that metadata, taken when it is built, so
+  rewriting a string or a container you handed `request_meta` in place does
+  not change what a request already sent means — set `request_meta` to the new
+  value instead, and the next request carries it.
 
 Anything the transport cannot read off its own configuration makes those
 unknowable, and reuse is then turned off rather than guessed at. Middleware of

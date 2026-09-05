@@ -206,9 +206,25 @@ module MCPClient
     # @param entry [MCPClient::CachedResult]
     # @return [MCPClient::CachedResult] the same entry, bound to the current request's context
     def bind_authorization_context(entry)
-      entry.authorization_context = request_authorization_context if respond_to?(:request_authorization_context, true)
+      if respond_to?(:request_authorization_context, true)
+        # An entry whose request nothing could record belongs to no context
+        # rather than to the anonymous one: the two are the same `nil`, and
+        # filing an authenticated result as anonymous is what hands it to the
+        # next caller who sends no credentials at all.
+        entry.authorization_context =
+          sent_authorization_known? ? request_authorization_context : MCPClient::CachedResult::UNKNOWN_CONTEXT
+      end
       entry.params_fingerprint = request_params_fingerprint if respond_to?(:request_params_fingerprint, true)
       entry
+    end
+
+    # Whether what the request behind an entry went out with is known at all.
+    # A transport that applies its own headers and nothing else always knows;
+    # {MCPClient::HttpTransportBase::CacheSupport} answers for a connection
+    # carrying host middleware.
+    # @return [Boolean]
+    def sent_authorization_known?
+      true
     end
 
     # @return [Boolean] whether an absent ttlMs means "immediately stale" (2026-07-28 servers)
@@ -356,7 +372,7 @@ module MCPClient
     def transport_thread_local_keys
       %i[served_entries_key recorded_entries_key response_received_key
          request_params_key round_trip_marker_key request_authorization_key
-         called_tool_definition_key]
+         exchange_records_key called_tool_definition_key]
         .select { |name| respond_to?(name, true) }
         .map { |name| send(name) }
     end
@@ -552,7 +568,11 @@ module MCPClient
     # @return [Boolean] whether a privately scoped entry belongs to the context being served
     def entry_matches_authorization?(entry, context, kind)
       return true unless entry&.cache_scope == 'private' && respond_to?(:current_authorization_context, true)
-      return false if entry.authorization_context.equal?(MCPClient::CachedResult::MIXED_CONTEXT)
+      # An entry that belongs to no context matches none: a private list
+      # whose pages were fetched under different credentials, or one whose
+      # request nothing could record. Both are sentinels rather than a
+      # header, so neither can be equal to a context being served.
+      return false unless entry.authorization_context.nil? || entry.authorization_context.is_a?(String)
 
       context = current_authorization_context(kind) if context == :current
       entry.authorization_context == context

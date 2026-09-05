@@ -36,6 +36,24 @@ module MCPClient
       Thread.current[request_params_key]
     end
 
+    # The fingerprint this thread holds, exactly as it stands — never the
+    # transport's reading of it. Taken when an exchange starts and put back
+    # when it ends ({MCPClient::HttpTransportBase::CacheSupport#exchange_jsonrpc}):
+    # a request nested inside it notes parameters of its own, and the host
+    # may go on rewriting the metadata it handed the transport while the
+    # response is on its way back. A fingerprint is taken when the request is
+    # built, so what it describes is the request as sent.
+    # @return [String, Symbol, nil]
+    def recorded_request_params
+      Thread.current[request_params_key]
+    end
+
+    # @param record [String, Symbol, nil] a record {#recorded_request_params} handed out
+    # @return [void]
+    def restore_request_params(record)
+      Thread.current[request_params_key] = record
+    end
+
     # Marks an attempt that has not built its request yet: the parameters
     # of the previous request on this thread say nothing about it.
     UNRECORDED_PARAMS = :unrecorded

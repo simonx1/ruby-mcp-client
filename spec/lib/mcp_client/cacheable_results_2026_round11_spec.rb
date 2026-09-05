@@ -123,12 +123,25 @@ RSpec.describe 'MCP 2026-07-28 cacheable results — round 11' do
       server&.cleanup
     end
 
-    it 'records a fresh templates hint on a fresh plain HTTP transport' do
-      stub_reads([])
+    it 'serves the templates it bounded on a fresh plain HTTP transport' do
+      lists = 0
+      stub_request(:post, url).to_return do |request|
+        body = JSON.parse(request.body)
+        next json_response(body['id'], discover_result) unless body['method'] == 'resources/templates/list'
+
+        lists += 1
+        json_response(body['id'],
+                      { 'resourceTemplates' => [{ 'uriTemplate' => 'file:///{p}', 'name' => 't' }],
+                        'ttlMs' => 60_000 })
+      end
       server = MCPClient::ServerHTTP.new(base_url: 'https://example.com', endpoint: '/mcp', retries: 0)
 
-      server.list_resource_templates
+      expect(server.list_resource_templates['resourceTemplates'].map(&:name)).to eq(['t'])
+      # Recording the hint is not serving from it: the second listing must be
+      # answered from the entry, without a request of its own.
+      expect(server.list_resource_templates['resourceTemplates'].map(&:name)).to eq(['t'])
 
+      expect(lists).to eq(1)
       expect(server.cache_info(:templates)[:fresh]).to be(true)
     ensure
       server&.cleanup
