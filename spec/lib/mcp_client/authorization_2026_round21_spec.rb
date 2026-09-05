@@ -60,14 +60,26 @@ RSpec.describe 'MCP 2026-07-28 authorization — round 21' do
     expect(provider.access_token&.access_token).to eq('soon')
   end
 
+  # Without client credentials the refresh exits before it ever reaches the
+  # token endpoint, and the example would pass on a code path that has
+  # nothing to do with a failing refresh. The registration is seeded, and the
+  # request the refresh makes is asserted.
   it 'still returns nil for an expired token whose refresh fails' do
     storage = MCPClient::Auth::OAuthProvider::MemoryStorage.new
     storage.set_server_metadata(server_url, as_meta(issuer: 'https://auth.example.com'))
+    storage.set_client_info(server_url, MCPClient::Auth::ClientInfo.new(
+                                          client_id: 'c', registration_type: 'pre_registered',
+                                          issuer: 'https://auth.example.com',
+                                          metadata: MCPClient::Auth::ClientMetadata.new(
+                                            redirect_uris: ['http://localhost:1/cb']
+                                          )
+                                        ))
     storage.set_token(server_url, MCPClient::Auth::Token.new(access_token: 'gone', expires_in: 0, refresh_token: 'r',
                                                              issuer: 'https://auth.example.com'))
-    stub_request(:post, 'https://auth.example.com/token').to_return(status: 503)
+    refresh = stub_request(:post, 'https://auth.example.com/token').to_return(status: 503)
     provider = provider_with(storage)
 
     expect(provider.access_token).to be_nil
+    expect(refresh).to have_been_requested
   end
 end

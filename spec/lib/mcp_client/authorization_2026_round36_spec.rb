@@ -181,16 +181,28 @@ RSpec.describe 'MCP 2026-07-28 authorization — round 36' do
         .to raise_error(MCPClient::Errors::ConnectionError)
     end
 
+    # `all(be_valid_encoding)` is satisfied by an empty Hash, so the names and
+    # the decoded values are asserted: every parameter survives, each
+    # undecodable byte becomes one replacement character, and the readable
+    # bytes around it are still there.
     it 'decodes a callback query string into text nothing downstream can choke on' do
       browser = MCPClient::Auth::BrowserOAuth.new(provider_for, callback_port: 1, callback_path: '/cb',
                                                                 logger: logger)
       params = browser.send(:parse_query_params, 'code=%FFabc&state=%FE&error_description=%FF%FE')
 
+      expect(params.keys).to contain_exactly('code', 'state', 'error_description')
+      expect(params['code']).to eq('?abc')
+      expect(params['state']).to eq('?')
+      expect(params['error_description']).to eq('??')
       expect(params.keys).to all(be_valid_encoding)
       expect(params.values).to all(be_valid_encoding)
     end
 
-    it 'completes a callback whose code and state carry undecodable bytes' do
+    # "Completes" here means the callback is ANSWERED, not that the
+    # authorization succeeded: the scrubbed state matches no pending flow, so
+    # the browser is told why rather than left hanging on a raised
+    # ArgumentError.
+    it 'answers a callback whose code and state carry undecodable bytes with an error' do
       store_pending_flow
       browser = MCPClient::Auth::BrowserOAuth.new(provider_for, callback_port: 1, callback_path: '/cb',
                                                                 logger: logger)

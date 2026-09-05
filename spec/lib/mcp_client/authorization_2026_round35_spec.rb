@@ -622,11 +622,14 @@ RSpec.describe 'MCP 2026-07-28 authorization — round 35' do
   describe 'a redirect URI a callback could never arrive on' do
     let(:unusable) do
       ['javascript:alert(1)', 'http:', 'https:', 'mailto:someone@example.com', 'data:text/html,<b>x</b>',
-       'file:///cb', 'javascript:/alert(1)', '//example.com/cb', 'urn:ietf:wg:oauth:2.0:oob']
+       'file:///cb', 'javascript:/alert(1)', '//example.com/cb', 'urn:ietf:wg:oauth:2.0:oob',
+       # MCP 2026-07-28 "Communication Security": every redirect URI is
+       # localhost or HTTPS, so plain HTTP anywhere else is not one.
+       'http://app.example.com/callback', 'http://10.0.0.1/callback']
     end
     let(:usable) do
       ['http://localhost:1/cb', 'https://app.example.com/callback', 'http://127.0.0.1:8080/callback',
-       'com.example.app:/oauth2/callback']
+       'http://[::1]:8080/callback', 'com.example.app:/oauth2/callback', 'com.example.app://oauth']
     end
 
     it 'is not a usable redirect URI' do

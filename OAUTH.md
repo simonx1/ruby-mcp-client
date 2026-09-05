@@ -114,11 +114,13 @@ The implementation follows the standard OAuth 2.1 authorization code flow with P
      reported registration failure, not a `NoMethodError` — and a `redirect_uris` the server omits or
      echoes back empty falls back to the redirect URI the registration asked for.
    - An array of strings is not yet an array of redirect URIs: every element must be one a callback
-     could actually arrive on — an `http`/`https` URL with a host (the loopback server `BrowserOAuth`
-     runs, or a hosted callback) or an RFC 8252 §7.1 private-use scheme with a path
-     (`com.example.app:/oauth2redirect`), and in neither case a fragment (RFC 6749 §3.1.2). So
-     `{"redirect_uris": [""]}`, `["/cb"]`, `["javascript:alert(1)"]`, `["data:text/html,…"]` and
-     `["http:"]` are a reported registration failure rather than a browser opened at them.
+     could actually arrive on AND one MCP 2026-07-28 allows ("All redirect URIs MUST be either
+     `localhost` or use HTTPS") — an HTTPS URL with a host, a plain-HTTP URL on the loopback
+     interface (the callback server `BrowserOAuth` runs), or an RFC 8252 §7.1 private-use scheme
+     (`com.example.app:/oauth2redirect`, `com.example.app://oauth`), and in no case a fragment (RFC
+     6749 §3.1.2). So `{"redirect_uris": [""]}`, `["/cb"]`, `["javascript:alert(1)"]`,
+     `["data:text/html,…"]`, `["http:"]` and `["http://app.example.com/cb"]` are a reported
+     registration failure rather than a browser opened at them.
    - The registered `token_endpoint_auth_method` is what the client then authenticates with. RFC 7591
      §2 makes `client_secret_basic` the default, so a registration response that issues a
      `client_secret` and names no method is recorded as a confidential client using it — not as
@@ -144,6 +146,19 @@ The implementation follows the standard OAuth 2.1 authorization code flow with P
      copy is written the first time a record is used or stored. When an authorization server change
      discards the registration in use, the per-issuer record is deliberately kept — that registration
      is still valid at the server that made it.
+
+     The resource-URL slot is the slot a host writes to, so it wins over the per-issuer copy whenever
+     the authorization server in use can be asked to accept what it holds: a client secret rotated
+     there is used by the next authorization request *and* by the next refresh, rather than being
+     overruled by the older copy. The one exception is a portable Client ID Metadata Document id,
+     which answers for every authorization server: credentials pre-registered with the server in use
+     come first, as the MCP client registration priority order says they should.
+
+     The write to that slot is the one a flow depends on — `complete_authorization_flow` reads it to
+     redeem the code — so a backend that cannot persist it raises a `ConnectionError` before the
+     browser is opened, instead of returning an authorization URL whose callback then reports
+     "Missing PKCE or client info" after the user has already consented. The per-issuer copy stays
+     best-effort: a backend that refuses that key logs at debug and the flow continues.
 3. **Authorization**: Redirect user to authorization server with PKCE parameters
    - The authorization endpoint's own query string is retained and the authorization parameters are
      appended to it (RFC 6749 §3.1), so an endpoint of `https://as.example/authorize?tenant=acme`
@@ -156,8 +171,8 @@ The implementation follows the standard OAuth 2.1 authorization code flow with P
    - Every other field is read against the type RFC 6749 Section 5.1 gives it: `expires_in` is an
      integer and `scope` a string. A field of any other type fails the exchange with the same
      `ConnectionError`, so `token_type: ["Bearer"]` never reaches the `Authorization` header and
-     `expires_in: "3600"` never reaches a `Time`. A `null` field reads as an absent one
-     (`token_type` still defaults to `Bearer`).
+     `expires_in: "3600"` never reaches a `Time`. A `null` field reads as an absent one — including
+     `token_type`, which is REQUIRED and therefore fails the response either way.
    - `access_token` and `token_type` must carry bytes an HTTP header can hold: both are non-empty
      strings free of control characters, so a token containing CR/LF (`"fresh\r\nX-Injected: 1"`)
      is refused instead of being stored and split into two header lines.
@@ -168,8 +183,11 @@ The implementation follows the standard OAuth 2.1 authorization code flow with P
      present a credential in a way its authorization server never authorized. Such a response fails
      the exchange with a `ConnectionError` and fails a refresh (keeping the still-valid token), and a
      stored record of such a type presents no token at all. The comparison is case-insensitive
-     (`bearer`, `BEARER`), and an **absent** `token_type` still reads as the `Bearer` this client
-     asked for.
+     (`bearer`, `BEARER`). An **absent** `token_type` is refused too: RFC 6749 §5.1 makes it REQUIRED
+     and defines no default — "Bearer" is one value it may carry (RFC 6750), not what its absence
+     means — and §7.1 forbids using a token whose type the client does not understand, which a client
+     that was told no type does not. So `200 {"access_token": "x"}` fails the exchange and fails a
+     refresh (keeping the still-valid token) rather than going out as `Authorization: Bearer x`.
    - `refresh_token` is a credential too, so it is bytes or nothing: `refresh_token: ""` fails the
      response rather than being persisted over the refresh token the client already holds.
    - A confidential client presents its credentials the way the authorization server registered them:
@@ -277,6 +295,13 @@ class DatabaseTokenStorage
   # get_server_metadata, set_server_metadata
   # get_pkce, set_pkce, delete_pkce
   # get_state, set_state, delete_state
+  #
+  # The PKCE record is the per-request record of one authorization request:
+  # it carries the code verifier, the expected issuer, the client id, the
+  # redirect URI and the `state` (MCP 2026-07-28). set_state/get_state keep
+  # answering as before, but the state is checked against the PKCE record
+  # too, so a backend must round-trip the record's fields (Hash-persisting
+  # backends get them from PKCE#to_h) rather than only the verifier.
 
   # Optional (MCP 2026-07-28): called when the authorization server behind
   # a resource changes, since a token from the previous one must not be
@@ -428,20 +453,35 @@ This implementation follows OAuth 2.1 security best practices:
   a `Hash` takes the last, other parsers take the first. `BrowserOAuth` refuses a callback that
   repeats any parameter, so `?iss=attacker&iss=recorded` (or a repeated `state` or `code`) is an
   error page rather than a flow that validates the recorded value and acts on the attacker's
-- **An access token is only ever presented as the type it was issued as**: `token_type` must be
-  `Bearer` (RFC 6749 §7.1 — "the client MUST NOT use an access token if it does not understand the
-  token type"), so a `DPoP` or `mac` token is refused where it is issued and where it is read back
+- **An access token is only ever presented as the type it was issued as**: `token_type` is REQUIRED
+  (RFC 6749 §5.1, which defines no default) and must be `Bearer` (§7.1 — "the client MUST NOT use an
+  access token if it does not understand the token type"), so a `DPoP` or `mac` token — and a
+  response that names no type at all — is refused where it is issued and where it is read back
   instead of going out as a bearer credential without the proof its type requires
-- **A refresh is re-checked against the authorization server in use when its response arrives**, not
-  only when it is sent, so a response that crosses an authorization server change is neither
-  presented nor written over the token of the server now in use
+- **A refresh and a code exchange are both re-checked against the authorization server in use when
+  the response arrives**, not only when the request is sent, so a response that crosses an
+  authorization server change is neither presented nor written over the token of the server now in
+  use — and a late code exchange no longer deletes the pending authorization request another flow
+  started meanwhile
+- **An authorization request is one record**: the `state`, the PKCE verifier, the expected issuer,
+  the client id and the redirect URI are stored together (MCP 2026-07-28 requires the issuer to be
+  associated with "the same per-request record used to store the PKCE code verifier (and the `state`
+  value, if used)"), and the callback's `state` is checked against that record — so two flows sharing
+  one storage backend cannot interleave their writes until one flow's state names the other's request
+- **Scopes accumulate across step-ups**: re-authorizing after an `insufficient_scope` challenge asks
+  for the union of the scopes already requested and the ones the challenge names, so acquiring
+  `files:write` does not give up `files:read`
 - **Credentials never reach a log** at any level: the `Authorization` header is not logged even
   truncated, and the browser callback logs the request path without the query string that carries
   `code=`
-- **A redirect URI must be one a callback can arrive on**: an `http`/`https` URL with a host, or an
-  RFC 8252 §7.1 private-use scheme with a path, and never with a fragment (RFC 6749 §3.1.2) — so a
-  dynamic registration cannot send the browser to `javascript:alert(1)`, `data:text/html,…` or a
-  bare `http:`
+- **A redirect URI must be one a callback can arrive on, and one MCP allows**: an HTTPS URL with a
+  host, a plain-HTTP URL on the loopback interface, or an RFC 8252 §7.1 private-use scheme
+  (`com.example.app:/cb`, `com.example.app://cb`), and never with a fragment (RFC 6749 §3.1.2) — so a
+  dynamic registration cannot send the browser to `javascript:alert(1)`, `data:text/html,…`, a bare
+  `http:`, or `http://app.example.com/callback`, which MCP 2026-07-28 "Communication Security"
+  forbids ("All redirect URIs MUST be either `localhost` or use HTTPS"). The same rule applies to the
+  `redirect_uri` the provider is configured with, which now raises an `ArgumentError` rather than
+  being registered
 - **Client credentials go out the way they were registered**: `client_secret_basic` (RFC 7591's
   default when a registration names no method) in an `Authorization: Basic` header, form-urlencoded
   before base64 (RFC 6749 §2.3.1); `client_secret_post` in the body; nothing for a public client or

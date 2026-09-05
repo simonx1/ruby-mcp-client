@@ -43,9 +43,13 @@ RSpec.describe 'MCP 2026-07-28 authorization — round 10' do
     expect(MCPClient::Auth::PKCE.from_h(storage.get_pkce(server_url).to_h).client_id).to eq('pre-registered')
   end
 
+  # The client id is deliberately UNCHANGED: with a different one the
+  # preceding identity check refuses the record on its own, and the issuer
+  # guard is never exercised. Two authorization servers can issue the same
+  # client id, and only the issuer recorded with the request tells them apart.
   it 'refuses to redeem the code with credentials bound to another authorization server' do
     provider, state = started_flow
-    storage.set_client_info(server_url, client_info(client_id: 'other', client_secret: 'other-secret',
+    storage.set_client_info(server_url, client_info(client_id: 'pre-registered', client_secret: 'other-secret',
                                                     issuer: 'https://other.example.com'))
     token_endpoint = stub_request(:post, 'https://auth.example.com/token')
 

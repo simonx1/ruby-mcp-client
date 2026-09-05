@@ -174,24 +174,36 @@ RSpec.describe 'MCP 2026-07-28 authorization — round 33' do
 
       it 'accepts a response that omits the optional fields' do
         stub_request(:post, token_endpoint)
-          .to_return(status: 200, headers: json, body: { 'access_token' => 'fresh' }.to_json)
+          .to_return(status: 200, headers: json,
+                     body: { 'access_token' => 'fresh', 'token_type' => 'Bearer' }.to_json)
         provider = provider_for
 
         expect(provider.access_token&.access_token).to eq('fresh')
         expect(authorization_header_for(provider)).to eq('Bearer fresh')
       end
 
-      # A JSON null says the same thing as an absent member; the defaults an
-      # omitted field gets still apply.
+      # A JSON null says the same thing as an absent member: the OPTIONAL
+      # fields keep the defaults an omitted field gets, and the REQUIRED
+      # token_type is missing either way (RFC 6749 Section 5.1).
       it 'treats a null optional field as an absent one' do
         stub_request(:post, token_endpoint)
           .to_return(status: 200, headers: json,
-                     body: { 'access_token' => 'fresh', 'token_type' => nil, 'expires_in' => nil,
+                     body: { 'access_token' => 'fresh', 'token_type' => 'Bearer', 'expires_in' => nil,
                              'refresh_token' => nil, 'scope' => nil }.to_json)
         provider = provider_for
 
         expect(provider.access_token&.access_token).to eq('fresh')
         expect(authorization_header_for(provider)).to eq('Bearer fresh')
+      end
+
+      it 'refuses a null token_type exactly as an absent one' do
+        stub_request(:post, token_endpoint)
+          .to_return(status: 200, headers: json,
+                     body: { 'access_token' => 'fresh', 'token_type' => nil }.to_json)
+        provider = provider_for
+
+        expect(provider.access_token&.access_token).to eq('still-valid')
+        expect(storage.get_token(server_url).access_token).to eq('still-valid')
       end
     end
 

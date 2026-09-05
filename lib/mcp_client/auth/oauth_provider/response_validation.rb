@@ -35,6 +35,20 @@ module MCPClient
         # Where the token response's field types are specified.
         TOKEN_RESPONSE_REFERENCE = 'RFC 6749 Section 5.1'
 
+        # RFC 6749 Section 5.1 makes BOTH access_token and token_type REQUIRED
+        # in a successful token response, and defines no default for either:
+        # "Bearer" is one value token_type may carry (RFC 6750), not what its
+        # absence means. A response that names no type says nothing about how
+        # the credential it carries may be presented, and RFC 6749 Section
+        # 7.1 is explicit that "the client MUST NOT use an access token if it
+        # does not understand the token type" — which a client that was told
+        # no type does not. So an omitted type is refused exactly as an
+        # omitted access_token is, and exactly as the DPoP and MAC types this
+        # client cannot present are, rather than guessed at and sent out
+        # behind `Authorization: Bearer`. (access_token has a check of its
+        # own, {#issued_access_token?}, which also asks for usable bytes.)
+        REQUIRED_TOKEN_RESPONSE_FIELDS = %w[token_type].freeze
+
         # Where the registration response's field types are specified.
         REGISTRATION_RESPONSE_REFERENCE = 'RFC 7591 Section 3.2.1'
 
@@ -44,9 +58,9 @@ module MCPClient
         # can carry: an empty string is no more usable than a JSON array, and
         # a CR or an LF would not be part of the value at all but the start of
         # another header line. token_type must moreover name a type this
-        # client can present (see {SUPPORTED_TOKEN_TYPE}); an absent one is
-        # the "Bearer" this client asked for and RFC 6749 Section 5.1
-        # describes. refresh_token is OPTIONAL but is a credential
+        # client can present (see {SUPPORTED_TOKEN_TYPE}), and it is REQUIRED:
+        # see {REQUIRED_TOKEN_RESPONSE_FIELDS}.
+        # refresh_token is OPTIONAL but is a credential
         # too: bytes or nothing, because "" would be persisted over the
         # refresh token the client already holds. scope is free text.
         # Fields the RFC does not name are ignored: an authorization server
@@ -189,7 +203,9 @@ module MCPClient
             return "the token response carries no access_token (#{TOKEN_RESPONSE_REFERENCE})"
           end
 
-          mistyped_field_error(data, TOKEN_RESPONSE_FIELDS, 'token response', TOKEN_RESPONSE_REFERENCE)
+          missing_field_error(data, REQUIRED_TOKEN_RESPONSE_FIELDS, 'token response',
+                              TOKEN_RESPONSE_REFERENCE) ||
+            mistyped_field_error(data, TOKEN_RESPONSE_FIELDS, 'token response', TOKEN_RESPONSE_REFERENCE)
         end
 
         # Why a parsed client registration response registers no client, if it
@@ -352,11 +368,12 @@ module MCPClient
         # the page instead of delivering a code anywhere; a bare `http:` has
         # one and no host to deliver to. So an array of strings registers
         # redirect URIs only when every element is one a callback could
-        # actually arrive on: an http(s) URL with a host (the loopback server
-        # {MCPClient::Auth::BrowserOAuth} runs, or a hosted callback), or an
-        # RFC 8252 Section 7.1 private-use scheme the host application
-        # registered with the operating system — and, either way, without the
-        # fragment RFC 6749 Section 3.1.2 forbids.
+        # actually arrive on AND one MCP 2026-07-28 allows: an HTTPS URL with
+        # a host, a plain-HTTP URL on the loopback interface (the callback
+        # server {MCPClient::Auth::BrowserOAuth} runs), or an RFC 8252
+        # Section 7.1 private-use scheme the host application registered with
+        # the operating system — and, either way, without the fragment RFC
+        # 6749 Section 3.1.2 forbids.
         # @param value [Object, nil] a candidate redirect URI
         # @return [Boolean]
         def redirect_uri_bytes?(value)
@@ -365,24 +382,46 @@ module MCPClient
           uri = URI.parse(value)
           scheme = uri.scheme.to_s.downcase
           return false unless uri.fragment.nil?
-          return !uri.host.to_s.empty? if CALLBACK_SCHEMES.include?(scheme)
+          return allowed_callback_url?(uri, scheme) if CALLBACK_SCHEMES.include?(scheme)
 
           private_use_redirect_uri?(uri, scheme)
         rescue URI::InvalidURIError
           false
         end
 
+        # MCP 2026-07-28 "Communication Security": "All redirect URIs MUST be
+        # either `localhost` or use HTTPS." Plain HTTP is the exception the
+        # loopback interface gets — the code never leaves the machine — and
+        # `http://app.example.com/callback` is not that exception: it carries
+        # the authorization code, and the authorization server's own error
+        # text, across the network in the clear.
+        # @param uri [URI::Generic] the parsed redirect URI
+        # @param scheme [String] its downcased scheme
+        # @return [Boolean]
+        def allowed_callback_url?(uri, scheme)
+          return false if uri.host.to_s.empty?
+          return true if scheme == 'https'
+
+          loopback_address?(uri.hostname.to_s)
+        end
+
         # RFC 8252 Section 7.1: a native application may receive its callback
         # on a private-use URI scheme, "a scheme based on a domain name under
         # their control, expressed in reverse order"
-        # (`com.example.app:/oauth2redirect`). Such a URI is hierarchical — it
-        # has a path, not an opaque body — which is what separates it from the
-        # `javascript:` and `data:` URIs that are not redirect targets at all.
+        # (`com.example.app:/oauth2redirect`, and the `com.example.app://oauth`
+        # authority spelling operating systems and SDKs also register). Such a
+        # URI is hierarchical — it has a path or an authority, not an opaque
+        # body — which is what separates it from the `javascript:` and `data:`
+        # URIs that are not redirect targets at all. The callback never leaves
+        # the device, so the localhost-or-HTTPS requirement that governs the
+        # network schemes does not reach it.
         # @param uri [URI::Generic] the parsed redirect URI
         # @param scheme [String] its downcased scheme
         # @return [Boolean]
         def private_use_redirect_uri?(uri, scheme)
-          scheme.include?('.') && uri.opaque.nil? && uri.path.to_s.start_with?('/')
+          return false unless scheme.include?('.') && uri.opaque.nil?
+
+          uri.path.to_s.start_with?('/') || !uri.host.to_s.empty?
         end
 
         # @param value [Object, nil] a candidate client id

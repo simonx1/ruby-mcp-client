@@ -434,14 +434,20 @@ RSpec.describe 'MCP 2026-07-28 authorization — verification pass' do
       end
     end
 
-    it 'still treats an omitted token_type as the bearer type RFC 6749 defaults it to' do
+    # RFC 6749 Section 5.1 makes token_type REQUIRED and gives it no default,
+    # and Section 7.1 forbids using a token whose type the client does not
+    # understand — which is exactly what a response that names no type leaves
+    # this client. So an omitted type is a failed refresh, not a bearer token
+    # by assumption: the still-valid token stays.
+    it 'refuses an omitted token_type rather than assuming the bearer type' do
       store_refreshable_token
       stub_request(:post, "#{issuer_a}/token")
         .to_return(status: 200, headers: json, body: { 'access_token' => 'fresh' }.to_json)
       provider = provider_for
 
-      expect(provider.access_token&.access_token).to eq('fresh')
-      expect(authorization_header_for(provider)).to eq('Bearer fresh')
+      expect(provider.access_token&.access_token).to eq('token-a')
+      expect(authorization_header_for(provider)).to eq('Bearer token-a')
+      expect(log_output.string).to match(/token_type/)
     end
   end
 end
