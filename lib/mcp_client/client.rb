@@ -24,25 +24,38 @@ module MCPClient
     # Requests with a mode outside this set are rejected with -32602.
     SUPPORTED_ELICITATION_MODES = %w[form url].freeze
 
-    # @!attribute [r] servers
-    #   @return [Array<MCPClient::ServerBase>] list of servers
-    # @!attribute [r] tool_cache
-    #   @return [Hash<String, MCPClient::Tool>] cache of tools by composite key (server_id:name)
-    # @!attribute [r] prompt_cache
-    #   @return [Hash<String, MCPClient::Prompt>] cache of prompts by composite key (server_id:name)
-    # @!attribute [r] resource_cache
-    #   @return [Hash<String, MCPClient::Resource>] cache of resources by composite key (server_id:uri)
-    # @!attribute [r] logger
-    #   @return [Logger] logger for client operations
-    # @!attribute [r] roots
-    #   @return [Array<MCPClient::Root>] list of MCP roots (MCP 2025-06-18)
-    #   @deprecated Roots is deprecated since MCP 2026-07-28 (SEP-2577); earliest
-    #     removal is the first revision released on or after 2027-07-28. Reading the
-    #     list is not itself a first use of the feature — the notice follows
-    #     configuring a root or serving one — but the list is a deprecated feature's
-    #     state, and a host reading it is holding one. Pass directories or files
-    #     through tool parameters, resource URIs or server configuration instead.
-    attr_reader :servers, :tool_cache, :prompt_cache, :resource_cache, :logger, :roots
+    # These readers are declared one per line with an ordinary doc comment
+    # rather than grouped under `@!attribute` directives, because the directive
+    # form loses documentation silently: YARD drops the docstring of the LAST
+    # directive in a block preceding a combined `attr_reader`, re-registering
+    # that name from the statement itself with the leftover (empty) docstring.
+    # The `roots` deprecation below was absent from the generated API
+    # documentation for exactly that reason, while every check that read the
+    # source found it.
+
+    # @return [Array<MCPClient::ServerBase>] list of servers
+    attr_reader :servers
+
+    # @return [Hash<String, MCPClient::Tool>] cache of tools by composite key (server_id:name)
+    attr_reader :tool_cache
+
+    # @return [Hash<String, MCPClient::Prompt>] cache of prompts by composite key (server_id:name)
+    attr_reader :prompt_cache
+
+    # @return [Hash<String, MCPClient::Resource>] cache of resources by composite key (server_id:uri)
+    attr_reader :resource_cache
+
+    # @return [Logger] logger for client operations
+    attr_reader :logger
+
+    # @return [Array<MCPClient::Root>] list of MCP roots (MCP 2025-06-18)
+    # @deprecated Roots is deprecated since MCP 2026-07-28 (SEP-2577); earliest
+    #   removal is the first revision released on or after 2027-07-28. Reading the
+    #   list is not itself a first use of the feature — the notice follows
+    #   configuring a root or serving one — but the list is a deprecated feature's
+    #   state, and a host reading it is holding one. Pass directories or files
+    #   through tool parameters, resource URIs or server configuration instead.
+    attr_reader :roots
 
     # Supported modes for structuredContent validation (MCP 2025-11-25):
     # :warn logs a warning on mismatch, :strict raises a ValidationError.

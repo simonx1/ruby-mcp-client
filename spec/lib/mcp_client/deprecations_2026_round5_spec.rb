@@ -57,6 +57,76 @@ RSpec.describe 'MCP 2026-07-28 deprecations (round 5)' do
     end
   end
 
+  # `level` is host code, and the notice asks for it BEFORE it writes. A host
+  # whose accessor reaches back into a deprecated feature therefore re-enters
+  # the notice on a path the reentrancy guard has to cover too: a guard that
+  # only wraps `logger.warn` leaves the probe recursing until the stack ends,
+  # and a SystemStackError is not a StandardError, so it escapes the rescue
+  # that exists to keep the deprecated operation working.
+  describe 'a logger whose level accessor re-enters a deprecated feature' do
+    # A `level` accessor that uses Roots, as a formatter, a log subscriber or
+    # an audit hook reading the client's configuration would.
+    def reentrant_logger(io)
+      Class.new(Logger) do
+        attr_accessor :client
+
+        def level
+          @client&.roots = []
+          super
+        end
+      end.new(io)
+    end
+
+    it 'still sets the roots, and lets the nested notice stand down' do
+      broken = reentrant_logger(output)
+      client = MCPClient::Client.new(mcp_server_configs: [], logger: broken)
+      broken.client = client
+
+      expect { client.roots = [{ uri: 'file:///workspace', name: 'Workspace' }] }.not_to raise_error
+      expect(client.roots.map(&:uri)).to eq(['file:///workspace'])
+    end
+
+    it 'writes the notice exactly once, from the outermost use' do
+      broken = reentrant_logger(output)
+      client = MCPClient::Client.new(mcp_server_configs: [], logger: broken)
+      broken.client = client
+
+      client.roots = [{ uri: 'file:///workspace', name: 'Workspace' }]
+
+      expect(output.string.scan(/Roots .*deprecated/).size).to eq(1)
+    end
+  end
+
+  # A standard ::Logger whose device was closed swallows the write failure
+  # inside Logger::LogDevice (it rescues and reports through Kernel#warn), so
+  # `logger.warn` returns as if it had written. Counting that as the notice
+  # spends the process's one notice on a line nobody can read, and silences
+  # every later use — including one holding a logger that does write.
+  describe 'a standard logger whose device is closed' do
+    let(:closed_logger) do
+      Logger.new(StringIO.new).tap(&:close)
+    end
+
+    it 'declines the notice without spending it' do
+      expect(MCPClient::Deprecations.warn(:roots, closed_logger)).to be(false)
+      expect(MCPClient::Deprecations.emitted?(:roots)).to be(false)
+    end
+
+    it 'leaves the notice owed, so a working logger still writes it' do
+      MCPClient::Deprecations.warn(:roots, closed_logger)
+
+      expect(MCPClient::Deprecations.warn(:roots, logger)).to be(true)
+      expect(output.string).to match(/Roots .*deprecated/)
+    end
+
+    it 'keeps serving the deprecated feature' do
+      client = MCPClient::Client.new(mcp_server_configs: [], logger: closed_logger)
+
+      expect { client.roots = [{ uri: 'file:///workspace', name: 'Workspace' }] }.not_to raise_error
+      expect(client.roots.map(&:uri)).to eq(['file:///workspace'])
+    end
+  end
+
   describe 'the earliest removal of each feature' do
     let(:registry) { MCPClient::Deprecations::REGISTRY }
 

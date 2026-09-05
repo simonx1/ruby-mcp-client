@@ -257,6 +257,31 @@ RSpec.describe 'MCP 2026-07-28 deprecations (round 11)' do
       expect(output.string.scan('Logging is deprecated').size).to eq(1)
     end
 
+    # A host that writes the key as a Symbol — the natural Ruby spelling for
+    # a hash literal — has adopted the deprecated utility just as much as one
+    # that writes the String. On the modern path the question never arises:
+    # `with_request_meta` builds the outgoing `_meta` and stringifies both the
+    # defaults and the supplied hash on the way. The LEGACY passthrough is
+    # where it does arise, because there the host's `_meta` goes out exactly
+    # as it was written and is the very hash the notice reads.
+    it 'warns when a legacy transport forwards a symbol-keyed log level' do
+      legacy = transport_class.new(logger, '2025-06-18')
+
+      params = legacy.with_request_meta({ '_meta' => { 'io.modelcontextprotocol/logLevel': 'debug' } })
+
+      expect(params['_meta']).to eq({ 'io.modelcontextprotocol/logLevel': 'debug' })
+      expect(output.string).to include('Logging is deprecated')
+    end
+
+    it 'warns when a legacy _meta is itself keyed by symbol' do
+      legacy = transport_class.new(logger, '2025-06-18')
+
+      params = legacy.with_request_meta({ _meta: { 'io.modelcontextprotocol/logLevel': 'warning' } })
+
+      expect(params[:_meta]).to eq({ 'io.modelcontextprotocol/logLevel': 'warning' })
+      expect(output.string).to include('Logging is deprecated')
+    end
+
     it 'warns when a legacy transport forwards it untouched' do
       legacy = transport_class.new(logger, '2025-06-18')
 
