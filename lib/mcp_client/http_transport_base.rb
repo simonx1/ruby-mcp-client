@@ -22,7 +22,6 @@ module MCPClient
     include ListenStream
     include CacheSupport
     include ToolListing
-    include MCPClient::CalledToolDefinition
 
     # Lightweight response wrapper for Faraday exception payloads (Hashes),
     # so the exception path and the default path share one challenge pipeline.

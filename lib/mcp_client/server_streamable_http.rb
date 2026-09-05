@@ -1225,17 +1225,12 @@ module MCPClient
     # interleaved on a POST SSE response stream.
     # @param message [Hash] the parsed JSON-RPC message
     def dispatch_server_message(message)
-      # Host code reached from here -- a notification listener, a handler for
-      # a server-initiated request -- may issue a tools/call of its own while
-      # the response that carried this message is still being parsed. Give it
-      # a slot of its own for the definition that call goes out under, so the
-      # call still waiting for this response keeps its own
+      # Host code reached from here -- a notification listener, a handler for a
+      # server-initiated request -- may call a tool of its own while the
+      # response that carried this message is still being parsed. Keep it
+      # outside the slot the call still waiting for this response is recording
+      # into, so what that call was answered under is not displaced
       # (MCPClient::CalledToolDefinition).
-      # Host code reached from here — a notification listener, a handler for a
-      # server-initiated request — may call a tool of its own while the response
-      # that carried this message is still being parsed. Keep it outside the slot
-      # the call still waiting for this response is recording into, so what that
-      # call was answered under is not displaced.
       outside_called_tool_definition { dispatch_server_message_now(message) }
     end
 

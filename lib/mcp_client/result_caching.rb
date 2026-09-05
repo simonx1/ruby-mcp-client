@@ -874,6 +874,9 @@ module MCPClient
               "Invalid resources/read response: expected an object, got #{result.class}"
       end
 
+      # Projecting `contents` out of an unfinished answer would present it as
+      # an empty successful read -- and cache it. The guard runs before both.
+      require_complete_result!(result, 'resources/read')
       contents = (result['contents'] || []).map { |content| MCPClient::ResourceContent.from_json(content) }
       entry = cache_entry_for(result, contents, now: received_at)
       # A read is cached only on an explicit, positive ttlMs: "if ttlMs is

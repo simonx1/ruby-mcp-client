@@ -9,10 +9,14 @@ require_relative 'header_params'
 require_relative 'subscription_support'
 require_relative 'result_caching'
 require_relative 'request_metadata'
+require_relative 'round_trip_marker'
+require_relative 'result_completeness'
 
 module MCPClient
   # Shared retry/backoff logic for JSON-RPC transports
   module JsonRpcCommon
+    include RoundTripMarker
+    include ResultCompleteness
     include SubscriptionSupport
     include ResultCaching
     # The `_meta` a request carries, the fingerprint a cached result is bound
@@ -692,33 +696,6 @@ module MCPClient
       modern? ? CORE_RESULT_TYPES : LEGACY_RESULT_TYPES
     end
 
-    # Project a payload out of a result that has to be finished. This client
-    # recognizes InputRequiredResult (resultType "input_required") but does
-    # not drive multi round-trip requests yet, so an operation that would
-    # extract a field from it — and so drop the server's inputRequests and
-    # opaque requestState — surfaces it instead of presenting an unfinished
-    # answer as an empty successful one. The whole result rides on the
-    # error's `data`, so a host can still drive the round trip itself.
-    # An unfinished answer is the InputRequired condition and is reported as
-    # such, the same way #reject_unfulfillable_input_required! reports one
-    # that reaches the response parser; any other discriminator this client
-    # cannot carry through is an invalid result.
-    # @param result [Object] the JSON-RPC result
-    # @param method [String] the request method, for the message
-    # @return [Object] the result, when it is complete
-    # @raise [MCPClient::Errors::InputRequiredError] when it is unfinished
-    # @raise [MCPClient::Errors::InvalidResultError] when it is neither
-    def require_complete_result!(result, method)
-      type = MCPClient::JsonRpcCommon.result_type(result)
-      return result if type == 'complete'
-
-      message = "#{method} answered with resultType #{type.to_s[0, 64].inspect}, which this " \
-                'client cannot carry through'
-      raise MCPClient::Errors::InputRequiredError.new(message, data: result) if type == 'input_required'
-
-      raise MCPClient::Errors::InvalidResultError.new("Invalid result: #{message}", data: result)
-    end
-
     # Build the error for a 4xx response: the typed JSON-RPC error when the
     # body is a JSON-RPC error response (with the HTTP status prefixed to the
     # peer's message), otherwise a plain ServerError with the fallback text.
@@ -941,26 +918,6 @@ module MCPClient
       end
       mark_round_trip_result(round_trips.positive?)
       result
-    end
-
-    # Whether the request this thread last resolved went through a multi
-    # round-trip retry. The marker is thread-local: a transport serves
-    # concurrent requests, and a result that depended on input responses
-    # MUST NOT be cached even if another request completed meanwhile.
-    # @return [Boolean]
-    def last_result_from_round_trip?
-      Thread.current[round_trip_marker_key] == true
-    end
-
-    # @param flag [Boolean]
-    # @return [void]
-    def mark_round_trip_result(flag)
-      Thread.current[round_trip_marker_key] = flag
-    end
-
-    # @return [Symbol] the thread-local key of this transport's round-trip marker
-    def round_trip_marker_key
-      :"mcp_client_round_trip_#{object_id}"
     end
 
     # The params for a multi round-trip retry: the original params plus the

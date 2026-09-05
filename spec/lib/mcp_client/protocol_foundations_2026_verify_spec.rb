@@ -807,6 +807,10 @@ RSpec.describe 'read_resource never presents an unfinished read as an empty one'
       end
 
       def stub_read_result(result)
+        # The read establishes the session before it sends; nothing here
+        # answers a real one.
+        allow(server).to receive(:ensure_connected)
+        allow(server).to receive(:ensure_initialized)
         allow(server).to receive(:rpc_request).and_return(result)
       end
 

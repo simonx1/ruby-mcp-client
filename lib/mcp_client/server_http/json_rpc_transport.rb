@@ -98,7 +98,7 @@ module MCPClient
         # still being parsed. Give it a slot of its own for the definition that
         # call goes out under, so the call still waiting for this response keeps
         # its own (MCPClient::CalledToolDefinition).
-        called_tool_definition_slot { dispatch_sse_message_now(message) }
+        outside_called_tool_definition { dispatch_sse_message_now(message) }
       end
 
       # @param message [Hash] a JSON-RPC request or notification
