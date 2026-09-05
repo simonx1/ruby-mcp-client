@@ -370,22 +370,10 @@ module MCPClient
       return cached if cached
 
       ensure_initialized
-      pages = []
-      received_ats = []
-      fingerprints = []
-      epoch = cache_epoch(:prompts)
-      prompts = collect_paginated('prompts') do |cursor|
-        params = {}
-        params['cursor'] = cursor if cursor
-        started = monotonic_now
-        result = rpc_request('prompts/list', params) || {}
-        pages << result
-        received_ats << response_received_at(since: started)
-        fingerprints << request_params_fingerprint
-        prompts = (result['prompts'] || []).map { |td| MCPClient::Prompt.from_json(td, server: self) }
-        [prompts, result['nextCursor']]
-      end
-      record_list_cache_hint('prompts/list', pages, received_ats, params: fingerprints, epoch: epoch)
+      # A cursor the server rejects restarts the list from its first page,
+      # exactly as it does on the HTTP transports (MCP pagination).
+      page = { cursor: nil }
+      prompts = restarting_rejected_cursor('prompts', page) { collect_prompt_pages(page) }
       attach_list_value(:prompts, prompts)
       prompts
     rescue MCPClient::Errors::ServerError => e
@@ -396,6 +384,31 @@ module MCPClient
       raise MCPClient::Errors::PromptGetError, "Error listing prompts: #{e.message}"
     rescue StandardError => e
       raise MCPClient::Errors::PromptGetError, "Error listing prompts: #{e.message}"
+    end
+
+    # Collect every page of prompts/list, recording what each page was
+    # answered under so the cache can bind the combined list to it.
+    # @param page [Hash] holds the cursor of the request in flight
+    # @return [Array<MCPClient::Prompt>]
+    def collect_prompt_pages(page)
+      pages = []
+      received_ats = []
+      fingerprints = []
+      epoch = cache_epoch(:prompts)
+      prompts = collect_paginated('prompts') do |cursor|
+        params = {}
+        params['cursor'] = cursor if cursor
+        started = monotonic_now
+        page[:cursor] = cursor
+        result = fetch_list_page(:prompts, cursor) { rpc_request('prompts/list', params) } || {}
+        pages << result
+        received_ats << response_received_at(since: started)
+        fingerprints << request_params_fingerprint
+        prompts = (result['prompts'] || []).map { |td| MCPClient::Prompt.from_json(td, server: self) }
+        [prompts, result['nextCursor']]
+      end
+      record_list_cache_hint('prompts/list', pages, received_ats, params: fingerprints, epoch: epoch)
+      prompts
     end
 
     # Get a prompt with the given parameters
@@ -568,22 +581,10 @@ module MCPClient
       return cached if cached
 
       ensure_initialized
-      pages = []
-      received_ats = []
-      fingerprints = []
-      epoch = cache_epoch(:tools)
-      tools = collect_paginated('tools') do |cursor|
-        params = {}
-        params['cursor'] = cursor if cursor
-        started = monotonic_now
-        result = rpc_request('tools/list', params) || {}
-        pages << result
-        received_ats << response_received_at(since: started)
-        fingerprints << request_params_fingerprint
-        tools = (result['tools'] || []).map { |td| MCPClient::Tool.from_json(td, server: self) }
-        [tools, result['nextCursor']]
-      end
-      record_list_cache_hint('tools/list', pages, received_ats, params: fingerprints, epoch: epoch)
+      # A cursor the server rejects restarts the list from its first page,
+      # exactly as it does on the HTTP transports (MCP pagination).
+      page = { cursor: nil }
+      tools = restarting_rejected_cursor('tools', page) { collect_tool_pages(page) }
       attach_list_value(:tools, tools)
       tools
     rescue MCPClient::Errors::ServerError => e
@@ -594,6 +595,31 @@ module MCPClient
       raise MCPClient::Errors::ToolCallError, "Error listing tools: #{e.message}"
     rescue StandardError => e
       raise MCPClient::Errors::ToolCallError, "Error listing tools: #{e.message}"
+    end
+
+    # Collect every page of tools/list, recording what each page was answered
+    # under so the cache can bind the combined list to it.
+    # @param page [Hash] holds the cursor of the request in flight
+    # @return [Array<MCPClient::Tool>]
+    def collect_tool_pages(page)
+      pages = []
+      received_ats = []
+      fingerprints = []
+      epoch = cache_epoch(:tools)
+      tools = collect_paginated('tools') do |cursor|
+        params = {}
+        params['cursor'] = cursor if cursor
+        started = monotonic_now
+        page[:cursor] = cursor
+        result = fetch_list_page(:tools, cursor) { rpc_request('tools/list', params) } || {}
+        pages << result
+        received_ats << response_received_at(since: started)
+        fingerprints << request_params_fingerprint
+        tools = (result['tools'] || []).map { |td| MCPClient::Tool.from_json(td, server: self) }
+        [tools, result['nextCursor']]
+      end
+      record_list_cache_hint('tools/list', pages, received_ats, params: fingerprints, epoch: epoch)
+      tools
     end
 
     # Call a tool with the given parameters

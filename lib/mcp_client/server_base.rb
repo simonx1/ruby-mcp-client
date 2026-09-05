@@ -322,15 +322,27 @@ module MCPClient
       # The cursor the page request now in flight carries, so a rejection can
       # be told apart from an -32602 the first page's request earned.
       page = { cursor: nil }
+      restarting_rejected_cursor(key, page) { collect_list_pages(method, key, page) }
+    end
+
+    # Collect a paginated list once more from its first page when the server
+    # rejects a cursor it had issued.
+    #
+    # MCP pagination: a cursor the server no longer accepts (-32602) ends the
+    # sequence the pages collected so far belong to, so the list is collected
+    # again from the beginning rather than failing a caller who only asked for
+    # a list. A second rejection is the server's answer and is raised, as is a
+    # rejection of the first page's own request — it carries no cursor.
+    # @param key [String] the result array key (for the log line)
+    # @param page [Hash] holds the cursor of the request in flight
+    # @yield collects every page of the list
+    # @return [Object] the block's value
+    def restarting_rejected_cursor(key, page)
       restarted = false
       begin
-        collect_list_pages(method, key, page)
+        page[:cursor] = nil
+        yield
       rescue MCPClient::Errors::ServerError => e
-        # MCP pagination: a cursor the server no longer accepts (-32602) ends
-        # the sequence the pages collected so far belong to, so the list is
-        # collected once more from the first page rather than failing a caller
-        # who only asked for a list. A second rejection is the server's answer
-        # and is raised.
         raise if restarted || !page[:cursor] || !cursor_rejected?(e)
 
         @logger.warn("Pagination for #{key} restarted: the server rejected a cursor it had issued")
@@ -343,6 +355,30 @@ module MCPClient
     # @return [Boolean] whether it rejects the cursor the request carried
     def cursor_rejected?(error)
       respond_to?(:invalid_cursor_error?, true) && invalid_cursor_error?(error)
+    end
+
+    # Send one page request of an auto-paginated list, dropping the entry the
+    # list is cached under when the server rejects the cursor it carried.
+    #
+    # A cursor names a position in one sequence of pages: once the server has
+    # forgotten it, the pages cached from that sequence are gone with it, and
+    # a restart that then fails transiently must not serve them back. Only the
+    # entry goes — the fetch already collecting this list replaces the
+    # transport's own copy, and an invalidation of a fetch's own making is not
+    # a change the host has to hear about (which would restart that fetch).
+    # A rejection of the first page's request carries no cursor and says
+    # nothing about the cache, so it leaves it alone.
+    # @param kind [Symbol, nil] the list kind
+    # @param cursor [String, nil] the cursor this page request carries
+    # @yield sends the page request
+    # @return [Object] the block's value
+    def fetch_list_page(kind, cursor)
+      yield
+    rescue MCPClient::Errors::ServerError => e
+      raise unless kind && cursor && cursor_rejected?(e) && respond_to?(:invalidate_cache, true)
+
+      invalidate_cache(kind)
+      raise
     end
 
     # Collect every page of a list, recording what each page was answered
@@ -358,11 +394,15 @@ module MCPClient
       fingerprints = []
       page[:cursor] = nil
       epoch = list_cache_epoch(method) if respond_to?(:list_cache_epoch, true)
+      kind = respond_to?(:list_kind_for, true) ? list_kind_for(method) : nil
       items = collect_paginated(key) do |cursor|
         params = cursor ? { cursor: cursor } : {}
         started = respond_to?(:monotonic_now, true) ? monotonic_now : nil
         page[:cursor] = cursor
-        result = rpc_request(method, params)
+        # A cursor the server no longer accepts ends the sequence its pages
+        # belong to: what was cached under that sequence goes with it, so a
+        # restart that then fails cannot serve it back (MCP pagination).
+        result = fetch_list_page(kind, cursor) { rpc_request(method, params) }
         pages << result
         received_ats << response_received_at(since: started) if respond_to?(:response_received_at, true)
         contexts << (respond_to?(:request_authorization_context, true) ? request_authorization_context : nil)

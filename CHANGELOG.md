@@ -7,6 +7,27 @@ metadata). Each feature lands in its own PR; this section accumulates them.
 
 ### Cacheable results (`ttlMs` / `cacheScope`)
 
+- **A result is bound to its own exchange, not to a request the response phase
+  nested inside it (round 35).** The credentials and the receipt time of an
+  HTTP exchange were both taken after `send_http_request` returned — after
+  every Faraday `on_complete` had run. A host response middleware that sent a
+  request of its own on that thread left *its* Authorization behind, and
+  Alice's `resources/read` was filed under Bob's context and handed to him
+  without a wire read; a middleware that merely took its time made a `ttlMs`
+  start counting from the end of its own work, so a result whose TTL had run
+  out long ago still read as fresh. The innermost middleware on the connection
+  now stamps both facts into the environment of the request it is handing to
+  the adapter, and the exchange reads them back from there.
+- **An invalid cursor discards the pages cached under it on every transport
+  (round 35).** Only the explicit-page listings dropped their cache when the
+  server rejected a cursor with `-32602`; an auto-paginated `tools/list` or
+  `prompts/list` restarted from the first page but left the previous sequence
+  in the cache, so a restart that then failed transiently served that sequence
+  back. Stdio did not restart at all — the same rejection surfaced as a
+  `ToolCallError` where the HTTP transports recovered. Both now behave alike: a
+  rejected cursor drops the entry the list is cached under, and every transport
+  restarts once from the first page.
+
 - **A private entry is bound to the credentials its request was sent with, not
   to what the response phase left behind (verification round).** The
   Authorization was recorded before the adapter sent the request and then read
