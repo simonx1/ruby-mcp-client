@@ -43,6 +43,14 @@ module MCPClient
       # were still empty and the stream that arrived afterwards ran on a
       # transport the host had closed — unreachable to a later `cleanup`, which
       # returns at once on a transport that is already disconnected.
+      #
+      # Clearing the flag cannot be trusted on its own, because it is not the
+      # same operation as the connect above it: a `cleanup` landing between
+      # the two is *undone* by the listen that resumes afterwards, which sets
+      # the flag back to false and goes on to POST on the transport that was
+      # just disconnected. So the question {#claim_listen_stream} asks is
+      # whether the connection is still up, not merely whether this flag was
+      # cleared since the last shutdown.
       # @return [void]
       def ensure_session_ready
         ensure_connected
@@ -146,12 +154,28 @@ module MCPClient
       # @return [Boolean] false when the connection was closed under it
       def claim_listen_stream(subscription, thread)
         listen_threads_mutex.synchronize do
-          next false if @listen_streams_closed
+          next false if @listen_streams_closed || !listen_connection_open?
 
           listen_wakeups[subscription] ||= Thread::Queue.new
           listen_threads[subscription] = thread
           true
         end
+      end
+
+      # Whether the transport is still connected, asked while the per-stream
+      # lock is held.
+      #
+      # Deliberately a bare read rather than `listen_transport_connected?`:
+      # every `cleanup` takes the transport lock and then this one, so taking
+      # them in the other order here would be a lock inversion. The read needs
+      # no lock to be correct for what it decides. `cleanup` clears the flag
+      # *before* it calls {#close_listen_streams}, so a claim that runs after
+      # the flag was cleared is refused, and one that runs before it is
+      # refused or found and closed by {#close_listen_streams} — whichever of
+      # the two reaches this lock first.
+      # @return [Boolean]
+      def listen_connection_open?
+        @connection_established
       end
 
       # End a listen the connection was closed under, before anything is sent:

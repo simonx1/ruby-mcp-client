@@ -91,8 +91,17 @@ module MCPClient
         # the server may be serving this listen, and {#cancel_subscription}
         # has to be able to name it even after a later request has taken the
         # subscription's own id (see {Subscription#record_outstanding_listen}).
+        # It is not cancellable until the write has finished, though — a close
+        # that named it while the pipe still held nothing would put
+        # `cancelled(n)` on the wire ahead of `listen(n)`. So this attempt
+        # marks it written and then cancels it itself, if that close has
+        # happened by then.
         subscription.record_outstanding_listen(id)
-        send_request(request, io: stdin)
+        begin
+          send_request(request, io: stdin)
+        ensure
+          subscription.mark_listen_written(id)
+        end
         cancel_outstanding_listens(subscription, io: stdin) if subscription.closed_by_client?
       rescue StandardError => e
         fail_open_attempt(subscription, id, e)

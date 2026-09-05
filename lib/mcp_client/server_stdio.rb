@@ -957,18 +957,22 @@ module MCPClient
     # Not just the one the subscription is on: a second listen written for it
     # on one process — a hand-over the queue duplicated, say — leaves the
     # server serving the first stream, and naming only the newest id left that
-    # one open with the client no longer able to refer to it. The
-    # subscription's own id is named as well, so a handle a caller closes
-    # before any write was recorded is still cancelled the way it always was.
+    # one open with the client no longer able to refer to it.
+    #
+    # The subscription's *current* id is not named on top of those. It used to
+    # be, so that a handle closed between taking an id and writing its request
+    # was cancelled anyway — but that cancellation named a request the server
+    # had not been sent, and reached the pipe ahead of it. Every id this
+    # client wrote is recorded ({MCPClient::Subscription#record_outstanding_listen}),
+    # so a written id is here already; an id that is only assigned is the
+    # opener's to cancel, once it has actually written it.
     # @param subscription [MCPClient::Subscription]
     # @param io [IO, nil] the pipe to cancel on; defaults to the live process's
     #   stdin, and is pinned by a caller that is cancelling ids it wrote to one
     #   particular process (see {JsonRpcTransport#open_subscription})
     # @return [void]
     def cancel_outstanding_listens(subscription, io: @stdin)
-      ids = subscription.take_outstanding_listens
-      ids |= [subscription.id] if subscription.id
-      ids.each { |id| send_subscription_cancellation(id, io: io) }
+      subscription.take_outstanding_listens.each { |id| send_subscription_cancellation(id, io: io) }
     end
 
     # Tell the server the client closed a subscriptions/listen request.

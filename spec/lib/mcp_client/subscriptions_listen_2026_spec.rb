@@ -80,6 +80,22 @@ RSpec.describe 'MCP 2026-07-28 subscriptions/listen' do
       expect { server.listen(notifications: { bogus: true }) }.to raise_error(ArgumentError, /bogus/)
     end
 
+    # The reserved per-request protocol fields (basic/index "_meta") are as
+    # much a part of a listen request as its filter, and a listen is the one
+    # request whose envelope nothing else in this suite reads.
+    it 'carries the reserved per-request protocol fields' do
+      server.on_elicitation_request { |_id, _params| {} }
+
+      server.listen(notifications: { tools_list_changed: true })
+
+      meta = written.find { |m| m['method'] == 'subscriptions/listen' }['params']['_meta']
+      expect(meta['io.modelcontextprotocol/protocolVersion']).to eq('2026-07-28')
+      expect(meta['io.modelcontextprotocol/clientInfo'])
+        .to eq({ 'name' => 'ruby-mcp-client', 'version' => MCPClient::VERSION })
+      expect(meta['io.modelcontextprotocol/clientCapabilities'])
+        .to eq({ 'elicitation' => { 'form' => {}, 'url' => {} } })
+    end
+
     it 'records the acknowledged subset and becomes active' do
       subscription = server.listen(notifications: { tools_list_changed: true, prompts_list_changed: true })
 
@@ -165,13 +181,22 @@ RSpec.describe 'MCP 2026-07-28 subscriptions/listen' do
       general = []
       server.on_notification { |method, _params| general << method }
       received = []
-      server.listen(notifications: { tools_list_changed: true }) { |m, _p| received << m }
+      subscription = server.listen(notifications: { tools_list_changed: true }) { |m, _p| received << m }
 
       server.handle_line(line('jsonrpc' => '2.0', 'method' => 'notifications/progress',
                               'params' => { 'progressToken' => 'p', 'progress' => 1 }))
+      # A tagged notification behind it, and waited for. Listeners run on the
+      # subscription's own dispatcher thread, so asserting emptiness the
+      # moment routing returns asserts only that the thread had not been
+      # scheduled yet; the dispatcher delivers in order, so an untagged
+      # notification that had been queued would be here by the time this one
+      # is.
+      server.handle_line(line('jsonrpc' => '2.0', 'method' => 'notifications/tools/list_changed',
+                              'params' => { '_meta' => { SUB_ID_META => subscription.id } }))
+      wait_for { received.any? }
 
-      expect(general).to eq(['notifications/progress'])
-      expect(received).to be_empty
+      expect(general).to eq(%w[notifications/progress notifications/tools/list_changed])
+      expect(received).to eq(['notifications/tools/list_changed'])
     end
 
     it 'maps subscribe_resource/unsubscribe_resource onto a listen stream per URI' do
@@ -259,7 +284,7 @@ RSpec.describe 'MCP 2026-07-28 subscriptions/listen' do
         'params' => { '_meta' => { SUB_ID_META => id }, 'notifications' => filter } }
     end
 
-    def stub_server(listen_bodies)
+    def stub_server(listen_bodies, tools: [])
       requests = []
       stub_request(:post, url).to_return do |request|
         body = JSON.parse(request.body)
@@ -272,7 +297,7 @@ RSpec.describe 'MCP 2026-07-28 subscriptions/listen' do
           builder = listen_bodies.shift or raise 'no more listen bodies'
           { status: 200, body: builder.call(body['id']), headers: { 'Content-Type' => 'text/event-stream' } }
         else
-          { status: 200, body: JSON.generate('jsonrpc' => '2.0', 'id' => body['id'], 'result' => { 'tools' => [] }),
+          { status: 200, body: JSON.generate('jsonrpc' => '2.0', 'id' => body['id'], 'result' => { 'tools' => tools }),
             headers: { 'Content-Type' => 'application/json' } }
         end
       end
@@ -305,6 +330,15 @@ RSpec.describe 'MCP 2026-07-28 subscriptions/listen' do
       listen = requests.find { |r| r[:body]['method'] == 'subscriptions/listen' }
       expect(listen[:headers]['Mcp-Method']).to eq('subscriptions/listen')
       expect(listen[:headers]['Accept']).to include('text/event-stream')
+      expect(listen[:headers]['Accept']).to include('application/json')
+      # Streamable HTTP "Sending Messages": every POST carries the negotiated
+      # version, and it MUST agree with the body's own.
+      expect(listen[:headers]['Mcp-Protocol-Version']).to eq('2026-07-28')
+      expect(listen[:body]['params']['_meta']['io.modelcontextprotocol/protocolVersion'])
+        .to eq(listen[:headers]['Mcp-Protocol-Version'])
+      expect(listen[:body]['params']['_meta']).to have_key('io.modelcontextprotocol/clientCapabilities')
+      expect(listen[:body]['params']['_meta']['io.modelcontextprotocol/clientInfo'])
+        .to eq({ 'name' => 'ruby-mcp-client', 'version' => MCPClient::VERSION })
       expect(listen[:body]['params']['notifications']).to eq({ 'toolsListChanged' => true })
       expect(subscription.acknowledged).to eq({ 'toolsListChanged' => true })
       expect(received).to eq(['notifications/tools/list_changed'])
@@ -368,6 +402,9 @@ RSpec.describe 'MCP 2026-07-28 subscriptions/listen' do
     end
 
     it 'invalidates the client tool cache from a subscription notification' do
+      # The server has to answer tools/list with something, or the client's own
+      # cache never holds an entry and the example says nothing about it: the
+      # request count alone is satisfied by the transport's cache going.
       requests = stub_server([
                                lambda do |id|
                                  sse(ack(id, { 'toolsListChanged' => true }),
@@ -376,15 +413,19 @@ RSpec.describe 'MCP 2026-07-28 subscriptions/listen' do
                                      { 'jsonrpc' => '2.0', 'id' => id,
                                        'result' => { 'resultType' => 'complete', '_meta' => { SUB_ID_META => id } } })
                                end
-                             ])
+                             ],
+                             tools: [{ 'name' => 'seeded', 'description' => 'a tool',
+                                       'inputSchema' => { 'type' => 'object' } }])
       allow(MCPClient::ServerFactory).to receive(:create).and_return(server)
       client = MCPClient::Client.new(mcp_server_configs: [{ type: 'streamable_http', base_url: 'x' }])
       client.list_tools
+      expect(client.tool_cache).not_to be_empty
 
       subscription = client.listen(notifications: { tools_list_changed: true })
       wait_until { subscription.state == :closed }
-      client.list_tools
 
+      expect(client.tool_cache).to be_empty
+      client.list_tools
       expect(requests.count { |r| r[:body]['method'] == 'tools/list' }).to eq(2)
     end
 
@@ -712,8 +753,19 @@ RSpec.describe 'MCP 2026-07-28 subscriptions/listen — round 2' do
       subscription.assign_id(9)
       buffer = +''
       state = { scanned: 0 }
-      expect(server).to receive(:match_event_terminator).at_most(3).times.and_call_original
+      offsets = []
+      allow(server).to receive(:match_event_terminator).and_wrap_original do |original, buf, from|
+        offsets << from
+        original.call(buf, from)
+      end
+
       3.times { server.send(:consume_listen_events, buffer << ('x' * 10), subscription, state) }
+
+      # Counting the calls says nothing — one per chunk either way. Each pass
+      # has to start where the last one stopped, less the three characters a
+      # terminator can straddle, or an unterminated event delivered in many
+      # chunks is re-scanned from the beginning every time.
+      expect(offsets).to eq([0, 7, 17])
 
       stub_const('MCPClient::HttpTransportBase::ListenStream::LISTEN_MAX_BUFFER_BYTES', 8)
       expect { server.send(:enforce_listen_buffer_cap!, buffer) }.to raise_error(MCPClient::Errors::ConnectionError)

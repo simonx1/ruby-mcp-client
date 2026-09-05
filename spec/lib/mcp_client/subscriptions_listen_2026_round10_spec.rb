@@ -311,6 +311,11 @@ RSpec.describe 'MCP 2026-07-28 subscriptions/listen — round 10' do
     def mapped_subscription
       subscription = MCPClient::Subscription.new(server: server, requested: { 'resourceSubscriptions' => [uri] })
       subscription.assign_id(11)
+      # A real open records the listen it writes, and only a written listen may
+      # be cancelled (see {MCPClient::Subscription#take_outstanding_listens}).
+      # This fixture assigns the id by hand, so it records the write by hand.
+      subscription.record_outstanding_listen(11)
+      subscription.mark_listen_written(11)
       server.register_subscription(subscription)
       server.route_notification('notifications/subscriptions/acknowledged',
                                 { '_meta' => { sub_meta => 11 }, 'notifications' => {

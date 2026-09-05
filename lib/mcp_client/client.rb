@@ -38,6 +38,11 @@ module MCPClient
     # Placeholder written in place of a redacted value.
     REDACTED = '[REDACTED]'
 
+    # Where {#register_notification_handlers} leaves word, on the thread that
+    # is routing, that the caches for the notification in hand have already
+    # been dropped by the transport's invalidation hook.
+    CACHE_INVALIDATION_MARK = :mcp_client_cache_invalidation
+
     # Maximum characters of a peer-supplied log message written to the host
     # log. The remote server controls this content, so an unbounded message
     # would let it inflate log storage at will.
@@ -699,11 +704,14 @@ module MCPClient
     #   prompts_list_changed, resources_list_changed (booleans),
     #   resource_subscriptions, task_ids (arrays of strings)
     # @param server [Integer, String, Symbol, MCPClient::ServerBase, nil] server selector
+    # @param ack_timeout [Numeric, false, nil] seconds to wait for the server's
+    #   acknowledgment before giving the listen up and cancelling it; nil takes
+    #   the transport's own read timeout, false waits for ever
     # @yield [method, params] notifications delivered on the subscription
     # @return [MCPClient::Subscription]
     # @raise [MCPClient::Errors::CapabilityError] if the server is not a 2026-07-28 server
-    def listen(notifications:, server: nil, &listener)
-      select_server(server).listen(notifications: notifications, &listener)
+    def listen(notifications:, server: nil, ack_timeout: nil, &listener)
+      select_server(server).listen(notifications: notifications, ack_timeout: ack_timeout, &listener)
     end
 
     # Set the logging level on all connected servers (MCP 2025-06-18)
@@ -785,23 +793,51 @@ module MCPClient
     # re-fetches instead of reading the entry the notification just
     # invalidated. Everything else this client does with a notification is host
     # code or leads to it (logging, progress callbacks, task status), and stays
-    # on the callback that runs last, behind the delivery. A transport with no
-    # such hook — a host-supplied one, say — keeps both on `on_notification`,
-    # with the invalidation first: it routes no subscriptions, so there is no
-    # delivery for it to be ahead of. Asked of the class rather than the
-    # instance, since the answer is the transport's nature, not its state.
+    # on the callback that runs last, behind the delivery. A transport that
+    # emits no such hook — a host-supplied adapter written against the older
+    # interface, say — keeps the invalidation on `on_notification`, ahead of
+    # everything else there: it routes no subscriptions, so there is no
+    # delivery for it to be ahead of.
+    #
+    # Which of the two it is cannot be answered by whether the transport *has*
+    # the hook: every {MCPClient::ServerBase} subclass inherits it, so the
+    # answer was yes for every custom adapter as well, and one that fans its
+    # notifications out through `@notification_callback` alone — exactly what
+    # the interface used to be — silently stopped invalidating anything. The
+    # question is whether the hook actually *ran* for the notification in
+    # hand, and the hook answers it itself: every path that emits it does so
+    # immediately before the host callback and on the same thread
+    # ({MCPClient::JsonRpcCommon#notify_cache_invalidation}), so a callback
+    # that arrives without that mark is one nothing invalidated for. Having
+    # the hook still decides whether one is *registered* — a host may supply
+    # an object that is no ServerBase at all — but no longer decides who
+    # invalidates.
     # @param server [MCPClient::ServerBase] the server to wire
     # @return [void]
     def register_notification_handlers(server)
-      hooked = server.class.method_defined?(:on_cache_invalidation)
-      server.on_cache_invalidation { |method, _params| invalidate_caches_for_notification(server, method) } if hooked
+      if server.class.method_defined?(:on_cache_invalidation)
+        server.on_cache_invalidation do |method, _params|
+          invalidate_caches_for_notification(server, method)
+          Thread.current[CACHE_INVALIDATION_MARK] = [server, method]
+        end
+      end
       server.on_notification do |method, params|
-        invalidate_caches_for_notification(server, method) unless hooked
+        mark = Thread.current[CACHE_INVALIDATION_MARK]
+        Thread.current[CACHE_INVALIDATION_MARK] = nil
+        invalidate_caches_for_notification(server, method) unless mark_covers?(mark, server, method)
         # Default notification processing (e.g., logging, progress)
         process_notification(server, method, params)
         # Invoke user-defined listeners
         @notification_listeners.each { |cb| cb.call(server, method, params) }
       end
+    end
+
+    # @param mark [Array, nil] what the invalidation hook left behind
+    # @param server [MCPClient::ServerBase] the transport routing now
+    # @param method [String] the notification being routed
+    # @return [Boolean] whether the mark is this notification's
+    def mark_covers?(mark, server, method)
+      mark.is_a?(Array) && mark[0].equal?(server) && mark[1] == method
     end
 
     # Drop the caches a notification invalidates.

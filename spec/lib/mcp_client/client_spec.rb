@@ -1198,5 +1198,61 @@ RSpec.describe MCPClient::Client do
 
       expect(client.tool_cache).to be_empty
     end
+
+    # A transport written against the interface as it stood before the
+    # invalidation hook existed: it fans notifications out through the
+    # callback ServerBase stores for it, and calls nothing else.
+    def legacy_custom_transport
+      Class.new(MCPClient::ServerBase) do
+        def initialize
+          super(name: 'legacy')
+        end
+
+        def list_tools
+          [MCPClient::Tool.new(name: 'legacy_tool', description: 'A tool', schema: {}, server: self)]
+        end
+
+        def cleanup; end
+
+        def emit(method, params)
+          @notification_callback&.call(method, params)
+        end
+      end.new
+    end
+
+    # codex [P2] client.rb:796: the fallback was chosen by asking whether the
+    # transport's *class* defines the invalidation hook — and every ServerBase
+    # subclass inherits it now, so a custom transport that emits only through
+    # the notification callback was treated as if it emitted the hook, and
+    # silently lost its cache invalidation altogether.
+    it 'clears the cache for a custom transport that only calls the notification callback' do
+      transport = legacy_custom_transport
+      allow(MCPClient::ServerFactory).to receive(:create).and_return(transport)
+      client = described_class.new(mcp_server_configs: [{ type: 'stdio', command: 'test' }])
+      client.list_tools
+      expect(client.tool_cache).not_to be_empty
+
+      transport.emit('notifications/tools/list_changed', {})
+
+      expect(client.tool_cache).to be_empty
+    end
+
+    # And the transports that do emit the hook must not invalidate twice: the
+    # hook runs ahead of a subscription delivery, so a second drop behind it
+    # would throw away whatever a listener re-fetched in between.
+    it 'does not invalidate twice for a transport that emits the hook' do
+      transport = MCPClient::ServerStdio.new(command: 'echo test')
+      allow(MCPClient::ServerFactory).to receive(:create).and_return(transport)
+      client = described_class.new(mcp_server_configs: [{ type: 'stdio', command: 'test' }])
+      drops = 0
+      allow(client).to receive(:invalidate_caches_for_notification).and_wrap_original do |original, *args|
+        drops += 1
+        original.call(*args)
+      end
+
+      transport.route_notification('notifications/tools/list_changed', {})
+
+      expect(drops).to eq(1)
+    end
   end
 end

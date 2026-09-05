@@ -16,11 +16,25 @@ module MCPClient
 
     # Open a long-lived notification stream. Modern servers only: the legacy
     # transports keep resources/subscribe and the HTTP GET stream.
+    #
+    # The request itself is meant to outlive every other one this client
+    # sends — its response is the server's *closing* of the stream — so the
+    # deadline the lifecycle asks for ("implementations SHOULD establish
+    # timeouts for all sent requests", basic/patterns/cancellation "Timeouts")
+    # is on the acknowledgment rather than on the response: a server MUST
+    # acknowledge a listen before it sends anything on it, so a listen that
+    # has not been acknowledged is a request nothing is happening on. One that
+    # expires is cancelled the way that section requires, and the handle is
+    # closed carrying the timeout, instead of staying `:pending` for the life
+    # of the process with nothing to tell the host why.
     # @param notifications [Hash] the SubscriptionFilter
+    # @param ack_timeout [Numeric, false, nil] seconds to wait for the
+    #   acknowledgment; nil takes the transport's own ({#subscription_ack_timeout},
+    #   i.e. its read timeout), false waits for ever
     # @yield [method, params] notifications delivered on the subscription
     # @return [MCPClient::Subscription]
     # @raise [MCPClient::Errors::CapabilityError] on a legacy session
-    def listen(notifications:, &listener)
+    def listen(notifications:, ack_timeout: nil, &listener)
       filter = MCPClient::Subscription.normalize_filter(notifications)
       ensure_session_ready
       unless modern?
@@ -31,7 +45,49 @@ module MCPClient
 
       subscription = MCPClient::Subscription.new(server: self, requested: filter, &listener)
       open_subscription(subscription)
+      await_acknowledgment_deadline(subscription, ack_timeout)
       subscription
+    end
+
+    # Arrange for an unacknowledged listen to be given up on.
+    #
+    # Started only once the request is on its way, so nothing is cancelled
+    # before it exists; it waits on the subscription's own settling signal, so
+    # an acknowledgment (or any other end) retires it at once rather than
+    # leaving a thread asleep for the whole deadline.
+    # @param subscription [MCPClient::Subscription]
+    # @param ack_timeout [Numeric, false, nil] see {#listen}
+    # @return [Thread, nil] the watchdog, for tests; nil when there is none
+    def await_acknowledgment_deadline(subscription, ack_timeout)
+      timeout = ack_timeout.nil? ? subscription_ack_timeout : ack_timeout
+      return nil unless timeout.is_a?(Numeric) && timeout.positive?
+
+      Thread.new do
+        Thread.current.name = 'MCP-listen-ack'
+        Thread.current.report_on_exception = false
+        next if subscription.wait_until_settled(timeout)
+
+        expire_unacknowledged_subscription(subscription, timeout)
+      end
+    end
+
+    # End a listen the server never acknowledged, and tell the server so.
+    # @param subscription [MCPClient::Subscription]
+    # @param timeout [Numeric] the deadline it missed
+    # @return [void]
+    def expire_unacknowledged_subscription(subscription, timeout)
+      @logger.warn("subscriptions/listen #{subscription.id} was not acknowledged within #{timeout}s; cancelling it")
+      subscription.finish(
+        by_client: true,
+        error: MCPClient::Errors::RequestTimeoutError.new(
+          "subscriptions/listen #{subscription.id} was not acknowledged within #{timeout}s"
+        )
+      )
+      # The handle is already closed, so this is the cancellation alone: the
+      # notifications/cancelled on stdio, the closed response stream on HTTP.
+      cancel_subscription(subscription)
+    rescue StandardError => e
+      @logger.debug("Cancelling an unacknowledged subscription raised #{e.class}: #{e.message}")
     end
 
     # The subscriptions this transport has opened, keyed by the String form
@@ -251,15 +307,32 @@ module MCPClient
     end
 
     # End a subscription on the server's closing response — but only when the
-    # result is one the client recognizes. Every other response goes through
+    # result is one the client recognizes, and only when it is a *completion*.
+    # Every other response goes through
     # {MCPClient::JsonRpcCommon#validate_result_type!}; skipping it here would
     # make a missing, scalar or unknown-resultType result indistinguishable
     # from a clean close.
+    #
+    # Recognized is not enough on its own. `input_required` is a resultType
+    # this client accepts — on tools/call, resources/read and prompts/get,
+    # the three requests a server may answer with one
+    # (basic/patterns/mrtr "Supported Requests"). subscriptions/listen is not
+    # among them, and the whole meaning of `input_required` is that the
+    # request has *not* completed, so reporting one as a graceful closure told
+    # the host the server had finished with a stream it had not.
     # @param subscription [MCPClient::Subscription]
     # @param result [Object] the response's result member
     # @return [void]
     def close_subscription_gracefully(subscription, result)
       validate_result_type!(result)
+      type = MCPClient::JsonRpcCommon.result_type(result)
+      unless type == 'complete'
+        raise MCPClient::Errors::InvalidResultError,
+              "Invalid result: resultType #{type.inspect} does not close a subscription; " \
+              "input_required is only valid for #{MCPClient::JsonRpcCommon::MRTR_METHODS.join(', ')}, " \
+              'not subscriptions/listen'
+      end
+
       @logger.debug("Server closed subscription #{subscription.id} gracefully")
       subscription.finish(gracefully: true)
     rescue MCPClient::Errors::InvalidResultError => e
@@ -395,7 +468,10 @@ module MCPClient
     # @param uri [String] the resource URI
     # @return [MCPClient::Subscription] the acknowledged subscription
     def open_resource_subscription(uri)
-      subscription = listen(notifications: { 'resourceSubscriptions' => [uri] })
+      # No watchdog: this caller waits for the acknowledgment itself, on the
+      # same timeout, and reports a stream that never arrives as its own
+      # failure rather than through a handle something else closed.
+      subscription = listen(notifications: { 'resourceSubscriptions' => [uri] }, ack_timeout: false)
       begin
         confirm_resource_subscription(subscription, uri)
         subscriptions_mutex.synchronize { resource_subscriptions[uri] = subscription }

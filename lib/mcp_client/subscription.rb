@@ -149,6 +149,9 @@ module MCPClient
       # The listen ids the transport has written for this subscription on the
       # session it is on, and not yet cancelled: see {#record_outstanding_listen}.
       @outstanding_listens = []
+      # Of those, the ones whose write has not finished yet. They are not
+      # cancellable: see {#take_outstanding_listens}.
+      @unwritten_listens = []
     end
 
     # @return [Integer] notifications queued for this subscription's listeners
@@ -380,24 +383,49 @@ module MCPClient
     # An attempt whose write raised is recorded too: the client cannot know
     # how much of it the peer saw, and cancelling a request the server never
     # received is ignored, while failing to cancel one it did receive is not.
+    # Recorded *before* the write for that reason, and marked written by
+    # {#mark_listen_written} whichever way the write ends.
     # @param id [Integer, String] the listen request id
     # @return [void]
     # @api private
     def record_outstanding_listen(id)
       @mutex.synchronize do
         @outstanding_listens << id unless @outstanding_listens.include?(id)
+        @unwritten_listens << id unless @unwritten_listens.include?(id)
       end
+    end
+
+    # The write of a listen request has finished — sent, or raised having sent
+    # who knows how much. Either way the id may now be cancelled.
+    #
+    # An id the session that carried it has since discarded
+    # ({#discard_outstanding_listens}) stays discarded: nothing written to a
+    # process that is gone is outstanding, and a late write that lands on its
+    # closed pipe must not put the id back.
+    # @param id [Integer, String] the listen request id
+    # @return [void]
+    # @api private
+    def mark_listen_written(id)
+      @mutex.synchronize { @unwritten_listens.delete(id) }
     end
 
     # The listen ids the server may still be serving for this subscription,
     # leaving none behind: the caller is cancelling them.
-    # @return [Array] the recorded ids, oldest first
+    #
+    # An id whose write has not finished is not among them, however impatient
+    # the caller: "the cancelled request MUST have been previously issued"
+    # (basic/patterns/cancellation), and cancelling an id the pipe has not
+    # carried yet put `cancelled(n)` on the wire ahead of `listen(n)`. The
+    # transport that is writing it cancels it itself once the write is done
+    # and it finds the subscription closed — the one moment at which the
+    # cancellation can name a request the server has actually been sent.
+    # @return [Array] the recorded ids that have been written, oldest first
     # @api private
     def take_outstanding_listens
       @mutex.synchronize do
-        outstanding = @outstanding_listens
-        @outstanding_listens = []
-        outstanding
+        taken = @outstanding_listens.reject { |id| @unwritten_listens.include?(id) }
+        @outstanding_listens -= taken
+        taken
       end
     end
 
@@ -407,7 +435,10 @@ module MCPClient
     # @return [void]
     # @api private
     def discard_outstanding_listens
-      @mutex.synchronize { @outstanding_listens = [] }
+      @mutex.synchronize do
+        @outstanding_listens = []
+        @unwritten_listens = []
+      end
     end
 
     # Whether this subscription is still the stream a given listen id opened.

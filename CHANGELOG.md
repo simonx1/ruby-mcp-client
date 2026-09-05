@@ -12,6 +12,15 @@ metadata). Each feature lands in its own PR; this section accumulates them.
   request with a `SubscriptionFilter` (`tools_list_changed`,
   `prompts_list_changed`, `resources_list_changed`, `resource_subscriptions`,
   `task_ids`; snake_case or camelCase) and return an `MCPClient::Subscription`.
+  The request itself is meant to outlive every other one the client sends — its
+  response is the server's *closing* of the stream — so the deadline the
+  lifecycle asks for is on the **acknowledgment** instead: a listen the server
+  has not acknowledged within `ack_timeout` (default: the transport's read
+  timeout) is cancelled and the handle closed carrying a
+  `RequestTimeoutError`, rather than staying `:pending` for the life of the
+  process with nothing to tell the host why. Pass `ack_timeout: false` to wait
+  for ever, or a number of seconds to bound it per request; an acknowledged
+  subscription runs for as long as the server keeps it either way.
   The server's `notifications/subscriptions/acknowledged` records the subset
   it honours (`acknowledged`, `unsupported`); notifications tagged with
   `io.modelcontextprotocol/subscriptionId` are demultiplexed to the
@@ -71,7 +80,14 @@ metadata). Each feature lands in its own PR; this section accumulates them.
   current depth. A closing response the client cannot recognize (an unknown
   `resultType`, a missing result, a scalar) fails the subscription with an
   `InvalidResultError` rather than ending it gracefully, the way every other
-  response is checked. The requested filter is copied and frozen when the
+  response is checked — and so does one that is recognized but is not a
+  completion: `input_required` is valid on `tools/call`, `resources/read` and
+  `prompts/get` alone, and means the request has *not* finished, so reporting
+  one as a graceful closure told the host the server had finished with a
+  stream it had not. On stdio a `notifications/cancelled` never precedes the
+  listen request it names: a `close` racing the write of a listen leaves that
+  id for the writer to cancel once it is actually on the wire, since "the
+  cancelled request MUST have been previously issued". The requested filter is copied and frozen when the
   subscription is created: the listen request is built from it on a background
   thread after `listen` returns, and again on every reconnect, so a caller that
   kept the array it passed could otherwise change what goes out. `unsupported`
@@ -102,8 +118,13 @@ metadata). Each feature lands in its own PR; this section accumulates them.
   notification out without routing a subscription announce the hook too — the
   legacy SSE parser, and the synthetic `tools/list_changed` a `Mcp-Param-*`
   header-mismatch refresh emits — so no transport is left invalidating on only
-  one of the two. A transport that does not define the hook keeps both on
-  `on_notification`, with the invalidation first. The host's `on_notification` callback now runs
+  one of the two. A transport that emits no such hook — a host-supplied adapter
+  written against the older interface, which fans notifications out through
+  `on_notification` alone — keeps the invalidation on `on_notification`, ahead
+  of everything else there. Which of the two it is is decided per
+  notification, by whether the hook actually ran for it: asking whether the
+  transport *has* the hook answered yes for every `ServerBase` subclass, so
+  such an adapter silently stopped invalidating anything at all. The host's `on_notification` callback now runs
   **last**, after the delivery has been queued, because it is the only step
   that can block: it is host code driven by the peer and it runs on whatever
   thread is routing — on stdio the process's sole stdout reader — so a

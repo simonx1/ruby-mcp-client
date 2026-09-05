@@ -124,16 +124,20 @@ RSpec.describe 'MCP 2026-07-28 subscriptions/listen — round 6' do
       end
       subscription.assign_id(7)
       server.register_subscription(subscription)
-      # Invalidation is made slow so that the ordering under test is the one
-      # the dispatcher thread would win: queued first, it delivers while the
-      # routing thread is still inside the invalidation.
-      allow(server).to receive(:invalidate_cache_for_notification).and_wrap_original do |original, *args|
-        sleep 0.2
+      # What the guarantee is about is the state of the caches at the instant
+      # the delivery is queued: from there on the dispatcher may run at any
+      # moment. Read here, synchronously on the routing thread, rather than
+      # from what the listener happens to see once it is scheduled — which a
+      # sleep can make likely but never certain.
+      queued = nil
+      allow(subscription).to receive(:deliver).and_wrap_original do |original, *args|
+        queued = [server.instance_variable_get(:@tools), client.tool_cache.dup]
         original.call(*args)
       end
 
       server.route_notification('notifications/tools/list_changed', { '_meta' => { sub_meta => 7 } })
 
+      expect(queued).to eq([nil, {}])
       transport_cache, client_cache = seen.pop(timeout: 3)
       expect(transport_cache).to be_nil
       expect(client_cache).to be_empty
@@ -191,6 +195,11 @@ RSpec.describe 'MCP 2026-07-28 subscriptions/listen — round 6' do
     def mapped_subscription
       subscription = MCPClient::Subscription.new(server: server, requested: { 'resourceSubscriptions' => [uri] })
       subscription.assign_id(11)
+      # A real open records the listen it writes, and only a written listen may
+      # be cancelled (see {MCPClient::Subscription#take_outstanding_listens}).
+      # This fixture assigns the id by hand, so it records the write by hand.
+      subscription.record_outstanding_listen(11)
+      subscription.mark_listen_written(11)
       server.register_subscription(subscription)
       server.subscriptions_mutex.synchronize { server.resource_subscriptions[uri] = subscription }
       subscription
@@ -231,12 +240,18 @@ RSpec.describe 'MCP 2026-07-28 subscriptions/listen — round 6' do
       http.subscriptions_mutex.synchronize { http.resource_subscriptions[uri] = subscription }
 
       # The re-acknowledgment is routed on the stream's own thread, so closing
-      # from inside it must not wait for that thread to finish.
-      Thread.new do
+      # from inside it must not wait for that thread to finish. Registered as
+      # that stream's thread from inside it, or the close would simply find no
+      # thread to join and the self-join it must avoid would never arise.
+      routed = Thread.new do
+        http.send(:listen_threads_mutex).synchronize do
+          http.send(:listen_threads)[subscription] = Thread.current
+        end
         http.route_notification('notifications/subscriptions/acknowledged',
                                 { '_meta' => { sub_meta => 11 }, 'notifications' => {} })
-      end.join(3)
+      end
 
+      expect(routed.join(3)).to be_truthy
       expect(http.live_resource_subscription(uri)).to be_nil
       expect(subscription).to be_closed
     end

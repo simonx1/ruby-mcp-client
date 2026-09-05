@@ -358,6 +358,9 @@ RSpec.describe 'MCP 2026-07-28 subscriptions/listen — round 3' do
 
       listens = writes.select { |message| message['method'] == 'subscriptions/listen' }
       expect(cancelled_after_send(listens.last)).to be(true)
+      # And nothing cancelled it *before* it was written: "the cancelled
+      # request MUST have been previously issued" (basic/patterns/cancellation).
+      expect(cancelled_before_send(listens.last)).to be(false)
       expect(subscription).to be_closed
     end
 
@@ -365,9 +368,20 @@ RSpec.describe 'MCP 2026-07-28 subscriptions/listen — round 3' do
     # after it — a cancellation that precedes the request it names leaves the
     # server-side subscription running for good.
     def cancelled_after_send(listen)
-      messages = writes
-      sent_at = messages.index { |message| message.equal?(listen) }
-      messages.drop(sent_at + 1).any? do |message|
+      cancellations_of(listen, writes.drop(index_of(listen) + 1))
+    end
+
+    # @return [Boolean] whether one was written before the request it names
+    def cancelled_before_send(listen)
+      cancellations_of(listen, writes.take(index_of(listen)))
+    end
+
+    def index_of(listen)
+      writes.index { |message| message.equal?(listen) }
+    end
+
+    def cancellations_of(listen, messages)
+      messages.any? do |message|
         message['method'] == 'notifications/cancelled' && message['params']['requestId'] == listen['id']
       end
     end

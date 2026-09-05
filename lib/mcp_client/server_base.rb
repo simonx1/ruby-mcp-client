@@ -190,9 +190,12 @@ module MCPClient
     # @param notifications [Hash] the SubscriptionFilter (tools_list_changed,
     #   prompts_list_changed, resources_list_changed, resource_subscriptions,
     #   task_ids — snake_case or camelCase)
+    # @param ack_timeout [Numeric, false, nil] seconds to wait for the
+    #   server's acknowledgment before giving the listen up; nil takes the
+    #   transport's own read timeout, false waits for ever
     # @yield [method, params] notifications delivered on the subscription
     # @return [MCPClient::Subscription]
-    def listen(notifications:, &listener)
+    def listen(notifications:, ack_timeout: nil, &listener)
       raise NotImplementedError, 'Subclasses must implement listen'
     end
 
