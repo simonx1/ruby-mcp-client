@@ -443,6 +443,67 @@ metadata). Each feature lands in its own PR; this section accumulates them.
   is refused where it is configured and where a registration response registers
   it, while plain HTTP on the loopback interface and RFC 8252 §7.1 private-use
   schemes (`com.example.app:/cb`, `com.example.app://cb`) are unaffected.
+  Binding now has to be *established*, not assumed: credentials a host
+  pre-registers without saying which authorization server issued them are no
+  longer bound to whichever server discovery returns first, correcting
+  "pre-registered and portable credentials … are bound on first use" above.
+  That inference sent a client secret registered with authorization server A
+  to authorization server B: the credentials sat in the resource slot in the
+  supported issuerless form, the resource began advertising B, starting the
+  authorization relabelled them as B's, and the code exchange POSTed A's
+  `client_secret` to B's token endpoint. They are kept — this client cannot
+  re-create them — but stay unusable, on the authorization path and on the
+  refresh path alike, until the host names their authorization server, either
+  with `issuer:` on the record or by storing them under
+  `provider.client_registration_key(issuer)`; the `ConnectionError` says so.
+  A Client ID Metadata Document id is portable and needs no binding, and a
+  *dynamic* registration this client made is still bound by the
+  authorization server cached alongside it (with nothing cached it is retired,
+  as before).
+  Tokens are now kept per authorization server too, which is what MCP
+  2026-07-28 asks for in as many words — "clients MUST maintain separate
+  registration state (client credentials, tokens) per authorization server".
+  Only the client credentials were; a token lived under the resource URL
+  alone and was thrown away when the authorization server changed, so a
+  resource served by two authorization servers over its lifetime sent the
+  user through consent again for a grant nobody had revoked. A token is now
+  written under its own authorization server's key as well as the slot in
+  use, set aside there when that server stops being the one in use, and
+  picked up again when it becomes the one in use — while a token this client
+  RETIRED (a 401 challenge naming another authorization server, a record that
+  cannot say where it came from) is deleted wherever it is kept, and no token
+  is ever presented to an authorization server other than the one bound to
+  it. The per-authorization-server copy is best-effort, exactly like the
+  registration copy: only the slot in use is essential.
+  Three checks were being made about the wrong thing. An authorization
+  *error* callback was validated against whatever per-request record was in
+  the PKCE slot rather than against the record its own `state` names, so two
+  flows sharing a storage backend could have A's state paired with B's
+  record and an error response of B displayed for A's flow, after an issuer
+  comparison it never had to satisfy; the completion's `state`-to-record
+  check now runs on the error path too. The step-up union read only what
+  *this provider instance* last requested, so a restart traded away every
+  permission the client already had — a `files:write` challenge produced an
+  authorization request for `files:write` alone, even with `files:read`
+  configured; the union now also covers the configured scope and the scope
+  the authorization server actually granted the token in hand (RFC 6749
+  §5.1), and it is dropped when the authorization server changes, so one
+  server's scopes are never asked of another. And a dynamic registration in
+  the resource slot answered ahead of credentials the host had pre-registered
+  for the very authorization server in use — and overwrote them under that
+  server's key on the way past — where the MCP registration priority order
+  puts pre-registered client information first and Dynamic Client
+  Registration last; a client-made registration no longer displaces a
+  host-configured one, in either sense.
+  Finally, retaining an authorization endpoint's own query string (RFC 6749
+  §3.1) no longer produces a request parameter twice: an endpoint of
+  `https://as.example/authorize?scope=openid` yielded a URL with two `scope`
+  parameters, and the same for `state`, `client_id` or a PKCE challenge the
+  endpoint happened to carry, which §3.1 forbids and leaves the server to
+  resolve — a `scope` in the endpoint URL could widen the consent the request
+  asks for. This request's parameters are now the only ones with those
+  names; every other endpoint parameter (`tenant`, `brand`, a locale) is
+  retained as before.
 
 ### Tasks extension (`io.modelcontextprotocol/tasks`)
 

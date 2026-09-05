@@ -54,10 +54,15 @@ RSpec.describe 'MCP 2026-07-28 authorization — round 7' do
     expect(refresh).not_to have_been_requested
   end
 
-  it 'keeps pre-registered credentials configured by the host when no authorization server was cached' do
+  # Round 38: credentials the host pre-registered are KEPT (this client
+  # cannot re-create them) but are not bound to whichever authorization
+  # server discovery happens to find — see round 38 for the leak that
+  # binding produced. Naming the server is what makes them usable.
+  it 'uses pre-registered credentials that name the authorization server discovery found' do
     storage = MCPClient::Auth::OAuthProvider::MemoryStorage.new
     storage.set_client_info(server_url, MCPClient::Auth::ClientInfo.new(
                                           client_id: 'pre-registered', registration_type: 'pre_registered',
+                                          issuer: 'https://auth.example.com',
                                           metadata: MCPClient::Auth::ClientMetadata.new(redirect_uris: [redirect_uri])
                                         ))
     provider = provider_for(storage)

@@ -103,6 +103,7 @@ RSpec.describe 'MCP 2026-07-28 authorization — round 8' do
     storage.set_server_metadata(server_url, as_meta)
     storage.set_client_info(server_url, MCPClient::Auth::ClientInfo.new(
                                           client_id: 'pre-registered', registration_type: 'pre_registered',
+                                          issuer: 'https://auth.example.com',
                                           metadata: MCPClient::Auth::ClientMetadata.new(redirect_uris: [redirect_uri])
                                         ))
     provider = provider_for(storage)

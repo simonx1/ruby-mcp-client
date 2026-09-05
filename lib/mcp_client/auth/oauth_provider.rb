@@ -10,6 +10,7 @@ require_relative 'oauth_provider/challenge_handling'
 require_relative 'oauth_provider/client_authentication'
 require_relative 'oauth_provider/registration_store'
 require_relative 'oauth_provider/response_validation'
+require_relative 'oauth_provider/token_store'
 
 module MCPClient
   module Auth
@@ -34,6 +35,7 @@ module MCPClient
       include PeerText
       include RegistrationStore
       include ResponseValidation
+      include TokenStore
 
       # @!attribute [rw] redirect_uri
       #   @return [String] OAuth redirect URI
@@ -66,6 +68,15 @@ module MCPClient
       # @raise [ArgumentError] if client_id_metadata_url is not an HTTPS URL with a path component
       # OIDC application types accepted for Dynamic Client Registration.
       APPLICATION_TYPES = %w[native web].freeze
+
+      # The authorization request parameters this client puts in the
+      # authorization URL. RFC 6749 Section 3.1: "Request and response
+      # parameters MUST NOT be included more than once", so an authorization
+      # endpoint whose own query already names one of these loses it to the
+      # value of this request (see {#merged_authorization_query}).
+      AUTHORIZATION_REQUEST_PARAMS = %w[
+        response_type client_id redirect_uri scope state code_challenge code_challenge_method resource
+      ].freeze
 
       # Literal names of the loopback interface (see #loopback_address?).
       LOOPBACK_HOSTS = %w[localhost 127.0.0.1 ::1 [::1]].freeze
@@ -158,17 +169,9 @@ module MCPClient
         # is current, and may retire the stored token: it is resolved before
         # the token is read, so a record it deleted is never written back.
         resolve_pending_challenge
-        token = stored_token
+        token = token_in_use
         logger.debug("OAuth access_token: retrieved token=#{token ? 'present' : 'nil'} for #{server_url}")
         return nil unless token
-
-        # A token from another authorization server is never presented
-        # (MCP 2026-07-28: registration state and tokens are per AS). Retired
-        # bytes are refused before any binding could attribute them anew.
-        return nil if retired_token?(token)
-
-        token = bind_token_issuer(token)
-        return nil unless token && token_for_current_issuer?(token)
 
         # Return token if still valid
         return token unless token.expired? || token.expires_soon?
@@ -451,6 +454,14 @@ module MCPClient
         end
 
         pkce = stored_pkce
+        # The per-request record must be the record of THIS response, as the
+        # success path requires: the separate state slot and the record can
+        # be torn apart by two flows sharing a storage backend, and a state
+        # that names another request's record makes every check below — the
+        # authorization server, the `iss` — a check about that other request.
+        # An error response would then be displayed after passing an issuer
+        # comparison it never had to satisfy.
+        ensure_state_for_request!(pkce, params['state']) if pkce
         cached = stored_server_metadata
         # The same checks the success path makes: an error response of
         # authorization server A is not displayed once a challenge received
@@ -655,15 +666,49 @@ module MCPClient
         scopes.empty? ? nil : scopes.join(' ')
       end
 
-      # "The client's previously requested scope set": what this provider last
-      # sent in an authorization request. It is a fact about this client, not
-      # about anything a peer said, so it is read from this provider rather
-      # than from storage — and it is forgotten with the rest of the
-      # per-server state when the provider is retargeted, since the scopes of
-      # one MCP server say nothing about another's.
+      # "The client's previously requested scope set". Three things say what
+      # this client already asked for, and a step-up that consulted only the
+      # first would trade away permissions:
+      #
+      # * the last authorization request this provider made — in-process, and
+      #   gone the moment the process restarts or the host builds another
+      #   provider;
+      # * the scope the host configured, which is what this client asks for
+      #   whenever a challenge is not overriding it;
+      # * the scope of the token in hand, which is what the authorization
+      #   server actually granted (RFC 6749 Section 5.1) and is the only one
+      #   of the three that survives a restart.
+      #
+      # The granted set counts only while the token belongs to the
+      # authorization server in use: what one server granted is not a
+      # permission another one ever gave, and asking B for A's scopes is at
+      # best a rejected request. The in-process set is dropped for the same
+      # reason when the authorization server changes, and with the rest of
+      # the per-server state when the provider is retargeted.
       # @return [Array<String>]
       def previously_requested_scopes
-        @requested_scope.to_s.split
+        (@requested_scope.to_s.split + configured_scopes + granted_scopes).uniq
+      end
+
+      # The scope the host configured, as a list.
+      # @return [Array<String>]
+      def configured_scopes
+        return supported_scopes if scope == :all
+        return [] unless scope.is_a?(String)
+
+        scope.split
+      end
+
+      # The scope the authorization server in use granted the token in hand.
+      # A token of another authorization server — or one this client
+      # retired — grants nothing here.
+      # @return [Array<String>]
+      def granted_scopes
+        token = stored_token_or_nil
+        return [] unless token.respond_to?(:scope) && token.scope.is_a?(String)
+        return [] unless token_for_current_issuer?(token)
+
+        token.scope.split
       end
 
       # A scopes_supported value as a scope list: RFC 8414 Section 2 and RFC
@@ -865,8 +910,11 @@ module MCPClient
       # authorization server to prove where they came from, cannot be bound
       # to whatever discovery finds now: a dynamic registration (with its
       # secret) and a token are retired so the flow re-registers and
-      # re-authorizes. Pre-registered and portable credentials are the
-      # host's own configuration and are bound on first use.
+      # re-authorizes. A portable Client ID Metadata Document id is valid at
+      # every authorization server, so it needs no binding; credentials the
+      # host pre-registered are kept — this client cannot re-create them —
+      # but stay unbound until the host says which authorization server
+      # issued them (see RegistrationStore#unbound_static?).
       # @return [void]
       def retire_records_without_issuer
         token = stored_token
@@ -908,14 +956,24 @@ module MCPClient
         # discarded so the next flow re-registers.
         @authorization_server_switched = true
         @supported_scopes = nil
+        # What was requested of the previous authorization server is not a
+        # permission the new one ever granted: the step-up union starts again
+        # rather than asking B for A's scopes.
+        @requested_scope = nil
         # Records another provider sharing the storage already bound to the
         # new server are its: only unbound ones and those of the previous
         # server are affected.
-        delete_token(bind_to: previous.issuer) unless record_bound_to?(stored_token_or_nil, current.issuer)
+        withdraw_token(previous.issuer) unless record_bound_to?(stored_token_or_nil, current.issuer)
         client_info = stored_client_info
         return if record_bound_to?(client_info, current.issuer)
 
-        if client_info.respond_to?(:issuer) && client_info.issuer.nil? && !portable_client?(client_info)
+        # An unbound record this client made is one it made with the previous
+        # server; credentials the HOST pre-registered are not, and are left
+        # unbound rather than attributed to a server that may never have
+        # issued them — attributing them would file them under that server's
+        # own key, and a later flow there would send their secret to it.
+        if client_info.respond_to?(:issuer) && client_info.issuer.nil? &&
+           !portable_client?(client_info) && !unbound_static?(client_info)
           client_info = client_info.with_issuer(previous.issuer,
                                                 registration_type: resolved_registration_type(client_info))
           store_client_info(client_info)
@@ -1321,41 +1379,6 @@ module MCPClient
               "Network error fetching server metadata: #{safe_error_text(e.message)}"
       end
 
-      # Forget the stored token (the authorization server it came from is no
-      # longer the one in use). Storage backends may implement the optional
-      # delete_token(server_url); otherwise set_token(server_url, nil) is
-      # attempted, and a backend that accepts neither is reported.
-      # @return [void]
-      # @param bind_to [String, nil] the issuer the token belonged to (or Token::RETIRED_ISSUER): a token
-      #   that records no issuer is first re-stored bound to it, so a backend that cannot delete still
-      #   keeps it away from another authorization server after a restart
-      def delete_token(bind_to: nil)
-        # Whatever the backend manages, this token is never presented again.
-        current = stored_token
-        if current.respond_to?(:access_token) && current.access_token
-          # Opaque tokens are unique only within an issuer: the marker names
-          # the issuer the bytes were retired for, so another provider
-          # sharing the storage may store the same bytes for a new server.
-          (@retired_tokens ||= {})[retirement_key(current, bind_to)] = true
-        end
-        if bind_to && current.respond_to?(:with_issuer) && (current.issuer.nil? || bind_to == Token::RETIRED_ISSUER)
-          begin
-            storage.set_token(server_url, current.with_issuer(bind_to))
-          rescue StandardError => e
-            logger.debug("Could not bind the retired token to its issuer in storage: #{e.class}")
-          end
-        end
-        if storage.respond_to?(:delete_token)
-          storage.delete_token(server_url)
-        else
-          storage.set_token(server_url, nil)
-        end
-      rescue StandardError => e
-        logger.warn('The OAuth token for the previous authorization server could not be removed from storage ' \
-                    "(#{e.class}); implement delete_token(server_url) on the storage backend. The token is " \
-                    'ignored while the authorization server differs from its issuer.')
-      end
-
       # Drop every piece of in-process state that belongs to one MCP server,
       # so a retargeted provider discovers the new one from scratch:
       #
@@ -1396,125 +1419,11 @@ module MCPClient
         normalize_record(storage.get_pkce(server_url), PKCE)
       end
 
-      # @return [Token, nil]
-      def stored_token
-        token = normalize_record(storage.get_token(server_url), Token)
-        # A backend without delete_token is asked to store nil, and one that
-        # persists plain hashes writes `nil.to_h` — `{}`. Read back that is a
-        # record without token bytes, whose header would be a bare "Bearer "
-        # attributed to whatever authorization server is current now. It is
-        # not a token: it is the absence storage meant to express. The same
-        # backend can read back any other JSON type, or bytes no header can
-        # carry, in EVERY field the token presents: a token_type that is not a
-        # string crashes `capitalize`, and one carrying CR/LF makes the
-        # `Authorization` value two header lines. A record that cannot be
-        # presented is not a token either, so the read path is as strict as
-        # the wire path.
-        return nil if token.respond_to?(:access_token) && !token_bytes?(token)
-
-        token
-      end
-
       # @param record [Object, Hash, nil]
       # @param klass [Class] a record class responding to from_h
       # @return [Object, nil]
       def normalize_record(record, klass)
         record.is_a?(Hash) ? klass.from_h(record) : record
-      end
-
-      # Persist a token the authorization server just issued. Opaque tokens
-      # are unique only within an issuer, so a new server may legitimately
-      # issue the same bytes as a token retired at the previous one: the
-      # fresh, issuer-bound token is never mistaken for the retired one.
-      # @param token [Token]
-      # @return [void]
-      def store_token(token)
-        storage.set_token(server_url, token)
-        # Only a persisted replacement lifts the marker: if the write failed,
-        # the stale record still in storage stays retired.
-        @retired_tokens&.delete(retirement_key(token, nil)) if token.respond_to?(:access_token)
-      end
-
-      # Whether a token was retired in this process: a bound token when its
-      # bytes were retired for its issuer, an unbound one when its bytes
-      # were retired for any issuer (it cannot say which one it came from).
-      # @param token [Token]
-      # @return [Boolean]
-      def retired_token?(token)
-        return true if token.respond_to?(:retired?) && token.retired?
-        return false unless token.respond_to?(:access_token) && @retired_tokens
-
-        issuer = token.respond_to?(:issuer) ? token.issuer : nil
-        return @retired_tokens.key?([issuer, token.access_token]) if issuer
-
-        @retired_tokens.keys.any? { |_issuer, bytes| bytes == token.access_token }
-      end
-
-      # The in-process retirement marker of a token: its bytes together with
-      # the issuer they were retired for (the recorded issuer, else the
-      # issuer the token was bound to at retirement).
-      # @param token [Token]
-      # @param bind_to [String, nil]
-      # @return [Array(String, String)]
-      def retirement_key(token, bind_to)
-        issuer = token.respond_to?(:issuer) ? token.issuer : nil
-        [issuer || bind_to || Token::RETIRED_ISSUER, token.access_token]
-      end
-
-      # Whether a stored token belongs to the authorization server currently
-      # known for this resource. While that server is unknown (no cached
-      # metadata) nothing is presented: the next challenge discovers it.
-      # @param token [Token]
-      # @return [Boolean]
-      def token_for_current_issuer?(token)
-        return false if retired_token?(token)
-        return true unless token.respond_to?(:issuer)
-
-        current = current_issuer_for_tokens
-        !current.nil? && current == token.issuer
-      end
-
-      # The authorization server tokens are judged against: a validated
-      # challenge received since the metadata was cached is authoritative
-      # (discovery treats it so), else the cached metadata's issuer.
-      # @return [String, nil]
-      def current_issuer_for_tokens
-        # A challenge we REFUSED said the cached authorization server is no
-        # longer the right one, and discovery fails closed on that latch. The
-        # request path must fail closed too: presenting the cached bearer would
-        # undo the rejection exactly as falling back to the cache would.
-        return nil if @challenge_error
-
-        advertised = Array(@challenge_resource_metadata&.authorization_servers).first
-        return advertised if advertised.is_a?(String)
-        # An unresolved challenge URL means the current server is unknown.
-        return nil if @challenge_metadata_url
-
-        stored_server_metadata&.issuer
-      end
-
-      # A token persisted before issuers were recorded was obtained from the
-      # authorization server cached alongside it (a server change always
-      # retires or binds the token first), so it is bound to that server on
-      # first use; while no server is known it is not presented.
-      # @param token [Token]
-      # @return [Token, nil] the bound token, or nil when it cannot be bound yet
-      def bind_token_issuer(token)
-        return token unless token.respond_to?(:issuer) && token.issuer.nil? && token.respond_to?(:with_issuer)
-        # A refused challenge says the cached server is no longer current, so
-        # it cannot attribute an unbound token either.
-        return nil if @challenge_error
-
-        current = stored_server_metadata&.issuer
-        return nil unless current
-
-        bound = token.with_issuer(current)
-        begin
-          storage.set_token(server_url, bound)
-        rescue StandardError => e
-          logger.debug("The stored OAuth token could not be re-stored with its issuer (#{e.class})")
-        end
-        bound
       end
 
       # Validate a Client ID Metadata Document URL (SEP-991): "The client_id
@@ -1777,10 +1686,41 @@ module MCPClient
         # Section 3.1). An authorization server that identifies a tenant, a
         # brand or a locale in its endpoint URL loses that identification if
         # the query is replaced, and sends the user somewhere else entirely.
-        existing_query = uri.query.to_s
-        appended = URI.encode_www_form(params)
-        uri.query = existing_query.empty? ? appended : "#{existing_query}&#{appended}"
+        #
+        # The same section: "Request and response parameters MUST NOT be
+        # included more than once." An endpoint query that already names an
+        # authorization request parameter this client sends — `scope`,
+        # `state`, `client_id`, a PKCE challenge — would otherwise appear
+        # twice, and which of the two the server reads is its own business:
+        # a `scope` of the endpoint URL could widen the consent this request
+        # asks for, and a second `state` or `code_challenge` decides the
+        # checks the callback is held to. This request's own parameters are
+        # therefore the only ones with those names; everything else the
+        # endpoint carries is retained.
+        uri.query = merged_authorization_query(uri.query, params)
         uri.to_s
+      end
+
+      # The authorization endpoint's own query with this request's parameters
+      # appended, and with any endpoint parameter this request names dropped
+      # (RFC 6749 Section 3.1 forbids a repeated request parameter).
+      # @param endpoint_query [String, nil] the query of the authorization endpoint URL
+      # @param params [Hash{Symbol => String}] this request's parameters
+      # @return [String] the query string to send
+      def merged_authorization_query(endpoint_query, params)
+        appended = URI.encode_www_form(params)
+        return appended if endpoint_query.to_s.empty?
+
+        kept = URI.decode_www_form(endpoint_query).reject do |name, _value|
+          next false unless AUTHORIZATION_REQUEST_PARAMS.include?(name)
+
+          logger.debug("Dropping #{name.inspect} from the authorization endpoint query: this authorization " \
+                       'request sets it')
+          true
+        end
+        return appended if kept.empty?
+
+        "#{URI.encode_www_form(kept)}&#{appended}"
       end
 
       # Exchange authorization code for access token
@@ -1985,6 +1925,11 @@ module MCPClient
       def refresh_client_info(issuer)
         in_use = stored_client_info
         usable = in_use.nil? || in_use.client_secret_expired? ? nil : in_use
+        # Credentials the host pre-registered without saying which
+        # authorization server issued them are not presented to the one the
+        # refresh goes to, exactly as an authorization request does not
+        # present them: nothing says that server issued them.
+        return registration_for_issuer(issuer) if unbound_static?(usable)
         return usable if usable && answers_for_issuer?(usable, issuer)
 
         registration_for_issuer(issuer) || in_use

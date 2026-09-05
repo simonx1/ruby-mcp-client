@@ -52,11 +52,14 @@ else
 
   # In a real application, you would:
   # 1. Open the auth_url in a browser or redirect the user
-  # 2. Handle the callback to extract the authorization code and state
+  # 2. Handle the callback to extract the authorization code, state and iss
   # 3. Complete the flow with the authorization code
 
   puts 'After authorization, you would call:'
-  puts 'token = MCPClient::OAuthClient.complete_oauth_flow(server, authorization_code, state)'
+  # The callback's `iss` (RFC 9207) is forwarded: an authorization server
+  # that advertises the parameter sends it, and a completion without it is
+  # refused rather than redeeming the code at the wrong server.
+  puts 'token = MCPClient::OAuthClient.complete_oauth_flow(server, authorization_code, state, iss: iss)'
 end
 
 # Example 3: Create OAuth-enabled Streamable HTTP server

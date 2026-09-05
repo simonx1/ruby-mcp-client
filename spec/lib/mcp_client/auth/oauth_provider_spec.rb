@@ -520,6 +520,9 @@ RSpec.describe MCPClient::Auth::OAuthProvider do
     context 'when no token is stored' do
       before do
         allow(storage).to receive(:get_token).with(server_url).and_return(nil)
+        # Nothing in the slot in use sends the read on to the copy kept for
+        # the authorization server in use, which needs to be known first.
+        allow(storage).to receive(:get_server_metadata).with(server_url).and_return(nil)
       end
 
       it 'returns nil' do
@@ -726,6 +729,8 @@ RSpec.describe MCPClient::Auth::OAuthProvider do
       allow(storage).to receive(:set_client_info)
       allow(storage).to receive(:set_pkce)
       allow(storage).to receive(:set_state)
+      # The scope union consults what the token in hand was granted.
+      allow(storage).to receive(:get_token).and_return(nil)
     end
 
     it 'resolves :all to all supported scopes in the authorization URL' do

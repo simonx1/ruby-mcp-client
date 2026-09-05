@@ -463,8 +463,13 @@ RSpec.describe 'MCP 2026-07-28 authorization — round 37' do
 
       challenge_to_b(provider)
 
-      expect(deleting_storage.deletions).to eq([server_url])
+      # A RETIRED token is removed wherever it is kept: the slot in use and
+      # the copy under its own authorization server's key, which a later
+      # return to that server would otherwise hand back.
+      expect(deleting_storage.deletions)
+        .to eq([provider.client_registration_key(issuer_a), server_url])
       expect(deleting_storage.get_token(server_url)).to be_nil
+      expect(deleting_storage.get_token(provider.client_registration_key(issuer_a))).to be_nil
     end
 
     it 'presents nothing once the record is gone' do

@@ -43,9 +43,11 @@ RSpec.describe 'MCP 2026-07-28 authorization — round 3' do
   end
 
   # Host-provided credentials say they are pre-registered (an untyped
-  # record counts as a dynamic registration since round 9).
+  # record counts as a dynamic registration since round 9) AND which
+  # authorization server issued them: since round 38 credentials that name
+  # none are not bound to whichever server discovery happens to find.
   def client_info(client_id: 'pre-registered', **opts)
-    opts = { registration_type: 'pre_registered' }.merge(opts)
+    opts = { registration_type: 'pre_registered', issuer: 'https://auth.example.com' }.merge(opts)
     MCPClient::Auth::ClientInfo.new(client_id: client_id,
                                     metadata: MCPClient::Auth::ClientMetadata.new(redirect_uris: [redirect_uri]),
                                     **opts)
@@ -57,9 +59,9 @@ RSpec.describe 'MCP 2026-07-28 authorization — round 3' do
                  body: { access_token: 'tok', token_type: 'Bearer', expires_in: 3600, refresh_token: 'r' }.to_json)
   end
 
-  it 'binds unbound credentials to the authorization server they were stored under, not the new one' do
+  it 'reports credentials of another authorization server instead of reusing them at the new one' do
     storage.set_server_metadata(server_url, as_meta(issuer: 'https://old.example.com'))
-    storage.set_client_info(server_url, client_info(client_id: 'from-old'))
+    storage.set_client_info(server_url, client_info(client_id: 'from-old', issuer: 'https://old.example.com'))
     provider = provider_for
     switch_authorization_server(provider, as_meta(registration_endpoint: 'https://auth.example.com/register'))
     registration = stub_request(:post, 'https://auth.example.com/register')

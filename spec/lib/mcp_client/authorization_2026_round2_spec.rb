@@ -43,9 +43,11 @@ RSpec.describe 'MCP 2026-07-28 authorization — round 2' do
   end
 
   # Host-provided credentials say they are pre-registered (an untyped
-  # record counts as a dynamic registration since round 9).
+  # record counts as a dynamic registration since round 9) AND which
+  # authorization server issued them: since round 38 credentials that name
+  # none are not bound to whichever server discovery happens to find.
   def client_info(client_id: 'pre-registered', **opts)
-    opts = { registration_type: 'pre_registered' }.merge(opts)
+    opts = { registration_type: 'pre_registered', issuer: 'https://auth.example.com' }.merge(opts)
     MCPClient::Auth::ClientInfo.new(client_id: client_id,
                                     metadata: MCPClient::Auth::ClientMetadata.new(redirect_uris: [redirect_uri]),
                                     **opts)
@@ -168,7 +170,7 @@ RSpec.describe 'MCP 2026-07-28 authorization — round 2' do
 
   it 'binds an untyped legacy record as a dynamic registration and keeps explicit pre-registration' do
     storage.set_server_metadata(server_url, as_meta)
-    storage.set_client_info(server_url, client_info(registration_type: nil))
+    storage.set_client_info(server_url, client_info(registration_type: nil, issuer: nil))
     provider = provider_for
     stub_discovery(provider, as_meta)
     provider.start_authorization_flow

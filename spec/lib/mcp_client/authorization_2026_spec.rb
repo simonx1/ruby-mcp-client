@@ -42,9 +42,11 @@ RSpec.describe 'MCP 2026-07-28 authorization' do
   end
 
   # Host-provided credentials say they are pre-registered (an untyped
-  # record counts as a dynamic registration since round 9).
+  # record counts as a dynamic registration since round 9) AND which
+  # authorization server issued them: since round 38 credentials that name
+  # none are not bound to whichever server discovery happens to find.
   def client_info(client_id: 'pre-registered', **opts)
-    opts = { registration_type: 'pre_registered' }.merge(opts)
+    opts = { registration_type: 'pre_registered', issuer: 'https://auth.example.com' }.merge(opts)
     MCPClient::Auth::ClientInfo.new(client_id: client_id,
                                     metadata: MCPClient::Auth::ClientMetadata.new(redirect_uris: [redirect_uri]),
                                     **opts)
@@ -380,7 +382,7 @@ RSpec.describe 'MCP 2026-07-28 authorization' do
       expect(storage.get_token(server_url)).to be_nil
     end
 
-    it 'binds pre-registered credentials to the first authorization server and refuses another' do
+    it 'uses pre-registered credentials at the authorization server they name and refuses another' do
       storage.set_client_info(server_url, client_info(registration_type: 'pre_registered'))
       provider = provider_for
       stub_discovery(provider, as_meta)
@@ -413,14 +415,21 @@ RSpec.describe 'MCP 2026-07-28 authorization' do
       expect(registration).not_to have_been_requested
     end
 
-    it 'adopts an unbound cached client for the current issuer' do
-      storage.set_client_info(server_url, client_info)
+    # A registration THIS CLIENT made, persisted before issuers were
+    # recorded, was made with the authorization server cached alongside it:
+    # that cache is what binds it. (Credentials the host pre-registered are
+    # not bound by inference — see round 38.)
+    it 'adopts an unbound cached dynamic registration for the issuer cached with it' do
+      storage.set_server_metadata(server_url, as_meta)
+      storage.set_client_info(server_url, client_info(client_id: 'legacy', registration_type: nil, issuer: nil))
       provider = provider_for
       stub_discovery(provider, as_meta)
 
-      provider.start_authorization_flow
+      url = provider.start_authorization_flow
 
+      expect(URI.decode_www_form(URI.parse(url).query).to_h['client_id']).to eq('legacy')
       expect(storage.get_client_info(server_url).issuer).to eq('https://auth.example.com')
+      expect(storage.get_client_info(server_url).registration_type).to eq('dynamic')
     end
   end
 

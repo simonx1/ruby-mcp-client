@@ -959,15 +959,32 @@ See [OAUTH.md](OAUTH.md) for full documentation.
 ### Authorization server binding (2026-07-28)
 
 - **Registration state is per authorization server (SEP-2352)** — credentials
-  are stored under the MCP server URL (the registration in use) *and* under
-  `provider.client_registration_key(issuer)`, so two authorization servers
-  behind one MCP server each keep their own registration instead of replacing
-  one another. Seed pre-registered credentials for a specific authorization
-  server with `storage.set_client_info(provider.client_registration_key(issuer), creds)`.
-- **Pre-registered credentials outrank a portable client id** — when an
-  authorization server has credentials of its own under
+  *and tokens* are stored under the MCP server URL (the record in use) *and*
+  under `provider.client_registration_key(issuer)`, so two authorization
+  servers behind one MCP server each keep their own registration state
+  instead of replacing one another. Seed pre-registered credentials for a
+  specific authorization server with
+  `storage.set_client_info(provider.client_registration_key(issuer), creds)`.
+- **Pre-registered credentials must name their authorization server** — a
+  `client_id` (and any secret with it) is issued by one authorization server,
+  so credentials that name none are not bound to whichever server discovery
+  happens to find: that would send the secret registered with one server to
+  another. Store them with `issuer:` on the `ClientInfo`, or under
+  `client_registration_key(issuer)`; without it, authorization raises a
+  `ConnectionError` saying so and nothing is sent anywhere. A Client ID
+  Metadata Document id is portable and needs no issuer.
+- **Pre-registered credentials outrank what the client registered itself** —
+  when an authorization server has credentials of its own under
   `client_registration_key(issuer)`, they are used ahead of a Client ID
-  Metadata Document id, which answers for every server.
+  Metadata Document id (which answers for every server) and ahead of a
+  dynamic registration in the slot, as the MCP registration priority order
+  requires — and a dynamic registration never overwrites them.
+- **A token is kept for each authorization server** — when the authorization
+  server changes, the token of the previous one is set aside under its own
+  key rather than thrown away, and picked up again if that server becomes the
+  one in use. A token this client retired (a 401 challenge naming another
+  authorization server) is deleted wherever it is kept, and no token is ever
+  presented to an authorization server other than the one that issued it.
 - **A registration a flow needs must reach storage** — a backend that cannot
   persist the credentials in use raises instead of returning an authorization
   URL whose callback would then report "Missing PKCE or client info". The
@@ -991,7 +1008,16 @@ See [OAUTH.md](OAUTH.md) for full documentation.
 - **Scopes accumulate across step-ups** — re-authorizing after an
   `insufficient_scope` challenge asks for the union of the scopes already
   requested and the ones the challenge names, so getting `files:write` does
-  not give up `files:read`.
+  not give up `files:read`. "Already requested" survives a restart: it covers
+  the configured scope and the scope the authorization server granted the
+  token in hand, not only what this provider object last asked for. It is
+  scoped to one authorization server, so another server's scopes are never
+  asked of the new one.
+- **An authorization request parameter appears once** — the authorization
+  endpoint's own query string is retained (RFC 6749 §3.1), but an endpoint of
+  `https://as.example/authorize?scope=openid` does not add a second `scope`
+  to the request; the same for `state`, `client_id` and the PKCE parameters.
+  Everything else the endpoint carries (`tenant`, `brand`, a locale) is kept.
 - **Only a token type the client understands is presented** — `token_type` is
   REQUIRED (RFC 6749 §5.1) and must be `Bearer` (§7.1). A `DPoP` or `mac`
   token is refused where it is issued and where it is read back, and so is a

@@ -9,7 +9,10 @@ This implementation provides OAuth 2.1 authentication support for the Ruby MCP C
 - **Automatic server discovery** via `.well-known` endpoints
 - **Dynamic client registration** when supported by servers
 - **Token refresh** and automatic token management
-- **Per-authorization-server credentials** (MCP 2026-07-28): store pre-registered credentials with `registration_type: 'pre_registered'`; a stored record without a type counts as a dynamic registration and is redone for a new authorization server
+- **Per-authorization-server credentials and tokens** (MCP 2026-07-28): store pre-registered credentials with
+  `registration_type: 'pre_registered'` **and the `issuer:` of the authorization server that issued them**
+  (or under `provider.client_registration_key(issuer)`); a stored record without a type counts as a dynamic
+  registration and is redone for a new authorization server, and tokens are kept per authorization server too
 - **Resource parameter implementation** (RFC 8707) for proper token audience binding
 - **Pluggable storage** for tokens and client credentials
 
@@ -33,8 +36,11 @@ unless MCPClient::OAuthClient.valid_token?(server)
   auth_url = MCPClient::OAuthClient.start_oauth_flow(server)
   puts "Please visit: #{auth_url}"
 
-  # After user authorization, complete the flow
-  # token = MCPClient::OAuthClient.complete_oauth_flow(server, code, state)
+  # After user authorization, complete the flow. Forward the callback's
+  # `iss` (RFC 9207): an authorization server that advertises
+  # `authorization_response_iss_parameter_supported` sends it, and a
+  # completion without it is refused rather than redeeming the code.
+  # token = MCPClient::OAuthClient.complete_oauth_flow(server, code, state, iss: iss)
 end
 
 # Use the server normally
@@ -141,6 +147,32 @@ The implementation follows the standard OAuth 2.1 authorization code flow with P
      storage.set_client_info(provider.client_registration_key('https://as-a.example.com'), creds_a)
      storage.set_client_info(provider.client_registration_key('https://as-b.example.com'), creds_b)
      ```
+
+     Credentials a host pre-registers **must say which authorization server issued them** — either by that
+     key, or with `issuer:` on the `ClientInfo`. A `client_id` and its secret are issued by one authorization
+     server, and whichever server discovery returns first does not establish that: a resource that starts
+     advertising another authorization server would otherwise have the credentials relabelled as its, and the
+     code exchange would post the secret registered with the first server to the second. Credentials that name
+     none are kept — this client cannot re-create them — but authorization (and refresh) raises a
+     `ConnectionError` naming both ways to bind them, and nothing is sent to any authorization server until
+     one is used. A Client ID Metadata Document id is portable across authorization servers and needs no
+     issuer; a dynamic registration this client made is bound by the authorization server cached alongside it,
+     and retired when nothing was cached.
+
+     Credentials the host pre-registered with the authorization server in use come first, ahead of both a
+     portable Client ID Metadata Document id and a dynamic registration this client made for itself — the MCP
+     client registration priority order — and a dynamic registration never overwrites them under that server's
+     key.
+
+     **Tokens are kept the same way.** MCP 2026-07-28 makes registration state — "client credentials, tokens" —
+     per authorization server, so a token is written under the resource URL (the token in use) *and* under
+     `client_registration_key(issuer)`. When the authorization server changes, the previous server's token is
+     set aside under its own key instead of being thrown away, and it is picked up again if that server becomes
+     the one in use, so a resource served by two authorization servers over its lifetime does not send the user
+     through consent again for a grant nobody revoked. A token this client *retired* — a 401 challenge naming
+     another authorization server, or a record that cannot say where it came from — is removed wherever it is
+     kept, and no token is presented to an authorization server other than the one bound to it. The per-server
+     copy is best-effort, like the registration copy; only the slot in use is essential.
 
      Nothing is migrated or moved: the resource-URL slot keeps answering as before, and a per-issuer
      copy is written the first time a record is used or stored. When an authorization server change
@@ -263,11 +295,15 @@ By default, the OAuth provider uses in-memory storage. For production use, imple
 
 ```ruby
 class DatabaseTokenStorage
-  def get_token(server_url)
-    # Return MCPClient::Auth::Token or nil
+  def get_token(key)
+    # Return MCPClient::Auth::Token or nil.
+    #
+    # The key is an opaque string, exactly as for get_client_info: the MCP
+    # server URL for the token in use, and provider.client_registration_key(
+    # issuer) for the token kept for one authorization server.
   end
 
-  def set_token(server_url, token)
+  def set_token(key, token)
     # Store token. A nil token means "forget it": remove the record rather
     # than serializing nil (a hash-persisting backend would otherwise store
     # an empty hash, which reads back as a token without bytes).
@@ -305,9 +341,13 @@ class DatabaseTokenStorage
 
   # Optional (MCP 2026-07-28): called when the authorization server behind
   # a resource changes, since a token from the previous one must not be
-  # reused. Without it, set_token(server_url, nil) is attempted; a backend
-  # that accepts neither is logged and the token is ignored instead.
-  def delete_token(server_url)
+  # reused. Without it, set_token(key, nil) is attempted; a backend that
+  # accepts neither is logged and the token is ignored instead. It is called
+  # with the server-URL key for the token in use and, when a token is
+  # retired outright, with client_registration_key(issuer) for the copy kept
+  # for that authorization server; on a plain authorization server change
+  # that copy is kept, so returning to that server finds its token.
+  def delete_token(key)
     # Remove the stored token
   end
 

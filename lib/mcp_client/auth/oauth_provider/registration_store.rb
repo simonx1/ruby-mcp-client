@@ -90,13 +90,17 @@ module MCPClient
           in_use = nil if in_use&.client_secret_expired?
           # Credentials a host pre-registered WITH THIS authorization server
           # come first, as the MCP 2026-07-28 client registration priority
-          # order says they should. A Client ID Metadata Document id is
-          # portable, so it answers for every authorization server; without
-          # this it would also answer for one the host gave credentials of its
-          # own — a registration with different permissions, and possibly a
-          # different consent policy, silently passed over because a portable
-          # id happened to be in the slot.
-          if portable_record?(in_use) && (pre_registered = pre_registered_for_issuer(issuer))
+          # order says they should: "pre-registered/cached client information
+          # first", then Client ID Metadata Documents, then Dynamic Client
+          # Registration. A record this client registered for itself is the
+          # last of those three, so it never answers ahead of credentials the
+          # host configured for the very server in use — and a portable
+          # Client ID Metadata Document id, which answers for every
+          # authorization server, does not either. The one record that does
+          # come first is a pre-registered record for THIS server already in
+          # the slot: that is the slot a host writes to, so a secret rotated
+          # there is not overruled by the older copy under the server's key.
+          if !pre_registered_for?(in_use, issuer) && (pre_registered = pre_registered_for_issuer(issuer))
             return adopt_client_info(pre_registered, issuer)
           end
 
@@ -104,7 +108,7 @@ module MCPClient
           # in use can be asked to accept it. It is the slot a host writes to,
           # so credentials rotated there are never overruled by an older copy
           # kept under the same authorization server's key.
-          if answers_for_issuer?(in_use, issuer) &&
+          if answers_for_issuer?(in_use, issuer) && !unbound_static?(in_use) &&
              (accepted = client_info_for_issuer(in_use, issuer, server_metadata))
             return accepted
           end
@@ -114,11 +118,54 @@ module MCPClient
           # not revoke it (SEP-2352).
           own = registration_for_issuer(issuer)
           return adopt_client_info(own, issuer) if own
+
+          refuse_unbound_static_credentials!(issuer) if unbound_static?(in_use)
           # A record of another authorization server, with nothing kept for
           # this one, is reported (pre-registered) or discarded (dynamic).
           return nil if in_use.nil? || answers_for_issuer?(in_use, issuer)
 
           client_info_for_issuer(in_use, issuer, server_metadata)
+        end
+
+        # Whether a record is credentials the host pre-registered with one
+        # particular authorization server.
+        # @param client_info [ClientInfo, nil]
+        # @param issuer [String] the issuer of the authorization server in use
+        # @return [Boolean]
+        def pre_registered_for?(client_info, issuer)
+          client_info.respond_to?(:pre_registered?) && client_info.pre_registered? &&
+            record_bound_to?(client_info, issuer)
+        end
+
+        # Credentials a host pre-registered but never said which authorization
+        # server issued them.
+        #
+        # MCP 2026-07-28 "Authorization Server Binding" keys credentials by
+        # the authorization server that ISSUED them, and whichever server
+        # discovery happens to return does not establish that: a resource
+        # that starts advertising another authorization server would relabel
+        # the host's credentials as belonging to it, and the code exchange
+        # would then post the client secret registered with one server to a
+        # different one. A client id and secret cannot be re-derived by this
+        # client the way a dynamic registration can, so they are not
+        # discarded either — the host is told to name their authorization
+        # server, and nothing is sent anywhere until it does.
+        # @param client_info [ClientInfo, nil]
+        # @return [Boolean]
+        def unbound_static?(client_info)
+          client_info.respond_to?(:pre_registered?) && client_info.pre_registered? &&
+            client_info.issuer.nil? && !portable_client?(client_info)
+        end
+
+        # @param issuer [String] the authorization server discovery found
+        # @return [void]
+        # @raise [MCPClient::Errors::ConnectionError]
+        def refuse_unbound_static_credentials!(issuer)
+          raise MCPClient::Errors::ConnectionError,
+                'Pre-registered OAuth client credentials record no authorization server, so the one this ' \
+                "resource advertises (#{safe_error_text(issuer)}) cannot be assumed to have issued them; " \
+                'store them with issuer: naming the authorization server that issued them, or under ' \
+                'storage.set_client_info(provider.client_registration_key(issuer), credentials)'
         end
 
         # Whether the registration in use is one the authorization server in
@@ -229,7 +276,7 @@ module MCPClient
                       "the authorization server is now #{safe_error_text(issuer)}")
           preserve_client_registration(client_info)
           delete_client_info
-          delete_token(bind_to: client_info.issuer)
+          withdraw_token(client_info.issuer)
           nil
         end
 
@@ -269,6 +316,13 @@ module MCPClient
         # name no authorization server (a portable Client ID Metadata Document
         # client, a retired one) have no key of their own and stay where they
         # are.
+        #
+        # A registration this client made for itself never replaces
+        # credentials the host pre-registered with the same authorization
+        # server: that key is where a host seeds them, and overwriting it
+        # would lose configuration this client cannot re-create — the next
+        # flow would register dynamically again and the pre-registered client
+        # would never be used at that server again.
         # @param client_info [ClientInfo, nil]
         # @return [void]
         def preserve_client_registration(client_info)
@@ -276,6 +330,10 @@ module MCPClient
 
           key = client_registration_key(client_info.issuer)
           return if key == server_url
+          if !pre_registered_for?(client_info, client_info.issuer) &&
+             pre_registered_for?(read_client_info(key), client_info.issuer)
+            return
+          end
 
           write_client_info(key, client_info)
         end
@@ -335,12 +393,6 @@ module MCPClient
         # @return [Boolean] whether the client id is portable across authorization servers
         def portable_client?(client_info)
           resolved_registration_type(client_info) == 'cimd'
-        end
-
-        # @param client_info [ClientInfo, nil] a record read from storage
-        # @return [Boolean] whether it is a portable (Client ID Metadata Document) registration
-        def portable_record?(client_info)
-          client_info.respond_to?(:registration_type) && portable_client?(client_info)
         end
 
         # The credentials a host pre-registered with one authorization server,
