@@ -425,13 +425,25 @@ RSpec.describe 'MCP 2026-07-28 authorization' do
   end
 
   describe MCPClient::OAuthClient do
-    it 'forwards application_type to the provider and iss to the flow completion' do
+    # Both factories take the option, so both are asserted: forwarding it from
+    # one says nothing about the other.
+    %i[create_streamable_http_server create_http_server].each do |factory|
+      it "forwards application_type to the provider from ##{factory}" do
+        provider = instance_double(MCPClient::Auth::OAuthProvider)
+        allow(MCPClient::Auth::OAuthProvider).to receive(:new).and_return(provider)
+
+        described_class.public_send(factory, server_url: server_url, application_type: 'web')
+
+        expect(MCPClient::Auth::OAuthProvider).to have_received(:new).with(hash_including(application_type: 'web'))
+      end
+    end
+
+    it 'forwards iss to the flow completion' do
       provider = instance_double(MCPClient::Auth::OAuthProvider)
       allow(MCPClient::Auth::OAuthProvider).to receive(:new).and_return(provider)
       allow(provider).to receive(:complete_authorization_flow).and_return(:token)
 
       server = described_class.create_streamable_http_server(server_url: server_url, application_type: 'web')
-      expect(MCPClient::Auth::OAuthProvider).to have_received(:new).with(hash_including(application_type: 'web'))
 
       expect(described_class.complete_oauth_flow(server, 'code', 'state', iss: 'https://auth.example.com'))
         .to eq(:token)

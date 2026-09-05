@@ -88,6 +88,18 @@ module MCPClient
           issuer = server_metadata.issuer
           in_use = stored_client_info
           in_use = nil if in_use&.client_secret_expired?
+          # Credentials a host pre-registered WITH THIS authorization server
+          # come first, as the MCP 2026-07-28 client registration priority
+          # order says they should. A Client ID Metadata Document id is
+          # portable, so it answers for every authorization server; without
+          # this it would also answer for one the host gave credentials of its
+          # own — a registration with different permissions, and possibly a
+          # different consent policy, silently passed over because a portable
+          # id happened to be in the slot.
+          if portable_record?(in_use) && (pre_registered = pre_registered_for_issuer(issuer))
+            return adopt_client_info(pre_registered, issuer)
+          end
+
           # The registration in use answers whenever the authorization server
           # in use can be asked to accept it. It is the slot a host writes to,
           # so credentials rotated there are never overruled by an older copy
@@ -164,7 +176,7 @@ module MCPClient
                                 record_bound_to?(current, issuer)
 
           preserve_client_registration(current)
-          write_client_info(server_url, client_info)
+          write_client_info!(client_info)
           client_info
         end
 
@@ -249,7 +261,7 @@ module MCPClient
         # @param client_info [ClientInfo]
         # @return [void]
         def store_client_info(client_info)
-          write_client_info(server_url, client_info)
+          write_client_info!(client_info)
           preserve_client_registration(client_info)
         end
 
@@ -275,10 +287,11 @@ module MCPClient
           client_info
         end
 
-        # One write to the storage backend. A backend that refuses a key it
-        # has not seen before must not take down a flow whose credentials are
-        # in hand: the registration in use is written first, and the per-issuer
-        # copy is a convenience for a later switch.
+        # One write to the storage backend under a per-authorization-server
+        # key. A backend that refuses a key it has not seen before must not
+        # take down a flow whose credentials are in hand: this copy is a
+        # convenience for a later switch, and the registration in use is
+        # written by {#write_client_info!}.
         # @param key [String] the storage key
         # @param client_info [ClientInfo, nil]
         # @return [void]
@@ -286,6 +299,24 @@ module MCPClient
           storage.set_client_info(key, client_info)
         rescue StandardError => e
           logger.debug("The OAuth client registration could not be stored under #{key.inspect} (#{e.class})")
+        end
+
+        # The write the flow depends on. {#complete_authorization_flow} reads
+        # the resource slot to redeem the code, so credentials that never
+        # reached it produce an authorization URL the user follows and a
+        # callback that answers "Missing PKCE or client info" — a failure
+        # after consent, blamed on the callback. A backend that cannot store
+        # them says so now, before the browser is opened. (The optional
+        # per-issuer copy is still best-effort; only this one is essential.)
+        # @param client_info [ClientInfo] the credentials the flow will use
+        # @return [void]
+        # @raise [MCPClient::Errors::ConnectionError] when the backend refuses the write
+        def write_client_info!(client_info)
+          storage.set_client_info(server_url, client_info)
+        rescue StandardError => e
+          raise MCPClient::Errors::ConnectionError,
+                "The OAuth client registration could not be stored (#{e.class}: " \
+                "#{safe_error_text(e.message)}); the authorization cannot continue"
         end
 
         # The registration type of stored credentials, recognizing a Client
@@ -304,6 +335,23 @@ module MCPClient
         # @return [Boolean] whether the client id is portable across authorization servers
         def portable_client?(client_info)
           resolved_registration_type(client_info) == 'cimd'
+        end
+
+        # @param client_info [ClientInfo, nil] a record read from storage
+        # @return [Boolean] whether it is a portable (Client ID Metadata Document) registration
+        def portable_record?(client_info)
+          client_info.respond_to?(:registration_type) && portable_client?(client_info)
+        end
+
+        # The credentials a host pre-registered with one authorization server,
+        # if it did. A dynamic registration is not one: it is this client's
+        # own record of a registration it made, which a portable id does not
+        # displace.
+        # @param issuer [String, nil] the issuer identifier
+        # @return [ClientInfo, nil]
+        def pre_registered_for_issuer(issuer)
+          record = registration_for_issuer(issuer)
+          record if record.respond_to?(:pre_registered?) && record.pre_registered?
         end
 
         # Forget the registration in use. The per-issuer record of the

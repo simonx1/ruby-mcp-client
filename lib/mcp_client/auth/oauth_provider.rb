@@ -47,8 +47,8 @@ module MCPClient
       #   @return [String] The MCP server URL (normalized)
       # @!attribute [r] client_id_metadata_url
       #   @return [String, nil] HTTPS URL of this client's Client ID Metadata Document (SEP-991)
-      attr_accessor :redirect_uri, :scope, :logger, :storage
-      attr_reader :server_url, :client_id_metadata_url
+      attr_accessor :scope, :logger, :storage
+      attr_reader :server_url, :client_id_metadata_url, :redirect_uri
 
       # Initialize OAuth provider
       # @param server_url [String] The MCP server URL (used as OAuth resource parameter)
@@ -95,6 +95,27 @@ module MCPClient
         @challenge_metadata_url = nil
         # Why a peer-advertised challenge URL was refused, if one was
         @challenge_error = nil
+      end
+
+      # MCP 2026-07-28 "Communication Security" requires implementations to
+      # follow OAuth 2.1 Section 1.5, and spells out what that means here:
+      # "All redirect URIs MUST be either `localhost` or use HTTPS." A
+      # callback on any other plain-HTTP host carries the authorization code
+      # — and, on an error response, the authorization server's own error
+      # text — across the network in the clear, where anyone on the path can
+      # redeem it. RFC 8252 Section 7.1 private-use schemes (a native app's
+      # `com.example.app:/oauth2redirect`) never leave the device and stay
+      # available.
+      # @param uri [String] the redirect URI to use
+      # @raise [ArgumentError] when it is not a callback this client may register
+      def redirect_uri=(uri)
+        unless redirect_uri_bytes?(uri)
+          raise ArgumentError,
+                'redirect_uri must be a localhost HTTP callback, an HTTPS URL or an RFC 8252 private-use ' \
+                "scheme URI (MCP 2026-07-28 requires every redirect URI to be localhost or HTTPS): #{uri.inspect}"
+        end
+
+        @redirect_uri = uri
       end
 
       # @param type [String, nil] 'native', 'web' or nil (derived from the redirect URI)
@@ -195,18 +216,28 @@ module MCPClient
         # Register client if needed
         client_info = get_or_register_client(server_metadata)
 
-        # Generate PKCE parameters. MCP 2026-07-28 "Authorization Response
-        # Validation": the selected authorization server's issuer is recorded
-        # in the same per-request record so the `iss` of the response can be
-        # checked against an authenticated value.
+        # Generate the state and the PKCE parameters as ONE per-request
+        # record. MCP 2026-07-28 "Authorization Response Validation": the
+        # selected authorization server's issuer is recorded "in the same
+        # per-request record used to store the PKCE code verifier (and the
+        # `state` value, if used)", so the `iss` of the response can be
+        # checked against an authenticated value — and so the state the
+        # response carries names THIS request rather than whichever record
+        # happens to be in the PKCE slot. Two flows sharing one storage
+        # backend interleave their writes: with the state in a slot of its
+        # own, A's state could end up alongside B's verifier, issuer and
+        # client, and A's code would then be redeemed at B.
+        state = SecureRandom.urlsafe_base64(32)
         pkce = PKCE.new(issuer: server_metadata.issuer,
                         iss_parameter_supported: server_metadata.iss_parameter_supported?,
                         client_id: client_info.client_id,
-                        redirect_uri: client_info.metadata.redirect_uris.first)
+                        redirect_uri: client_info.metadata.redirect_uris.first,
+                        state: state)
         storage.set_pkce(server_url, pkce)
 
-        # Generate state parameter
-        state = SecureRandom.urlsafe_base64(32)
+        # The separate slot is still written: it is the documented storage
+        # interface, and a callback handler (or an older version of this
+        # library) reads the state from it.
         storage.set_state(server_url, state)
 
         # Build authorization URL
@@ -232,6 +263,9 @@ module MCPClient
         client_info = stored_client_info
         raise MCPClient::Errors::ConnectionError, 'Missing PKCE or client info' unless pkce && client_info
 
+        # The per-request record must be the record of THIS request.
+        ensure_state_for_request!(pkce, state)
+
         # The code is redeemed only at the authorization server the request
         # was sent to: the issuer recorded with the PKCE record (RFC 9207
         # mix-up protection). A different server discovered since — a 401
@@ -253,14 +287,88 @@ module MCPClient
         # Exchange authorization code for tokens
         token = exchange_authorization_code(server_metadata, client_info, code, pkce)
 
-        # Store token
+        accept_exchanged_token(token, pkce)
+      end
+
+      # The response of a code exchange arrives at a client whose
+      # authorization server may have changed since the request went out —
+      # updated protected resource metadata, a 401 challenge, another provider
+      # sharing the storage — exactly as a refresh response does. So the
+      # checks made before the request are made again over the response,
+      # before anything is written: bytes issued by a server that is no longer
+      # this resource's would otherwise be stored over the token of the server
+      # that IS in use, and the cleanup would delete the pending authorization
+      # request that server had already started.
+      # @param token [Token] the token the exchange response carried
+      # @param pkce [PKCE] the per-request record the exchange was made with
+      # @return [Token]
+      # @raise [MCPClient::Errors::ConnectionError] when the response is no longer this resource's to keep
+      def accept_exchanged_token(token, pkce)
+        raise_authorization_server_changed!(pkce.issuer) unless exchange_target_current?(pkce.issuer)
+
         store_token(token)
 
-        # Clean up temporary data
-        storage.delete_pkce(server_url)
-        storage.delete_state(server_url)
+        # Clean up this request's temporary data — and only this request's: a
+        # flow started meanwhile keeps the records it is waiting on.
+        discard_pending_request(pkce)
 
         token
+      end
+
+      # Whether the code exchange that just answered is still this resource's:
+      # the authorization server it went to is the one in use now (an
+      # unresolved or refused challenge means it is unknown, which is not
+      # "still A"), and the token slot the response would be written to does
+      # not already hold another server's token. A record this client retired
+      # is not another server's token to protect — it is what a backend that
+      # could not delete left behind — so it does not stand in the way.
+      # @param issuer [String] the authorization server the flow started at
+      # @return [Boolean]
+      def exchange_target_current?(issuer)
+        return false unless current_issuer_for_tokens == issuer
+
+        stored = stored_token_or_nil
+        return true unless stored.respond_to?(:issuer) && stored.issuer
+        return true if retired_token?(stored)
+
+        stored.issuer == issuer
+      end
+
+      # Delete the pending-flow records of one authorization request, leaving
+      # a newer request's records alone.
+      # @param pkce [PKCE] the per-request record whose flow just ended
+      # @return [void]
+      def discard_pending_request(pkce)
+        pending = stored_pkce
+        storage.delete_pkce(server_url) if pending.nil? || same_request?(pending, pkce)
+        recorded = pkce.state if pkce.respond_to?(:state)
+        stored_state = storage.get_state(server_url)
+        storage.delete_state(server_url) if recorded.nil? || stored_state.nil? || stored_state == recorded
+      end
+
+      # @param one [PKCE, Object] the record currently in the pending-flow slot
+      # @param other [PKCE] the record the flow that just ended was made with
+      # @return [Boolean] whether both records describe the same authorization request
+      def same_request?(one, other)
+        one.respond_to?(:code_verifier) && one.code_verifier == other.code_verifier
+      end
+
+      # The state of a callback must be the state of the per-request record
+      # the rest of the checks read. A record written by this client always
+      # carries one; a record persisted before the state was recorded there
+      # carries none, and the separate slot (already compared by the caller)
+      # is all there is to go on.
+      # @param pkce [PKCE] the per-request record
+      # @param state [String, nil] the callback's state parameter
+      # @return [void]
+      # @raise [MCPClient::Errors::ConnectionError] when the record is another request's
+      def ensure_state_for_request!(pkce, state)
+        recorded = pkce.state if pkce.respond_to?(:state)
+        return if recorded.nil? || recorded == state
+
+        raise MCPClient::Errors::ConnectionError,
+              'Authorization response rejected: the pending authorization request is not the one this ' \
+              'response answers; restart the authorization'
       end
 
       # The stored credentials must be the ones the authorization request
@@ -319,6 +427,7 @@ module MCPClient
                 'Authorization response rejected: no issuer was recorded for this authorization request'
         end
 
+        ensure_state_for_request!(pkce, state)
         cached = stored_server_metadata
         ensure_authorization_server_unchanged!(pkce, cached)
         ensure_client_for_request!(stored_client_info, pkce)
@@ -498,13 +607,22 @@ module MCPClient
               "(recorded #{safe_error_text(recorded)}); restart the authorization"
       end
 
-      # Resolve the scope for authorization/registration requests using the
-      # MCP 2025-11-25 scope selection strategy: the challenge's scope
-      # parameter is authoritative; then an explicitly configured scope
-      # (:all resolves to the AS-advertised scope list); then the Protected
-      # Resource Metadata's scopes_supported; otherwise omit scope entirely.
+      # Resolve the scope for authorization/registration requests: the MCP
+      # scope SELECTION strategy picks what this request needs (see
+      # {#selected_scope}), and the 2026-07-28 step-up rule adds back what has
+      # already been asked for (see {#accumulated_scope}).
       # @return [String, nil]
       def resolved_scope
+        accumulated_scope(selected_scope)
+      end
+
+      # What this request needs, by the MCP 2025-11-25 scope selection
+      # strategy: the challenge's scope parameter is authoritative; then an
+      # explicitly configured scope (:all resolves to the AS-advertised scope
+      # list); then the Protected Resource Metadata's scopes_supported;
+      # otherwise no scope at all.
+      # @return [String, nil]
+      def selected_scope
         return @challenge_scope if @challenge_scope && !@challenge_scope.empty?
 
         if scope == :all
@@ -519,6 +637,33 @@ module MCPClient
         return prm_scopes.join(' ') unless prm_scopes.empty?
 
         nil
+      end
+
+      # MCP 2026-07-28 "Step-Up Authorization Flow", step 2: "Determine
+      # required scopes by computing the union of the client's previously
+      # requested scope set and the scopes from the current challenge. This
+      # ensures previously granted permissions are preserved when servers
+      # emit per-operation scope challenges." A challenge is authoritative for
+      # what the CURRENT operation needs, not for what the client already had:
+      # re-authorizing with the challenge's scope alone trades the permissions
+      # every other operation depends on for the one being retried, and the
+      # next operation challenges again.
+      # @param selected [String, nil] the scope this request selects on its own
+      # @return [String, nil] the union, or nil when no scope is to be sent
+      def accumulated_scope(selected)
+        scopes = (previously_requested_scopes + selected.to_s.split).uniq
+        scopes.empty? ? nil : scopes.join(' ')
+      end
+
+      # "The client's previously requested scope set": what this provider last
+      # sent in an authorization request. It is a fact about this client, not
+      # about anything a peer said, so it is read from this provider rather
+      # than from storage — and it is forgotten with the rest of the
+      # per-server state when the provider is retargeted, since the scopes of
+      # one MCP server say nothing about another's.
+      # @return [Array<String>]
+      def previously_requested_scopes
+        @requested_scope.to_s.split
       end
 
       # A scopes_supported value as a scope list: RFC 8414 Section 2 and RFC
@@ -1235,6 +1380,7 @@ module MCPClient
         @challenge_metadata_url = nil
         @challenge_error = nil
         @challenge_scope = nil
+        @requested_scope = nil
         @authorization_server_switched = nil
       end
 
@@ -1608,11 +1754,15 @@ module MCPClient
         # Use the redirect_uri that was actually registered
         registered_redirect_uri = client_info.metadata.redirect_uris.first
 
+        # What this request asks for is what the next step-up challenge has
+        # to be unioned with.
+        @requested_scope = resolved_scope
+
         params = {
           response_type: 'code',
           client_id: client_info.client_id,
           redirect_uri: registered_redirect_uri,
-          scope: resolved_scope,
+          scope: @requested_scope,
           state: state,
           code_challenge: pkce.code_challenge,
           code_challenge_method: pkce.code_challenge_method,
@@ -1700,7 +1850,7 @@ module MCPClient
 
         Token.new(
           access_token: data['access_token'],
-          token_type: data['token_type'] || 'Bearer',
+          token_type: data['token_type'],
           expires_in: data['expires_in'],
           scope: data['scope'],
           refresh_token: data['refresh_token'],
@@ -1725,7 +1875,7 @@ module MCPClient
         server_metadata = discover_authorization_server
         # Registration state is per authorization server (SEP-2352): the
         # credentials of the server being refreshed at, wherever they are kept.
-        client_info = registration_for_issuer(server_metadata&.issuer) || stored_client_info
+        client_info = refresh_client_info(server_metadata&.issuer)
 
         return nil unless server_metadata && client_info
         return nil unless refresh_permitted?(token, client_info, server_metadata)
@@ -1765,7 +1915,7 @@ module MCPClient
 
         new_token = Token.new(
           access_token: data['access_token'],
-          token_type: data['token_type'] || 'Bearer',
+          token_type: data['token_type'],
           expires_in: data['expires_in'],
           scope: data['scope'],
           refresh_token: data['refresh_token'] || token.refresh_token,
@@ -1821,6 +1971,23 @@ module MCPClient
         return true unless stored.respond_to?(:issuer) && stored.issuer
 
         stored.issuer == issuer
+      end
+
+      # The credentials a refresh presents are the ones an authorization
+      # request would be made with: the two paths must not disagree about
+      # which record answers for an authorization server. The resource slot
+      # is the slot a host writes to, so credentials rotated there — a new
+      # secret under the same client id — are never overruled by the older
+      # copy kept under that authorization server's own key; the copy answers
+      # only when the slot holds credentials of some other server.
+      # @param issuer [String, nil] the authorization server the refresh is made at
+      # @return [ClientInfo, nil]
+      def refresh_client_info(issuer)
+        in_use = stored_client_info
+        usable = in_use.nil? || in_use.client_secret_expired? ? nil : in_use
+        return usable if usable && answers_for_issuer?(usable, issuer)
+
+        registration_for_issuer(issuer) || in_use
       end
 
       # A refresh token (and a client secret) is only ever presented to the

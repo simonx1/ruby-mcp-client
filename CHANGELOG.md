@@ -398,12 +398,51 @@ metadata). Each feature lands in its own PR; this section accumulates them.
   still-valid token) and presents nothing when a storage backend reads one
   back, instead of going out as a bearer credential without the proof its type
   requires — and spelled `Dpop` by `String#capitalize` at that. The comparison
-  is case-insensitive and an absent `token_type` still reads as the `Bearer`
-  RFC 6749 §5.1 describes. And a browser callback may carry each parameter only
+  is case-insensitive, and a response that names NO type is refused too: RFC
+  6749 §5.1 makes `token_type` REQUIRED and defines no default — "Bearer" is
+  one value it may carry (RFC 6750), not what its absence means — and §7.1
+  forbids using a token whose type the client does not understand, which a
+  client that was told no type does not. `200 {"access_token":"x"}` used to
+  become `Authorization: Bearer x`; it is now a failed code exchange and a
+  failed refresh that keeps the still-valid token. And a browser callback may
+  carry each parameter only
   once (RFC 6749 §3.1): the parsed parameters are a Hash, where the last value
   of a repeated name silently won, so `?iss=attacker&iss=recorded` passed every
   check this client makes while a reader that takes the first value saw another
   authorization server; a callback repeating any parameter is now refused.
+  An authorization request is now ONE record, as the specification asks: the
+  `state`, the PKCE verifier, the expected issuer, the client id and the
+  redirect URI are written together, and the callback's `state` is checked
+  against the record the other checks read. Keeping the state in a slot of its
+  own let two flows sharing a storage backend interleave their writes — A
+  writes its PKCE, B writes PKCE and state, A writes its state — until A's
+  state sat beside B's verifier, issuer and client, and A's authorization code
+  was POSTed to B's token endpoint. The code exchange is re-checked when its
+  response arrives, exactly as a refresh is: a response that comes back after
+  the authorization server changed no longer stores its token over the new
+  server's, and the cleanup that follows deletes only the records of the
+  request that just ended, leaving a flow another provider started meanwhile
+  waiting on the records it is waiting on. A refresh now presents the
+  credentials an authorization request would be made with: a client secret
+  rotated in the slot a host writes to — the MCP server URL — is used, where
+  before an older copy under the authorization server's own key answered
+  first and an authorization server that had revoked it replied
+  `invalid_client`. Credentials pre-registered with the authorization server in
+  use come ahead of a Client ID Metadata Document id, which is portable and so
+  answered for every server, including one the host had given credentials of
+  its own. A storage backend that cannot persist the registration a flow needs
+  now raises: the write was best-effort for both the essential resource slot
+  and the optional per-issuer copy, so a failure produced an authorization URL
+  the user followed and a callback that answered "Missing PKCE or client info"
+  after consent. Re-authorizing after an `insufficient_scope` challenge asks
+  for the union of the scopes already requested and the ones the challenge
+  names (MCP 2026-07-28 step-up flow, step 2), instead of the challenge's
+  scopes alone — which traded the permissions every other operation depended on
+  for the one being retried. And every redirect URI must be `localhost` or use
+  HTTPS, as the MCP security considerations require: `http://app.example.com/callback`
+  is refused where it is configured and where a registration response registers
+  it, while plain HTTP on the loopback interface and RFC 8252 §7.1 private-use
+  schemes (`com.example.app:/cb`, `com.example.app://cb`) are unaffected.
 
 ### Tasks extension (`io.modelcontextprotocol/tasks`)
 

@@ -75,7 +75,7 @@ RSpec.describe 'MCP 2026-07-28 authorization — round 7' do
       provider = provider_for(MCPClient::Auth::OAuthProvider::MemoryStorage.new, redirect_uri: uri)
       expect(provider.send(:resolved_application_type)).to eq('native'), uri
     end
-    %w[https://app.example.com/callback http://10.0.0.1/callback].each do |uri|
+    %w[https://app.example.com/callback https://10.0.0.1/callback].each do |uri|
       provider = provider_for(MCPClient::Auth::OAuthProvider::MemoryStorage.new, redirect_uri: uri)
       expect(provider.send(:resolved_application_type)).to eq('web'), uri
     end

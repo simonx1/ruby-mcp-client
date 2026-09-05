@@ -552,7 +552,7 @@ module MCPClient
     # PKCE (Proof Key for Code Exchange) helper
     class PKCE
       attr_reader :code_verifier, :code_challenge, :code_challenge_method, :issuer, :iss_parameter_supported,
-                  :client_id, :redirect_uri
+                  :client_id, :redirect_uri, :state
 
       # Generate PKCE parameters
       # @param code_verifier [String, nil] Existing code verifier (for deserialization)
@@ -567,8 +567,13 @@ module MCPClient
       #   code is redeemed with the same credentials
       # @param redirect_uri [String, nil] the redirect URI the authorization request was made with, so
       #   the code is redeemed with the same value (RFC 6749 Section 4.1.3)
+      # @param state [String, nil] the `state` of the authorization request. MCP 2026-07-28 requires the
+      #   issuer to be associated with "the same per-request record used to store the PKCE code verifier
+      #   (and the `state` value, if used)": keeping the state in a slot of its own lets two flows sharing
+      #   one storage backend interleave their writes until one flow's state names another flow's record,
+      #   so it is recorded here as well and checked against the callback's state
       def initialize(code_verifier: nil, code_challenge: nil, code_challenge_method: nil, issuer: nil,
-                     iss_parameter_supported: nil, client_id: nil, redirect_uri: nil)
+                     iss_parameter_supported: nil, client_id: nil, redirect_uri: nil, state: nil)
         @code_verifier = code_verifier || generate_code_verifier
         @code_challenge = code_challenge || generate_code_challenge(@code_verifier)
         @code_challenge_method = code_challenge_method || 'S256'
@@ -581,6 +586,7 @@ module MCPClient
         @iss_parameter_supported = iss_parameter_supported if [true, false].include?(iss_parameter_supported)
         @client_id = client_id
         @redirect_uri = redirect_uri
+        @state = state
       end
 
       # Convert to hash for serialization
@@ -595,6 +601,7 @@ module MCPClient
         hash[:iss_parameter_supported] = @iss_parameter_supported unless @iss_parameter_supported.nil?
         hash[:client_id] = @client_id if @client_id
         hash[:redirect_uri] = @redirect_uri if @redirect_uri
+        hash[:state] = @state if @state
         hash
       end
 
@@ -621,7 +628,8 @@ module MCPClient
 
         new(code_verifier: verifier, code_challenge: challenge, code_challenge_method: method, issuer: issuer,
             iss_parameter_supported: supported, client_id: data[:client_id] || data['client_id'],
-            redirect_uri: data[:redirect_uri] || data['redirect_uri'])
+            redirect_uri: data[:redirect_uri] || data['redirect_uri'],
+            state: data[:state] || data['state'])
       end
 
       private

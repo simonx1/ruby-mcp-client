@@ -93,11 +93,16 @@ RSpec.describe 'MCP 2026-07-28 authorization — round 8' do
     expect(URI.decode_www_form(URI.parse(url).query).to_h['client_id']).to eq('dyn-new')
   end
 
+  # Without registration_type the record is an effectively DYNAMIC one, and
+  # the example says nothing about pre-registered credentials at all. The type
+  # is declared, and its survival of the serializing round trip asserted: it
+  # is what decides between "reported" and "discarded" on an authorization
+  # server change.
   it 'completes a flow with serialized pre-registered credentials' do
     storage = serializing_storage
     storage.set_server_metadata(server_url, as_meta)
     storage.set_client_info(server_url, MCPClient::Auth::ClientInfo.new(
-                                          client_id: 'pre-registered',
+                                          client_id: 'pre-registered', registration_type: 'pre_registered',
                                           metadata: MCPClient::Auth::ClientMetadata.new(redirect_uris: [redirect_uri])
                                         ))
     provider = provider_for(storage)
@@ -109,5 +114,8 @@ RSpec.describe 'MCP 2026-07-28 authorization — round 8' do
     state = URI.decode_www_form(URI.parse(url).query).to_h['state']
 
     expect(provider.complete_authorization_flow('code', state).access_token).to eq('fresh')
+    stored = storage.get_client_info(server_url)
+    expect(stored['registration_type'] || stored[:registration_type]).to eq('pre_registered')
+    expect(MCPClient::Auth::ClientInfo.from_h(stored)).to be_pre_registered
   end
 end
