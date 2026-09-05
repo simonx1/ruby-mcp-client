@@ -62,7 +62,10 @@ RSpec.describe 'MCP 2026-07-28 Streamable HTTP modern mode' do
     stub_request(:post, url).to_return do |request|
       body = JSON.parse(request.body)
       requests << { headers: request.headers, body: body }
-      responder = responders.fetch(body['method']) { raise "unexpected method #{body['method']}" }
+      # A modern tools/call fetches tools/list first (x-mcp-header extraction).
+      responder = responders.fetch(body['method']) do
+        body['method'] == 'tools/list' ? { 'tools' => [] } : raise("unexpected method #{body['method']}")
+      end
       responder.respond_to?(:call) ? responder.call(body, request) : json_response(body['id'], responder)
     end
     requests
@@ -512,7 +515,7 @@ RSpec.describe 'MCP 2026-07-28 Streamable HTTP modern mode' do
 
       server.call_tool('echo', { 'x' => 1 })
 
-      expect(requests.map { |r| r[:body]['method'] }).to eq(%w[server/discover tools/call])
+      expect(requests.map { |r| r[:body]['method'] }).to eq(%w[server/discover tools/list tools/call])
       expect(server.protocol_era).to eq(:modern)
       expect(requests.last[:headers]['Mcp-Protocol-Version']).to eq('2026-07-28')
       expect(requests.last[:headers]['Mcp-Method']).to eq('tools/call')

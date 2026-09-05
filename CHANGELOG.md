@@ -5,6 +5,61 @@
 Groundwork for the 2026-07-28 protocol revision (stateless, per-request
 metadata). Each feature lands in its own PR; this section accumulates them.
 
+### Custom headers from tool parameters (`x-mcp-header`)
+
+- **`Mcp-Param-{name}` headers.** On a modern Streamable HTTP (or plain HTTP)
+  session, arguments of tool parameters annotated with `x-mcp-header` are
+  mirrored into request headers on `tools/call`: strings as-is (Base64
+  sentinel when not header-safe), integers in decimal, booleans lowercase;
+  absent or null arguments produce no header. The tool list is fetched on
+  demand when a tool is called before `tools/list`. An argument that cannot
+  be mirrored (a float, an object, an integer outside the IEEE754 safe
+  range) fails the call locally with `ValidationError`.
+- **The `Mcp-Param-*` namespace is client-owned on a modern session.** It is
+  derived from the call's arguments and from nothing else, so a header of
+  that name supplied in `headers:` is dropped from modern requests (matching
+  HTTP's case-insensitive field names, whatever spelling was configured)
+  before the computed ones are attached. Previously a configured
+  `Mcp-Param-Region` survived a call that omitted `region`, standing for an
+  argument the spec requires to produce no header — which no `tools/list`
+  refresh could correct. Legacy sessions, where the namespace has no
+  protocol meaning, keep sending it.
+- **Invalid annotations reject the tool.** A definition whose `x-mcp-header`
+  is empty, not an HTTP field-name token, not case-insensitively unique, on a
+  non-primitive property, or not statically reachable through `properties`
+  keys alone (inside `items`, composition/conditional keywords, `$defs`, a
+  `$ref` target or at the root) is excluded from `tools/list` with a warning
+  naming the tool. `MCPClient::HeaderParams` exposes the validation and
+  extraction (`validate_schema`, `annotations`, `headers_for`).
+- **HeaderMismatch recovery.** A `-32020` rejection of `tools/call` triggers
+  one `tools/list` refresh and a single retry with recomputed headers; the
+  refresh is announced upward as a `tools/list_changed` notification so the
+  client-level cache picks up the new definition, and a refresh that fails
+  keeps the original rejection. It composes with the modern re-issue of a
+  request whose response stream broke, in either order: a HeaderMismatch
+  retry whose stream closes is re-issued, and a re-issue rejected for its
+  headers still refreshes `tools/list`. Each recovery is spent once, so a
+  call is sent at most three times. Transport list caches now follow
+  `list_changed` notifications, and a refresh cannot be overwritten by a
+  stale concurrent fetch.
+- **A result is validated against the definition its call went out under.**
+  The transport records the definition each `tools/call` request derived its
+  `Mcp-Param-*` headers from (`MCPClient::CalledToolDefinition`), and
+  `call_tool` checks `structuredContent` against that one — the retry's
+  refreshed definition after a HeaderMismatch, and otherwise the definition
+  in force when the request was sent. A `tools/list_changed` that merely
+  races the call (on the response stream, or from another thread) no longer
+  moves the schema: previously it made the client re-list and validate
+  against a definition the server never used, which both invented
+  `ValidationError`s in `:strict` mode and let a looser replacement pass a
+  result the answering definition forbade. A call that host code nests inside
+  another — from a notification listener, or a handler for a server-initiated
+  request — records into a slot of its own.
+- Mirroring is a MUST: a call whose tool definition cannot be fetched fails
+  rather than going out without headers. Instance data inside a schema
+  (`default`, `examples`, `enum`, `const`) is never treated as an annotation.
+- stdio ignores the annotation entirely, as the spec allows.
+
 ### Streamable HTTP modern mode (no sessions, request metadata headers)
 
 - **Era detection over HTTP** (Streamable HTTP "Backward Compatibility").

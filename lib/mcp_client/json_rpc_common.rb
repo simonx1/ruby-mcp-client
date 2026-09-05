@@ -3,6 +3,7 @@
 require 'json'
 require 'zlib'
 require 'stringio'
+require_relative 'header_params'
 
 module MCPClient
   # Shared retry/backoff logic for JSON-RPC transports
@@ -68,6 +69,21 @@ module MCPClient
         end
         raise
       end
+    end
+
+    # Maximum characters of peer-supplied text written to the host log.
+    MAX_PEER_LOG_TEXT_LENGTH = 4096
+
+    # Make peer-supplied text safe to write to the host log: control
+    # characters (notably newlines, which would let a server forge log
+    # entries) are escaped and the result is capped.
+    # @param text [Object] peer-supplied text
+    # @return [String] sanitized, length-bounded text
+    def sanitize_log_text(text)
+      escaped = text.to_s.gsub(/[\x00-\x1F\x7F]/) { |c| format('\\x%02X', c.ord) }
+      return escaped if escaped.length <= MAX_PEER_LOG_TEXT_LENGTH
+
+      "#{escaped[0, MAX_PEER_LOG_TEXT_LENGTH]}... (truncated from #{escaped.length} chars)"
     end
 
     # A log-safe description of a JSON-RPC message: its method and id only.
@@ -684,14 +700,6 @@ module MCPClient
       reader&.close
     end
 
-    # Header value that may travel as-is: visible ASCII (0x21-0x7E), with
-    # spaces and tabs allowed only in the interior (RFC 9110 field values;
-    # MCP 2026-07-28 Streamable HTTP "Value Encoding").
-    HEADER_SAFE_VALUE = /\A[\x21-\x7E](?:[\x20-\x7E\t]*[\x21-\x7E])?\z/
-    # The Base64 sentinel format; a plain value matching it must itself be
-    # encoded to avoid ambiguity.
-    HEADER_BASE64_SENTINEL = /\A=\?base64\?.*\?=\z/m
-
     # Which request field mirrors into the Mcp-Name header (MCP 2026-07-28
     # Streamable HTTP "Standard Request Headers"; the tasks extension adds
     # taskId routing for its methods).
@@ -713,10 +721,7 @@ module MCPClient
     # @param value [String, Integer, true, false] the parameter value
     # @return [String] the header value
     def encode_header_value(value)
-      text = value.to_s
-      return text if text.match?(HEADER_SAFE_VALUE) && !text.match?(HEADER_BASE64_SENTINEL)
-
-      "=?base64?#{[text.encode('UTF-8')].pack('m0')}?="
+      MCPClient::HeaderParams.encode_header_value(value)
     end
 
     # The HTTP headers a modern (2026-07-28) request must carry: the protocol

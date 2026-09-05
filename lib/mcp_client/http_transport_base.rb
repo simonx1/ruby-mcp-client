@@ -2,13 +2,18 @@
 
 require 'net/http'
 require_relative 'json_rpc_common'
+require_relative 'called_tool_definition'
 require_relative 'auth/oauth_provider'
+
+require_relative 'http_transport_base/param_headers'
 
 module MCPClient
   # Base module for HTTP-based JSON-RPC transports
   # Contains common functionality shared between HTTP and Streamable HTTP transports
   module HttpTransportBase
     include JsonRpcCommon
+    include CalledToolDefinition
+    include ParamHeaders
 
     # Lightweight response wrapper for Faraday exception payloads (Hashes),
     # so the exception path and the default path share one challenge pipeline.
@@ -53,24 +58,40 @@ module MCPClient
         method = 'server/discover'
       end
 
-      result = with_retry(method) do
-        sent_version = protocol_version
-        begin
-          send_request_and_parse(method, params, timeout)
-        rescue MCPClient::Errors::UnsupportedProtocolVersionError => e
-          # MCP 2026-07-28 basic/versioning: select a mutually supported
-          # version from the error's list and retry. The server rejected the
-          # request before processing it, so a re-send cannot duplicate a side
-          # effect. Compared against the version THIS request went out with:
-          # a concurrent request may already have moved the transport on.
-          version = select_protocol_version(e.supported)
-          raise unless modern? && version && version != sent_version
+      result = with_retry(method) { send_with_recovery(method, params, timeout) }
+      # Every server/discover answer is validated and applied: a later
+      # heartbeat may advertise new versions or capabilities.
+      result = apply_discover_result(result) if method == 'server/discover'
+      result
+    end
 
-          @logger.info("Server does not support protocol version #{sent_version}; " \
-                       "retrying #{method} with #{version}")
-          @protocol_version = version
-          send_request_and_parse(method, params, timeout)
-        end
+    # One with_retry attempt: the request itself plus the two 2026-07-28
+    # recoveries it may need.
+    #
+    # Both re-sends `retry` the same guarded block rather than running inside
+    # their own rescue clause, so either recovery's re-send is still covered by
+    # the other — a HeaderMismatch retry whose stream closes is re-issued, and
+    # a re-issue that is rejected for its headers still refreshes tools/list.
+    # Each recovery fires at most once, so the pair is bounded at three sends.
+    #
+    # Both flags are scoped to this attempt, which is all a tools/call ever
+    # gets — with_retry refuses to re-attempt a NON_IDEMPOTENT_METHODS
+    # request — and gives an idempotent method one re-issue per attempt.
+    # @param method [String] JSON-RPC method name
+    # @param params [Hash] parameters for the request
+    # @param timeout [Numeric, nil] per-request timeout override
+    # @return [Object] result from the JSON-RPC response
+    def send_with_recovery(method, params, timeout)
+      stream_reissued = false
+      header_refreshed = false
+      begin
+        send_request_with_version_retry(method, params, timeout)
+      rescue MCPClient::Errors::HeaderMismatchError => e
+        raise unless modern? && method == 'tools/call' && !header_refreshed
+
+        header_refreshed = true
+        refresh_tools_after_header_mismatch(e)
+        retry
       rescue MCPClient::Errors::ResponseStreamClosedError => e
         # Modern Streamable HTTP has no resumption: "a broken response stream
         # loses the in-flight request; clients MUST re-issue it as a new
@@ -79,20 +100,46 @@ module MCPClient
         # makes closing the response stream itself the cancellation signal —
         # the server MUST treat the broken stream as a cancellation and stop
         # work — so the re-issue is the behaviour the protocol expects rather
-        # than a blind replay. Exactly one re-issue happens, for every
-        # method: with_retry never retries a ResponseStreamClosedError, so a
-        # second broken stream surfaces instead of looping.
+        # than a blind replay. Exactly one re-issue happens, for every method:
+        # this flag bounds the attempt, and with_retry never re-attempts a
+        # ResponseStreamClosedError, so a second broken stream surfaces
+        # instead of looping.
         #
         # A stream that closed between (or inside) SSE events reaches here
         # from the parser; one that died at the socket reaches here from
         # connection_failure_error. Both are the same loss.
+        raise if stream_reissued
+
+        stream_reissued = true
         @logger.warn("#{e.message}; re-issuing #{method} as a new request")
+        retry
+      end
+    end
+
+    # Send the request, renegotiating the protocol version once if the server
+    # rejects the one it went out with.
+    # @param method [String] JSON-RPC method name
+    # @param params [Hash] parameters for the request
+    # @param timeout [Numeric, nil] per-request timeout override
+    # @return [Object] result from the JSON-RPC response
+    def send_request_with_version_retry(method, params, timeout)
+      sent_version = protocol_version
+      begin
+        send_request_and_parse(method, params, timeout)
+      rescue MCPClient::Errors::UnsupportedProtocolVersionError => e
+        # MCP 2026-07-28 basic/versioning: select a mutually supported
+        # version from the error's list and retry. The server rejected the
+        # request before processing it, so a re-send cannot duplicate a side
+        # effect. Compared against the version THIS request went out with:
+        # a concurrent request may already have moved the transport on.
+        version = select_protocol_version(e.supported)
+        raise unless modern? && version && version != sent_version
+
+        @logger.info("Server does not support protocol version #{sent_version}; " \
+                     "retrying #{method} with #{version}")
+        @protocol_version = version
         send_request_and_parse(method, params, timeout)
       end
-      # Every server/discover answer is validated and applied: a later
-      # heartbeat may advertise new versions or capabilities.
-      result = apply_discover_result(result) if method == 'server/discover'
-      result
     end
 
     # One request/response exchange with its own JSON-RPC id.
@@ -103,7 +150,10 @@ module MCPClient
     def send_request_and_parse(method, params, timeout)
       request_id = @mutex.synchronize { @request_id += 1 }
       request = build_jsonrpc_request(method, params, request_id)
-      send_jsonrpc_request(request, timeout: timeout)
+      # Computed before sending so a value that cannot be mirrored fails the
+      # call locally (ValidationError) rather than mid-request.
+      param_headers = modern? ? mcp_param_headers(request) : {}
+      send_jsonrpc_request(request, timeout: timeout, extra_headers: param_headers)
     rescue MCPClient::Errors::RequestTimeoutError
       # MCP lifecycle: on timeout the sender SHOULD cancel the abandoned
       # request. On modern Streamable HTTP closing the response stream IS the
@@ -498,11 +548,11 @@ module MCPClient
     # @raise [MCPClient::Errors::ConnectionError] if connection fails
     # @raise [MCPClient::Errors::TransportError] if response isn't valid JSON
     # @raise [MCPClient::Errors::ToolCallError] for other errors during request execution
-    def send_jsonrpc_request(request, timeout: nil)
+    def send_jsonrpc_request(request, timeout: nil, extra_headers: {})
       @logger.debug("Sending JSON-RPC request: #{describe_jsonrpc_message(request)}")
 
       begin
-        response = send_http_request(request, timeout: timeout)
+        response = send_http_request(request, timeout: timeout, extra_headers: extra_headers)
         parse_response(response, request)
       rescue MCPClient::Errors::ConnectionError, MCPClient::Errors::TransportError, MCPClient::Errors::ServerError
         raise
@@ -520,7 +570,7 @@ module MCPClient
     # @param request [Hash] the JSON-RPC request
     # @return [Faraday::Response] the HTTP response
     # @raise [MCPClient::Errors::ConnectionError] if connection fails
-    def send_http_request(request, timeout: nil)
+    def send_http_request(request, timeout: nil, extra_headers: {})
       conn = http_connection
       # Capture the session id this request goes out with — the value
       # apply_request_headers attaches — so a later 404 is attributed to the
@@ -532,6 +582,7 @@ module MCPClient
       begin
         response = conn.post(@endpoint) do |req|
           apply_request_headers(req, request)
+          apply_param_headers(req, extra_headers)
           # Per-request timeout override (MCP lifecycle: timeouts SHOULD be
           # configurable on a per-request basis)
           req.options.timeout = timeout if timeout
@@ -665,6 +716,107 @@ module MCPClient
       return false if sent_session_id.nil?
 
       @mutex.synchronize { !@restarting_session }
+    end
+
+    # Drop the cached tool list and re-fetch it. Hosts layered above the
+    # transport (MCPClient::Client) keep their own tool cache, so the refresh
+    # is announced the way the server itself would: as a tools/list_changed
+    # notification.
+    # @return [void]
+    def refresh_tools_cache
+      invalidate_tools_cache
+      list_tools
+      @notification_callback&.call('notifications/tools/list_changed', {})
+    end
+
+    # Forget the cached tool list. The generation counter lets a list fetch
+    # that was already in flight recognise that it is stale and not
+    # overwrite a fresher list.
+    # @return [void]
+    def invalidate_tools_cache
+      @mutex.synchronize do
+        @tools = nil
+        @tools_data = nil
+        @tools_generation = tools_generation + 1
+      end
+    end
+
+    # @return [Integer] the current tool-list generation (bump on invalidation)
+    def tools_generation
+      @tools_generation ||= 0
+    end
+
+    # Fetch and cache the tool list, re-fetching when the cache was
+    # invalidated while the fetch was in flight (bounded).
+    # @return [Array<MCPClient::Tool>]
+    def fetch_tools_list
+      3.times do
+        generation = @mutex.synchronize { tools_generation }
+        tools_data = request_tools_list
+        # MCP 2026-07-28: tools with invalid x-mcp-header annotations are
+        # excluded from the list on this transport.
+        tools_data = reject_invalid_header_tools(tools_data) if modern?
+        tools = tools_data.map { |tool_data| MCPClient::Tool.from_json(tool_data, server: self) }
+        stored = store_tools(tools, generation)
+        return stored if stored
+      end
+      raise MCPClient::Errors::TransportError, 'tools/list kept changing while it was being fetched'
+    end
+
+    # Store a freshly fetched tool list unless the cache was invalidated
+    # while it was being fetched, in which case the fresher list wins.
+    # @param tools [Array<MCPClient::Tool>] the fetched list
+    # @param generation [Integer] tools_generation when the fetch started
+    # @return [Array<MCPClient::Tool>] the list to hand to the caller
+    def store_tools(tools, generation)
+      @mutex.synchronize do
+        return @tools = tools if tools_generation == generation
+
+        # Invalidated while in flight: this list is stale even if nothing
+        # newer was stored yet. Hand back whatever is current (nil makes the
+        # caller fetch again).
+        @tools
+      end
+    end
+
+    # Keep the transport's list caches in step with the server's list-changed
+    # notifications, so a re-list after a change (or the HeaderMismatch
+    # refresh) really fetches the new definitions.
+    # @param method [String] a notification method
+    # @return [void]
+    def invalidate_cache_for_notification(method)
+      case method
+      when 'notifications/tools/list_changed' then invalidate_tools_cache
+      when 'notifications/prompts/list_changed'
+        @mutex.synchronize do
+          @prompts = nil
+          @prompts_data = nil
+        end
+      when 'notifications/resources/list_changed'
+        @mutex.synchronize do
+          @resources_result = nil
+          @resources_data = nil
+        end
+      end
+    end
+
+    # Exclude tool definitions whose x-mcp-header annotations violate the
+    # transport constraints (MCP 2026-07-28: "Rejection means the client
+    # MUST exclude the invalid tool from the result of tools/list"), logging
+    # a warning with the tool name and the reason.
+    # @param tools_data [Array<Hash>] raw tool definitions
+    # @return [Array<Hash>] the acceptable definitions
+    def reject_invalid_header_tools(tools_data)
+      tools_data.reject do |data|
+        schema = data['inputSchema'] || data[:inputSchema] || data['schema'] || data[:schema]
+        errors = MCPClient::HeaderParams.validate_schema(schema)
+        next false if errors.empty?
+
+        name = data['name'] || data[:name]
+        @logger.warn("Rejecting tool #{sanitize_log_text(name.to_s.inspect)}: invalid x-mcp-header annotation: " \
+                     "#{sanitize_log_text(errors.join('; '))}")
+        true
+      end
     end
 
     # Build the ServerError for a 4xx surfaced as a Faraday::ClientError by
