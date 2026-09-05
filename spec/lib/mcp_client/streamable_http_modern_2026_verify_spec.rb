@@ -556,8 +556,15 @@ RSpec.describe 'MCP 2026-07-28 Streamable HTTP — a response stream that really
       end
 
       it 'surfaces the loss after exactly one re-issue when the socket ends mid-stream twice' do
+        # Only the call breaks: a modern call_tool reads tools/list first (to
+        # derive its Mcp-Param-* headers), and a list that broke would raise
+        # before the call this example is about ever went out.
         start_server do |message|
-          message['method'] == 'server/discover' ? jsonrpc(message, discovery) : MidStreamCloseServer::CLOSE_MID_STREAM
+          case message['method']
+          when 'server/discover' then jsonrpc(message, discovery)
+          when 'tools/call' then MidStreamCloseServer::CLOSE_MID_STREAM
+          else jsonrpc(message, { 'tools' => [] })
+          end
         end
 
         expect { transport(klass).call_tool('t', {}) }
