@@ -48,9 +48,11 @@ RSpec.describe 'MCP 2026-07-28 JSON Schema handling — round 8' do
 
   describe 'unsupported keywords behind local references' do
     it 'scans a target inside a definition bag the dialect does not walk' do
-      schema = { 'type' => 'object',
-                 'properties' => { 'email' => { '$ref' => '#/definitions/email' } },
-                 'definitions' => { 'email' => { 'type' => 'string', 'format' => 'email' } } }
+      # draft-07 predates `$defs`, so nothing walks it there: only following
+      # the reference reaches what it holds.
+      schema = { '$schema' => draft7, 'type' => 'object',
+                 'properties' => { 'email' => { '$ref' => '#/$defs/email' } },
+                 '$defs' => { 'email' => { 'type' => 'string', 'format' => 'email' } } }
       expect(validator.unsupported_keywords(schema)).to eq(['format'])
     end
 

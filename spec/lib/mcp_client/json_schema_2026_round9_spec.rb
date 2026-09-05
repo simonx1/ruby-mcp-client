@@ -22,8 +22,8 @@ RSpec.describe 'MCP 2026-07-28 JSON Schema handling — round 9' do
     end
 
     it 'still resolves a pointer into that bag' do
-      schema = { 'properties' => { 'a' => { '$ref' => '#/definitions/x' } },
-                 'definitions' => { 'x' => { 'type' => 'string' } } }
+      schema = { 'properties' => { 'a' => { '$ref' => '#/x-defs/x' } },
+                 'x-defs' => { 'x' => { 'type' => 'string' } } }
       expect(validator.check_schema(schema)).to be_empty
       expect(validator.validate({ 'a' => 1 }, schema)).to contain_exactly(a_string_matching(/expected type string/))
     end

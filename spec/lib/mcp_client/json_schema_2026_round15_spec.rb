@@ -43,9 +43,9 @@ RSpec.describe 'MCP 2026-07-28 JSON Schema handling — round 15' do
 
   it 'scans a referenced target for unsupported keywords at its own lexical depth' do
     chain = nested_properties(validator::MAX_SCHEMA_DEPTH - 1, { '$ref' => '#/$defs/t' })
-    schema = chain.merge('$defs' => { 't' => { 'items' => { 'uniqueItems' => true } } })
+    schema = chain.merge('$defs' => { 't' => { 'items' => { 'unevaluatedItems' => false } } })
     expect(validator.check_schema(schema)).to be_empty
-    expect(validator.unsupported_keywords(schema)).to include('uniqueItems')
+    expect(validator.unsupported_keywords(schema)).to include('unevaluatedItems')
   end
 
   it 'treats a tautological additionalItems beside a tuple as decided' do

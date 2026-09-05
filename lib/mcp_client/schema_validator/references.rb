@@ -227,7 +227,7 @@ module MCPClient
       def anchor_index(root, dialect)
         index = { resources: {}.compare_by_identity, anchors: {}.compare_by_identity,
                   dialects: {}.compare_by_identity, bases: {}.compare_by_identity, by_base: {},
-                  duplicates: [], visited: 0, truncated: false }
+                  duplicates: [], duplicate_ids: [], visited: 0, truncated: false }
         index[:dialects][root] = dialect
         # The document's own base: the root's `$id` where it declares one,
         # else the empty reference. Relative references resolve against each
@@ -247,7 +247,15 @@ module MCPClient
         id = declared && resource.is_a?(Hash) ? resource['$id'] : nil
         base = (id.is_a?(String) ? merge_uri(parent_base, id) : parent_base) || parent_base
         index[:bases][resource] = base
-        index[:by_base][base] ||= resource
+        known = index[:by_base][base]
+        return index[:by_base][base] = resource if known.nil?
+
+        # Two resources answering to one URI: which one a reference lands on
+        # would depend on the order the walk met them in, so the document is
+        # unusable rather than resolved by luck (JSON Schema 2020-12 Core
+        # Section 9.1.2). Only a declared `$id` can collide; the base a
+        # resource merely inherits is its parent's, already registered.
+        index[:duplicate_ids] << base if id.is_a?(String) && !known.equal?(resource)
       end
 
       # Index every schema position reachable from the pending seeds, within
@@ -420,11 +428,13 @@ module MCPClient
       # @return [Array(Integer, Boolean), nil] the depth and whether the
       #   pointer crossed an opaque keyword; nil when it cannot be followed
       def pointer_position(ref, root, dialect, counter, from)
+        index = (counter[:anchors] ||= anchor_index(root, dialect))
+        node, ref = pointer_origin(index, root, ref, from)
+        return nil unless node
+
         tokens = pointer_tokens(ref)
         return nil unless tokens
 
-        index = (counter[:anchors] ||= anchor_index(root, dialect))
-        node = (from && index[:resources][from]) || root
         depths = counter[:depths] || {}
         walk = { index: index, depths: depths, dialect: index[:dialects][node] || dialect,
                  depth: depths[node] || 0, mode: :schema, opaque: false, visited: true }
@@ -461,6 +471,20 @@ module MCPClient
                            !(walk[:dialect] == DRAFT_07 && node.is_a?(Hash) && node.key?('$ref') &&
                              token != 'definitions')
         walk[:depth] += 1 unless %i[map array].include?(walk[:mode])
+      end
+
+      # The resource a reference's pointer is read inside, and the bare
+      # fragment that applies there. A reference written as an absolute URI
+      # into the bundled document (`urn:root#/x/y`) addresses the very
+      # position its bare spelling (`#/x/y`) does, so the pointer is followed
+      # — and the target accounted for — the same way whichever the peer
+      # wrote (JSON Schema 2020-12 Core Section 9.3.1).
+      # @return [Array(Hash, String), Array(nil, nil)]
+      def pointer_origin(index, root, ref, from)
+        resource = (from && index[:resources][from]) || root
+        return [resource, ref] if ref.start_with?('#')
+
+        retarget_reference(index, resource, ref)
       end
 
       # The decoded RFC 6901 tokens of a fragment pointer.

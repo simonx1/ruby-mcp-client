@@ -48,18 +48,24 @@ module MCPClient
         'type' => :type_names, 'enum' => :array, 'required' => :property_names, 'pattern' => :string,
         'minLength' => :non_negative_integer, 'maxLength' => :non_negative_integer,
         'minItems' => :non_negative_integer, 'maxItems' => :non_negative_integer,
-        'minimum' => :number, 'maximum' => :number
+        'minimum' => :number, 'maximum' => :number,
+        'multipleOf' => :positive_number, 'uniqueItems' => :boolean,
+        'minContains' => :non_negative_integer, 'maxContains' => :non_negative_integer,
+        'minProperties' => :non_negative_integer, 'maxProperties' => :non_negative_integer,
+        'dependentRequired' => :dependent_required
       }.freeze
 
       # The JSON Schema type names (2020-12 Validation Section 6.1.1).
       JSON_TYPE_NAMES = %w[array boolean integer null number object string].freeze
 
-      # Check the assertion keyword values a schema object carries. Every one
-      # of these keywords exists in all supported dialects, so no dialect test
-      # is needed.
+      # Check the assertion keyword values a schema object carries. A keyword
+      # the dialect does not define (`minContains` under draft-07) is an
+      # unknown one there: ignored, never malformed.
       # @return [void]
-      def check_assertion_shapes(schema, problems)
+      def check_assertion_shapes(schema, dialect, problems)
         schema.each do |keyword, value|
+          next unless keyword_known?(keyword, dialect)
+
           problem = assertion_shape_problem(keyword, value)
           problems << problem if problem
         end
@@ -67,15 +73,70 @@ module MCPClient
 
       # @return [String, nil] why an assertion value is malformed
       def assertion_shape_problem(keyword, value)
-        case ASSERTION_SHAPES[keyword]
-        when :type_names then type_shape_problem(value)
-        when :array then "#{keyword} must be an array" unless value.is_a?(Array)
-        when :property_names then "#{keyword} must be an array of property names" unless property_names?(value)
-        when :string then "#{keyword} must be a string" unless value.is_a?(String)
-        when :non_negative_integer
-          "#{keyword} must be a non-negative integer" unless integer?(value) && !value.negative?
-        when :number then "#{keyword} must be a number" unless value.is_a?(Numeric)
-        end
+        shape = ASSERTION_SHAPES[keyword]
+        return nil unless shape
+        return type_shape_problem(value) if shape == :type_names
+        return dependent_required_shape_problem(keyword, value) if shape == :dependent_required
+
+        requirement = shape_requirement(shape, value)
+        "#{keyword} must be #{requirement}" if requirement
+      end
+
+      # Each simple assertion shape: the predicate that admits a value, and
+      # how the requirement reads in a problem.
+      VALUE_SHAPES = {
+        array: [:array_value?, 'an array'],
+        property_names: [:property_names?, 'an array of distinct property names'],
+        string: [:string_value?, 'a string'],
+        non_negative_integer: [:non_negative_integer?, 'a non-negative integer'],
+        number: [:number_value?, 'a number'],
+        positive_number: [:positive_number?, 'a number greater than zero'],
+        boolean: [:boolean_value?, 'a boolean']
+      }.freeze
+
+      # @return [String, nil] what a malformed value should have been
+      def shape_requirement(shape, value)
+        predicate, requirement = VALUE_SHAPES[shape]
+        requirement unless predicate.nil? || send(predicate, value)
+      end
+
+      # @return [Boolean]
+      def array_value?(value)
+        value.is_a?(Array)
+      end
+
+      # @return [Boolean]
+      def string_value?(value)
+        value.is_a?(String)
+      end
+
+      # @return [Boolean]
+      def number_value?(value)
+        value.is_a?(Numeric)
+      end
+
+      # @return [Boolean]
+      def positive_number?(value)
+        value.is_a?(Numeric) && value.positive?
+      end
+
+      # @return [Boolean]
+      def non_negative_integer?(value)
+        integer?(value) && !value.negative?
+      end
+
+      # @return [Boolean]
+      def boolean_value?(value)
+        [true, false].include?(value)
+      end
+
+      # `dependentRequired` maps a property name to the names it requires
+      # (JSON Schema 2020-12 Validation Section 6.5.4).
+      # @return [String, nil]
+      def dependent_required_shape_problem(keyword, value)
+        return if value.is_a?(Hash) && value.each_value.all? { |v| property_names?(v) }
+
+        "#{keyword} must be an object of arrays of distinct property names"
       end
 
       # @return [String, nil] why a `type` value is malformed
@@ -98,10 +159,45 @@ module MCPClient
         'dependencies entries must be schemas or arrays of property names'
       end
 
+      # JSON Schema 2020-12 Validation Sections 6.5.3 and 6.5.4: the elements
+      # of `required` (and of a `dependentRequired` entry) are strings, and
+      # they MUST be unique — a name written twice is a malformed keyword,
+      # not the same assertion made again.
       # @param value [Object]
-      # @return [Boolean] whether value is an array of property names
+      # @return [Boolean] whether value is an array of distinct property names
       def property_names?(value)
-        value.is_a?(Array) && value.all?(String)
+        value.is_a?(Array) && value.all?(String) && value.uniq.size == value.size
+      end
+
+      # An identifier must have the shape its dialect defines: `$id` is a URI
+      # reference without a non-empty fragment (JSON Schema 2020-12 Core
+      # Section 8.2.1) — draft-07 additionally spells a plain-name identifier
+      # as a bare fragment (Core Section 8.2.3) — and `$anchor` /
+      # `$dynamicAnchor` hold a plain name (Core Section 8.2.2). An
+      # identifier the validator cannot read names nothing, so a reference
+      # written to it would silently resolve elsewhere.
+      # @return [void]
+      def check_identifier_shapes(schema, dialect, problems)
+        id_problem = id_shape_problem(schema['$id'], dialect) if schema.key?('$id')
+        problems << id_problem if id_problem
+        %w[$anchor $dynamicAnchor].each do |keyword|
+          next unless schema.key?(keyword) && keyword_known?(keyword, dialect)
+
+          problems << "#{keyword} must be a plain name" unless anchor_name?(schema[keyword], dialect)
+        end
+      end
+
+      # @return [String, nil] why an `$id` is malformed
+      def id_shape_problem(id, dialect)
+        return '$id must be a non-empty string' unless id.is_a?(String) && !id.empty?
+        # draft-07 Core Section 8.2.3: an $id that is exactly a fragment
+        # declares a plain name rather than a base URI.
+        return nil if dialect == DRAFT_07 && id.start_with?('#')
+
+        fragment = id.split('#', 2)[1]
+        return nil if fragment.nil? || fragment.empty?
+
+        "$id #{clip(id.inspect)} must not contain a non-empty fragment"
       end
 
       # exclusiveMinimum / exclusiveMaximum are numbers in every supported

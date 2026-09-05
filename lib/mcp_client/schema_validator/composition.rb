@@ -2,10 +2,9 @@
 
 module MCPClient
   module SchemaValidator
-    # How complete a verdict on one value is, and the part of `contains` its
-    # bounds alone decide. Extended into SchemaValidator, so the methods are
-    # its own; {Evaluation} applies the composition keywords themselves and
-    # reads the answers here.
+    # How complete a verdict on one value is. Extended into SchemaValidator,
+    # so the methods are its own; {Evaluation} applies the composition
+    # keywords themselves and reads the answers here.
     #
     # A composition branch is evaluated speculatively (its errors are a
     # verdict, not output). anyOf and allOf are monotonic, so a branch that
@@ -14,6 +13,13 @@ module MCPClient
     # applying to the instance is :undecided and never a match, while one
     # decided by its evaluated keywords (or carrying only annotations) is a
     # full verdict.
+    #
+    # Every standard assertion whose verdict this validator can reach is
+    # evaluated ({SchemaValidator.validate_object},
+    # {SchemaValidator.validate_array}, {SchemaValidator.validate_number}),
+    # so what is left here is only what genuinely cannot be decided: the two
+    # keywords read off the annotations a whole composition produces, the
+    # dynamic references, and `format` where it asserts.
     module Composition
       # Whether a schema object carries an assertion the validator does not
       # evaluate (in the dialect in force) that applies to this instance, so
@@ -36,107 +42,35 @@ module MCPClient
       end
 
       # Whether an unevaluated assertion can still change the result for
-      # this instance: a keyword that has no effect without its companion
-      # (minContains / maxContains without contains, additionalItems beside
-      # a non-tuple items — JSON Schema 2020-12 Validation Sections
-      # 6.4.4-6.4.5, draft-07 Section 9.3.1.2), one the instance never
-      # reaches (additionalItems or unevaluatedItems when the tuple or an
-      # items schema covers every item, additionalProperties or
-      # unevaluatedProperties when every property is covered, uniqueItems
-      # below two items, maxContains or maxProperties the instance cannot
-      # exceed, minProperties it already satisfies, a dependency none of
-      # whose triggers is present), one its companion switches off
-      # (contains with minContains 0) or whose value cannot fail
-      # (additionalProperties true, uniqueItems false, minProperties 0, an
-      # empty dependency map) decides nothing.
+      # this instance. `unevaluatedItems` and `unevaluatedProperties` are
+      # decided by the annotations a whole composition produces, so they
+      # assert only where the schema's own applicators leave the instance
+      # uncovered (a tuple, an `items` schema or an `additionalItems` beside
+      # a tuple evaluates every item; a named, pattern-matched or
+      # `additionalProperties`-covered member every property) and only where
+      # their value can fail at all. The dynamic references and a draft-07
+      # `format` always can.
       # @return [Boolean]
       def effective_assertion?(schema, keyword, data, dialect = nil, deadline = nil)
         value = schema[keyword]
         case keyword
-        when 'contains', 'minContains', 'maxContains', 'additionalItems', 'unevaluatedItems', 'uniqueItems'
-          effective_array_assertion?(schema, keyword, value, data, dialect)
-        when 'additionalProperties', 'unevaluatedProperties', 'propertyNames', 'minProperties', 'maxProperties',
-             'dependentRequired', 'dependentSchemas', 'dependencies', 'patternProperties'
-          effective_object_assertion?(schema, keyword, value, data, dialect, deadline)
-        when 'multipleOf' then value.is_a?(Numeric) && data.is_a?(Numeric)
+        when 'unevaluatedItems' then effective_unevaluated_items?(schema, value, data, dialect)
+        when 'unevaluatedProperties'
+          data.is_a?(Hash) && ![true, {}].include?(value) && uncovered_property?(schema, data, deadline)
         else true
         end
       end
 
-      # The array assertions whose effect depends on a companion keyword or
-      # on the instance's length. A companion the dialect does not define
-      # (`minContains` under draft-07) changes nothing.
-      # @return [Boolean]
-      def effective_array_assertion?(schema, keyword, value, data, dialect = nil)
+      # @return [Boolean] whether `unevaluatedItems` can still reject an item
+      def effective_unevaluated_items?(schema, value, data, dialect)
         return false unless data.is_a?(Array)
 
-        case keyword
-        when 'contains' then effective_contains?(schema, data, dialect)
-        when 'minContains', 'maxContains' then effective_contains_bound?(schema, keyword, value, data, dialect)
-        when 'uniqueItems' then value == true && data.length > 1
-        else
-          # additionalItems (beside a tuple only) / unevaluatedItems: only
-          # items past what the tuple (or an items schema, which evaluates
-          # every item) covers.
-          return false if keyword == 'additionalItems' && !schema['items'].is_a?(Array)
-
-          ![true, {}].include?(value) && data.length > evaluated_item_count(schema, keyword, dialect)
-        end
+        ![true, {}].include?(value) && data.length > evaluated_item_count(schema, dialect)
       end
 
       # @return [Boolean] whether a contains schema in force matches every item
       def contains_everything?(schema, dialect)
         keyword_known?('contains', dialect) && [true, {}].include?(schema['contains'])
-      end
-
-      # @return [Boolean] whether a contains schema in force matches no item
-      def contains_nothing?(schema, dialect)
-        keyword_known?('contains', dialect) && schema['contains'] == false
-      end
-
-      # Whether the number of matching items is known without evaluating the
-      # item schema: the array's own length when `contains` matches every
-      # item, zero when it matches none.
-      # @return [Boolean]
-      def contains_count_known?(schema, dialect)
-        contains_everything?(schema, dialect) || contains_nothing?(schema, dialect)
-      end
-
-      # The range the number of matching items lies in, read off the array's
-      # length alone (JSON Schema 2020-12 Validation Section 6.4.4: the
-      # count is between none and all of the items).
-      # @return [Array(Integer, Integer)] the lowest and highest count
-      def contains_count_range(data, schema, dialect)
-        return [data.length, data.length] if contains_everything?(schema, dialect)
-        return [0, 0] if contains_nothing?(schema, dialect)
-
-        [0, data.length]
-      end
-
-      # Whether `contains` can still change the result: not when its
-      # companion switches it off (minContains 0), not when the count is
-      # known from the array's length (a tautological schema matches every
-      # item, `false` none), and not when the array is too short to reach
-      # minContains whatever its items are, since
-      # {SchemaValidator.validate_contains} then decides the keyword outright.
-      # @return [Boolean]
-      def effective_contains?(schema, data, dialect)
-        return false if contains_count_known?(schema, dialect)
-
-        min = contains_min(schema, dialect)
-        min.positive? && data.length >= min
-      end
-
-      # A `contains` bound asserts only beside a `contains` this validator
-      # leaves unevaluated, and only where the array's length does not
-      # already settle it: a lower bound that requires a match the array is
-      # long enough to hold, an upper bound the instance can exceed.
-      # @return [Boolean]
-      def effective_contains_bound?(schema, keyword, value, data, dialect)
-        return false unless schema.key?('contains') && value.is_a?(Numeric) &&
-                            !contains_count_known?(schema, dialect)
-
-        keyword == 'minContains' ? value.positive? && data.length >= value : data.length > value
       end
 
       # The number of matching items `contains` requires: its companion
@@ -155,89 +89,19 @@ module MCPClient
         max if max.is_a?(Numeric)
       end
 
-      # Apply the part of `contains` the bounds alone decide. The number of
-      # matching items is never more than the array holds and never less
-      # than none, so a bound outside that range is an assertion this
-      # validator settles whatever the item schema says (JSON Schema 2020-12
-      # Validation Sections 6.4.4-6.4.5: the default minContains is 1, so
-      # any contains rejects the empty array). Bounds that cannot overlap
-      # each other settle it too: `minContains` above `maxContains` admits
-      # no count at all, so the keyword fails before the item schema is
-      # ever consulted. A tautological schema (`true` / `{}`) matches every
-      # item and `false` none, which pins the count exactly; a contains
-      # that has to be matched item by item leaves only what its bounds
-      # decide, and the rest unevaluated.
-      # @param data [Array] the instance
-      # @param schema [Hash] string-keyed schema
-      # @param path [String] location for error messages
-      # @param dialect [String, nil] the dialect in force
-      # @return [Array<String>] validation errors
-      def validate_contains(data, schema, path, dialect)
-        return [] unless keyword_known?('contains', dialect) && schema_value?(schema['contains'])
-
-        low, high = contains_count_range(data, schema, dialect)
-        min = contains_min(schema, dialect)
-        max = contains_max(schema, dialect)
-        errors = contains_length_errors(path, low, high, min, max)
-        return errors unless errors.empty? && max && min > max
-
-        ["#{path}: contains requires between #{min} and #{max} matching items, which no count satisfies"]
-      end
-
-      # The bounds the array's own length settles: a lower bound above the
-      # highest count the array can reach, an upper bound below the lowest.
-      # @return [Array<String>] validation errors
-      def contains_length_errors(path, low, high, min, max)
-        errors = []
-        errors << "#{path}: expected at least #{min} items matching contains, got #{contains_seen(low, high, high)}" \
-          if high < min
-        errors << "#{path}: expected at most #{max} items matching contains, got #{contains_seen(low, high, low)}" \
-          if max && low > max
-        errors
-      end
-
-      # How the count reads in an error: the number itself when the array's
-      # length pins it, else the bound the error rests on.
-      # @return [String]
-      def contains_seen(low, high, bound)
-        return bound.to_s if low == high
-
-        "#{bound == high ? 'at most' : 'at least'} #{bound}"
-      end
-
       # How many leading items the tuple keywords in force evaluate, or
-      # infinity when an items schema (or a contains schema matching every
-      # item — JSON Schema 2020-12 Core Section 10.3.1.3) evaluates them all.
+      # infinity when an items schema, an `additionalItems` beside the tuple
+      # or a contains schema matching every item (JSON Schema 2020-12 Core
+      # Section 10.3.1.3) evaluates them all.
       # @return [Integer, Float]
-      def evaluated_item_count(schema, keyword, dialect)
+      def evaluated_item_count(schema, dialect)
         tuple = schema['prefixItems'] if keyword_known?('prefixItems', dialect) && schema['prefixItems'].is_a?(Array)
         tuple ||= schema['items'] if schema['items'].is_a?(Array)
-        if keyword == 'unevaluatedItems' && (schema_value?(schema['items']) || contains_everything?(schema, dialect))
-          return Float::INFINITY
-        end
+        return Float::INFINITY if schema_value?(schema['items']) || contains_everything?(schema, dialect) ||
+                                  (tuple && keyword_known?('additionalItems', dialect) &&
+                                   schema_value?(schema['additionalItems']))
 
         tuple ? tuple.length : 0
-      end
-
-      # The object assertions whose effect depends on the instance's
-      # properties.
-      # @return [Boolean]
-      def effective_object_assertion?(schema, keyword, value, data, dialect = nil, deadline = nil)
-        return false unless data.is_a?(Hash)
-
-        case keyword
-        when 'additionalProperties', 'unevaluatedProperties'
-          ![true, {}].include?(value) && uncovered_property?(schema, keyword, data, dialect, deadline)
-        when 'propertyNames' then ![true, {}].include?(value) && !data.empty?
-        when 'minProperties' then value.is_a?(Numeric) && data.size < value
-        when 'maxProperties' then value.is_a?(Numeric) && data.size > value
-        when 'patternProperties' then effective_pattern_properties?(value, data, deadline)
-        else
-          # An instance may carry either key form, so a trigger is present
-          # when either form is (like `required` and `properties`).
-          value.is_a?(Hash) &&
-            value.any? { |trigger, dep| property_present?(data, trigger) && dependency_can_fail?(dep, data) }
-        end
       end
 
       # @param data [Hash] the instance
@@ -249,39 +113,15 @@ module MCPClient
         data.key?(name) || data.key?(name.to_sym)
       end
 
-      # `patternProperties` asserts only through a pattern some property
-      # name matches whose schema is not a tautology.
-      # @return [Boolean]
-      def effective_pattern_properties?(value, data, deadline = nil)
-        return false unless value.is_a?(Hash) && data.is_a?(Hash)
-
-        value.any? do |pattern, sub|
-          ![true, {}].include?(sub) &&
-            data.each_key.any? { |name| pattern_matches?(pattern.to_s, name.to_s, deadline) }
-        end
-      end
-
-      # A dependency whose value cannot fail (a required list every name of
-      # which the instance already carries — an empty list included — or a
-      # schema of true / {}) decides nothing for a present trigger.
-      # @param data [Hash] the instance
-      # @return [Boolean]
-      def dependency_can_fail?(dep, data)
-        return dep.any? { |name| !property_present?(data, name) } if dep.is_a?(Array)
-
-        ![true, {}].include?(dep)
-      end
-
       # Whether the instance has a property the schema's own property
-      # applicators leave to the keyword: one named in `properties` is
-      # covered, one an `additionalProperties` schema evaluates is covered
-      # for `unevaluatedProperties`, and one matching a `patternProperties`
-      # pattern is covered (an unreadable pattern is assumed to match
-      # nothing, keeping the branch undecided).
+      # applicators leave to `unevaluatedProperties`: one named in
+      # `properties` is covered, one an `additionalProperties` schema
+      # evaluates is covered, and one matching a `patternProperties` pattern
+      # is covered (an unreadable pattern is assumed to match nothing,
+      # keeping the branch undecided).
       # @return [Boolean]
-      def uncovered_property?(schema, keyword, data, dialect, deadline = nil)
-        return false if keyword == 'unevaluatedProperties' && schema.key?('additionalProperties') &&
-                        keyword_known?('additionalProperties', dialect)
+      def uncovered_property?(schema, data, deadline = nil)
+        return false if schema.key?('additionalProperties') && schema_value?(schema['additionalProperties'])
 
         named = schema['properties'].is_a?(Hash) ? schema['properties'].keys.map(&:to_s) : []
         patterns = schema['patternProperties'].is_a?(Hash) ? schema['patternProperties'].keys.map(&:to_s) : []
@@ -296,8 +136,7 @@ module MCPClient
       # Match a server-supplied pattern against a property name. Both come
       # from the peer, so — exactly like {.validate_pattern} — the match runs
       # under the validation-wide deadline: a backtracking expression here
-      # decides only whether a branch is undecided, and must not be able to
-      # hold the calling thread for it.
+      # must not be able to hold the calling thread.
       # @param deadline [Float, nil] monotonic deadline for the whole validation
       # @return [Boolean]
       # @raise [Aborted] when the budget is exhausted
@@ -305,7 +144,7 @@ module MCPClient
         remaining = pattern_budget_remaining(deadline)
         raise Aborted, "validation time budget exhausted before pattern #{clip(pattern.inspect)}" if remaining.zero?
 
-        Regexp.new(pattern, timeout: remaining).match?(name)
+        ecma_regexp(pattern, remaining).match?(name)
       rescue Regexp::TimeoutError
         raise Aborted, "pattern #{clip(pattern.inspect)} exceeded the #{PATTERN_MATCH_TIMEOUT}s matching budget"
       rescue RegexpError, TypeError

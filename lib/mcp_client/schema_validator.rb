@@ -10,6 +10,7 @@ require_relative 'schema_validator/keyword_scan'
 require_relative 'schema_validator/composition'
 require_relative 'schema_validator/evaluation'
 require_relative 'schema_validator/scalars'
+require_relative 'schema_validator/instances'
 
 module MCPClient
   # Self-contained JSON Schema validator used to check a tool call result's
@@ -51,12 +52,21 @@ module MCPClient
   #   per-validation time budget. Hitting a bound aborts the validation with
   #   one error: an aborted validation never reads as a pass.
   #
-  # The rest of the vocabulary (additionalProperties, format assertions,
-  # unevaluated*, additionalItems, dependencies, ...) is out of scope:
-  # unrecognized keywords are ignored rather than misapplied, so validation is
-  # best-effort — it may accept data a full validator would reject, but it
-  # does not reject data that conforms to the schema. So that this gap is
-  # never silent, {.unsupported_keywords} reports which unapplied validation
+  # - multipleOf (numbers), uniqueItems, contains with minContains /
+  #   maxContains, additionalItems (draft-07, 2019-09) (arrays)
+  # - minProperties, maxProperties, patternProperties, additionalProperties,
+  #   propertyNames, dependentRequired / dependentSchemas (2019-09, 2020-12)
+  #   and draft-07 dependencies (objects)
+  #
+  # What is left out is what cannot be decided without the annotations a
+  # whole composition produces (unevaluatedItems, unevaluatedProperties) or
+  # without a dynamic scope ($dynamicRef, $recursiveRef), plus the two
+  # keywords that only annotate in the default dialect (format, which full
+  # validators assert only in format-assertion mode, and contentSchema).
+  # Those are ignored rather than misapplied, so validation is best-effort
+  # there — it may accept data a full validator would reject, but it does not
+  # reject data that conforms to the schema. So that this gap is never
+  # silent, {.unsupported_keywords} reports which unapplied validation
   # keywords a schema uses; callers surface them as a warning.
   module SchemaValidator
     extend Dialects
@@ -68,6 +78,7 @@ module MCPClient
     extend Composition
     extend Evaluation
     extend Scalars
+    extend Instances
 
     # Raised inside a validation to abandon it (time budget, resource bound).
     class Aborted < StandardError; end
@@ -124,17 +135,22 @@ module MCPClient
     MAX_NODE_DEPTH = 256
 
     # JSON Schema keywords that affect validation but that this validator
-    # does not evaluate: assertion keywords (multipleOf, uniqueItems,
-    # contains bounds, property-count bounds, dependentRequired), the
-    # remaining applicators, draft-specific keywords, and format (asserted by
-    # full validators in format-assertion mode). Their presence means
+    # does not evaluate: the dynamic references (whose target depends on the
+    # dynamic scope a validation was entered through), the two keywords
+    # decided by annotations collected across a whole composition
+    # (`unevaluatedItems` / `unevaluatedProperties`), and the two that only
+    # annotate in the default dialect (`format`, asserted by full validators
+    # in format-assertion mode, and `contentSchema`). Their presence means
     # validation is partial: data may pass here that a full validator would
     # reject.
+    #
+    # Every other standard keyword is evaluated. A standard assertion left
+    # unevaluated is not a smaller report but a wrong verdict: it makes a
+    # composition branch undecided, and an undecided branch is accepted
+    # wherever the composition is monotonic (`allOf`, `anyOf`), so the
+    # instance passes a schema that rejects it.
     UNSUPPORTED_KEYWORDS = %w[
-      $dynamicRef $recursiveRef
-      additionalProperties patternProperties propertyNames dependentSchemas dependencies
-      additionalItems contains minContains maxContains uniqueItems contentSchema
-      multipleOf format dependentRequired minProperties maxProperties
+      $dynamicRef $recursiveRef contentSchema format
       unevaluatedProperties unevaluatedItems
     ].freeze
 
@@ -148,10 +164,8 @@ module MCPClient
     # 2020-12 Validation Section 6: keywords apply only to their type), so
     # it cannot leave a branch undecided.
     UNSUPPORTED_ASSERTIONS_BY_TYPE = {
-      Hash => %w[additionalProperties patternProperties propertyNames dependentSchemas dependencies
-                 dependentRequired minProperties maxProperties unevaluatedProperties],
-      Array => %w[additionalItems contains minContains maxContains uniqueItems unevaluatedItems],
-      Numeric => %w[multipleOf]
+      Hash => %w[unevaluatedProperties],
+      Array => %w[unevaluatedItems]
     }.freeze
 
     # Unsupported keywords that apply to every instance.
@@ -327,7 +341,8 @@ module MCPClient
     end
 
     # Problems the anchor index reveals: anchor names must be unique within
-    # a schema resource (JSON Schema 2020-12 Core Section 8.2.2) — a name
+    # a schema resource (JSON Schema 2020-12 Core Section 8.2.2) and a
+    # resource URI unique within the document (Section 9.1.2) — either
     # declared twice would bind a reference to whichever declaration the
     # walk met first — and an index that stopped at its bound before
     # reaching every object leaves references and resource dialects
@@ -339,6 +354,9 @@ module MCPClient
       problems = index[:duplicates].map do |name|
         "anchor #{clip(name.inspect)} is declared more than once in a schema resource"
       end
+      problems.concat(index[:duplicate_ids].uniq.map do |base|
+        "schema resource #{clip(base.inspect)} is declared more than once"
+      end)
       if index[:truncated]
         problems << 'schema has too many or too deeply nested objects to index its anchors ' \
                     "(more than #{MAX_SUBSCHEMAS}, or deeper than #{MAX_SCHEMA_DEPTH})"
@@ -436,8 +454,9 @@ module MCPClient
         problems << 'items must be a schema in JSON Schema 2020-12 (positional schemas go in prefixItems)'
       end
       check_applicator_shapes(schema, dialect, problems)
-      check_assertion_shapes(schema, problems)
+      check_assertion_shapes(schema, dialect, problems)
       check_exclusive_bounds(schema, dialect, problems)
+      check_identifier_shapes(schema, dialect, problems)
     end
 
     # Account for a schema (object or boolean) about to be walked: once per
@@ -561,10 +580,13 @@ module MCPClient
     # booleans.
     # @return [void]
     def self.charge_boolean_target(hop, root, from, counter, problems)
+      index = (counter[:anchors] ||= anchor_index(root, counter[:dialect]))
+      resource, hop = pointer_origin(index, root, hop, from)
+      return unless resource
+
       tokens = pointer_tokens(hop)
       return unless tokens
 
-      resource = (counter[:anchors] && from && counter[:anchors][:resources][from]) || root
       key = [resource.object_id, tokens]
       seen = (counter[:boolean_targets] ||= {})
       return if seen.key?(key)
@@ -580,7 +602,9 @@ module MCPClient
     # @return [void]
     def self.check_dynamic_ref(walk, schema, keyword, _dialect)
       ref = schema[keyword]
-      return unless ref.is_a?(String)
+      # A reference that is not a URI reference at all names nothing: it is
+      # not silently ignored (a malformed keyword is not an absent one).
+      return walk.problems << "#{keyword} must be a string, got #{json_type(ref)}" unless ref.is_a?(String)
       return unless external_ref?(ref, walk.root, walk.counter[:dialect], walk.counter, from: schema)
 
       walk.problems << "external #{keyword} #{clip(ref.inspect)} is not dereferenced"
@@ -852,83 +876,6 @@ module MCPClient
         errors << "#{path}: value #{clip_value(data)} does not equal const #{clip_value(schema['const'])}"
       end
       errors
-    end
-
-    # Validate an object against required/properties.
-    # @param data [Hash] the object
-    # @param schema [Hash] string-keyed schema
-    # @param path [String] location for error messages
-    # @return [Array<String>] validation errors
-    def self.validate_object(data, schema, path, ctx)
-      errors = []
-      Array(schema['required']).each do |raw_name|
-        name = raw_name.to_s
-        errors << "#{path}: missing required property '#{clip(name)}'" unless data.key?(name) || data.key?(name.to_sym)
-      end
-      properties = schema['properties']
-      return errors unless properties.is_a?(Hash)
-
-      properties.each do |raw_name, prop_schema|
-        next unless schema_value?(prop_schema)
-
-        name = raw_name.to_s
-        key = if data.key?(name)
-                name
-              elsif data.key?(name.to_sym)
-                name.to_sym
-              end
-        next if key.nil?
-
-        # A property is a smaller instance, so the hops taken to reach this
-        # schema cannot repeat forever below it: the budget counts a chain
-        # of references applied to one value, not how deep the data nests.
-        # The step down is what the depth bound counts.
-        errors.concat(validate_child(data[key], prop_schema, "#{path}/#{name}", ctx))
-      end
-      errors
-    end
-
-    # Validate an array against items/prefixItems/minItems/maxItems.
-    # 2020-12 puts positional schemas in `prefixItems` and the rest under
-    # `items`; draft-07 and 2019-09 put positional schemas in an `items`
-    # array. Both forms are honoured.
-    # @param data [Array] the array
-    # @param schema [Hash] string-keyed schema
-    # @param path [String] location for error messages
-    # @return [Array<String>] validation errors
-    def self.validate_array(data, schema, path, ctx, dialect = ctx.dialect)
-      errors = []
-      min_items = schema['minItems']
-      max_items = schema['maxItems']
-      if min_items.is_a?(Numeric) && data.length < min_items
-        errors << "#{path}: expected at least #{min_items} items, got #{data.length}"
-      end
-      if max_items.is_a?(Numeric) && data.length > max_items
-        errors << "#{path}: expected at most #{max_items} items, got #{data.length}"
-      end
-      items = schema['items']
-      # 2020-12 puts positional schemas in prefixItems (items must be a
-      # schema); draft-07 and 2019-09 put them in an items array and know no
-      # prefixItems.
-      positional = if dialect == DEFAULT_DIALECT
-                     schema['prefixItems'].is_a?(Array) ? schema['prefixItems'] : []
-                   else
-                     items.is_a?(Array) ? items : []
-                   end
-      data.each_with_index do |item, idx|
-        item_schema = if idx < positional.length
-                        positional[idx]
-                      elsif !items.is_a?(Array)
-                        items
-                      end
-        next unless schema_value?(item_schema)
-
-        # An item is a smaller instance: the hop budget starts over and the
-        # depth bound counts the step, so a recursive schema describes data
-        # of any depth up to it (see {.validate_object}).
-        errors.concat(validate_child(item, item_schema, "#{path}/#{idx}", ctx))
-      end
-      errors.concat(validate_contains(data, schema, path, dialect))
     end
 
     # Bound a piece of peer-derived text destined for a message.

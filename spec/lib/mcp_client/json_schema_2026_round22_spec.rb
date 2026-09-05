@@ -116,13 +116,13 @@ RSpec.describe 'MCP 2026-07-28 JSON Schema handling — round 22' do
     end
   end
 
-  describe 'a branch that already failed a supported assertion' do
+  describe 'a node whose own type already rejected the value' do
     # Backtracking Ruby's regexp cache cannot flatten: matching it would
     # burn the whole validation budget.
     let(:evil_pattern) { '^(a*)*\1$' }
     let(:evil_name) { "#{'a' * 17}!" }
 
-    it 'is not measured for the keywords the validator does not evaluate' do
+    it 'spends nothing more on the keywords for the type it does not have' do
       schema = { 'not' => { 'type' => 'string', 'patternProperties' => { evil_pattern => false } } }
       started = Process.clock_gettime(Process::CLOCK_MONOTONIC)
       errors = validator.validate({ evil_name => 1 }, schema)
@@ -131,9 +131,10 @@ RSpec.describe 'MCP 2026-07-28 JSON Schema handling — round 22' do
       expect(errors).to be_empty
     end
 
-    it 'still measures a branch its supported assertions accept' do
+    it 'still applies them when the type accepts the value' do
       schema = { 'not' => { 'type' => 'object', 'patternProperties' => { '^a' => { 'type' => 'string' } } } }
       expect(validator.validate({ 'ab' => 1 }, schema)).to be_empty
+      expect(validator.validate({ 'ab' => 'x' }, schema)).to contain_exactly(a_string_matching(/not/))
     end
   end
 
@@ -166,6 +167,49 @@ RSpec.describe 'MCP 2026-07-28 JSON Schema handling — round 22' do
 
       expect(client.instance_variable_get(:@input_schema_warnings)).to be_empty
       expect(client.instance_variable_get(:@output_schema_coverage)).to be_empty
+    end
+
+    # An emptied memo hash is only the mechanism; what matters is that the
+    # next call decides on the definition the server is now serving.
+    it 'decides the next call on the refreshed definition, warning about it again' do
+      log = StringIO.new
+      allow(MCPClient::ServerFactory).to receive(:create).and_return(mock_server)
+      allow(mock_server).to receive(:on_notification)
+      partial = MCPClient::Tool.from_json({ 'name' => 't', 'description' => 'd',
+                                            'inputSchema' => { 'type' => 'object' },
+                                            'outputSchema' => { 'type' => 'object', 'format' => 'x' } },
+                                          server: mock_server)
+      allow(mock_server).to receive(:list_tools).and_return([partial])
+      allow(mock_server).to receive(:call_tool).and_return({ 'content' => [], 'structuredContent' => { 'a' => 1 } })
+      client = MCPClient::Client.new(mcp_server_configs: [{ type: 'stdio', command: 'test' }],
+                                     logger: Logger.new(log))
+
+      2.times { client.call_tool('t', {}) }
+      expect(log.string.scan('validation is partial').size).to eq(1)
+
+      # A refreshed definition the notification announces: the coverage
+      # warning is made again, and it names what the new schema uses.
+      refreshed = MCPClient::Tool.from_json(
+        { 'name' => 't', 'description' => 'd', 'inputSchema' => { 'type' => 'object' },
+          'outputSchema' => { 'type' => 'object', 'unevaluatedProperties' => false } }, server: mock_server
+      )
+      allow(mock_server).to receive(:list_tools).and_return([refreshed])
+      client.send(:invalidate_caches_for_notification, mock_server, 'notifications/tools/list_changed')
+
+      client.call_tool('t', {})
+      expect(log.string.scan('validation is partial').size).to eq(2)
+      expect(log.string).to include('unevaluatedProperties')
+
+      # And a refreshed dialect is refused, rather than read from the memo
+      # the first definition filled in.
+      unusable = MCPClient::Tool.from_json(
+        { 'name' => 't', 'description' => 'd',
+          'inputSchema' => { '$schema' => 'urn:unknown', 'type' => 'object' } }, server: mock_server
+      )
+      allow(mock_server).to receive(:list_tools).and_return([unusable])
+      client.send(:invalidate_caches_for_notification, mock_server, 'notifications/tools/list_changed')
+
+      expect { client.call_tool('t', {}) }.to raise_error(MCPClient::Errors::ValidationError, /urn:unknown/)
     end
 
     it 'forgets them when the whole cache is cleared' do

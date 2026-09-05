@@ -359,17 +359,22 @@ data = result['structuredContent']  # Type-safe structured data
 
 # Per MCP 2025-11-25, clients SHOULD validate structured results against the
 # tool's output schema, and a tool that declares an outputSchema must return
-# structuredContent in successful results. call_tool checks both automatically
-# for the common JSON Schema keywords (type, properties, required, items, enum,
-# numeric/string bounds). The full 2020-12 vocabulary ($ref/$dynamicRef/$defs,
-# allOf/anyOf/oneOf/not, if/then/else, additionalProperties, patternProperties,
-# propertyNames, prefixItems, contains/minContains/maxContains, uniqueItems,
-# multipleOf, format, dependentRequired/dependentSchemas, minProperties/
-# maxProperties, unevaluated*) is NOT evaluated: when a schema uses any of
-# those keywords, call_tool logs a "validation is partial" warning naming them
-# (in both modes), since data may pass this check that a full validator would
-# reject. By default a violation (mismatch, or missing structuredContent on a
-# successful result) logs a warning; opt in to strict mode to raise instead:
+# structuredContent in successful results. call_tool checks both automatically,
+# against the JSON Schema vocabulary this client evaluates: type, enum/const,
+# properties/required, patternProperties, additionalProperties, propertyNames,
+# minProperties/maxProperties, dependentRequired/dependentSchemas (draft-07
+# dependencies), items/prefixItems/additionalItems, minItems/maxItems,
+# uniqueItems, contains with minContains/maxContains, string bounds and
+# pattern (ECMAScript anchoring), numeric bounds and multipleOf,
+# allOf/anyOf/oneOf/not, if/then/else, and $ref/$defs/definitions inside the
+# document. What is NOT evaluated is what needs annotations collected across a
+# whole composition (unevaluatedItems, unevaluatedProperties) or a dynamic
+# scope ($dynamicRef, $recursiveRef), plus the two keywords that only annotate
+# (format, contentSchema). When a schema uses one of those, call_tool logs a
+# "validation is partial" warning naming them (in both modes), since data may
+# pass this check that a full validator would reject. By default a violation
+# (mismatch, or missing structuredContent on a successful result) logs a
+# warning; opt in to strict mode to raise instead:
 client = MCPClient::Client.new(
   mcp_server_configs: [...],
   validate_structured_content: :strict # raises MCPClient::Errors::ValidationError on violation
@@ -403,12 +408,20 @@ client.call_tool('t', {})
 #     that dialect is not supported (supported: ...)"
 ```
 
-An unsupported dialect in an `outputSchema` is reported the way every other
-structured-content violation is: a warning by default, a `ValidationError`
-under `validate_structured_content: :strict`. An input schema that is merely
-unusable for another reason (a `$ref` that would need a network fetch, a
-document past the resource bounds, a malformed keyword value) is warned about
-and the call still goes out, since the server owns argument validation.
+The same applies to an `outputSchema`: an unsupported dialect there raises a
+`ValidationError` in both modes, since the client cannot read the schema at
+all — unlike a structured-content mismatch, which the
+`validate_structured_content` mode decides. The definition checked is the one
+the answered request actually went out under, so a `HeaderMismatch` retry
+under a refreshed schema is covered too. A schema that is merely unusable for
+another reason (a `$ref` that would need a network fetch, a document past the
+resource bounds, a malformed keyword value) is warned about, and for an input
+schema the call still goes out, since the server owns argument validation.
+
+Two schema resources may not answer to one URI: a document whose `$id`s (or
+whose `$anchor` names within one resource) collide is unusable, since which
+declaration a reference lands on would otherwise depend on the order the
+document was read in.
 
 References are resolved inside the document only — nothing is ever fetched —
 but a document that bundles the resources it uses is resolved in full: a

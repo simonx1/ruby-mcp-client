@@ -38,7 +38,8 @@ module MCPClient
 
       # The composition keywords, in the order they are applied. Each step
       # takes the application and a continuation, and returns a step.
-      COMPOSITION_STEPS = %i[compose_all_of compose_any_of compose_one_of compose_not compose_conditional].freeze
+      COMPOSITION_STEPS = %i[compose_all_of compose_any_of compose_one_of compose_not compose_conditional
+                             compose_dependent_schemas].freeze
 
       # Begin applying one (sub)schema to the value, under the bound on the
       # walk itself: one more node visited.
@@ -130,9 +131,15 @@ module MCPClient
         schema = app.schema
         errors = app.errors
         errors.concat(validate_type(data, schema['type'], app.path)) if schema.key?('type')
+        # A node its own `type` already rejected is decided: the keywords for
+        # the value's actual type could only add detail, and evaluating them
+        # would spend the peer's `patternProperties` expressions and item
+        # schemas on a value this schema has refused.
+        return compose(app) unless errors.empty?
+
         errors.concat(validate_enum(data, schema, app.path))
         case data
-        when Hash then errors.concat(validate_object(data, schema, app.path, app.ctx))
+        when Hash then errors.concat(validate_object(data, schema, app.path, app.ctx, app.dialect))
         when Array then errors.concat(validate_array(data, schema, app.path, app.ctx, app.dialect))
         when String then errors.concat(validate_string(data, schema, app.path, app.ctx.deadline))
         when Numeric then errors.concat(validate_number(data, schema, app.path, app.dialect))
@@ -163,6 +170,57 @@ module MCPClient
         ctx = app.ctx
         ctx.undecided += 1 if app.errors.empty? && partial_keywords?(app.schema, app.dialect, app.data, ctx.deadline)
         [:done, count_errors(ctx, app.errors, already_counted: ctx.errors - app.counted_before)]
+      end
+
+      # The schema half of a dependency: `dependentSchemas` in 2019-09 and
+      # 2020-12, and the schema entries of draft-07's `dependencies` (JSON
+      # Schema 2020-12 Core Section 10.2.2.4, draft-07 Section 6.5.7). Each
+      # dependency whose trigger the instance carries applies its schema to
+      # that same instance, so — like allOf — it runs on the trampoline
+      # rather than on the interpreter's stack.
+      # @param app [Application]
+      # @return [Array] a step
+      def compose_dependent_schemas(app, &cont)
+        return cont.call unless app.data.is_a?(Hash)
+
+        subs = triggered_dependencies(app)
+        return cont.call if subs.empty?
+
+        dependency_branch(app, subs, 0, cont)
+      end
+
+      # @param app [Application]
+      # @return [Array<Array(String, Object)>] the trigger and schema of every
+      #   dependency the instance turns on, in document order
+      def triggered_dependencies(app)
+        subs = []
+        %w[dependentSchemas dependencies].each do |keyword|
+          map = app.schema[keyword] if keyword_known?(keyword, app.dialect)
+          next unless map.is_a?(Hash)
+
+          map.each do |trigger, sub|
+            subs << [trigger.to_s, sub] if schema_value?(sub) && property_present?(app.data, trigger)
+          end
+        end
+        subs
+      end
+
+      # @param app [Application]
+      # @param subs [Array] the triggered dependencies
+      # @param idx [Integer] the dependency to apply
+      # @param cont [Proc] what follows
+      # @return [Array] a step
+      def dependency_branch(app, subs, idx, cont)
+        return cont.call if idx >= subs.length
+
+        trigger, sub = subs[idx]
+        [:apply, sub, app.ref_depth, false, lambda do |errors|
+          next dependency_branch(app, subs, idx + 1, cont) if errors.empty?
+
+          app.errors << "#{app.path}: does not satisfy the schema required by property " \
+                        "'#{clip(trigger)}' (#{clip(errors.first.to_s)})"
+          dependency_branch(app, subs, idx + 1, cont)
+        end]
       end
 
       # allOf: the first failing branch decides it, and later branches are

@@ -67,10 +67,10 @@ RSpec.describe 'MCP 2026-07-28 JSON Schema handling — round 20' do
   it 'scans a data-keyword $ref target at its own position even from a referrer at the depth bound' do
     leaf = nested('properties', 0, { '$ref' => '#/default' })
     validator::MAX_SCHEMA_DEPTH.times { leaf = { 'properties' => { 'a' => leaf } } }
-    schema = leaf.merge('default' => { 'type' => 'array', 'uniqueItems' => true })
+    schema = leaf.merge('default' => { 'type' => 'array', 'unevaluatedItems' => false })
 
     expect(validator.check_schema(schema)).to be_empty
-    expect(validator.unsupported_keywords(schema)).to eq(['uniqueItems'])
+    expect(validator.unsupported_keywords(schema)).to eq(['unevaluatedItems'])
   end
 
   it 'copies a symbol-keyed target adopted from a data keyword within the structural budget' do

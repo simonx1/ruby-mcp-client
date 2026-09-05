@@ -37,9 +37,9 @@ RSpec.describe 'MCP 2026-07-28 JSON Schema handling — round 25' do
 
     it 'still reports the keywords a reference to a schema object reaches' do
       schema = { 'definitions' => {}, 'x' => 1.5, '$ref' => '#/y',
-                 'y' => { 'type' => 'array', 'uniqueItems' => true } }
+                 'y' => { 'type' => 'array', 'unevaluatedItems' => false } }
 
-      expect(validator.unsupported_keywords(schema)).to contain_exactly('uniqueItems')
+      expect(validator.unsupported_keywords(schema)).to contain_exactly('unevaluatedItems')
     end
   end
 
@@ -87,8 +87,12 @@ RSpec.describe 'MCP 2026-07-28 JSON Schema handling — round 25' do
                                           '$defs' => { 'any' => true } })).to be_empty
     end
 
-    it 'still leaves bounds the array length cannot settle unevaluated' do
-      expect(validator.validate([1, 2], { 'contains' => { 'type' => 'string' } })).to be_empty
+    it 'matches the items themselves where the bounds leave the count open' do
+      expect(validator.validate([1, 2], { 'contains' => { 'type' => 'string' } }))
+        .to contain_exactly(a_string_matching(/at least 1 items matching contains/))
+      expect(validator.validate([1, 'x'], { 'contains' => { 'type' => 'string' } })).to be_empty
+      # `minContains: 0` switches the lower bound off, and a `maxContains` no
+      # count can exceed asserts nothing either.
       expect(validator.validate([1, 2], { 'contains' => { 'type' => 'string' },
                                           'minContains' => 0, 'maxContains' => 0 })).to be_empty
     end
@@ -97,7 +101,11 @@ RSpec.describe 'MCP 2026-07-28 JSON Schema handling — round 25' do
       schema = { '$schema' => 'http://json-schema.org/draft-07/schema#',
                  'contains' => { 'type' => 'string' }, 'maxContains' => 0 }
 
-      expect(validator.validate([1, 2], schema)).to be_empty
+      # The unknown upper bound makes nothing unsatisfiable: draft-07
+      # `contains` asks only for one matching item, and never for at most none.
+      expect(validator.validate([1, 2], schema))
+        .to contain_exactly(a_string_matching(/at least 1 items matching contains/))
+      expect(validator.validate([1, 'x', 'y'], schema)).to be_empty
     end
   end
 

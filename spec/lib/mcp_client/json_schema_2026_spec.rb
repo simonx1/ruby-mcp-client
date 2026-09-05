@@ -33,10 +33,13 @@ RSpec.describe 'MCP 2026-07-28 JSON Schema handling' do
       expect(errors).to contain_exactly(a_string_matching(/dialect.*not supported/))
     end
 
-    it 'documents the supported dialects' do
-      expect(validator::SUPPORTED_DIALECTS).to include('https://json-schema.org/draft/2020-12/schema',
-                                                       'https://json-schema.org/draft/2019-09/schema',
-                                                       'http://json-schema.org/draft-07/schema')
+    it 'implements exactly 2020-12, 2019-09 and draft-07' do
+      expect(validator::SUPPORTED_DIALECTS).to contain_exactly('https://json-schema.org/draft/2020-12/schema',
+                                                               'https://json-schema.org/draft/2019-09/schema',
+                                                               'http://json-schema.org/draft-07/schema')
+      validator::SUPPORTED_DIALECTS.each do |dialect|
+        expect(validator.check_schema({ '$schema' => dialect, 'type' => 'object' })).to be_empty
+      end
     end
 
     it 'requires a schema to be an object' do
@@ -194,7 +197,11 @@ RSpec.describe 'MCP 2026-07-28 JSON Schema handling' do
       client = client_with([tool({ 'type' => 'null' })], validate_structured_content: :strict)
       allow(mock_server).to receive(:call_tool).and_return({ 'content' => [], 'structuredContent' => nil })
 
-      expect(client.call_tool('tool', {})['structuredContent']).to be_nil
+      returned = client.call_tool('tool', {})
+      # The key itself must survive: reading it as nil would pass just as
+      # well for a result the client had dropped it from.
+      expect(returned).to have_key('structuredContent')
+      expect(returned['structuredContent']).to be_nil
       expect(log_output.string).not_to include('structuredContent')
     end
 
@@ -217,6 +224,33 @@ RSpec.describe 'MCP 2026-07-28 JSON Schema handling' do
       expect { client.call_tool('tool', {}) }.to raise_error(MCPClient::Errors::ValidationError, %r{#/0})
     end
 
+    # "structuredContent can be any JSON value (object, array, string,
+    # number, boolean, or null)": every one of them is validated, and a
+    # symbol-keyed result carries the value just as a string-keyed one does.
+    {
+      'string' => ['ok', 42], 'number' => [1.5, 'no'], 'boolean' => [false, 'no'], 'null' => [nil, 1]
+    }.each do |type, (conforming, violating)|
+      it "validates #{type} structured content" do
+        client = client_with([tool({ 'type' => type })], validate_structured_content: :strict)
+        allow(mock_server).to receive(:call_tool).and_return({ 'content' => [], 'structuredContent' => conforming })
+        expect(client.call_tool('tool', {})['structuredContent']).to eq(conforming)
+
+        allow(mock_server).to receive(:call_tool).and_return({ 'content' => [], 'structuredContent' => violating })
+        expect { client.call_tool('tool', {}) }
+          .to raise_error(MCPClient::Errors::ValidationError, /expected type #{type}/)
+      end
+    end
+
+    it 'reads a symbol-keyed result the same way' do
+      client = client_with([tool({ 'type' => 'string' })], validate_structured_content: :strict)
+      allow(mock_server).to receive(:call_tool).and_return({ content: [], structuredContent: 'ok' })
+      expect(client.call_tool('tool', {})[:structuredContent]).to eq('ok')
+
+      allow(mock_server).to receive(:call_tool).and_return({ content: [], structuredContent: 42 })
+      expect { client.call_tool('tool', {}) }
+        .to raise_error(MCPClient::Errors::ValidationError, /expected type string/)
+    end
+
     it 'treats an output schema with an external $ref as a violation rather than as permissive' do
       schema = { 'type' => 'object', 'properties' => { 'p' => { '$ref' => 'https://example.com/p.json' } } }
       client = client_with([tool(schema)], validate_structured_content: :strict)
@@ -226,14 +260,17 @@ RSpec.describe 'MCP 2026-07-28 JSON Schema handling' do
       expect(a_request(:any, /example\.com/)).not_to have_been_made
     end
 
-    it 'warns (default mode) when the output schema uses an unsupported dialect' do
+    it 'errors (in either mode) when the output schema uses an unsupported dialect' do
+      # MCP 2026-07-28 basic "Implementation Requirements": the client MUST
+      # return an error saying the dialect is not supported. That is not a
+      # structured-content mismatch the host's mode may reduce to a log line.
       schema = { '$schema' => 'http://json-schema.org/draft-04/schema#', 'type' => 'object' }
-      client = client_with([tool(schema)])
       allow(mock_server).to receive(:call_tool).and_return({ 'content' => [], 'structuredContent' => {} })
 
-      client.call_tool('tool', {})
-
-      expect(log_output.string).to match(/dialect.*not supported/)
+      expect { client_with([tool(schema)]).call_tool('tool', {}) }
+        .to raise_error(MCPClient::Errors::ValidationError, /dialect.*not supported/)
+      expect { client_with([tool(schema)], validate_structured_content: :strict).call_tool('tool', {}) }
+        .to raise_error(MCPClient::Errors::ValidationError, /dialect.*not supported/)
     end
 
     it 'warns once about an unusable input schema and still calls the tool' do

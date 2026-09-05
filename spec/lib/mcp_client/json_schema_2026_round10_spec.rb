@@ -40,8 +40,10 @@ RSpec.describe 'MCP 2026-07-28 JSON Schema handling — round 10' do
   describe 'names of a resource reached through a foreign bag' do
     let(:schema) do
       {
-        'properties' => { 'a' => { '$ref' => '#/definitions/x' } },
-        'definitions' => {
+        'properties' => { 'a' => { '$ref' => '#/x-defs/x' } },
+        # A vendor bag no dialect defines, so nothing walks it: the resource
+        # is reached only by following the pointer.
+        'x-defs' => {
           'x' => { '$id' => 'https://example.com/x', '$anchor' => 'trap', 'type' => 'object',
                    'properties' => { 'v' => { '$ref' => '#trap' } } }
         }

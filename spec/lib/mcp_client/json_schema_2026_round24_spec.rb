@@ -105,8 +105,10 @@ RSpec.describe 'MCP 2026-07-28 JSON Schema handling — round 24' do
       expect(validator.validate(['x'], schema)).to be_empty
     end
 
-    it 'still leaves a contains the length cannot settle unevaluated' do
-      expect(validator.validate([1, 2], { 'contains' => { 'type' => 'string' } })).to be_empty
+    it 'matches item by item where the length cannot settle contains' do
+      expect(validator.validate([1, 2], { 'contains' => { 'type' => 'string' } }))
+        .to contain_exactly(a_string_matching(/at least 1 items matching contains/))
+      expect(validator.validate([1, 'x'], { 'contains' => { 'type' => 'string' } })).to be_empty
       # `maxContains: 0` alone is unsatisfiable beside the default
       # `minContains: 1` (round 25); with the lower bound switched off, how
       # many items match is still the item schema's business.
