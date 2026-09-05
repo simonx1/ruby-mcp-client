@@ -760,7 +760,7 @@ RSpec.describe 'MCP 2026-07-28 modern mode — plain HTTP transport and concurre
   it 'ServerHTTP sends Accept for both JSON and SSE and parses an SSE-framed DiscoverResult and tool result' do
     server = MCPClient::ServerHTTP.new(base_url: 'https://example.com', endpoint: '/mcp', retries: 0)
     notifications = []
-    server.on_notification { |method, _params| notifications << method }
+    server.on_notification { |method, params| notifications << [method, params] }
     requests = []
     stub_request(:post, url).to_return do |request|
       body = JSON.parse(request.body)
@@ -784,7 +784,9 @@ RSpec.describe 'MCP 2026-07-28 modern mode — plain HTTP transport and concurre
     expect(server.call_tool('t', {})).to eq({ 'content' => [] })
     expect(server.protocol_era).to eq(:modern)
     expect(requests.first[:headers]['Accept']).to include('application/json').and include('text/event-stream')
-    expect(notifications).to eq(['notifications/progress'])
+    # The whole payload, not just the method name: a dispatcher that dropped
+    # params would still satisfy a name-only assertion.
+    expect(notifications).to eq([['notifications/progress', { 'progress' => 1 }]])
     server.cleanup
   end
 
@@ -831,6 +833,49 @@ RSpec.describe 'MCP 2026-07-28 modern mode — plain HTTP transport and concurre
       Array.new(4) { Thread.new { server.list_tools } }.each(&:join)
 
       expect(probes).to eq(1)
+      expect(server.protocol_era).to eq(:modern)
+      server.cleanup
+    end
+
+    it "#{klass} does not let a stale reconnect tear down a connection another caller just made" do
+      server = klass.new(base_url: 'https://example.com', endpoint: '/mcp', retries: 0)
+      probes = 0
+      mutex = Mutex.new
+      stub_request(:post, url).to_return do |request|
+        body = JSON.parse(request.body)
+        mutex.synchronize { probes += 1 } if body['method'] == 'server/discover'
+        result = body['method'] == 'server/discover' ? discover_result : { 'tools' => [] }
+        { status: 200, body: JSON.generate('jsonrpc' => '2.0', 'id' => body['id'], 'result' => result),
+          headers: { 'Content-Type' => 'application/json' } }
+      end
+      stub_request(:get, url).to_return(status: 405, body: '')
+
+      server.connect
+      server.instance_variable_set(:@connection_established, false)
+
+      # Hold the first caller between "the connection is down" and its
+      # teardown, so the second caller can reconnect underneath it. Resuming
+      # the first must not undo that reconnect and probe all over again.
+      at_teardown = Queue.new
+      resume = Queue.new
+      first = true
+      allow(server).to receive(:cleanup).and_wrap_original do |original|
+        if first
+          first = false
+          at_teardown << :poised
+          resume.pop
+        end
+        original.call
+      end
+
+      stale = Thread.new { server.list_tools }
+      at_teardown.pop
+      fresh = Thread.new { server.list_tools }
+      sleep 0.1
+      resume << :go
+      [stale, fresh].each(&:join)
+
+      expect(probes).to eq(2)
       expect(server.protocol_era).to eq(:modern)
       server.cleanup
     end
@@ -906,5 +951,196 @@ RSpec.describe 'MCP 2026-07-28 Streamable HTTP modern mode — round 3' do
     expect { server.connect }.to raise_error(MCPClient::Errors::ConnectionError, /2099-01-01/)
     expect(server.protocol_version).to be_nil
     expect(server.protocol_era).to be_nil
+  end
+end
+
+# Review round 4 (codex): the plain HTTP transport's new SSE support must not
+# swallow a legacy server's requests (2025-11-25 allows them on the response
+# stream, and a ping MUST be answered promptly), and neither transport may
+# complete a request with a response that answers a different one.
+RSpec.describe 'MCP 2026-07-28 modern mode — SSE dispatch on a response stream' do
+  let(:url) { 'https://example.com/mcp' }
+
+  def discover_result
+    { 'resultType' => 'complete', 'supportedVersions' => ['2026-07-28'], 'capabilities' => { 'tools' => {} } }
+  end
+
+  def legacy_init_result
+    { 'protocolVersion' => '2025-11-25', 'capabilities' => {},
+      'serverInfo' => { 'name' => 'legacy', 'version' => '1' } }
+  end
+
+  def sse(*messages)
+    messages.map { |m| "event: message\ndata: #{JSON.generate(m)}\n\n" }.join
+  end
+
+  def sse_response(*messages)
+    { status: 200, body: sse(*messages), headers: { 'Content-Type' => 'text/event-stream' } }
+  end
+
+  def json_response(id, result)
+    { status: 200, body: JSON.generate('jsonrpc' => '2.0', 'id' => id, 'result' => result),
+      headers: { 'Content-Type' => 'application/json' } }
+  end
+
+  # Answer POSTs from `responders` (keyed by JSON-RPC method) and record every
+  # message the client sent — including any response it POSTs back to the
+  # server, which carries no method at all.
+  def stub_posts(responders)
+    sent = []
+    stub_request(:post, url).to_return do |request|
+      body = JSON.parse(request.body)
+      sent << body
+      responder = responders[body['method']]
+      responder ? responder.call(body) : { status: 202, body: '' }
+    end
+    sent
+  end
+
+  def legacy_handshake(extra = {})
+    {
+      'server/discover' => ->(_body) { { status: 400, body: 'Bad Request' } },
+      'initialize' => ->(body) { json_response(body['id'], legacy_init_result) }
+    }.merge(extra)
+  end
+
+  describe MCPClient::ServerHTTP do
+    let(:server) { described_class.new(base_url: 'https://example.com', endpoint: '/mcp', retries: 0) }
+
+    after { server.cleanup }
+
+    it 'answers a legacy server ping carried on an SSE response stream' do
+      sent = stub_posts(legacy_handshake('tools/list' => lambda do |body|
+        sse_response({ 'jsonrpc' => '2.0', 'id' => 'ping-1', 'method' => 'ping' },
+                     { 'jsonrpc' => '2.0', 'id' => body['id'], 'result' => { 'tools' => [] } })
+      end))
+
+      expect(server.list_tools).to eq([])
+
+      # A server that pings and never hears back may abandon the session.
+      pong = sent.find { |m| m['id'] == 'ping-1' }
+      expect(pong).to include('jsonrpc' => '2.0', 'result' => {})
+    end
+
+    it 'answers a legacy server request it cannot serve with method not found' do
+      sent = stub_posts(legacy_handshake('tools/list' => lambda do |body|
+        sse_response({ 'jsonrpc' => '2.0', 'id' => 'req-1', 'method' => 'sampling/createMessage', 'params' => {} },
+                     { 'jsonrpc' => '2.0', 'id' => body['id'], 'result' => { 'tools' => [] } })
+      end))
+
+      expect(server.list_tools).to eq([])
+
+      answer = sent.find { |m| m['id'] == 'req-1' }
+      expect(answer.dig('error', 'code')).to eq(-32_601)
+    end
+
+    it 'drops a server-initiated request on a modern response stream without answering it' do
+      sent = stub_posts(
+        'server/discover' => ->(body) { json_response(body['id'], discover_result) },
+        'tools/list' => lambda do |body|
+          sse_response({ 'jsonrpc' => '2.0', 'id' => 'ping-1', 'method' => 'ping' },
+                       { 'jsonrpc' => '2.0', 'id' => 'req-1', 'method' => 'com.example/unknown' },
+                       { 'jsonrpc' => '2.0', 'id' => body['id'], 'result' => { 'tools' => [] } })
+        end
+      )
+
+      expect(server.list_tools).to eq([])
+
+      # 2026-07-28: the server MUST NOT send independent requests on this
+      # stream, and clients MUST NOT POST responses to it.
+      expect(sent.map { |m| m['method'] }).to eq(%w[server/discover tools/list])
+    end
+  end
+
+  [MCPClient::ServerHTTP, MCPClient::ServerStreamableHTTP].each do |klass|
+    describe klass do
+      let(:server) { klass.new(base_url: 'https://example.com', endpoint: '/mcp', retries: 0) }
+
+      after { server.cleanup }
+
+      it 'treats a stream carrying only another request\'s response as a lost stream' do
+        lists = 0
+        stub_posts(
+          'server/discover' => ->(body) { json_response(body['id'], discover_result) },
+          'tools/list' => lambda do |body|
+            lists += 1
+            if lists == 1
+              sse_response('jsonrpc' => '2.0', 'id' => 999,
+                           'result' => { 'tools' => [{ 'name' => 'stale', 'inputSchema' => {} }] })
+            else
+              json_response(body['id'], { 'tools' => [] })
+            end
+          end
+        )
+
+        # No response to this request arrived, so the stream was lost: the
+        # request is re-issued rather than completed with a stale result.
+        expect(server.list_tools).to eq([])
+        expect(lists).to eq(2)
+      end
+    end
+  end
+end
+
+# Review round 4 (codex): the "no protocol-level session" claim was only
+# tested against servers that never offered one.
+RSpec.describe 'MCP 2026-07-28 modern mode — a server that offers a session anyway' do
+  let(:url) { 'https://example.com/mcp' }
+
+  def discover_result
+    { 'resultType' => 'complete', 'supportedVersions' => ['2026-07-28'], 'capabilities' => { 'tools' => {} } }
+  end
+
+  [MCPClient::ServerHTTP, MCPClient::ServerStreamableHTTP].each do |klass|
+    it "#{klass} neither retains nor echoes an Mcp-Session-Id from a modern server" do
+      server = klass.new(base_url: 'https://example.com', endpoint: '/mcp', retries: 0)
+      requests = []
+      stub_request(:post, url).to_return do |request|
+        body = JSON.parse(request.body)
+        requests << request.headers
+        result = case body['method']
+                 when 'server/discover' then discover_result
+                 when 'tools/call' then { 'content' => [] }
+                 else { 'tools' => [] }
+                 end
+        { status: 200, body: JSON.generate('jsonrpc' => '2.0', 'id' => body['id'], 'result' => result),
+          headers: { 'Content-Type' => 'application/json', 'Mcp-Session-Id' => 'sess-modern' } }
+      end
+      delete_stub = stub_request(:delete, url).to_return(status: 200, body: '')
+
+      server.list_tools
+      server.call_tool('t', {})
+      server.cleanup
+
+      # 2026-07-28 removed the session layer: an assigned id must be ignored,
+      # never echoed on a later request, and never DELETEd at teardown.
+      expect(requests.size).to eq(3)
+      expect(requests).to all(satisfy { |h| !h.key?('Mcp-Session-Id') })
+      expect(server.instance_variable_get(:@session_id)).to be_nil
+      expect(delete_stub).not_to have_been_requested
+    end
+
+    it "#{klass} suppresses the session header even if a session id is somehow held" do
+      server = klass.new(base_url: 'https://example.com', endpoint: '/mcp', retries: 0)
+      requests = []
+      stub_request(:post, url).to_return do |request|
+        body = JSON.parse(request.body)
+        requests << request.headers
+        result = body['method'] == 'server/discover' ? discover_result : { 'content' => [] }
+        { status: 200, body: JSON.generate('jsonrpc' => '2.0', 'id' => body['id'], 'result' => result),
+          headers: { 'Content-Type' => 'application/json' } }
+      end
+
+      server.connect
+      # The subclasses return early from apply_request_headers when modern.
+      # Nothing on a modern connection assigns a session id, so plant one to
+      # exercise that guard rather than trusting it by inspection.
+      server.instance_variable_set(:@session_id, 'sess-planted')
+
+      server.call_tool('t', {})
+
+      expect(requests.last).not_to have_key('Mcp-Session-Id')
+      server.cleanup
+    end
   end
 end

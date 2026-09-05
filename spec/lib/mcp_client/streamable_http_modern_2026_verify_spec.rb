@@ -162,6 +162,22 @@ RSpec.describe 'MCP 2026-07-28 Streamable HTTP modern mode — verification' do
         expect(requests.count { |r| r['method'] == 'tools/call' }).to eq(2)
       end
 
+      it 'makes exactly one replacement request for a broken stream even with retries configured' do
+        server = klass.new(base_url: 'https://example.com', endpoint: '/mcp', retries: 3, retry_backoff: 0)
+        requests = stub_posts(
+          'server/discover' => discover_result,
+          'tools/list' => ->(_body, _reqs) { keep_alive_only }
+        )
+
+        expect { server.list_tools }
+          .to raise_error(MCPClient::Errors::MCPError, /closed before delivering the response/)
+
+        # The spec asks for one new request, not for the generic retry
+        # budget: an idempotent method must not multiply it by retries + 1.
+        expect(requests.count { |r| r['method'] == 'tools/list' }).to eq(2)
+        server.cleanup
+      end
+
       # --- 3. A break inside an event recovers like a break between events.
 
       it 're-issues an idempotent request whose response stream was cut inside an SSE event' do
@@ -215,6 +231,21 @@ RSpec.describe 'MCP 2026-07-28 Streamable HTTP modern mode — verification' do
         expect(timeouts.first).to eq(3)
         expect(timeouts.last).to eq(30)
         server.cleanup
+      end
+
+      it 'never falls back to initialize after a DiscoverResult with no mutual version' do
+        requests = stub_posts(
+          'server/discover' => { 'resultType' => 'complete', 'supportedVersions' => ['2099-01-01'] },
+          'initialize' => ->(_body, _reqs) { raise 'initialize must not be sent to a modern server' }
+        )
+
+        # Discovery did not establish a usable version, but it did establish
+        # the era: the server answered server/discover with a DiscoverResult.
+        2.times do
+          expect { server.connect }.to raise_error(MCPClient::Errors::ModernServerError, /2099-01-01/)
+        end
+
+        expect(methods_sent(requests)).to eq(%w[server/discover server/discover])
       end
 
       # --- 5. The modern verdict is cached like the legacy one.
@@ -301,6 +332,44 @@ RSpec.describe 'MCP 2026-07-28 Streamable HTTP modern mode — verification' do
       expect(get_stub).not_to have_been_requested
     end
 
+    it 'stops at a DiscoverResult that advertises no version this client speaks' do
+      post_stub = stub_request(:post, ambiguous_url).to_return(
+        status: 200,
+        body: JSON.generate('jsonrpc' => '2.0', 'id' => 1,
+                            'result' => { 'resultType' => 'complete',
+                                          'supportedVersions' => ['2099-01-01'] }),
+        headers: { 'Content-Type' => 'application/json' }
+      )
+      get_stub = stub_request(:get, ambiguous_url).to_return(status: 200, body: '')
+
+      # The server answered as a modern server; it just has no version in
+      # common. The legacy transports cannot do better, and trying them
+      # buries the actionable message in a "tried all transports" list.
+      expect { MCPClient.connect(ambiguous_url, retries: 0) }
+        .to raise_error(MCPClient::Errors::ModernServerError, /2099-01-01/)
+
+      expect(post_stub).to have_been_requested.once
+      expect(get_stub).not_to have_been_requested
+    end
+
+    it 'stops at a well-formed -32022 that advertises no version this client speaks' do
+      post_stub = stub_request(:post, ambiguous_url).to_return(
+        status: 400,
+        body: JSON.generate('jsonrpc' => '2.0', 'id' => 1,
+                            'error' => { 'code' => -32_022, 'message' => 'Unsupported protocol version',
+                                         'data' => { 'supported' => ['2099-01-01'],
+                                                     'requested' => '2026-07-28' } }),
+        headers: { 'Content-Type' => 'application/json' }
+      )
+      get_stub = stub_request(:get, ambiguous_url).to_return(status: 200, body: '')
+
+      expect { MCPClient.connect(ambiguous_url, retries: 0) }
+        .to raise_error(MCPClient::Errors::ModernServerError, /2099-01-01/)
+
+      expect(post_stub).to have_been_requested.once
+      expect(get_stub).not_to have_been_requested
+    end
+
     it 'does not fall back to a legacy transport when the caller asked for protocol: :modern' do
       post_stub = stub_request(:post, ambiguous_url).to_return(status: 400, body: 'Bad Request')
       get_stub = stub_request(:get, ambiguous_url).to_return(status: 200, body: '')
@@ -310,6 +379,204 @@ RSpec.describe 'MCP 2026-07-28 Streamable HTTP modern mode — verification' do
 
       expect(post_stub).to have_been_requested.once
       expect(get_stub).not_to have_been_requested
+    end
+  end
+end
+
+# A real HTTP server on 127.0.0.1 that can end a response *mid-stream*.
+#
+# The WebMock broken-stream fixtures above return a **completed** HTTP
+# response whose SSE body happens to carry no result. That is not the failure
+# the 2026-07-28 re-issue rule is about: an actual broken response stream is a
+# socket that stops in the middle of the body, which Faraday surfaces as a
+# connection failure rather than as a short body. This server produces exactly
+# that — status line, SSE headers, one chunk, then close, with no terminating
+# chunk — so the re-issue path is exercised against the error a real network
+# failure raises.
+class MidStreamCloseServer
+  # Reply token: send SSE headers and one chunk, then close the socket.
+  CLOSE_MID_STREAM = :close_mid_stream
+
+  # @return [Integer] the ephemeral port the server listens on
+  attr_reader :port
+
+  # @yieldparam message [Hash] the JSON-RPC message the client POSTed
+  # @yieldreturn [Hash, Symbol] a JSON-RPC reply, or CLOSE_MID_STREAM
+  def initialize(&responder)
+    @responder = responder
+    @received = []
+    @mutex = Mutex.new
+    @listener = TCPServer.new('127.0.0.1', 0)
+    @port = @listener.addr[1]
+    @thread = Thread.new { accept_loop }
+  end
+
+  # @return [Array<Hash>] every JSON-RPC message received, in order
+  def received
+    @mutex.synchronize { @received.dup }
+  end
+
+  # @return [void]
+  def stop
+    @thread&.kill
+    @listener.close unless @listener.closed?
+  rescue IOError
+    nil
+  end
+
+  private
+
+  def accept_loop
+    loop do
+      client = @listener.accept
+      begin
+        serve(client)
+      rescue StandardError
+        nil
+      ensure
+        begin
+          client.close
+        rescue StandardError
+          nil
+        end
+      end
+    end
+  rescue StandardError
+    nil
+  end
+
+  def serve(client)
+    return unless client.gets # the request line
+
+    headers = read_headers(client)
+    message = JSON.parse(client.read(headers['content-length'].to_i).to_s)
+    @mutex.synchronize { @received << message }
+    write_reply(client, @responder.call(message))
+  end
+
+  def read_headers(client)
+    headers = {}
+    while (line = client.gets)
+      line = line.strip
+      break if line.empty?
+
+      name, value = line.split(':', 2)
+      headers[name.to_s.downcase] = value.to_s.strip
+    end
+    headers
+  end
+
+  def write_reply(client, reply)
+    if reply == CLOSE_MID_STREAM
+      chunk = ": keep-alive\n\n"
+      client.write("HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\n" \
+                   "Transfer-Encoding: chunked\r\nConnection: close\r\n\r\n")
+      client.write(format("%<size>x\r\n%<chunk>s\r\n", size: chunk.bytesize, chunk: chunk))
+    else
+      body = JSON.generate(reply)
+      client.write("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n" \
+                   "Content-Length: #{body.bytesize}\r\nConnection: close\r\n\r\n#{body}")
+    end
+    client.flush
+  end
+end
+
+RSpec.describe 'MCP 2026-07-28 Streamable HTTP — a response stream that really breaks' do
+  before do
+    # The shared server/discover stub in spec_helper would intercept the probe
+    # before it reached the local socket.
+    WebMock.reset!
+    WebMock.allow_net_connect!
+  end
+
+  after do
+    @server&.cleanup
+    @fixture&.stop
+    WebMock.disable_net_connect!(allow_localhost: true)
+  end
+
+  def jsonrpc(message, result)
+    { 'jsonrpc' => '2.0', 'id' => message['id'], 'result' => result }
+  end
+
+  def discovery
+    { 'resultType' => 'complete', 'supportedVersions' => ['2026-07-28'],
+      'capabilities' => { 'tools' => {} } }
+  end
+
+  def start_server(&responder)
+    @fixture = MidStreamCloseServer.new(&responder)
+  end
+
+  def transport(klass, **opts)
+    @server = klass.new(base_url: "http://127.0.0.1:#{@fixture.port}", endpoint: '/mcp', retries: 0, **opts)
+  end
+
+  def methods_received
+    @fixture.received.map { |r| r['method'] }
+  end
+
+  HTTP_TRANSPORTS.each do |klass|
+    describe klass do
+      it 're-issues tools/call with a new id when the socket ends mid-stream' do
+        calls = 0
+        start_server do |message|
+          case message['method']
+          when 'server/discover' then jsonrpc(message, discovery)
+          when 'tools/call'
+            calls += 1
+            calls == 1 ? MidStreamCloseServer::CLOSE_MID_STREAM : jsonrpc(message, { 'content' => [] })
+          else jsonrpc(message, { 'tools' => [] })
+          end
+        end
+
+        expect(transport(klass).call_tool('t', {})).to eq({ 'content' => [] })
+
+        tool_calls = @fixture.received.select { |r| r['method'] == 'tools/call' }
+        expect(tool_calls.size).to eq(2)
+        expect(tool_calls[0]['id']).not_to eq(tool_calls[1]['id'])
+      end
+
+      it 're-issues the server/discover probe when the socket ends mid-stream' do
+        probes = 0
+        start_server do |message|
+          case message['method']
+          when 'server/discover'
+            probes += 1
+            probes == 1 ? MidStreamCloseServer::CLOSE_MID_STREAM : jsonrpc(message, discovery)
+          when 'initialize' then raise 'initialize must not be sent after a lost response stream'
+          else jsonrpc(message, { 'tools' => [] })
+          end
+        end
+
+        transport(klass).connect
+
+        expect(@server.protocol_era).to eq(:modern)
+        expect(methods_received).to eq(%w[server/discover server/discover])
+      end
+
+      it 'surfaces the loss after exactly one re-issue when the socket ends mid-stream twice' do
+        start_server do |message|
+          message['method'] == 'server/discover' ? jsonrpc(message, discovery) : MidStreamCloseServer::CLOSE_MID_STREAM
+        end
+
+        expect { transport(klass).call_tool('t', {}) }
+          .to raise_error(MCPClient::Errors::ResponseStreamClosedError)
+        expect(@fixture.received.count { |r| r['method'] == 'tools/call' }).to eq(2)
+      end
+
+      it 'does not re-issue when the connection was never established' do
+        start_server { |message| jsonrpc(message, discovery) }
+        port = @fixture.port
+        @fixture.stop
+        server = klass.new(base_url: "http://127.0.0.1:#{port}", endpoint: '/mcp', retries: 0)
+
+        expect { server.connect }.to raise_error(MCPClient::Errors::ConnectionError) do |error|
+          expect(error).not_to be_a(MCPClient::Errors::ResponseStreamClosedError)
+        end
+      ensure
+        server&.cleanup
+      end
     end
   end
 end
