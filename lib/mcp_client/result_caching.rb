@@ -126,7 +126,13 @@ module MCPClient
     # @param method [String] a list method, e.g. 'tools/list'
     # @return [Array<Integer>] the generation of that list's cache key
     def list_cache_epoch(method)
-      cache_epoch(LIST_METHOD_KINDS[method])
+      cache_epoch(list_kind_for(method))
+    end
+
+    # @param method [String] a list method, e.g. 'tools/list'
+    # @return [Symbol, nil] the cache kind that list fills
+    def list_kind_for(method)
+      LIST_METHOD_KINDS[method]
     end
 
     # @return [Array<Integer>] (call while holding cache_entries_mutex)
