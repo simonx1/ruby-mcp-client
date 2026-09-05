@@ -58,6 +58,8 @@ RSpec.describe 'MCP 2026-07-28 tasks extension — round 19' do
 
     client.send(:handle_task_status_notification, 'srv', nil)
 
+    expect(output.string).to include('Failed to parse task status notification')
+    expect(output.string).to match(/not an object/)
     expect(output.string).not_to include('status: working')
   end
 end

@@ -34,8 +34,12 @@ module MCPClient
       MIN_TASK_POLL_INTERVAL = 0.05
       # Longest pause between two polls, whatever pollIntervalMs says: a
       # peer-supplied interval the clock cannot represent (or that is merely
-      # enormous) is bounded rather than handed to sleep.
-      MAX_TASK_POLL_INTERVAL = 3600.0
+      # enormous) is bounded rather than handed to sleep. It is a backstop
+      # against nonsense and not a pace of this client's own: an interval a
+      # server can plausibly mean for a long-running task is kept, because
+      # polling faster than the server asked for is what the spec's polling
+      # SHOULD is there to prevent.
+      MAX_TASK_POLL_INTERVAL = 86_400.0
       MIN_TASK_REQUEST_TIMEOUT = 0.001
       # The longest a single poll request may wait, whatever the TTL: a hung
       # tasks/get must not block the wait for the task's whole lifetime.
@@ -602,9 +606,13 @@ module MCPClient
         # definition newer than the one the call carried.
         with_called_tool_definition(srv) do
           result = modern_task_tool_call(tool_name, parameters, srv, epoch)
-          next created_task(result, srv, epoch) if task_result?(result)
+          # Read once, because reading it spends it: whichever branch follows
+          # validates against this definition, and a handle carries it so the
+          # result the task delivers later is checked against it too.
+          called = tool && (called_tool_definition(srv, tool.name) || tool)
+          next created_task(result, srv, epoch).with_called_tool(called) if task_result?(result)
 
-          MCPClient::Task.completed_locally(validated_sync_result(result, srv, tool), server: srv)
+          MCPClient::Task.completed_locally(validated_sync_result(result, called), server: srv)
         end
       end
 
@@ -634,12 +642,26 @@ module MCPClient
       # against the tool's outputSchema exactly as #call_tool would — against
       # the definition the request went out under, which a mid-call
       # HeaderMismatch refresh may since have replaced.
-      # @param tool [MCPClient::Tool, nil] the definition the call was made with
+      # @param tool [MCPClient::Tool, nil] the definition the call went out under
       # @return [Object] the validated result
-      def validated_sync_result(result, srv, tool)
+      def validated_sync_result(result, tool)
         return result unless tool
 
-        validate_structured_content!(called_tool_definition(srv, tool.name) || tool, result)
+        validate_structured_content!(tool, result)
+      end
+
+      # The result a task delivered, validated against the definition the
+      # request that created the task went out under — the same check a
+      # synchronous answer to that request gets. Only a handle names a tool:
+      # a task id identifies no request, so a caller that kept only the id
+      # gets the result unvalidated, as before.
+      # @param task [Object] what the caller named the task with
+      # @param result [Object] the result the task delivered
+      # @return [Object] the result
+      def validated_task_result(task, result)
+        return result unless task.is_a?(MCPClient::Task) && task.called_tool
+
+        validate_structured_content!(task.called_tool, result)
       end
 
       # The handle for a CreateTaskResult, which MUST carry a taskId.
@@ -878,7 +900,11 @@ module MCPClient
         return false unless code == MCPClient::Errors::Codes::INVALID_PARAMS
         return true if method == 'tasks/get'
         return false if error.message.match?(/inputResponses/i)
-        return true if error.message.match?(/not found|unknown task|no such task|invalid taskId/i)
+        # An expired task is a task that is gone: the server dropped it, its
+        # id names nothing, and the legacy matcher below has always read it
+        # that way. The code is what separates this from an internal error
+        # whose message merely mentions an expiry.
+        return true if error.message.match?(/not found|unknown task|no such task|invalid taskId|expired/i)
 
         # A caller that named no request keeps the reading it had: the params
         # are the request's problem, anything else the task's.

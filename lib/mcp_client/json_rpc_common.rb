@@ -17,7 +17,6 @@ require_relative 'request_metadata'
 require_relative 'round_trip_marker'
 require_relative 'result_completeness'
 require_relative 'session_pin'
-require_relative 'input_round_trips'
 
 module MCPClient
   # Shared retry/backoff logic for JSON-RPC transports
@@ -36,7 +35,6 @@ module MCPClient
     # Requests may be pinned to the session they belong to (see SessionPin).
     include SessionPin
     # Input requests of a multi-round tool call (see InputRoundTrips).
-    include InputRoundTrips
 
     # JSON-RPC methods with arbitrary side effects that MUST NOT be re-sent
     # automatically. Even a "transient" failure (5xx, dropped connection,
