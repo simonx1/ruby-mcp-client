@@ -678,7 +678,10 @@ RSpec.describe 'MCP 2026-07-28 x-mcp-header — a call nested by a listener that
       sent << [body['method'], body.dig('params', 'name')]
       case body['method']
       when 'server/discover' then json_response(body['id'], modern_discover)
-      when 'tools/list' then json_response(body['id'], { 'tools' => [charge, audit] })
+      # Bounded, so the list answers the call's header derivation from the
+      # cache: on a 2026 server an absent ttlMs means 0, and the sequence
+      # below counts the recovery, not the caching layer underneath it.
+      when 'tools/list' then json_response(body['id'], { 'tools' => [charge, audit], 'ttlMs' => 60_000 })
       when 'tools/call'
         if body['params']['name'] == 'audit'
           failure.call(body)
@@ -854,7 +857,7 @@ RSpec.describe 'MCP 2026-07-28 x-mcp-header — two calls in flight at once' do
     # have recorded before either reads back.
     threads = %w[a b].map do |name|
       Thread.new do
-        server.send(:called_tool_definition_slot) do
+        server.send(:recording_called_tool_definition) do
           opened << name
           start.pop(timeout: 5)
           server.send(:note_called_tool_definition, name, MCPClient::Tool.from_json({ 'name' => name }, server: nil))

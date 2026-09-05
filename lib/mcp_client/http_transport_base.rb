@@ -393,7 +393,7 @@ module MCPClient
       # trickle of SSE keep-alives would never time out and every caller
       # waiting on the connection monitor would block with it. One deadline
       # covers the probe and its one re-issue.
-      deadline = @discover_timeout && (monotonic_now + @discover_timeout)
+      deadline = @discover_timeout && (Process.clock_gettime(Process::CLOCK_MONOTONIC) + @discover_timeout)
       result = begin
         send_discover_request(deadline)
       rescue MCPClient::Errors::ResponseStreamClosedError => e
@@ -449,11 +449,6 @@ module MCPClient
       request_id = @mutex.synchronize { @request_id += 1 }
       request = build_jsonrpc_request('server/discover', {}, request_id)
       send_jsonrpc_request(request, timeout: @discover_timeout, deadline: deadline)
-    end
-
-    # @return [Float] a monotonic clock reading in seconds
-    def monotonic_now
-      Process.clock_gettime(Process::CLOCK_MONOTONIC)
     end
 
     # @param result [Object] a JSON-RPC result
@@ -966,7 +961,11 @@ module MCPClient
       # Appended below any user middleware: the capture's on_complete puts the
       # streamed body back before raise_error and friends inspect it, and the
       # retry middleware above re-enters it on every attempt.
-      conn.builder.use(ResponseBodyCapture)
+      begin
+        conn.builder.use(ResponseBodyCapture)
+      rescue StandardError => e
+        @logger.debug("Could not install the response capture middleware: #{e.class}")
+      end
       # Innermost of all, so its on_request sees the Authorization a request
       # finally carries -- after the host's middleware has run (MCP 2026-07-28
       # caching binds an entry to the credentials it was fetched with).

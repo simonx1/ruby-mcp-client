@@ -317,7 +317,8 @@ module MCPClient
       # @param handler [Faraday::RackBuilder::Handler]
       # @return [Symbol] :neutral, :pure or :unknown
       def probe_handler_class(handler)
-        return :neutral if handler.klass == AuthorizationRecorder
+        # The transport's own handlers cannot change what a request carries.
+        return :neutral if [AuthorizationRecorder, StreamRecovery::ResponseBodyCapture].include?(handler.klass)
         return :unknown unless probe_host_callback_free?(handler)
         return :neutral if PROBE_AUTHORIZATION_NEUTRAL_MIDDLEWARE.include?(handler.klass.name)
         return :neutral if probe_response_only_middleware?(handler.klass)
@@ -354,7 +355,10 @@ module MCPClient
       # @param handler [Faraday::RackBuilder::Handler]
       # @return [Boolean]
       def probe_body_neutral_handler?(handler)
-        return true if handler.klass == AuthorizationRecorder
+        # The transport's own handlers: the recorder reads a request's
+        # Authorization, and the capture buffers a response's body -- neither
+        # changes the parameters the server answers.
+        return true if [AuthorizationRecorder, StreamRecovery::ResponseBodyCapture].include?(handler.klass)
         return true if PROBE_PURE_MIDDLEWARE.include?(handler.klass)
         return false unless probe_host_callback_free?(handler)
 
@@ -523,10 +527,10 @@ module MCPClient
       # (MCP 2026-07-28 caching).
       # @param request [Hash] the JSON-RPC request
       # @return [Object] the parsed result
-      def exchange_jsonrpc(request, timeout: nil, extra_headers: {})
+      def exchange_jsonrpc(request, timeout: nil, deadline: nil, extra_headers: {})
         sent_params = recorded_request_params
         recording_one_exchange do
-          perform_jsonrpc_exchange(request, timeout: timeout, extra_headers: extra_headers)
+          perform_jsonrpc_exchange(request, timeout: timeout, deadline: deadline, extra_headers: extra_headers)
         ensure
           restore_request_params(sent_params)
         end
@@ -535,9 +539,9 @@ module MCPClient
       # One exchange, from the POST to the parsed result.
       # @param request [Hash] the JSON-RPC request
       # @return [Object] the parsed result
-      def perform_jsonrpc_exchange(request, timeout: nil, extra_headers: {})
+      def perform_jsonrpc_exchange(request, timeout: nil, deadline: nil, extra_headers: {})
         clear_response_received_at if respond_to?(:clear_response_received_at, true)
-        response = send_http_request(request, timeout: timeout, extra_headers: extra_headers)
+        response = send_http_request(request, timeout: timeout, deadline: deadline, extra_headers: extra_headers)
         # When the innermost middleware had the response, not when the host's
         # response phase was finished with it.
         received_at = response_receipt_time(response)

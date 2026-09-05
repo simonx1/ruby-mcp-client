@@ -347,8 +347,8 @@ module MCPClient
       params = {}
       params['cursor'] = cursor if cursor
       epoch = cache_epoch(:resources)
-      page = fetching_list_page(:resources, cursor) { rpc_request('resources/list', params) }
-      result = require_complete_result!(page, 'resources/list')
+      answer = fetching_list_page(:resources, cursor) { rpc_request('resources/list', params) }
+      result = require_complete_result!(answer, 'resources/list')
       record_cache_hint(:resources, result, epoch: epoch) unless cursor
 
       resources = (result['resources'] || []).map do |resource_data|
@@ -482,8 +482,8 @@ module MCPClient
       params = {}
       params['cursor'] = cursor if cursor
       epoch = cache_epoch(:templates)
-      page = fetching_list_page(:templates, cursor) { rpc_request('resources/templates/list', params) }
-      result = require_complete_result!(page, 'resources/templates/list')
+      answer = fetching_list_page(:templates, cursor) { rpc_request('resources/templates/list', params) }
+      result = require_complete_result!(answer, 'resources/templates/list')
       record_cache_hint(:templates, result, epoch: epoch) unless cursor
 
       templates = (result['resourceTemplates'] || []).map do |template_data|

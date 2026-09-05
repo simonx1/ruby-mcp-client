@@ -219,8 +219,8 @@ module MCPClient
         params = {}
         params['cursor'] = cursor if cursor
         epoch = cache_epoch(:resources)
-        page = fetching_list_page(:resources, cursor) { rpc_request('resources/list', params) }
-        result = require_complete_result!(page, 'resources/list')
+        answer = fetching_list_page(:resources, cursor) { rpc_request('resources/list', params) }
+        result = require_complete_result!(answer, 'resources/list')
         # MCP 2026-07-28 caching: the first page's hint decides how long the
         # cached list may be served, counted from receipt (the list is
         # attached once converted).
@@ -287,8 +287,8 @@ module MCPClient
       params = {}
       params['cursor'] = cursor if cursor
       epoch = cache_epoch(:templates)
-      page = fetching_list_page(:templates, cursor) { rpc_request('resources/templates/list', params) }
-      result = require_complete_result!(page, 'resources/templates/list')
+      answer = fetching_list_page(:templates, cursor) { rpc_request('resources/templates/list', params) }
+      result = require_complete_result!(answer, 'resources/templates/list')
       # MCP 2026-07-28 caching: the first page's hint decides freshness,
       # counted from receipt (the list is attached once converted).
       record_cache_hint(:templates, result, epoch: epoch) unless cursor

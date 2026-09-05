@@ -131,7 +131,7 @@ module MCPClient
       # @yield the host code
       # @return [Object] the block's value
       def dispatching_to_host(&)
-        called_tool_definition_slot(&)
+        outside_called_tool_definition(&)
       rescue StandardError => e
         e.extend(NestedExchange) unless e.frozen?
         raise

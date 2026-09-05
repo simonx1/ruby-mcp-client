@@ -404,8 +404,8 @@ module MCPClient
         # A cursor the server no longer accepts ends the sequence its pages
         # belong to: what was cached under that sequence goes with it, so a
         # restart that then fails cannot serve it back (MCP pagination).
-        page = fetch_list_page(kind, cursor) { rpc_request(method, params) }
-        result = require_complete_result!(page, method)
+        answer = fetch_list_page(kind, cursor) { rpc_request(method, params) }
+        result = require_complete_result!(answer, method)
         pages << result
         received_ats << response_received_at(since: started) if respond_to?(:response_received_at, true)
         contexts << (respond_to?(:request_authorization_context, true) ? request_authorization_context : nil)
