@@ -1231,7 +1231,12 @@ module MCPClient
       # a slot of its own for the definition that call goes out under, so the
       # call still waiting for this response keeps its own
       # (MCPClient::CalledToolDefinition).
-      called_tool_definition_slot { dispatch_server_message_now(message) }
+      # Host code reached from here — a notification listener, a handler for a
+      # server-initiated request — may call a tool of its own while the response
+      # that carried this message is still being parsed. Keep it outside the slot
+      # the call still waiting for this response is recording into, so what that
+      # call was answered under is not displaced.
+      outside_called_tool_definition { dispatch_server_message_now(message) }
     end
 
     # @param message [Hash] the parsed JSON-RPC message

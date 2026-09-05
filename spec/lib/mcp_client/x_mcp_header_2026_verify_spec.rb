@@ -277,8 +277,17 @@ RSpec.describe 'MCP 2026-07-28 x-mcp-header — the definition a call went out u
       end
     end
     client = strict_client
+    # Only the notification the *server* sent on the retry's own response
+    # stream may move the list on. The refresh a HeaderMismatch triggers
+    # announces a list_changed of its own, and reacting to that one would
+    # replace the definition before the retry even goes out — which is the
+    # host changing the answer, not the race this example is about.
+    retry_sent = false
     client.on_notification do |_srv, method, _params|
-      listed = tool_with_output(object_schema('v3'), header: 'Zone') if method.end_with?('list_changed')
+      next unless method.end_with?('list_changed')
+
+      listed = tool_with_output(object_schema('v3'), header: 'Zone') if retry_sent
+      retry_sent = true
     end
 
     result = client.call_tool('execute_sql', { 'region' => 'eu' })

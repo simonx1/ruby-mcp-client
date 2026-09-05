@@ -68,6 +68,10 @@ module MCPClient
       def refresh_tools_cache
         invalidate_tools_cache
         list_tools
+        # Announced on both hooks, in the order routing uses them, so a host
+        # whose cache invalidation runs ahead of subscription deliveries is
+        # told here too (see {MCPClient::ServerBase#on_cache_invalidation}).
+        notify_cache_invalidation('notifications/tools/list_changed', {})
         @notification_callback&.call('notifications/tools/list_changed', {})
       end
 

@@ -1404,18 +1404,6 @@ module MCPClient
       matching_tools.first
     end
 
-    # Run one call with a slot of its own for the definition the transport's
-    # request goes out under (MCPClient::CalledToolDefinition). Transports
-    # that do not mirror tool parameters into headers record nothing, and the
-    # call runs unwrapped.
-    # @param server [MCPClient::ServerBase] the transport the call goes to
-    # @return [Object] the block's value
-    def with_called_tool_definition(server, &block)
-      return block.call unless server.respond_to?(:called_tool_definition_slot, true)
-
-      server.send(:called_tool_definition_slot, &block)
-    end
-
     # The definition the transport's own tools/call request went out under,
     # taken from the transport so it is spent on this one re-resolve.
     #
@@ -1433,19 +1421,6 @@ module MCPClient
       return nil unless server.respond_to?(:take_called_tool_definition, true)
 
       server.send(:take_called_tool_definition, tool_name.to_s)&.first
-    end
-
-    # The definition the transport's own tools/call request went out under,
-    # taken from the transport so it is spent on this one re-resolve.
-    # @param tool [MCPClient::Tool] the tool as resolved before the call
-    # @return [Array(MCPClient::Tool, nil), nil] a one-element array holding
-    #   the definition the call carried (its element is nil when the list no
-    #   longer carried the tool), or nil when the transport recorded none
-    def called_tool_definition(tool)
-      server = tool.server
-      return nil unless server.respond_to?(:take_called_tool_definition, true)
-
-      server.send(:take_called_tool_definition, tool.name.to_s)
     end
 
     # Reject a plain (synchronous) call for a tool whose execution.taskSupport is

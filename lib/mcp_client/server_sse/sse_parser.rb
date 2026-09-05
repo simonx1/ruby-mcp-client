@@ -90,13 +90,16 @@ module MCPClient
       def process_notification?(data)
         return false unless data['method'] && !data.key?('id')
 
-        # The shared pipeline handles subscription bookkeeping and cache
-        # invalidation before the host's callback sees the notification.
-        if respond_to?(:route_notification, true)
-          route_notification(data['method'], data['params'])
-        else
-          @notification_callback&.call(data['method'], data['params'])
-        end
+        # The legacy SSE transport carries no subscriptions/listen stream, so
+        # there is no delivery to run ahead of — but the transport's own caches
+        # and a host that registered its invalidation on the dedicated hook
+        # must still be told, in the order routing uses them
+        # (see {MCPClient::ServerBase#on_cache_invalidation}).
+        invalidate_cache_for_notification(data['method'], data['params']) if respond_to?(
+          :invalidate_cache_for_notification, true
+        )
+        notify_cache_invalidation(data['method'], data['params'])
+        @notification_callback&.call(data['method'], data['params'])
         true
       end
 
