@@ -300,7 +300,7 @@ module MCPClient
       }
       send_request(req)
       res = wait_response(req_id)
-      result = process_jsonrpc_response(res) || {}
+      result = require_complete_result!(process_jsonrpc_response(res) || {}, 'resources/read')
       contents = result['contents'] || []
       contents.map { |content| MCPClient::ResourceContent.from_json(content) }
     rescue MCPClient::Errors::ServerError => e

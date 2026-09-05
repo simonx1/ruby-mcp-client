@@ -299,6 +299,10 @@ module MCPClient
     # via #accepted_result_types once such an extension is negotiated.
     CORE_RESULT_TYPES = %w[complete input_required].freeze
 
+    # The only result type a handshake-era (legacy) server can validly send:
+    # the others were introduced with the discriminator itself.
+    LEGACY_RESULT_TYPES = %w[complete].freeze
+
     # The resultType of a result object. MCP 2026-07-28 makes the field
     # required, but "for backward compatibility with servers implementing
     # earlier protocol versions, which do not include resultType, clients
@@ -318,7 +322,32 @@ module MCPClient
     # that negotiated a result-type-adding extension.
     # @return [Array<String>]
     def accepted_result_types
-      CORE_RESULT_TYPES
+      # input_required names the multi round-trip pattern, which exists only
+      # in modern revisions: a handshake-era server answering with it is
+      # malformed, and treating it as valid would let a wrapper flatten an
+      # unfinished result into an empty successful one.
+      modern? ? CORE_RESULT_TYPES : LEGACY_RESULT_TYPES
+    end
+
+    # Project a payload out of a result that has to be finished. This client
+    # recognizes InputRequiredResult (resultType "input_required") but does
+    # not drive multi round-trip requests yet, so an operation that would
+    # extract a field from it — and so drop the server's inputRequests and
+    # opaque requestState — surfaces it instead of presenting an unfinished
+    # answer as an empty successful one. The whole result rides on the
+    # error's `data`, so a host can still drive the round trip itself.
+    # @param result [Object] the JSON-RPC result
+    # @param method [String] the request method, for the message
+    # @return [Object] the result, when it is complete
+    # @raise [MCPClient::Errors::InvalidResultError] when it is not
+    def require_complete_result!(result, method)
+      type = MCPClient::JsonRpcCommon.result_type(result)
+      return result if type == 'complete'
+
+      raise MCPClient::Errors::InvalidResultError.new(
+        "Invalid result: #{method} answered with resultType #{type.to_s[0, 64].inspect}, which this " \
+        'client cannot carry through (multi round-trip requests are not implemented)', data: result
+      )
     end
 
     # Build the error for a 4xx response: the typed JSON-RPC error when the

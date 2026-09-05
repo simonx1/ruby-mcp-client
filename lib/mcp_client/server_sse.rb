@@ -236,7 +236,7 @@ module MCPClient
     # @raise [MCPClient::Errors::ResourceReadError] for other errors during resource reading
     # @raise [MCPClient::Errors::ConnectionError] if server is disconnected
     def read_resource(uri)
-      result = rpc_request('resources/read', { uri: uri })
+      result = require_complete_result!(rpc_request('resources/read', { uri: uri }), 'resources/read')
       contents = result['contents'] || []
       contents.map { |content| MCPClient::ResourceContent.from_json(content) }
     rescue MCPClient::Errors::ServerError => e

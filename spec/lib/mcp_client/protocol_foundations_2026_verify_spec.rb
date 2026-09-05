@@ -161,13 +161,24 @@ RSpec.describe 'modern protocol error recognition matches the schema wire shape'
         .to be(false)
     end
 
-    it 'rejects an empty supported list (no version left to retry with)' do
-      expect(unsupported({ 'supported' => [], 'requested' => 'x' }).modern_protocol_error?).to be(false)
+    # The schema types these members, it does not constrain their length. A
+    # server that names no mutually usable version has still identified
+    # itself as modern: "no compatible version" and "not a modern server"
+    # are different conditions, and conflating them would send the client
+    # back to an initialize handshake this server does not implement.
+    it 'accepts an empty supported list: no compatible version is still a modern rejection' do
+      error = unsupported({ 'supported' => [], 'requested' => 'x' })
+      expect(error.modern_protocol_error?).to be(true)
+      expect(error.supported).to eq([])
     end
 
-    it 'rejects a supported list carrying an empty version string' do
+    it 'accepts a supported list carrying an empty version string' do
       expect(unsupported({ 'supported' => ['2026-07-28', ''], 'requested' => 'x' }).modern_protocol_error?)
-        .to be(false)
+        .to be(true)
+    end
+
+    it 'accepts an empty requested version' do
+      expect(unsupported({ 'supported' => ['2026-07-28'], 'requested' => '' }).modern_protocol_error?).to be(true)
     end
 
     it 'rejects a supported member that is not an array' do
@@ -216,9 +227,21 @@ RSpec.describe 'modern protocol error recognition matches the schema wire shape'
       expect(MCPClient::Errors::ServerError.from_jsonrpc(raw).modern_protocol_error?).to be(false)
     end
 
-    it 'rejects an empty message' do
+    # JSON-RPC 2.0 requires `message` to be a String; it does not require it
+    # to be a non-empty one, and an empty one still discriminates nothing —
+    # a legacy endpoint misusing a reserved code would send prose, not "".
+    it 'accepts an empty message, which JSON-RPC still counts as a string' do
       raw = { 'code' => -32_020, 'message' => '' }
-      expect(MCPClient::Errors::ServerError.from_jsonrpc(raw).modern_protocol_error?).to be(false)
+      error = MCPClient::Errors::ServerError.from_jsonrpc(raw)
+      expect(error).to be_a(MCPClient::Errors::HeaderMismatchError)
+      expect(error.modern_protocol_error?).to be(true)
+    end
+
+    it 'accepts an empty message on an otherwise schema-valid -32022' do
+      error = unsupported({ 'supported' => ['2026-07-28'], 'requested' => '2025-11-25' }, message: '')
+      expect(error).to be_a(MCPClient::Errors::UnsupportedProtocolVersionError)
+      expect(error.modern_protocol_error?).to be(true)
+      expect(error.supported).to eq(['2026-07-28'])
     end
 
     it 'still recognizes -32020, which mandates no data, when the message is there' do
@@ -578,20 +601,34 @@ RSpec.describe 'a gzip HTTP error body is decompressed within the inspection bou
     server.send(:send_http_request, { 'jsonrpc' => '2.0', 'id' => 1, 'method' => 'x', 'params' => {} })
   end
 
-  # Record every size argument the production code asks the gzip reader for.
-  # An implementation that inflated the whole body before measuring it would
-  # read with no bound (nil) — which is exactly the mutation this kills.
+  # Record what the production code asks the gzip reader for AND what it got
+  # back. An implementation that inflated the whole body before measuring it
+  # would read with no bound (nil); one that looped would stay under the
+  # per-read bound while producing far more than it — both are killed here.
+  # @return [Hash{Symbol=>Array<Integer, nil>}] :requested sizes, :produced bytes
   def record_gzip_reads
-    reads = []
+    reads = { requested: [], produced: [] }
     allow(Zlib::GzipReader).to receive(:new).and_wrap_original do |original, *args|
       reader = original.call(*args)
       allow(reader).to receive(:read).and_wrap_original do |original_read, *read_args|
-        reads << read_args.first
-        original_read.call(*read_args)
+        reads[:requested] << read_args.first
+        original_read.call(*read_args).tap { |chunk| reads[:produced] << chunk.to_s.bytesize }
       end
       reader
     end
     reads
+  end
+
+  # A JSON-RPC error response whose serialization is exactly `size` bytes.
+  def payload_of_size(size)
+    error = { 'code' => -32_022, 'message' => '',
+              'data' => { 'supported' => ['2026-07-28'], 'requested' => '2025-11-25' } }
+    body = { 'jsonrpc' => '2.0', 'id' => 1, 'error' => error }
+    padding = size - JSON.generate(body).bytesize
+    raise ArgumentError, "cannot build a payload of #{size} bytes" if padding.negative?
+
+    error['message'] = 'x' * padding
+    JSON.generate(body)
   end
 
   it 'never asks the reader for more than the bound, even for a 4 MiB expansion' do
@@ -601,9 +638,12 @@ RSpec.describe 'a gzip HTTP error body is decompressed within the inspection bou
     reads = record_gzip_reads
 
     expect { send_request }.to raise_error(MCPClient::Errors::ServerError) { |e| expect(e.code).to be_nil }
-    expect(reads).not_to be_empty
-    expect(reads).to all(be_a(Integer))
-    expect(reads.max).to be <= bound + 1
+    expect(reads[:requested]).not_to be_empty
+    expect(reads[:requested]).to all(be_a(Integer))
+    expect(reads[:requested].max).to be <= bound + 1
+    # The cumulative bound, not just the per-read one: however many reads it
+    # takes, the client never materializes more than the inspection ceiling.
+    expect(reads[:produced].sum).to be <= bound + 1
   end
 
   it 'still reads a small gzip error body through the same bounded path' do
@@ -616,6 +656,519 @@ RSpec.describe 'a gzip HTTP error body is decompressed within the inspection bou
     expect { send_request }.to raise_error(MCPClient::Errors::UnsupportedProtocolVersionError) do |e|
       expect(e.supported).to eq(['2026-07-28'])
     end
-    expect(reads).to all(be_a(Integer))
+    expect(reads[:requested]).to all(be_a(Integer))
+    expect(reads[:produced].sum).to be <= bound + 1
+  end
+
+  it 'still parses a body that expands to exactly the bound' do
+    payload = payload_of_size(bound)
+    expect(payload.bytesize).to eq(bound)
+    stub_gzip_body(payload)
+    reads = record_gzip_reads
+
+    expect { send_request }.to raise_error(MCPClient::Errors::UnsupportedProtocolVersionError) do |e|
+      expect(e.code).to eq(-32_022)
+      expect(e.supported).to eq(['2026-07-28'])
+    end
+    expect(reads[:produced].sum).to eq(bound)
+  end
+
+  it 'gives up on a body one byte past the bound' do
+    payload = payload_of_size(bound + 1)
+    expect(payload.bytesize).to eq(bound + 1)
+    stub_gzip_body(payload)
+
+    expect { send_request }.to raise_error(MCPClient::Errors::ServerError) do |e|
+      expect(e.code).to be_nil
+      expect(e.message).to include('400')
+    end
+  end
+
+  it 'falls back to a plain error when the gzip body is malformed' do
+    stub_request(:post, 'https://example.com/rpc')
+      .to_return(status: 400, body: 'not gzip at all',
+                 headers: { 'Content-Type' => 'application/json', 'Content-Encoding' => 'gzip' })
+
+    expect { send_request }.to raise_error(MCPClient::Errors::ServerError) do |e|
+      expect(e.code).to be_nil
+      expect(e).not_to be_a(MCPClient::Errors::TransientServerError)
+    end
+  end
+end
+
+# --- Round 3, finding A: input_required belongs to the modern era only ------
+#
+# `resultType` and the multi round-trip pattern that "input_required" names
+# were introduced by 2026-07-28. A session that negotiated a handshake
+# revision has no such pattern, so a legacy answer claiming an unfinished
+# result is malformed — and must never be quietly flattened into an empty
+# successful one by a wrapper that projects a field out of the result.
+RSpec.describe 'input_required is a modern-era result type' do
+  let(:transport) do
+    Class.new do
+      include MCPClient::JsonRpcCommon
+
+      attr_accessor :protocol_version
+
+      def initialize
+        @logger = Logger.new(StringIO.new)
+      end
+    end.new
+  end
+
+  def process(result)
+    transport.process_jsonrpc_response({ 'jsonrpc' => '2.0', 'id' => 1, 'result' => result })
+  end
+
+  it 'accepts it once a modern revision is established' do
+    transport.protocol_version = '2026-07-28'
+    result = { 'resultType' => 'input_required', 'requestState' => 'continue-later' }
+
+    expect(process(result)).to eq(result)
+    expect(transport.accepted_result_types).to include('input_required')
+  end
+
+  it 'rejects it from a session that negotiated a handshake revision' do
+    transport.protocol_version = '2025-11-25'
+
+    expect { process({ 'resultType' => 'input_required', 'requestState' => 'continue-later' }) }
+      .to raise_error(MCPClient::Errors::InvalidResultError, /input_required/)
+    expect(transport.accepted_result_types).to eq(['complete'])
+  end
+
+  it 'rejects it before any revision is established' do
+    expect { process({ 'resultType' => 'input_required' }) }
+      .to raise_error(MCPClient::Errors::InvalidResultError, /input_required/)
+  end
+
+  it 'still accepts a complete result in the legacy era' do
+    transport.protocol_version = '2025-11-25'
+    expect(process({ 'resultType' => 'complete', 'tools' => [] })).to eq({ 'resultType' => 'complete', 'tools' => [] })
+  end
+end
+
+# --- Round 3, finding B: a read must never be flattened while incomplete ----
+#
+# read_resource projects `contents` out of the result. This client does not
+# drive multi round-trip requests yet, so an InputRequiredResult reaching the
+# wrapper must surface — presenting a continuation as an empty successful
+# read loses the requestState and lies about the outcome.
+RSpec.describe 'read_resource never presents an unfinished read as an empty one' do
+  let(:incomplete) { { 'resultType' => 'input_required', 'requestState' => 'continue-later' } }
+
+  shared_examples 'surfaces an incomplete resources/read result' do
+    it 'raises instead of returning an empty content list on a modern session' do
+      server.instance_variable_set(:@protocol_version, '2026-07-28')
+      stub_read_result(incomplete)
+
+      expect { server.read_resource('file:///x.txt') }
+        .to raise_error(MCPClient::Errors::InvalidResultError, /input_required/) do |e|
+          expect(e).not_to be_a(MCPClient::Errors::ResourceReadError)
+          expect(e.protocol_error?).to be(true)
+          # The continuation is preserved, not discarded: a host can drive
+          # the round trip itself from the opaque requestState.
+          expect(e.data).to eq(incomplete)
+          expect(e.data['requestState']).to eq('continue-later')
+        end
+    end
+
+    it 'still returns the contents of a completed read' do
+      server.instance_variable_set(:@protocol_version, '2026-07-28')
+      stub_read_result({ 'resultType' => 'complete',
+                         'contents' => [{ 'uri' => 'file:///x.txt', 'text' => 'hi' }] })
+
+      expect(server.read_resource('file:///x.txt').map(&:uri)).to eq(['file:///x.txt'])
+    end
+  end
+
+  context 'with ServerStdio' do
+    let(:server) { MCPClient::ServerStdio.new(command: 'echo test') }
+
+    def stub_read_result(result)
+      server.instance_variable_set(:@initialized, true)
+      allow(server).to receive(:send_request)
+      allow(server).to receive(:wait_response).and_return({ 'jsonrpc' => '2.0', 'id' => 1, 'result' => result })
+    end
+
+    include_examples 'surfaces an incomplete resources/read result'
+  end
+
+  [MCPClient::ServerHTTP, MCPClient::ServerStreamableHTTP, MCPClient::ServerSSE].each do |klass|
+    context "with #{klass}" do
+      let(:server) do
+        if klass == MCPClient::ServerSSE
+          klass.new(base_url: 'https://example.com/sse')
+        else
+          klass.new(base_url: 'https://example.com')
+        end
+      end
+
+      def stub_read_result(result)
+        allow(server).to receive(:rpc_request).and_return(result)
+      end
+
+      include_examples 'surfaces an incomplete resources/read result'
+    end
+  end
+end
+
+# --- Round 3, finding C: an unrecognized discriminator stays invalid --------
+#
+# Deliberate policy, pinned here so it cannot be relaxed by accident:
+# `resultType` is a name the 2026-07-28 revision coined, so a server that
+# sends one at all is 2026-aware whatever era this client believes it
+# negotiated. Treating a value it does not recognize as "complete" is the
+# silent-truncation failure the spec's MUST exists to prevent, so the rule
+# is applied in every era — unlike the bare-array results legacy servers were
+# actually observed to send, which stay tolerated.
+RSpec.describe 'an unrecognized resultType is invalid in every era' do
+  let(:transport) do
+    Class.new do
+      include MCPClient::JsonRpcCommon
+
+      attr_accessor :protocol_version
+
+      def initialize
+        @logger = Logger.new(StringIO.new)
+      end
+    end.new
+  end
+
+  ['2026-07-28', '2025-11-25', '2024-11-05', nil].each do |version|
+    it "rejects it with the session version #{version.inspect}" do
+      transport.protocol_version = version
+
+      expect { transport.process_jsonrpc_response({ 'id' => 1, 'result' => { 'resultType' => 'vendor_summary' } }) }
+        .to raise_error(MCPClient::Errors::InvalidResultError, /vendor_summary/)
+    end
+  end
+
+  it 'reads a symbol-keyed resultType, as a symbolizing middleware would leave it' do
+    expect(MCPClient::JsonRpcCommon.result_type({ resultType: 'input_required' })).to eq('input_required')
+    expect(MCPClient::JsonRpcCommon.result_type({ resultType: 'vendor_summary' })).to eq('vendor_summary')
+
+    transport.protocol_version = '2026-07-28'
+    expect { transport.process_jsonrpc_response({ 'id' => 1, 'result' => { resultType: 'vendor_summary' } }) }
+      .to raise_error(MCPClient::Errors::InvalidResultError, /vendor_summary/)
+    expect(transport.process_jsonrpc_response({ 'id' => 1, 'result' => { resultType: 'complete' } }))
+      .to eq({ resultType: 'complete' })
+  end
+
+  it 'rejects a symbol-keyed input_required from a legacy session too' do
+    transport.protocol_version = '2025-11-25'
+    expect { transport.process_jsonrpc_response({ 'id' => 1, 'result' => { resultType: 'input_required' } }) }
+      .to raise_error(MCPClient::Errors::InvalidResultError, /input_required/)
+  end
+end
+
+# --- Round 3, finding D: an invalid result is answered, never re-sent -------
+#
+# InvalidResultError being a ServerError is only half the guarantee; this
+# drives a real request with retries configured and counts the wire sends.
+RSpec.describe 'an invalid result is never retried on the wire' do
+  let(:base_url) { 'https://example.com' }
+  let(:endpoint) { '/rpc' }
+
+  it 'sends tools/list exactly once even with retries configured' do
+    server = MCPClient::ServerHTTP.new(base_url: base_url, endpoint: endpoint, retries: 3, retry_backoff: 0)
+    server.instance_variable_set(:@connection_established, true)
+    server.instance_variable_set(:@initialized, true)
+    stub_request(:post, "#{base_url}#{endpoint}").to_return do |request|
+      { status: 200,
+        body: JSON.generate('jsonrpc' => '2.0', 'id' => JSON.parse(request.body)['id'],
+                            'result' => { 'resultType' => 'vendor_summary', 'tools' => [] }),
+        headers: { 'Content-Type' => 'application/json' } }
+    end
+
+    expect { server.list_tools }.to raise_error(MCPClient::Errors::InvalidResultError)
+    expect(a_request(:post, "#{base_url}#{endpoint}")).to have_been_made.once
+  end
+
+  it 'still retries a 5xx for the same request, so the count means something' do
+    server = MCPClient::ServerHTTP.new(base_url: base_url, endpoint: endpoint, retries: 2, retry_backoff: 0)
+    server.instance_variable_set(:@connection_established, true)
+    server.instance_variable_set(:@initialized, true)
+    stub_request(:post, "#{base_url}#{endpoint}").to_return(status: 503, body: 'nope')
+
+    expect { server.list_tools }.to raise_error(MCPClient::Errors::TransientServerError)
+    expect(a_request(:post, "#{base_url}#{endpoint}")).to have_been_made.times(3)
+  end
+end
+
+# --- Round 3, finding E: typed errors keep their data through call_tool -----
+RSpec.describe 'a typed HTTP error keeps code, data and status through the public wrappers' do
+  let(:base_url) { 'https://example.com' }
+  let(:endpoint) { '/rpc' }
+  let(:capability_data) { { 'requiredCapabilities' => { 'elicitation' => { 'form' => {} } } } }
+
+  [MCPClient::ServerHTTP, MCPClient::ServerStreamableHTTP].each do |klass|
+    context "with #{klass}" do
+      let(:server) { klass.new(base_url: base_url, endpoint: endpoint, retries: 0) }
+
+      before do
+        server.instance_variable_set(:@connection_established, true)
+        server.instance_variable_set(:@initialized, true)
+        stub_request(:post, "#{base_url}#{endpoint}")
+          .to_return(status: 400,
+                     body: JSON.generate('jsonrpc' => '2.0', 'id' => 1,
+                                         'error' => { 'code' => -32_021, 'message' => 'Missing capability',
+                                                      'data' => capability_data }),
+                     headers: { 'Content-Type' => 'application/json' })
+      end
+
+      it 'keeps them through call_tool rather than wrapping them in ToolCallError' do
+        expect { server.call_tool('t', {}) }
+          .to raise_error(MCPClient::Errors::MissingRequiredClientCapabilityError) do |e|
+            expect(e).not_to be_a(MCPClient::Errors::ToolCallError)
+            expect(e.code).to eq(-32_021)
+            expect(e.data).to eq(capability_data)
+            expect(e.required_capabilities).to eq({ 'elicitation' => { 'form' => {} } })
+            expect(e.http_status).to eq(400)
+          end
+      end
+
+      it 'keeps them through read_resource rather than wrapping them in ResourceReadError' do
+        expect { server.read_resource('file:///x') }
+          .to raise_error(MCPClient::Errors::MissingRequiredClientCapabilityError) do |e|
+            expect(e).not_to be_a(MCPClient::Errors::ResourceReadError)
+            expect(e.code).to eq(-32_021)
+            expect(e.http_status).to eq(400)
+          end
+      end
+
+      it 'keeps them through get_prompt rather than wrapping them in PromptGetError' do
+        expect { server.get_prompt('p', {}) }
+          .to raise_error(MCPClient::Errors::MissingRequiredClientCapabilityError) do |e|
+            expect(e).not_to be_a(MCPClient::Errors::PromptGetError)
+            expect(e.data).to eq(capability_data)
+            expect(e.http_status).to eq(400)
+          end
+      end
+    end
+  end
+end
+
+# --- Round 3, finding F: two outstanding requests, answered out of order ----
+#
+# The earlier SSE and stdio examples answer inside the mocked send, so one
+# waiter is never actually blocked while another request is outstanding.
+# These leave two requests in flight, answer the SECOND one first, and check
+# that each answer reaches its own caller and that the pending bookkeeping is
+# emptied either way.
+RSpec.describe 'two outstanding requests are answered independently and out of order' do
+  # Take one posted request, failing loudly instead of blocking forever.
+  def take(queue)
+    deadline = Time.now + 5
+    loop do
+      begin
+        return queue.pop(true)
+      rescue ThreadError
+        raise 'no request was sent within 5s' if Time.now > deadline
+      end
+      sleep 0.01
+    end
+  end
+
+  let(:capability_error) do
+    { 'code' => -32_021, 'message' => 'Missing required client capability',
+      'data' => { 'requiredCapabilities' => { 'elicitation' => {} } } }
+  end
+  let(:tool_listing) do
+    { 'resultType' => 'complete', 'tools' => [{ 'name' => 't', 'description' => 'd', 'inputSchema' => {} }] }
+  end
+
+  context 'with ServerSSE (stream reader -> waiter)' do
+    let(:server) { MCPClient::ServerSSE.new(base_url: 'https://example.com/sse', read_timeout: 5, retries: 0) }
+
+    before do
+      server.instance_variable_set(:@connection_established, true)
+      server.instance_variable_set(:@sse_connected, true)
+      server.instance_variable_set(:@initialized, true)
+      server.instance_variable_set(:@rpc_endpoint, 'https://example.com/messages')
+    end
+
+    def answer(id, payload)
+      body = JSON.generate({ 'jsonrpc' => '2.0', 'id' => id }.merge(payload))
+      server.send(:parse_and_handle_sse_event, "event: message\ndata: #{body}\n\n")
+    end
+
+    it 'gives each waiter its own answer and leaves no pending state behind' do
+      sent = Queue.new
+      allow(server).to receive(:post_json_rpc_request) { |request| sent << request and nil }
+
+      listing = Thread.new { server.list_tools }
+      calling = Thread.new do
+        server.call_tool('t', {})
+      rescue MCPClient::Errors::ServerError => e
+        e
+      end
+
+      ids = {}
+      2.times do
+        request = take(sent)
+        ids[request['method']] = request['id']
+      end
+      expect(ids.keys).to contain_exactly('tools/list', 'tools/call')
+
+      answer(ids['tools/call'], 'error' => capability_error)
+      answer(ids['tools/list'], 'result' => tool_listing)
+
+      expect(listing.join(5)).not_to be_nil
+      expect(calling.join(5)).not_to be_nil
+      expect(listing.value.map(&:name)).to eq(['t'])
+      expect(calling.value).to be_a(MCPClient::Errors::MissingRequiredClientCapabilityError)
+      expect(calling.value.required_capabilities).to eq({ 'elicitation' => {} })
+      expect(server.instance_variable_get(:@sse_results)).to be_empty
+      expect(server.instance_variable_get(:@pending_request_ids)).to be_empty
+    end
+  end
+
+  context 'with ServerStdio (reader thread -> waiter)' do
+    let(:server) { MCPClient::ServerStdio.new(command: 'echo test', read_timeout: 5) }
+
+    before { server.instance_variable_set(:@initialized, true) }
+
+    def answer(id, payload)
+      server.send(:handle_line, "#{JSON.generate({ 'jsonrpc' => '2.0', 'id' => id }.merge(payload))}\n")
+    end
+
+    it 'gives each waiter its own answer and leaves no pending state behind' do
+      sent = Queue.new
+      allow(server).to receive(:send_request) { |request| sent << request and nil }
+
+      listing = Thread.new { server.list_tools }
+      calling = Thread.new do
+        server.call_tool('t', {})
+      rescue MCPClient::Errors::ServerError => e
+        e
+      end
+
+      ids = {}
+      2.times do
+        request = take(sent)
+        ids[request['method']] = request['id']
+      end
+      expect(ids.keys).to contain_exactly('tools/list', 'tools/call')
+
+      answer(ids['tools/call'], 'error' => capability_error)
+      answer(ids['tools/list'], 'result' => tool_listing)
+
+      expect(listing.join(5)).not_to be_nil
+      expect(calling.join(5)).not_to be_nil
+      expect(listing.value.map(&:name)).to eq(['t'])
+      expect(calling.value).to be_a(MCPClient::Errors::MissingRequiredClientCapabilityError)
+      expect(calling.value.required_capabilities).to eq({ 'elicitation' => {} })
+      expect(server.instance_variable_get(:@pending)).to be_empty
+      expect(server.instance_variable_get(:@awaiting)).to be_empty
+    end
+  end
+end
+
+# --- Round 3, finding G: resource errors and pages off the real wire --------
+#
+# The resource-not-found mapping and the discriminator check are exercised
+# here against stubbed HTTP responses (JSON for ServerHTTP, SSE for
+# ServerStreamableHTTP) rather than a mocked rpc_request, and across a
+# paginated list where only the SECOND page is malformed.
+RSpec.describe 'resource errors and paginated results off the wire' do
+  let(:base_url) { 'https://example.com' }
+  let(:endpoint) { '/rpc' }
+
+  shared_examples 'maps wire-level resource errors' do
+    before do
+      server.instance_variable_set(:@connection_established, true)
+      server.instance_variable_set(:@initialized, true)
+    end
+
+    it 'maps a modern -32602 to ResourceNotFound' do
+      server.instance_variable_set(:@protocol_version, '2026-07-28')
+      respond_with('error' => { 'code' => -32_602, 'message' => 'No such resource' })
+
+      expect { server.read_resource('file:///gone') }
+        .to raise_error(MCPClient::Errors::ResourceNotFound, %r{file:///gone})
+    end
+
+    it 'keeps a legacy -32602 a ResourceReadError' do
+      server.instance_variable_set(:@protocol_version, '2025-11-25')
+      respond_with('error' => { 'code' => -32_602, 'message' => 'Invalid params' })
+
+      expect { server.read_resource('file:///gone') }
+        .to raise_error(MCPClient::Errors::ResourceReadError, /Invalid params/) do |e|
+          expect(e).not_to be_a(MCPClient::Errors::ResourceNotFound)
+        end
+    end
+
+    it 'maps the legacy -32002 to ResourceNotFound in either era' do
+      server.instance_variable_set(:@protocol_version, '2025-11-25')
+      respond_with('error' => { 'code' => -32_002, 'message' => 'Resource not found' })
+
+      expect { server.read_resource('file:///gone') }.to raise_error(MCPClient::Errors::ResourceNotFound)
+    end
+
+    it 'treats an absent resultType as complete on a modern session too' do
+      # "clients MUST treat an absent resultType as 'complete'" is a
+      # backward-compatibility rule, not a legacy-only one.
+      server.instance_variable_set(:@protocol_version, '2026-07-28')
+      respond_with('result' => { 'contents' => [{ 'uri' => 'file:///x', 'text' => 'hi' }] })
+
+      expect(server.read_resource('file:///x').map(&:uri)).to eq(['file:///x'])
+    end
+
+    it 'rejects an unrecognized discriminator on a later pagination page' do
+      pages = [
+        { 'result' => { 'resultType' => 'complete', 'nextCursor' => 'page-2',
+                        'tools' => [{ 'name' => 'first', 'description' => 'd', 'inputSchema' => {} }] } },
+        { 'result' => { 'resultType' => 'vendor_summary',
+                        'tools' => [{ 'name' => 'second', 'description' => 'd', 'inputSchema' => {} }] } }
+      ]
+      respond_in_sequence(pages)
+
+      expect { server.list_tools }.to raise_error(MCPClient::Errors::InvalidResultError, /vendor_summary/)
+    end
+  end
+
+  context 'with ServerHTTP (JSON responses)' do
+    let(:server) { MCPClient::ServerHTTP.new(base_url: base_url, endpoint: endpoint, retries: 0) }
+
+    def encode(id, payload)
+      { status: 200, body: JSON.generate({ 'jsonrpc' => '2.0', 'id' => id }.merge(payload)),
+        headers: { 'Content-Type' => 'application/json' } }
+    end
+
+    def respond_with(payload)
+      stub_request(:post, "#{base_url}#{endpoint}").to_return { |r| encode(JSON.parse(r.body)['id'], payload) }
+    end
+
+    def respond_in_sequence(payloads)
+      remaining = payloads.dup
+      stub_request(:post, "#{base_url}#{endpoint}").to_return do |request|
+        encode(JSON.parse(request.body)['id'], remaining.shift || payloads.last)
+      end
+    end
+
+    include_examples 'maps wire-level resource errors'
+  end
+
+  context 'with ServerStreamableHTTP (SSE responses)' do
+    let(:server) { MCPClient::ServerStreamableHTTP.new(base_url: base_url, endpoint: endpoint, retries: 0) }
+
+    def encode(id, payload)
+      body = JSON.generate({ 'jsonrpc' => '2.0', 'id' => id }.merge(payload))
+      { status: 200, body: "event: message\ndata: #{body}\n\n",
+        headers: { 'Content-Type' => 'text/event-stream' } }
+    end
+
+    def respond_with(payload)
+      stub_request(:post, "#{base_url}#{endpoint}").to_return { |r| encode(JSON.parse(r.body)['id'], payload) }
+    end
+
+    def respond_in_sequence(payloads)
+      remaining = payloads.dup
+      stub_request(:post, "#{base_url}#{endpoint}").to_return do |request|
+        encode(JSON.parse(request.body)['id'], remaining.shift || payloads.last)
+      end
+    end
+
+    include_examples 'maps wire-level resource errors'
   end
 end

@@ -326,7 +326,7 @@ module MCPClient
     # @return [Array<MCPClient::ResourceContent>] array of resource contents
     # @raise [MCPClient::Errors::ResourceReadError] if resource reading fails
     def read_resource(uri)
-      result = rpc_request('resources/read', { uri: uri })
+      result = require_complete_result!(rpc_request('resources/read', { uri: uri }), 'resources/read')
       contents = result['contents'] || []
       contents.map { |content| MCPClient::ResourceContent.from_json(content) }
     rescue MCPClient::Errors::ServerError => e

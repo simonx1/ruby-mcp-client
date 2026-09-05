@@ -183,6 +183,10 @@ RSpec.describe 'MCP 2026-07-28 protocol foundations' do
     end
 
     it 'passes through an "input_required" result for the caller to handle' do
+      # Only a modern session has the multi round-trip pattern; a legacy one
+      # answering with it is malformed (see the era examples in the
+      # verification spec).
+      transport.instance_variable_set(:@protocol_version, '2026-07-28')
       result = { 'resultType' => 'input_required', 'requestState' => 'blob' }
       expect(transport.process_jsonrpc_response({ 'id' => 1, 'result' => result })).to eq(result)
       expect(MCPClient::JsonRpcCommon.result_type(result)).to eq('input_required')
@@ -231,7 +235,32 @@ RSpec.describe 'MCP 2026-07-28 protocol foundations' do
           .to raise_error(MCPClient::Errors::ResourceNotFound, %r{file:///missing.txt.*Resource not found})
       end
 
+      it 'keeps -32602 a ResourceReadError on a legacy session' do
+        # -32602 only means "no such resource" from 2026-07-28 on; on a
+        # handshake session it is still plain Invalid params.
+        server.instance_variable_set(:@protocol_version, '2025-11-25')
+        stub_read_error(-32_602, 'Invalid params')
+        expect { server.read_resource('file:///missing.txt') }
+          .to raise_error(MCPClient::Errors::ResourceReadError, /Invalid params/) do |e|
+            expect(e).not_to be_a(MCPClient::Errors::ResourceNotFound)
+          end
+      end
+
+      it 'keeps -32602 a ResourceReadError before any session is established' do
+        stub_read_error(-32_602, 'Invalid params')
+        expect { server.read_resource('file:///missing.txt') }
+          .to raise_error(MCPClient::Errors::ResourceReadError) do |e|
+            expect(e).not_to be_a(MCPClient::Errors::ResourceNotFound)
+          end
+      end
+
       it 'raises ResourceNotFound for the legacy -32002 code' do
+        stub_read_error(-32_002, 'Resource not found')
+        expect { server.read_resource('file:///missing.txt') }.to raise_error(MCPClient::Errors::ResourceNotFound)
+      end
+
+      it 'raises ResourceNotFound for -32002 on a modern session too' do
+        server.instance_variable_set(:@protocol_version, '2026-07-28')
         stub_read_error(-32_002, 'Resource not found')
         expect { server.read_resource('file:///missing.txt') }.to raise_error(MCPClient::Errors::ResourceNotFound)
       end
@@ -526,11 +555,22 @@ RSpec.describe 'resource-not-found mapping is protocol-era aware' do
   end
 
   it 'exposes the protocol era on every transport' do
-    server = MCPClient::ServerStdio.new(command: 'echo')
-    expect(server.protocol_version).to be_nil
-    expect(server.modern?).to be(false)
-    server.instance_variable_set(:@protocol_version, '2026-07-28')
-    expect(server.modern?).to be(true)
+    servers = [MCPClient::ServerStdio.new(command: 'echo'),
+               MCPClient::ServerHTTP.new(base_url: 'https://example.com'),
+               MCPClient::ServerStreamableHTTP.new(base_url: 'https://example.com'),
+               MCPClient::ServerSSE.new(base_url: 'https://example.com/sse')]
+
+    servers.each do |server|
+      expect(server.protocol_version).to be_nil, "#{server.class}: expected no era before connecting"
+      expect(server.modern?).to be(false), "#{server.class}: nil is not a modern era"
+
+      server.instance_variable_set(:@protocol_version, '2025-11-25')
+      expect(server.modern?).to be(false), "#{server.class}: a handshake revision is not modern"
+
+      server.instance_variable_set(:@protocol_version, '2026-07-28')
+      expect(server.protocol_version).to eq('2026-07-28')
+      expect(server.modern?).to be(true), "#{server.class}: 2026-07-28 is modern"
+    end
   end
 end
 

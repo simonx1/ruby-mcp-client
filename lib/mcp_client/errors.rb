@@ -153,9 +153,13 @@ module MCPClient
       end
 
       # @param message [Object] the error object's `message` member
-      # @return [Boolean] whether it is the non-empty string JSON-RPC requires
+      # @return [Boolean] whether it is the string JSON-RPC requires
       def self.wire_message?(message)
-        message.is_a?(String) && !message.empty?
+        # JSON-RPC 2.0 types `message` as a String and says nothing about its
+        # length, so an empty one is well-formed. Nothing is discriminated by
+        # rejecting it either: a legacy endpoint misusing a reserved code
+        # would carry prose, not "".
+        message.is_a?(String)
       end
 
       # @param code [Integer, nil] a JSON-RPC error code
@@ -265,17 +269,18 @@ module MCPClient
       end
 
       # The schema types this error's data as `supported: string[]` and
-      # `requested: string`, and the client can only act on it — retry with a
-      # version the server named — when `supported` actually holds versions.
-      # Anything else is malformed, and must not pass for a modern server's
-      # rejection of the request.
+      # `requested: string`. Both members, with those types, are what a
+      # modern server's rejection carries and what a legacy endpoint emitting
+      # a bare -32022 does not — so they are the whole test. Their length is
+      # not: an empty `supported` means the server named no version this
+      # client can retry with, which is a failed negotiation with a modern
+      # server, not evidence of a legacy one.
       # @return [Boolean] whether data carries the shape the schema requires
       def well_formed?
         list = data_member('supported')
-        return false unless list.is_a?(Array) && !list.empty?
-        return false unless list.all? { |version| version.is_a?(String) && !version.empty? }
+        return false unless list.is_a?(Array) && list.all?(String)
 
-        requested.is_a?(String) && !requested.empty?
+        requested.is_a?(String)
       end
     end
 
