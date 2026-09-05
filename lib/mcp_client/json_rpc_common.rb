@@ -561,18 +561,24 @@ module MCPClient
     # opaque requestState — surfaces it instead of presenting an unfinished
     # answer as an empty successful one. The whole result rides on the
     # error's `data`, so a host can still drive the round trip itself.
+    # An unfinished answer is the InputRequired condition and is reported as
+    # such, the same way #reject_unfulfillable_input_required! reports one
+    # that reaches the response parser; any other discriminator this client
+    # cannot carry through is an invalid result.
     # @param result [Object] the JSON-RPC result
     # @param method [String] the request method, for the message
     # @return [Object] the result, when it is complete
-    # @raise [MCPClient::Errors::InvalidResultError] when it is not
+    # @raise [MCPClient::Errors::InputRequiredError] when it is unfinished
+    # @raise [MCPClient::Errors::InvalidResultError] when it is neither
     def require_complete_result!(result, method)
       type = MCPClient::JsonRpcCommon.result_type(result)
       return result if type == 'complete'
 
-      raise MCPClient::Errors::InvalidResultError.new(
-        "Invalid result: #{method} answered with resultType #{type.to_s[0, 64].inspect}, which this " \
-        'client cannot carry through (multi round-trip requests are not implemented)', data: result
-      )
+      message = "#{method} answered with resultType #{type.to_s[0, 64].inspect}, which this " \
+                'client cannot carry through (multi round-trip requests are not implemented)'
+      raise MCPClient::Errors::InputRequiredError.new(message, data: result) if type == 'input_required'
+
+      raise MCPClient::Errors::InvalidResultError.new("Invalid result: #{message}", data: result)
     end
 
     # Build the error for a 4xx response: the typed JSON-RPC error when the
