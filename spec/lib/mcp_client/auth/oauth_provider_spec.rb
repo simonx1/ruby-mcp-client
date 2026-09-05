@@ -7,6 +7,12 @@ RSpec.describe MCPClient::Auth::OAuthProvider do
   let(:redirect_uri) { 'http://localhost:8080/callback' }
   let(:logger) { instance_double('Logger') }
   let(:storage) { instance_double('MCPClient::Auth::OAuthProvider::MemoryStorage') }
+  let(:known_server_metadata) do
+    MCPClient::Auth::ServerMetadata.new(issuer: 'https://auth.example.com',
+                                        authorization_endpoint: 'https://auth.example.com/authorize',
+                                        token_endpoint: 'https://auth.example.com/token',
+                                        code_challenge_methods_supported: ['S256'])
+  end
 
   subject(:oauth_provider) do
     described_class.new(
@@ -185,13 +191,25 @@ RSpec.describe MCPClient::Auth::OAuthProvider do
           .not_to raise_error
       end
 
-      it 'allows http on localhost for local development' do
+      # The local-development exception needs a local stack on both ends: a
+      # loopback endpoint advertised to a client whose configured server is
+      # loopback too. For this remote server it is no exception at all.
+      it 'rejects http on localhost for a remote server' do
         expect { oauth_provider.send(:enforce_https!, 'http://localhost:9292/token', 'token endpoint') }
+          .to raise_error(MCPClient::Errors::ConnectionError, /must use HTTPS/)
+      end
+
+      it 'allows http on localhost when the configured server is loopback' do
+        local = described_class.new(server_url: 'http://localhost:9292/mcp', redirect_uri: redirect_uri,
+                                    logger: logger, storage: storage)
+        expect { local.send(:enforce_https!, 'http://localhost:9292/token', 'token endpoint') }
           .not_to raise_error
       end
 
-      it 'allows http on an IPv6 loopback endpoint' do
-        expect { oauth_provider.send(:enforce_https!, 'http://[::1]:9292/token', 'token endpoint') }
+      it 'allows http on an IPv6 loopback endpoint when the configured server is loopback' do
+        local = described_class.new(server_url: 'http://localhost:9292/mcp', redirect_uri: redirect_uri,
+                                    logger: logger, storage: storage)
+        expect { local.send(:enforce_https!, 'http://[::1]:9292/token', 'token endpoint') }
           .not_to raise_error
       end
 
@@ -342,7 +360,12 @@ RSpec.describe MCPClient::Auth::OAuthProvider do
           resource: 'http://localhost:9292/mcp', authorization_servers: ['http://localhost:9292']
         )
         allow(local_provider).to receive(:fetch_resource_metadata).and_return(local_meta)
-        allow(local_provider).to receive(:fetch_server_metadata).and_return(server_meta(['S256']))
+        # RFC 8414: the metadata issuer must be the identifier it was fetched for.
+        local_as = MCPClient::Auth::ServerMetadata.new(
+          issuer: 'http://localhost:9292', authorization_endpoint: 'https://auth.example.com/authorize',
+          token_endpoint: 'https://auth.example.com/token', code_challenge_methods_supported: ['S256']
+        )
+        allow(local_provider).to receive(:fetch_server_metadata).and_return(local_as)
 
         result = local_provider.send(:discover_authorization_server)
         expect(result.token_endpoint).to eq('https://auth.example.com/token')
@@ -351,7 +374,13 @@ RSpec.describe MCPClient::Auth::OAuthProvider do
       it 'falls back to direct AS discovery when no PRM document exists (404)' do
         # fetch_resource_metadata returns nil for a genuine 404 (absent candidate)
         allow(provider).to receive(:fetch_resource_metadata).and_return(nil)
-        allow(provider).to receive(:fetch_server_metadata).and_return(server_meta(['S256']))
+        # Direct discovery treats the MCP server origin as the issuer, so the
+        # document must name that origin (RFC 8414 Section 3.3).
+        origin_as = MCPClient::Auth::ServerMetadata.new(
+          issuer: 'https://mcp.example.com', authorization_endpoint: 'https://auth.example.com/authorize',
+          token_endpoint: 'https://auth.example.com/token', code_challenge_methods_supported: ['S256']
+        )
+        allow(provider).to receive(:fetch_server_metadata).and_return(origin_as)
 
         result = provider.send(:discover_authorization_server)
         expect(result.token_endpoint).to eq('https://auth.example.com/token')
@@ -508,10 +537,13 @@ RSpec.describe MCPClient::Auth::OAuthProvider do
 
       before do
         allow(storage).to receive(:get_token).with(server_url).and_return(token)
+        # MCP 2026-07-28: a token is presented only for the known authorization server
+        allow(storage).to receive(:get_server_metadata).with(server_url).and_return(known_server_metadata)
+        allow(storage).to receive(:set_token)
       end
 
       it 'returns the token' do
-        expect(oauth_provider.access_token).to eq(token)
+        expect(oauth_provider.access_token.access_token).to eq(token.access_token)
       end
     end
 
@@ -529,12 +561,15 @@ RSpec.describe MCPClient::Auth::OAuthProvider do
 
       before do
         allow(storage).to receive(:get_token).with(server_url).and_return(expired_token)
-        allow(oauth_provider).to receive(:refresh_token).with(expired_token).and_return(nil)
+        allow(storage).to receive(:get_server_metadata).with(server_url).and_return(known_server_metadata)
+        allow(storage).to receive(:set_token)
+        allow(oauth_provider).to receive(:refresh_token).and_return(nil)
       end
 
       it 'attempts to refresh the token' do
         oauth_provider.access_token
-        expect(oauth_provider).to have_received(:refresh_token).with(expired_token)
+        expect(oauth_provider).to have_received(:refresh_token)
+          .with(an_object_having_attributes(access_token: 'expired_token', refresh_token: 'refresh123'))
       end
     end
   end
@@ -579,10 +614,11 @@ RSpec.describe MCPClient::Auth::OAuthProvider do
       let(:www_authenticate) { 'Bearer resource="https://example.com/.well-known/oauth-protected-resource"' }
 
       before do
+        allow(storage).to receive(:get_server_metadata).and_return(nil)
         allow(response).to receive(:headers).and_return('WWW-Authenticate' => www_authenticate)
         allow(oauth_provider).to receive(:fetch_resource_metadata).and_return(
           MCPClient::Auth::ResourceMetadata.new(
-            resource: 'https://example.com',
+            resource: server_url, # MCP 2026-07-28: a challenge naming another resource is refused
             authorization_servers: ['https://auth.example.com']
           )
         )
@@ -687,6 +723,7 @@ RSpec.describe MCPClient::Auth::OAuthProvider do
       allow(storage).to receive(:get_server_metadata).and_return(server_metadata)
       allow(storage).to receive(:set_server_metadata)
       allow(storage).to receive(:get_client_info).and_return(client_info)
+      allow(storage).to receive(:set_client_info)
       allow(storage).to receive(:set_pkce)
       allow(storage).to receive(:set_state)
     end
@@ -719,6 +756,7 @@ RSpec.describe MCPClient::Auth::OAuthProvider do
     let(:server_metadata) do
       instance_double(
         'MCPClient::Auth::ServerMetadata',
+        issuer: 'https://auth.example.com',
         token_endpoint: 'https://tropic-dev.us.auth0.com/oauth/token'
       )
     end
@@ -818,7 +856,8 @@ RSpec.describe MCPClient::Auth::OAuthProvider do
     let(:server_metadata) do
       instance_double(
         'MCPClient::Auth::ServerMetadata',
-        registration_endpoint: 'https://auth.example.com/register'
+        registration_endpoint: 'https://auth.example.com/register',
+        issuer: 'https://auth.example.com'
       )
     end
     let(:registration_response_body) do

@@ -12,20 +12,63 @@ module MCPClient
   module Auth
     # OAuth token model representing access/refresh tokens
     class Token
-      attr_reader :access_token, :token_type, :expires_in, :scope, :refresh_token, :expires_at
+      attr_reader :access_token, :token_type, :expires_in, :scope, :refresh_token, :expires_at, :issuer
 
       # @param access_token [String] The access token
       # @param token_type [String] Token type (default: "Bearer")
       # @param expires_in [Integer, nil] Token lifetime in seconds
       # @param scope [String, nil] Token scope
       # @param refresh_token [String, nil] Refresh token for renewal
-      def initialize(access_token:, token_type: 'Bearer', expires_in: nil, scope: nil, refresh_token: nil)
+      # @param issuer [String, nil] issuer identifier of the authorization server that issued the token
+      #   (MCP 2026-07-28: tokens are per authorization server and never presented to another)
+      # @param expires_at [Time, String, nil] an already-known expiry, as persisted by {#to_h}; it
+      #   takes precedence over expires_in
+      def initialize(access_token:, token_type: 'Bearer', expires_in: nil, scope: nil, refresh_token: nil,
+                     issuer: nil, expires_at: nil)
         @access_token = access_token
         @token_type = token_type
-        @expires_in = expires_in
+        # A record read back from a storage backend that persists plain
+        # hashes carries whatever was written (or edited) there. The lifetime
+        # is validated BEFORE it is added to a Time: `Time.now + "3600"` is a
+        # TypeError out of `OAuthProvider#access_token` — a crash in the
+        # request path, over a record the read-path checks were about to
+        # refuse anyway.
+        @expires_in = self.class.usable_lifetime(expires_in)
         @scope = scope
+        @issuer = issuer
         @refresh_token = refresh_token
-        @expires_at = expires_in ? Time.now + expires_in : nil
+        @expires_at = resolve_expiry(expires_in, expires_at)
+      end
+
+      # An expiry this client cannot read is recorded as this instant. An
+      # unreadable expiry is not "no expiry": read that way, a mangled
+      # lifetime would make a token that never expires and is never
+      # refreshed. Read as an instant long past, the record is refreshed or
+      # re-authorized instead — and says so again after a round trip through
+      # storage.
+      UNREADABLE_EXPIRY = Time.at(0).utc.freeze
+
+      # A lifetime that can be added to a Time. RFC 6749 Section 5.1 makes
+      # expires_in a number of seconds; anything else says nothing.
+      # @param value [Object, nil]
+      # @return [Integer, Float, nil]
+      def self.usable_lifetime(value)
+        value if value.is_a?(Integer) || value.is_a?(Float)
+      end
+
+      # An expiry instant, as persisted by {#to_h} (an ISO 8601 string) or as
+      # given. Unparseable text, or a value of another type, is no expiry.
+      # @param value [Object, nil]
+      # @return [Time, nil]
+      def self.usable_expiry(value)
+        return value if value.is_a?(Time)
+        return nil unless value.is_a?(String)
+
+        begin
+          Time.parse(value)
+        rescue ArgumentError
+          nil
+        end
       end
 
       # Check if the token is expired
@@ -44,6 +87,23 @@ module MCPClient
         Time.now >= (@expires_at - 300) # 5 minutes buffer
       end
 
+      # Issuer value marking a token that must never be presented again
+      # (retired after an authorization server change, on a storage backend
+      # that cannot delete it).
+      RETIRED_ISSUER = 'urn:mcp:retired-token'
+
+      # A copy of this token bound to an authorization server (or retired).
+      # @param issuer [String]
+      # @return [Token]
+      def with_issuer(issuer)
+        self.class.from_h(to_h.merge(issuer: issuer))
+      end
+
+      # @return [Boolean] whether the token was retired
+      def retired?
+        @issuer == RETIRED_ISSUER
+      end
+
       # Convert token to authorization header value
       # @return [String] Authorization header value
       def to_header
@@ -60,34 +120,55 @@ module MCPClient
           scope: @scope,
           refresh_token: @refresh_token,
           expires_at: @expires_at&.iso8601
-        }
+        }.tap { |hash| hash[:issuer] = @issuer if @issuer }
       end
+
+      # The instant this token expires: the recorded one, else the lifetime
+      # added to now, else none at all — and {UNREADABLE_EXPIRY} when the
+      # record carries an expiry, or a lifetime, that is neither.
+      #
+      # A record that carries an expires_at is answered by that expires_at
+      # alone. `expires_in` is the lifetime of a token at the moment it was
+      # ISSUED (RFC 6749 Section 5.1), and a record read back from storage was
+      # not issued now: reading `{ expires_in: 3600, expires_at: 'not a time' }`
+      # — the exact shape {#to_h} persists, with the one field this client
+      # depends on mangled — as an hour from now hands back a token that is
+      # very likely expired and is never refreshed until a request fails with
+      # it. An expiry that cannot be read is not a fresh lifetime; it is an
+      # expiry this client cannot vouch for, so the record fails closed and
+      # is refreshed or re-authorized instead.
+      # @param expires_in [Object, nil] the lifetime as given
+      # @param expires_at [Object, nil] the expiry as given
+      # @return [Time, nil]
+      def resolve_expiry(expires_in, expires_at)
+        return self.class.usable_expiry(expires_at) || UNREADABLE_EXPIRY unless expires_at.nil?
+        return Time.now + @expires_in if @expires_in
+        return nil if expires_in.nil?
+
+        UNREADABLE_EXPIRY
+      end
+      private :resolve_expiry
 
       # Create token from hash
       # @param data [Hash] Token data
       # @return [Token] New token instance
       def self.from_h(data)
-        token = new(
+        new(
           access_token: data[:access_token] || data['access_token'],
           token_type: data[:token_type] || data['token_type'] || 'Bearer',
           expires_in: data[:expires_in] || data['expires_in'],
           scope: data[:scope] || data['scope'],
-          refresh_token: data[:refresh_token] || data['refresh_token']
+          refresh_token: data[:refresh_token] || data['refresh_token'],
+          issuer: data[:issuer] || data['issuer'],
+          expires_at: data[:expires_at] || data['expires_at']
         )
-
-        # Set expires_at if provided
-        if (expires_at_str = data[:expires_at] || data['expires_at'])
-          token.instance_variable_set(:@expires_at, Time.parse(expires_at_str))
-        end
-
-        token
       end
     end
 
     # OAuth client metadata for registration and authorization
     class ClientMetadata
       attr_reader :redirect_uris, :token_endpoint_auth_method, :grant_types, :response_types, :scope,
-                  :client_name, :client_uri, :logo_uri, :tos_uri, :policy_uri, :contacts
+                  :client_name, :client_uri, :logo_uri, :tos_uri, :policy_uri, :contacts, :application_type
 
       # @param redirect_uris [Array<String>] List of valid redirect URIs
       # @param token_endpoint_auth_method [String] Authentication method for token endpoint
@@ -100,11 +181,13 @@ module MCPClient
       # @param tos_uri [String, nil] URL of the client terms of service
       # @param policy_uri [String, nil] URL of the client privacy policy
       # @param contacts [Array<String>, nil] List of contact emails for the client
+      # @param application_type [String, nil] OIDC application type ('native' or 'web'), required in
+      #   Dynamic Client Registration by MCP 2026-07-28
       def initialize(redirect_uris:, token_endpoint_auth_method: 'none',
                      grant_types: %w[authorization_code refresh_token],
                      response_types: ['code'], scope: nil,
                      client_name: nil, client_uri: nil, logo_uri: nil,
-                     tos_uri: nil, policy_uri: nil, contacts: nil)
+                     tos_uri: nil, policy_uri: nil, contacts: nil, application_type: nil)
         @redirect_uris = redirect_uris
         @token_endpoint_auth_method = token_endpoint_auth_method
         @grant_types = grant_types
@@ -116,6 +199,7 @@ module MCPClient
         @tos_uri = tos_uri
         @policy_uri = policy_uri
         @contacts = contacts
+        @application_type = application_type
       end
 
       # Convert to hash for HTTP requests
@@ -132,33 +216,84 @@ module MCPClient
           logo_uri: @logo_uri,
           tos_uri: @tos_uri,
           policy_uri: @policy_uri,
-          contacts: @contacts
+          contacts: @contacts,
+          application_type: @application_type
         }.compact
       end
     end
 
     # Registered OAuth client information
     class ClientInfo
-      attr_reader :client_id, :client_secret, :client_id_issued_at, :client_secret_expires_at, :metadata
+      # How the client id was obtained (MCP 2026-07-28 client registration):
+      # 'pre_registered' credentials belong to one authorization server and
+      # must not be reused with another; 'dynamic' registrations are redone
+      # for a new authorization server; 'cimd' (Client ID Metadata Document)
+      # client ids are portable across authorization servers.
+      REGISTRATION_TYPES = %w[pre_registered dynamic cimd].freeze
+
+      attr_reader :client_id, :client_secret, :client_id_issued_at, :client_secret_expires_at, :metadata,
+                  :issuer, :registration_type
 
       # @param client_id [String] OAuth client ID
       # @param client_secret [String, nil] OAuth client secret (for confidential clients)
       # @param client_id_issued_at [Integer, nil] Unix timestamp when client ID was issued
       # @param client_secret_expires_at [Integer, nil] Unix timestamp when client secret expires
       # @param metadata [ClientMetadata] Client metadata
+      # @param issuer [String, nil] issuer identifier of the authorization server these credentials
+      #   belong to (MCP 2026-07-28 "Authorization Server Binding")
+      # @param registration_type [String, nil] one of REGISTRATION_TYPES (nil: unknown, treated as a
+      #   dynamic registration; credentials a host pre-registered should say 'pre_registered')
       def initialize(client_id:, metadata:, client_secret: nil, client_id_issued_at: nil,
-                     client_secret_expires_at: nil)
+                     client_secret_expires_at: nil, issuer: nil, registration_type: nil)
+        unless registration_type.nil? || REGISTRATION_TYPES.include?(registration_type)
+          raise ArgumentError, "registration_type must be one of #{REGISTRATION_TYPES.join(', ')}"
+        end
+
         @client_id = client_id
         @client_secret = client_secret
         @client_id_issued_at = client_id_issued_at
         @client_secret_expires_at = client_secret_expires_at
         @metadata = metadata
+        @issuer = issuer
+        @registration_type = registration_type
       end
 
-      # Check if client secret is expired
+      # @return [Boolean] whether the client id is portable across authorization servers
+      def portable?
+        @registration_type == 'cimd'
+      end
+
+      # @return [Boolean] whether these are pre-registered (static) credentials
+      def pre_registered?
+        effective_registration_type == 'pre_registered'
+      end
+
+      # The registration type. Credentials persisted before the field existed
+      # count as a dynamic registration: RFC 7591's client_id_issued_at is
+      # optional, so its absence proves nothing, and this library only ever
+      # stored the registrations it made. Credentials a host pre-registered
+      # are recorded as such explicitly (registration_type: 'pre_registered').
+      # @return [String]
+      def effective_registration_type
+        @registration_type || 'dynamic'
+      end
+
+      # A copy bound to an authorization server.
+      # @param issuer [String] the issuer identifier
+      # @param registration_type [String] the type to record (defaults to the effective type)
+      # @return [ClientInfo]
+      def with_issuer(issuer, registration_type: effective_registration_type)
+        self.class.new(client_id: @client_id, metadata: @metadata, client_secret: @client_secret,
+                       client_id_issued_at: @client_id_issued_at, client_secret_expires_at: @client_secret_expires_at,
+                       issuer: issuer, registration_type: registration_type)
+      end
+
+      # Check if client secret is expired. RFC 7591 Section 3.2.1 gives 0 the
+      # meaning "this secret does not expire", so it is not an expiry in the
+      # past.
       # @return [Boolean] true if client secret is expired
       def client_secret_expired?
-        return false unless @client_secret_expires_at
+        return false if @client_secret_expires_at.nil? || @client_secret_expires_at.zero?
 
         Time.now.to_i >= @client_secret_expires_at
       end
@@ -171,7 +306,9 @@ module MCPClient
           client_secret: @client_secret,
           client_id_issued_at: @client_id_issued_at,
           client_secret_expires_at: @client_secret_expires_at,
-          metadata: @metadata.to_h
+          metadata: @metadata.to_h,
+          issuer: @issuer,
+          registration_type: @registration_type
         }.compact
       end
 
@@ -187,7 +324,9 @@ module MCPClient
           client_secret: data[:client_secret] || data['client_secret'],
           client_id_issued_at: data[:client_id_issued_at] || data['client_id_issued_at'],
           client_secret_expires_at: data[:client_secret_expires_at] || data['client_secret_expires_at'],
-          metadata: metadata
+          metadata: metadata,
+          issuer: data[:issuer] || data['issuer'],
+          registration_type: data[:registration_type] || data['registration_type']
         )
       end
 
@@ -207,7 +346,8 @@ module MCPClient
           logo_uri: metadata_data[:logo_uri] || metadata_data['logo_uri'],
           tos_uri: metadata_data[:tos_uri] || metadata_data['tos_uri'],
           policy_uri: metadata_data[:policy_uri] || metadata_data['policy_uri'],
-          contacts: metadata_data[:contacts] || metadata_data['contacts']
+          contacts: metadata_data[:contacts] || metadata_data['contacts'],
+          application_type: metadata_data[:application_type] || metadata_data['application_type']
         )
       end
 
@@ -224,7 +364,8 @@ module MCPClient
     class ServerMetadata
       attr_reader :issuer, :authorization_endpoint, :token_endpoint, :registration_endpoint,
                   :scopes_supported, :response_types_supported, :grant_types_supported,
-                  :code_challenge_methods_supported, :client_id_metadata_document_supported
+                  :code_challenge_methods_supported, :client_id_metadata_document_supported,
+                  :authorization_response_iss_parameter_supported
 
       # @param issuer [String] Issuer identifier URL
       # @param authorization_endpoint [String] Authorization endpoint URL
@@ -236,9 +377,14 @@ module MCPClient
       # @param code_challenge_methods_supported [Array<String>, nil] Supported PKCE code challenge methods (RFC 8414)
       # @param client_id_metadata_document_supported [Boolean, nil] Whether the server accepts
       #   Client ID Metadata Document client IDs (MCP 2025-11-25 / SEP-991)
+      # @param authorization_response_iss_parameter_supported [Boolean, nil] Whether the server includes
+      #   the `iss` parameter in authorization responses (RFC 9207 Section 2.3, MCP 2026-07-28).
+      #   Defaults to the RFC 8414 default (false, "not advertised"); an explicit nil means the
+      #   record carries no answer at all — see {#iss_parameter_recorded?}
       def initialize(issuer:, authorization_endpoint:, token_endpoint:, registration_endpoint: nil,
                      scopes_supported: nil, response_types_supported: nil, grant_types_supported: nil,
-                     code_challenge_methods_supported: nil, client_id_metadata_document_supported: nil)
+                     code_challenge_methods_supported: nil, client_id_metadata_document_supported: nil,
+                     authorization_response_iss_parameter_supported: false)
         @issuer = issuer
         @authorization_endpoint = authorization_endpoint
         @token_endpoint = token_endpoint
@@ -248,6 +394,45 @@ module MCPClient
         @grant_types_supported = grant_types_supported
         @code_challenge_methods_supported = code_challenge_methods_supported
         @client_id_metadata_document_supported = client_id_metadata_document_supported
+        @authorization_response_iss_parameter_supported =
+          self.class.normalize_iss_advertisement(authorization_response_iss_parameter_supported)
+      end
+
+      # Whether the server advertises the RFC 9207 `iss` authorization
+      # response parameter; when it does, a response without `iss` MUST be
+      # rejected (MCP 2026-07-28 "Authorization Response Validation").
+      # @return [Boolean]
+      def iss_parameter_supported?
+        @authorization_response_iss_parameter_supported == true
+      end
+
+      # RFC 8414 makes authorization_response_iss_parameter_supported a JSON
+      # boolean. A document (or a persisted record) carrying anything else —
+      # "true", 1, {} — says nothing this client can act on, and "says
+      # nothing" must never be read as "not advertised": that is the reading
+      # that accepts a callback with no `iss` from a server that does send
+      # one, which is exactly the mix-up RFC 9207 exists to stop. An
+      # unusable answer is therefore treated as an advertisement — the check
+      # fails closed, refusing a response without `iss` — and is recorded as
+      # one, so a round trip through storage keeps the same reading. Only an
+      # absent value (nil) stays "no answer at all" (see
+      # {#iss_parameter_recorded?}).
+      # @param value [Object, nil] the value as given
+      # @return [Boolean, nil]
+      def self.normalize_iss_advertisement(value)
+        return value if value.nil? || value == true || value == false
+
+        true
+      end
+
+      # Whether this record actually carries an answer about the RFC 9207
+      # `iss` parameter. A record persisted before this client read the field
+      # carries none, and "no answer" must not be read as "not supported":
+      # that would accept a response without `iss` from a server that
+      # advertises it.
+      # @return [Boolean]
+      def iss_parameter_recorded?
+        !@authorization_response_iss_parameter_supported.nil?
       end
 
       # Check if dynamic client registration is supported
@@ -275,7 +460,8 @@ module MCPClient
           response_types_supported: @response_types_supported,
           grant_types_supported: @grant_types_supported,
           code_challenge_methods_supported: @code_challenge_methods_supported,
-          client_id_metadata_document_supported: @client_id_metadata_document_supported
+          client_id_metadata_document_supported: @client_id_metadata_document_supported,
+          authorization_response_iss_parameter_supported: @authorization_response_iss_parameter_supported
         }.compact
       end
 
@@ -293,8 +479,25 @@ module MCPClient
           grant_types_supported: data[:grant_types_supported] || data['grant_types_supported'],
           code_challenge_methods_supported: data[:code_challenge_methods_supported] ||
             data['code_challenge_methods_supported'],
-          client_id_metadata_document_supported: fetch_boolean(data, :client_id_metadata_document_supported)
+          client_id_metadata_document_supported: fetch_boolean(data, :client_id_metadata_document_supported),
+          authorization_response_iss_parameter_supported:
+            fetch_boolean(data, :authorization_response_iss_parameter_supported)
         )
+      end
+
+      # Read an authorization server's own metadata document. An absent
+      # authorization_response_iss_parameter_supported in a FETCHED document
+      # is the server's own answer ("no", the RFC 8414 default), so it is
+      # recorded as an explicit false; only a record PERSISTED before this
+      # client read the field ({.from_h} of a hash without the key) is left
+      # without an answer.
+      # @param data [Hash] the parsed metadata document
+      # @return [ServerMetadata]
+      def self.from_discovery_document(data)
+        metadata = from_h(data)
+        return metadata if metadata.iss_parameter_recorded?
+
+        from_h(data.merge(authorization_response_iss_parameter_supported: false))
       end
 
       # Fetch a possibly-false value from a hash by symbol or string key.
@@ -348,26 +551,58 @@ module MCPClient
 
     # PKCE (Proof Key for Code Exchange) helper
     class PKCE
-      attr_reader :code_verifier, :code_challenge, :code_challenge_method
+      attr_reader :code_verifier, :code_challenge, :code_challenge_method, :issuer, :iss_parameter_supported,
+                  :client_id, :redirect_uri, :state
 
       # Generate PKCE parameters
       # @param code_verifier [String, nil] Existing code verifier (for deserialization)
       # @param code_challenge [String, nil] Existing code challenge (for deserialization)
       # @param code_challenge_method [String] Challenge method (default: 'S256')
-      def initialize(code_verifier: nil, code_challenge: nil, code_challenge_method: nil)
+      # @param issuer [String, nil] the selected authorization server's issuer, recorded with this
+      #   per-request record for RFC 9207 validation of the authorization response (MCP 2026-07-28)
+      # @param iss_parameter_supported [Boolean, nil] whether that authorization server advertised
+      #   authorization_response_iss_parameter_supported, recorded with the request so the response
+      #   is judged by the server the request went to
+      # @param client_id [String, nil] the client id the authorization request was made with, so the
+      #   code is redeemed with the same credentials
+      # @param redirect_uri [String, nil] the redirect URI the authorization request was made with, so
+      #   the code is redeemed with the same value (RFC 6749 Section 4.1.3)
+      # @param state [String, nil] the `state` of the authorization request. MCP 2026-07-28 requires the
+      #   issuer to be associated with "the same per-request record used to store the PKCE code verifier
+      #   (and the `state` value, if used)": keeping the state in a slot of its own lets two flows sharing
+      #   one storage backend interleave their writes until one flow's state names another flow's record,
+      #   so it is recorded here as well and checked against the callback's state
+      def initialize(code_verifier: nil, code_challenge: nil, code_challenge_method: nil, issuer: nil,
+                     iss_parameter_supported: nil, client_id: nil, redirect_uri: nil, state: nil)
         @code_verifier = code_verifier || generate_code_verifier
         @code_challenge = code_challenge || generate_code_challenge(@code_verifier)
         @code_challenge_method = code_challenge_method || 'S256'
+        @issuer = issuer
+        # A record read back from a hash-persisting backend can carry
+        # anything here. Not a boolean is not an answer: the record says
+        # nothing about the `iss` parameter, so the authorization server's own
+        # metadata decides (and that reading fails closed), rather than a
+        # mangled value silently meaning "not advertised".
+        @iss_parameter_supported = iss_parameter_supported if [true, false].include?(iss_parameter_supported)
+        @client_id = client_id
+        @redirect_uri = redirect_uri
+        @state = state
       end
 
       # Convert to hash for serialization
       # @return [Hash] Hash representation
       def to_h
-        {
+        hash = {
           code_verifier: @code_verifier,
           code_challenge: @code_challenge,
           code_challenge_method: @code_challenge_method
         }
+        hash[:issuer] = @issuer if @issuer
+        hash[:iss_parameter_supported] = @iss_parameter_supported unless @iss_parameter_supported.nil?
+        hash[:client_id] = @client_id if @client_id
+        hash[:redirect_uri] = @redirect_uri if @redirect_uri
+        hash[:state] = @state if @state
+        hash
       end
 
       # Create PKCE instance from hash
@@ -381,11 +616,20 @@ module MCPClient
         verifier = data[:code_verifier] || data['code_verifier']
         challenge = data[:code_challenge] || data['code_challenge']
         method = data[:code_challenge_method] || data['code_challenge_method']
+        issuer = data[:issuer] || data['issuer']
+        supported = if data.key?(:iss_parameter_supported)
+                      data[:iss_parameter_supported]
+                    else
+                      data['iss_parameter_supported']
+                    end
 
         raise ArgumentError, 'Missing code_verifier' unless verifier
         raise ArgumentError, 'Missing code_challenge' unless challenge
 
-        new(code_verifier: verifier, code_challenge: challenge, code_challenge_method: method)
+        new(code_verifier: verifier, code_challenge: challenge, code_challenge_method: method, issuer: issuer,
+            iss_parameter_supported: supported, client_id: data[:client_id] || data['client_id'],
+            redirect_uri: data[:redirect_uri] || data['redirect_uri'],
+            state: data[:state] || data['state'])
       end
 
       private

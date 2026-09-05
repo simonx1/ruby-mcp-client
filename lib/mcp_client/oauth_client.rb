@@ -22,6 +22,8 @@ module MCPClient
     # @option options [Object, nil] :storage Storage backend for OAuth tokens and client info
     # @option options [String, nil] :client_id_metadata_url HTTPS URL of this client's
     #   Client ID Metadata Document (SEP-991)
+    # @option options [String, nil] :application_type 'native' or 'web' for Dynamic Client
+    #   Registration (MCP 2026-07-28; derived from the redirect URI when omitted)
     # @return [ServerHTTP] OAuth-enabled HTTP server
     def self.create_http_server(server_url:, **options)
       opts = default_server_options.merge(options)
@@ -32,7 +34,8 @@ module MCPClient
         scope: opts[:scope],
         logger: opts[:logger],
         storage: opts[:storage],
-        client_id_metadata_url: opts[:client_id_metadata_url]
+        client_id_metadata_url: opts[:client_id_metadata_url],
+        application_type: opts[:application_type]
       )
 
       ServerHTTP.new(
@@ -61,7 +64,8 @@ module MCPClient
         scope: opts[:scope],
         logger: opts[:logger],
         storage: opts[:storage],
-        client_id_metadata_url: opts[:client_id_metadata_url]
+        client_id_metadata_url: opts[:client_id_metadata_url],
+        application_type: opts[:application_type]
       )
 
       ServerStreamableHTTP.new(
@@ -93,13 +97,17 @@ module MCPClient
     # @param server [ServerHTTP, ServerStreamableHTTP] The OAuth-enabled server
     # @param code [String] Authorization code from callback
     # @param state [String] State parameter from callback
+    # @param iss [String, nil] the `iss` parameter of the authorization response (RFC 9207,
+    #   MCP 2026-07-28), validated against the recorded issuer before the token exchange
     # @return [Auth::Token] Access token
     # @raise [ArgumentError] if server doesn't have OAuth provider
-    def self.complete_oauth_flow(server, code, state)
+    def self.complete_oauth_flow(server, code, state, iss: nil)
       oauth_provider = server.instance_variable_get(:@oauth_provider)
       raise ArgumentError, 'Server does not have OAuth provider configured' unless oauth_provider
 
-      oauth_provider.complete_authorization_flow(code, state)
+      return oauth_provider.complete_authorization_flow(code, state) if iss.nil?
+
+      oauth_provider.complete_authorization_flow(code, state, iss: iss)
     end
 
     # Check if server has a valid OAuth access token
@@ -125,7 +133,8 @@ module MCPClient
         name: nil,
         logger: nil,
         storage: nil,
-        client_id_metadata_url: nil
+        client_id_metadata_url: nil,
+        application_type: nil
       }
     end
   end

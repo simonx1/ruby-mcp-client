@@ -828,6 +828,11 @@ module MCPClient
     # @return [String, nil] the Bearer challenge's parameters (possibly empty),
     #   or nil when the header has no Bearer challenge
     def bearer_challenge_segment(header)
+      # Peer bytes, made decodable before any pattern is run over them:
+      # `gsub` and `match` raise `ArgumentError` on invalid UTF-8, and a
+      # challenge that crashed the code reading it would surface as the
+      # client's own ArgumentError instead of an authorization error.
+      header = MCPClient::Auth::PeerText.decodable(header) if header
       return nil unless header
 
       # Locate the Bearer scheme token only OUTSIDE quoted strings: a quoted

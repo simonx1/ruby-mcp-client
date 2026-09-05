@@ -5,6 +5,445 @@
 Groundwork for the 2026-07-28 protocol revision (stateless, per-request
 metadata). Each feature lands in its own PR; this section accumulates them.
 
+### Authorization (RFC 9207 issuer validation, client registration)
+
+- **Issuer validation.** `OAuthProvider#start_authorization_flow` records
+  the selected authorization server's `issuer` with the PKCE record;
+  `complete_authorization_flow(code, state, iss:)` (and
+  `OAuthClient.complete_oauth_flow(..., iss:)`) validates the response's
+  `iss` per RFC 9207 before the code reaches any token endpoint: a present
+  `iss` must equal the recorded issuer byte for byte (no URL
+  normalization), an absent one is rejected when the server advertises
+  `authorization_response_iss_parameter_supported`, and a request without a
+  recorded issuer fails closed. `OAuthProvider#authorization_error_message`
+  applies the same check to error responses, and `BrowserOAuth` forwards
+  the callback's `iss` and refuses to display a mismatching error.
+  `ServerMetadata` parses `authorization_response_iss_parameter_supported`.
+- **Dynamic Client Registration.** Registrations carry an
+  `application_type` (`native` for loopback and custom-scheme redirect
+  URIs, `web` otherwise; `application_type:` overrides), retry once with the
+  other type when the server rejects the redirect URI for it, surface the
+  server's `error` / `error_description`, and log that DCR is deprecated in
+  favour of Client ID Metadata Documents.
+- **Authorization server binding.** `ClientInfo` gained `issuer` and
+  `registration_type` (`pre_registered`, `dynamic`, `cimd`); `Token` gained
+  `issuer`. Credentials and tokens are bound to the issuer that produced
+  them: the code is redeemed only at the authorization server recorded for
+  the request (a server change mid-flow ends the flow), a token or refresh
+  token is never presented to another authorization server, a dynamic
+  registration is redone for a new authorization server (and the old token
+  dropped through the optional `delete_token` storage method, see
+  OAUTH.md), pre-registered credentials for another issuer raise a
+  `ConnectionError` instead of being reused, credentials persisted before
+  these fields existed are bound on first use (as `dynamic` when they carry
+  `client_id_issued_at`, else `pre_registered`), and Client ID Metadata
+  Document client ids stay portable. Authorization server metadata whose
+  `issuer` is not the identifier it was fetched for is rejected (RFC 8414
+  Section 3.3, byte for byte). Error responses are `state`-bound and their
+  description is sanitized; `client_metadata[:application_type]` counts as
+  the explicit application type. The `iss` advertisement of the request's
+  authorization server is recorded with the PKCE record and decides how a
+  response without `iss` is treated; credentials stored without a binding
+  are bound to the authorization server they were stored under (a Client ID
+  Metadata Document client is recognized by its client id); a token that
+  records no issuer is never refreshed once the authorization server
+  changed, and a 401 challenge naming another authorization server retires
+  the stored token at once. A retired token that storage cannot delete is
+  re-stored bound to its former issuer; a metadata document naming another
+  issuer is skipped in favour of the next well-known candidate; a portable
+  client id is reused only where the authorization server advertises
+  `client_id_metadata_document_supported`; storage backends that persist
+  plain hashes (like the `FileTokenStorage` example) are read back through
+  `from_h`; and a freshly issued token is never mistaken for a retired one
+  that happened to use the same bytes. A backend that refuses to forget a
+  dynamic client no longer stops an authorization server switch; a token
+  persisted before issuers were recorded is bound to the authorization
+  server cached alongside it on first use; no token is presented while the
+  authorization server is unknown (the next challenge discovers it, and the
+  discovery is remembered in-process for backends that do not persist
+  metadata); an error response that matches no stored state is rejected.
+  Records persisted before issuers were recorded, with no cached
+  authorization server to prove where they came from, are retired on
+  discovery (a dynamic registration and its token) rather than bound to
+  whatever discovery finds; pre-registered and portable credentials are the
+  host's configuration and are bound on first use.
+  `OAuthProvider#validate_authorization_response!(state, iss:)` checks a
+  success callback before anything is shown, and `BrowserOAuth` answers a
+  rejected callback with the error page instead of "successful"; loopback
+  redirect URIs are recognized semantically (`127.0.0.0/8`, `::1` in any
+  spelling, `localhost`) for the `application_type`. A retired dynamic
+  registration is stamped as retired before it is deleted, so a backend
+  that cannot delete never lets it be adopted for the server discovery
+  finds; serialized `ClientInfo` records are read back through `from_h`
+  like every other record. A persisted record without a
+  `registration_type` counts as a dynamic registration (RFC 7591's
+  `client_id_issued_at` is optional, so its absence proves nothing);
+  credentials a host pre-registers should be stored with
+  `registration_type: 'pre_registered'` so they survive an authorization
+  server change as a reported mismatch instead of a re-registration. The
+  client id an authorization request was made with is recorded with its
+  PKCE record, and the code is redeemed only with those credentials: a
+  record swapped in shared storage during the flow (another client id, or
+  credentials bound to another authorization server) ends the flow
+  instead of reaching the token endpoint. An unbound record swapped in
+  meanwhile counts as changed credentials; the callback precheck
+  (`validate_authorization_response!`) also fails when a challenge or
+  cached metadata names another authorization server or the stored
+  credentials changed, so the browser never sees a success page for a
+  callback the flow rejects; in-process retirement markers are scoped by
+  issuer, so another provider sharing the storage may store the same
+  opaque bytes issued by a new authorization server. A PKCE record that
+  names no client (persisted by an earlier version, or by a backend that
+  dropped the field) fails closed like one without an issuer. A 401
+  challenge retires the stored token only when its metadata would pass
+  discovery's checks (the resource matches, the advertised authorization
+  server is an acceptable URL) and is otherwise refused whole, like a
+  challenge with an unacceptable metadata URL; the browser precheck also
+  fails while a refused or still-unfetched challenge is outstanding;
+  `Token#to_h` keeps every legacy key and adds `issuer` only when set;
+  a retirement marker is lifted only once the replacement token was
+  persisted. A successfully fetched challenge naming the same
+  authorization server does not fail the callback precheck; a challenge
+  advertising no authorization server is refused; a later validated
+  challenge supersedes a refused one (the refused document is forgotten);
+  peer-controlled metadata values are sanitized in refusals. An
+  authorization server switch leaves records another provider already
+  bound to the new server alone, and the redirect URI an authorization
+  request was made with is recorded with its PKCE record and used for the
+  code exchange. Accepting a new challenge metadata URL forgets the
+  previous document and any refusal before the fetch, so a failed fetch
+  leaves the flow waiting on the URL the current header named (the
+  precheck fails and discovery retries it) instead of completing against
+  stale state. A challenge naming the authorization server a stored token
+  is already bound to (another provider sharing the storage finished the
+  switch) retires nothing, and that token is presented at once: a
+  validated pending challenge is the authoritative server for tokens, as
+  it already is for discovery. A token inside its early-refresh window is
+  presented when the refresh — or the discovery it needs — cannot run,
+  provided it is still current after that discovery (one it retired is
+  not); only an expired token whose refresh fails yields none; metadata
+  bodies that are not JSON objects are a discovery failure. While a
+  challenge's metadata URL is pending and unresolved no cached token is
+  presented; the next access retries that URL first — before the token is
+  read, so a record that retry retired is never written back — and judges
+  the token by what the document names. Only a 401 challenge's refusal
+  stays authoritative for later discovery: a peer URL refused during
+  speculative well-known discovery is fetched again next time, so a
+  document the operator fixes no longer leaves the provider failing for
+  its lifetime. An authority-less URL (`https:foo`) is refused for want of
+  a host before it can retire the stored token, and the code is redeemed
+  with the redirect URI recorded for the authorization request (RFC 6749
+  Section 4.1.3): a token endpoint whose error names another redirect URI
+  is reported as a mismatch rather than retried with the peer's value
+  (records made before the URI was recorded keep the legacy retry). A
+  peer-advertised URL's host is now classified by parsing it as an address
+  rather than by string prefixes, so IPv4-mapped and expanded IPv6
+  spellings (`[::ffff:169.254.169.254]`, `[0:0:0:0:0:0:0:1]`) and the
+  shorthand IPv4 forms resolvers accept (`127.1`, `0x7f.0.0.1`,
+  `2130706433`) are refused like the dotted-quad ones. A refused challenge
+  now withholds the cached token as well: while it stands, `access_token`
+  and `apply_authorization` present nothing, just as discovery refuses the
+  cached authorization server. A speculative protected-resource document
+  whose authorization server is refused no longer supplies the scopes of
+  the next request, and authorization server metadata persisted before
+  `authorization_response_iss_parameter_supported` was recorded is
+  rediscovered rather than read as "the server does not send `iss`". A
+  peer-advertised host is classified by the name a resolver would look up,
+  so a fully qualified spelling (`169.254.169.254.`, `127.0.0.1.`,
+  `localhost.`) is refused like the undotted one; and the browser callback
+  precheck (`validate_authorization_response!`) and
+  `authorization_error_message` read an unrecorded `iss` advertisement the
+  way the completion does — rediscovering the answer, and assuming the
+  advertisement when it cannot be had — so a legacy in-flight callback
+  never shows a success page (or the peer's error text) for a response the
+  token exchange then rejects. A peer-advertised host is percent-decoded
+  before it is classified — `URI#hostname` does not decode, but the HTTP
+  client dials the decoded name — so `169.254.169.254%2e`,
+  `127%2e0%2e0%2e1`, `%31%32%37.0.0.1` and `localhost%2e` are refused like
+  the plain spellings, and a host that is still not a hostname after
+  decoding is refused outright. A redirect URI's host is read the same way
+  for the registered `application_type`, so a shorthand or fully qualified
+  loopback callback (`http://127.1/cb`, `http://127.0.0.1./cb`) registers
+  as `native` instead of as a `web` client whose plain-HTTP redirect URI
+  the authorization server may reject. The local-development exception for
+  peer-advertised URLs is now loopback-only: it applies when the
+  *configured* server URL is loopback AND the advertised target is
+  loopback too, so a server on a private network (`10.0.0.5`,
+  `app.internal`, `printer.local`) no longer turns off the HTTPS
+  requirement or the local-address refusal, and not even a loopback server
+  can send the client to `169.254.169.254` or another private address. One
+  definition of loopback now serves the SSRF classifier, the registered
+  `application_type` and the plain-HTTP exception for configured and
+  discovered endpoints: RFC 6761 `*.localhost` names count as loopback
+  (`http://app.localhost:3000/cb` registers as `native`), and an HTTP
+  authorization or token endpoint on a loopback spelling (`http://127.1`,
+  `http://localhost.`, `http://[::ffff:127.0.0.1]`) is accepted like
+  `http://127.0.0.1`. A host is case-folded after its percent escapes are
+  decoded, so `%4Cocalhost` ("Localhost") classifies as loopback rather
+  than as an unknown public name. When that rediscovery of an unrecorded
+  `iss` advertisement returns a *different* authorization server, the
+  callback precheck and `authorization_error_message` now reject the
+  response as "the authorization server changed during the flow" — the
+  same refusal `complete_authorization_flow` makes — instead of reading it
+  as "the server advertises `iss`", so a legacy in-flight callback carrying
+  the recorded issuer no longer shows a success page for a flow the
+  completion refuses; a rediscovery that cannot be made is still unknown
+  rather than a change. An endpoint discovered in authorization server
+  metadata is now classified exactly like a peer-advertised URL, so the
+  plain-HTTP exception applies only to a local stack (a loopback endpoint
+  and a loopback configured server) and a discovered endpoint may not name
+  a loopback, private or link-local address: metadata from a public
+  authorization server can no longer collect the authorization code at
+  `http://app.localhost:3000/steal` or at an internal address. A protected
+  resource document rejected as not this resource's — or naming no
+  authorization server — no longer supplies the scopes of a later flow, as
+  a refused authorization server URL already did not. And a token record a
+  storage backend left behind for a deleted token (a backend without
+  `delete_token` is asked to store `nil`, and one that persists hashes
+  writes `nil.to_h`) is no token: it is never presented as a bare
+  `Bearer ` bound to the current authorization server. The
+  `FileTokenStorage` example and the storage documentation remove the
+  record for a `nil` token instead of serializing it. A `200` from the
+  token endpoint that carries no `access_token` (or an empty one) is now a
+  protocol error rather than a credential, as RFC 6749 Section 5.1
+  requires: the code exchange raises a `ConnectionError` instead of storing
+  an empty token and reporting success, and a refresh fails — keeping the
+  still-valid token it was about to replace — instead of overwriting it
+  with bytes that would go out as a bare `Bearer `; `access_token` and
+  `apply_authorization` apply the same check to whatever they are about to
+  present. `authorization_error_message` now makes the checks the success
+  path makes before it displays anything, so the `error_description` of
+  authorization server A is withheld once an outstanding, refused or
+  server-changing 401 challenge — or shared storage — moved the flow to B,
+  instead of being shown for a callback the completion rejects. And a
+  stored client record without a `client_id` (what a hash-persisting
+  backend reads back after the `set_client_info(server_url, nil)` fallback
+  deleted an issuer-less dynamic client) is no client at all: a new dynamic
+  registration is made instead of an authorization request with an empty
+  `client_id`. Those checks now read the response's type as well as its
+  presence: a token response carries a credential only when it is a JSON
+  object whose `access_token` is a non-empty string, so `200 []` and
+  `200 null` are a failed refresh (keeping the still-valid token) or a
+  failed exchange instead of a `TypeError`, and `{"access_token": ["x"]}`
+  no longer overwrites the stored token and goes out as
+  `Authorization: Bearer ["x"]`. A registration response is held to the
+  same standard (RFC 7591 Section 3.2.1): a `201` whose `client_id` is
+  missing, empty or not a string fails the registration outright, so the
+  flow ends before the browser is opened rather than after the user has
+  already visited an authorization endpoint with no usable `client_id`.
+  Finally, the in-process state a provider accumulates for one MCP server —
+  the discovered-metadata fallback for backends that do not persist
+  metadata, the memoized `supported_scopes`, the adopted, pending or
+  refused 401 challenge and its scope, and the "authorization server
+  changed" flag — is forgotten when the public `server_url=` setter
+  retargets the provider, so a provider reused for another server
+  discovers it instead of sending its authorization, registration and
+  token requests to the previous server's endpoints. Retirement markers
+  are kept: they name the issuer the bytes were retired for, not the
+  resource URL, and stay true when two MCP servers share one
+  authorization server. That type-strictness now covers every field of both
+  responses, not only the credential each carries: a token response is read
+  against the types RFC 6749 Section 5.1 gives its fields (`token_type` and
+  `access_token` non-empty strings, `expires_in` an integer,
+  `refresh_token` and `scope` strings) and a registration response against
+  the types RFC 7591 Section 3.2.1 and Section 2 give theirs
+  (`client_secret`, `token_endpoint_auth_method`, `scope`, `client_name`,
+  `client_uri`, `logo_uri`, `tos_uri`, `policy_uri` and `application_type`
+  strings, `client_id_issued_at` and `client_secret_expires_at` integers,
+  `redirect_uris`, `grant_types`, `response_types` and `contacts` arrays of
+  strings). A field of any other type fails the whole response the way a
+  missing `access_token` does — a `ConnectionError` on the code exchange
+  and on registration, a warning that keeps the still-valid token on a
+  refresh — instead of a `NoMethodError` capitalizing
+  `token_type: ["Bearer"]` into a header, a `TypeError` adding
+  `expires_in: "3600"` to a `Time` after the still-valid token was already
+  gone, or a `NoMethodError` asking a `redirect_uris` string for its
+  `first` inside `register_client`. A `null` field still reads as an absent
+  one, and `redirect_uris` the server echoes back empty (or omits) still
+  falls back to the requested redirect URI. A stored client record whose
+  `client_id` is not a non-empty string is likewise no client — the same
+  test the stored token's bytes get — so a hash-persisting backend that
+  reads one back registers a new client before the browser opens instead of
+  starting a flow the callback then rejects. In the same reading of RFC 7591
+  Section 3.2.1, a `client_secret_expires_at` of `0` means a secret that does
+  not expire, so a client registered with one is no longer treated as having
+  expired at the epoch and re-registered on every flow. A field of the right
+  JSON type is still not a usable credential, and the read path is now as
+  strict as the wire path: `access_token` and `token_type` must carry bytes an
+  HTTP header can hold, so a `200` whose token contains CR/LF (or any control
+  byte) is refused instead of being stored and turned into a two-line
+  `Authorization` value, and a record storage reads back whose `token_type` is
+  empty, of another type or control-bearing presents no token at all instead
+  of crashing `String#capitalize`. A `refresh_token` is a credential too — `""`
+  is refused like a missing one rather than persisted over the refresh token
+  the client already holds — and a registration response's `redirect_uris`
+  must be usable redirect URIs (absolute and parseable), so `[""]` is a
+  reported registration failure instead of a browser opened at
+  `…&redirect_uri=&…`. An `authorization_response_iss_parameter_supported`
+  that is not a JSON boolean (`"true"`, `1`, `{}`) is no answer at all and now
+  fails closed — it is read as "advertised", so a callback without `iss` is
+  refused — where before it counted as "not advertised"; a PKCE record
+  carrying such a value defers to the authorization server's own metadata.
+  Finally, every peer-supplied string that reaches a log line or an exception
+  message — which `BrowserOAuth` renders on its error page — goes through one
+  sanitizer (`MCPClient::Auth::PeerText`): a failed token exchange quotes a
+  printable, bounded body instead of the raw one, and a body that is not JSON
+  is described by position and size (`malformed JSON, at line 1 column 1,
+  26 byte body`) rather than by the token the parser choked on. Those helpers
+  live on the OAuth classes themselves, so a rescue path can no longer raise
+  `NoMethodError` over a helper only the JSON-RPC transports have — which is
+  what a non-JSON `200` on a token refresh did, out of the very request the
+  still-valid token should have served. Those helpers are now total: nothing
+  a peer sends can raise out of them. Bytes that are not valid UTF-8 — a
+  `400` body, an `error_description=%FF` a callback carries through
+  `CGI.unescape`, or the undecodable fragment a `JSON::ParserError` message
+  quotes — used to raise `ArgumentError` out of `String#gsub`, `String#strip`
+  and the regexp match, so the sanitizer that exists to make peer bytes safe
+  was the one thing those bytes could crash; they are replaced before
+  anything looks at them, and the flow reports a `ConnectionError` (and the
+  browser flow finishes) as it does for any other bad response. The type
+  checks now cover the two metadata documents as well as the two response
+  bodies: a protected resource document is read against RFC 9728 Section 2
+  (`resource` a string, `authorization_servers` and `scopes_supported` arrays
+  of strings) and an authorization server document against RFC 8414
+  Section 2 (the endpoints strings, `scopes_supported`,
+  `response_types_supported`, `grant_types_supported` and
+  `code_challenge_methods_supported` arrays of strings), so a
+  `scopes_supported` of `"mcp:read"` is a refused document rather than a
+  `NoMethodError` out of `start_authorization_flow` — and a
+  `code_challenge_methods_supported` of `"S256 …"` is no longer read as PKCE
+  support because a String answers `include?("S256")`. The two boolean
+  advertisements keep their fail-closed reading. A cached record a
+  hash-persisting backend reads back is held to the same standard where it
+  is used: PKCE support requires an array, and a `scopes_supported` that is
+  not one contributes no scopes instead of crashing `join`. Client
+  authentication now follows the method the authorization server registered:
+  RFC 7591 Section 2 makes `client_secret_basic` the default when a
+  registration response names none, so a registration that issues a secret
+  is recorded as a confidential client instead of as `none` (a combination
+  that authenticates nowhere), and the credentials go out in an
+  `Authorization: Basic` header — form-urlencoded before they are base64'd,
+  per RFC 6749 Section 2.3.1 — for `client_secret_basic`, in the body for
+  `client_secret_post`, and not at all for a public client or for a method
+  this client cannot present (which is logged). An authorization endpoint's
+  own query string is retained when the authorization parameters are
+  appended (RFC 6749 Section 3.1), so an endpoint of
+  `https://as.example/authorize?tenant=acme` no longer loses its tenant. A
+  persisted token record's expiry is validated before it is used in
+  arithmetic: an `expires_in` that is not a number and an `expires_at` that
+  is not a readable instant no longer raise a `TypeError` out of
+  `access_token`, and — since an expiry that cannot be read is not "no
+  expiry" — such a record reads as expired (through a storage round trip
+  too), so it is refreshed or re-authorized rather than presented forever.
+  No log line carries a credential at any level: the `Authorization` header
+  is no longer logged even truncated, and the browser callback logs only the
+  request path, never the query string that carries `code=`. And a
+  registered `redirect_uris` must name a URI a callback could actually
+  arrive on — an http(s) URL with a host, or an RFC 8252 Section 7.1
+  private-use scheme with a path, and no fragment (RFC 6749 Section 3.1.2) —
+  so `javascript:alert(1)`, `data:text/html,…` and a bare `http:` are a
+  reported registration failure instead of a browser opened at them.
+  Peer bytes are now made decodable where they are *parsed*, not only where
+  they are printed: a total sanitizer only helps the text that reaches it,
+  and `String#gsub`, `String#match`, `Regexp#match?`, `String#split` and
+  `String#strip` all raise `ArgumentError` on bytes that are not valid
+  UTF-8. So the `unauthorized_client` body matched for a `redirect_uri`
+  mismatch, the `WWW-Authenticate` header masked and matched for its
+  `Bearer` challenge segment (in `OAuthProvider` and in the HTTP transports
+  alike) and the callback query string `CGI.unescape` hands back are scrubbed
+  before a pattern is run over them, without the truncation and
+  control-stripping a message needs but a parser cannot have. A token
+  endpoint `400` whose `error_description` is not UTF-8 now raises the
+  `ConnectionError` it always should have, a `401`/`403` challenge with an
+  undecodable parameter is still classified rather than crashing the code
+  reading it, and a callback of `?code=%FF&state=%FE` finishes the browser
+  flow. Metadata documents must now carry what their RFCs make REQUIRED, not
+  merely avoid fields of the wrong type: an authorization server document
+  without `issuer`, `authorization_endpoint` or `token_endpoint` (RFC 8414
+  Section 2) and a protected resource document without `resource` (RFC 9728
+  Section 2) are refused at discovery, cached nowhere and used for no scope
+  resolution — previously such a document was accepted and the flow failed
+  with a `URI::InvalidURIError` out of `start_authorization_flow` or
+  `complete_authorization_flow`, after a dynamic client registration had
+  already created a client at the authorization server. And a token record
+  that carries an `expires_at` is answered by that `expires_at` alone:
+  `expires_in` is the lifetime a token had when it was *issued* (RFC 6749
+  Section 5.1) and a record read back from storage was not issued now, so it
+  no longer stands in for a stored expiry that cannot be read.
+  `Token.from_h(expires_in: 3600, expires_at: 'not a time')` — the shape
+  `to_h` persists, with the one field this client depends on mangled — reads
+  as expired and is refreshed, where before it came back with an hour of
+  fresh lifetime. A refresh is now re-checked when its *response* arrives, not
+  only when it is sent: a token refreshed at authorization server A that comes
+  back after protected-resource metadata (or a `401` challenge) moved the
+  resource to B is discarded — it is neither written over B's token in storage
+  (which also resurrected a token the challenge had just retired) nor handed to
+  the caller, who used to receive it and present `Authorization: Bearer` with
+  A's bytes. Registration state became per authorization server, as SEP-2352
+  requires: credentials are kept under the MCP server URL — the registration in
+  use, where every storage backend and every record written by an earlier
+  version already has them — *and* under a key of the issuing authorization
+  server, `OAuthProvider#client_registration_key(issuer)`, so two authorization
+  servers behind one MCP server no longer share one slot. Configuring the
+  second no longer replaces the first, and returning to the first finds its
+  registration instead of raising "these credentials belong to another
+  authorization server"; a dynamic registration discarded on an authorization
+  server change is kept under its own server's key, since it is still valid
+  there, and reused if that server comes back. Storage keys stay opaque strings
+  and nothing is migrated or moved, so a backend that treats the key as a
+  string needs no change and a downgrade still finds every record. `token_type`
+  must now name a type this client can present (RFC 6749 §7.1: "the client MUST
+  NOT use an access token if it does not understand the token type"): a `DPoP`
+  or `mac` token fails the code exchange, fails a refresh (keeping the
+  still-valid token) and presents nothing when a storage backend reads one
+  back, instead of going out as a bearer credential without the proof its type
+  requires — and spelled `Dpop` by `String#capitalize` at that. The comparison
+  is case-insensitive, and a response that names NO type is refused too: RFC
+  6749 §5.1 makes `token_type` REQUIRED and defines no default — "Bearer" is
+  one value it may carry (RFC 6750), not what its absence means — and §7.1
+  forbids using a token whose type the client does not understand, which a
+  client that was told no type does not. `200 {"access_token":"x"}` used to
+  become `Authorization: Bearer x`; it is now a failed code exchange and a
+  failed refresh that keeps the still-valid token. And a browser callback may
+  carry each parameter only
+  once (RFC 6749 §3.1): the parsed parameters are a Hash, where the last value
+  of a repeated name silently won, so `?iss=attacker&iss=recorded` passed every
+  check this client makes while a reader that takes the first value saw another
+  authorization server; a callback repeating any parameter is now refused.
+  An authorization request is now ONE record, as the specification asks: the
+  `state`, the PKCE verifier, the expected issuer, the client id and the
+  redirect URI are written together, and the callback's `state` is checked
+  against the record the other checks read. Keeping the state in a slot of its
+  own let two flows sharing a storage backend interleave their writes — A
+  writes its PKCE, B writes PKCE and state, A writes its state — until A's
+  state sat beside B's verifier, issuer and client, and A's authorization code
+  was POSTed to B's token endpoint. The code exchange is re-checked when its
+  response arrives, exactly as a refresh is: a response that comes back after
+  the authorization server changed no longer stores its token over the new
+  server's, and the cleanup that follows deletes only the records of the
+  request that just ended, leaving a flow another provider started meanwhile
+  waiting on the records it is waiting on. A refresh now presents the
+  credentials an authorization request would be made with: a client secret
+  rotated in the slot a host writes to — the MCP server URL — is used, where
+  before an older copy under the authorization server's own key answered
+  first and an authorization server that had revoked it replied
+  `invalid_client`. Credentials pre-registered with the authorization server in
+  use come ahead of a Client ID Metadata Document id, which is portable and so
+  answered for every server, including one the host had given credentials of
+  its own. A storage backend that cannot persist the registration a flow needs
+  now raises: the write was best-effort for both the essential resource slot
+  and the optional per-issuer copy, so a failure produced an authorization URL
+  the user followed and a callback that answered "Missing PKCE or client info"
+  after consent. Re-authorizing after an `insufficient_scope` challenge asks
+  for the union of the scopes already requested and the ones the challenge
+  names (MCP 2026-07-28 step-up flow, step 2), instead of the challenge's
+  scopes alone — which traded the permissions every other operation depended on
+  for the one being retried. And every redirect URI must be `localhost` or use
+  HTTPS, as the MCP security considerations require: `http://app.example.com/callback`
+  is refused where it is configured and where a registration response registers
+  it, while plain HTTP on the loopback interface and RFC 8252 §7.1 private-use
+  schemes (`com.example.app:/cb`, `com.example.app://cb`) are unaffected.
+
 ### Tasks extension (`io.modelcontextprotocol/tasks`)
 
 - **A cleanup no longer restarts the lifetime counters (round 39).**
@@ -1841,7 +2280,11 @@ retries, logs and reflects back.
 - A server that advertises a cross-origin SSE `endpoint`, a plain-HTTP or loopback
   OAuth discovery URL, or redirects RPC POSTs off-origin will now be rejected. If
   you develop against a local stack, point the *configured* server URL at
-  localhost and the loopback exception still applies.
+  loopback (`localhost`, a `*.localhost` name, or any spelling of 127.0.0.0/8
+  or `::1`) and the exception still applies — but only to loopback discovery
+  URLs. A configured server URL that is merely private (`10.0.0.5`,
+  `app.internal`, `printer.local`) gets no exception at all: its discovery URLs
+  must be HTTPS and must not name a loopback or private address.
 - Set `max_decompressed_body_bytes:` if you legitimately exchange responses that
   expand beyond 64 MiB.
 - Development now expects Ruby 4.0.6 (`.ruby-version`); the gem still supports

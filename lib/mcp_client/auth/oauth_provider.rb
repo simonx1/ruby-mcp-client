@@ -3,7 +3,13 @@
 require 'faraday'
 require 'json'
 require 'uri'
+require 'ipaddr'
 require_relative '../auth'
+require_relative 'peer_text'
+require_relative 'oauth_provider/challenge_handling'
+require_relative 'oauth_provider/client_authentication'
+require_relative 'oauth_provider/registration_store'
+require_relative 'oauth_provider/response_validation'
 
 module MCPClient
   module Auth
@@ -23,6 +29,12 @@ module MCPClient
       # boundaries. Mirrors HttpTransportBase::AUTH_PARAMS_RUN.
       AUTH_PARAMS_RUN = /\A(?:[\s,]*#{AUTH_PARAM})*/
 
+      include ChallengeHandling
+      include ClientAuthentication
+      include PeerText
+      include RegistrationStore
+      include ResponseValidation
+
       # @!attribute [rw] redirect_uri
       #   @return [String] OAuth redirect URI
       # @!attribute [rw] scope
@@ -35,8 +47,8 @@ module MCPClient
       #   @return [String] The MCP server URL (normalized)
       # @!attribute [r] client_id_metadata_url
       #   @return [String, nil] HTTPS URL of this client's Client ID Metadata Document (SEP-991)
-      attr_accessor :redirect_uri, :scope, :logger, :storage
-      attr_reader :server_url, :client_id_metadata_url
+      attr_accessor :scope, :logger, :storage
+      attr_reader :server_url, :client_id_metadata_url, :redirect_uri
 
       # Initialize OAuth provider
       # @param server_url [String] The MCP server URL (used as OAuth resource parameter)
@@ -52,15 +64,28 @@ module MCPClient
       #   skipping dynamic registration. Hosting the metadata JSON at that URL is the
       #   application's responsibility.
       # @raise [ArgumentError] if client_id_metadata_url is not an HTTPS URL with a path component
+      # OIDC application types accepted for Dynamic Client Registration.
+      APPLICATION_TYPES = %w[native web].freeze
+
+      # Literal names of the loopback interface (see #loopback_address?).
+      LOOPBACK_HOSTS = %w[localhost 127.0.0.1 ::1 [::1]].freeze
+
+      # @return [String, nil] the explicit application_type for Dynamic Client Registration
+      attr_reader :application_type
+
       def initialize(server_url:, redirect_uri: 'http://localhost:8080/callback', scope: nil, logger: nil, storage: nil,
-                     client_metadata: {}, client_id_metadata_url: nil)
+                     client_metadata: {}, client_id_metadata_url: nil, application_type: nil)
         self.server_url = server_url
         self.redirect_uri = redirect_uri
         self.scope = scope
         self.logger = logger || Logger.new($stdout, level: Logger::WARN)
         self.storage = storage || MemoryStorage.new
         self.client_id_metadata_url = client_id_metadata_url
-        @extra_client_metadata = client_metadata
+        # An application_type given through client_metadata is the host's
+        # explicit choice too; it never silently overrides the derived type.
+        extra = (client_metadata || {}).transform_keys(&:to_sym)
+        self.application_type = application_type || extra[:application_type]
+        @extra_client_metadata = extra.except(:application_type)
         @http_client = create_http_client
         # Protected resource metadata learned from a 401 WWW-Authenticate
         # challenge, reused by discovery so a challenge-advertised metadata URL
@@ -72,9 +97,49 @@ module MCPClient
         @challenge_error = nil
       end
 
+      # MCP 2026-07-28 "Communication Security" requires implementations to
+      # follow OAuth 2.1 Section 1.5, and spells out what that means here:
+      # "All redirect URIs MUST be either `localhost` or use HTTPS." A
+      # callback on any other plain-HTTP host carries the authorization code
+      # — and, on an error response, the authorization server's own error
+      # text — across the network in the clear, where anyone on the path can
+      # redeem it. RFC 8252 Section 7.1 private-use schemes (a native app's
+      # `com.example.app:/oauth2redirect`) never leave the device and stay
+      # available.
+      # @param uri [String] the redirect URI to use
+      # @raise [ArgumentError] when it is not a callback this client may register
+      def redirect_uri=(uri)
+        unless redirect_uri_bytes?(uri)
+          raise ArgumentError,
+                'redirect_uri must be a localhost HTTP callback, an HTTPS URL or an RFC 8252 private-use ' \
+                "scheme URI (MCP 2026-07-28 requires every redirect URI to be localhost or HTTPS): #{uri.inspect}"
+        end
+
+        @redirect_uri = uri
+      end
+
+      # @param type [String, nil] 'native', 'web' or nil (derived from the redirect URI)
+      # @raise [ArgumentError] for any other value
+      def application_type=(type)
+        type = type&.to_s
+        unless type.nil? || APPLICATION_TYPES.include?(type)
+          raise ArgumentError, "application_type must be one of #{APPLICATION_TYPES.join(', ')}: #{type.inspect}"
+        end
+
+        @application_type = type
+      end
+
       # @param url [String] Server URL to normalize
       def server_url=(url)
-        @server_url = normalize_server_url(url)
+        normalized = normalize_server_url(url)
+        # Everything discovery leaves on the instance describes the resource
+        # it was discovered FOR. Retargeting the provider at another server
+        # must not let the previous server's metadata answer for the new one:
+        # the fallback that survives a backend which does not persist metadata
+        # would otherwise send the new server's authorization, registration
+        # and token requests to the previous server's endpoints.
+        forget_per_server_state if defined?(@server_url) && @server_url && normalized != @server_url
+        @server_url = normalized
       end
 
       # Set the Client ID Metadata Document URL (SEP-991), validating it per the
@@ -89,15 +154,46 @@ module MCPClient
       # Get current access token (refresh if needed)
       # @return [Token, nil] Current valid access token or nil
       def access_token
-        token = storage.get_token(server_url)
+        # A challenge still to be fetched decides which authorization server
+        # is current, and may retire the stored token: it is resolved before
+        # the token is read, so a record it deleted is never written back.
+        resolve_pending_challenge
+        token = stored_token
         logger.debug("OAuth access_token: retrieved token=#{token ? 'present' : 'nil'} for #{server_url}")
         return nil unless token
+
+        # A token from another authorization server is never presented
+        # (MCP 2026-07-28: registration state and tokens are per AS). Retired
+        # bytes are refused before any binding could attribute them anew.
+        return nil if retired_token?(token)
+
+        token = bind_token_issuer(token)
+        return nil unless token && token_for_current_issuer?(token)
 
         # Return token if still valid
         return token unless token.expired? || token.expires_soon?
 
-        # Try to refresh if we have a refresh token
-        refresh_token(token) if token.refresh_token
+        # Refresh early when possible; a still-valid token is presented when
+        # the refresh (or the discovery it needs) cannot run right now. What
+        # comes back is judged against the authorization server that is
+        # current NOW, not the one the refresh was started with.
+        refreshed = refresh_if_possible(token)
+        return refreshed if token_bytes?(refreshed) && token_for_current_issuer?(refreshed)
+        # The discovery a refresh ran may have retired this very token.
+        return nil if token.expired? || retired_token?(token) || !token_for_current_issuer?(token)
+
+        token
+      end
+
+      # @param token [Token]
+      # @return [Token, nil] the refreshed token, or nil when no refresh could be obtained
+      def refresh_if_possible(token)
+        return nil unless token.refresh_token
+
+        refresh_token(token)
+      rescue MCPClient::Errors::ConnectionError => e
+        logger.warn("Token refresh could not run: #{e.message}")
+        nil
       end
 
       # Return the scopes supported by the authorization server
@@ -105,7 +201,9 @@ module MCPClient
       # @return [Array<String>] supported scopes, or empty array if not advertised
       # @raise [MCPClient::Errors::ConnectionError] if server discovery fails
       def supported_scopes
-        @supported_scopes ||= discover_authorization_server.scopes_supported || []
+        # A record a hash-persisting backend read back may carry anything
+        # here; only an array of scopes is a scope list (RFC 8414 Section 2).
+        @supported_scopes ||= advertised_scopes(discover_authorization_server.scopes_supported)
       end
 
       # Start OAuth authorization flow
@@ -118,12 +216,28 @@ module MCPClient
         # Register client if needed
         client_info = get_or_register_client(server_metadata)
 
-        # Generate PKCE parameters
-        pkce = PKCE.new
+        # Generate the state and the PKCE parameters as ONE per-request
+        # record. MCP 2026-07-28 "Authorization Response Validation": the
+        # selected authorization server's issuer is recorded "in the same
+        # per-request record used to store the PKCE code verifier (and the
+        # `state` value, if used)", so the `iss` of the response can be
+        # checked against an authenticated value — and so the state the
+        # response carries names THIS request rather than whichever record
+        # happens to be in the PKCE slot. Two flows sharing one storage
+        # backend interleave their writes: with the state in a slot of its
+        # own, A's state could end up alongside B's verifier, issuer and
+        # client, and A's code would then be redeemed at B.
+        state = SecureRandom.urlsafe_base64(32)
+        pkce = PKCE.new(issuer: server_metadata.issuer,
+                        iss_parameter_supported: server_metadata.iss_parameter_supported?,
+                        client_id: client_info.client_id,
+                        redirect_uri: client_info.metadata.redirect_uris.first,
+                        state: state)
         storage.set_pkce(server_url, pkce)
 
-        # Generate state parameter
-        state = SecureRandom.urlsafe_base64(32)
+        # The separate slot is still written: it is the documented storage
+        # interface, and a callback handler (or an older version of this
+        # library) reads the state from it.
         storage.set_state(server_url, state)
 
         # Build authorization URL
@@ -133,32 +247,222 @@ module MCPClient
       # Complete OAuth authorization flow with authorization code
       # @param code [String] Authorization code from callback
       # @param state [String] State parameter from callback
+      # @param iss [String, nil] the `iss` parameter of the authorization response (RFC 9207);
+      #   validated against the issuer recorded when the flow started, before the code is sent
+      #   to any token endpoint (MCP 2026-07-28)
       # @return [Token] Access token
-      # @raise [MCPClient::Errors::ConnectionError] if token exchange fails
+      # @raise [MCPClient::Errors::ConnectionError] if the issuer check or the token exchange fails
       # @raise [ArgumentError] if state parameter doesn't match
-      def complete_authorization_flow(code, state)
+      def complete_authorization_flow(code, state, iss: nil)
         # Verify state parameter
         stored_state = storage.get_state(server_url)
         raise ArgumentError, 'Invalid state parameter' unless stored_state == state
 
         # Get stored PKCE and client info
-        pkce = storage.get_pkce(server_url)
-        client_info = storage.get_client_info(server_url)
-        server_metadata = discover_authorization_server
-
+        pkce = stored_pkce
+        client_info = stored_client_info
         raise MCPClient::Errors::ConnectionError, 'Missing PKCE or client info' unless pkce && client_info
+
+        # The per-request record must be the record of THIS request.
+        ensure_state_for_request!(pkce, state)
+
+        # The code is redeemed only at the authorization server the request
+        # was sent to: the issuer recorded with the PKCE record (RFC 9207
+        # mix-up protection). A different server discovered since — a 401
+        # challenge pointing elsewhere — ends this flow instead.
+        unless pkce.issuer.is_a?(String)
+          raise MCPClient::Errors::ConnectionError,
+                'Authorization response rejected: no issuer was recorded for this authorization request, ' \
+                'so it cannot be bound to an authorization server; restart the authorization'
+        end
+        server_metadata = discover_authorization_server
+        raise_authorization_server_changed!(pkce.issuer) unless server_metadata.issuer == pkce.issuer
+        validate_authorization_response_issuer!(iss, pkce.issuer, iss_parameter_supported_for?(pkce, server_metadata))
+        # The credentials that redeem the code are the ones the request was
+        # made with: a record swapped in shared storage meanwhile (another
+        # client id, or credentials of another authorization server) is
+        # never sent to this token endpoint.
+        ensure_client_for_request!(client_info, pkce)
 
         # Exchange authorization code for tokens
         token = exchange_authorization_code(server_metadata, client_info, code, pkce)
 
-        # Store token
-        storage.set_token(server_url, token)
+        accept_exchanged_token(token, pkce)
+      end
 
-        # Clean up temporary data
-        storage.delete_pkce(server_url)
-        storage.delete_state(server_url)
+      # The response of a code exchange arrives at a client whose
+      # authorization server may have changed since the request went out —
+      # updated protected resource metadata, a 401 challenge, another provider
+      # sharing the storage — exactly as a refresh response does. So the
+      # checks made before the request are made again over the response,
+      # before anything is written: bytes issued by a server that is no longer
+      # this resource's would otherwise be stored over the token of the server
+      # that IS in use, and the cleanup would delete the pending authorization
+      # request that server had already started.
+      # @param token [Token] the token the exchange response carried
+      # @param pkce [PKCE] the per-request record the exchange was made with
+      # @return [Token]
+      # @raise [MCPClient::Errors::ConnectionError] when the response is no longer this resource's to keep
+      def accept_exchanged_token(token, pkce)
+        raise_authorization_server_changed!(pkce.issuer) unless exchange_target_current?(pkce.issuer)
+
+        store_token(token)
+
+        # Clean up this request's temporary data — and only this request's: a
+        # flow started meanwhile keeps the records it is waiting on.
+        discard_pending_request(pkce)
 
         token
+      end
+
+      # Whether the code exchange that just answered is still this resource's:
+      # the authorization server it went to is the one in use now (an
+      # unresolved or refused challenge means it is unknown, which is not
+      # "still A"), and the token slot the response would be written to does
+      # not already hold another server's token. A record this client retired
+      # is not another server's token to protect — it is what a backend that
+      # could not delete left behind — so it does not stand in the way.
+      # @param issuer [String] the authorization server the flow started at
+      # @return [Boolean]
+      def exchange_target_current?(issuer)
+        return false unless current_issuer_for_tokens == issuer
+
+        stored = stored_token_or_nil
+        return true unless stored.respond_to?(:issuer) && stored.issuer
+        return true if retired_token?(stored)
+
+        stored.issuer == issuer
+      end
+
+      # Delete the pending-flow records of one authorization request, leaving
+      # a newer request's records alone.
+      # @param pkce [PKCE] the per-request record whose flow just ended
+      # @return [void]
+      def discard_pending_request(pkce)
+        pending = stored_pkce
+        storage.delete_pkce(server_url) if pending.nil? || same_request?(pending, pkce)
+        recorded = pkce.state if pkce.respond_to?(:state)
+        stored_state = storage.get_state(server_url)
+        storage.delete_state(server_url) if recorded.nil? || stored_state.nil? || stored_state == recorded
+      end
+
+      # @param one [PKCE, Object] the record currently in the pending-flow slot
+      # @param other [PKCE] the record the flow that just ended was made with
+      # @return [Boolean] whether both records describe the same authorization request
+      def same_request?(one, other)
+        one.respond_to?(:code_verifier) && one.code_verifier == other.code_verifier
+      end
+
+      # The state of a callback must be the state of the per-request record
+      # the rest of the checks read. A record written by this client always
+      # carries one; a record persisted before the state was recorded there
+      # carries none, and the separate slot (already compared by the caller)
+      # is all there is to go on.
+      # @param pkce [PKCE] the per-request record
+      # @param state [String, nil] the callback's state parameter
+      # @return [void]
+      # @raise [MCPClient::Errors::ConnectionError] when the record is another request's
+      def ensure_state_for_request!(pkce, state)
+        recorded = pkce.state if pkce.respond_to?(:state)
+        return if recorded.nil? || recorded == state
+
+        raise MCPClient::Errors::ConnectionError,
+              'Authorization response rejected: the pending authorization request is not the one this ' \
+              'response answers; restart the authorization'
+      end
+
+      # The stored credentials must be the ones the authorization request
+      # was made with; a request that recorded no client cannot be bound to
+      # any and fails closed, like one that recorded no issuer.
+      # @param client_info [ClientInfo, nil]
+      # @param pkce [PKCE]
+      # @return [void]
+      # @raise [MCPClient::Errors::ConnectionError]
+      def ensure_client_for_request!(client_info, pkce)
+        unless pkce.respond_to?(:client_id) && pkce.client_id.is_a?(String)
+          raise MCPClient::Errors::ConnectionError,
+                'Authorization response rejected: no client was recorded for this authorization request; ' \
+                'restart the authorization'
+        end
+        return if client_info && client_for_request?(client_info, pkce)
+
+        raise MCPClient::Errors::ConnectionError,
+              'Authorization response rejected: the client credentials changed during the flow; ' \
+              'restart the authorization'
+      end
+
+      # Whether stored credentials are the ones an authorization request was
+      # made with: the recorded client id and, unless portable, bound to the
+      # request's authorization server.
+      # @param client_info [ClientInfo]
+      # @param pkce [PKCE]
+      # @return [Boolean]
+      def client_for_request?(client_info, pkce)
+        return false if pkce.client_id != client_info.client_id
+        return true if portable_client?(client_info)
+
+        # A started flow binds its non-portable client, so an unbound record
+        # here was put in storage by someone else meanwhile.
+        !client_info.respond_to?(:issuer) || client_info.issuer == pkce.issuer
+      end
+
+      # Check a success response before anything is shown or exchanged: the
+      # state must be the one of the pending flow and the response's `iss`
+      # must identify the authorization server the request went to (RFC
+      # 9207). {#complete_authorization_flow} repeats the check before the
+      # token exchange; a browser callback uses this to answer correctly.
+      # @param state [String, nil] the callback's state parameter
+      # @param iss [String, nil] the callback's iss parameter
+      # @return [void]
+      # @raise [MCPClient::Errors::ConnectionError] when the response is not this flow's or the issuer fails
+      def validate_authorization_response!(state, iss: nil)
+        stored_state = storage.get_state(server_url)
+        unless stored_state && stored_state == state
+          raise MCPClient::Errors::ConnectionError, 'Authorization response rejected: state mismatch'
+        end
+
+        pkce = stored_pkce
+        unless pkce.respond_to?(:issuer) && pkce.issuer.is_a?(String)
+          raise MCPClient::Errors::ConnectionError,
+                'Authorization response rejected: no issuer was recorded for this authorization request'
+        end
+
+        ensure_state_for_request!(pkce, state)
+        cached = stored_server_metadata
+        ensure_authorization_server_unchanged!(pkce, cached)
+        ensure_client_for_request!(stored_client_info, pkce)
+        validate_authorization_response_issuer!(iss, pkce.issuer, iss_advertised_for_response?(pkce, cached))
+      end
+
+      # The message to surface for an authorization *error* response, after
+      # the same RFC 9207 issuer check as a success response: "on mismatch
+      # the client MUST NOT act on or display error, error_description, or
+      # error_uri" (MCP 2026-07-28 "Authorization Response Validation").
+      # @param params [Hash] the callback parameters (error, error_description, iss, state, ...)
+      # @return [String] the error text to show
+      # @raise [MCPClient::Errors::ConnectionError] when the response's issuer does not check out
+      def authorization_error_message(params)
+        params = params.to_h.transform_keys(&:to_s)
+        # Every started flow records a state, so a response that cannot be
+        # matched to one is not this client's to act on.
+        stored_state = storage.get_state(server_url)
+        if stored_state.nil? || params['state'] != stored_state
+          raise MCPClient::Errors::ConnectionError, 'Authorization error response rejected: state mismatch'
+        end
+
+        pkce = stored_pkce
+        cached = stored_server_metadata
+        # The same checks the success path makes: an error response of
+        # authorization server A is not displayed once a challenge received
+        # during the flow — or shared storage — moved the flow to B. Without a
+        # recorded issuer there is nothing to compare, and the issuer check
+        # below rejects the response outright.
+        ensure_authorization_server_unchanged!(pkce, cached) if pkce.respond_to?(:issuer) && pkce.issuer.is_a?(String)
+        # Only the request's own authorization server can say whether iss is
+        # expected: a cache that names another server is no guide.
+        cached = nil unless pkce && cached && cached.issuer == pkce.issuer
+        validate_authorization_response_issuer!(params['iss'], pkce&.issuer, iss_advertised_for_response?(pkce, cached))
+        safe_error_text((params['error_description'] || params['error'] || 'unknown error').to_s).strip
       end
 
       # Apply OAuth authorization to HTTP request
@@ -167,114 +471,14 @@ module MCPClient
       def apply_authorization(request)
         token = access_token
         logger.debug("OAuth apply_authorization: token=#{token ? 'present' : 'nil'}")
-        return unless token
+        # A record without access token bytes is never presented: a bare
+        # "Bearer " is not a credential (RFC 6749 Section 5.1).
+        return unless token_bytes?(token)
 
-        logger.debug("OAuth applying authorization header: #{token.to_header[0..20]}...")
+        # The header's value is the credential: not a prefix of it, not a
+        # truncation of it. It is never written to a log at any level.
+        logger.debug('OAuth applying authorization header')
         request.headers['Authorization'] = token.to_header
-      end
-
-      # Handle 401 Unauthorized response (for server discovery)
-      # @param response [Faraday::Response] HTTP response
-      # @return [ResourceMetadata, nil] Resource metadata if found
-      def handle_unauthorized_response(response)
-        www_authenticate = response.headers['WWW-Authenticate'] || response.headers['www-authenticate']
-        return nil unless www_authenticate
-
-        # Challenge parameters are read from the Bearer challenge's own
-        # segment only — never from the whole (possibly multi-challenge)
-        # header — so parameters belonging to Basic or another scheme cannot
-        # drive Bearer scope selection or resource metadata discovery. A
-        # header without a Bearer challenge carries no usable Bearer params.
-        bearer_params = bearer_challenge_segment(www_authenticate)
-
-        # MCP 2025-11-25: "Clients MUST treat the scopes provided in the
-        # challenge as authoritative for satisfying the current request" —
-        # including resetting a previously challenged scope when the current
-        # challenge carries none.
-        url = extract_resource_metadata_url(www_authenticate)
-
-        # The challenge header is peer-controlled input: validate the
-        # advertised URL BEFORE storing, fetching, or recording any challenge
-        # state, so a malicious challenge cannot pivot this host into requests
-        # against internal services (SSRF) and cannot leave the provider
-        # holding half of a rejected challenge.
-        validate_peer_advertised_url!(url, 'resource metadata URL (from WWW-Authenticate challenge)') if url
-
-        @challenge_scope = bearer_params && extract_challenge_param(bearer_params, 'scope')
-        return nil unless url
-
-        # Remember the advertised URL even if the fetch below fails, so a
-        # later discovery retries it instead of probing well-known URIs the
-        # challenge already superseded.
-        @challenge_metadata_url = url
-
-        # This URL was explicitly advertised by the 401 challenge, so a 404 is a
-        # misconfiguration to surface (strict), not a speculative miss to skip.
-        metadata = fetch_resource_metadata(url, strict: true)
-        # Reuse this challenge-advertised metadata during the subsequent OAuth
-        # flow instead of re-deriving (and possibly missing) the well-known URL.
-        @challenge_resource_metadata = metadata
-        metadata
-      end
-
-      # Extract the protected-resource-metadata URL from a WWW-Authenticate header.
-      # Per RFC 9728 the parameter is `resource_metadata`; a legacy `resource`
-      # parameter is accepted as a fallback for older servers. Only the Bearer
-      # challenge's own segment is consulted, so a parameter belonging to
-      # another scheme's challenge can never drive discovery.
-      # @param header [String] the WWW-Authenticate header value
-      # @return [String, nil] the metadata URL if present
-      def extract_resource_metadata_url(header)
-        params = bearer_challenge_segment(header)
-        return nil unless params
-
-        # Auth-params may include optional whitespace around '=' (RFC 7235).
-        # Quoted form: resource_metadata = "https://..."
-        if (m = params.match(/resource_metadata\s*=\s*"([^"]+)"/))
-          return m[1]
-        end
-
-        # Unquoted token form: resource_metadata = https://...
-        if (m = params.match(/resource_metadata\s*=\s*([^,\s]+)/))
-          return m[1]
-        end
-
-        # Legacy fallback: resource="https://..."
-        params.match(/resource\s*=\s*"([^"]+)"/)&.captures&.first
-      end
-
-      # Extract the Bearer challenge's own parameter segment from a (possibly
-      # multi-challenge) WWW-Authenticate header, so params belonging to other
-      # schemes (e.g. `Basic resource_metadata="...", Bearer realm="x"`) are
-      # never attributed to the Bearer challenge. Mirrors
-      # HttpTransportBase#bearer_challenge_segment.
-      # @param header [String, nil] the WWW-Authenticate header value
-      # @return [String, nil] the Bearer challenge's parameters (possibly
-      #   empty), or nil when the header has no Bearer challenge
-      def bearer_challenge_segment(header)
-        return nil unless header
-
-        # Locate the Bearer scheme token only OUTSIDE quoted strings: a
-        # quoted value such as realm="prefix Bearer x" must not anchor the
-        # segment.
-        masked = header.gsub(/"(?:\\.|[^"\\])*"/) { |q| "\"#{' ' * (q.length - 2)}\"" }
-        match = masked.match(/(?:\A|[\s,])Bearer(?=[\s,]|\z)/i)
-        return nil unless match
-
-        header[match.end(0)..][AUTH_PARAMS_RUN]
-      end
-
-      # Extract an auth-param value from a WWW-Authenticate header
-      # (quoted or unquoted form, optional whitespace around '=').
-      # @param header [String] the WWW-Authenticate header value
-      # @param name [String] the auth-param name
-      # @return [String, nil] the parameter value if present
-      def extract_challenge_param(header, name)
-        if (m = header.match(/(?:^|[\s,])#{Regexp.escape(name)}\s*=\s*"([^"]*)"/i))
-          return m[1]
-        end
-
-        header.match(/(?:^|[\s,])#{Regexp.escape(name)}\s*=\s*([^,\s]+)/i)&.captures&.first
       end
 
       # Scope requested by the most recent WWW-Authenticate challenge.
@@ -283,13 +487,142 @@ module MCPClient
 
       private
 
-      # Resolve the scope for authorization/registration requests using the
-      # MCP 2025-11-25 scope selection strategy: the challenge's scope
-      # parameter is authoritative; then an explicitly configured scope
-      # (:all resolves to the AS-advertised scope list); then the Protected
-      # Resource Metadata's scopes_supported; otherwise omit scope entirely.
+      # A challenge received during the flow — refused, still to be fetched,
+      # or naming another authorization server — or cached metadata for
+      # another server ends the flow here. Applied to a success response and,
+      # equally, to an error response: "the client MUST NOT act on or display
+      # error, error_description, or error_uri" is worth nothing if the text
+      # of authorization server A is shown after the flow moved to B.
+      # @param pkce [PKCE] the record of the authorization request
+      # @param cached [ServerMetadata, nil] the metadata currently in storage, if any
+      # @return [void]
+      # @raise [MCPClient::Errors::ConnectionError]
+      def ensure_authorization_server_unchanged!(pkce, cached)
+        if @challenge_error || (@challenge_metadata_url && @challenge_resource_metadata.nil?)
+          raise MCPClient::Errors::ConnectionError,
+                'Authorization response rejected: a challenge received during the flow must be resolved first; ' \
+                'restart the authorization'
+        end
+
+        advertised = Array(@challenge_resource_metadata&.authorization_servers).first
+        return unless (advertised && advertised != pkce.issuer) || (cached && cached.issuer != pkce.issuer)
+
+        raise MCPClient::Errors::ConnectionError,
+              'Authorization response rejected: the authorization server changed during the flow; ' \
+              'restart the authorization'
+      end
+
+      # RFC 9207 Section 2.4 as applied by MCP 2026-07-28: a present `iss`
+      # must equal the recorded issuer byte for byte (no scheme/host case
+      # folding, default-port elision, trailing-slash or percent-encoding
+      # normalization); an absent `iss` is rejected when the authorization
+      # server advertises the parameter. Without a recorded issuer nothing
+      # can be validated, so a present `iss` is rejected (fail closed).
+      # @param iss [String, nil] the response's iss parameter
+      # @param expected [String, nil] the issuer recorded when the flow started
+      # @param server_metadata [ServerMetadata, nil] the authorization server metadata
+      # @return [void]
+      # @raise [MCPClient::Errors::ConnectionError]
+      # @param supported [Boolean] whether the request's authorization server advertises iss
+      def validate_authorization_response_issuer!(iss, expected, supported)
+        unless expected.is_a?(String)
+          raise MCPClient::Errors::ConnectionError,
+                'Authorization response rejected: no issuer was recorded for this authorization request, ' \
+                'so it cannot be bound to an authorization server; restart the authorization'
+        end
+        if iss.nil?
+          return unless supported
+
+          raise MCPClient::Errors::ConnectionError,
+                'Authorization response rejected: the authorization server advertises the iss parameter ' \
+                '(authorization_response_iss_parameter_supported) but the response carries none'
+        end
+        return if iss.to_s == expected
+
+        raise MCPClient::Errors::ConnectionError,
+              "Authorization response rejected: issuer mismatch (expected #{safe_error_text(expected)})"
+      end
+
+      # Whether the authorization server of a request advertised the iss
+      # response parameter: recorded with the PKCE record; for a record
+      # persisted before that field existed, the metadata of the same
+      # issuer decides.
+      # @return [Boolean]
+      def iss_parameter_supported_for?(pkce, server_metadata)
+        recorded = pkce&.iss_parameter_supported
+        return recorded == true unless recorded.nil?
+
+        server_metadata&.iss_parameter_supported? == true
+      end
+
+      # The same question for a check made BEFORE the token exchange (the
+      # browser callback precheck and the error-response path), which reads
+      # cached metadata rather than freshly discovered metadata. Metadata
+      # persisted before this client read RFC 9207 records no answer, and
+      # reading that silence as "not supported" would show a success page (or
+      # the peer's error text) for a response {#complete_authorization_flow}
+      # then rejects. So when neither the PKCE record nor the cache carries an
+      # answer, the answer is rediscovered exactly as the completion does; an
+      # answer that cannot be obtained is unknown, not "no", and the
+      # advertisement is assumed (fail closed) so a missing `iss` is refused.
+      # @param pkce [PKCE, nil] the record of the authorization request
+      # @param cached [ServerMetadata, nil] cached metadata of the same issuer, if any
+      # @return [Boolean] whether the request's authorization server advertises iss
+      # @raise [MCPClient::Errors::ConnectionError] when rediscovery names another authorization server
+      def iss_advertised_for_response?(pkce, cached)
+        recorded = pkce&.iss_parameter_supported
+        return recorded == true unless recorded.nil?
+        return cached.iss_parameter_supported? if cached&.iss_parameter_recorded?
+        # Without a recorded issuer nothing can be validated at all; the
+        # caller rejects the response, so no discovery is worth making.
+        return false unless pkce.respond_to?(:issuer) && pkce.issuer.is_a?(String)
+
+        rediscovered = begin
+          discover_authorization_server
+        rescue MCPClient::Errors::ConnectionError
+          nil
+        end
+        # An answer that could not be obtained is unknown, not "no".
+        return true if rediscovered.nil?
+
+        # A rediscovery naming ANOTHER authorization server says nothing about
+        # this request's `iss`: it is the very "the authorization server
+        # changed during the flow" that {#complete_authorization_flow} rejects.
+        # Reducing it to "iss is advertised" would let a callback carrying the
+        # recorded issuer pass this check, and a browser flow would show a
+        # success page for a response the completion then refuses.
+        raise_authorization_server_changed!(pkce.issuer) unless rediscovered.issuer == pkce.issuer
+
+        rediscovered.iss_parameter_supported?
+      end
+
+      # The authorization server of a pending flow is no longer the one the
+      # request went to, so the code can never be redeemed: end the flow.
+      # @param recorded [String] the issuer recorded when the flow started
+      # @return [void]
+      # @raise [MCPClient::Errors::ConnectionError]
+      def raise_authorization_server_changed!(recorded)
+        raise MCPClient::Errors::ConnectionError,
+              'Authorization response rejected: the authorization server changed during the flow ' \
+              "(recorded #{safe_error_text(recorded)}); restart the authorization"
+      end
+
+      # Resolve the scope for authorization/registration requests: the MCP
+      # scope SELECTION strategy picks what this request needs (see
+      # {#selected_scope}), and the 2026-07-28 step-up rule adds back what has
+      # already been asked for (see {#accumulated_scope}).
       # @return [String, nil]
       def resolved_scope
+        accumulated_scope(selected_scope)
+      end
+
+      # What this request needs, by the MCP 2025-11-25 scope selection
+      # strategy: the challenge's scope parameter is authoritative; then an
+      # explicitly configured scope (:all resolves to the AS-advertised scope
+      # list); then the Protected Resource Metadata's scopes_supported;
+      # otherwise no scope at all.
+      # @return [String, nil]
+      def selected_scope
         return @challenge_scope if @challenge_scope && !@challenge_scope.empty?
 
         if scope == :all
@@ -300,10 +633,50 @@ module MCPClient
         end
 
         prm = @challenge_resource_metadata || @resource_metadata
-        prm_scopes = prm&.scopes_supported
-        return prm_scopes.join(' ') if prm_scopes && !prm_scopes.empty?
+        prm_scopes = advertised_scopes(prm&.scopes_supported)
+        return prm_scopes.join(' ') unless prm_scopes.empty?
 
         nil
+      end
+
+      # MCP 2026-07-28 "Step-Up Authorization Flow", step 2: "Determine
+      # required scopes by computing the union of the client's previously
+      # requested scope set and the scopes from the current challenge. This
+      # ensures previously granted permissions are preserved when servers
+      # emit per-operation scope challenges." A challenge is authoritative for
+      # what the CURRENT operation needs, not for what the client already had:
+      # re-authorizing with the challenge's scope alone trades the permissions
+      # every other operation depends on for the one being retried, and the
+      # next operation challenges again.
+      # @param selected [String, nil] the scope this request selects on its own
+      # @return [String, nil] the union, or nil when no scope is to be sent
+      def accumulated_scope(selected)
+        scopes = (previously_requested_scopes + selected.to_s.split).uniq
+        scopes.empty? ? nil : scopes.join(' ')
+      end
+
+      # "The client's previously requested scope set": what this provider last
+      # sent in an authorization request. It is a fact about this client, not
+      # about anything a peer said, so it is read from this provider rather
+      # than from storage — and it is forgotten with the rest of the
+      # per-server state when the provider is retargeted, since the scopes of
+      # one MCP server say nothing about another's.
+      # @return [Array<String>]
+      def previously_requested_scopes
+        @requested_scope.to_s.split
+      end
+
+      # A scopes_supported value as a scope list: RFC 8414 Section 2 and RFC
+      # 9728 Section 2 both make it an array of strings, and a document that
+      # breaks that is refused on the wire — but a record read back from a
+      # storage backend that persists plain hashes is not, and `"a b".join`
+      # is a NoMethodError out of the flow.
+      # @param scopes [Object, nil] the advertised value
+      # @return [Array<String>] the scopes, or none
+      def advertised_scopes(scopes)
+        return [] unless scopes.is_a?(Array)
+
+        scopes.grep(String)
       end
 
       # Normalize server URL to canonical form
@@ -423,10 +796,12 @@ module MCPClient
       # @return [ServerMetadata] Authorization server metadata
       # @raise [MCPClient::Errors::ConnectionError] if discovery fails
       def discover_authorization_server
-        # A challenge we refused is still authoritative: it says the cached
+        # A CHALLENGE we refused is still authoritative: it says the cached
         # authorization server is no longer the right one. Falling back to
         # that cache (or to speculative well-known probing) would quietly
-        # undo the rejection, so surface it instead.
+        # undo the rejection, so surface it instead. Only a challenge sets
+        # this: a refused well-known document leaves nothing latched and is
+        # fetched again below.
         raise MCPClient::Errors::ConnectionError, @challenge_error if @challenge_error
 
         # A fresh 401 challenge is authoritative and overrides any cached
@@ -434,12 +809,19 @@ module MCPClient
         # whether the challenge-advertised PRM was already fetched or only its
         # URL is pending (e.g. the initial fetch failed and must be retried).
         challenge_pending = @challenge_resource_metadata || @challenge_metadata_url
-        cached = storage.get_server_metadata(server_url) unless challenge_pending
+        cached = stored_server_metadata unless challenge_pending
         if cached
           # Validate the cached entry before use so a persisted/older cache with
           # an HTTP endpoint or without S256 is still rejected.
           validate_server_metadata!(cached)
-          return cached
+          # A record persisted before this client read RFC 9207's
+          # authorization_response_iss_parameter_supported says nothing about
+          # the parameter. Treating that silence as "not supported" would
+          # accept an authorization response without `iss` from a server that
+          # advertises it, so the answer is rediscovered rather than assumed.
+          return cached if cached.iss_parameter_recorded?
+
+          logger.debug('Cached authorization server metadata predates the iss parameter record; rediscovering')
         end
 
         discover_and_cache_authorization_server
@@ -449,7 +831,7 @@ module MCPClient
       # @return [ServerMetadata]
       # @raise [MCPClient::Errors::ConnectionError] if discovery or validation fails
       def discover_and_cache_authorization_server
-        previous = storage.get_server_metadata(server_url)
+        previous = stored_server_metadata
 
         # RFC 9728: Protected Resource Metadata is authoritative — try it first,
         # then fall back to treating the MCP server origin as its own AS.
@@ -463,13 +845,47 @@ module MCPClient
         # Validate BEFORE caching so invalid metadata is never persisted.
         validate_server_metadata!(server_metadata)
 
-        invalidate_client_info_on_as_change(previous, server_metadata)
+        if previous
+          invalidate_client_info_on_as_change(previous, server_metadata)
+        else
+          retire_records_without_issuer
+        end
 
         storage.set_server_metadata(server_url, server_metadata)
+        # Remembered in-process as well: a backend that does not persist
+        # metadata would otherwise never know the current issuer.
+        @discovered_server_metadata = server_metadata
         @challenge_resource_metadata = nil # consumed
         @challenge_metadata_url = nil # consumed
         @challenge_error = nil
         server_metadata
+      end
+
+      # Records persisted before issuers were recorded, with no cached
+      # authorization server to prove where they came from, cannot be bound
+      # to whatever discovery finds now: a dynamic registration (with its
+      # secret) and a token are retired so the flow re-registers and
+      # re-authorizes. Pre-registered and portable credentials are the
+      # host's own configuration and are bound on first use.
+      # @return [void]
+      def retire_records_without_issuer
+        token = stored_token
+        delete_token(bind_to: Token::RETIRED_ISSUER) if token.respond_to?(:issuer) && token.issuer.nil?
+
+        client_info = stored_client_info
+        return unless client_info.respond_to?(:issuer) && client_info.issuer.nil?
+        return if portable_client?(client_info) || resolved_registration_type(client_info) != 'dynamic'
+
+        logger.debug('Discarding a dynamic OAuth client registration whose authorization server is unknown')
+        # Stamped as retired first, so a backend that cannot delete still
+        # leaves a record no authorization server matches.
+        begin
+          storage.set_client_info(server_url, client_info.with_issuer(Token::RETIRED_ISSUER,
+                                                                      registration_type: 'dynamic'))
+        rescue StandardError => e
+          logger.debug("The stale OAuth client registration could not be re-stored as retired (#{e.class})")
+        end
+        delete_client_info
       end
 
       # When a 401 challenge changes the authorization server, per-AS state cached
@@ -481,17 +897,53 @@ module MCPClient
       def invalidate_client_info_on_as_change(previous, current)
         return unless previous && previous.issuer != current.issuer
 
-        logger.debug('Authorization server changed; discarding client and scopes from the previous AS')
+        logger.debug('Authorization server changed; discarding the token and scopes from the previous AS')
 
-        # Prefer an explicit delete; fall back to the always-available
-        # set_client_info(nil) so custom storage backends are handled too.
-        if storage.respond_to?(:delete_client_info)
-          storage.delete_client_info(server_url)
-        else
-          storage.set_client_info(server_url, nil)
-        end
-
+        # Registration state is per authorization server: a token from the
+        # previous one is not valid for the new one. Credentials stored
+        # without a binding belonged to the previous server, so they are
+        # bound to it first; then they are kept only when bound
+        # (pre-registered, so the mismatch can be reported) or portable
+        # (Client ID Metadata Document), and a dynamic registration is
+        # discarded so the next flow re-registers.
+        @authorization_server_switched = true
         @supported_scopes = nil
+        # Records another provider sharing the storage already bound to the
+        # new server are its: only unbound ones and those of the previous
+        # server are affected.
+        delete_token(bind_to: previous.issuer) unless record_bound_to?(stored_token_or_nil, current.issuer)
+        client_info = stored_client_info
+        return if record_bound_to?(client_info, current.issuer)
+
+        if client_info.respond_to?(:issuer) && client_info.issuer.nil? && !portable_client?(client_info)
+          client_info = client_info.with_issuer(previous.issuer,
+                                                registration_type: resolved_registration_type(client_info))
+          store_client_info(client_info)
+        end
+        keep = client_info.respond_to?(:portable?) && (portable_client?(client_info) || client_info.pre_registered?)
+        return if keep
+
+        # The registration itself is still valid at the server that made it,
+        # so it is kept under that server's own key; only the answer to
+        # "which credentials does this resource use now" is discarded.
+        preserve_client_registration(client_info)
+        delete_client_info
+      end
+
+      # @param record [Token, ClientInfo, Object, nil]
+      # @param issuer [String]
+      # @return [Boolean] whether the record says it belongs to that issuer
+      def record_bound_to?(record, issuer)
+        record.respond_to?(:issuer) && record.issuer == issuer
+      end
+
+      # The stored token, or nil when the backend cannot even be asked
+      # (a minimal backend without get_token, tolerated as before).
+      # @return [Token, nil]
+      def stored_token_or_nil
+        stored_token
+      rescue StandardError
+        nil
       end
 
       # Apply the PKCE-support and HTTPS-endpoint checks to server metadata.
@@ -514,22 +966,38 @@ module MCPClient
         resource_metadata = challenge_or_well_known_resource_metadata
         return nil unless resource_metadata
 
-        validate_resource_matches!(resource_metadata)
+        # A document that is not this resource's — or that names no
+        # authorization server — is rejected whole, and the copy
+        # {#fetch_resource_metadata} kept for scope resolution goes with it:
+        # otherwise a later flow (the path 404s, the origin is its own
+        # authorization server) would request the scopes of a document this
+        # discovery refused, exactly the leftover already closed for a refused
+        # authorization server URL.
+        begin
+          validate_resource_matches!(resource_metadata)
+        rescue MCPClient::Errors::ConnectionError => e
+          refuse_resource_metadata!(e.message)
+        end
 
         auth_server_url = Array(resource_metadata.authorization_servers).first
         unless auth_server_url
-          raise MCPClient::Errors::ConnectionError,
-                'Protected resource metadata does not advertise any authorization_servers'
+          refuse_resource_metadata!('Protected resource metadata does not advertise any authorization_servers')
         end
 
         # authorization_servers is untrusted PRM content: validate the
         # advertised origin BEFORE constructing and fetching well-known URLs
         # on it, so a malicious protected resource cannot drive discovery GETs
         # against internal services (SSRF).
+        # Only a challenge-advertised document is authoritative enough for a
+        # refusal to latch: a speculative well-known document that is refused
+        # now must be fetched again by the next discovery, so a server the
+        # operator fixes is not unreachable for the life of this provider.
         validate_peer_advertised_url!(auth_server_url,
-                                      'authorization server (advertised by protected resource metadata)')
+                                      'authorization server (advertised by protected resource metadata)',
+                                      latch: challenge_advertised_metadata?)
 
-        server_metadata = fetch_first_server_metadata(authorization_server_metadata_urls(auth_server_url))
+        server_metadata = fetch_first_server_metadata(authorization_server_metadata_urls(auth_server_url),
+                                                      auth_server_url)
         unless server_metadata
           raise MCPClient::Errors::ConnectionError,
                 "Authorization server advertised by protected resource metadata (#{auth_server_url}) " \
@@ -563,7 +1031,7 @@ module MCPClient
       # @return [ServerMetadata, nil]
       def discover_via_direct_authorization_server
         origin = origin_of(URI.parse(server_url))
-        fetch_first_server_metadata(authorization_server_metadata_urls(origin))
+        fetch_first_server_metadata(authorization_server_metadata_urls(origin), origin)
       end
 
       # Fetch the first Protected Resource Metadata document that resolves.
@@ -588,19 +1056,56 @@ module MCPClient
       # genuine alternatives, so any failing candidate is skipped to try the next.
       # @param urls [Array<String>] candidate URLs
       # @return [ServerMetadata, nil]
-      def fetch_first_server_metadata(urls)
+      # @param urls [Array<String>] well-known candidates
+      # @param issuer [String] the issuer identifier the candidates were built from
+      def fetch_first_server_metadata(urls, issuer)
+        rejected = nil
         urls.each do |url|
           md = try_fetch_server_metadata(url)
-          return md if md
+          next unless md
+
+          begin
+            validate_metadata_issuer!(md, issuer)
+          rescue MCPClient::Errors::ConnectionError => e
+            # Not this candidate: the next well-known location may hold the
+            # document for the issuer actually asked for.
+            logger.debug("Authorization server metadata candidate rejected (#{safe_error_text(url.to_s)}): " \
+                         "#{e.message}")
+            rejected = e
+            next
+          end
+          return md
         end
+        # Only mismatching documents were found: say so rather than "nothing".
+        raise rejected if rejected
+
         nil
+      end
+
+      # RFC 8414 Section 3.3 / OpenID Connect Discovery 4.3 (MCP 2026-07-28
+      # "Authorization Server Metadata Discovery"): "the issuer value in the
+      # document MUST be identical to the issuer identifier used to construct
+      # the well-known URL. If they differ, the client MUST NOT use the
+      # metadata." The issuer is the trust anchor of the RFC 9207 check, so a
+      # document naming another issuer is rejected outright.
+      # @param metadata [ServerMetadata]
+      # @param issuer [String]
+      # @raise [MCPClient::Errors::ConnectionError]
+      def validate_metadata_issuer!(metadata, issuer)
+        # Byte-for-byte (RFC 8414 Section 4): no case folding, no slash or
+        # port normalization.
+        return if metadata.issuer.is_a?(String) && metadata.issuer == issuer.to_s
+
+        raise MCPClient::Errors::ConnectionError,
+              "Authorization server metadata rejected: its issuer #{safe_error_text(metadata.issuer.to_s).inspect} " \
+              "is not the identifier it was fetched for (#{safe_error_text(issuer.to_s)})"
       end
 
       # Non-raising server-metadata fetch used while iterating candidates.
       def try_fetch_server_metadata(url)
         fetch_server_metadata(url)
       rescue MCPClient::Errors::ConnectionError => e
-        logger.debug("Authorization server metadata candidate failed (#{url}): #{e.message}")
+        logger.debug("Authorization server metadata candidate failed (#{safe_error_text(url.to_s)}): #{e.message}")
         nil
       end
 
@@ -617,6 +1122,14 @@ module MCPClient
           raise MCPClient::Errors::ConnectionError,
                 'Authorization server metadata omits code_challenge_methods_supported; ' \
                 'the server does not support PKCE and the client must refuse to proceed'
+        elsif !methods.is_a?(Array)
+          # A String answers `include?('S256')` for "S256 not supported": read
+          # that way, a server with no PKCE at all would pass this check. The
+          # wire path refuses such a document outright; a record read back
+          # from a hash-persisting storage backend arrives here instead.
+          raise MCPClient::Errors::ConnectionError,
+                'Authorization server metadata code_challenge_methods_supported is not an array of strings ' \
+                '(RFC 8414); PKCE support cannot be established and the client must refuse to proceed'
         elsif !methods.include?('S256')
           raise MCPClient::Errors::ConnectionError,
                 'Authorization server does not support PKCE S256 ' \
@@ -624,8 +1137,8 @@ module MCPClient
         end
       end
 
-      # Require HTTPS for all discovered authorization server endpoints, with a
-      # localhost exception for local development.
+      # Require HTTPS for all discovered authorization server endpoints, with
+      # the local-development exception for a local stack.
       # @param server_metadata [ServerMetadata]
       def enforce_https_endpoints!(server_metadata)
         enforce_https!(server_metadata.authorization_endpoint, 'authorization endpoint')
@@ -635,87 +1148,34 @@ module MCPClient
         enforce_https!(server_metadata.registration_endpoint, 'registration endpoint')
       end
 
-      # Validate a URL that a peer advertised to us (a 401 challenge's
-      # resource_metadata, or PRM authorization_servers).
-      #
-      # Stricter than enforce_https!, which exists for URLs the OPERATOR
-      # configured and therefore tolerates plain-HTTP loopback for local
-      # development. Applying that exception to peer-supplied input would
-      # leave the reported SSRF intact against the most sensitive targets of
-      # all — services listening only on localhost. The loopback exception is
-      # honored here only when the configured MCP server is itself loopback,
-      # i.e. the developer is already pointed at a local stack.
-      #
-      # The rejection is recorded so a later discovery fails closed instead of
-      # silently reusing cached authorization-server metadata.
-      #
-      # NOTE: hostnames are checked literally. This does not resolve DNS, so a
-      # public name that resolves to a private address is not caught here;
-      # that needs resolution-time checking in the HTTP layer.
-      # @param url [String] the peer-advertised URL
-      # @param label [String] human-readable name for errors
-      # @raise [MCPClient::Errors::ConnectionError] if the URL is not acceptable
-      def validate_peer_advertised_url!(url, label)
-        uri = URI.parse(url)
-        host = uri.hostname.to_s.downcase
-
-        if uri.scheme != 'https' && !(uri.scheme == 'http' && local_development?)
-          reject_challenge!("OAuth #{label} must use HTTPS: #{url}")
-        end
-        reject_challenge!("OAuth #{label} must not target a loopback or private address: #{url}") if
-          local_address?(host) && !local_development?
-      rescue URI::InvalidURIError
-        reject_challenge!("OAuth #{label} is not a valid URL: #{url}")
-      end
-
-      # @param message [String] why the challenge was refused
-      # @raise [MCPClient::Errors::ConnectionError] always
-      def reject_challenge!(message)
-        # Drop every scrap of the refused challenge so nothing half-applied
-        # survives, and remember why for the next discovery attempt.
-        @challenge_scope = nil
-        @challenge_metadata_url = nil
-        @challenge_resource_metadata = nil
-        @challenge_error = message
-        raise MCPClient::Errors::ConnectionError, message
-      end
-
-      # @return [Boolean] whether the configured MCP server is itself local,
-      #   in which case local discovery targets are expected
-      def local_development?
-        local_address?(URI.parse(server_url).hostname.to_s.downcase)
-      rescue URI::InvalidURIError
-        false
-      end
-
-      # @param host [String] a downcased hostname
-      # @return [Boolean] whether it names a loopback, private or link-local address
-      def local_address?(host)
-        return true if %w[localhost 127.0.0.1 ::1 0.0.0.0].include?(host)
-        return true if host.end_with?('.localhost', '.local', '.internal')
-        return true if host.start_with?('127.', '10.', '192.168.', '169.254.')
-        return true if host.match?(/\A172\.(1[6-9]|2\d|3[01])\./)
-        return true if host.match?(/\A\[?(fc|fd|fe80)/)
-
-        false
-      end
-
+      # An endpoint discovered in authorization server metadata is as
+      # peer-controlled as a URL a challenge or a protected resource document
+      # advertises — the code, the verifier and the client id are POSTed to
+      # the token endpoint — so it is classified by exactly the same rules:
+      # HTTPS unless this is a local stack (a loopback target advertised to a
+      # client whose configured server is loopback too), never a loopback,
+      # private or link-local address otherwise, and always a host a resolver
+      # could look up. Without that, metadata from any public authorization
+      # server could name `http://app.localhost:3000/steal` or an internal
+      # address and collect the authorization code there. The refusal is not
+      # latched: only a 401 challenge is authoritative enough for that.
       # @param url [String, nil] endpoint URL
       # @param label [String] human-readable endpoint name for errors
-      # @raise [MCPClient::Errors::ConnectionError] if the URL is not HTTPS (non-localhost)
+      # @raise [MCPClient::Errors::ConnectionError] if the URL is not acceptable
       def enforce_https!(url, label)
         return if url.nil?
 
-        uri = URI.parse(url)
-        return if uri.scheme == 'https'
-        # Dev exception is only for plain HTTP on a loopback host — not any other
-        # scheme (e.g. ftp://localhost). Use #hostname (not #host) so an IPv6
-        # loopback like http://[::1]:9292 matches without the surrounding brackets.
-        return if uri.scheme == 'http' && %w[localhost 127.0.0.1 ::1].include?(uri.hostname)
+        validate_peer_advertised_url!(url, label, latch: false)
+      end
 
-        raise MCPClient::Errors::ConnectionError, "OAuth #{label} must use HTTPS: #{url}"
-      rescue URI::InvalidURIError
-        raise MCPClient::Errors::ConnectionError, "OAuth #{label} is not a valid URL: #{url}"
+      # Forget the protected resource document and refuse: a document rejected
+      # as not this resource's must not go on supplying scopes.
+      # @param message [String] why the document was refused
+      # @return [void]
+      # @raise [MCPClient::Errors::ConnectionError] always
+      def refuse_resource_metadata!(message)
+        @resource_metadata = nil
+        raise MCPClient::Errors::ConnectionError, message
       end
 
       # Validate the PRM `resource` identifies this server (RFC 9728 confused
@@ -739,7 +1199,7 @@ module MCPClient
         return if advertised == expected
 
         raise MCPClient::Errors::ConnectionError,
-              "Protected resource metadata resource (#{resource_metadata.resource}) " \
+              "Protected resource metadata resource (#{safe_error_text(resource_metadata.resource.to_s)}) " \
               "does not match the server URL (#{server_url})"
       end
 
@@ -755,7 +1215,8 @@ module MCPClient
       def resource_identity(url)
         uri = URI.parse(url)
         unless uri.scheme && uri.host
-          raise MCPClient::Errors::ConnectionError, "Invalid resource URL (must be absolute): #{url}"
+          raise MCPClient::Errors::ConnectionError,
+                "Invalid resource URL (must be absolute): #{safe_error_text(url.to_s)}"
         end
 
         scheme = uri.scheme.downcase
@@ -769,7 +1230,7 @@ module MCPClient
 
         "#{scheme}://#{host}#{":#{port}" if port}#{path}#{query}"
       rescue URI::InvalidURIError
-        raise MCPClient::Errors::ConnectionError, "Invalid resource URL: #{url}"
+        raise MCPClient::Errors::ConnectionError, "Invalid resource URL: #{safe_error_text(url.to_s)}"
       end
 
       # Fetch resource metadata from URL.
@@ -785,7 +1246,7 @@ module MCPClient
       # @return [ResourceMetadata, nil] metadata, or nil if a speculative URL returns 404
       # @raise [MCPClient::Errors::ConnectionError] on any non-404 failure, or on 404 when strict
       def fetch_resource_metadata(url, strict: false)
-        logger.debug("Fetching resource metadata from: #{url}")
+        logger.debug("Fetching resource metadata from: #{safe_error_text(url.to_s)}")
 
         response = @http_client.get(url) do |req|
           req.headers['Accept'] = 'application/json'
@@ -798,15 +1259,29 @@ module MCPClient
         end
 
         data = JSON.parse(response.body)
+        raise MCPClient::Errors::ConnectionError, 'Invalid resource metadata: not a JSON object' unless data.is_a?(Hash)
+
+        # RFC 9728 Section 2 gives every field a type, and this client acts on
+        # them: a `scopes_supported` that is not an array of strings would be
+        # joined into a scope parameter (or crash trying), an
+        # `authorization_servers` that is not one would drive discovery at
+        # whatever `Array()` made of it. A document that breaks a type is a
+        # protocol error, not metadata.
+        if (error = resource_metadata_error(data))
+          raise MCPClient::Errors::ConnectionError, "Invalid resource metadata: #{error}"
+        end
+
         metadata = ResourceMetadata.from_h(data)
         # Retain the most recently fetched PRM so scope resolution can fall
         # back to its scopes_supported (MCP scope selection priority 2).
         @resource_metadata = metadata
         metadata
       rescue JSON::ParserError => e
-        raise MCPClient::Errors::ConnectionError, "Invalid resource metadata JSON: #{e.message}"
+        raise MCPClient::Errors::ConnectionError,
+              "Invalid resource metadata JSON: #{describe_parse_error(e, response&.body)}"
       rescue Faraday::Error => e
-        raise MCPClient::Errors::ConnectionError, "Network error fetching resource metadata: #{e.message}"
+        raise MCPClient::Errors::ConnectionError,
+              "Network error fetching resource metadata: #{safe_error_text(e.message)}"
       end
 
       # Fetch authorization server metadata from URL
@@ -814,7 +1289,7 @@ module MCPClient
       # @return [ServerMetadata] Server metadata
       # @raise [MCPClient::Errors::ConnectionError] if fetch fails
       def fetch_server_metadata(url)
-        logger.debug("Fetching server metadata from: #{url}")
+        logger.debug("Fetching server metadata from: #{safe_error_text(url.to_s)}")
 
         response = @http_client.get(url) do |req|
           req.headers['Accept'] = 'application/json'
@@ -825,68 +1300,221 @@ module MCPClient
         end
 
         data = JSON.parse(response.body)
-        ServerMetadata.from_h(data)
+        raise MCPClient::Errors::ConnectionError, 'Invalid server metadata: not a JSON object' unless data.is_a?(Hash)
+
+        # RFC 8414 Section 2 gives every field a type, and a document that
+        # breaks one is never usable metadata: an endpoint that is not a
+        # string is not an endpoint, and a `code_challenge_methods_supported`
+        # that is not an array of strings cannot establish PKCE support — a
+        # String would answer `include?("S256")` for "S256 is not supported
+        # here", which is precisely the downgrade the check exists to stop.
+        if (error = server_metadata_error(data))
+          raise MCPClient::Errors::ConnectionError, "Invalid server metadata: #{error}"
+        end
+
+        ServerMetadata.from_discovery_document(data)
       rescue JSON::ParserError => e
-        raise MCPClient::Errors::ConnectionError, "Invalid server metadata JSON: #{e.message}"
+        raise MCPClient::Errors::ConnectionError,
+              "Invalid server metadata JSON: #{describe_parse_error(e, response&.body)}"
       rescue Faraday::Error => e
-        raise MCPClient::Errors::ConnectionError, "Network error fetching server metadata: #{e.message}"
+        raise MCPClient::Errors::ConnectionError,
+              "Network error fetching server metadata: #{safe_error_text(e.message)}"
       end
 
-      # Get or register OAuth client, following the MCP 2025-11-25 client
-      # registration priority order: pre-registered/cached client information
-      # first, then Client ID Metadata Documents (SEP-991) when the
-      # authorization server advertises support and a metadata URL is
-      # configured, then Dynamic Client Registration as a fallback.
-      # @param server_metadata [ServerMetadata] Authorization server metadata
-      # @return [ClientInfo] Client information
-      # @raise [MCPClient::Errors::ConnectionError] if registration fails
-      def get_or_register_client(server_metadata)
-        # 1. Pre-registered or previously registered client info from storage
-        if (client_info = storage.get_client_info(server_url)) && !client_info.client_secret_expired?
-          logger.debug("Using cached OAuth client for #{server_url}")
-          return client_info
+      # Forget the stored token (the authorization server it came from is no
+      # longer the one in use). Storage backends may implement the optional
+      # delete_token(server_url); otherwise set_token(server_url, nil) is
+      # attempted, and a backend that accepts neither is reported.
+      # @return [void]
+      # @param bind_to [String, nil] the issuer the token belonged to (or Token::RETIRED_ISSUER): a token
+      #   that records no issuer is first re-stored bound to it, so a backend that cannot delete still
+      #   keeps it away from another authorization server after a restart
+      def delete_token(bind_to: nil)
+        # Whatever the backend manages, this token is never presented again.
+        current = stored_token
+        if current.respond_to?(:access_token) && current.access_token
+          # Opaque tokens are unique only within an issuer: the marker names
+          # the issuer the bytes were retired for, so another provider
+          # sharing the storage may store the same bytes for a new server.
+          (@retired_tokens ||= {})[retirement_key(current, bind_to)] = true
         end
-
-        # 2. Client ID Metadata Documents (SEP-991): the HTTPS metadata URL is
-        # itself the client_id — no registration request is needed.
-        if client_id_metadata_url && server_metadata.supports_client_id_metadata_documents?
-          return client_info_from_metadata_url
+        if bind_to && current.respond_to?(:with_issuer) && (current.issuer.nil? || bind_to == Token::RETIRED_ISSUER)
+          begin
+            storage.set_token(server_url, current.with_issuer(bind_to))
+          rescue StandardError => e
+            logger.debug("Could not bind the retired token to its issuer in storage: #{e.class}")
+          end
         end
-
-        # 3. Dynamic Client Registration (RFC 7591) fallback
-        logger.debug('No cached client found, registering new OAuth client...')
-        if server_metadata.supports_registration?
-          register_client(server_metadata)
+        if storage.respond_to?(:delete_token)
+          storage.delete_token(server_url)
         else
-          raise MCPClient::Errors::ConnectionError,
-                'Dynamic client registration not supported and no client credentials found'
+          storage.set_token(server_url, nil)
         end
+      rescue StandardError => e
+        logger.warn('The OAuth token for the previous authorization server could not be removed from storage ' \
+                    "(#{e.class}); implement delete_token(server_url) on the storage backend. The token is " \
+                    'ignored while the authorization server differs from its issuer.')
       end
 
-      # Build client information for a Client ID Metadata Document client
-      # (SEP-991): the configured HTTPS metadata URL is used directly as the
-      # client_id in authorization and token requests, without a dynamic
-      # registration POST. Serving the metadata JSON at that URL is the
-      # application's responsibility, not this library's.
-      # @return [ClientInfo] Client information with the metadata URL as client_id
-      def client_info_from_metadata_url
-        logger.debug("Using Client ID Metadata Document URL as client_id: #{client_id_metadata_url}")
+      # Drop every piece of in-process state that belongs to one MCP server,
+      # so a retargeted provider discovers the new one from scratch:
+      #
+      # * the discovered-metadata fallback and the memoized scopes, which name
+      #   the previous server's authorization server and what it advertises;
+      # * the challenge state — an adopted document, a URL whose fetch is
+      #   still pending, a latched refusal and the scope the challenge asked
+      #   for — all of it said by the previous server's 401;
+      # * the resource metadata kept for scope resolution;
+      # * the "the authorization server changed" flag, which is a fact about
+      #   the previous server's history.
+      #
+      # Retirement markers are deliberately kept: they are keyed by the issuer
+      # the bytes were retired for, not by the resource URL, so they stay true
+      # when two MCP servers sit behind one authorization server.
+      # @return [void]
+      def forget_per_server_state
+        @discovered_server_metadata = nil
+        @supported_scopes = nil
+        @resource_metadata = nil
+        @challenge_resource_metadata = nil
+        @challenge_metadata_url = nil
+        @challenge_error = nil
+        @challenge_scope = nil
+        @requested_scope = nil
+        @authorization_server_switched = nil
+      end
 
-        metadata = ClientMetadata.new(
-          redirect_uris: [redirect_uri],
-          token_endpoint_auth_method: 'none', # Public client
-          grant_types: %w[authorization_code refresh_token],
-          response_types: ['code'],
-          scope: resolved_scope,
-          **@extra_client_metadata
-        )
+      # Storage backends may persist plain hashes (the FileTokenStorage
+      # example does); records are normalized before any field is read.
+      # @return [ServerMetadata, nil]
+      def stored_server_metadata
+        normalize_record(storage.get_server_metadata(server_url), ServerMetadata) || @discovered_server_metadata
+      end
 
-        client_info = ClientInfo.new(client_id: client_id_metadata_url, metadata: metadata)
+      # @return [PKCE, nil]
+      def stored_pkce
+        normalize_record(storage.get_pkce(server_url), PKCE)
+      end
 
-        # Persist so complete_authorization_flow and token refresh can find it
-        storage.set_client_info(server_url, client_info)
+      # @return [Token, nil]
+      def stored_token
+        token = normalize_record(storage.get_token(server_url), Token)
+        # A backend without delete_token is asked to store nil, and one that
+        # persists plain hashes writes `nil.to_h` — `{}`. Read back that is a
+        # record without token bytes, whose header would be a bare "Bearer "
+        # attributed to whatever authorization server is current now. It is
+        # not a token: it is the absence storage meant to express. The same
+        # backend can read back any other JSON type, or bytes no header can
+        # carry, in EVERY field the token presents: a token_type that is not a
+        # string crashes `capitalize`, and one carrying CR/LF makes the
+        # `Authorization` value two header lines. A record that cannot be
+        # presented is not a token either, so the read path is as strict as
+        # the wire path.
+        return nil if token.respond_to?(:access_token) && !token_bytes?(token)
 
-        client_info
+        token
+      end
+
+      # @param record [Object, Hash, nil]
+      # @param klass [Class] a record class responding to from_h
+      # @return [Object, nil]
+      def normalize_record(record, klass)
+        record.is_a?(Hash) ? klass.from_h(record) : record
+      end
+
+      # Persist a token the authorization server just issued. Opaque tokens
+      # are unique only within an issuer, so a new server may legitimately
+      # issue the same bytes as a token retired at the previous one: the
+      # fresh, issuer-bound token is never mistaken for the retired one.
+      # @param token [Token]
+      # @return [void]
+      def store_token(token)
+        storage.set_token(server_url, token)
+        # Only a persisted replacement lifts the marker: if the write failed,
+        # the stale record still in storage stays retired.
+        @retired_tokens&.delete(retirement_key(token, nil)) if token.respond_to?(:access_token)
+      end
+
+      # Whether a token was retired in this process: a bound token when its
+      # bytes were retired for its issuer, an unbound one when its bytes
+      # were retired for any issuer (it cannot say which one it came from).
+      # @param token [Token]
+      # @return [Boolean]
+      def retired_token?(token)
+        return true if token.respond_to?(:retired?) && token.retired?
+        return false unless token.respond_to?(:access_token) && @retired_tokens
+
+        issuer = token.respond_to?(:issuer) ? token.issuer : nil
+        return @retired_tokens.key?([issuer, token.access_token]) if issuer
+
+        @retired_tokens.keys.any? { |_issuer, bytes| bytes == token.access_token }
+      end
+
+      # The in-process retirement marker of a token: its bytes together with
+      # the issuer they were retired for (the recorded issuer, else the
+      # issuer the token was bound to at retirement).
+      # @param token [Token]
+      # @param bind_to [String, nil]
+      # @return [Array(String, String)]
+      def retirement_key(token, bind_to)
+        issuer = token.respond_to?(:issuer) ? token.issuer : nil
+        [issuer || bind_to || Token::RETIRED_ISSUER, token.access_token]
+      end
+
+      # Whether a stored token belongs to the authorization server currently
+      # known for this resource. While that server is unknown (no cached
+      # metadata) nothing is presented: the next challenge discovers it.
+      # @param token [Token]
+      # @return [Boolean]
+      def token_for_current_issuer?(token)
+        return false if retired_token?(token)
+        return true unless token.respond_to?(:issuer)
+
+        current = current_issuer_for_tokens
+        !current.nil? && current == token.issuer
+      end
+
+      # The authorization server tokens are judged against: a validated
+      # challenge received since the metadata was cached is authoritative
+      # (discovery treats it so), else the cached metadata's issuer.
+      # @return [String, nil]
+      def current_issuer_for_tokens
+        # A challenge we REFUSED said the cached authorization server is no
+        # longer the right one, and discovery fails closed on that latch. The
+        # request path must fail closed too: presenting the cached bearer would
+        # undo the rejection exactly as falling back to the cache would.
+        return nil if @challenge_error
+
+        advertised = Array(@challenge_resource_metadata&.authorization_servers).first
+        return advertised if advertised.is_a?(String)
+        # An unresolved challenge URL means the current server is unknown.
+        return nil if @challenge_metadata_url
+
+        stored_server_metadata&.issuer
+      end
+
+      # A token persisted before issuers were recorded was obtained from the
+      # authorization server cached alongside it (a server change always
+      # retires or binds the token first), so it is bound to that server on
+      # first use; while no server is known it is not presented.
+      # @param token [Token]
+      # @return [Token, nil] the bound token, or nil when it cannot be bound yet
+      def bind_token_issuer(token)
+        return token unless token.respond_to?(:issuer) && token.issuer.nil? && token.respond_to?(:with_issuer)
+        # A refused challenge says the cached server is no longer current, so
+        # it cannot attribute an unbound token either.
+        return nil if @challenge_error
+
+        current = stored_server_metadata&.issuer
+        return nil unless current
+
+        bound = token.with_issuer(current)
+        begin
+          storage.set_token(server_url, bound)
+        rescue StandardError => e
+          logger.debug("The stored OAuth token could not be re-stored with its issuer (#{e.class})")
+        end
+        bound
       end
 
       # Validate a Client ID Metadata Document URL (SEP-991): "The client_id
@@ -929,34 +1557,35 @@ module MCPClient
       # @return [ClientInfo] Registered client information
       # @raise [MCPClient::Errors::ConnectionError] if registration fails
       def register_client(server_metadata)
-        logger.debug("Registering OAuth client at: #{server_metadata.registration_endpoint}")
+        logger.warn('Dynamic Client Registration is deprecated in MCP 2026-07-28; prefer a Client ID Metadata ' \
+                    'Document (client_id_metadata_url) or pre-registered credentials')
+        logger.debug("Registering OAuth client at: #{safe_error_text(server_metadata.registration_endpoint.to_s)}")
 
-        metadata = ClientMetadata.new(
-          redirect_uris: [redirect_uri],
-          token_endpoint_auth_method: 'none', # Public client
-          grant_types: %w[authorization_code refresh_token],
-          response_types: ['code'],
-          scope: resolved_scope,
-          **@extra_client_metadata
-        )
+        app_type = resolved_application_type
+        response = post_registration(server_metadata, app_type)
 
-        response = @http_client.post(server_metadata.registration_endpoint) do |req|
-          req.headers['Content-Type'] = 'application/json'
-          req.headers['Accept'] = 'application/json'
-          req.body = metadata.to_h.to_json
+        # "Clients MAY retry registration with an adjusted application_type"
+        # when an OIDC server rejects the redirect URI for the type derived
+        # here (never for one the host chose explicitly).
+        if !response.success? && application_type.nil? &&
+           registration_error(response)[:error] == 'invalid_redirect_uri'
+          alternate = app_type == 'native' ? 'web' : 'native'
+          logger.warn("Client registration rejected the redirect URI for application_type #{app_type}; " \
+                      "retrying as #{alternate}")
+          app_type = alternate
+          response = post_registration(server_metadata, app_type)
         end
 
-        unless response.success?
-          raise MCPClient::Errors::ConnectionError, "Client registration failed: HTTP #{response.status}"
-        end
+        raise_registration_failure!(response) unless response.success?
 
         data = JSON.parse(response.body)
-        logger.debug("OAuth client registered successfully: #{data['client_id']}")
+        client_id = registered_client_id!(data)
+        logger.debug("OAuth client registered successfully: #{safe_error_text(client_id)}")
 
         # Parse registered metadata from server response (may differ from our request)
         registered_metadata = ClientMetadata.new(
-          redirect_uris: data['redirect_uris'] || [redirect_uri],
-          token_endpoint_auth_method: data['token_endpoint_auth_method'] || 'none',
+          redirect_uris: registered_redirect_uris(data),
+          token_endpoint_auth_method: registered_auth_method(data),
           grant_types: data['grant_types'] || %w[authorization_code refresh_token],
           response_types: data['response_types'] || ['code'],
           scope: data['scope'],
@@ -965,35 +1594,154 @@ module MCPClient
           logo_uri: data['logo_uri'],
           tos_uri: data['tos_uri'],
           policy_uri: data['policy_uri'],
-          contacts: data['contacts']
+          contacts: data['contacts'],
+          application_type: data['application_type'] || app_type
         )
 
-        # Warn if server changed redirect_uri
-        requested_uri = redirect_uri
-        registered_uri = registered_metadata.redirect_uris.first
-        if registered_uri != requested_uri
-          logger.warn('OAuth server changed redirect_uri:')
-          logger.warn("  Requested:  #{requested_uri}")
-          logger.warn("  Registered: #{registered_uri}")
-          logger.warn("Using server's registered redirect_uri for token exchange.")
-        end
+        warn_registered_redirect_uri(registered_metadata)
 
         client_info = ClientInfo.new(
-          client_id: data['client_id'],
+          client_id: client_id,
           client_secret: data['client_secret'],
           client_id_issued_at: data['client_id_issued_at'],
           client_secret_expires_at: data['client_secret_expires_at'],
-          metadata: registered_metadata
+          metadata: registered_metadata,
+          # Bound to the authorization server that issued the credentials
+          issuer: server_metadata.issuer,
+          registration_type: 'dynamic'
         )
 
         # Store client info
-        storage.set_client_info(server_url, client_info)
+        store_client_info(client_info)
 
         client_info
       rescue JSON::ParserError => e
-        raise MCPClient::Errors::ConnectionError, "Invalid client registration response: #{e.message}"
+        raise MCPClient::Errors::ConnectionError,
+              "Invalid client registration response: #{describe_parse_error(e, response&.body)}"
       rescue Faraday::Error => e
-        raise MCPClient::Errors::ConnectionError, "Network error during client registration: #{e.message}"
+        raise MCPClient::Errors::ConnectionError,
+              "Network error during client registration: #{safe_error_text(e.message)}"
+      end
+
+      # The authorization server may register a redirect URI other than the
+      # one asked for; the registered value is what the token exchange must
+      # then present (RFC 6749 Section 4.1.3), so say so.
+      # @param registered_metadata [ClientMetadata] the metadata as registered
+      # @return [void]
+      def warn_registered_redirect_uri(registered_metadata)
+        registered_uri = registered_metadata.redirect_uris.first
+        return if registered_uri == redirect_uri
+
+        logger.warn('OAuth server changed redirect_uri:')
+        logger.warn("  Requested:  #{redirect_uri}")
+        logger.warn("  Registered: #{safe_error_text(registered_uri.to_s)}")
+        logger.warn("Using server's registered redirect_uri for token exchange.")
+      end
+
+      # The client id of a registration response, once the response has been
+      # checked field by field against the types RFC 7591 gives them: a
+      # response that names no client has registered nothing, and one whose
+      # fields are of other JSON types would be stored and only crash later —
+      # a `redirect_uris` string asked for its `first`, a
+      # `client_secret_expires_at` string compared with a Unix timestamp. A
+      # registration response is refused here exactly as a token response
+      # without an access token is, before the browser is ever opened.
+      # @param data [Object, nil] the parsed JSON registration response
+      # @return [String] the registered client id
+      # @raise [MCPClient::Errors::ConnectionError] when the response registers no usable client
+      def registered_client_id!(data)
+        if (error = registration_response_error(data))
+          raise MCPClient::Errors::ConnectionError, "Client registration failed: #{error}"
+        end
+
+        data['client_id']
+      end
+
+      # The redirect URIs a registration response registered, defaulting to
+      # the one the registration request asked for when the server echoes
+      # none back (RFC 7591 Section 2 makes redirect_uris an array of
+      # strings; its type is checked before this runs).
+      # @param data [Hash] the parsed JSON registration response
+      # @return [Array<String>]
+      def registered_redirect_uris(data)
+        uris = data['redirect_uris']
+        uris.is_a?(Array) && !uris.empty? ? uris : [redirect_uri]
+      end
+
+      # One Dynamic Client Registration request.
+      # @param server_metadata [ServerMetadata]
+      # @param app_type [String] the application_type to declare
+      # @return [Faraday::Response]
+      def post_registration(server_metadata, app_type)
+        metadata = ClientMetadata.new(
+          redirect_uris: [redirect_uri],
+          token_endpoint_auth_method: 'none', # Public client
+          grant_types: %w[authorization_code refresh_token],
+          response_types: ['code'],
+          scope: resolved_scope,
+          application_type: app_type,
+          **@extra_client_metadata
+        )
+
+        @http_client.post(server_metadata.registration_endpoint) do |req|
+          req.headers['Content-Type'] = 'application/json'
+          req.headers['Accept'] = 'application/json'
+          req.body = metadata.to_h.to_json
+        end
+      end
+
+      # "When a registration request is rejected, clients SHOULD surface a
+      # meaningful error": the RFC 7591 error and description, when given.
+      # @param response [Faraday::Response] the failed registration response
+      # @raise [MCPClient::Errors::ConnectionError]
+      def raise_registration_failure!(response)
+        error = registration_error(response)
+        detail = [error[:error], error[:error_description]].compact.join(': ')
+        raise MCPClient::Errors::ConnectionError,
+              "Client registration failed: HTTP #{response.status}#{" (#{detail})" unless detail.empty?}"
+      end
+
+      # The application_type to register: the host's explicit choice, else
+      # 'native' for loopback and custom-scheme redirect URIs (desktop, CLI,
+      # mobile, locally hosted apps) and 'web' for a remote redirect URI
+      # (MCP 2026-07-28 "Application Type and Redirect URI Constraints").
+      # @return [String]
+      def resolved_application_type
+        return application_type if application_type
+
+        uri = URI.parse(redirect_uri.to_s)
+        return 'native' unless %w[http https].include?(uri.scheme.to_s.downcase)
+
+        loopback_host?(uri.host) ? 'native' : 'web'
+      rescue URI::InvalidURIError
+        'native'
+      end
+
+      # Whether a redirect URI host is a loopback interface: 'localhost', an
+      # RFC 6761 '*.localhost' name (puma-dev, Caddy), or any loopback address
+      # (127.0.0.0/8, ::1, in any spelling). The host is read the way a
+      # resolver reads it — decoded, unbracketed, undotted, and through the
+      # shorthand IPv4 parser — so '127.1', '0x7f.0.0.1', '127.0.0.1.' and
+      # 'app.localhost' register as native like the plain spelling, instead of
+      # being sent for registration as a web client whose HTTP redirect URI the
+      # authorization server may then reject.
+      # @param host [String, nil]
+      # @return [Boolean]
+      def loopback_host?(host)
+        loopback_address?(host.to_s)
+      end
+
+      # The RFC 7591 error of a failed registration response, sanitized for
+      # a log line or exception message.
+      # @param response [Faraday::Response]
+      # @return [Hash] :error and :error_description (nil when absent)
+      def registration_error(response)
+        body = JSON.parse(response.body.to_s)
+        return {} unless body.is_a?(Hash)
+
+        { error: safe_error_text(body['error']), error_description: safe_error_text(body['error_description']) }
+      rescue JSON::ParserError
+        {}
       end
 
       # Build authorization URL
@@ -1006,11 +1754,15 @@ module MCPClient
         # Use the redirect_uri that was actually registered
         registered_redirect_uri = client_info.metadata.redirect_uris.first
 
+        # What this request asks for is what the next step-up challenge has
+        # to be unioned with.
+        @requested_scope = resolved_scope
+
         params = {
           response_type: 'code',
           client_id: client_info.client_id,
           redirect_uri: registered_redirect_uri,
-          scope: resolved_scope,
+          scope: @requested_scope,
           state: state,
           code_challenge: pkce.code_challenge,
           code_challenge_method: pkce.code_challenge_method,
@@ -1018,7 +1770,16 @@ module MCPClient
         }.compact
 
         uri = URI.parse(server_metadata.authorization_endpoint)
-        uri.query = URI.encode_www_form(params)
+        # "The client directs the resource owner to the constructed URI using
+        # an HTTP redirection response... The endpoint URI MAY include an
+        # application/x-www-form-urlencoded formatted query component, which
+        # MUST be retained when adding additional query parameters" (RFC 6749
+        # Section 3.1). An authorization server that identifies a tenant, a
+        # brand or a locale in its endpoint URL loses that identification if
+        # the query is replaced, and sends the user somewhere else entirely.
+        existing_query = uri.query.to_s
+        appended = URI.encode_www_form(params)
+        uri.query = existing_query.empty? ? appended : "#{existing_query}&#{appended}"
         uri.to_s
       end
 
@@ -1032,8 +1793,10 @@ module MCPClient
       def exchange_authorization_code(server_metadata, client_info, code, pkce)
         logger.debug('Exchanging authorization code for access token')
 
-        # Use the redirect_uri that was actually registered, not our requested one
-        registered_redirect_uri = client_info.metadata.redirect_uris.first
+        # The redirect_uri the authorization request was made with (recorded
+        # with the PKCE record), else the registered one
+        recorded_redirect_uri = pkce.redirect_uri if pkce.respond_to?(:redirect_uri)
+        registered_redirect_uri = recorded_redirect_uri || client_info.metadata.redirect_uris.first
 
         params = {
           grant_type: 'authorization_code',
@@ -1044,10 +1807,10 @@ module MCPClient
           resource: server_url
         }
 
-        # Add client_secret if required by token_endpoint_auth_method
-        if client_info.client_secret && client_info.metadata.token_endpoint_auth_method == 'client_secret_post'
-          params[:client_secret] = client_info.client_secret
-        end
+        # The credentials go out the way the authorization server registered
+        # them: in the body for client_secret_post, in an Authorization header
+        # for client_secret_basic (RFC 7591's default).
+        authorization = apply_client_credentials!(params, client_info)
 
         request_body = URI.encode_www_form(params)
 
@@ -1055,6 +1818,7 @@ module MCPClient
           @http_client.post(server_metadata.token_endpoint) do |req|
             req.headers['Content-Type'] = 'application/x-www-form-urlencoded'
             req.headers['Accept'] = 'application/json'
+            req.headers['Authorization'] = authorization if authorization
             req.body = body
           end
         end
@@ -1062,37 +1826,42 @@ module MCPClient
         response = send_token_request.call(request_body)
 
         unless response.success?
-          redirect_hint = extract_redirect_mismatch(response.body)
-
-          if redirect_hint && redirect_hint[:expected] && redirect_hint[:expected] != registered_redirect_uri
-            expected_uri = redirect_hint[:expected]
-            logger.warn(
-              "Token exchange failed: redirect_uri mismatch. Retrying with server's expected value: #{expected_uri}"
-            )
-
-            params[:redirect_uri] = redirect_hint[:expected]
-            retry_body = URI.encode_www_form(params)
-
-            response = send_token_request.call(retry_body)
+          retry_uri = redirect_uri_retry_target(response.body, sent: registered_redirect_uri,
+                                                               recorded: recorded_redirect_uri)
+          if retry_uri
+            params[:redirect_uri] = retry_uri
+            response = send_token_request.call(URI.encode_www_form(params))
           end
         end
 
         unless response.success?
-          raise MCPClient::Errors::ConnectionError, "Token exchange failed: HTTP #{response.status} - #{response.body}"
+          raise MCPClient::Errors::ConnectionError,
+                "Token exchange failed: HTTP #{response.status} - #{safe_body_text(response.body)}"
         end
 
         data = JSON.parse(response.body)
+        # RFC 6749 Section 5.1 gives every field of a successful response a
+        # type; a 200 that breaks one is a protocol error, not a credential.
+        # Storing it would report success and then present a bare "Bearer ",
+        # or crash later capitalizing a token_type that is not a string.
+        if (error = token_response_error(data))
+          raise MCPClient::Errors::ConnectionError, "Token exchange failed: #{error}"
+        end
+
         Token.new(
           access_token: data['access_token'],
-          token_type: data['token_type'] || 'Bearer',
+          token_type: data['token_type'],
           expires_in: data['expires_in'],
           scope: data['scope'],
-          refresh_token: data['refresh_token']
+          refresh_token: data['refresh_token'],
+          issuer: server_metadata.issuer
         )
       rescue JSON::ParserError => e
-        raise MCPClient::Errors::ConnectionError, "Invalid token response: #{e.message}"
+        raise MCPClient::Errors::ConnectionError,
+              "Invalid token response: #{describe_parse_error(e, response&.body)}"
       rescue Faraday::Error => e
-        raise MCPClient::Errors::ConnectionError, "Network error during token exchange: #{e.message}"
+        raise MCPClient::Errors::ConnectionError,
+              "Network error during token exchange: #{safe_error_text(e.message)}"
       end
 
       # Refresh access token
@@ -1104,9 +1873,12 @@ module MCPClient
         logger.debug('Refreshing access token')
 
         server_metadata = discover_authorization_server
-        client_info = storage.get_client_info(server_url)
+        # Registration state is per authorization server (SEP-2352): the
+        # credentials of the server being refreshed at, wherever they are kept.
+        client_info = refresh_client_info(server_metadata&.issuer)
 
         return nil unless server_metadata && client_info
+        return nil unless refresh_permitted?(token, client_info, server_metadata)
 
         params = {
           grant_type: 'refresh_token',
@@ -1115,14 +1887,12 @@ module MCPClient
           resource: server_url
         }
 
-        # Add client_secret if required by token_endpoint_auth_method
-        if client_info.client_secret && client_info.metadata.token_endpoint_auth_method == 'client_secret_post'
-          params[:client_secret] = client_info.client_secret
-        end
+        authorization = apply_client_credentials!(params, client_info)
 
         response = @http_client.post(server_metadata.token_endpoint) do |req|
           req.headers['Content-Type'] = 'application/x-www-form-urlencoded'
           req.headers['Accept'] = 'application/json'
+          req.headers['Authorization'] = authorization if authorization
           req.body = URI.encode_www_form(params)
         end
 
@@ -1132,34 +1902,167 @@ module MCPClient
         end
 
         data = JSON.parse(response.body)
+        # A refresh response that breaks RFC 6749 Section 5.1 — no
+        # access_token bytes, or a field of the wrong JSON type — is a failed
+        # refresh: the still-valid token stays in storage rather than being
+        # overwritten with something that would go out as "Bearer ", and
+        # nothing is raised out of the request path that a still-valid token
+        # could have served.
+        if (error = token_response_error(data))
+          logger.warn("Token refresh failed: #{error}; keeping the stored token")
+          return nil
+        end
+
         new_token = Token.new(
           access_token: data['access_token'],
-          token_type: data['token_type'] || 'Bearer',
+          token_type: data['token_type'],
           expires_in: data['expires_in'],
           scope: data['scope'],
-          refresh_token: data['refresh_token'] || token.refresh_token
+          refresh_token: data['refresh_token'] || token.refresh_token,
+          issuer: server_metadata.issuer
         )
 
-        storage.set_token(server_url, new_token)
-        new_token
+        accept_refreshed_token(new_token, server_metadata.issuer)
       rescue JSON::ParserError => e
-        logger.warn("Invalid token refresh response: #{describe_parse_error(e)}")
+        logger.warn("Invalid token refresh response: #{describe_parse_error(e, response&.body)}")
         nil
       rescue Faraday::Error => e
-        logger.warn("Network error during token refresh: #{e.message}")
+        logger.warn("Network error during token refresh: #{safe_error_text(e.message)}")
         nil
       end
 
+      # A refresh is two events with an unbounded gap between them: the
+      # request goes to the authorization server the token came from, and the
+      # response arrives at a client whose authorization server may have
+      # changed meanwhile — updated protected resource metadata, a 401
+      # challenge, another provider sharing the storage. So the check
+      # {#refresh_permitted?} made before the request is made again over the
+      # response, and it covers the write as much as the presentation: bytes
+      # issued by a server that is no longer this resource's would otherwise
+      # be stored over the token of the server that IS in use (resurrecting,
+      # in the challenge case, a token that was just retired) and be handed
+      # straight back to the caller without ever passing the issuer check the
+      # stored-token path makes.
+      # @param new_token [Token] the token the refresh response carried
+      # @param issuer [String] the authorization server the refresh was made with
+      # @return [Token, nil] the token, or nil when it is no longer this resource's to keep
+      def accept_refreshed_token(new_token, issuer)
+        unless refresh_target_current?(issuer)
+          logger.warn('Discarding the refreshed token: the authorization server changed while the refresh ' \
+                      'was in flight')
+          return nil
+        end
+
+        store_token(new_token)
+        new_token
+      end
+
+      # Whether a refresh made with an authorization server is still this
+      # resource's: that server is the one in use now (an unresolved or
+      # refused challenge means it is unknown, which is not "still A"), and
+      # the token slot the response would be written to does not already hold
+      # a token of another server.
+      # @param issuer [String] the authorization server the refresh was made with
+      # @return [Boolean]
+      def refresh_target_current?(issuer)
+        return false unless current_issuer_for_tokens == issuer
+
+        stored = stored_token_or_nil
+        return true unless stored.respond_to?(:issuer) && stored.issuer
+
+        stored.issuer == issuer
+      end
+
+      # The credentials a refresh presents are the ones an authorization
+      # request would be made with: the two paths must not disagree about
+      # which record answers for an authorization server. The resource slot
+      # is the slot a host writes to, so credentials rotated there — a new
+      # secret under the same client id — are never overruled by the older
+      # copy kept under that authorization server's own key; the copy answers
+      # only when the slot holds credentials of some other server.
+      # @param issuer [String, nil] the authorization server the refresh is made at
+      # @return [ClientInfo, nil]
+      def refresh_client_info(issuer)
+        in_use = stored_client_info
+        usable = in_use.nil? || in_use.client_secret_expired? ? nil : in_use
+        return usable if usable && answers_for_issuer?(usable, issuer)
+
+        registration_for_issuer(issuer) || in_use
+      end
+
+      # A refresh token (and a client secret) is only ever presented to the
+      # authorization server that issued it (MCP 2026-07-28: registration
+      # state and tokens are per authorization server).
+      # @return [Boolean]
+      def refresh_permitted?(token, client_info, server_metadata)
+        issuer = token.respond_to?(:issuer) ? token.issuer : nil
+        if issuer && issuer != server_metadata.issuer
+          logger.warn('Not refreshing the token: the authorization server changed since it was issued')
+          return false
+        end
+        # A token that does not say where it came from is not refreshed once
+        # the authorization server is known to have changed.
+        if issuer.nil? && @authorization_server_switched
+          logger.warn('Not refreshing the token: it records no issuer and the authorization server changed')
+          return false
+        end
+        if client_info.respond_to?(:issuer) && client_info.issuer && !client_info.portable? &&
+           client_info.issuer != server_metadata.issuer
+          logger.warn('Not refreshing the token: the client credentials belong to another authorization server')
+          return false
+        end
+        true
+      end
+
+      # The redirect_uri to retry a failed code exchange with, if any.
+      #
+      # RFC 6749 Section 4.1.3 redeems the code with the redirect_uri of the
+      # authorization request, which is recorded on the PKCE record. Where it
+      # was recorded, a value parsed out of the peer's error text is never
+      # substituted for it: redeeming with a URI this client never sent is not
+      # a recovery, so the contradiction is surfaced. Only legacy records made
+      # before the URI was recorded keep the older retry-with-the-server's-value
+      # behaviour, where there is nothing authoritative to contradict.
+      # @param body [String] the token endpoint's error body
+      # @param sent [String, nil] the redirect_uri the request was made with
+      # @param recorded [String, nil] the redirect_uri recorded for this authorization request
+      # @return [String, nil] the URI to retry with, or nil to keep the failure
+      # @raise [MCPClient::Errors::ConnectionError] when the error contradicts the recorded URI
+      def redirect_uri_retry_target(body, sent:, recorded:)
+        expected = extract_redirect_mismatch(body)&.fetch(:expected, nil)
+        return nil unless expected && expected != sent
+
+        if recorded
+          raise MCPClient::Errors::ConnectionError,
+                'Token exchange failed: the authorization server expected a redirect_uri other than the one the ' \
+                "authorization request was made with (#{recorded}); restart the authorization"
+        end
+
+        logger.warn("Token exchange failed: redirect_uri mismatch. Retrying with server's expected value: " \
+                    "#{safe_error_text(expected)}")
+        expected
+      end
+
       # Extract redirect_uri mismatch details from an OAuth error response
+      #
+      # The description is a peer's bytes, and nothing about them guarantees
+      # valid UTF-8: `String#match` raises `ArgumentError` on a lone `\xFF`,
+      # out of the very rescue path that exists to turn a 400 into a
+      # ConnectionError. It is made decodable before it is matched — the
+      # bounded, printable form of {#safe_error_text} would do for a message
+      # but not for a pattern, which has to see the URIs the peer actually
+      # wrote.
       # @param body [String] Raw HTTP response body
       # @return [Hash, nil] Hash with :sent and :expected URIs if mismatch detected
       def extract_redirect_mismatch(body)
-        data = JSON.parse(body)
+        data = JSON.parse(body.to_s)
+        return nil unless data.is_a?(Hash)
+
         error = data['error'] || data[:error]
         return nil unless error == 'unauthorized_client'
 
-        description = data['error_description'] || data[:error_description]
-        return nil unless description.is_a?(String)
+        description = matchable_peer_text(data['error_description'] || data[:error_description])
+        return nil unless description
 
         match = description.match(%r{You sent\s+(https?://\S+)[,.]?\s+and we expected\s+(https?://\S+)}i)
         return nil unless match
