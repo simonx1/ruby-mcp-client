@@ -380,6 +380,7 @@ module MCPClient
         raise MCPClient::Errors::ConnectionError, "Server returned an invalid server/discover result (#{result.class})"
       end
 
+      reject_input_required_discover!(result)
       versions = result['supportedVersions']
       unless versions.is_a?(Array) && versions.all?(String)
         raise MCPClient::Errors::ConnectionError, 'server/discover result has no supportedVersions list'
@@ -404,6 +405,26 @@ module MCPClient
       info = result.dig('_meta', META_SERVER_INFO)
       @server_info = info if info.is_a?(Hash)
       result
+    end
+
+    # An InputRequiredResult is defined only for tools/call, resources/read
+    # and prompts/get (MCP 2026-07-28 basic/patterns/mrtr "Supported
+    # Requests"). server/discover is not one of them, so an input_required
+    # discover answer is invalid and MUST NOT be applied or cached: the probe
+    # would otherwise adopt a protocol version out of an unfinished result
+    # and hand that result back as the first heartbeat. The rejection is a
+    # ConnectionError, not an InvalidResultError, because a server answering
+    # server/discover at all is modern — it must never be mistaken for a
+    # legacy server and retried with the initialize handshake.
+    # @param result [Hash] the server/discover result
+    # @return [void]
+    # @raise [MCPClient::Errors::ConnectionError] if the result is an InputRequiredResult
+    def reject_input_required_discover!(result)
+      return unless MCPClient::JsonRpcCommon.result_type(result) == 'input_required'
+
+      raise MCPClient::Errors::ConnectionError,
+            'Server answered server/discover with an input_required result; multi round-trip requests are ' \
+            "only valid for #{MRTR_METHODS.join(', ')}"
     end
 
     # Validate a log level name (logging utility levels).
@@ -795,7 +816,8 @@ module MCPClient
     # handlers and retry the original request — as an independent request
     # with a new id — carrying inputResponses keyed like the requests and
     # the opaque requestState echoed verbatim (omitted when the server sent
-    # none). A result without inputRequests is retried immediately.
+    # none). A result without inputRequests asks for nothing this client can
+    # fulfil, so it is retried after a growing pause (INPUT_RETRY_DELAY).
     # @param method [String] the JSON-RPC method
     # @param params [Hash] the original params
     # @param timeout [Numeric, nil] per-request timeout

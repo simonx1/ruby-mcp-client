@@ -105,10 +105,14 @@ RSpec.describe 'MCP 2026-07-28 multi round-trip requests' do
       expect(responses['r']).to eq({ 'roots' => [{ 'uri' => 'file:///p', 'name' => 'p' }] })
     end
 
-    it 'retries immediately when only requestState is present' do
+    # The retry is paced (INPUT_RETRY_DELAY), not immediate; what this pins is
+    # that a requestState-only answer is retried at all, carrying the state
+    # and no inputResponses. The pacing itself is covered further down.
+    it 'retries a requestState-only answer with the state and no inputResponses' do
       sent = script_stdio(server, [{ 'result' => discover_result },
                                    { 'result' => input_required(nil, state: 'wait-for-oob') },
                                    { 'result' => { 'content' => [] } }])
+      allow(server).to receive(:sleep)
 
       server.call_tool('t', {})
 
@@ -158,14 +162,23 @@ RSpec.describe 'MCP 2026-07-28 multi round-trip requests' do
                                    { 'result' => { 'messages' => [] } }])
 
       contents = server.read_resource('file:///r')
-      prompt = server.get_prompt('p', {})
+      prompt = server.get_prompt('p', { 'topic' => 'ruby' })
 
       expect(contents.first.text).to eq('ok')
       expect(prompt).to eq({ 'messages' => [] })
       expect(sent.map { |r| r['method'] })
         .to eq(%w[server/discover resources/read resources/read prompts/get prompts/get])
       expect(sent[2]['params']['uri']).to eq('file:///r')
-      expect(sent[4]['params']['name']).to eq('p')
+      expect(sent[2]['params']['inputResponses'])
+        .to eq({ 'a' => { 'action' => 'accept', 'content' => { 'name' => 'x' } } })
+      expect(sent[2]['params']['requestState']).to eq('opaque-state')
+      # The prompts/get retry is a continuation, not the original request sent
+      # again: it keeps the name and arguments AND carries the round trip.
+      expect(sent[4]['params']).to include('name' => 'p', 'arguments' => { 'topic' => 'ruby' },
+                                           'requestState' => 'opaque-state')
+      expect(sent[4]['params']['inputResponses'])
+        .to eq({ 'b' => { 'action' => 'accept', 'content' => { 'name' => 'x' } } })
+      expect(sent[3]['params']).not_to have_key('inputResponses')
     end
 
     it 'rejects an input_required result on a method that does not support it' do
@@ -175,16 +188,30 @@ RSpec.describe 'MCP 2026-07-28 multi round-trip requests' do
       expect { server.list_tools }.to raise_error(MCPClient::Errors::InvalidResultError, /input_required/)
     end
 
-    it 'bounds the number of round trips' do
+    it 'documents ten as the round-trip ceiling' do
+      expect(MCPClient::JsonRpcCommon::MAX_INPUT_ROUND_TRIPS).to eq(10)
+    end
+
+    it 'completes on the tenth round trip' do
       server.on_elicitation_request { |_k, _p| { 'action' => 'accept', 'content' => { 'name' => 'x' } } }
       responses = [{ 'result' => discover_result }] +
-                  Array.new(MCPClient::JsonRpcCommon::MAX_INPUT_ROUND_TRIPS + 2) do
-                    { 'result' => input_required({ 'a' => elicit_request }) }
-                  end
+                  Array.new(10) { { 'result' => input_required({ 'a' => elicit_request }) } } +
+                  [{ 'result' => { 'content' => [{ 'type' => 'text', 'text' => 'finally' }] } }]
+      sent = script_stdio(server, responses)
+
+      expect(server.call_tool('t', {})['content'].first['text']).to eq('finally')
+      expect(sent.count { |r| r['method'] == 'tools/call' }).to eq(11)
+    end
+
+    it 'gives up on the eleventh round trip' do
+      server.on_elicitation_request { |_k, _p| { 'action' => 'accept', 'content' => { 'name' => 'x' } } }
+      responses = [{ 'result' => discover_result }] +
+                  Array.new(12) { { 'result' => input_required({ 'a' => elicit_request }) } }
       sent = script_stdio(server, responses)
 
       expect { server.call_tool('t', {}) }.to raise_error(MCPClient::Errors::InputRequiredError, /round trips/)
-      expect(sent.count { |r| r['method'] == 'tools/call' }).to eq(MCPClient::JsonRpcCommon::MAX_INPUT_ROUND_TRIPS + 1)
+      # Eleven requests: the original plus the ten permitted continuations.
+      expect(sent.count { |r| r['method'] == 'tools/call' }).to eq(11)
     end
 
     it 'raises InputRequiredError without retrying when an input request cannot be fulfilled' do

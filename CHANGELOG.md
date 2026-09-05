@@ -16,7 +16,9 @@ metadata). Each feature lands in its own PR; this section accumulates them.
   request as a new request (new id, same params) carrying `inputResponses`
   keyed like the requests and the opaque `requestState` echoed verbatim
   (omitted when the server sent none). A result without `inputRequests` is
-  retried immediately; the round trip never leaks into other requests.
+  retried after a short pause (see below); the round trip never leaks into
+  other requests, and every attempt is rebuilt from the caller's own params,
+  so a continuation field the server stops sending is dropped.
 - **Capabilities.** Modern requests once again declare `elicitation`
   (`form` and `url`), `roots` (without `listChanged`) and `sampling` (with
   `tools` when opted in) when the corresponding handler is registered. Only
@@ -43,7 +45,11 @@ metadata). Each feature lands in its own PR; this section accumulates them.
   handler error) or a malformed `inputRequests` raise
   `MCPClient::Errors::InputRequiredError` (exposing `input_requests` and
   `request_state`) without a retry; `input_required` on any other method is
-  an `InvalidResultError`.
+  an `InvalidResultError`. `server/discover` is not one of the three methods
+  that may be answered with `input_required` either: such an answer is
+  refused before any protocol version or capability it carries is applied or
+  cached, so a probe can never adopt a version out of an unfinished result
+  and hand that result back as the first heartbeat.
 
 ### Custom headers from tool parameters (`x-mcp-header`)
 
