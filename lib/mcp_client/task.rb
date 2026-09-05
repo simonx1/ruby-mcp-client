@@ -20,7 +20,7 @@ module MCPClient
     TERMINAL_STATUSES = %w[completed failed cancelled].freeze
 
     attr_reader :task_id, :status, :status_message, :created_at, :last_updated_at, :ttl, :poll_interval, :server,
-                :input_requests, :result, :error, :session_epoch, :task_generation
+                :input_requests, :result, :error, :session_epoch, :task_generation, :called_tool
 
     # 2026-07-28 names of the retention and polling hints (milliseconds).
     alias ttl_ms ttl
@@ -291,6 +291,21 @@ module MCPClient
     def with_task_generation(generation)
       copy = dup
       copy.instance_variable_set(:@task_generation, generation)
+      copy
+    end
+
+    # A copy of this handle naming the tool definition the request that
+    # created the task went out under, so the result the task delivers can be
+    # validated against the very schema a synchronous answer would have been
+    # (see {MCPClient::Client#get_task_result}). A task id alone identifies no
+    # tool, so only a handle carries this.
+    # @param tool [MCPClient::Tool, nil] the definition the creating tools/call carried
+    # @return [Task]
+    def with_called_tool(tool)
+      return self unless tool
+
+      copy = dup
+      copy.instance_variable_set(:@called_tool, tool)
       copy
     end
 

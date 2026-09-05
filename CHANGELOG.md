@@ -7,6 +7,60 @@ metadata). Each feature lands in its own PR; this section accumulates them.
 
 ### Tasks extension (`io.modelcontextprotocol/tasks`)
 
+- **A cleanup no longer restarts the lifetime counters (round 39).**
+  `Client#cleanup` dropped everything the task registry held, the per-session
+  counter that numbers task lifetimes included. Ending a connection is not
+  ending a session — a 2026-07-28 HTTP transport is sessionless and its tasks
+  outlive a cleanup — so the next creation in that session was numbered from
+  zero again: a task handle retained across the cleanup named the task that
+  replaced its own, and `cancel_task` through it cancelled the replacement.
+  Meanwhile, before any replacement existed, `get_task` through that handle
+  raised `TaskReplacedError` for a task still running on the server. What an
+  id names is no longer bookkeeping that a cleanup forgets: the lifetimes and
+  their counters stay (a session that really ends still takes its own with it,
+  and the prune still bounds the ids of tasks nothing tracks), while the
+  answered keys, pending answers and in-flight holds are dropped as before.
+- **A task-delivered result is validated against the tool that produced it
+  (round 39).** `call_tool_as_task` handed back a remote handle without the
+  definition its creating `tools/call` went out under, and `get_task_result`
+  then returned whatever the task delivered: with `validate_structured_content:
+  :strict`, a `structuredContent` its tool's `outputSchema` forbids came back
+  unchecked, where the same call through `call_tool` raised `ValidationError`.
+  The handle a creation returns now carries that definition — the one the
+  request was answered under, which a mid-call HeaderMismatch refresh may have
+  replaced — and `get_task_result` validates against it, on the legacy
+  `tasks/result` path too. A task named by a bare id identifies no tool and is
+  returned unvalidated, as before.
+- **A finished legacy task leaves nothing on the books (round 39).** A
+  successful `tasks/result`, and a `tasks/cancel` answered with a terminal
+  task, left the task's bookkeeping registered as live. Since the prune exempts
+  ids whose bookkeeping is live, a host that submitted tasks and read their
+  results — never calling `get_task` — grew both registries without bound and
+  scanned an ever longer lifetime map on every creation. Both paths now release
+  the task's bookkeeping the way a terminal poll does; an acknowledgement that
+  still reports the task working leaves it alone.
+- **An expired task is a missing task on `tasks/update` and `tasks/cancel`
+  (round 39).** A 2026-07-28 server answering `{"code":-32602,"message":"Task
+  has expired"}` produced a generic `TaskError`, and the task's bookkeeping
+  survived, although the legacy matcher has always read an expiry as the task
+  being gone. The modern matcher now agrees, so the documented `TaskNotFound`
+  is raised and the bookkeeping is released. A `-32602` that rejects the
+  supplied `inputResponses` is still the request's failure, not the task's.
+- **The polling pace a server asks for is kept (round 39).** Every
+  `pollIntervalMs` was capped at one hour, so a task paced at two hours was
+  polled twice as often as its server asked — the opposite of what the polling
+  SHOULD is for. The bound is now a day: it still catches an interval the clock
+  cannot represent (or one that is merely absurd) without shortening a pace a
+  server can plausibly mean.
+- **A pre-write refusal keeps its type through the transports (round 39).** The
+  guard that holds a task request to the lifetime it is about is checked
+  immediately before the wire; a creation landing between the request path's
+  own check and that one made the transports raise `TaskReplacedError` from
+  inside their broad rescues, which turned it into a `TransportError` (stdio)
+  or a `ToolCallError` (HTTP, SSE). A definite "this was not sent" then reached
+  `update_task` as an ambiguous transport failure, which keeps the answers
+  pending for a task that no longer exists. The three transports now re-raise
+  it unchanged, as they already do for a session that ended under the request.
 - **The lifetime cap forgets tasks that ended, never one that is running
   (verification round).** A creation recorded the id's lifetime but no
   bookkeeping for the task it started, and the prune exempts only ids whose

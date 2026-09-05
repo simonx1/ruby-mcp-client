@@ -145,7 +145,12 @@ module MCPClient
             note_response_received_at if respond_to?(:note_response_received_at, true)
             parse_direct_response(response)
           end
-        rescue MCPClient::Errors::ConnectionError, MCPClient::Errors::TransportError, MCPClient::Errors::ServerError
+        # A pre-write refusal keeps its type: the late pin check inside the
+        # POST turns a request down (or the caller's own guard does, see
+        # {MCPClient::SessionPin#guarded_writes}) and nothing was written,
+        # which is not an error of executing the request.
+        rescue MCPClient::Errors::ConnectionError, MCPClient::Errors::TransportError,
+               MCPClient::Errors::ServerError, MCPClient::Errors::TaskReplacedError
           raise
         rescue JSON::ParserError => e
           raise MCPClient::Errors::TransportError, "Invalid JSON response from server: #{describe_parse_error(e)}"

@@ -62,8 +62,11 @@ module MCPClient
           # names the task this call started, so a handle of the task it
           # replaced never updates, cancels or waits for the one that
           # answers to the id now.
+          # The handle names the tool the task is running, so the result it
+          # delivers is validated against that tool's outputSchema (see
+          # #get_task_result) exactly as a synchronous answer would be.
           started_task_lifetime(MCPClient::Task.from_create_result(result, server: srv, session_epoch: epoch),
-                                srv, epoch)
+                                srv, epoch).with_called_tool(tool)
         rescue MCPClient::Errors::ServerError, MCPClient::Errors::TransportError,
                MCPClient::Errors::ConnectionError => e
           raise MCPClient::Errors::TaskError, "Error creating task for tool '#{tool_name}': #{e.message}"
@@ -163,11 +166,14 @@ module MCPClient
       # CallToolResult hash with 'content'/'isError'/'structuredContent'); it is
       # NOT wrapped in a Task. Blocks on the server until the task is terminal.
       #
-      # NOTE: structured-content validation (see #validate_structured_content!)
-      # does not cover task-delivered results yet: a task ID alone does not
-      # identify which tool (and therefore which outputSchema) produced the
-      # result, and the client keeps no task-to-tool registry. Callers who need
-      # validation here can run MCPClient::SchemaValidator.validate themselves.
+      # The result is validated against the tool's outputSchema (see
+      # #validate_structured_content!) exactly as a synchronous answer to the
+      # same call would be, when the task is named with the handle
+      # #call_tool_as_task returned: the handle carries the definition its
+      # creating request went out under. A task ID alone identifies no tool
+      # (and therefore no outputSchema), so a caller that kept only the id
+      # gets the result unvalidated and can run
+      # MCPClient::SchemaValidator.validate themselves.
       # @param task_id [String, MCPClient::Task] the task; passing the Task
       #   handle returned by #call_tool_as_task routes to its own server
       # @param server [Integer, String, Symbol, MCPClient::ServerBase, nil] server selector
@@ -187,7 +193,7 @@ module MCPClient
         ensure_task_capability!(srv, 'result', strict: true)
         # MCP 2026-07-28 removed tasks/result: the result is delivered inline
         # by tasks/get once the task is terminal.
-        return task_outcome(wait_for_task(task_id, server: srv)) if modern_server?(srv)
+        return validated_task_result(task_id, task_outcome(wait_for_task(task_id, server: srv))) if modern_server?(srv)
 
         # The result of the task the handle names, in the session it was seen
         # in: the request is pinned to that session and refused once it has
@@ -202,7 +208,11 @@ module MCPClient
           # The result of the task that was asked for, not of the one a
           # creation gave the id to while it was in flight.
           verify_task_lifetime!(pin)
-          result
+          # The task is over: nothing of its bookkeeping may colour a later
+          # task the server names with the same id, and nothing keeps it on
+          # the books either.
+          forget_task_keys(srv, task_id, epoch: epoch, pin: pin)
+          validated_task_result(handle, result)
         rescue MCPClient::Errors::ServerError => e
           raise if e.protocol_error?
 
@@ -279,7 +289,13 @@ module MCPClient
           verify_task_lifetime!(pin)
           return cancelled_task_handle(task, task_id, srv, epoch) if modern_server?(srv)
 
-          MCPClient::Task.from_json(result, server: srv, session_epoch: epoch)
+          cancelled = MCPClient::Task.from_json(result, server: srv, session_epoch: epoch)
+          # A legacy cancellation that answers with a terminal task ended it:
+          # its bookkeeping goes with it, exactly as a terminal poll's does.
+          # An acknowledgement that still reports the task working leaves it
+          # alone — the wait following it still owes the server its answers.
+          forget_task_keys(srv, task_id, epoch: epoch, pin: pin) if cancelled.terminal?
+          cancelled
         rescue MCPClient::Errors::ServerError => e
           raise if e.protocol_error?
           # A terminal task cannot be cancelled (-32602); that is an error, not a

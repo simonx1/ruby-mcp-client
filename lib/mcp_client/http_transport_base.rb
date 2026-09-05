@@ -518,7 +518,12 @@ module MCPClient
 
       begin
         exchange_jsonrpc(request, timeout: timeout, extra_headers: extra_headers)
-      rescue MCPClient::Errors::ConnectionError, MCPClient::Errors::TransportError, MCPClient::Errors::ServerError
+      # A pre-write refusal keeps its type: the late pin check inside
+      # #send_http_request turns a request down (or the caller's own guard
+      # does, see {MCPClient::SessionPin#guarded_writes}) and nothing was
+      # written, which is not an error of executing the request.
+      rescue MCPClient::Errors::ConnectionError, MCPClient::Errors::TransportError,
+             MCPClient::Errors::ServerError, MCPClient::Errors::TaskReplacedError
         raise
       rescue JSON::ParserError => e
         raise MCPClient::Errors::TransportError, "Invalid JSON response from server: #{describe_parse_error(e)}"

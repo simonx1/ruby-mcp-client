@@ -69,14 +69,22 @@ module MCPClient
       end
 
       # Forget every task's bookkeeping (the client is being cleaned up).
+      #
+      # What an id names is not bookkeeping and does not go with it. Ending a
+      # connection is not ending a session — a 2026-07-28 HTTP transport is
+      # sessionless, and its tasks outlive a cleanup — so the lifetimes and,
+      # above all, the session counters that number them stay: restarting a
+      # counter would hand a task created after the cleanup the number a
+      # handle from before it still names, and that handle would then update
+      # or cancel the task that replaced its own. A session that does end
+      # takes its lifetimes with it as before (see {#drop_ended_session_state}),
+      # and the ids of tasks nothing tracks any more are pruned (see
+      # {#prune_task_lifetimes}), so what is kept stays bounded.
       # @return [void]
       def clear_task_states
         answered_keys_mutex.synchronize do
           @task_states = nil
           @in_flight_keys = nil
-          @task_session_epochs = nil
-          @task_lifetimes = nil
-          @task_lifetime_counters = nil
         end
       end
 

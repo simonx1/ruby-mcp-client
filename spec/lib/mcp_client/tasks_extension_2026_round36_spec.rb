@@ -264,6 +264,53 @@ RSpec.describe 'MCP 2026-07-28 tasks extension — round 36' do
                                 name: 'cleanup-test')
     end
 
+    def tool_list
+      { 'tools' => [{ 'name' => 'slow', 'description' => 'd', 'inputSchema' => { 'type' => 'object' } }] }
+    end
+
+    # A sessionless 2026-07-28 Streamable HTTP server that turns tools/call
+    # into a task and answers its polls: one input request, then the result.
+    # Every creation hands out the same id — a server may name a new task
+    # with the id of one that is over.
+    def streamable_task_server
+      @sent = []
+      polls = 0
+      stub_request(:post, url).to_return do |request|
+        body = JSON.parse(request.body)
+        @sent << body
+        result = case body['method']
+                 when 'server/discover' then discover_result
+                 when 'tools/list' then tool_list
+                 when 'tools/call' then create_result.merge('pollIntervalMs' => 1000)
+                 when 'tasks/get'
+                   polls += 1
+                   if polls > 2
+                     detailed_task(status: 'completed', poll_ms: 1000,
+                                   'result' => { 'content' => [], 'isError' => false })
+                   else
+                     detailed_task(status: 'input_required', poll_ms: 1000,
+                                   'inputRequests' => { 'k1' => elicit_request })
+                   end
+                 else {}
+                 end
+        json_response(body['id'], result)
+      end
+      streamable(:modern)
+    end
+
+    # What the client actually put on the wire.
+    def sent_methods(method)
+      (@sent || []).select { |request| request['method'] == method }
+    end
+
+    # A wait whose clock only moves when the client sleeps: one poll, then
+    # the budget is gone.
+    def fake_clock(client)
+      now = 0.0
+      allow(client).to receive(:monotonic_time) { now }
+      allow(client).to receive(:sleep) { |seconds| now += seconds }
+    end
+
     it 'leaves the session epoch alone for a sessionless 2026-07-28 streamable transport' do
       stub_modern
       server = streamable(:modern)
@@ -298,28 +345,59 @@ RSpec.describe 'MCP 2026-07-28 tasks extension — round 36' do
       expect(server.session_epoch).to be > epoch
     end
 
-    it 'keeps the answered keys of a task that outlives a sessionless reconnect' do
-      stub_modern
-      server = streamable(:modern)
-      client = client_for(server)
-      server.connect
-      client.send(:remember_answered_keys, server, 'task-1', ['k1'])
+    it 'answers an input request once across a sessionless reconnect' do
+      handled = 0
+      client = client_for(streamable_task_server,
+                          elicitation_handler: lambda { |_m, _s|
+                            handled += 1
+                            { action: 'accept', content: { 'n' => 'x' } }
+                          })
+      handle = client.call_tool_as_task('slow', {})
+      # The first wait answers k1 and then runs out of budget: the poll
+      # interval the server asks for is longer than what is left of it.
+      fake_clock(client)
+      expect { client.wait_for_task(handle, timeout: 0.5) }
+        .to raise_error(MCPClient::Errors::TaskError, /timed out/i)
+      expect(handled).to eq(1)
 
-      server.cleanup
+      handle.server.cleanup
 
-      expect(client.send(:answered_task_keys, server, 'task-1')).to include('k1')
+      # The connection ended, the session did not: the second wait sees the
+      # very same k1 and must not answer it again.
+      expect(client.wait_for_task(handle)).to be_completed
+      expect(handled).to eq(1)
+      expect(sent_methods('tasks/update').size).to eq(1)
     end
 
-    it 'keeps a task handle of a sessionless server usable after a reconnect' do
-      stub_modern
-      server = streamable(:modern)
-      client = client_for(server)
-      server.connect
-      handle = MCPClient::Task.new(task_id: 'task-1', status: 'working', server: server, modern: true)
+    it 'keeps a creation-stamped handle usable after a sessionless reconnect' do
+      client = client_for(streamable_task_server)
+      handle = client.call_tool_as_task('slow', {})
 
-      server.cleanup
+      client.cleanup
 
-      expect(client.send(:handle_session_epoch, handle, server, 'updating')).to eq(handle.session_epoch)
+      # Nothing has taken the id: the task is still the server's, and the
+      # handle still names it.
+      expect(client.get_task(handle).task_id).to eq('task-1')
+      expect(sent_methods('tasks/get').size).to eq(1)
+    end
+
+    it 'refuses a handle whose task id a creation reused after a client cleanup' do
+      client = client_for(streamable_task_server)
+      handle = client.call_tool_as_task('slow', {})
+
+      client.cleanup
+
+      # The task expired and the server handed the id to another one. The
+      # lifetime numbers of a session never restart, so the replacement is
+      # not what the old handle names.
+      replacement = client.call_tool_as_task('slow', {})
+      expect(replacement.task_generation).not_to eq(handle.task_generation)
+      expect { client.cancel_task(handle) }.to raise_error(MCPClient::Errors::TaskReplacedError)
+      expect(sent_methods('tasks/cancel')).to be_empty
+      # And the guard is not simply refusing everything: the task the id
+      # names now is cancellable through its own handle.
+      expect(client.cancel_task(replacement).status).to eq('working')
+      expect(sent_methods('tasks/cancel').size).to eq(1)
     end
   end
 end

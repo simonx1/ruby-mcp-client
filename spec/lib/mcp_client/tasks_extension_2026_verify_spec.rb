@@ -340,16 +340,18 @@ RSpec.describe 'MCP 2026-07-28 tasks extension — verification round' do
   end
 
   describe 'the lifetime pin a real transport enforces' do
-    # The transport's own wire path: only send_request is stubbed, so the
-    # pre-write check every built-in transport makes runs for real.
+    # The transport's own wire path, down to the write itself: only the pipe
+    # is substituted, so every pre-write check the transport makes — the one
+    # in the same critical section as the write included — runs for real.
     def wired(server)
       sent = []
       allow(server).to receive(:connect).and_return(true)
       allow(server).to receive(:start_reader)
       allow(server).to receive(:start_stderr_reader)
       allow(server).to receive(:ensure_initialized).and_return(true)
-      server.instance_variable_set(:@stdin, double('stdin', puts: nil, flush: nil, closed?: true, close: nil))
-      allow(server).to receive(:send_request) { |req| sent << req }
+      pipe = double('stdin', flush: nil, closed?: false, close: nil)
+      allow(pipe).to receive(:puts) { |line| sent << JSON.parse(line) }
+      server.instance_variable_set(:@stdin, pipe)
       allow(server).to receive(:wait_response) { |id, **_| { 'jsonrpc' => '2.0', 'id' => id, 'result' => {} } }
       sent
     end
@@ -365,6 +367,27 @@ RSpec.describe 'MCP 2026-07-28 tasks extension — verification round' do
       expect { client.update_task(handle, { 'k1' => accept }) }
         .to raise_error(MCPClient::Errors::TaskError, /new task with this id/i)
       expect(sent).to be_empty
+    end
+
+    it 'writes nothing when a creation lands between the last two checks' do
+      client = client_for
+      negotiated
+      handle = creation(client)
+      sent = wired(stdio)
+      # Past the check the request path makes before it builds the request,
+      # and before the one the transport makes under the write lock.
+      allow(stdio).to receive(:build_jsonrpc_request).and_wrap_original do |original, *args, **kwargs|
+        creation(client)
+        original.call(*args, **kwargs)
+      end
+
+      # The refusal keeps its type on the way up, so the update takes its
+      # replacement branch: a definite "they were discarded", never the
+      # ambiguous transport failure a wrapped refusal would report.
+      expect { client.update_task(handle, { 'k1' => accept }) }
+        .to raise_error(MCPClient::Errors::TaskError, /new task with this id .* discarded/im)
+      expect(sent).to be_empty
+      expect(client.send(:task_state, stdio, 'task-1')[:pending_update]).to be_nil
     end
 
     it 'writes the update of a task nothing replaced' do

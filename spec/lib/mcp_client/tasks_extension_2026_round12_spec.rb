@@ -100,10 +100,28 @@ RSpec.describe 'MCP 2026-07-28 tasks extension — round 12' do
   end
 
   it 'drives a wait from the standalone client entry point' do
-    script = "require 'mcp_client/client'; " \
-             "task = MCPClient::Task.completed_locally({ 'content' => [] }); " \
-             'client = MCPClient::Client.new(mcp_server_configs: [], logger: Logger.new(File::NULL)); ' \
-             "exit(client.send(:task_state, Object.new, 't')[:answered].is_a?(Set) ? 0 : 3)"
+    # A public wait and a public result read, through `mcp_client/client`
+    # alone: everything the task path reaches for (Set, Time, the task
+    # modules) has to come with that one require.
+    script = <<~RUBY
+      require 'mcp_client/client'
+      ext = MCPClient::JsonRpcCommon::TASKS_EXTENSION
+      server = Object.new
+      def server.modern? = true
+      def server.capability?(*) = true
+      def server.capabilities
+        { 'tools' => {}, 'extensions' => { MCPClient::JsonRpcCommon::TASKS_EXTENSION => {} } }
+      end
+      def server.rpc_request(_method, _params, timeout: nil)
+        now = Time.now.utc.iso8601(3)
+        { 'resultType' => 'complete', 'taskId' => 'task-1', 'status' => 'completed', 'createdAt' => now,
+          'lastUpdatedAt' => now, 'ttlMs' => nil, 'result' => { 'content' => [], 'isError' => false } }
+      end
+      client = MCPClient::Client.new(mcp_server_configs: [], logger: Logger.new(File::NULL), extensions: [ext])
+      client.servers << server
+      task = client.wait_for_task('task-1', server: server)
+      exit(task.completed? && client.get_task_result(task)['isError'] == false ? 0 : 3)
+    RUBY
     expect(system(RbConfig.ruby, '-Ilib', '-e', script, out: File::NULL, err: File::NULL)).to be(true)
   end
 end

@@ -95,7 +95,11 @@ RSpec.describe 'MCP 2026-07-28 tasks extension — round 26' do
       .to raise_error(MCPClient::Errors::TaskError)
 
     states = client.instance_variable_get(:@task_states).values
-    expect(states).not_to be_empty
+    # Exactly one state recorded the key, and that very state holds the
+    # payload to resend: losing both would satisfy the pairing below.
+    carrying = states.select { |state| state[:answered].include?('k1') }
+    expect(carrying.size).to eq(1)
+    expect(carrying.first[:pending_update]).to eq({ 'k1' => { 'action' => 'accept' } })
     states.each do |state|
       expect(state[:answered].include?('k1')).to eq(!state[:pending_update].nil?)
     end

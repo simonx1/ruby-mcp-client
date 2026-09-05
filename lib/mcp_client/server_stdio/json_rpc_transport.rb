@@ -645,8 +645,12 @@ module MCPClient
         # never to whichever pipe the transport holds by now.
         @mutex.synchronize { check_session_pin! }
         io.puts(req.to_json)
-      rescue MCPClient::Errors::SessionChangedError
-        # Nothing was written, and nothing will answer this id.
+      rescue MCPClient::Errors::SessionChangedError, MCPClient::Errors::TaskReplacedError
+        # A refusal, not a failure: the pin (or the caller's own pre-write
+        # guard, see {MCPClient::SessionPin#guarded_writes}) turned the write
+        # down. Nothing was written, nothing will answer this id, and the
+        # refusal keeps its type — a definite "this request is not to be
+        # sent" must not reach the caller as an ambiguous transport failure.
         @mutex.synchronize { @awaiting.delete(req['id']) } if req.is_a?(Hash) && req['id']
         raise
       rescue StandardError => e

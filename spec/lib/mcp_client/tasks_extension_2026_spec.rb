@@ -441,10 +441,13 @@ RSpec.describe 'MCP 2026-07-28 tasks extension' do
       allow(client).to receive(:sleep)
 
       result = client.call_tool('slow', {})
+      client.update_task('task-1', { 'k1' => { 'action' => 'accept' } })
       client.cancel_task('task-1')
 
       expect(result['content'].first['text']).to eq('http')
-      expect(seen).to include(['tasks/get', 'task-1', 'tasks/get'], ['tasks/cancel', 'task-1', 'tasks/cancel'])
+      expect(seen).to include(['tasks/get', 'task-1', 'tasks/get'],
+                              ['tasks/update', 'task-1', 'tasks/update'],
+                              ['tasks/cancel', 'task-1', 'tasks/cancel'])
     end
   end
 end
@@ -712,8 +715,25 @@ RSpec.describe 'MCP 2026-07-28 tasks extension — round 3' do
     client
   end
 
-  it 'never retries tasks/update' do
-    expect(MCPClient::JsonRpcCommon::NON_IDEMPOTENT_METHODS).to include('tasks/update')
+  it 'retries a poll a transient failure lost, and never the answers of an update' do
+    retrying = MCPClient::ServerStdio.new(command: 'echo test', read_timeout: 1, retries: 1, retry_backoff: 0)
+    allow(MCPClient::ServerFactory).to receive(:create).and_return(retrying)
+    retried = MCPClient::Client.new(mcp_server_configs: [{ type: 'stdio', command: 'x' }], extensions: [TASKS_EXT])
+    sent = script_stdio(retrying, [])
+    # Every task request fails the way a re-send could fix; the handshake
+    # itself answers as usual.
+    allow(retrying).to receive(:wait_response) do |id, **_opts|
+      raise MCPClient::Errors::TransientServerError, 'busy' if sent.last['method'].start_with?('tasks/')
+
+      { 'jsonrpc' => '2.0', 'id' => id, 'result' => discover_result }
+    end
+
+    expect { retried.get_task('task-1') }.to raise_error(MCPClient::Errors::MCPError)
+    expect(sent.count { |r| r['method'] == 'tasks/get' }).to eq(2)
+
+    expect { retried.update_task('task-1', { 'k1' => { 'action' => 'accept' } }) }
+      .to raise_error(MCPClient::Errors::MCPError)
+    expect(sent.count { |r| r['method'] == 'tasks/update' }).to eq(1)
   end
 
   it 'checks the deadline before polling and bounds the poll by the remaining timeout' do
@@ -894,15 +914,23 @@ RSpec.describe 'MCP 2026-07-28 tasks extension — round 4' do
   it 'remembers answered input request keys across waits for the same task' do
     client = client_for(stdio, elicitation_handler: ->(_m, _s) { { action: 'accept', content: { 'n' => 'x' } } })
     sent = script_stdio(stdio, [{ 'result' => discover_result }, tool_list, { 'result' => task_result },
-                                { 'result' => detailed_task(status: 'input_required',
+                                { 'result' => detailed_task(status: 'input_required', poll_ms: 10_000,
                                                             'inputRequests' => { 'k1' => elicit_request }) },
                                 { 'result' => {} },
                                 { 'result' => detailed_task(status: 'input_required',
                                                             'inputRequests' => { 'k1' => elicit_request }) },
                                 { 'result' => detailed_task(status: 'completed', 'result' => call_result) }])
     task = client.call_tool_as_task('slow', {})
+    # A clock that only moves when the wait sleeps: the first wait gets one
+    # round, and the pace the server then asks for spends the rest of its budget.
+    now = 0.0
+    allow(client).to receive(:monotonic_time) { now }
+    allow(client).to receive(:sleep) { |seconds| now += seconds }
 
-    expect { client.wait_for_task(task, timeout: 0) }.to raise_error(MCPClient::Errors::TaskError, /timed out/i)
+    expect { client.wait_for_task(task, timeout: 0.5) }.to raise_error(MCPClient::Errors::TaskError, /timed out/i)
+    # The first wait is the one that answered k1.
+    expect(sent.count { |r| r['method'] == 'tasks/update' }).to eq(1)
+
     expect(client.wait_for_task(task)).to be_completed
     expect(sent.count { |r| r['method'] == 'tasks/update' }).to eq(1)
   end
@@ -1154,8 +1182,19 @@ RSpec.describe 'MCP 2026-07-28 tasks extension — round 6' do
     expect { client.get_task_result('task-1') }.to raise_error(MCPClient::Errors::ConnectionError, /server down/)
   end
 
-  it 'guards the answered-key registry with a mutex' do
+  it 'holds the registry lock whenever it reaches into the task states' do
     client = client_for(stdio)
-    expect(client.send(:answered_keys_mutex)).to be_a(Mutex)
+    lock = client.send(:answered_keys_mutex)
+    held = []
+    allow(client).to receive(:task_state_locked).and_wrap_original do |original, *args|
+      held << lock.owned?
+      original.call(*args)
+    end
+
+    client.send(:task_state, stdio, 'task-1')
+    client.send(:remember_answered_keys, stdio, 'task-1', ['k1'])
+
+    expect(held).to eq([true, true])
+    expect(client.send(:answered_task_keys, stdio, 'task-1')).to include('k1')
   end
 end

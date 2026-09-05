@@ -374,7 +374,10 @@ client = MCPClient::Client.new(
   mcp_server_configs: [...],
   validate_structured_content: :strict # raises MCPClient::Errors::ValidationError on violation
 )
-# Task-delivered results (get_task_result) are not validated yet.
+# A task-delivered result (get_task_result) is validated the same way when the
+# task is named with the Task handle call_tool_as_task returned: the handle
+# carries the definition its creating call went out under. A bare task ID
+# identifies no tool, so a result fetched by ID is not validated.
 ```
 
 A result is checked against the tool definition the request that produced it

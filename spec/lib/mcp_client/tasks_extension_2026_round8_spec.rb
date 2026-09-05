@@ -103,7 +103,11 @@ RSpec.describe 'MCP 2026-07-28 tasks extension — round 8' do
   end
 
   it 'counts input rounds per task across waits' do
-    client = client_for(stdio, elicitation_handler: ->(_m, _s) { { action: 'accept', content: { 'n' => 'x' } } })
+    handled = 0
+    client = client_for(stdio, elicitation_handler: lambda { |_m, _s|
+      handled += 1
+      { action: 'accept', content: { 'n' => 'x' } }
+    })
     keys = 0
     # Every poll asks for a new key; every update is acknowledged.
     server = lambda { |req|
@@ -113,13 +117,24 @@ RSpec.describe 'MCP 2026-07-28 tasks extension — round 8' do
       { 'result' => detailed_task(status: 'input_required', poll_ms: 20,
                                   'inputRequests' => { "k#{keys}" => elicit_request }) }
     }
-    script_stdio(stdio, [{ 'result' => discover_result }, tool_list, { 'result' => task_result }, server])
+    sent = script_stdio(stdio, [{ 'result' => discover_result }, tool_list, { 'result' => task_result }, server])
     task = client.call_tool_as_task('slow', {})
-    # Real pacing: the first wait gets through a few rounds, then times out.
-    allow(client).to receive(:sleep) { |seconds| Kernel.sleep(seconds) }
+    # A clock that only moves when the wait sleeps: the first wait gets
+    # exactly four rounds at the pace the server asks for, then times out.
+    now = 0.0
+    allow(client).to receive(:monotonic_time) { now }
+    allow(client).to receive(:sleep) { |seconds| now += seconds }
 
-    expect { client.wait_for_task(task, timeout: 0.05) }.to raise_error(MCPClient::Errors::TaskError, /timed out/i)
+    expect { client.wait_for_task(task, timeout: 0.2) }.to raise_error(MCPClient::Errors::TaskError, /timed out/i)
+    spent = sent.count { |r| r['method'] == 'tasks/update' }
+    expect(spent).to eq(4)
+
+    # The second wait resumes the count where the first left it: what the cap
+    # bounds is the task's rounds, not one wait's.
     expect { client.wait_for_task(task) }.to raise_error(MCPClient::Errors::InputRequiredError, /round/)
+    expect(sent.count { |r| r['method'] == 'tasks/update' })
+      .to eq(MCPClient::Client::TaskSupport::MAX_TASK_INPUT_ROUNDS)
+    expect(handled).to eq(MCPClient::Client::TaskSupport::MAX_TASK_INPUT_ROUNDS)
   end
 
   it 'refuses list_tasks when the server era cannot be established' do
