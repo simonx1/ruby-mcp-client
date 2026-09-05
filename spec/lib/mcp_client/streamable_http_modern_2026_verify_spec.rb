@@ -47,7 +47,14 @@ RSpec.describe 'MCP 2026-07-28 Streamable HTTP modern mode — verification' do
   end
 
   # Record every POST and answer it from `responders` keyed by JSON-RPC method.
+  #
+  # `tools/list` answers with an empty list unless the example scripts it: a
+  # branch stacked above this one derives Mcp-Param-* headers from the tool
+  # list, so a tools/call there fetches it first. Nothing on this branch asks
+  # for it, so the default is inert here and keeps these examples honest once
+  # that behaviour exists.
   def stub_posts(responders)
+    responders = { 'tools/list' => { 'tools' => [] } }.merge(responders)
     requests = []
     stub_request(:post, url).to_return do |request|
       body = JSON.parse(request.body)
