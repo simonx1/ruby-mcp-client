@@ -5,6 +5,87 @@
 Groundwork for the 2026-07-28 protocol revision (stateless, per-request
 metadata). Each feature lands in its own PR; this section accumulates them.
 
+### Streamable HTTP modern mode (no sessions, request metadata headers)
+
+- **Era detection over HTTP** (Streamable HTTP "Backward Compatibility").
+  Both HTTP transports POST `server/discover` first. A `DiscoverResult`, or a
+  recognized modern JSON-RPC error in a 400 body (`UnsupportedProtocolVersion`
+  is retried with an advertised version; `HeaderMismatch` and
+  `MissingRequiredClientCapability` are surfaced), marks the server modern. A
+  404 carrying -32601 is a modern server without discovery support
+  (tolerated, capabilities unknown). Any other 4xx — or a 2xx that is not a
+  `DiscoverResult` — is a legacy server: the `initialize` handshake runs as
+  before. **Both verdicts are cached** for the transport, so a server once
+  found modern never gets `initialize` on a later connection, however a later
+  probe fails. `protocol:` and `discover_timeout:` are accepted by
+  `http_config`, `streamable_http_config`, the factory and `MCPClient.connect`.
+- **Only a genuine rejection settles the era.** A probe whose exchange never
+  completed says nothing about the server: 401/403, 5xx (including a 5xx
+  surfaced as an exception by user-configured `raise_error` middleware, which
+  now raises `TransientServerError` like the default response path), timeouts,
+  an oversized body and a broken response stream all propagate instead of
+  recording a (cached, permanent) legacy verdict. The probe itself goes
+  through the modern re-issue path: a `server/discover` whose response stream
+  dies is re-sent once with a new request id before the failure is reported.
+- **A modern verdict survives the transport detector.** A modern-but-
+  incompatible server now raises `MCPClient::Errors::ModernServerError` (a
+  `ConnectionError` subclass), which `MCPClient.connect` re-raises for an
+  ambiguous URL instead of falling through to the legacy SSE and HTTP+POST
+  transports. `MCPClient.connect(url, protocol: :modern)` likewise no longer
+  falls back to those legacy-only transports. This covers a server whose
+  `DiscoverResult` (or well-formed `-32022` list) advertises no version this
+  client speaks: discovery settled the era even though it settled no version,
+  so the era is cached and a later connection never sends `initialize`.
+- **Request metadata headers.** Every modern POST carries
+  `MCP-Protocol-Version` (equal to the body's `_meta`), `Mcp-Method` and, for
+  `tools/call`, `prompts/get` and `resources/read`, `Mcp-Name` (also for the
+  tasks extension's `taskId`). Values that are not header-safe use the
+  `=?base64?…?=` sentinel encoding (`encode_header_value`).
+- **No protocol-level session.** Modern connections send no
+  `Mcp-Session-Id`, open no GET event stream, send no DELETE, and never use
+  `Last-Event-ID`. Closing the stream is the cancellation signal (no
+  `notifications/cancelled` on timeout). Server-initiated JSON-RPC requests on
+  a response stream are dropped with a warning; SSE comment keep-alives are
+  ignored. `ping` maps to `server/discover` and `log_level=` to the
+  per-request `_meta` level.
+- **A broken response stream is re-issued, `tools/call` included** (changelog
+  major change 9: "A broken response stream loses the in-flight request;
+  clients **MUST** re-issue it as a new request with a new request ID"). The
+  rule has no per-method exception, and this revision makes the broken stream
+  itself the cancellation signal the server MUST act on — it "**MUST NOT** send
+  any further messages" for the cancelled request — so the replacement request
+  is what the protocol expects rather than a blind replay. Exactly one
+  re-issue is made, for every method: `with_retry` never retries a
+  `ResponseStreamClosedError`, so a second broken stream surfaces as that
+  error instead of looping (previously an idempotent method could multiply
+  the replacement by the retry budget). The other no-replay guarantees are
+  unchanged — a 5xx, a timeout, an oversized body or an expired session
+  during `tools/call` is never re-sent, because in none of those cases was
+  the server told to stop.
+
+  All three ways a stream can be lost take that one path: a break between SSE
+  events, a break inside an event's JSON, and **a socket that dies mid-body**.
+  The last is what a broken stream actually looks like on the wire — Faraday
+  raises rather than handing back a truncated body — and it previously
+  surfaced as a plain `ConnectionError` with no replacement request. A socket
+  failure that proves the request never reached the server (connection
+  refused, DNS, unreachable network), and a notification (which has no
+  response to lose), still raise `ConnectionError`.
+- **Plain HTTP + SSE response streams.** `ServerHTTP` now advertises and
+  parses `text/event-stream` responses. On a **legacy** stream the server may
+  still send requests, so a `ping` is answered with an empty result and any
+  other server-initiated method with JSON-RPC `-32601` rather than dropped in
+  silence; on a **modern** stream they are dropped, as 2026-07-28 requires. A
+  stream that carries only a response to a *different* request is treated as
+  a lost stream on a modern server (both HTTP transports) instead of
+  completing the call with someone else's result; the lenient
+  single-response fallback remains for legacy servers, which echo ids loosely.
+- **Reconnection is serialized.** `ensure_connected` now holds the transport
+  monitor across its "is the connection up?" check and the
+  cleanup/reconnect that follows, so a caller that observed a dead connection
+  can no longer tear down the connection another caller established in the
+  meantime (which terminated its session and re-ran the era probe).
+
 ### Stateless protocol on stdio (server/discover, per-request `_meta`)
 
 - **No handshake for modern servers.** On stdio the client now probes with

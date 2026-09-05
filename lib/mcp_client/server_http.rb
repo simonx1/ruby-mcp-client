@@ -16,7 +16,10 @@ module MCPClient
   # @note Elicitation Support (MCP 2025-06-18)
   #   This transport does NOT support server-initiated elicitation requests.
   #   The HTTP transport uses a pure request-response architecture where only the client
-  #   can initiate requests. For elicitation support, use one of these transports instead:
+  #   can initiate requests. A legacy server that sends one on an SSE response
+  #   stream is answered with JSON-RPC -32601 rather than left waiting (a
+  #   `ping` gets the empty result it requires). For elicitation support, use
+  #   one of these transports instead:
   #   - ServerStdio: Full bidirectional JSON-RPC over stdin/stdout
   #   - ServerSSE: Server requests via SSE stream, client responses via HTTP POST
   #   - ServerStreamableHTTP: Server requests via SSE-formatted responses, client responses via HTTP POST
@@ -93,13 +96,16 @@ module MCPClient
                   end
 
       # Set up headers for HTTP requests
+      # MCP 2026-07-28 Streamable HTTP: the client MUST list both content
+      # types and support either framing of the response.
       @headers = opts[:headers].merge({
                                         'Content-Type' => 'application/json',
-                                        'Accept' => 'application/json',
+                                        'Accept' => 'application/json, text/event-stream',
                                         'User-Agent' => "ruby-mcp-client/#{MCPClient::VERSION}"
                                       })
 
       @read_timeout = opts[:read_timeout]
+      configure_protocol_mode(opts[:protocol], opts[:discover_timeout])
       @faraday_config = opts[:faraday_config]
       @tools = nil
       @tools_data = nil
@@ -116,32 +122,34 @@ module MCPClient
     # @return [Boolean] true if connection was successful
     # @raise [MCPClient::Errors::ConnectionError] if connection fails
     def connect
-      return true if @mutex.synchronize { @connection_established }
+      # Serialized: concurrent first requests must not each run the probe
+      # and possibly settle on different eras (the monitor is reentrant, so
+      # the request plumbing inside may take @mutex again).
+      @mutex.synchronize do
+        return true if @connection_established
 
-      begin
-        @mutex.synchronize do
+        begin
           @connection_established = false
           @initialized = false
-        end
 
-        # Test connectivity with a simple HTTP request
-        test_connection
+          # Test connectivity with a simple HTTP request
+          test_connection
 
-        # Perform MCP initialization handshake
-        perform_initialize
+          # Establish the protocol era: server/discover for a modern server,
+          # the initialize handshake for a legacy one.
+          negotiate_protocol
 
-        @mutex.synchronize do
           @connection_established = true
           @initialized = true
-        end
 
-        true
-      rescue MCPClient::Errors::ConnectionError => e
-        cleanup
-        raise e
-      rescue StandardError => e
-        cleanup
-        raise MCPClient::Errors::ConnectionError, "Failed to connect to MCP server at #{@base_url}: #{e.message}"
+          true
+        rescue MCPClient::Errors::ConnectionError => e
+          cleanup
+          raise e
+        rescue StandardError => e
+          cleanup
+          raise MCPClient::Errors::ConnectionError, "Failed to connect to MCP server at #{@base_url}: #{e.message}"
+        end
       end
     end
 
@@ -201,6 +209,10 @@ module MCPClient
     # Override apply_request_headers to add session and protocol version headers
     def apply_request_headers(req, request)
       super
+
+      # Modern servers have no session; the base class added the 2026-07-28
+      # request metadata headers.
+      return if modern?
 
       # Add session and protocol version headers for non-initialize requests
       return unless request['method'] != 'initialize'
@@ -367,10 +379,17 @@ module MCPClient
     # @raise [MCPClient::Errors::ServerError] if server returns an error
     def log_level=(level)
       ensure_connected
+      # MCP 2026-07-28 removed logging/setLevel: the level travels per request
+      # in _meta["io.modelcontextprotocol/logLevel"].
+      if modern?
+        @log_level = validate_log_level!(level)
+        return
+      end
+
       require_capability!('logging', method: 'logging/setLevel')
       rpc_request('logging/setLevel', { level: level })
     rescue MCPClient::Errors::ConnectionError, MCPClient::Errors::TransportError,
-           MCPClient::Errors::CapabilityError
+           MCPClient::Errors::CapabilityError, ArgumentError
       raise
     rescue StandardError => e
       raise MCPClient::Errors::ServerError, "Error setting log level: #{e.message}"
@@ -502,7 +521,9 @@ module MCPClient
         name: nil,
         logger: nil,
         oauth_provider: nil,
-        faraday_config: nil
+        faraday_config: nil,
+        protocol: :auto,
+        discover_timeout: nil
       }
     end
 
@@ -527,11 +548,19 @@ module MCPClient
     # @return [void]
     # @raise [MCPClient::Errors::ConnectionError] if connection is not established
     def ensure_connected
-      return if @mutex.synchronize { @connection_established && @initialized }
+      # Serialized on the transport monitor (reentrant, so the nested
+      # cleanup/connect may take it again): checking the flags and acting on
+      # them must be one step. Otherwise a caller that observed "disconnected"
+      # can be overtaken by one that reconnects, and then tear that fresh
+      # connection down — terminating its session and re-running the era
+      # probe.
+      @mutex.synchronize do
+        return if @connection_established && @initialized
 
-      @logger.debug('Connection not active, attempting to reconnect before request')
-      cleanup
-      connect
+        @logger.debug('Connection not active, attempting to reconnect before request')
+        cleanup
+        connect
+      end
     end
 
     # Request the tools list using JSON-RPC

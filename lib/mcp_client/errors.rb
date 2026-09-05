@@ -4,7 +4,17 @@ module MCPClient
   # Collection of error classes used by the MCP client
   module Errors
     # Base error class for all MCP-related errors
-    class MCPError < StandardError; end
+    class MCPError < StandardError
+      # Whether this failure left the request/response exchange incomplete —
+      # a broken response stream, a timeout, an HTTP 5xx, an oversized body.
+      # Such a failure says nothing about which protocol era the server
+      # implements, so the server/discover probe re-raises it instead of
+      # recording a (cached, permanent) legacy verdict.
+      # @return [Boolean]
+      def era_inconclusive?
+        false
+      end
+    end
 
     # Raised when a tool is not found
     class ToolNotFound < MCPError; end
@@ -53,6 +63,15 @@ module MCPClient
         @error_description = error_description
       end
     end
+
+    # Raised when a server/discover probe identified the peer as a modern
+    # (2026-07-28+) MCP server that this client cannot complete a connection
+    # with — an incompatible version list, or a modern protocol error the
+    # client cannot correct. A subclass of ConnectionError so existing
+    # rescues keep working, but the era is settled: MCPClient's transport
+    # detector re-raises it instead of falling back to the legacy SSE or
+    # HTTP+POST transports, which cannot do better against a modern server.
+    class ModernServerError < ConnectionError; end
 
     # JSON-RPC error codes used by MCP (basic/index.mdx "Error Codes").
     #
@@ -334,7 +353,13 @@ module MCPClient
     # while the retry logic can single it out. Application-level failures
     # (JSON-RPC error responses, HTTP 4xx) use plain ServerError and are NOT
     # retried, since the server already processed/rejected the request.
-    class TransientServerError < ServerError; end
+    class TransientServerError < ServerError
+      # @return [Boolean] a 5xx means the request did not complete: it
+      #   identifies neither a modern nor a legacy server
+      def era_inconclusive?
+        true
+      end
+    end
 
     # Raised when there's an error in the MCP server transport
     class TransportError < MCPError
@@ -350,7 +375,27 @@ module MCPClient
     # request may still be executing server-side, so a blind re-send could
     # run a non-idempotent operation twice (MCP lifecycle: on timeout the
     # sender SHOULD cancel and stop waiting, not re-send).
-    class RequestTimeoutError < TransportError; end
+    class RequestTimeoutError < TransportError
+      # @return [Boolean] no answer arrived at all, so no era was learned
+      def era_inconclusive?
+        true
+      end
+    end
+
+    # Raised on the modern (2026-07-28) Streamable HTTP transport when an SSE
+    # response stream ends before delivering the JSON-RPC response. There is
+    # no resumption: "a broken response stream loses the in-flight request;
+    # clients MUST re-issue it as a new request with a new request ID". The
+    # transport makes that one replacement request itself — for every method,
+    # tools/call included, since the broken stream is also the cancellation
+    # signal the server MUST act on — and raises this when it too is lost.
+    class ResponseStreamClosedError < TransportError
+      # @return [Boolean] the response was lost in transit, so the exchange
+      #   revealed nothing about the server's protocol era
+      def era_inconclusive?
+        true
+      end
+    end
 
     # Raised when a response body exceeded the configured size limit (e.g. a
     # gzip payload that expands past the decompression ceiling). A subclass of
@@ -358,7 +403,13 @@ module MCPClient
     # excluded from automatic retries: the server already received and
     # processed the request, so re-sending it could run a non-idempotent
     # operation again — and would decompress the oversized body each time.
-    class ResponseTooLargeError < TransportError; end
+    class ResponseTooLargeError < TransportError
+      # @return [Boolean] the body was never decoded, so it was never read as
+      #   a modern or a legacy answer
+      def era_inconclusive?
+        true
+      end
+    end
 
     # Raised when tool parameters fail validation against the tool's input
     # schema, or (in strict mode) when a tool result's structuredContent fails

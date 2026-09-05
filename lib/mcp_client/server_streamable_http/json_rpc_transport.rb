@@ -126,17 +126,29 @@ module MCPClient
       def parse_sse_response(sse_body, request_id = nil)
         events, retry_ms = extract_sse_events(sse_body)
 
-        raise MCPClient::Errors::TransportError, 'No data found in SSE response' if events.empty?
+        if events.empty?
+          # An empty stream is a stream that closed before delivering the
+          # response; on a modern server that means re-issue, not resume.
+          if modern?
+            raise MCPClient::Errors::ResponseStreamClosedError, 'SSE stream closed before delivering the response'
+          end
+
+          raise MCPClient::Errors::TransportError, 'No data found in SSE response'
+        end
 
         responses, saw_invalid_json = route_sse_events(events)
         matched = select_sse_response(responses, request_id)
         return matched if matched
 
-        if saw_invalid_json
+        if saw_invalid_json && !modern?
           raise MCPClient::Errors::TransportError,
                 'Invalid JSON response from server: SSE stream contained no valid JSON-RPC response'
         end
 
+        # On a modern server a disconnection that lands inside an event's JSON
+        # is the same loss as one that lands between events, so both take the
+        # re-issue path (2026-07-28 changelog, major change 9). Recovery must
+        # not depend on where the break fell.
         resume_or_fail(events, request_id, retry_ms)
       end
 
@@ -151,6 +163,13 @@ module MCPClient
       # @raise [MCPClient::Errors::ServerError] when resumption fails
       # @raise [MCPClient::Errors::TransportError] when no cursor was received
       def resume_or_fail(events, request_id, retry_ms = nil)
+        # MCP 2026-07-28 removed SSE resumability: the in-flight request is
+        # lost and must be re-issued as a new request (see rpc_request).
+        if modern?
+          raise MCPClient::Errors::ResponseStreamClosedError,
+                'SSE stream closed before delivering the response'
+        end
+
         # Only a validated id may become a cursor: it is sent back as a
         # Last-Event-ID header on the resumption GET.
         cursor = events.reverse.find { |e| retainable_event_id?(e[:id]) }&.dig(:id)
@@ -226,7 +245,7 @@ module MCPClient
         saw_invalid_json = false
 
         events.each do |event|
-          if event[:id] && !event[:id].empty?
+          if event[:id] && !event[:id].empty? && !modern?
             # The POST SSE stream is peer-controlled like the GET one, so its
             # ids get the same bound/charset check before being retained or
             # echoed in a Last-Event-ID header.
@@ -278,7 +297,13 @@ module MCPClient
                     responses.find { |msg| msg['id'] == request_id || msg['id'].to_s == request_id.to_s }
                   end
 
-        if matched.nil? && responses.length == 1
+        # A legacy server that echoes ids loosely — a string where an integer
+        # went out, or an id an intermediary rewrote — gets the benefit of the
+        # doubt when its stream carried exactly one response. A modern one
+        # does not: no response to THIS request arrived, so the request was
+        # lost and MCP 2026-07-28 says to re-issue it rather than complete it
+        # with the answer to something else.
+        if matched.nil? && responses.length == 1 && !modern?
           matched = responses.first
           @logger.warn(
             "SSE response id #{matched['id'].inspect} does not match request id #{request_id.inspect}; " \
