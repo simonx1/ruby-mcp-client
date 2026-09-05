@@ -1,6 +1,7 @@
 # frozen_string_literal: true
 
 require 'open3'
+require 'monitor'
 require 'json'
 require_relative 'version'
 require 'logger'
@@ -35,6 +36,14 @@ module MCPClient
     # (e.g. progress output using carriage returns).
     STDERR_MAX_LINE_SIZE = 64 * 1024
 
+    # How the server's protocol era is established (MCP 2026-07-28
+    # basic/transports/stdio "Backward Compatibility"):
+    # - :auto   probe with server/discover, fall back to initialize on any
+    #           non-modern error or timeout (dual-era client, the default)
+    # - :modern probe with server/discover and fail if the server is legacy
+    # - :legacy skip the probe and run the initialize handshake
+    PROTOCOL_MODES = %i[auto modern legacy].freeze
+
     # Initialize a new ServerStdio instance
     # @param command [String, Array] the stdio command to launch the MCP JSON-RPC server
     #   For improved security, passing an Array is recommended to avoid shell injection issues
@@ -44,12 +53,28 @@ module MCPClient
     # @param name [String, nil] optional name for this server
     # @param logger [Logger, nil] optional logger
     # @param env [Hash] optional environment variables for the subprocess
-    def initialize(command:, retries: 0, retry_backoff: 1, read_timeout: READ_TIMEOUT, name: nil, logger: nil, env: {})
+    # @param protocol [Symbol] :auto (probe, fall back to initialize), :modern
+    #   (probe, no fallback) or :legacy (initialize handshake only)
+    # @param discover_timeout [Numeric, nil] seconds to wait for the
+    #   server/discover probe (default: read_timeout — a modern server that is
+    #   slow to start must not be misclassified as legacy)
+    def initialize(command:, retries: 0, retry_backoff: 1, read_timeout: READ_TIMEOUT, name: nil, logger: nil, env: {},
+                   protocol: :auto, discover_timeout: nil)
       super(name: name)
+      unless PROTOCOL_MODES.include?(protocol)
+        raise ArgumentError, "protocol must be one of #{PROTOCOL_MODES.inspect}, got #{protocol.inspect}"
+      end
+
+      @protocol_mode = protocol
+      @discover_timeout = discover_timeout || read_timeout
       @command_array = command.is_a?(Array) ? command : nil
       @command = command.is_a?(Array) ? command.join(' ') : command
       @mutex = Mutex.new
       @cond = ConditionVariable.new
+      # Serializes process start and protocol negotiation: two threads must
+      # not each spawn the server or run the probe and the fallback on the
+      # same pipes. Reentrant because negotiation waits on @mutex inside.
+      @init_lock = Monitor.new
       @next_id = 1
       @pending = {}
       # Ids of requests awaiting a response; used to drop late/unsolicited
@@ -68,6 +93,10 @@ module MCPClient
       @sampling_request_callback = nil # MCP 2025-11-25
       @reader_thread = nil
       @stderr_thread = nil
+      # Bumped whenever a subprocess is spawned or torn down, so a reader
+      # thread only ever speaks for the transport it was started for.
+      @transport_generation = 0
+      @transport_retired = false
     end
 
     # Server info from the initialize response
@@ -77,6 +106,12 @@ module MCPClient
     # Server capabilities from the initialize response
     # @return [Hash, nil] Server capabilities
     attr_reader :capabilities
+
+    # @return [Symbol] the configured protocol mode (:auto, :modern or :legacy)
+    attr_reader :protocol_mode
+
+    # @return [Numeric] seconds allowed for the server/discover probe
+    attr_reader :discover_timeout
 
     # Connect to the MCP server by launching the command process via stdin/stdout
     # @return [Boolean] true if connection was successful
@@ -93,6 +128,7 @@ module MCPClient
       else
         @stdin, @stdout, @stderr, @wait_thread = Open3.popen3(@command)
       end
+      @transport_generation += 1
       pin_pipe_encodings
       true
     rescue StandardError => e
@@ -115,13 +151,38 @@ module MCPClient
     # Spawn a reader thread to collect JSON-RPC responses
     # @return [Thread] the reader thread
     def start_reader
+      generation = @transport_generation
       @reader_thread = Thread.new do
         @stdout.each_line do |line|
           handle_line(line)
         end
       rescue StandardError
         # Reader thread aborted unexpectedly
+      ensure
+        retire_transport(generation)
       end
+    end
+
+    # The subprocess closed its stdout: it has exited (or its pipes were
+    # dropped), so no response will ever arrive on this transport again. MCP
+    # 2026-07-28 basic/transports/stdio ("Unexpected Termination") says a
+    # client SHOULD restart a server that terminated unexpectedly, so retire
+    # the handshake rather than let it describe a process that no longer
+    # exists: the next request releases these handles and negotiates again
+    # against a fresh subprocess.
+    #
+    # Nothing is restarted or replayed from here. A request that was in
+    # flight may already have been executed server-side, so it fails as it
+    # would on any other broken transport; only the session is recoverable.
+    # A deliberate shutdown bumps the generation first, so its own reader
+    # reaching EOF is not mistaken for an unexpected exit.
+    # @param generation [Integer] the transport this reader was started for
+    # @return [void]
+    def retire_transport(generation)
+      return unless generation == @transport_generation
+
+      @transport_retired = true
+      @logger.debug('Server stdout closed; the transport will be re-established on the next request')
     end
 
     # Spawn a thread to continuously drain the subprocess stderr.
@@ -171,7 +232,15 @@ module MCPClient
 
       # Dispatch JSON-RPC requests from server (has id AND method) - MCP 2025-06-18
       if msg['method'] && msg.key?('id')
-        handle_server_request(msg)
+        if modern_peer?
+          # MCP 2026-07-28 stdio: "The server MUST NOT write JSON-RPC requests
+          # to stdout" and "The client MUST NOT write JSON-RPC responses" —
+          # server-to-client interactions travel in InputRequiredResult.
+          @logger.warn("Ignoring server-initiated request #{msg['method']}: " \
+                       'a modern MCP server MUST NOT write JSON-RPC requests to stdout')
+        else
+          handle_server_request(msg)
+        end
         return
       end
 
@@ -201,6 +270,24 @@ module MCPClient
       # bad line cannot kill the reader thread
     end
 
+    # Whether a server-initiated request is prohibited traffic.
+    #
+    # Judged by the ESTABLISHED era, not by protocol_version: during the
+    # server/discover probe the latter is only the version this client
+    # proposed. A legacy server MAY ping while the probe is unanswered and
+    # then wait for the response before doing anything else, so treating its
+    # request as prohibited modern traffic deadlocks the negotiation.
+    #
+    # The one exception is a client configured protocol: :modern, which has
+    # already ruled out the legacy fallback that the accommodation exists
+    # for. It will never speak legacy, so it never runs a host callback for a
+    # server request nor writes the response back — not even while its own
+    # probe is still in flight.
+    # @return [Boolean]
+    def modern_peer?
+      protocol_era == :modern || @protocol_mode == :modern
+    end
+
     # List all prompts available from the MCP server
     # @return [Array<MCPClient::Prompt>] list of available prompts
     # @raise [MCPClient::Errors::ServerError] if server returns an error
@@ -210,11 +297,7 @@ module MCPClient
       collect_paginated('prompts') do |cursor|
         params = {}
         params['cursor'] = cursor if cursor
-        req_id = next_id
-        req = { 'jsonrpc' => '2.0', 'id' => req_id, 'method' => 'prompts/list', 'params' => params }
-        send_request(req)
-        res = wait_response(req_id)
-        result = process_jsonrpc_response(res) || {}
+        result = rpc_request('prompts/list', params) || {}
         prompts = (result['prompts'] || []).map { |td| MCPClient::Prompt.from_json(td, server: self) }
         [prompts, result['nextCursor']]
       end
@@ -236,17 +319,7 @@ module MCPClient
     # @raise [MCPClient::Errors::PromptGetError] for other errors during prompt interpolation
     def get_prompt(prompt_name, parameters)
       ensure_initialized
-      req_id = next_id
-      # JSON-RPC method for getting a prompt
-      req = {
-        'jsonrpc' => '2.0',
-        'id' => req_id,
-        'method' => 'prompts/get',
-        'params' => build_named_request_params(prompt_name, parameters)
-      }
-      send_request(req)
-      res = wait_response(req_id)
-      process_jsonrpc_response(res)
+      rpc_request('prompts/get', build_named_request_params(prompt_name, parameters))
     rescue MCPClient::Errors::ServerError => e
       # 2026-07-28 protocol errors carry actionable data (requiredCapabilities,
       # supported versions); keep them intact instead of wrapping.
@@ -264,13 +337,9 @@ module MCPClient
     # @raise [MCPClient::Errors::ResourceReadError] for other errors during resource listing
     def list_resources(cursor: nil)
       ensure_initialized
-      req_id = next_id
       params = {}
       params['cursor'] = cursor if cursor
-      req = { 'jsonrpc' => '2.0', 'id' => req_id, 'method' => 'resources/list', 'params' => params }
-      send_request(req)
-      res = wait_response(req_id)
-      result = process_jsonrpc_response(res) || {}
+      result = rpc_request('resources/list', params) || {}
       resources = (result['resources'] || []).map { |td| MCPClient::Resource.from_json(td, server: self) }
       { 'resources' => resources, 'nextCursor' => result['nextCursor'] }
     rescue MCPClient::Errors::ServerError => e
@@ -290,17 +359,8 @@ module MCPClient
     # @raise [MCPClient::Errors::ResourceReadError] for other errors during resource reading
     def read_resource(uri)
       ensure_initialized
-      req_id = next_id
-      # JSON-RPC method for reading a resource
-      req = {
-        'jsonrpc' => '2.0',
-        'id' => req_id,
-        'method' => 'resources/read',
-        'params' => { 'uri' => uri }
-      }
-      send_request(req)
-      res = wait_response(req_id)
-      result = require_complete_result!(process_jsonrpc_response(res) || {}, 'resources/read')
+      result = require_complete_result!(rpc_request('resources/read', { 'uri' => uri }) || {},
+                                        'resources/read')
       contents = result['contents'] || []
       contents.map { |content| MCPClient::ResourceContent.from_json(content) }
     rescue MCPClient::Errors::ServerError => e
@@ -319,13 +379,9 @@ module MCPClient
     # @raise [MCPClient::Errors::ResourceReadError] for other errors during resource template listing
     def list_resource_templates(cursor: nil)
       ensure_initialized
-      req_id = next_id
       params = {}
       params['cursor'] = cursor if cursor
-      req = { 'jsonrpc' => '2.0', 'id' => req_id, 'method' => 'resources/templates/list', 'params' => params }
-      send_request(req)
-      res = wait_response(req_id)
-      result = process_jsonrpc_response(res) || {}
+      result = rpc_request('resources/templates/list', params) || {}
       templates = (result['resourceTemplates'] || []).map { |td| MCPClient::ResourceTemplate.from_json(td, server: self) }
       { 'resourceTemplates' => templates, 'nextCursor' => result['nextCursor'] }
     rescue MCPClient::Errors::ServerError => e
@@ -346,16 +402,7 @@ module MCPClient
     def subscribe_resource(uri)
       ensure_initialized
       require_capability!('resources', 'subscribe', method: 'resources/subscribe')
-      req_id = next_id
-      req = {
-        'jsonrpc' => '2.0',
-        'id' => req_id,
-        'method' => 'resources/subscribe',
-        'params' => { 'uri' => uri }
-      }
-      send_request(req)
-      res = wait_response(req_id)
-      process_jsonrpc_response(res)
+      rpc_request('resources/subscribe', { 'uri' => uri })
       true
     rescue MCPClient::Errors::CapabilityError
       raise
@@ -377,16 +424,7 @@ module MCPClient
     def unsubscribe_resource(uri)
       ensure_initialized
       require_capability!('resources', 'subscribe', method: 'resources/unsubscribe')
-      req_id = next_id
-      req = {
-        'jsonrpc' => '2.0',
-        'id' => req_id,
-        'method' => 'resources/unsubscribe',
-        'params' => { 'uri' => uri }
-      }
-      send_request(req)
-      res = wait_response(req_id)
-      process_jsonrpc_response(res)
+      rpc_request('resources/unsubscribe', { 'uri' => uri })
       true
     rescue MCPClient::Errors::CapabilityError
       raise
@@ -409,12 +447,7 @@ module MCPClient
       collect_paginated('tools') do |cursor|
         params = {}
         params['cursor'] = cursor if cursor
-        req_id = next_id
-        # JSON-RPC method for listing tools
-        req = { 'jsonrpc' => '2.0', 'id' => req_id, 'method' => 'tools/list', 'params' => params }
-        send_request(req)
-        res = wait_response(req_id)
-        result = process_jsonrpc_response(res) || {}
+        result = rpc_request('tools/list', params) || {}
         tools = (result['tools'] || []).map { |td| MCPClient::Tool.from_json(td, server: self) }
         [tools, result['nextCursor']]
       end
@@ -436,17 +469,7 @@ module MCPClient
     # @raise [MCPClient::Errors::ToolCallError] for other errors during tool execution
     def call_tool(tool_name, parameters)
       ensure_initialized
-      req_id = next_id
-      # JSON-RPC method for calling a tool
-      req = {
-        'jsonrpc' => '2.0',
-        'id' => req_id,
-        'method' => 'tools/call',
-        'params' => build_named_request_params(tool_name, parameters)
-      }
-      send_request(req)
-      res = wait_response(req_id)
-      process_jsonrpc_response(res)
+      rpc_request('tools/call', build_named_request_params(tool_name, parameters))
     rescue MCPClient::Errors::ServerError => e
       # 2026-07-28 protocol errors carry actionable data (requiredCapabilities,
       # supported versions); keep them intact instead of wrapping.
@@ -466,18 +489,9 @@ module MCPClient
     def complete(ref:, argument:, context: nil)
       ensure_initialized
       require_capability!('completions', method: 'completion/complete')
-      req_id = next_id
       params = { 'ref' => ref, 'argument' => argument }
       params['context'] = context if context
-      req = {
-        'jsonrpc' => '2.0',
-        'id' => req_id,
-        'method' => 'completion/complete',
-        'params' => params
-      }
-      send_request(req)
-      res = wait_response(req_id)
-      (process_jsonrpc_response(res) || {})['completion'] || { 'values' => [] }
+      (rpc_request('completion/complete', params) || {})['completion'] || { 'values' => [] }
     rescue MCPClient::Errors::CapabilityError
       raise
     rescue MCPClient::Errors::ServerError => e
@@ -497,18 +511,17 @@ module MCPClient
     # @raise [MCPClient::Errors::ServerError] if server returns an error
     def log_level=(level)
       ensure_initialized
+      # MCP 2026-07-28 removed logging/setLevel: the level is declared per
+      # request in _meta["io.modelcontextprotocol/logLevel"], so store it
+      # and let every subsequent request carry it.
+      if modern?
+        @log_level = validate_log_level!(level)
+        return
+      end
+
       require_capability!('logging', method: 'logging/setLevel')
-      req_id = next_id
-      req = {
-        'jsonrpc' => '2.0',
-        'id' => req_id,
-        'method' => 'logging/setLevel',
-        'params' => { 'level' => level }
-      }
-      send_request(req)
-      res = wait_response(req_id)
-      process_jsonrpc_response(res) || {}
-    rescue MCPClient::Errors::CapabilityError
+      rpc_request('logging/setLevel', { 'level' => level }) || {}
+    rescue MCPClient::Errors::CapabilityError, ArgumentError
       raise
     rescue MCPClient::Errors::ServerError => e
       # 2026-07-28 protocol errors carry actionable data (requiredCapabilities,
@@ -755,6 +768,10 @@ module MCPClient
     def cleanup
       return unless @stdin
 
+      # Past this point the reader threads speak for a transport that is
+      # being dismantled on purpose: their EOF must not retire whatever
+      # replaces it.
+      @transport_generation += 1
       @stdin.close unless @stdin.closed?
       terminate_server_process
       @stdout.close unless @stdout.closed?

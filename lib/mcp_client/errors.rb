@@ -199,6 +199,14 @@ module MCPClient
         true
       end
 
+      # Whether a server/discover probe answered with this error identifies a
+      # modern server (a recognized modern error, or a malformed modern
+      # result). Non-error transport failures never do.
+      # @return [Boolean]
+      def modern_protocol_error_for_probe?
+        modern_protocol_error?
+      end
+
       private
 
       # A member of the error's `data` object, accepting both key spellings:
@@ -284,6 +292,29 @@ module MCPClient
       end
     end
 
+    # Raised when a request returns an InputRequiredResult (resultType
+    # "input_required", MCP 2026-07-28 multi round-trip requests) that this
+    # client cannot fulfil — for example because it declared no capability
+    # the server could have asked for. Exposes the server's input requests
+    # and opaque request state so a host can drive the round trip itself.
+    class InputRequiredError < ServerError
+      # @return [Hash] the InputRequests map (key => request object)
+      def input_requests
+        requests = data.is_a?(Hash) ? (data['inputRequests'] || data[:inputRequests]) : nil
+        requests.is_a?(Hash) ? requests : {}
+      end
+
+      # @return [String, nil] the opaque requestState to echo on a retry
+      def request_state
+        data.is_a?(Hash) ? (data['requestState'] || data[:requestState]) : nil
+      end
+
+      # @return [Boolean] always true: a protocol-level condition, never wrapped
+      def protocol_error?
+        true
+      end
+    end
+
     # Raised when a server result is malformed at the protocol level — e.g.
     # its `resultType` is a value this client does not recognize, which MCP
     # 2026-07-28 says MUST be considered invalid. A ServerError (not a
@@ -306,7 +337,12 @@ module MCPClient
     class TransientServerError < ServerError; end
 
     # Raised when there's an error in the MCP server transport
-    class TransportError < MCPError; end
+    class TransportError < MCPError
+      # @return [Boolean] a transport failure never identifies a modern server
+      def modern_protocol_error_for_probe?
+        false
+      end
+    end
 
     # Raised when a request exceeded its timeout without receiving a
     # response. A subclass of TransportError so existing rescues keep

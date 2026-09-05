@@ -720,11 +720,17 @@ RSpec.describe 'input_required is a modern-era result type' do
     transport.process_jsonrpc_response({ 'jsonrpc' => '2.0', 'id' => 1, 'result' => result })
   end
 
-  it 'accepts it once a modern revision is established' do
+  it 'recognizes it once a modern revision is established' do
     transport.protocol_version = '2026-07-28'
     result = { 'resultType' => 'input_required', 'requestState' => 'continue-later' }
 
-    expect(process(result)).to eq(result)
+    # Recognized, not accepted: this client cannot fulfil the round trip, so
+    # the result surfaces as the InputRequired condition with the whole
+    # answer on `data` — never as an invalid result, and never flattened.
+    expect { process(result) }.to raise_error(MCPClient::Errors::InputRequiredError) do |e|
+      expect(e.data).to eq(result)
+      expect(e.request_state).to eq('continue-later')
+    end
     expect(transport.accepted_result_types).to include('input_required')
   end
 
@@ -762,13 +768,13 @@ RSpec.describe 'read_resource never presents an unfinished read as an empty one'
       stub_read_result(incomplete)
 
       expect { server.read_resource('file:///x.txt') }
-        .to raise_error(MCPClient::Errors::InvalidResultError, /input_required/) do |e|
+        .to raise_error(MCPClient::Errors::InputRequiredError, /input_required/) do |e|
           expect(e).not_to be_a(MCPClient::Errors::ResourceReadError)
           expect(e.protocol_error?).to be(true)
           # The continuation is preserved, not discarded: a host can drive
           # the round trip itself from the opaque requestState.
           expect(e.data).to eq(incomplete)
-          expect(e.data['requestState']).to eq('continue-later')
+          expect(e.request_state).to eq('continue-later')
         end
     end
 

@@ -58,8 +58,13 @@ module MCPClient
     #   structuredContent does not match the tool's declared outputSchema (MCP 2025-11-25:
     #   "Clients SHOULD validate structured results against this schema"): :warn (default)
     #   logs a warning, :strict raises MCPClient::Errors::ValidationError
+    # @param request_meta [Hash, #call, nil] metadata merged into every request's `_meta`
+    #   (a Hash, or a callable returning one, evaluated per request) — e.g. OpenTelemetry
+    #   trace context (`traceparent`, `tracestate`, `baggage`, MCP 2026-07-28) or
+    #   vendor-prefixed keys. Reserved protocol keys cannot be set this way.
     def initialize(mcp_server_configs: [], logger: nil, elicitation_handler: nil, roots: nil, sampling_handler: nil,
-                   sampling_supports_tools: false, client_info: nil, validate_structured_content: :warn)
+                   sampling_supports_tools: false, client_info: nil, validate_structured_content: :warn,
+                   request_meta: nil)
       unless STRUCTURED_CONTENT_MODES.include?(validate_structured_content)
         raise ArgumentError, "validate_structured_content must be one of #{STRUCTURED_CONTENT_MODES.inspect}, " \
                              "got #{validate_structured_content.inspect}"
@@ -100,8 +105,7 @@ module MCPClient
       @roots = normalize_roots(roots)
       # Register default and user-defined notification handlers on each server
       @servers.each do |server|
-        # Host-provided Implementation info for the initialize clientInfo
-        server.client_info = client_info if client_info && server.respond_to?(:client_info=)
+        configure_server_identity(server, client_info, request_meta)
         server.on_notification do |method, params|
           # Default notification processing (e.g., cache invalidation, logging)
           process_notification(server, method, params)
@@ -701,6 +705,18 @@ module MCPClient
     end
 
     private
+
+    # Hand the host's identity and request metadata to a transport.
+    # @param server [MCPClient::ServerBase] the transport
+    # @param client_info [Hash, nil] Implementation info sent as clientInfo
+    # @param request_meta [Hash, #call, nil] metadata merged into every request's _meta
+    # @return [void]
+    def configure_server_identity(server, client_info, request_meta)
+      # Host-provided Implementation info for clientInfo (initialize on
+      # legacy servers, per-request _meta on modern ones)
+      server.client_info = client_info if client_info && server.respond_to?(:client_info=)
+      server.request_meta = request_meta if request_meta && server.respond_to?(:request_meta=)
+    end
 
     # Whether the server's negotiated capability set is available yet.
     # @param srv [MCPClient::ServerBase] the server
@@ -1429,6 +1445,10 @@ module MCPClient
         # transports without a server-request channel (plain HTTP) never
         # declare roots.
         next unless server.respond_to?(:on_roots_list_request)
+        # notifications/roots/list_changed was removed in MCP 2026-07-28: a
+        # modern server reads roots through the multi round-trip pattern
+        # when it needs them, and has no channel to be told they changed.
+        next if server.respond_to?(:modern?) && server.modern?
 
         begin
           server.rpc_notify('notifications/roots/list_changed', {})
