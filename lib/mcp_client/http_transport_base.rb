@@ -662,7 +662,10 @@ module MCPClient
     def apply_captured_session_id(req, request, sent_session_id)
       return if request['method'] == 'initialize'
 
-      if sent_session_id
+      # A modern session has none at all -- the client MUST NOT send
+      # Mcp-Session-Id -- so what such a request was cleared for is "no
+      # session", whatever a non-conforming server got itself recorded.
+      if sent_session_id && !modern?
         req.headers['Mcp-Session-Id'] = sent_session_id
       else
         req.headers.delete('Mcp-Session-Id')
