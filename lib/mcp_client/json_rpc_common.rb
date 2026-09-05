@@ -5,6 +5,7 @@ require 'digest'
 require 'json'
 require 'zlib'
 require 'stringio'
+require_relative 'deprecation_notices'
 require_relative 'header_params'
 require_relative 'subscription_support'
 require_relative 'result_caching'
@@ -19,6 +20,7 @@ module MCPClient
   module JsonRpcCommon
     include RoundTripMarker
     include ResultCompleteness
+    include DeprecationNotices
     include SubscriptionSupport
     include ResultCaching
     # The `_meta` a request carries, the fingerprint a cached result is bound
@@ -397,7 +399,12 @@ module MCPClient
     # @return [Hash, nil] params with `_meta` merged under the String key
     def with_request_meta(params, claim: :none)
       defaults = host_request_meta(claim)
-      return params if defaults.empty? && !modern?
+      if defaults.empty? && !modern?
+        # Legacy traffic is passed through untouched — including a `_meta`
+        # the caller supplied, which still goes out as it stands.
+        warn_request_log_level_deprecated(params.is_a?(Hash) ? (params['_meta'] || params[:_meta]) : nil)
+        return params
+      end
 
       params = params.is_a?(Hash) ? params.dup : {}
       supplied = params.delete('_meta')
@@ -418,6 +425,7 @@ module MCPClient
         meta.merge!(required_request_meta)
       end
       params['_meta'] = meta
+      warn_request_log_level_deprecated(meta)
       params
     end
 
@@ -653,6 +661,13 @@ module MCPClient
     # before connect so the initialize request advertises it; it only takes
     # effect when a sampling request callback is also registered, since
     # sampling.tools is a sub-capability of sampling.
+    #
+    # @deprecated Sampling is deprecated since MCP 2026-07-28 (SEP-2577);
+    #   earliest removal is the first revision released on or after
+    #   2027-07-28, and this sub-capability goes with the capability it
+    #   refines. Declaring it raises no notice of its own — serving a
+    #   sampling/createMessage request does. Integrate directly with the LLM
+    #   provider API instead.
     # @return [void]
     def declare_sampling_tools
       @sampling_tools_supported = true

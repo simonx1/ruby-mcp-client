@@ -22,8 +22,10 @@ module MCPClient
   #   `ping` gets the empty result it requires). For elicitation support, use
   #   one of these transports instead:
   #   - ServerStdio: Full bidirectional JSON-RPC over stdin/stdout
-  #   - ServerSSE: Server requests via SSE stream, client responses via HTTP POST
   #   - ServerStreamableHTTP: Server requests via SSE-formatted responses, client responses via HTTP POST
+  #   - ServerSSE: Server requests via SSE stream, client responses via HTTP POST — but the
+  #     HTTP+SSE transport is deprecated (SEP-2596; earliest removal three months after
+  #     SEP-2596 reaches Final), so prefer ServerStreamableHTTP for a new integration
   class ServerHTTP < ServerBase
     require_relative 'server_http/json_rpc_transport'
 
@@ -415,7 +417,12 @@ module MCPClient
     #   'critical', 'alert', 'emergency')
     # @return [Hash] empty result on success
     # @raise [MCPClient::Errors::ServerError] if server returns an error
+    # @deprecated Logging is deprecated since MCP 2026-07-28 (SEP-2577);
+    #   earliest removal is the first revision released on or after
+    #   2027-07-28. Have the server log to stderr (stdio) or use
+    #   OpenTelemetry instead.
     def log_level=(level)
+      MCPClient::Deprecations.warn(:logging, @logger)
       ensure_connected
       # MCP 2026-07-28 removed logging/setLevel: the level travels per request
       # in _meta["io.modelcontextprotocol/logLevel"].
@@ -549,6 +556,13 @@ module MCPClient
     end
 
     # Register a handler for roots/list input requests (MCP 2026-07-28).
+    #
+    # @deprecated Roots is deprecated since MCP 2026-07-28 (SEP-2577); earliest
+    #   removal is the first revision released on or after 2027-07-28. Registering
+    #   a handler is not itself use of Roots — a handler that answers with no root
+    #   exposes nothing deprecated — but a handler that answers with a root adopts
+    #   the deprecated feature and raises the notice. Pass directories or files
+    #   through tool parameters, resource URIs or server configuration instead.
     # @param block [Proc] callback that receives (key, params) and returns a ListRootsResult
     # @return [void]
     def on_roots_list_request(&block)
@@ -556,6 +570,11 @@ module MCPClient
     end
 
     # Register a handler for sampling input requests (MCP 2026-07-28).
+    #
+    # @deprecated Sampling is deprecated since MCP 2026-07-28 (SEP-2577); earliest
+    #   removal is the first revision released on or after 2027-07-28. Integrate
+    #   directly with the LLM provider API instead of serving
+    #   sampling/createMessage.
     # @param block [Proc] callback that receives (key, params) and returns a CreateMessageResult
     # @return [void]
     def on_sampling_request(&block)

@@ -268,6 +268,8 @@ RSpec.describe 'MCP 2026-07-28 authorization' do
     end
 
     it 'registers a localhost redirect as a native application and warns that DCR is deprecated' do
+      MCPClient::Deprecations.enabled = true
+      MCPClient::Deprecations.reset!
       output = StringIO.new
       provider = provider_for(logger: Logger.new(output))
       stub_discovery(provider, as_meta(registration_endpoint: registration_endpoint))
@@ -276,7 +278,10 @@ RSpec.describe 'MCP 2026-07-28 authorization' do
       provider.start_authorization_flow
 
       expect(registration_bodies.first['application_type']).to eq('native')
-      expect(output.string).to match(/Dynamic Client Registration is deprecated/)
+      expect(output.string).to match(/Dynamic Client Registration .*deprecated/)
+    ensure
+      MCPClient::Deprecations.reset!
+      MCPClient::Deprecations.enabled = false
     end
 
     it 'registers a custom-scheme redirect as native and a remote https redirect as web' do

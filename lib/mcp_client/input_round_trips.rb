@@ -76,6 +76,10 @@ module MCPClient
         )
       end
 
+      # The handler this reaches is the same callback a legacy
+      # server-initiated request would have used, so Roots and Sampling are
+      # just as deprecated here (SEP-2577).
+      warn_input_request_deprecated(request_method, request['params'])
       begin
         response = instance_variable_get(handler_ivar).call(key, request['params'] || {})
       rescue StandardError => e
@@ -98,6 +102,7 @@ module MCPClient
         )
       end
 
+      warn_input_request_answer_deprecated(request_method, response)
       response
     end
 

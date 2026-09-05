@@ -5,6 +5,222 @@
 Groundwork for the 2026-07-28 protocol revision (stateless, per-request
 metadata). Each feature lands in its own PR; this section accumulates them.
 
+### Deprecations (feature lifecycle policy)
+
+- **Deprecation notices.** `MCPClient::Deprecations` names every feature
+  the 2026-07-28 revision placed in the Deprecated state (`REGISTRY`) and
+  logs one notice per feature per process on first use, with the suggested
+  migration: Roots (`roots:` / `Client#roots=`), Sampling
+  (`sampling_handler:`), Logging (`Client#log_level=`), the HTTP+SSE
+  transport (`MCPClient::ServerSSE`), the `includeContext` values
+  `thisServer` / `allServers` received in a sampling request (still served)
+  and OAuth Dynamic Client Registration (SEP-2577, SEP-2596, MCP PR #2858).
+  Everything keeps working; `MCPClient::Deprecations.enabled = false`
+  silences the notices. The registry records when each feature entered the
+  Deprecated state (the HTTP+SSE transport since 2025-03-26, the
+  `includeContext` values since 2025-11-25) alongside each feature's
+  `earliest_removal`, carrying the deprecated-features registry's own
+  "Earliest removal" wording: what Roots, Sampling, Logging and Dynamic
+  Client Registration wait for is *the first revision released on or after
+  2027-07-28* — a revision, not a date a host can plan around — while the
+  `includeContext` values *follow Sampling (SEP-2577)* and only the HTTP+SSE
+  transport has a clock of its own (*three months after SEP-2596 reaches
+  Final*). Every notice and every YARD `@deprecated` tag names that earliest
+  removal next to the deprecation SEP, as the feature lifecycle policy's
+  tier-1 SDK obligation requires.
+  The notices fire from the transport, not only from `MCPClient::Client`, so
+  a host that drives a `ServerStdio`, `ServerSSE`, `ServerHTTP` or
+  `ServerStreamableHTTP` object directly still sees them: serving a
+  `sampling/createMessage` request through `on_sampling_request` warns
+  (including the `includeContext` values on the request), and so does
+  answering a `roots/list` request through `on_roots_list_request` with a
+  list that carries a root, whether the request arrives
+  server-initiated or through the multi round-trip pattern, and a
+  `notifications/message` warns from the shared notification routing so a
+  bare `on_notification` callback is covered too. The HTTP+SSE notice is
+  logged once the transport is actually connected (so `MCPClient.connect`
+  probing a URL does not spend it) and a later `connect` on an
+  already-established connection retries a notice the first one could not
+  emit. A logger that drops warnings, fails to report its level or raises
+  does not consume the notice (no logger failure ever reaches the deprecated
+  operation, and the logger is called outside the registry's lock), and the
+  once-per-process bookkeeping is scoped to the owning PID, so a prefork
+  server (Puma, Unicorn) that warned while preloading does not silence each
+  worker's own first use.
+  The Roots notice follows use of the feature, not the presence of a
+  handler: `MCPClient::Client` registers a `roots/list` handler on every
+  server so that a later `client.roots = [...]` is served without
+  reconnecting, and it answers `roots/list` with an empty list until a root
+  is set — so a host that never passed `roots:` and never called
+  `Client#roots=` is never warned about Roots, while a configured list, a
+  `roots=` call or an answer carrying a root all warn. The deprecated
+  keyword arguments name the earliest removal next to their SEP too:
+  `Client.new`'s `roots:` and `sampling_handler:`, and the
+  `sampling_handler` option of `MCPClient.connect`. The transport-level
+  registrations carry the same mark: `on_roots_list_request` and
+  `on_sampling_request` on `ServerStdio`, `ServerSSE`, `ServerHTTP` and
+  `ServerStreamableHTTP` are tagged `@deprecated` with SEP-2577 and the
+  earliest removal, so a host that drives a transport directly meets the
+  deprecation in the YARD rather than in the first runtime notice — and the
+  Roots tag says what round 7 made true, that registering a handler is not
+  itself use and only an answer carrying a root adopts the feature.
+- **HTTP+SSE marked where it is offered.** SEP-2596 puts the HTTP+SSE
+  transport on the only short clock in the registry (three months after
+  SEP-2596 reaches Final), so every place that presents it as an ordinary
+  transport choice now says so and points at Streamable HTTP: the README
+  Overview, the Quick Connect example (which now leads with Streamable
+  HTTP) and the transport-detection table, and, in YARD, the `/sse` and
+  `transport:` entries of `MCPClient.connect`, its SSE `@example`, and
+  `MCPClient.sse_config`, which gains a `@deprecated` tag pointing at
+  `MCPClient.streamable_http_config`.
+- **A reservation is not a notice (round 9).** `MCPClient::Deprecations`
+  used to mark a feature spent the moment a caller claimed the right to log
+  it, so two first uses racing with different loggers could lose the notice
+  outright: the claiming caller blocked inside a broken logger, the
+  contender holding a working one saw the slot taken and stood down, and the
+  claim's later failure left the notice owed to a use that might never come.
+  A notice is now spent only once a `logger.warn` came back without raising,
+  so a caller that arrives while another is inside the logger either finds
+  the notice out (and stands down) or takes it over when that attempt
+  failed. `Deprecations.emitted?` reports notices that actually went out,
+  never one still in flight. (Round 10 kept that outcome and replaced the
+  reservation states, condition variable and bounded wait that carried it
+  with a per-feature emission gate.)
+- **HTTP+SSE marked in the last places it was offered (round 9).**
+  Continuing the round 8 sweep: the README's Advanced Configuration
+  `sse_config` example and the auto-detect fallback row of the
+  transport-detection table, and, in `MCPClient.connect`'s YARD, the
+  "Other HTTP URLs" fallback text; the multiple-server `@example` no longer
+  reaches for an `/sse` URL at all.
+- **What a notice costs its caller, said honestly (round 10).** The
+  reservation machinery bounded the wait of a caller that met a notice in
+  flight, on the strength of a promise this path cannot keep — that a notice
+  never holds up the deprecated operation. The bound constrained the
+  contenders, never the caller actually stuck in the logger: a first use
+  whose logger blocks forever (a synchronous remote logger, stalled I/O)
+  never returned from `warn` at all, so the client construction, SSE
+  connection or incoming request that triggered it never completed either.
+  And the contenders bought nothing with their wait: a reservation that
+  hangs is never released, so every later first use of Sampling, Logging or
+  the HTTP+SSE transport — all features whose trigger points are hit
+  repeatedly — waited the timeout out again and still came away without the
+  notice. Keeping the stronger promise would have meant a detached emission
+  thread (which loses the ordering between the notice and the operation it
+  describes) or `Timeout.timeout` around a host's logger (which raises
+  inside arbitrary third-party code, during its own IO, ensure blocks or
+  locking). So the promise is narrowed to the one the rest of the library
+  already makes: a notice costs its caller what one `logger.warn` costs it,
+  and no more — every other `logger.warn` here blocks its caller the same
+  way, and a logger that blocks forever blocks the library everywhere, not
+  only in this path. `Deprecations::PENDING_WAIT_SECONDS`, the `:pending`
+  state and the condition variable are gone; an attempt is serialized on a
+  gate held only for the feature being logged, so nothing is timed, no
+  caller comes away from a wait with the notice neither emitted nor its own
+  to write, and a notice in flight still never delays another feature's
+  notice, `Deprecations.emitted?` or `Deprecations.reset!`. Everything the
+  earlier rounds established stands: one notice per feature per process, a
+  logger that raises or drops warnings neither breaks the deprecated
+  operation nor spends the notice, and the bookkeeping (gates included) is
+  rebuilt after a fork.
+- **HTTP+SSE marked in the `ServerHTTP` elicitation note (round 10).** The
+  note listing the transports that do support server-initiated elicitation
+  still offered `ServerSSE` as an ordinary alternative; it now leads with
+  `ServerStreamableHTTP` and marks the HTTP+SSE entry with SEP-2596 and its
+  earliest removal, like the README, `MCPClient.connect` and
+  `MCPClient.sse_config`.
+- **A notice never queues from inside a notice (round 11).** Round 10's
+  emission gate is held across `logger.warn`, which is host code that may
+  itself reach a deprecated feature — a formatter, a log subscriber. A
+  thread already inside a notice that then queued for a gate could wait
+  forever: for its own gate, when the callback warns for the feature being
+  logged, or (through a logger that serializes its writes, as `::Logger`
+  does) for the gate of a second feature held by a thread that is waiting
+  for that very logger. Both threads then hang, and the sampling request,
+  the log level or the SSE `connect` behind the notice never returns. A
+  thread inside a notice now never queues: its nested attempt stands down
+  at once and leaves that notice owed to a later use, exactly as a dropped
+  one is — the notice it stood down from is being written by whoever holds
+  the gate. Round 10's contract is untouched: one notice per feature per
+  process, and a plain contender still waits for another thread's emission
+  and takes the notice over when that emission fails.
+- **A logger that writes nowhere does not spend a notice (round 11).**
+  `Logger.new(nil)` is a supported no-output logger: it keeps every level,
+  so the level probe passed it, and its `warn` returns successfully having
+  written nothing — which marked the notice emitted and silenced every
+  later use, including one holding a logger that does write. A logger with
+  no device is now treated like one that drops warnings: the deprecated
+  operation is unaffected and the notice stays owed.
+- **The log level in request metadata is Logging too (round 11).** MCP
+  2026-07-28 moved the log level off `logging/setLevel` and onto every
+  request, so `log_level=` and an incoming `notifications/message` are not
+  the only ways into the deprecated Logging utility: a host that puts
+  `io.modelcontextprotocol/logLevel` in `request_meta` or in a per-call
+  `_meta` adopts it just as squarely, and `with_request_meta` forwards the
+  key on the wire. That now raises the Logging notice on first use, on the
+  modern path and on the legacy one that passes a supplied `_meta` through
+  untouched.
+- **HTTP+SSE marked in the last two places it was offered (round 11).** The
+  README's Protocol Support elicitation bullet listed SSE as an ordinary
+  elicitation transport with no mark (it now leads with Streamable HTTP and
+  marks HTTP+SSE), and `MCPClient.connect`'s `transport: :sse` entry named
+  SEP-2596 without its earliest removal (three months after SEP-2596
+  reaches Final), which every other mark carries.
+- **`protocol:` and `discover_timeout:` documented as they behave.** The
+  README offered both on `MCPClient.connect` without qualification, but
+  `MCPClient::ServerSSE` accepts neither and `MCPClient.connect` drops them
+  for an `/sse` URL. The deprecated transport has no era of its own, so the
+  documentation now names the three transports that carry the options
+  (stdio, HTTP, Streamable HTTP) and says HTTP+SSE is not one of them,
+  rather than adding era support to a transport on its way out.
+- **No caller waits for a notice (verification pass).** Round 11 stopped a
+  thread that is already inside a notice from queueing for an emission gate,
+  but the thread holding the logger's lock need not be inside a notice at
+  all: an ordinary `logger.info` holds `::Logger`'s device lock for the
+  length of the write, and the device — a formatter, a log subscriber, an
+  audit hook — may itself reach a deprecated feature. That thread then
+  queued for the gate of a second thread which was waiting for the very
+  device lock the first one held, and neither moved again; round 11's
+  `emitting?` guard could not see it, because the first thread was doing
+  ordinary logging rather than writing a notice. No rule about who may queue
+  fixes that, since a waiter cannot know what it is holding, so the gates
+  are gone: the once-per-process accounting is an atomic claim, taken and
+  released under a mutex this module never holds while calling out, and a
+  caller that meets a notice in flight stands down at once instead of
+  queueing behind it. What that gives up is round 9's takeover — a contender
+  no longer writes the notice a failed emission owed — and what it keeps is
+  what mattered: one notice per feature per process, and a notice that was
+  not written is not spent, so the feature's next use raises it again.
+- **A notice is not spent on a warning the logger filtered (verification
+  pass).** `Logger#warn` returns true whether it wrote the line or dropped
+  it for its level, so the level probe was the only evidence a notice was
+  readable — and a contender that waited behind a failing emission carried a
+  probe taken before the wait: with its logger's level raised to ERROR in
+  the meantime, its warning was filtered, the process's one notice was
+  marked emitted having been written nowhere, and lowering the level again
+  did not bring it back. Nothing waits any more, and the probe now sits next
+  to the write rather than at the top of `Deprecations.warn`.
+- **`Root`, `Client#roots` and `declare_sampling_tools` marked (verification
+  pass).** The marking checks counted `@deprecated` tags, which cannot show
+  that a given API carries one, and accepted any window from the registry,
+  which cannot show that a tag names its own. An explicit API-to-feature
+  inventory replaces both, and it named three surfaces that carried no mark:
+  `MCPClient::Root`, the `Client#roots` reader, and `declare_sampling_tools`
+  (the sampling.tools sub-capability, which goes with the capability it
+  refines). Each now cites its feature's SEP and its own earliest removal,
+  none of them warns where it did not warn before, and every `@deprecated`
+  tag in the library is accounted for by the inventory.
+- **Documentation.** README documents the 2026-07-28 support (discovery
+  and per-request metadata, multi round-trip requests, `x-mcp-header`,
+  subscriptions, cacheable results, the tasks extension, authorization) and
+  the deprecated features with their earliest removals and migrations —
+  each row naming what actually triggers the notice, Sampling's
+  transport-level `on_sampling_request` included; the
+  2026-07-28 section flags `log_level=` as deprecated where it presents it,
+  rather than only in the table further down, and states what actually
+  triggers the Roots notice (a configured list, a `roots=` call or a
+  non-empty `roots/list` answer — never the empty answer a client that never
+  configured a root gives).
+
 ### JSON Schema handling
 
 - **The standard assertions are evaluated, patterns are ECMAScript, and
@@ -2329,16 +2545,33 @@ metadata). Each feature lands in its own PR; this section accumulates them.
   than in a tight loop. The plain HTTP transport now accepts the elicitation,
   roots and sampling handlers so `MCPClient::Client` can serve round trips on
   it too.
+- **URL-mode elicitation drops `elicitationId` on modern servers.**
+  2026-07-28 removed the `notifications/elicitation/complete` notification
+  and the `elicitationId` field of URL-mode `elicitation/create` requests:
+  the outcome is learned by retrying the original request, and a server that
+  must correlate an elicitation across retries carries its own identifier in
+  the opaque `requestState`. The metadata hash handed to an elicitation
+  handler therefore no longer carries an `elicitationId` key at all for a
+  modern server — a modern server that sends the field anyway cannot smuggle
+  a correlation id to the host through it, and the client logs one warning
+  naming the field (never its value). On a 2025-11-25 server the field is
+  part of the protocol and the host contract is unchanged, key present (nil
+  when the server sent none) and all. This library never implemented
+  `notifications/elicitation/complete`, so nothing there had to be removed.
 - **Limits and errors.** More than 10 consecutive `input_required` answers,
   an input request this client cannot honour (unknown method, no handler,
   handler error) or a malformed `inputRequests` raise
   `MCPClient::Errors::InputRequiredError` (exposing `input_requests` and
   `request_state`) without a retry; `input_required` on any other method is
-  an `InvalidResultError`. `server/discover` is not one of the three methods
-  that may be answered with `input_required` either: such an answer is
-  refused before any protocol version or capability it carries is applied or
-  cached, so a probe can never adopt a version out of an unfinished result
-  and hand that result back as the first heartbeat.
+  an `InvalidResultError`.
+  Writing that notice is a courtesy, not part of the decision: a logger that
+  raises costs the notice and never the elicitation, the same isolation
+  `MCPClient::Deprecations.warn` has.
+  `server/discover` is not one of the three methods that may be answered
+  with `input_required` either: such an answer is refused before any
+  protocol version or capability it carries is applied or cached, so a probe
+  can never adopt a version out of an unfinished result and hand that result
+  back as the first heartbeat.
 
 ### Custom headers from tool parameters (`x-mcp-header`)
 
@@ -2437,7 +2670,10 @@ metadata). Each feature lands in its own PR; this section accumulates them.
   `notifications/cancelled` on timeout). Server-initiated JSON-RPC requests on
   a response stream are dropped with a warning; SSE comment keep-alives are
   ignored. `ping` maps to `server/discover` and `log_level=` to the
-  per-request `_meta` level.
+  per-request `_meta` level. A session id a non-conforming modern server
+  sends back anyway is never captured (the only capture point is the
+  `initialize` response, which a modern server is never sent), so it is
+  never echoed on a later request and no DELETE terminates it.
 - **A broken response stream is re-issued, `tools/call` included** (changelog
   major change 9: "A broken response stream loses the in-flight request;
   clients **MUST** re-issue it as a new request with a new request ID"). The

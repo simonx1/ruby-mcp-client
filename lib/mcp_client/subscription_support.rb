@@ -196,6 +196,11 @@ module MCPClient
     # @return [void]
     def route_notification(method, params)
       handle_subscription_control(method, params)
+      # notifications/message is the Logging utility, Deprecated as a whole in
+      # 2026-07-28 (SEP-2577). The notice belongs here rather than in
+      # MCPClient::Client: a host that registered on_notification on the
+      # transport itself receives log messages without a Client ever existing.
+      warn_logging_deprecated if method == 'notifications/message'
       invalidate_cache_for_notification(method, params)
       # The host's caches go with the transport's, on their own hook rather
       # than on the host callback below: that callback is deliberately last —

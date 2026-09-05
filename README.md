@@ -20,7 +20,7 @@ gem install ruby-mcp-client
 MCP enables AI assistants to discover and invoke external tools via different transport mechanisms:
 
 - **stdio** - Local processes implementing the MCP protocol
-- **SSE** - Server-Sent Events with streaming support
+- **SSE** *(deprecated)* - Server-Sent Events with streaming support; the HTTP+SSE transport is deprecated and new integrations should use **Streamable HTTP** instead (see [Deprecated features](#deprecated-features))
 - **HTTP** - Simple request/response (non-streaming)
 - **Streamable HTTP** - HTTP POST with SSE-formatted responses
 
@@ -28,24 +28,32 @@ Built-in API conversions: `to_openai_tools()`, `to_anthropic_tools()`, `to_googl
 
 ## MCP Protocol Support
 
-Implements the **MCP 2025-11-25** specification. The client negotiates the
-protocol version during `initialize` and disconnects if the server answers
-with a revision it cannot speak (supported: `2025-11-25`, `2025-06-18`,
-`2025-03-26`, `2024-11-05`):
+Implements the **MCP 2026-07-28** specification and stays compatible with
+every earlier revision (`2025-11-25`, `2025-06-18`, `2025-03-26`,
+`2024-11-05`). The client is dual-era: it probes each server with
+`server/discover` and talks the stateless 2026-07-28 protocol (per-request
+`_meta`, no `initialize`, no sessions) to servers that answer it, and runs
+the classic `initialize` handshake with everyone else — disconnecting if a
+server answers with a revision it cannot speak. See
+[MCP 2026-07-28 Features](#mcp-2026-07-28-features) for the new
+capabilities and [Deprecated features](#deprecated-features) for what the
+revision retires.
 
-- **Tools**: list, call, streaming, annotations (hint-style), structured outputs, title
+- **Tools**: list, call, streaming, annotations (hint-style), structured outputs validated against `outputSchema` (JSON Schema 2020-12 / 2019-09 / draft-07), title, `x-mcp-header` parameters
 - **Prompts**: list, get with parameters
 - **Resources**: list, read, templates, subscriptions, pagination, ResourceLink content
-- **Elicitation**: Server-initiated user interactions (stdio, SSE, Streamable HTTP)
-- **Roots**: Filesystem scope boundaries with change notifications
-- **Sampling**: Server-requested LLM completions with modelPreferences
+- **Elicitation**: Server-initiated user interactions (stdio, Streamable HTTP, and the *deprecated* HTTP+SSE transport) and multi round-trip `input_required` results
+- **Roots** *(deprecated in 2026-07-28)*: Filesystem scope boundaries with change notifications
+- **Sampling** *(deprecated in 2026-07-28)*: Server-requested LLM completions with modelPreferences
 - **Completion**: Autocomplete for prompts/resources with context
-- **Logging**: Server log messages with level filtering
-- **Tasks**: Task-augmented `tools/call` — create with a `ttl`, poll `tasks/get`, retrieve via `tasks/result`, plus `tasks/list` and `tasks/cancel`
+- **Logging** *(deprecated in 2026-07-28)*: Server log messages with level filtering
+- **Tasks**: Task-augmented `tools/call` on 2025-11-25 servers and the `io.modelcontextprotocol/tasks` extension on 2026-07-28 servers
+- **Subscriptions**: `subscriptions/listen` notification streams (2026-07-28)
+- **Caching**: `ttlMs` / `cacheScope` freshness hints on lists, reads and discovery (2026-07-28)
 - **Audio**: Audio content type support
 - **Progress & Cancellation**: `progressToken` plumbing with per-call callbacks; automatic `notifications/cancelled` for abandoned requests
 - **Metadata**: `icons`, `title` and `_meta` parsed on tools, prompts and resources
-- **OAuth 2.1**: PKCE (S256 required), RFC 8414/9728 discovery, dynamic registration, Client ID Metadata Documents, scope step-up challenges
+- **OAuth 2.1**: PKCE (S256 required), RFC 8414/9728 discovery, RFC 9207 issuer validation, Client ID Metadata Documents, dynamic registration *(deprecated)*, scope step-up challenges
 
 Transports treat the server as untrusted input — see
 [Treating the Server as Untrusted](#treating-the-server-as-untrusted) for the
@@ -59,9 +67,9 @@ The simplest way to connect to an MCP server:
 require 'mcp_client'
 
 # Auto-detect transport from URL
-client = MCPClient.connect('http://localhost:8000/sse')      # SSE
 client = MCPClient.connect('http://localhost:8931/mcp')      # Streamable HTTP
 client = MCPClient.connect('npx -y @modelcontextprotocol/server-filesystem /home')  # stdio
+client = MCPClient.connect('http://localhost:8000/sse')      # SSE (HTTP+SSE: deprecated, use Streamable HTTP)
 
 # With options
 client = MCPClient.connect('http://api.example.com/mcp',
@@ -72,7 +80,7 @@ client = MCPClient.connect('http://api.example.com/mcp',
 )
 
 # Multiple servers
-client = MCPClient.connect(['http://server1/mcp', 'http://server2/sse'])
+client = MCPClient.connect(['http://server1/mcp', 'http://server2/mcp'])
 
 # Force specific transport
 client = MCPClient.connect('http://custom.com/api', transport: :streamable_http)
@@ -95,11 +103,11 @@ protocol meaning, send it unchanged.
 
 | URL Pattern | Transport |
 |-------------|-----------|
-| Ends with `/sse` | SSE |
+| Ends with `/sse` | SSE — HTTP+SSE is *deprecated*, prefer Streamable HTTP ([Deprecated features](#deprecated-features)) |
 | Ends with `/mcp` | Streamable HTTP |
 | `stdio://command` or Array | stdio |
 | `npx`, `node`, `python`, etc. | stdio |
-| Other HTTP URLs | Auto-detect (Streamable HTTP → SSE → HTTP) |
+| Other HTTP URLs | Auto-detect (Streamable HTTP → SSE → HTTP) — the SSE step is the *deprecated* HTTP+SSE transport, tried only after Streamable HTTP fails ([Deprecated features](#deprecated-features)) |
 
 ## Working with Tools, Prompts & Resources
 
@@ -325,6 +333,202 @@ refused rather than deferred — a `listen` whose connection is closed while it
 is being opened raises `ConnectionError` instead of POSTing onto a transport
 the host has closed, which no later `cleanup` would find.
 
+## MCP 2026-07-28 Features
+
+The 2026-07-28 revision makes the protocol stateless: there is no
+`initialize` handshake, no session and no server-to-client request channel.
+Every request carries its own metadata, and anything the server needs from
+the client is asked for through the result itself. The client detects which
+era a server speaks and adapts; existing code keeps working unchanged.
+
+### Discovery and per-request metadata
+
+```ruby
+client = MCPClient.connect('http://localhost:8931/mcp')
+server = client.servers.first
+server.modern?            # => true for a 2026-07-28 server
+server.protocol_version   # => "2026-07-28"
+server.protocol_era       # => :modern or :legacy
+```
+
+A modern server is recognised by its answer to `server/discover`; every
+request then carries `io.modelcontextprotocol/protocolVersion`,
+`io.modelcontextprotocol/clientInfo` and
+`io.modelcontextprotocol/clientCapabilities` in `_meta`, and on HTTP the
+`MCP-Protocol-Version`, `Mcp-Method` and `Mcp-Name` headers. Host-supplied
+metadata (a Hash or a callable evaluated per request) is merged into every
+request with `MCPClient::Client.new(request_meta: ...)`. Force an era with
+`protocol: :modern` / `protocol: :legacy` (default `:auto`) and tune the
+probe with `discover_timeout:` on `stdio_config`, `http_config` and
+`streamable_http_config` (or the matching server constructors), and on
+`MCPClient.connect` for those same three transports. The deprecated HTTP+SSE
+transport has no era of its own: `MCPClient::ServerSSE` takes neither option,
+so `MCPClient.connect` drops both for an `/sse` URL rather than passing them
+on ([Deprecated features](#deprecated-features)).
+`ping` maps to `server/discover` and `log_level=` to the per-request log
+level on modern servers.
+
+> `log_level=` is deprecated in MCP 2026-07-28 (SEP-2577). On a modern
+> server it writes `_meta["io.modelcontextprotocol/logLevel"]`, part of the
+> Logging utility the revision marks Deprecated as a whole: new
+> implementations SHOULD NOT adopt it. See
+> [Deprecated features](#deprecated-features).
+
+Typed errors
+carry the JSON-RPC code: `MCPClient::Errors::HeaderMismatchError`
+(-32020), `MissingRequiredClientCapabilityError` (-32021) and
+`UnsupportedProtocolVersionError` (-32022).
+
+### Multi round-trip requests
+
+On a modern server `tools/call`, `resources/read` and `prompts/get` may
+answer `resultType: "input_required"`. The client fulfils each request in
+`inputRequests` with the handlers it already has — the elicitation handler,
+the sampling handler and the configured roots — and re-sends the original
+request with `inputResponses` and the server's opaque `requestState`. More
+than 10 rounds, a request the client cannot honour or a malformed
+`inputRequests` raise `MCPClient::Errors::InputRequiredError` (exposing
+`input_requests` and `request_state`).
+
+### URL-mode elicitation
+
+An elicitation handler of arity 2 (or more) is called with the message and a
+metadata hash when the server asks for an out-of-band (`url`) interaction.
+On a **2025-11-25** server that hash is
+`{ 'mode' => 'url', 'url' => ..., 'elicitationId' => ... }`; on a
+**2026-07-28** server it is `{ 'mode' => 'url', 'url' => ... }` — the
+revision removed `elicitationId` together with
+`notifications/elicitation/complete`, because the outcome is learned by
+retrying the original request rather than from a server-initiated signal, and
+a server that must correlate an elicitation across retries carries its own
+identifier in the opaque `requestState`. A modern server that sends
+`elicitationId` anyway does not reach the host with it: the field is dropped
+and a warning is logged.
+
+### Custom headers from tool parameters
+
+Tool parameters annotated with `x-mcp-header` are mirrored into
+`Mcp-Param-{name}` request headers on `tools/call` (Streamable HTTP and
+plain HTTP). A `-32020` HeaderMismatch rejection triggers one `tools/list`
+refresh and a retry; tools with invalid annotations are excluded from the
+list with a warning. `MCPClient::HeaderParams` exposes the validation.
+
+### Subscriptions (`subscriptions/listen`)
+
+```ruby
+subscription = client.listen(notifications: { tools_list_changed: true,
+                                              resource_subscriptions: ['file:///etc/hosts'] }) do |method, params|
+  puts "#{method}: #{params.inspect}"
+end
+subscription.acknowledged   # what the server agreed to watch
+subscription.unsupported    # what it did not
+subscription.close
+```
+
+Each subscription is one long-lived `subscriptions/listen` request; on
+Streamable HTTP it runs on its own stream and is re-opened with backoff when
+the stream drops, on stdio it is re-sent when the process restarts.
+`subscribe_resource` / `unsubscribe_resource` map onto listen streams on
+modern servers.
+
+### Cacheable results
+
+`server/discover`, the `*/list` requests and `resources/read` carry
+`ttlMs` and `cacheScope`. Lists are served while fresh and re-fetched on
+access once stale (a stale list is served with a warning when the re-fetch
+fails transiently); `resources/read` results with a `ttlMs` are cached per
+URI. Entries with `cacheScope: "private"` are bound to the credentials the
+request went out with and never shared across authorization contexts.
+`server.cache_info(:tools)` / `cache_info(:read, uri)` expose `ttl_ms`,
+`cache_scope`, `received_at` and `fresh`.
+
+### Tasks extension (`io.modelcontextprotocol/tasks`)
+
+```ruby
+client = MCPClient::Client.new(mcp_server_configs: [...],
+                               extensions: ['io.modelcontextprotocol/tasks'])
+
+result = client.call_tool('long_running', {})   # polls tasks/get transparently
+
+task = client.call_tool_as_task('long_running', {})
+task = client.wait_for_task(task, timeout: 120)  # answers input_required via tasks/update
+task.result if task.completed?
+client.cancel_task(task)
+```
+
+Task-augmented calls are opt-in through `extensions:`; a server that
+answers `tools/call` with a task is polled at its `pollIntervalMs` until the
+task is terminal or its `ttlMs` elapses, and `input_required` tasks are
+answered with the elicitation / sampling / roots handlers. `tasks/list` and
+`tasks/result` do not exist on 2026-07-28 servers; the legacy task API keeps
+working on 2025-11-25 servers.
+
+### Authorization
+
+`OAuthProvider` records the authorization server's `issuer` with each
+authorization request and validates the callback's `iss` per RFC 9207
+(`complete_authorization_flow(code, state, iss:)`); client credentials and
+tokens are bound to the issuer that produced them, so a server that
+switches authorization servers never sees another server's token. Dynamic
+Client Registration carries `application_type` and is deprecated in favour
+of Client ID Metadata Documents (`client_id_metadata_url:`). See
+[OAUTH.md](OAUTH.md).
+
+### Deprecated features
+
+The 2026-07-28 [deprecated features registry](https://modelcontextprotocol.io/specification/2026-07-28/deprecated)
+lists these as Deprecated under the feature lifecycle policy: they keep
+working during their deprecation window, but new integrations should not
+adopt them. The earliest removal is the registry's own, and it names a
+*revision*, not a date: what the features 2026-07-28 deprecates wait for is
+the first revision released on or after 2027-07-28, which may itself land
+well after that date — do not plan around 2027-07-28 as a removal date. The
+`includeContext` values follow Sampling, and only the HTTP+SSE transport has
+a clock of its own. The earliest removal is when a feature becomes
+*eligible* for removal; the actual removal is a Core Maintainer decision
+taken during release preparation. The client logs one notice per feature per
+process on first use, naming the earliest removal and the suggested
+migration:
+
+| Feature | Deprecated since | Earliest removal | Migration |
+|---------|------------------|------------------|-----------|
+| Roots (`roots:`, `Client#roots=`, or answering a `roots/list` request with a non-empty list) | 2026-07-28 (SEP-2577) | the first revision released on or after 2027-07-28 | Pass directories or files through tool parameters, resource URIs or server configuration |
+| Sampling (`sampling_handler:` on `Client.new` or `MCPClient.connect`, or serving a request through a transport's `on_sampling_request`) | 2026-07-28 (SEP-2577) | the first revision released on or after 2027-07-28 | Integrate directly with the LLM provider API |
+| Logging (`log_level=` on the client or a server, an `io.modelcontextprotocol/logLevel` in `request_meta` or a per-call `_meta`, `notifications/message`) | 2026-07-28 (SEP-2577) | the first revision released on or after 2027-07-28 | Log to stderr (stdio) or use OpenTelemetry |
+| HTTP+SSE transport (`MCPClient::ServerSSE`, warned once it is connected) | 2025-03-26 (reclassified by SEP-2596) | three months after SEP-2596 reaches Final | Migrate the server to Streamable HTTP |
+| `includeContext` `"thisServer"` / `"allServers"` in sampling requests | 2025-11-25 (reclassified by SEP-2596) | follows Sampling (SEP-2577) | Servers omit the field or send `"none"` |
+| OAuth Dynamic Client Registration | 2026-07-28 (PR #2858) | the first revision released on or after 2027-07-28 | Client ID Metadata Documents or pre-registered credentials |
+
+A client that never adopted Roots is never warned about them. It registers a
+`roots/list` handler on every server unconditionally, so that a later
+`client.roots = [...]` is served without reconnecting, and until a root is set
+it answers `roots/list` with an empty list — an empty answer exposes nothing
+deprecated, so it raises no notice. The notice fires when the host configures
+`roots:`, calls `Client#roots=`, or serves an answer that actually carries a
+root (including from a transport driven directly, without a `Client`).
+
+`MCPClient::Deprecations::REGISTRY` lists them, each with its
+`earliest_removal`; set
+`MCPClient::Deprecations.enabled = false` (before constructing clients) to
+silence the notices. Notices go to the logger the client or server was
+given; without one they go to the default `$stdout` logger like every other
+warning. A notice costs the deprecated operation exactly what one
+`logger.warn` costs it, and no more: a logger that raises, drops the notice
+or writes nowhere (`Logger.new(nil)`, or one whose device has been closed) is
+swallowed, so the feature keeps working and the notice stays owed to a later
+use — but a logger that blocks, blocks its caller here just as it does
+everywhere else in the library.
+Nothing ever waits for a notice. A caller that meets one already in flight —
+another thread's first use, or a formatter, log subscriber, audit hook or
+`level` accessor that reaches a deprecated feature from inside the notice
+being written — stands down at once instead of queueing behind it. Queueing would be worth a
+deadlock, since the thread writing a notice holds the logger and the thread
+that would queue may be holding a lock that logger needs (an ordinary
+`logger.info` holds exactly such a lock while its device runs). And it would
+buy nothing: whoever holds the notice is writing it, and if their logger
+fails or filters the warning the notice is owed again, so the feature's next
+use raises it.
+
 ## MCP 2025-11-25 Features
 
 ### Tool Annotations
@@ -434,6 +638,8 @@ it.
 
 ### Roots
 
+> Deprecated in MCP 2026-07-28 (SEP-2577); see [Deprecated features](#deprecated-features).
+
 ```ruby
 # Set filesystem scope boundaries
 client.roots = [
@@ -446,6 +652,8 @@ client.roots
 ```
 
 ### Sampling (Server-requested LLM completions)
+
+> Deprecated in MCP 2026-07-28 (SEP-2577); see [Deprecated features](#deprecated-features).
 
 ```ruby
 # Configure handler when creating client
@@ -556,6 +764,8 @@ result = client.complete(
 
 ### Logging
 
+> Deprecated in MCP 2026-07-28 (SEP-2577); see [Deprecated features](#deprecated-features).
+
 ```ruby
 # Set log level
 client.log_level = 'debug'  # debug/info/notice/warning/error/critical
@@ -641,6 +851,9 @@ For more control, use `create_client` with explicit configs:
 client = MCPClient.create_client(
   mcp_server_configs: [
     MCPClient.stdio_config(command: 'npx server', name: 'local'),
+    # HTTP+SSE is deprecated (SEP-2596): keep this only for an existing SSE
+    # server, and prefer Streamable HTTP (streamable_http_config below) for
+    # anything new. See "Deprecated features".
     MCPClient.sse_config(
       base_url: 'https://api.example.com/sse',
       headers: { 'Authorization' => 'Bearer TOKEN' },
@@ -901,7 +1114,7 @@ client = MCPClient::Client.new(
 )
 ```
 
-Features: PKCE, server discovery (`.well-known`), dynamic registration, token refresh.
+Features: PKCE, server discovery (`.well-known`), RFC 9207 issuer validation, Client ID Metadata Documents, dynamic registration (deprecated fallback), token refresh.
 
 See [OAUTH.md](OAUTH.md) for full documentation.
 

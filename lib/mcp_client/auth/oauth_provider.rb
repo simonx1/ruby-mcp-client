@@ -10,6 +10,7 @@ require_relative 'oauth_provider/challenge_handling'
 require_relative 'oauth_provider/client_authentication'
 require_relative 'oauth_provider/registration_store'
 require_relative 'oauth_provider/response_validation'
+require_relative '../deprecations'
 
 module MCPClient
   module Auth
@@ -1553,12 +1554,16 @@ module MCPClient
       end
 
       # Register OAuth client dynamically
+      # @deprecated Dynamic Client Registration is deprecated since MCP 2026-07-28
+      #   (PR #2858); earliest removal is the first revision released on or after
+      #   2027-07-28. Prefer a Client ID Metadata Document (client_id_metadata_url)
+      #   or pre-registered credentials. It remains the fallback for authorization
+      #   servers without Client ID Metadata Document support.
       # @param server_metadata [ServerMetadata] Authorization server metadata
       # @return [ClientInfo] Registered client information
       # @raise [MCPClient::Errors::ConnectionError] if registration fails
       def register_client(server_metadata)
-        logger.warn('Dynamic Client Registration is deprecated in MCP 2026-07-28; prefer a Client ID Metadata ' \
-                    'Document (client_id_metadata_url) or pre-registered credentials')
+        MCPClient::Deprecations.warn(:dynamic_client_registration, logger)
         logger.debug("Registering OAuth client at: #{safe_error_text(server_metadata.registration_endpoint.to_s)}")
 
         app_type = resolved_application_type

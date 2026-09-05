@@ -3,6 +3,7 @@
 # Load all MCPClient components
 require_relative 'mcp_client/errors'
 require_relative 'mcp_client/deep_copy'
+require_relative 'mcp_client/deprecations'
 require_relative 'mcp_client/tool'
 require_relative 'mcp_client/prompt'
 require_relative 'mcp_client/resource'
@@ -38,11 +39,17 @@ module MCPClient
   # Simplified connection API - auto-detects transport and returns connected client
   #
   # @param target [String, Array<String>] URL(s) or command for connection
-  #   - URLs ending in /sse -> SSE transport
+  #   - URLs ending in /sse -> SSE transport. The HTTP+SSE transport has been
+  #     deprecated since MCP 2025-03-26 and is listed in the 2026-07-28
+  #     deprecated features registry (SEP-2596); earliest removal is three
+  #     months after SEP-2596 reaches Final. New integrations should use
+  #     Streamable HTTP.
   #   - URLs ending in /mcp -> Streamable HTTP transport
   #   - stdio://command or Array commands -> stdio transport
   #   - Commands starting with npx, node, python, ruby, etc. -> stdio transport
-  #   - Other HTTP URLs -> Try Streamable HTTP, fallback to SSE, then HTTP
+  #   - Other HTTP URLs -> Try Streamable HTTP, then the deprecated HTTP+SSE
+  #     transport (SEP-2596), then HTTP. The SSE step is a fallback for an
+  #     existing server, not a choice a new integration should rely on.
   # Accepts keyword arguments for connection options:
   # - headers [Hash] HTTP headers for remote transports
   # - read_timeout [Integer] Request timeout in seconds (default: 30)
@@ -53,18 +60,23 @@ module MCPClient
   # - env [Hash] Environment variables for stdio
   # - ping [Integer] Ping interval for SSE (default: 10)
   # - endpoint [String] JSON-RPC endpoint path (default: '/rpc')
-  # - transport [Symbol] Force transport type (:stdio, :sse, :http, :streamable_http)
-  # - sampling_handler [Proc] Handler for sampling requests
+  # - transport [Symbol] Force transport type (:stdio, :sse, :http, :streamable_http).
+  #   :sse forces the deprecated HTTP+SSE transport (SEP-2596); earliest
+  #   removal is three months after SEP-2596 reaches Final. Prefer
+  #   :streamable_http.
+  # - sampling_handler [Proc] Handler for sampling requests. Deprecated since MCP
+  #   2026-07-28 (SEP-2577); earliest removal is the first revision released on or
+  #   after 2027-07-28. Integrate directly with the LLM provider API instead.
   # @yield [Faraday::Connection] Optional block for Faraday customization
   # @return [MCPClient::Client] Connected client ready to use
   # @raise [MCPClient::Errors::ConnectionError] if connection fails
   # @raise [MCPClient::Errors::TransportDetectionError] if transport cannot be determined
   #
-  # @example Connect to SSE server
-  #   client = MCPClient.connect('http://localhost:8000/sse')
-  #
   # @example Connect to Streamable HTTP server
   #   client = MCPClient.connect('http://localhost:8000/mcp')
+  #
+  # @example Connect to SSE server (deprecated transport; prefer Streamable HTTP)
+  #   client = MCPClient.connect('http://localhost:8000/sse')
   #
   # @example Connect with options
   #   client = MCPClient.connect('http://api.example.com/mcp',
@@ -78,7 +90,7 @@ module MCPClient
   #   client = MCPClient.connect(['npx', '-y', '@modelcontextprotocol/server-filesystem', '/home'])
   #
   # @example Connect to multiple servers
-  #   client = MCPClient.connect(['http://server1/mcp', 'http://server2/sse'])
+  #   client = MCPClient.connect(['http://server1/mcp', 'http://server2/mcp'])
   #
   # @example Force transport type
   #   client = MCPClient.connect('http://custom-server.com', transport: :streamable_http)
@@ -428,6 +440,11 @@ module MCPClient
   end
 
   # Create a standard server configuration for SSE
+  #
+  # @deprecated The HTTP+SSE transport has been deprecated since MCP 2025-03-26
+  #   and is listed in the 2026-07-28 deprecated features registry (SEP-2596);
+  #   earliest removal is three months after SEP-2596 reaches Final. Use
+  #   {MCPClient.streamable_http_config} and {MCPClient::ServerStreamableHTTP}.
   # @param base_url [String] base URL for the server
   # @param headers [Hash] HTTP headers to include in requests
   # @param read_timeout [Integer] read timeout in seconds (default: 30)

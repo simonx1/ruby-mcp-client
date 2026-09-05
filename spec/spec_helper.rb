@@ -28,6 +28,10 @@ RSpec.configure do |config|
     c.syntax = :expect
   end
 
+  # Deprecation notices are once-per-process and would make examples
+  # order-dependent; only the deprecations spec turns them on.
+  config.before(:suite) { MCPClient::Deprecations.enabled = false }
+
   # Reset WebMock before each test to ensure test isolation
   config.before(:each) do
     WebMock.reset!

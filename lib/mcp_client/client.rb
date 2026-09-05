@@ -4,6 +4,7 @@ require 'logger'
 require 'securerandom'
 require_relative 'deep_copy'
 require_relative 'client/list_aggregation'
+require_relative 'deprecations'
 require_relative 'client/task_support'
 require_relative 'client/task_api'
 
@@ -23,19 +24,38 @@ module MCPClient
     # Requests with a mode outside this set are rejected with -32602.
     SUPPORTED_ELICITATION_MODES = %w[form url].freeze
 
-    # @!attribute [r] servers
-    #   @return [Array<MCPClient::ServerBase>] list of servers
-    # @!attribute [r] tool_cache
-    #   @return [Hash<String, MCPClient::Tool>] cache of tools by composite key (server_id:name)
-    # @!attribute [r] prompt_cache
-    #   @return [Hash<String, MCPClient::Prompt>] cache of prompts by composite key (server_id:name)
-    # @!attribute [r] resource_cache
-    #   @return [Hash<String, MCPClient::Resource>] cache of resources by composite key (server_id:uri)
-    # @!attribute [r] logger
-    #   @return [Logger] logger for client operations
-    # @!attribute [r] roots
-    #   @return [Array<MCPClient::Root>] list of MCP roots (MCP 2025-06-18)
-    attr_reader :servers, :tool_cache, :prompt_cache, :resource_cache, :logger, :roots
+    # These readers are declared one per line with an ordinary doc comment
+    # rather than grouped under `@!attribute` directives, because the directive
+    # form loses documentation silently: YARD drops the docstring of the LAST
+    # directive in a block preceding a combined `attr_reader`, re-registering
+    # that name from the statement itself with the leftover (empty) docstring.
+    # The `roots` deprecation below was absent from the generated API
+    # documentation for exactly that reason, while every check that read the
+    # source found it.
+
+    # @return [Array<MCPClient::ServerBase>] list of servers
+    attr_reader :servers
+
+    # @return [Hash<String, MCPClient::Tool>] cache of tools by composite key (server_id:name)
+    attr_reader :tool_cache
+
+    # @return [Hash<String, MCPClient::Prompt>] cache of prompts by composite key (server_id:name)
+    attr_reader :prompt_cache
+
+    # @return [Hash<String, MCPClient::Resource>] cache of resources by composite key (server_id:uri)
+    attr_reader :resource_cache
+
+    # @return [Logger] logger for client operations
+    attr_reader :logger
+
+    # @return [Array<MCPClient::Root>] list of MCP roots (MCP 2025-06-18)
+    # @deprecated Roots is deprecated since MCP 2026-07-28 (SEP-2577); earliest
+    #   removal is the first revision released on or after 2027-07-28. Reading the
+    #   list is not itself a first use of the feature — the notice follows
+    #   configuring a root or serving one — but the list is a deprecated feature's
+    #   state, and a host reading it is holding one. Pass directories or files
+    #   through tool parameters, resource URIs or server configuration instead.
+    attr_reader :roots
 
     # Supported modes for structuredContent validation (MCP 2025-11-25):
     # :warn logs a warning on mismatch, :strict raises a ValidationError.
@@ -64,8 +84,13 @@ module MCPClient
     # @param mcp_server_configs [Array<Hash>] configurations for MCP servers
     # @param logger [Logger, nil] optional logger, defaults to STDOUT
     # @param elicitation_handler [Proc, nil] optional handler for elicitation requests (MCP 2025-06-18)
-    # @param roots [Array<MCPClient::Root, Hash>, nil] optional list of roots (MCP 2025-06-18)
-    # @param sampling_handler [Proc, nil] optional handler for sampling requests (MCP 2025-11-25)
+    # @param roots [Array<MCPClient::Root, Hash>, nil] optional list of roots (MCP 2025-06-18).
+    #   Deprecated since MCP 2026-07-28 (SEP-2577); earliest removal is the first revision
+    #   released on or after 2027-07-28. Pass directories or files through tool parameters,
+    #   resource URIs or server configuration instead.
+    # @param sampling_handler [Proc, nil] optional handler for sampling requests (MCP 2025-11-25).
+    #   Deprecated since MCP 2026-07-28 (SEP-2577); earliest removal is the first revision
+    #   released on or after 2027-07-28. Integrate directly with the LLM provider API instead.
     # @param sampling_supports_tools [Boolean] whether the sampling handler supports tool use
     #   (MCP 2025-11-25 / SEP-1577); declares the sampling.tools capability and forwards
     #   tools/toolChoice params to the handler instead of rejecting tool-enabled requests
@@ -134,12 +159,14 @@ module MCPClient
       @notification_listeners = []
       # Elicitation handler (MCP 2025-06-18)
       @elicitation_handler = elicitation_handler
-      # Sampling handler (MCP 2025-11-25)
+      # Sampling handler (MCP 2025-11-25; deprecated in 2026-07-28, SEP-2577)
       @sampling_handler = sampling_handler
+      MCPClient::Deprecations.warn(:sampling, @logger) if sampling_handler
       # Whether the sampling handler supports tool use (SEP-1577)
       @sampling_supports_tools = sampling_supports_tools
-      # Roots (MCP 2025-06-18)
+      # Roots (MCP 2025-06-18; deprecated in 2026-07-28, SEP-2577)
       @roots = normalize_roots(roots)
+      MCPClient::Deprecations.warn(:roots, @logger) unless @roots.empty?
       # Register default and user-defined notification handlers on each server
       @servers.each do |server|
         configure_server_identity(server, client_info, request_meta)
@@ -148,8 +175,13 @@ module MCPClient
         # supports: transports derive their declared client capabilities from
         # the callbacks registered before connecting, and MCP forbids using
         # capabilities that were not negotiated.
+        # The transports call the callback with (request_id, params) only, so
+        # the asking server is closed over here: the URL-mode host contract
+        # depends on its protocol era (MCP 2026-07-28 removed elicitationId).
         if @elicitation_handler && server.respond_to?(:on_elicitation_request)
-          server.on_elicitation_request(&method(:handle_elicitation_request))
+          server.on_elicitation_request do |request_id, request_params|
+            handle_elicitation_request(request_id, request_params, server)
+          end
         end
         # The client always implements the roots feature (roots/list and
         # list_changed notifications), independent of the current roots list.
@@ -431,9 +463,14 @@ module MCPClient
 
     # Set the roots for this client (MCP 2025-06-18)
     # When roots are changed, a notification is sent to all connected servers
+    # @deprecated Roots are deprecated since MCP 2026-07-28 (SEP-2577);
+    #   earliest removal is the first revision released on or after
+    #   2027-07-28. Pass directories or files through tool parameters,
+    #   resource URIs or server configuration instead.
     # @param new_roots [Array<MCPClient::Root, Hash>] the new roots to set
     # @return [void]
     def roots=(new_roots)
+      MCPClient::Deprecations.warn(:roots, @logger)
       @roots = normalize_roots(new_roots)
       # Notify servers that roots have changed
       notify_roots_changed
@@ -606,11 +643,16 @@ module MCPClient
 
     # Set the logging level on all connected servers (MCP 2025-06-18)
     # To set on a specific server, use: client.find_server('name').log_level = 'debug'
+    # @deprecated Logging is deprecated since MCP 2026-07-28 (SEP-2577);
+    #   earliest removal is the first revision released on or after
+    #   2027-07-28. Have the server log to stderr (stdio) or use
+    #   OpenTelemetry instead.
     # @param level [String] the log level ('debug', 'info', 'notice', 'warning', 'error',
     #   'critical', 'alert', 'emergency')
     # @return [Array<Hash>] results from servers
     # @raise [MCPClient::Errors::ServerError] if server returns an error
     def log_level=(level)
+      MCPClient::Deprecations.warn(:logging, @logger)
       @servers.filter_map do |srv|
         # MCP lifecycle: only use capabilities that were successfully
         # negotiated — skip servers whose NEGOTIATED set lacks logging.
@@ -1114,6 +1156,7 @@ module MCPClient
     end
 
     def handle_log_message(server_id, params)
+      MCPClient::Deprecations.warn(:logging, @logger)
       level = params['level'] || 'info'
       logger_name = params['logger']
       data = params['data']
@@ -1593,8 +1636,11 @@ module MCPClient
     # Supports both form mode (structured data) and URL mode (out-of-band interaction).
     # @param _request_id [String, Integer] the JSON-RPC request ID (unused at client layer)
     # @param params [Hash] the elicitation parameters
+    # @param server [MCPClient::ServerBase, nil] the server that asked, so the
+    #   URL-mode host contract can follow its protocol era; nil (an era that
+    #   was never established) keeps the 2025-11-25 contract
     # @return [Hash] the elicitation response
-    def handle_elicitation_request(_request_id, params)
+    def handle_elicitation_request(_request_id, params, server = nil)
       mode = params['mode'] || 'form'
       # MCP 2025-11-25: requests with a mode not declared in client
       # capabilities MUST be rejected with -32602 (Invalid params). This check
@@ -1616,7 +1662,7 @@ module MCPClient
 
       begin
         result = if mode == 'url'
-                   handle_url_elicitation(params, message)
+                   handle_url_elicitation(params, message, server)
                  else
                    handle_form_elicitation(params, message)
                  end
@@ -1674,10 +1720,10 @@ module MCPClient
     # Handle URL mode elicitation (MCP 2025-11-25)
     # @param params [Hash] the elicitation parameters
     # @param message [String] the human-readable message
+    # @param server [MCPClient::ServerBase, nil] the server that asked
     # @return [Object] handler result
-    def handle_url_elicitation(params, message)
-      url = params['url']
-      elicitation_id = params['elicitationId']
+    def handle_url_elicitation(params, message, server = nil)
+      url_params = url_elicitation_metadata(params, server)
 
       # Call handler with URL-mode specific params
       case @elicitation_handler.arity
@@ -1686,11 +1732,44 @@ module MCPClient
       when 1
         @elicitation_handler.call(message)
       when 2, -1
-        @elicitation_handler.call(message, { 'mode' => 'url', 'url' => url, 'elicitationId' => elicitation_id })
+        @elicitation_handler.call(message, url_params)
       else
-        @elicitation_handler.call(message, { 'mode' => 'url', 'url' => url, 'elicitationId' => elicitation_id },
-                                  params['metadata'])
+        @elicitation_handler.call(message, url_params, params['metadata'])
       end
+    end
+
+    # The URL-mode metadata handed to the host. MCP 2026-07-28 (changelog,
+    # minor change 11) removed the `elicitationId` field along with
+    # `notifications/elicitation/complete`: under the multi round-trip
+    # requests pattern the client learns the outcome by retrying the original
+    # request, and a server that must correlate an elicitation across retries
+    # carries its own identifier in `requestState`. So a modern server's
+    # contract has no such key at all — not even a nil one — and a
+    # non-conforming modern server that sends the field anyway cannot smuggle
+    # a correlation id to the host through it. For a server on an earlier
+    # revision the field is part of the protocol and the contract is
+    # unchanged, key present (nil when the server sent none) and all; a nil
+    # server (an era that was never established) is treated the same way.
+    # @param params [Hash] the elicitation parameters
+    # @param server [MCPClient::ServerBase, nil] the server that asked
+    # @return [Hash] the metadata hash for the host's handler
+    def url_elicitation_metadata(params, server)
+      metadata = { 'mode' => 'url', 'url' => params['url'] }
+      return metadata.merge('elicitationId' => params['elicitationId']) unless modern_server?(server)
+
+      if params.key?('elicitationId')
+        # Dropping the field is the protocol decision; saying so is a
+        # courtesy. A logger that raises costs the notice, never the
+        # elicitation — the value is a server-chosen correlation id, so the
+        # message names the field and never quotes it.
+        begin
+          @logger.warn('Ignoring elicitationId on a URL-mode elicitation request: MCP 2026-07-28 removed the field ' \
+                       '(the outcome is learned by retrying the original request; correlate via requestState)')
+        rescue StandardError
+          nil
+        end
+      end
+      metadata
     end
 
     # Format and validate the elicitation response
@@ -1880,6 +1959,12 @@ module MCPClient
         return jsonrpc_error_result(-32_602,
                                     'Invalid params: tools/toolChoice provided but the sampling.tools ' \
                                     'capability was not declared')
+      end
+
+      # SEP-2596: "thisServer" / "allServers" are deprecated (omit the field
+      # or send "none"); the request is still served as before.
+      if %w[thisServer allServers].include?(params['includeContext'])
+        MCPClient::Deprecations.warn(:include_context, @logger, detail: "includeContext #{params['includeContext']}")
       end
 
       messages = params['messages'] || []
