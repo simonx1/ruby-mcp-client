@@ -380,6 +380,7 @@ module MCPClient
         raise MCPClient::Errors::ConnectionError, "Server returned an invalid server/discover result (#{result.class})"
       end
 
+      reject_input_required_discover!(result)
       versions = result['supportedVersions']
       unless versions.is_a?(Array) && versions.all?(String)
         raise MCPClient::Errors::ConnectionError, 'server/discover result has no supportedVersions list'
@@ -404,6 +405,26 @@ module MCPClient
       info = result.dig('_meta', META_SERVER_INFO)
       @server_info = info if info.is_a?(Hash)
       result
+    end
+
+    # An InputRequiredResult is defined only for tools/call, resources/read
+    # and prompts/get (MCP 2026-07-28 basic/patterns/mrtr "Supported
+    # Requests"). server/discover is not one of them, so an input_required
+    # discover answer is invalid and MUST NOT be applied or cached: the probe
+    # would otherwise adopt a protocol version out of an unfinished result
+    # and hand that result back as the first heartbeat. The rejection is a
+    # ConnectionError, not an InvalidResultError, because a server answering
+    # server/discover at all is modern — it must never be mistaken for a
+    # legacy server and retried with the initialize handshake.
+    # @param result [Hash] the server/discover result
+    # @return [void]
+    # @raise [MCPClient::Errors::ConnectionError] if the result is an InputRequiredResult
+    def reject_input_required_discover!(result)
+      return unless MCPClient::JsonRpcCommon.result_type(result) == 'input_required'
+
+      raise MCPClient::Errors::ConnectionError,
+            'Server answered server/discover with an input_required result; multi round-trip requests are ' \
+            "only valid for #{MRTR_METHODS.join(', ')}"
     end
 
     # Validate a log level name (logging utility levels).
@@ -499,23 +520,25 @@ module MCPClient
     # @return [Hash] the capabilities object for the initialize request
     def client_capabilities
       capabilities = {}
-      # MCP 2026-07-28 delivers roots/sampling/elicitation through the multi
-      # round-trip pattern (InputRequiredResult), not server-initiated
-      # requests. Until that pattern is implemented, modern requests declare
-      # none of these: a server MUST NOT ask for what the client did not
-      # declare, so an unfulfillable input request is never provoked.
-      unless modern?
-        if registered_callback?(:@elicitation_request_callback)
-          # Both defined elicitation modes are implemented (an empty object
-          # would mean form-only per the spec's backwards-compatibility rule).
-          capabilities['elicitation'] = { 'form' => {}, 'url' => {} }
-        end
-        capabilities['roots'] = { 'listChanged' => true } if registered_callback?(:@roots_list_request_callback)
-        if registered_callback?(:@sampling_request_callback)
-          # SEP-1577: servers may only send tool-enabled sampling requests when
-          # the client declares the sampling.tools sub-capability.
-          capabilities['sampling'] = sampling_tools_supported? ? { 'tools' => {} } : {}
-        end
+      # On a modern server these features are served through the multi
+      # round-trip pattern (InputRequiredResult), on a legacy one through
+      # server-initiated requests; either way they are declared only when
+      # the host registered a handler, since the server MUST NOT ask for
+      # what the client did not declare.
+      if registered_callback?(:@elicitation_request_callback)
+        # Both defined elicitation modes are implemented (an empty object
+        # would mean form-only per the spec's backwards-compatibility rule).
+        capabilities['elicitation'] = { 'form' => {}, 'url' => {} }
+      end
+      if registered_callback?(:@roots_list_request_callback)
+        # notifications/roots/list_changed was removed in 2026-07-28, so the
+        # modern roots capability has no listChanged flag.
+        capabilities['roots'] = modern? ? {} : { 'listChanged' => true }
+      end
+      if registered_callback?(:@sampling_request_callback)
+        # SEP-1577: servers may only send tool-enabled sampling requests when
+        # the client declares the sampling.tools sub-capability.
+        capabilities['sampling'] = sampling_tools_supported? ? { 'tools' => {} } : {}
       end
       capabilities['extensions'] = declared_extensions.dup unless declared_extensions.empty?
       # NOTE: we intentionally do NOT declare a client `tasks` capability. That
@@ -603,7 +626,7 @@ module MCPClient
       return result if type == 'complete'
 
       message = "#{method} answered with resultType #{type.to_s[0, 64].inspect}, which this " \
-                'client cannot carry through (multi round-trip requests are not implemented)'
+                'client cannot carry through'
       raise MCPClient::Errors::InputRequiredError.new(message, data: result) if type == 'input_required'
 
       raise MCPClient::Errors::InvalidResultError.new("Invalid result: #{message}", data: result)
@@ -761,8 +784,188 @@ module MCPClient
       result = response['result']
       validate_result_type!(result)
       record_server_info(result)
-      reject_unfulfillable_input_required!(result)
       result
+    end
+
+    # Client requests a server MAY answer with an InputRequiredResult (MCP
+    # 2026-07-28 basic/patterns/mrtr "Supported Requests"); on any other
+    # request such a result is invalid.
+    MRTR_METHODS = %w[tools/call resources/read prompts/get].freeze
+
+    # Ceiling on consecutive input_required answers to one logical request.
+    # Servers MAY keep asking, but an unbounded loop is a hostile server.
+    MAX_INPUT_ROUND_TRIPS = 10
+
+    # Pause before retrying an InputRequiredResult that asked for nothing
+    # (requestState only — e.g. a URL-mode elicitation still in progress out
+    # of band). The client MAY retry immediately, but a tight loop would just
+    # burn the round-trip budget; doubles up to the maximum.
+    INPUT_RETRY_DELAY = 0.5
+    INPUT_RETRY_MAX_DELAY = 5
+
+    # Input request methods and the transport callback that fulfils each.
+    INPUT_REQUEST_HANDLERS = {
+      'elicitation/create' => :@elicitation_request_callback,
+      'sampling/createMessage' => :@sampling_request_callback,
+      'roots/list' => :@roots_list_request_callback
+    }.freeze
+
+    # Drive a request through the multi round-trip pattern (MCP 2026-07-28
+    # basic/patterns/mrtr): while the server answers with an
+    # InputRequiredResult, fulfil its inputRequests through the registered
+    # handlers and retry the original request — as an independent request
+    # with a new id — carrying inputResponses keyed like the requests and
+    # the opaque requestState echoed verbatim (omitted when the server sent
+    # none). A result without inputRequests asks for nothing this client can
+    # fulfil, so it is retried after a growing pause (INPUT_RETRY_DELAY).
+    # @param method [String] the JSON-RPC method
+    # @param params [Hash] the original params
+    # @param timeout [Numeric, nil] per-request timeout
+    # @yieldparam params [Hash] params for one attempt (original, or with inputResponses)
+    # @yieldreturn [Object] the attempt's result
+    # @return [Object] the final (complete) result
+    # @raise [MCPClient::Errors::InvalidResultError] input_required on an unsupported method
+    # @raise [MCPClient::Errors::InputRequiredError] when a round trip cannot be fulfilled or too many occur
+    def resolve_input_round_trips(method, params, _timeout = nil)
+      result = yield(params)
+      round_trips = 0
+      delay = INPUT_RETRY_DELAY
+      while MCPClient::JsonRpcCommon.result_type(result) == 'input_required'
+        unless modern? && MRTR_METHODS.include?(method)
+          raise MCPClient::Errors::InvalidResultError,
+                "Invalid result: input_required is only valid for #{MRTR_METHODS.join(', ')} " \
+                "on an MCP 2026-07-28 server, not #{method} (#{protocol_version})"
+        end
+
+        round_trips += 1
+        if round_trips > MAX_INPUT_ROUND_TRIPS
+          raise MCPClient::Errors::InputRequiredError.new(
+            "Server kept requesting input for #{method} after #{MAX_INPUT_ROUND_TRIPS} round trips", data: result
+          )
+        end
+
+        @logger.debug("#{method} requires input (round trip #{round_trips}); fulfilling and retrying")
+        retry_params = retry_params_for(params, result)
+        unless retry_params.key?('inputResponses')
+          sleep(delay)
+          delay = [delay * 2, INPUT_RETRY_MAX_DELAY].min
+        end
+        result = yield(retry_params)
+      end
+      result
+    end
+
+    # The params for a multi round-trip retry: the original params plus the
+    # fulfilled inputResponses and the server's requestState. Both fields
+    # affect only this retry; the caller's params are not mutated.
+    # @param params [Hash] the original params
+    # @param result [Hash] the InputRequiredResult
+    # @return [Hash]
+    def retry_params_for(params, result)
+      retry_params = (params.is_a?(Hash) ? params.dup : {})
+      retry_params.delete('inputResponses')
+      retry_params.delete(:inputResponses)
+      retry_params.delete('requestState')
+      retry_params.delete(:requestState)
+
+      if result.key?('inputRequests')
+        retry_params['inputResponses'] = fulfil_input_requests(result['inputRequests'], result)
+      end
+      state = result['requestState']
+      retry_params['requestState'] = state unless state.nil?
+      retry_params
+    end
+
+    # Fulfil every input request through the handler registered for its
+    # method. There is no per-key error channel in InputResponses, so any
+    # request this client cannot honour fails the whole round trip.
+    # @param input_requests [Hash] the InputRequests map
+    # @param result [Hash] the InputRequiredResult (for error data)
+    # @return [Hash] the InputResponses map
+    # @raise [MCPClient::Errors::InputRequiredError]
+    def fulfil_input_requests(input_requests, result)
+      unless input_requests.is_a?(Hash)
+        raise MCPClient::Errors::InputRequiredError.new('Malformed InputRequiredResult: inputRequests is not an object',
+                                                        data: result)
+      end
+
+      input_requests.to_h do |key, request|
+        [key, fulfil_input_request(key, request, result)]
+      end
+    end
+
+    # @param key [String] the server-assigned request key
+    # @param request [Hash] the input request ({ 'method' => ..., 'params' => ... })
+    # @param result [Hash] the InputRequiredResult (for error data)
+    # @return [Hash] the handler's result
+    # @raise [MCPClient::Errors::InputRequiredError]
+    def fulfil_input_request(key, request, result)
+      shown_key = sanitize_log_text(key.to_s.inspect)
+      unless request.is_a?(Hash) && request['method'].is_a?(String) &&
+             (request['params'].nil? || request['params'].is_a?(Hash))
+        raise MCPClient::Errors::InputRequiredError.new("Malformed input request #{shown_key} (method/params)",
+                                                        data: result)
+      end
+
+      request_method = request['method']
+      shown_method = sanitize_log_text(request_method.inspect)
+      handler_ivar = INPUT_REQUEST_HANDLERS[request_method]
+      unless handler_ivar
+        raise MCPClient::Errors::InputRequiredError.new(
+          "Unsupported input request method #{shown_method} for key #{shown_key}", data: result
+        )
+      end
+      unless registered_callback?(handler_ivar)
+        raise MCPClient::Errors::InputRequiredError.new(
+          "Server requested #{shown_method} (key #{shown_key}) but no handler is registered for it " \
+          '(the capability was not declared)', data: result
+        )
+      end
+      if undeclared_sampling_tool_use?(request_method, request['params'])
+        raise MCPClient::Errors::InputRequiredError.new(
+          "Server requested tool-enabled #{shown_method} (key #{shown_key}) but the sampling.tools " \
+          'capability was not declared', data: result
+        )
+      end
+
+      begin
+        response = instance_variable_get(handler_ivar).call(key, request['params'] || {})
+      rescue StandardError => e
+        # The exception text is host-internal; it stays in the local log.
+        @logger.error("Handler for #{shown_method} (key #{shown_key}) raised: #{e.message}")
+        raise MCPClient::Errors::InputRequiredError.new(
+          "Handler for #{shown_method} (key #{shown_key}) failed", data: result
+        )
+      end
+      unless response.is_a?(Hash)
+        raise MCPClient::Errors::InputRequiredError.new(
+          "Handler for #{shown_method} (key #{shown_key}) returned #{response.class}, expected a result object",
+          data: result
+        )
+      end
+      if (error = response['error'] || response[:error])
+        message = error.is_a?(Hash) ? (error['message'] || error[:message]) : error
+        raise MCPClient::Errors::InputRequiredError.new(
+          "Handler for #{shown_method} (key #{shown_key}) failed: #{sanitize_log_text(message)}", data: result
+        )
+      end
+
+      response
+    end
+
+    # SEP-1577 (sampling tool calling): a server MUST NOT send `tools` or
+    # `toolChoice` to a client that did not declare the sampling.tools
+    # sub-capability. On a server-initiated request the client answers -32602;
+    # InputResponses has no per-request error channel, so on the multi
+    # round-trip path the whole round trip fails instead — the sampler is
+    # never invoked with a request this client never advertised support for.
+    # @param method [String] the input request method
+    # @param params [Hash, nil] the input request params
+    # @return [Boolean] whether this is tool-enabled sampling without the declaration
+    def undeclared_sampling_tool_use?(method, params)
+      return false unless method == 'sampling/createMessage' && !sampling_tools_supported?
+
+      params.is_a?(Hash) && (params.key?('tools') || params.key?('toolChoice'))
     end
 
     # Notifications the 2026-07-28 revision removed; never written to a
@@ -773,22 +976,6 @@ module MCPClient
     # @return [Boolean] whether it must be dropped for a modern server
     def suppressed_modern_notification?(method)
       modern? && REMOVED_MODERN_NOTIFICATIONS.include?(method)
-    end
-
-    # An InputRequiredResult asks the client to fulfil server requests and
-    # retry. This client declares no capability a modern server could use
-    # for that yet, so such a result cannot be honoured and must not be
-    # mistaken for the operation's result.
-    # @param result [Object] a JSON-RPC result
-    # @return [void]
-    # @raise [MCPClient::Errors::InputRequiredError]
-    def reject_unfulfillable_input_required!(result)
-      return unless MCPClient::JsonRpcCommon.result_type(result) == 'input_required'
-
-      raise MCPClient::Errors::InputRequiredError.new(
-        'Server returned an input_required result (multi round-trip request) that this client cannot fulfil',
-        data: result
-      )
     end
 
     # Servers SHOULD identify themselves in every result's `_meta`

@@ -232,7 +232,10 @@ Sampling tool calling (SEP-1577) is opt-in: pass `sampling_supports_tools: true`
 to declare the `sampling.tools` capability. The handler then receives the full
 request params (including `tools`/`toolChoice`) as an optional fifth argument;
 without the opt-in, tool-enabled sampling requests are rejected with `-32602`
-as the spec requires:
+as the spec requires. On a 2026-07-28 server, where sampling arrives as an
+input request inside a multi round-trip answer and `inputResponses` has no
+per-request error channel, the same rejection fails the whole round trip with
+`MCPClient::Errors::InputRequiredError` and the handler is never invoked:
 
 ```ruby
 client = MCPClient::Client.new(
@@ -301,7 +304,11 @@ that negotiated the corresponding capability; otherwise
 capabilities that were not negotiated). `Client#log_level=` skips
 non-logging servers instead of failing. Declared *client* capabilities are
 derived from what the host actually registered (handlers, roots), never
-hardcoded.
+hardcoded — and they gate the client's own traffic too:
+`notifications/roots/list_changed` goes only to a session that declared
+`roots` (never to a 2026-07-28 server, which removed the notification, and
+never to plain HTTP on a legacy session, which has no server-request channel
+to serve roots on).
 
 ### Completion (Autocomplete)
 
@@ -384,6 +391,13 @@ client = MCPClient::Client.new(
   }
 )
 ```
+
+In URL mode the handler's second argument is
+`{ 'mode' => 'url', 'url' => ..., 'elicitationId' => ... }` and its answer is
+consent, not data: only an explicit `action` of `accept`, `decline` or `cancel`
+(or a literal `true` for accept) counts — anything else is answered `cancel`.
+`content` is dropped, since it is form-mode only, while a handler-supplied
+`_meta` is passed through.
 
 ## Advanced Configuration
 

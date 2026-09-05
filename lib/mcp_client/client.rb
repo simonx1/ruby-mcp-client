@@ -1289,7 +1289,7 @@ module MCPClient
       # precedes everything else — an undeclared mode is -32602 even when no
       # handler is configured.
       unless SUPPORTED_ELICITATION_MODES.include?(mode)
-        @logger.warn("Rejecting elicitation request with unsupported mode '#{mode}'")
+        @logger.warn("Rejecting elicitation request with unsupported mode '#{sanitize_peer_log_text(mode.to_s)}'")
         return jsonrpc_error_result(-32_602, "Elicitation mode '#{mode}' is not supported")
       end
 
@@ -1341,7 +1341,9 @@ module MCPClient
       # Validate schema if present
       if schema
         schema_errors = ElicitationValidator.validate_schema(schema)
-        @logger.warn("Elicitation schema validation warnings: #{schema_errors.join('; ')}") unless schema_errors.empty?
+        unless schema_errors.empty?
+          @logger.warn("Elicitation schema validation warnings: #{sanitize_peer_log_text(schema_errors.join('; '))}")
+        end
       end
 
       # Call the user-defined handler
@@ -1384,7 +1386,11 @@ module MCPClient
     # @param params [Hash] original request params (for schema validation)
     # @return [Hash] formatted response
     def format_elicitation_response(result, params)
-      response = normalize_elicitation_result(result)
+      response = if (params['mode'] || 'form') == 'url'
+                   normalize_url_elicitation_result(result)
+                 else
+                   normalize_elicitation_result(result)
+                 end
 
       # Per the ElicitResult schema, content is only present when the action
       # is accept and the mode was form; it is omitted for decline/cancel and
@@ -1407,6 +1413,29 @@ module MCPClient
       end
 
       response
+    end
+
+    # A URL-mode elicitation reports the user's consent to open the URL, so
+    # only an explicit answer counts: `true` or an ElicitResult with an
+    # `action` of accept/decline/cancel. Anything else — a bare value, a form
+    # style content hash, nil — is not consent and is answered with cancel.
+    # @param result [Object] handler result
+    # @return [Hash] normalized ElicitResult without content
+    def normalize_url_elicitation_result(result)
+      return { 'action' => 'accept' } if result == true
+
+      action = result.is_a?(Hash) ? (result['action'] || result[:action]) : nil
+      if %w[accept decline cancel].include?(action.to_s)
+        # ElicitResult carries `_meta` in every mode; only `content` is
+        # form-mode-specific, and format_elicitation_response strips it.
+        meta = result['_meta'] || result[:_meta]
+        return { 'action' => action.to_s, '_meta' => meta }.compact
+      end
+
+      unless result.nil? || result == false
+        @logger.warn('URL-mode elicitation handler gave no explicit action; answering cancel (consent is explicit)')
+      end
+      { 'action' => 'cancel' }
     end
 
     # Normalize a handler's return value into a string-keyed ElicitResult
@@ -1451,7 +1480,7 @@ module MCPClient
       action = result['action']
       return result if %w[accept decline cancel].include?(action)
 
-      @logger.warn("Unknown elicitation action '#{action}', defaulting to accept")
+      @logger.warn("Unknown elicitation action '#{sanitize_peer_log_text(action.to_s)}', defaulting to accept")
       result.merge('action' => 'accept')
     end
 
@@ -1481,19 +1510,31 @@ module MCPClient
       { 'roots' => @roots.map(&:to_h) }
     end
 
+    # Whether a server may be told the roots list changed. MCP forbids using a
+    # capability that was not declared during initialization, so the
+    # notification goes only to sessions whose declared client capabilities
+    # include roots: a transport that registers the handlers for the modern
+    # multi round-trip pattern but has no server-request channel to serve
+    # them on (plain HTTP on a legacy session) declares none, however it
+    # answers respond_to?.
+    # @param server [Object] an MCP server transport
+    # @return [Boolean]
+    def roots_list_changed_recipient?(server)
+      return false unless server.respond_to?(:on_roots_list_request)
+      # notifications/roots/list_changed was removed in MCP 2026-07-28: a
+      # modern server reads roots through the multi round-trip pattern when it
+      # needs them, and has no channel to be told they changed.
+      return false if server.respond_to?(:modern?) && server.modern?
+      return true unless server.respond_to?(:client_capabilities)
+
+      server.client_capabilities.key?('roots')
+    end
+
     # Send notification to all servers that roots have changed (MCP 2025-06-18)
     # @return [void]
     def notify_roots_changed
       @servers.each do |server|
-        # Only notify sessions where the roots capability could be declared:
-        # MCP forbids using capabilities that were not negotiated, and
-        # transports without a server-request channel (plain HTTP) never
-        # declare roots.
-        next unless server.respond_to?(:on_roots_list_request)
-        # notifications/roots/list_changed was removed in MCP 2026-07-28: a
-        # modern server reads roots through the multi round-trip pattern
-        # when it needs them, and has no channel to be told they changed.
-        next if server.respond_to?(:modern?) && server.modern?
+        next unless roots_list_changed_recipient?(server)
 
         begin
           server.rpc_notify('notifications/roots/list_changed', {})

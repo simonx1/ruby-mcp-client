@@ -167,12 +167,12 @@ RSpec.describe 'MCP 2026-07-28 stateless protocol (stdio)' do
       expect(first[META_VERSION]).to eq('2026-07-28')
     end
 
-    it 'declares roots with listChanged only to legacy servers (removed in 2026-07-28)' do
+    it 'declares roots without listChanged in modern mode (the notification was removed)' do
       transport.instance_variable_set(:@roots_list_request_callback, proc {})
       transport.protocol_version = '2025-11-25'
       expect(transport.client_capabilities['roots']).to eq({ 'listChanged' => true })
       transport.protocol_version = '2026-07-28'
-      expect(transport.client_capabilities).not_to have_key('roots')
+      expect(transport.client_capabilities['roots']).to eq({})
     end
 
     it 'declares negotiated extensions under clientCapabilities.extensions' do
@@ -699,29 +699,7 @@ RSpec.describe 'MCP 2026-07-28 stateless protocol (stdio) — review follow-ups'
     expect(server.protocol_era).to eq(:modern)
   end
 
-  describe 'modern client capabilities before multi round-trip support' do
-    let(:transport) do
-      Class.new do
-        include MCPClient::JsonRpcCommon
-
-        attr_accessor :protocol_version
-
-        def initialize
-          @logger = Logger.new(StringIO.new)
-        end
-      end.new
-    end
-
-    it 'omits roots, elicitation and sampling from modern requests' do
-      transport.instance_variable_set(:@roots_list_request_callback, proc {})
-      transport.instance_variable_set(:@elicitation_request_callback, proc {})
-      transport.instance_variable_set(:@sampling_request_callback, proc {})
-      transport.protocol_version = '2025-11-25'
-      expect(transport.client_capabilities.keys).to include('roots', 'elicitation', 'sampling')
-      transport.protocol_version = '2026-07-28'
-      expect(transport.client_capabilities).to eq({})
-    end
-
+  describe 'input_required results' do
     it 'surfaces an input_required result as InputRequiredError instead of a tool result' do
       sent = script_stdio(server, [{ 'result' => discover_result },
                                    { 'result' => { 'resultType' => 'input_required', 'requestState' => 'blob',

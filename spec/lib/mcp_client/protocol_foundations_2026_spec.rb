@@ -182,15 +182,22 @@ RSpec.describe 'MCP 2026-07-28 protocol foundations' do
       expect(MCPClient::JsonRpcCommon.result_type(result)).to eq('complete')
     end
 
-    it 'recognizes an "input_required" result and surfaces it as InputRequiredError' do
+    it 'passes an "input_required" result through for the multi round-trip resolver on a modern session' do
       # Only a modern session has the multi round-trip pattern; a legacy one
       # answering with it is malformed (see the era examples in the
       # verification spec).
       transport.instance_variable_set(:@protocol_version, '2026-07-28')
       result = { 'resultType' => 'input_required', 'requestState' => 'blob' }
       expect(MCPClient::JsonRpcCommon.result_type(result)).to eq('input_required')
+      transport.instance_variable_set(:@protocol_version, '2026-07-28')
+      expect(transport.process_jsonrpc_response({ 'id' => 1, 'result' => result })).to eq(result)
+    end
+
+    it 'rejects an "input_required" result from a legacy session' do
+      result = { 'resultType' => 'input_required', 'requestState' => 'blob' }
+      transport.instance_variable_set(:@protocol_version, '2025-11-25')
       expect { transport.process_jsonrpc_response({ 'id' => 1, 'result' => result }) }
-        .to raise_error(MCPClient::Errors::InputRequiredError) { |e| expect(e.request_state).to eq('blob') }
+        .to raise_error(MCPClient::Errors::InvalidResultError)
     end
 
     it 'rejects an unrecognized resultType as an invalid response' do

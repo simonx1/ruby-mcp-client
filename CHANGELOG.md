@@ -5,6 +5,52 @@
 Groundwork for the 2026-07-28 protocol revision (stateless, per-request
 metadata). Each feature lands in its own PR; this section accumulates them.
 
+### Multi round-trip requests (InputRequiredResult)
+
+- **Server-to-client interactions on modern servers.** `tools/call`,
+  `resources/read` and `prompts/get` may now be answered with
+  `resultType: "input_required"`. The client fulfils every entry of
+  `inputRequests` through the handlers it already has — `elicitation/create`
+  via the elicitation handler, `sampling/createMessage` via the sampling
+  handler, `roots/list` from the client's roots — and retries the original
+  request as a new request (new id, same params) carrying `inputResponses`
+  keyed like the requests and the opaque `requestState` echoed verbatim
+  (omitted when the server sent none). A result without `inputRequests` is
+  retried after a short pause (see below); the round trip never leaks into
+  other requests, and every attempt is rebuilt from the caller's own params,
+  so a continuation field the server stops sending is dropped.
+- **Capabilities.** Modern requests once again declare `elicitation`
+  (`form` and `url`), `roots` (without `listChanged`) and `sampling` (with
+  `tools` when opted in) when the corresponding handler is registered. Only
+  declared capabilities are used: a `sampling/createMessage` input request
+  carrying `tools` or `toolChoice` fails the round trip (the sampler is never
+  invoked) unless the host opted into `sampling.tools`, and
+  `notifications/roots/list_changed` is sent only to a session that declared
+  `roots` — registering the plain HTTP handlers, which serve the modern round
+  trips, does not make a legacy plain HTTP session a recipient.
+- **URL-mode elicitation answers keep `_meta`.** An ElicitResult carries
+  `_meta` in every mode; a URL-mode answer now passes the handler's `_meta`
+  through (on both the round-trip and the legacy server-request path) while
+  `content`, which is form-mode only, is still stripped.
+- **Recovery keeps the round trip.** Transport-level recovery of an attempt
+  (retries, version renegotiation, the HeaderMismatch refresh, a re-issued
+  stream) re-sends the attempt's own `inputResponses`/`requestState`. An
+  answer that carries only `requestState` (an out-of-band interaction still
+  in progress) is retried with a growing pause (0.5 s doubling to 5 s) rather
+  than in a tight loop. The plain HTTP transport now accepts the elicitation,
+  roots and sampling handlers so `MCPClient::Client` can serve round trips on
+  it too.
+- **Limits and errors.** More than 10 consecutive `input_required` answers,
+  an input request this client cannot honour (unknown method, no handler,
+  handler error) or a malformed `inputRequests` raise
+  `MCPClient::Errors::InputRequiredError` (exposing `input_requests` and
+  `request_state`) without a retry; `input_required` on any other method is
+  an `InvalidResultError`. `server/discover` is not one of the three methods
+  that may be answered with `input_required` either: such an answer is
+  refused before any protocol version or capability it carries is applied or
+  cached, so a probe can never adopt a version out of an unfinished result
+  and hand that result back as the first heartbeat.
+
 ### Custom headers from tool parameters (`x-mcp-header`)
 
 - **`Mcp-Param-{name}` headers.** On a modern Streamable HTTP (or plain HTTP)

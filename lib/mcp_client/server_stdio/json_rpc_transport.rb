@@ -328,25 +328,30 @@ module MCPClient
           method = 'server/discover'
         end
 
-        result = with_retry(method) do
-          sent_version = nil
-          begin
-            send_request_and_wait(method, params, timeout) { |version| sent_version = version }
-          rescue MCPClient::Errors::UnsupportedProtocolVersionError => e
-            # MCP 2026-07-28 basic/versioning: "The client SHOULD select a
-            # mutually supported version from the supported list and retry
-            # the request". The server rejected the request before
-            # processing it, so re-sending cannot duplicate a side effect.
-            # Compared against the version THIS request declared, read back
-            # from the request itself: a concurrent request may have moved
-            # the transport on while this one was being built.
-            version = select_protocol_version(e.supported)
-            raise unless modern? && version && version != sent_version
+        # The multi round-trip resolver sits outside the per-attempt
+        # recovery, so a retry that carries inputResponses/requestState keeps
+        # them through transport retries, version renegotiation and the like.
+        result = resolve_input_round_trips(method, params, timeout) do |attempt_params|
+          with_retry(method) do
+            sent_version = nil
+            begin
+              send_request_and_wait(method, attempt_params, timeout) { |version| sent_version = version }
+            rescue MCPClient::Errors::UnsupportedProtocolVersionError => e
+              # MCP 2026-07-28 basic/versioning: "The client SHOULD select a
+              # mutually supported version from the supported list and retry
+              # the request". The server rejected the request before
+              # processing it, so re-sending cannot duplicate a side effect.
+              # Compared against the version THIS request declared, read back
+              # from the request itself: a concurrent request may have moved
+              # the transport on while this one was being built.
+              version = select_protocol_version(e.supported)
+              raise unless modern? && version && version != sent_version
 
-            @logger.info("Server does not support protocol version #{sent_version}; " \
-                         "retrying #{method} with #{version}")
-            @protocol_version = version
-            send_request_and_wait(method, params, timeout)
+              @logger.info("Server does not support protocol version #{sent_version}; " \
+                           "retrying #{method} with #{version}")
+              @protocol_version = version
+              send_request_and_wait(method, attempt_params, timeout)
+            end
           end
         end
         # Every server/discover answer is validated and applied: a later
