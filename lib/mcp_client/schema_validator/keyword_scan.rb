@@ -70,7 +70,11 @@ module MCPClient
           return queue_scan(scan, schema, depth, dialect, referenced, :each_definition)
         end
 
-        found.concat((schema.keys & UNSUPPORTED_KEYWORDS).select { |k| keyword_known?(k, dialect) })
+        found.concat((schema.keys & UNSUPPORTED_KEYWORDS).select do |k|
+          # A node that evaluates `unevaluatedItems` / `unevaluatedProperties`
+          # itself leaves no gap to report (see {Composition#unevaluated_applied?}).
+          keyword_known?(k, dialect) && !unevaluated_applied?(schema, k, dialect)
+        end)
         queue_scan(scan, schema, depth, dialect, referenced, :each_subschema)
       end
 

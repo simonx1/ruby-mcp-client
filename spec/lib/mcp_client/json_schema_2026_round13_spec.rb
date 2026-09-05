@@ -10,8 +10,13 @@ RSpec.describe 'MCP 2026-07-28 JSON Schema handling — round 13' do
   let(:validator) { MCPClient::SchemaValidator }
 
   it 'discards the uncertainty of a branch that definitely fails' do
-    schema = { 'not' => { 'not' => { 'minimum' => 10, 'multipleOf' => 2 } } }
+    # The branch holds a keyword this validator cannot decide (`$dynamicRef`
+    # needs a dynamic scope) beside one it can: the definite failure decides
+    # the branch, and the uncertainty is not carried out of it.
+    schema = { 'not' => { 'not' => { 'minimum' => 10, '$dynamicRef' => '#x' } } }
     expect(validator.validate(3, schema)).to contain_exactly(a_string_matching(/not/))
+    # Without the definite failure the same branch is genuinely undecided,
+    # and the uncertainty does reach the outer negation.
     expect(validator.validate(12, schema)).to be_empty
   end
 
@@ -32,9 +37,13 @@ RSpec.describe 'MCP 2026-07-28 JSON Schema handling — round 13' do
   end
 
   it 'keeps a genuinely undecided branch undecided' do
-    expect(validator.validate(3, { 'not' => { 'multipleOf' => 2 } })).to be_empty
-    expect(validator.validate(3, { 'not' => { 'anyOf' => [{ 'multipleOf' => 2 }, { 'type' => 'string' }] } }))
-      .to be_empty
-    expect(validator.validate(3, { 'oneOf' => [true, { 'multipleOf' => 2 }] })).to be_empty
+    # `multipleOf` is evaluated and decides its branch outright, so what is
+    # left undecided here is a keyword no verdict can be reached for.
+    undecidable = { '$dynamicRef' => '#x' }
+    expect(validator.validate(3, { 'not' => undecidable })).to be_empty
+    expect(validator.validate(3, { 'not' => { 'anyOf' => [undecidable, { 'type' => 'string' }] } })).to be_empty
+    expect(validator.validate(3, { 'oneOf' => [true, undecidable] })).to be_empty
+    # And a branch the validator can decide is decided: `not` reports it.
+    expect(validator.validate(3, { 'not' => { 'multipleOf' => 3 } })).to contain_exactly(a_string_matching(/not/))
   end
 end

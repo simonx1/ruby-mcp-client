@@ -541,8 +541,10 @@ module MCPClient
         # pin the enumeration takes (see #streamed_call_chunks) — this one
         # covers a transport that sends while building it.
         stream = pinned_to_session(server, task_epoch) { server.call_tool_streaming(tool_name, parameters) }
-        return stream unless task_epoch || (tasks_extension? && modern_server?(server))
-
+        # Every stream goes through the wrapper, whether or not tasks are in
+        # play: "Clients SHOULD validate structured results against this
+        # schema" is about a result, not about the method that fetched it, and
+        # so is the dialect a result's schema declares.
         streamed_call_chunks(stream, tool, tool_name, server, epoch: task_epoch)
       rescue MCPClient::Errors::ConnectionError => e
         # Add server identity information to the error for better context
@@ -703,7 +705,11 @@ module MCPClient
               # it to the call's result, validated as #call_tool does — against
               # the definition a mid-stream refresh (HeaderMismatch recovery)
               # may have replaced.
-              next yielder << chunk unless resolve && task_result?(chunk)
+              task = resolve && task_result?(chunk)
+              # A chunk that is neither a task nor a complete CallToolResult is
+              # progress, not an answer: only a result is checked against the
+              # tool's outputSchema.
+              next yielder << chunk unless task || complete_call_result?(chunk)
 
               # The definition the stream's one request went out under, read
               # before a task is waited for (see #call_tool) and read once:
@@ -713,12 +719,22 @@ module MCPClient
                 called = called_tool_definition(server, tool_name)
                 read_called = true
               end
-              result = complete_task_result(tool_name, server, chunk, epoch)
+              result = task ? complete_task_result(tool_name, server, chunk, epoch) : chunk
               yielder << validate_called_result!(called || tool, result)
             end
           end
         end
       end
+    end
+
+    # Whether a streamed chunk is the call's answer rather than an update on
+    # its way. MCP 2026-07-28 makes `resultType` required and has clients
+    # treat an absent one as "complete", which is what every pre-2026 server
+    # sends.
+    # @param chunk [Object] one chunk of a streaming tools/call
+    # @return [Boolean]
+    def complete_call_result?(chunk)
+      chunk.is_a?(Hash) && MCPClient::JsonRpcCommon.result_type(chunk) == 'complete'
     end
 
     # Hand the host's identity and request metadata to a transport.
@@ -1131,11 +1147,13 @@ module MCPClient
 
       # MCP 2026-07-28: structuredContent "can be any JSON value (object,
       # array, string, number, boolean, or null)", so presence is decided by
-      # the key, not by the value. MCP 2025-11-25 knows only object structured
-      # content, so on a session negotiated to that revision a null is what it
-      # was there: no structured content at all.
+      # the key, not by the value. MCP 2025-11-25 types it as an object, so on
+      # a session negotiated to that revision anything else — a null, an
+      # array, a string, a number, a boolean — is what it was there: no
+      # structured content at all. The widening is a 2026-07-28 rule and does
+      # not reach back over a legacy session.
       key = [:structuredContent, 'structuredContent'].find { |k| result.key?(k) }
-      key = nil if key && result[key].nil? && legacy_server?(tool.server)
+      key = nil if key && !result[key].is_a?(Hash) && legacy_server?(tool.server)
       unless key
         handle_structured_content_violation(
           "Tool '#{sanitize_peer_log_text(tool.name.to_s)}' declares an output schema but its successful result " \

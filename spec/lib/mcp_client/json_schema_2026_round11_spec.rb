@@ -38,7 +38,10 @@ RSpec.describe 'MCP 2026-07-28 JSON Schema handling — round 11' do
     it 'skips a conditional whose if it cannot decide, unless the branches agree' do
       # Neither branch can be selected, but both reject the value, so the
       # instance is rejected whichever way the condition goes.
-      condition = { 'unevaluatedItems' => false }
+      # A `$dynamicRef` needs the dynamic scope a validation was entered
+      # through, which this validator does not track: a condition carrying
+      # one is genuinely undecidable.
+      condition = { '$dynamicRef' => '#node' }
       agreed = { 'if' => condition, 'then' => { 'type' => 'string' }, 'else' => { 'type' => 'string' } }
       expect(validator.validate([1], agreed)).to contain_exactly(a_string_matching(/expected type string/))
       schema = { 'if' => condition, 'then' => { 'type' => 'string' }, 'else' => { 'type' => 'array' } }
@@ -48,8 +51,8 @@ RSpec.describe 'MCP 2026-07-28 JSON Schema handling — round 11' do
     end
 
     it 'keeps treating a partial pass as a pass where that is the permissive direction' do
-      expect(validator.validate([1], { 'anyOf' => [{ 'unevaluatedItems' => false }] })).to be_empty
-      expect(validator.validate([1], { 'allOf' => [{ 'unevaluatedItems' => false }] })).to be_empty
+      expect(validator.validate([1], { 'anyOf' => [{ '$dynamicRef' => '#node' }] })).to be_empty
+      expect(validator.validate([1], { 'allOf' => [{ '$dynamicRef' => '#node' }] })).to be_empty
       # An assertion this validator does evaluate decides those compositions
       # rather than passing them: an unevaluated one is not a licence to
       # accept what the schema rejects.

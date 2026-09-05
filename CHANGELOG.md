@@ -7,6 +7,77 @@ metadata). Each feature lands in its own PR; this section accumulates them.
 
 ### JSON Schema handling
 
+- **JSON equality, ECMA-262 patterns, the annotation-driven keywords, and a
+  budget the instance cannot outrun (third verification round).** The
+  assertions the previous round started applying reached some wrong verdicts,
+  and the checks ran in places the resource bounds did not reach. Eight
+  fixes:
+
+  - *`uniqueItems` compares JSON values.* An object was canonicalized into an
+    array of its member pairs with nothing recording its type, so `[{}, []]`
+    and `[{"a": 1}, [["a", 1]]]` — pairs of distinct JSON values — were
+    reported as duplicates and `:strict` rejected a conforming result (and,
+    through `not`, accepted one the schema rejects). JSON equality begins
+    with the type (JSON Schema 2020-12 Core Section 4.2.2), and the canonical
+    form now carries it.
+  - *A `pattern` is read as ECMA-262, not only anchored like one.* The
+    previous round rewrote `^` and `$`; the rest was still Ruby, and the two
+    dialects disagree in both directions. `\A` anchors in Ruby and is a
+    literal `"A"` in ECMA-262 (Annex B identity escape), `.` excludes only
+    `"\n"` in Ruby against ECMA-262's four line terminators, Ruby's `\s`
+    knows none of the Unicode spaces ECMA-262 counts, and `[]` — an empty
+    class matching nothing there — is no expression at all in Ruby, so the
+    keyword was skipped and every string passed it. A pattern is now
+    translated to the Ruby expression that means the same thing, inside
+    character classes included (where Ruby's nested classes and `&&`
+    intersection are ECMA-262 literals).
+  - *`unevaluatedItems` and `unevaluatedProperties` are evaluated where a
+    node produces the annotations they read.* They were skipped outright, so
+    `{"prefixItems": [{"type": "number"}], "unevaluatedItems": false}`
+    admitted `[1, "x"]` and `{"unevaluatedProperties": false}` admitted
+    `{"extra": 1}` — instances a 2020-12 validator rejects. At a node with no
+    in-place applicator they are exactly `additionalItems` /
+    `additionalProperties` over what the node did not name, and they are
+    applied there (and no longer reported as partial coverage). Beside an
+    `allOf` / `anyOf` / `oneOf` / `if` / `$ref` / `dependentSchemas` — or, for
+    items, a `contains`, whose matches annotate — the annotations come from a
+    whole composition, and the keyword stays unevaluated and reported. The
+    dynamic references (`$dynamicRef`, `$recursiveRef`) need the dynamic
+    scope a validation was entered through, which this validator does not
+    track: they remain unevaluated, reported, and never a match for `not`,
+    `oneOf` or `if`.
+  - *The loops over the instance consult the budget.* How wide an object or
+    an array is, is the peer's choice, and a member decided without
+    descending into it visited no node — so the deadline was only consulted
+    between the nodes such a sweep happened to visit. A 100k-property object
+    under `{"not": {"additionalProperties": false}}` ran ~8x past a 20ms
+    budget and reported the work as a pass. The property sweep, the tuple
+    tail and the recursive `uniqueItems` canonicalization now reach a
+    checkpoint per member.
+  - *The metadata keywords must be written as their type.* `{"readOnly":
+    "no"}`, `{"title": 5}`, `{"format": 3}` and their kind preflighted clean,
+    so `:strict` checked results against a schema no validator could read.
+    Annotating rather than asserting does not exempt a keyword from JSON
+    Schema 2020-12 Validation Section 9; a malformed one makes the document
+    unusable, as a malformed assertion does.
+  - *An ordinary streamed result is validated.* `call_tool_streaming` handed
+    the transport's chunks back unchecked unless the tasks extension was on
+    and the chunk was a task, so the very payload `call_tool` refuses came
+    through it silently — the unsupported output dialect included. A chunk
+    that is a complete `CallToolResult` now gets the same check as a
+    synchronous answer; anything else is progress and is passed through.
+  - *A `HeaderMismatch` retry is not sent under a schema nothing can read.*
+    The rejection means the server did not execute the attempt, and the
+    retry is the send that would — so a refreshed `inputSchema` declaring an
+    unsupported dialect now stops the call before it goes out, rather than
+    after the tool has run.
+  - *2025-11-25 structured content is an object.* Only a present `null` was
+    read as "no structured content" on a legacy session; an array, a string,
+    a number or a boolean was taken for structured content and checked
+    against the output schema. The widening to any JSON value is a 2026-07-28
+    rule and does not reach back over a session negotiated to the older
+    revision.
+
 - **The standard assertions are evaluated, patterns are ECMAScript, and
   unsupported dialects are refused wherever they appear (second verification
   round).** MCP 2026-07-28 basic "Implementation Requirements" makes JSON

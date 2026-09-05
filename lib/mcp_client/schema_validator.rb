@@ -24,7 +24,8 @@ module MCPClient
   # - properties, required (objects)
   # - items, prefixItems (2020-12) / tuple-form items (draft-07, 2019-09),
   #   minItems, maxItems (arrays)
-  # - minLength, maxLength, pattern (strings)
+  # - minLength, maxLength, pattern (an ECMA-262 regular expression,
+  #   translated to the Ruby expression that means the same thing) (strings)
   # - minimum, maximum, exclusiveMinimum, exclusiveMaximum (numbers)
   # - allOf, anyOf, oneOf, not, if/then/else (composition)
   # - $ref to a location inside the same schema document (`#`, `#/$defs/x`,
@@ -58,14 +59,24 @@ module MCPClient
   #   propertyNames, dependentRequired / dependentSchemas (2019-09, 2020-12)
   #   and draft-07 dependencies (objects)
   #
-  # What is left out is what cannot be decided without the annotations a
-  # whole composition produces (unevaluatedItems, unevaluatedProperties) or
-  # without a dynamic scope ($dynamicRef, $recursiveRef), plus the two
-  # keywords that only annotate in the default dialect (format, which full
-  # validators assert only in format-assertion mode, and contentSchema).
-  # Those are ignored rather than misapplied, so validation is best-effort
-  # there — it may accept data a full validator would reject, but it does not
-  # reject data that conforms to the schema. So that this gap is never
+  # - unevaluatedItems, unevaluatedProperties at a node that produces every
+  #   annotation they read: with no in-place applicator beside them (and, for
+  #   items, no `contains`) they are `additionalItems` / `additionalProperties`
+  #   over what the node did not name
+  #
+  # What is left out is exactly what cannot be decided here:
+  # unevaluatedItems / unevaluatedProperties where an in-place applicator
+  # (allOf, anyOf, oneOf, if, $ref, dependentSchemas — or a `contains`, whose
+  # matches annotate the items they matched) contributes annotations
+  # collected across a whole composition, the dynamic references
+  # ($dynamicRef, $recursiveRef), whose target depends on the dynamic scope a
+  # validation was entered through, and the two keywords that only annotate
+  # in the default dialect (format, which full validators assert only in
+  # format-assertion mode, and contentSchema). Those are ignored rather than
+  # misapplied, so validation is best-effort there — it may accept data a
+  # full validator would reject, but it does not reject data that conforms to
+  # the schema, and an unevaluated keyword is never read as a match for a
+  # non-monotonic composition (not, oneOf, if). So that this gap is never
   # silent, {.unsupported_keywords} reports which unapplied validation
   # keywords a schema uses; callers surface them as a warning.
   module SchemaValidator
@@ -135,14 +146,21 @@ module MCPClient
     MAX_NODE_DEPTH = 256
 
     # JSON Schema keywords that affect validation but that this validator
-    # does not evaluate: the dynamic references (whose target depends on the
+    # may not evaluate: the dynamic references (whose target depends on the
     # dynamic scope a validation was entered through), the two keywords
     # decided by annotations collected across a whole composition
     # (`unevaluatedItems` / `unevaluatedProperties`), and the two that only
     # annotate in the default dialect (`format`, asserted by full validators
-    # in format-assertion mode, and `contentSchema`). Their presence means
-    # validation is partial: data may pass here that a full validator would
-    # reject.
+    # in format-assertion mode, and `contentSchema`). Where one of them is
+    # left unevaluated, validation is partial: data may pass here that a full
+    # validator would reject.
+    #
+    # The annotation-driven pair is only *sometimes* in this position: at a
+    # node that produces every annotation it reads there is no composition to
+    # collect anything from, and {Composition#unevaluated_applied?} says so —
+    # {Instances} applies the keyword there and the scan does not report it.
+    # The dynamic references are always here: a dynamic scope is not
+    # something a node can produce for itself.
     #
     # Every other standard keyword is evaluated. A standard assertion left
     # unevaluated is not a smaller report but a wrong verdict: it makes a
@@ -219,6 +237,7 @@ module MCPClient
       'unevaluatedItems' => [DEFAULT_DIALECT, DRAFT_2019_09],
       'unevaluatedProperties' => [DEFAULT_DIALECT, DRAFT_2019_09],
       'contentSchema' => [DEFAULT_DIALECT, DRAFT_2019_09],
+      'deprecated' => [DEFAULT_DIALECT, DRAFT_2019_09],
       'minContains' => [DEFAULT_DIALECT, DRAFT_2019_09],
       'maxContains' => [DEFAULT_DIALECT, DRAFT_2019_09],
       '$anchor' => [DEFAULT_DIALECT, DRAFT_2019_09],
@@ -782,6 +801,19 @@ module MCPClient
     def self.count_visit(ctx)
       ctx.visits += 1
       raise Aborted, "more than #{MAX_NODE_VISITS} schema nodes visited" if ctx.visits > MAX_NODE_VISITS
+
+      check_deadline(ctx)
+    end
+
+    # Consult the validation-wide deadline without spending the node-visit
+    # allowance. A loop over the instance's own members (an object's
+    # properties, an array's items) is as long as the peer made it and may
+    # decide a member without visiting a node for it, so the loop itself has
+    # to reach a checkpoint: otherwise the budget is only consulted between
+    # the nodes such a sweep happens to visit, and a wide enough instance
+    # runs past it — reported, inside a speculative branch, as a pass.
+    # @raise [Aborted]
+    def self.check_deadline(ctx)
       raise Aborted, 'validation time budget exhausted' if budget_exhausted?(ctx.deadline)
     end
 

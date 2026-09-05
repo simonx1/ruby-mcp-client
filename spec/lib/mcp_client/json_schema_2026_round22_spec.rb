@@ -160,13 +160,19 @@ RSpec.describe 'MCP 2026-07-28 JSON Schema handling — round 22' do
       client = client_with([tool('old')])
       client.send(:input_schema_state, tool('old'))
       client.send(:warn_partial_schema_coverage, tool('old'))
+      client.send(:output_schema_state, tool('old'))
       expect(client.instance_variable_get(:@input_schema_warnings)).not_to be_empty
+      expect(client.instance_variable_get(:@output_schema_dialects)).not_to be_empty
 
       allow(mock_server).to receive(:list_tools).and_return([tool('new')])
       client.list_tools(cache: false)
 
       expect(client.instance_variable_get(:@input_schema_warnings)).to be_empty
       expect(client.instance_variable_get(:@output_schema_coverage)).to be_empty
+      # The output-dialect memo is keyed by a tool definition too, so it is
+      # forgotten with the rest: a server that keeps renaming its tools must
+      # not grow it without bound.
+      expect(client.instance_variable_get(:@output_schema_dialects)).to be_empty
     end
 
     # An emptied memo hash is only the mechanism; what matters is that the
@@ -191,7 +197,8 @@ RSpec.describe 'MCP 2026-07-28 JSON Schema handling — round 22' do
       # warning is made again, and it names what the new schema uses.
       refreshed = MCPClient::Tool.from_json(
         { 'name' => 't', 'description' => 'd', 'inputSchema' => { 'type' => 'object' },
-          'outputSchema' => { 'type' => 'object', 'unevaluatedProperties' => false } }, server: mock_server
+          'outputSchema' => { 'type' => 'object', 'allOf' => [true],
+                              'unevaluatedProperties' => false } }, server: mock_server
       )
       allow(mock_server).to receive(:list_tools).and_return([refreshed])
       client.send(:invalidate_caches_for_notification, mock_server, 'notifications/tools/list_changed')

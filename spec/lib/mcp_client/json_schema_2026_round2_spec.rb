@@ -67,6 +67,13 @@ RSpec.describe 'MCP 2026-07-28 JSON Schema handling — round 2' do
       long = 'x' * 10_000
       errors = validator.validate(long, { 'enum' => ['a'] })
       expect(errors.first.bytesize).to be < 600
+      # The const half of the same message, from both sides: the instance
+      # and the schema's value are peer-controlled alike.
+      errors = validator.validate(long, { 'const' => 'a' })
+      expect(errors.first.bytesize).to be < 600
+      errors = validator.validate('a', { 'const' => long })
+      expect(errors.first.bytesize).to be < 600
+      expect(errors.first).to match(/does not equal const/)
     end
   end
 
@@ -145,7 +152,7 @@ RSpec.describe 'MCP 2026-07-28 JSON Schema handling — round 2' do
       expect(validator.unsupported_keywords({ '$schema' => draft7, 'dependencies' => {} })).to eq([])
       expect(validator.unsupported_keywords({ '$schema' => validator::DRAFT_2019_09, '$recursiveRef' => '#' }))
         .to eq(['$recursiveRef'])
-      expect(validator.unsupported_keywords({ '$schema' => validator::DRAFT_2019_09,
+      expect(validator.unsupported_keywords({ '$schema' => validator::DRAFT_2019_09, 'allOf' => [true],
                                               'unevaluatedItems' => false })).to eq(['unevaluatedItems'])
     end
 

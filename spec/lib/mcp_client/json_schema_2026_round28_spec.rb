@@ -117,7 +117,7 @@ RSpec.describe 'MCP 2026-07-28 JSON Schema handling — round 28' do
 
     it 'applies patternProperties, additionalProperties and propertyNames' do
       schema = { 'properties' => { 'a' => { 'type' => 'integer' } },
-                 'patternProperties' => { '\Ax' => { 'type' => 'string' } },
+                 'patternProperties' => { '^x' => { 'type' => 'string' } },
                  'additionalProperties' => false }
       expect(validator.validate({ 'a' => 1, 'xy' => 'ok' }, schema)).to be_empty
       expect(validator.validate({ 'xy' => 3 }, schema)).to contain_exactly(a_string_matching(/expected type string/))

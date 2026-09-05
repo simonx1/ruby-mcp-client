@@ -42,7 +42,7 @@ RSpec.describe 'MCP 2026-07-28 JSON Schema handling — verification round' do
 
     it 'scans a long chain of shallow references for unsupported keywords' do
       scanned = chained_refs(400)
-      scanned['$defs']['400'] = { 'unevaluatedItems' => false }
+      scanned['$defs']['400'] = { 'allOf' => [true], 'unevaluatedItems' => false }
       expect(on_thread { validator.unsupported_keywords(scanned) }).to contain_exactly('unevaluatedItems')
     end
 
@@ -60,25 +60,53 @@ RSpec.describe 'MCP 2026-07-28 JSON Schema handling — verification round' do
       let(:logger) { Logger.new(StringIO.new) }
       let(:mock_server) { instance_double(MCPClient::ServerBase, name: 'server1') }
 
-      def client_with(tool)
+      # :strict, so a check that did not run is not the same observation as
+      # a check that ran and passed: an unusable schema raises here.
+      def client_with(tool, result = { 'structuredContent' => {} })
         allow(MCPClient::ServerFactory).to receive(:create).and_return(mock_server)
         allow(mock_server).to receive(:on_notification)
         allow(mock_server).to receive(:list_tools).and_return([tool])
-        allow(mock_server).to receive(:call_tool).and_return({ 'structuredContent' => {} })
-        MCPClient::Client.new(mcp_server_configs: [{ type: 'stdio', command: 'test' }], logger: logger)
+        allow(mock_server).to receive(:call_tool).and_return(result)
+        MCPClient::Client.new(mcp_server_configs: [{ type: 'stdio', command: 'test' }], logger: logger,
+                              validate_structured_content: :strict)
       end
 
       it 'checks a chained input schema on the calling thread without overflowing it' do
         tool = MCPClient::Tool.new(name: 't', description: 'd', schema: schema, server: mock_server)
         client = client_with(tool)
         expect(on_thread { client.call_tool('t', {}) }).to eq({ 'structuredContent' => {} })
+
+        # The control: the same chain ending in a dialect nothing can read is
+        # refused, so the walk really reached the end of it.
+        unreadable = chained_refs(400)
+        unreadable['$defs']['400'] = { '$id' => 'https://example.com/r', '$schema' => 'urn:unknown' }
+        broken = MCPClient::Tool.new(name: 'u', description: 'd', schema: unreadable, server: mock_server)
+        allow(mock_server).to receive(:list_tools).and_return([broken])
+        expect { on_thread { client_with(broken).call_tool('u', {}) } }
+          .to raise_error(MCPClient::Errors::ValidationError, /urn:unknown/)
       end
 
       it 'checks a chained output schema on the calling thread without overflowing it' do
         tool = MCPClient::Tool.new(name: 't', description: 'd', schema: { 'type' => 'object' },
                                    output_schema: schema, server: mock_server)
-        client = client_with(tool)
-        expect(on_thread { client.call_tool('t', {}) }).to eq({ 'structuredContent' => {} })
+        # No SystemStackError on the calling thread: the hop budget stops the
+        # chain, and an aborted validation is a violation like any other
+        # rather than a pass (or a crash out of the tool call).
+        expect { on_thread { client_with(tool).call_tool('t', {}) } }
+          .to raise_error(MCPClient::Errors::ValidationError, /exceeds #{validator::MAX_REF_DEPTH} hops/)
+
+        # A chain within the hop budget is walked to its end, which really
+        # decides the result.
+        length = validator::MAX_REF_DEPTH - 2
+        typed = chained_refs(length)
+        typed['$defs'][length.to_s] = { 'type' => 'array' }
+        checked = MCPClient::Tool.new(name: 'v', description: 'd', schema: { 'type' => 'object' },
+                                      output_schema: typed, server: mock_server)
+        allow(mock_server).to receive(:list_tools).and_return([checked])
+        expect { on_thread { client_with(checked).call_tool('v', {}) } }
+          .to raise_error(MCPClient::Errors::ValidationError, %r{does not satisfy allOf/0})
+        expect(on_thread { client_with(checked, { 'structuredContent' => [] }).call_tool('v', {}) })
+          .to eq({ 'structuredContent' => [] })
       end
     end
   end
@@ -194,7 +222,8 @@ RSpec.describe 'MCP 2026-07-28 JSON Schema handling — verification round' do
     end
 
     it 'scans a modern definitions bag for unsupported keywords' do
-      schema = { 'type' => 'array', 'definitions' => { 'x' => { 'unevaluatedItems' => false } } }
+      schema = { 'type' => 'array', 'definitions' => { 'x' => { 'allOf' => [true],
+                                                                'unevaluatedItems' => false } } }
       expect(validator.unsupported_keywords(schema)).to contain_exactly('unevaluatedItems')
     end
 
@@ -287,11 +316,13 @@ RSpec.describe 'MCP 2026-07-28 JSON Schema handling — verification round' do
   end
 
   describe 'a condition the validator cannot decide' do
-    # `unevaluatedItems` is decided by the annotations a whole composition
-    # produces, which this validator does not collect, so a condition
-    # carrying one is genuinely undecidable — unlike the standard assertions,
-    # which are evaluated and decide their condition outright.
-    let(:undecidable) { { 'unevaluatedItems' => false } }
+    # A `$dynamicRef` resolves through the dynamic scope a validation was
+    # entered through, which this validator does not track, so a condition
+    # carrying one is genuinely undecidable — unlike the standard
+    # assertions, which are evaluated and decide their condition outright,
+    # and unlike an `unevaluatedItems` whose annotations its own node
+    # produces, which is now evaluated too.
+    let(:undecidable) { { '$dynamicRef' => '#node' } }
 
     it 'reports a failure both branches agree on' do
       schema = { 'if' => undecidable, 'then' => false, 'else' => false }

@@ -731,6 +731,10 @@ RSpec.describe MCPClient::Client do
       end
 
       before do
+        # The client asks the transport about optional hooks while it wraps
+        # the stream; anything not stubbed below it simply does not have.
+        allow(mock_server).to receive(:respond_to?).and_return(false)
+        allow(mock_server2).to receive(:respond_to?).and_return(false)
         # Make sure mock_server responds to call_tool_streaming
         allow(mock_server).to receive(:call_tool_streaming).and_return(Enumerator.new { |y|
           [1, 2, 3].each do |i|
@@ -763,7 +767,10 @@ RSpec.describe MCPClient::Client do
       it 'streams from the specified server by name' do
         enum = multi_client.call_tool_streaming('test_tool', {}, server: 'server2')
         expect(mock_server2).to have_received(:call_tool_streaming).with('test_tool', {})
-        expect(enum).to eq(server2_stream)
+        # The client wraps the transport's stream (every chunk is checked
+        # against the tool's outputSchema), so the chunks are what identify
+        # the server that was streamed from, not the enumerator object.
+        expect(enum.to_a).to eq([4, 5, 6])
       end
     end
   end

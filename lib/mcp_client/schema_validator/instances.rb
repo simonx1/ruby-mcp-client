@@ -9,9 +9,10 @@ module MCPClient
     # undecided.
     #
     # Everything here is decided by the instance and this schema object
-    # alone, which is why it can be evaluated at all: `unevaluatedItems` and
-    # `unevaluatedProperties` are decided by annotations produced across a
-    # whole composition and stay out.
+    # alone, which is why it can be evaluated at all — `unevaluatedItems` and
+    # `unevaluatedProperties` included, but only at a node that produces
+    # every annotation they read ({Composition#unevaluated_applied?}); where
+    # a composition produces them, they stay out.
     module Instances
       # Validate an object against the keywords that apply to it: `required`,
       # the property-count bounds, the required half of a dependency, the
@@ -31,6 +32,47 @@ module MCPClient
         errors.concat(validate_dependent_required(data, schema, path, dialect))
         errors.concat(validate_named_properties(data, schema, path, ctx))
         errors.concat(validate_other_properties(data, schema, path, ctx, dialect))
+        errors.concat(validate_unevaluated_properties(data, schema, path, ctx, dialect))
+      end
+
+      # `unevaluatedProperties` (JSON Schema 2020-12 Core Section 11.3),
+      # where this node produces every annotation it reads: it then applies
+      # to exactly the members `properties`, `patternProperties` and
+      # `additionalProperties` left over, which is what
+      # {Composition#uncovered_property?} already answers. A node carrying an
+      # in-place applicator is another matter — the annotations come from a
+      # whole composition there — and stays unevaluated (and reported).
+      # @return [Array<String>] validation errors
+      def validate_unevaluated_properties(data, schema, path, ctx, dialect)
+        sub = schema['unevaluatedProperties']
+        return [] unless unevaluated_applied?(schema, 'unevaluatedProperties', dialect)
+        # An `additionalProperties` schema evaluates every member the node did
+        # not name, so nothing is left over (and one that is `false` has
+        # already failed the node).
+        return [] if schema.key?('additionalProperties') && schema_value?(schema['additionalProperties'])
+
+        named = schema['properties'].is_a?(Hash) ? schema['properties'].keys.map(&:to_s) : []
+        patterns = schema['patternProperties'].is_a?(Hash) ? schema['patternProperties'].keys.map(&:to_s) : []
+        data.flat_map do |key, value|
+          check_deadline(ctx)
+          name = key.to_s
+          next [] if named.include?(name) || patterns.any? { |p| pattern_matches?(p, name, ctx.deadline) }
+
+          unevaluated_errors(value, sub, "#{path}/#{name}", ctx,
+                             "#{path}: property '#{clip(name)}' is not allowed (unevaluatedProperties is false)")
+        end
+      end
+
+      # What one member or item left unevaluated costs: the keyword's schema
+      # applied to it, or — where that schema is `false` — one error.
+      # @return [Array<String>] validation errors
+      def unevaluated_errors(value, sub, path, ctx, refusal)
+        if sub == false
+          count_visit(ctx)
+          return [refusal]
+        end
+
+        validate_child(value, sub, path, ctx)
       end
 
       # minProperties / maxProperties (JSON Schema 2020-12 Validation Sections
@@ -110,6 +152,11 @@ module MCPClient
 
         named = schema['properties'].is_a?(Hash) ? schema['properties'].keys.map(&:to_s) : []
         data.flat_map do |key, value|
+          # How wide this sweep is the peer's choice, not the schema's, and a
+          # member the applicators decide without descending into it visits no
+          # node of its own: the deadline is consulted here so a huge object
+          # cannot run the walk past the budget between two nodes it visits.
+          check_deadline(ctx)
           property_errors(key.to_s, value, path, ctx,
                           names: names, patterns: patterns, additional: additional, named: named)
         end
@@ -127,8 +174,13 @@ module MCPClient
           errors.concat(validate_child(value, sub, "#{path}/#{name}", ctx))
         end
         return errors if matched || named.include?(name) || additional.nil?
-        return errors.push("#{path}: property '#{clip(name)}' is not allowed (additionalProperties is false)") if
-          additional == false
+
+        # A rejected member costs an error rather than a descent, so it is
+        # charged here: the count is what stops a peer-sized object.
+        if additional == false
+          count_visit(ctx)
+          return errors.push("#{path}: property '#{clip(name)}' is not allowed (additionalProperties is false)")
+        end
 
         errors.concat(validate_child(value, additional, "#{path}/#{name}", ctx))
       end
@@ -175,7 +227,32 @@ module MCPClient
         end
         errors.concat(validate_unique_items(data, schema, path, ctx))
         errors.concat(validate_items(data, schema, path, ctx, dialect))
+        errors.concat(validate_unevaluated_items(data, schema, path, ctx, dialect))
         errors.concat(validate_contains(data, schema, path, ctx, dialect))
+      end
+
+      # `unevaluatedItems` (JSON Schema 2020-12 Core Section 11.2) at a node
+      # that produces every annotation it reads: the items past the ones the
+      # tuple keywords in force evaluated, which
+      # {Composition#evaluated_item_count} already counts. As with
+      # `unevaluatedProperties`, a node carrying an in-place applicator — or
+      # a `contains`, whose matches annotate the items they matched — keeps
+      # the keyword unevaluated and reported.
+      # @return [Array<String>] validation errors
+      def validate_unevaluated_items(data, schema, path, ctx, dialect)
+        sub = schema['unevaluatedItems']
+        return [] unless unevaluated_applied?(schema, 'unevaluatedItems', dialect)
+
+        covered = evaluated_item_count(schema, dialect)
+        return [] if covered == Float::INFINITY || data.length <= covered
+
+        errors = []
+        (covered...data.length).each do |idx|
+          check_deadline(ctx)
+          errors.concat(unevaluated_errors(data[idx], sub, "#{path}/#{idx}", ctx,
+                                           "#{path}: item #{idx} is not allowed (unevaluatedItems is false)"))
+        end
+        errors
       end
 
       # The item schemas: the positional ones first, then the schema that
@@ -197,12 +274,18 @@ module MCPClient
                else
                  items
                end
+        return [] if positional.empty? && !schema_value?(rest)
+
         errors = []
         data.each_with_index do |item, idx|
+          # As in {.validate_other_properties}: the array's length is the
+          # peer's, and an item the tuple tail rejects visits no node.
+          check_deadline(ctx)
           item_schema = idx < positional.length ? positional[idx] : rest
           next unless schema_value?(item_schema)
 
           if item_schema == false && idx >= positional.length && items.is_a?(Array)
+            count_visit(ctx)
             errors << "#{path}: item #{idx} is not allowed (additionalItems is false)"
             next
           end
@@ -228,7 +311,7 @@ module MCPClient
         seen = {}
         data.each_with_index do |item, idx|
           count_visit(ctx)
-          key = comparable_value(item, 0)
+          key = comparable_value(item, 0, ctx)
           first = seen[key]
           unless first.nil?
             return ["#{path}: items #{first} and #{idx} are equal, but uniqueItems requires every item to differ"]
@@ -242,17 +325,30 @@ module MCPClient
       # A value in the form JSON equality compares: numbers as exact rationals
       # (so 1 and 1.0 agree), objects as their members sorted by name and with
       # either Ruby key form read as the same name.
+      #
+      # The form carries the JSON type, because JSON equality begins with it:
+      # an object is never equal to an array, however their members line up
+      # (JSON Schema 2020-12 Core Section 4.2.2). Encoding both as a bare
+      # Ruby Array made `[{}, []]` and `[{"a": 1}, [["a", 1]]]` read as
+      # duplicates, so :strict rejected a conforming result — and, through
+      # `not`, accepted one the schema rejects.
+      #
+      # Canonicalizing a value walks all of it, and the value came from the
+      # peer, so every node is accounted for like any other the walk visits.
       # @param value [Object] the instance value
       # @param depth [Integer] how far into the value this is
+      # @param ctx [Context] the validation context
       # @return [Object] a value that hashes and compares as JSON equality does
-      # @raise [Aborted] when the value nests beyond the bound
-      def comparable_value(value, depth)
+      # @raise [Aborted] when the value nests beyond the bound, or a budget is hit
+      def comparable_value(value, depth, ctx)
         raise Aborted, "instance nested deeper than #{MAX_NODE_DEPTH}" if depth > MAX_NODE_DEPTH
 
+        count_visit(ctx)
         case value
-        when Hash then value.map { |k, v| [k.to_s, comparable_value(v, depth + 1)] }.sort_by(&:first)
-        when Array then value.map { |v| comparable_value(v, depth + 1) }
-        when Numeric then exact_number(value)
+        when Hash then [:object, value.map { |k, v| [k.to_s, comparable_value(v, depth + 1, ctx)] }.sort_by(&:first)]
+        when Array then [:array, value.map { |v| comparable_value(v, depth + 1, ctx) }]
+        when Numeric then [:number, exact_number(value)]
+        when String then [:string, value]
         else value
         end
       end

@@ -37,7 +37,7 @@ RSpec.describe 'MCP 2026-07-28 JSON Schema handling — round 25' do
 
     it 'still reports the keywords a reference to a schema object reaches' do
       schema = { 'definitions' => {}, 'x' => 1.5, '$ref' => '#/y',
-                 'y' => { 'type' => 'array', 'unevaluatedItems' => false } }
+                 'y' => { 'type' => 'array', 'allOf' => [true], 'unevaluatedItems' => false } }
 
       expect(validator.unsupported_keywords(schema)).to contain_exactly('unevaluatedItems')
     end

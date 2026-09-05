@@ -68,7 +68,7 @@ RSpec.describe MCPClient::SchemaValidator do
         compiled = orig.call(*args, **kwargs)
       end
 
-      described_class.validate('abc', { 'type' => 'string', 'pattern' => '\\A[a-z]+\\z' })
+      described_class.validate('abc', { 'type' => 'string', 'pattern' => '^[a-z]+$' })
 
       expect(compiled.timeout).to be > 0
       expect(compiled.timeout).to be <= MCPClient::SchemaValidator::PATTERN_MATCH_TIMEOUT
@@ -80,7 +80,7 @@ RSpec.describe MCPClient::SchemaValidator do
       # because the constraint could not be evaluated.
       stub_const('MCPClient::SchemaValidator::PATTERN_MATCH_TIMEOUT', 0.001)
       stub_const('MCPClient::SchemaValidator::MIN_PATTERN_MATCH_TIMEOUT', 0.0005)
-      schema = { 'type' => 'string', 'pattern' => '\\A(a|b|ab)*\\z' }
+      schema = { 'type' => 'string', 'pattern' => '^(a|b|ab)*$' }
 
       expect(described_class.validate("#{'ab' * 20_000}c", schema))
         .to contain_exactly(a_string_matching(/pattern.*budget/i))
@@ -90,7 +90,7 @@ RSpec.describe MCPClient::SchemaValidator do
       # The server controls how many strings it sends as well as the pattern,
       # so a per-match limit would multiply: N items x limit.
       stub_const('MCPClient::SchemaValidator::PATTERN_MATCH_TIMEOUT', 0.3)
-      schema = { 'type' => 'array', 'items' => { 'type' => 'string', 'pattern' => '\\A(a|b|ab)*\\z' } }
+      schema = { 'type' => 'array', 'items' => { 'type' => 'string', 'pattern' => '^(a|b|ab)*$' } }
       data = Array.new(8) { "#{'ab' * 20_000}c" }
 
       started = Process.clock_gettime(Process::CLOCK_MONOTONIC)
@@ -103,7 +103,7 @@ RSpec.describe MCPClient::SchemaValidator do
     end
 
     it 'enforces string patterns' do
-      schema = { 'type' => 'string', 'pattern' => '\\A[a-z]+\\z' }
+      schema = { 'type' => 'string', 'pattern' => '^[a-z]+$' }
       expect(described_class.validate('abc', schema)).to be_empty
       expect(described_class.validate('123', schema)).to contain_exactly(a_string_matching(/pattern/))
     end
@@ -171,7 +171,10 @@ RSpec.describe MCPClient::SchemaValidator do
     end
 
     it 'detects top-level unsupported keywords' do
-      schema = { 'type' => 'object', 'unevaluatedProperties' => false, 'format' => 'custom' }
+      # `unevaluatedProperties` beside an in-place applicator: the annotations
+      # it reads come from a whole composition there, so it stays unevaluated
+      # (a node that produces them itself now applies the keyword).
+      schema = { 'type' => 'object', 'allOf' => [true], 'unevaluatedProperties' => false, 'format' => 'custom' }
       expect(described_class.unsupported_keywords(schema)).to contain_exactly('unevaluatedProperties', 'format')
     end
 
@@ -182,7 +185,11 @@ RSpec.describe MCPClient::SchemaValidator do
       keywords.each do |keyword|
         # Under a dialect that defines the keyword.
         dialect = described_class::DIALECT_KEYWORDS.fetch(keyword, [described_class::DEFAULT_DIALECT]).first
-        expect(described_class.unsupported_keywords({ '$schema' => dialect, keyword => {} })).to eq([keyword])
+        schema = { '$schema' => dialect, keyword => {} }
+        # The annotation-driven pair is evaluated where a node produces every
+        # annotation it reads, so it is reported beside an in-place applicator.
+        schema['allOf'] = [true] if keyword.start_with?('unevaluated')
+        expect(described_class.unsupported_keywords(schema)).to eq([keyword])
       end
     end
 
@@ -223,7 +230,7 @@ RSpec.describe MCPClient::SchemaValidator do
     end
 
     it 'detects unsupported keywords nested inside applicator schemas' do
-      schema = { 'anyOf' => [{ 'type' => 'object', 'unevaluatedProperties' => false }] }
+      schema = { 'anyOf' => [{ 'type' => 'object', 'allOf' => [true], 'unevaluatedProperties' => false }] }
       expect(described_class.unsupported_keywords(schema)).to contain_exactly('unevaluatedProperties')
     end
 
@@ -273,7 +280,8 @@ RSpec.describe MCPClient::SchemaValidator do
     end
 
     it 'handles symbol-keyed schemas' do
-      schema = { type: 'object', unevaluatedProperties: false, properties: { a: { anyOf: [{ format: 'email' }] } } }
+      schema = { type: 'object', allOf: [true], unevaluatedProperties: false,
+                 properties: { a: { anyOf: [{ format: 'email' }] } } }
       expect(described_class.unsupported_keywords(schema)).to contain_exactly('unevaluatedProperties', 'format')
     end
 
@@ -444,6 +452,9 @@ RSpec.describe MCPClient::Client do
             'conditions' => { 'type' => 'string', 'format' => 'custom' }
           },
           'required' => %w[temperature conditions],
+          # Beside an in-place applicator, `unevaluatedProperties` reads
+          # annotations this validator does not collect and stays unevaluated.
+          'allOf' => [{ 'type' => 'object' }],
           'unevaluatedProperties' => false
         }
       end

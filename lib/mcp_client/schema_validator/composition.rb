@@ -18,8 +18,9 @@ module MCPClient
     # evaluated ({SchemaValidator.validate_object},
     # {SchemaValidator.validate_array}, {SchemaValidator.validate_number}),
     # so what is left here is only what genuinely cannot be decided: the two
-    # keywords read off the annotations a whole composition produces, the
-    # dynamic references, and `format` where it asserts.
+    # annotation-driven keywords *where a composition produces the
+    # annotations they read* ({#unevaluated_applied?} tells the two cases
+    # apart), the dynamic references, and `format` where it asserts.
     module Composition
       # Whether a schema object carries an assertion the validator does not
       # evaluate (in the dialect in force) that applies to this instance, so
@@ -47,18 +48,47 @@ module MCPClient
       # assert only where the schema's own applicators leave the instance
       # uncovered (a tuple, an `items` schema or an `additionalItems` beside
       # a tuple evaluates every item; a named, pattern-matched or
-      # `additionalProperties`-covered member every property) and only where
-      # their value can fail at all. The dynamic references and a draft-07
-      # `format` always can.
+      # `additionalProperties`-covered member every property), only where
+      # their value can fail at all, and only where this node did not
+      # evaluate them itself ({#unevaluated_applied?}). The dynamic
+      # references and a draft-07 `format` always can.
       # @return [Boolean]
       def effective_assertion?(schema, keyword, data, dialect = nil, deadline = nil)
         value = schema[keyword]
+        return false if unevaluated_applied?(schema, keyword, dialect)
+
         case keyword
         when 'unevaluatedItems' then effective_unevaluated_items?(schema, value, data, dialect)
         when 'unevaluatedProperties'
           data.is_a?(Hash) && ![true, {}].include?(value) && uncovered_property?(schema, data, deadline)
         else true
         end
+      end
+
+      # The in-place applicators: keywords that apply another schema to the
+      # same instance, and so contribute annotations of their own to the ones
+      # `unevaluatedItems` / `unevaluatedProperties` read. (`not` contributes
+      # none: it succeeds exactly when its subschema failed, and a failed
+      # subschema annotates nothing.)
+      IN_PLACE_APPLICATORS = %w[$ref $dynamicRef $recursiveRef allOf anyOf oneOf if dependentSchemas
+                                dependencies].freeze
+
+      # Whether this node evaluates one of the annotation-driven keywords
+      # itself. It can where every annotation the keyword reads is produced
+      # by the node's own applicators: no in-place applicator (which would
+      # contribute annotations collected across a composition), and — for
+      # `unevaluatedItems` — no `contains`, whose matching items are
+      # annotated as evaluated (JSON Schema 2020-12 Core Section 10.3.1.3).
+      # There the keyword is `additionalProperties` / `additionalItems` over
+      # what this node did not name, which {Instances} applies.
+      # @return [Boolean]
+      def unevaluated_applied?(schema, keyword, dialect)
+        return false unless %w[unevaluatedItems unevaluatedProperties].include?(keyword)
+        return false unless keyword_known?(keyword, dialect) && schema_value?(schema[keyword])
+        return false if IN_PLACE_APPLICATORS.any? { |kw| schema.key?(kw) && keyword_known?(kw, dialect) }
+        return true unless keyword == 'unevaluatedItems'
+
+        !(keyword_known?('contains', dialect) && schema_value?(schema['contains']))
       end
 
       # @return [Boolean] whether `unevaluatedItems` can still reject an item

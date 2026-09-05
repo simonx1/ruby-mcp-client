@@ -55,6 +55,21 @@ module MCPClient
         'dependentRequired' => :dependent_required
       }.freeze
 
+      # The standard keywords that only annotate, with the type JSON Schema
+      # 2020-12 Validation Section 9 (and Section 8 for the content
+      # keywords) gives each. Annotating rather than asserting does not
+      # exempt a keyword from being written correctly: a schema that spells
+      # one wrong is a malformed document, and reading it as usable let
+      # :strict check results against a schema no validator could read.
+      ANNOTATION_SHAPES = {
+        'title' => :string, 'description' => :string, '$comment' => :string, 'format' => :string,
+        'contentEncoding' => :string, 'contentMediaType' => :string,
+        'readOnly' => :boolean, 'writeOnly' => :boolean, 'deprecated' => :boolean, 'examples' => :array
+      }.freeze
+
+      # Every keyword whose value shape the preflight reads.
+      KEYWORD_SHAPES = ASSERTION_SHAPES.merge(ANNOTATION_SHAPES).freeze
+
       # The JSON Schema type names (2020-12 Validation Section 6.1.1).
       JSON_TYPE_NAMES = %w[array boolean integer null number object string].freeze
 
@@ -71,9 +86,9 @@ module MCPClient
         end
       end
 
-      # @return [String, nil] why an assertion value is malformed
+      # @return [String, nil] why an assertion or annotation value is malformed
       def assertion_shape_problem(keyword, value)
-        shape = ASSERTION_SHAPES[keyword]
+        shape = KEYWORD_SHAPES[keyword]
         return nil unless shape
         return type_shape_problem(value) if shape == :type_names
         return dependent_required_shape_problem(keyword, value) if shape == :dependent_required

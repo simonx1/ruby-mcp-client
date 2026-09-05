@@ -42,6 +42,24 @@ RSpec.describe 'MCP 2026-07-28 JSON Schema handling' do
       end
     end
 
+    it 'reads each of them with its own grammar, not all as 2020-12' do
+      # Positional schemas live in `items` before 2020-12 and in
+      # `prefixItems` from it, so the same document means different things
+      # under two of the three dialects this validator implements.
+      tuple = { 'items' => [{ 'type' => 'integer' }], 'additionalItems' => false }
+      legacy = tuple.merge('$schema' => 'http://json-schema.org/draft-07/schema#')
+      expect(validator.check_schema(legacy)).to be_empty
+      expect(validator.validate([1, 2], legacy)).to contain_exactly(a_string_matching(/additionalItems is false/))
+      modern = tuple.merge('$schema' => validator::DEFAULT_DIALECT)
+      expect(validator.check_schema(modern)).to include(a_string_matching(/items must be a schema/))
+      # And a `$ref` replaces its siblings under draft-07 only.
+      sibling = { '$ref' => '#/$defs/s', 'maxLength' => 1, '$defs' => { 's' => { 'type' => 'string' } } }
+      expect(validator.validate('xy', sibling)).to contain_exactly(a_string_matching(/maxLength/))
+      expect(validator.validate('xy', sibling.merge('$schema' => 'http://json-schema.org/draft-07/schema#',
+                                                    'definitions' => { 's' => { 'type' => 'string' } })))
+        .to be_empty
+    end
+
     it 'requires a schema to be an object' do
       expect(validator.check_schema(nil)).to contain_exactly(a_string_matching(/must be an object/))
       expect(validator.check_schema('string')).to contain_exactly(a_string_matching(/must be an object/))

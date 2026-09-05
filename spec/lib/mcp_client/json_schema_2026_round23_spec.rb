@@ -100,9 +100,16 @@ RSpec.describe 'MCP 2026-07-28 JSON Schema handling — round 23' do
         .to contain_exactly(a_string_matching(/value satisfies the schema in not/))
     end
 
-    it 'leaves a contains schema it does not evaluate undecided' do
-      # A real contains schema is still unevaluated: not must not fail here.
-      expect(validator.validate([1], { 'not' => { 'contains' => { 'type' => 'string' } } })).to be_empty
+    it 'leaves a contains whose items it cannot decide undecided' do
+      # An item the validator cannot decide is neither a match nor a
+      # non-match, so the count never settles and `not` must not fail here.
+      undecidable = { 'contains' => { '$dynamicRef' => '#x' } }
+      expect(validator.validate([1], { 'not' => undecidable })).to be_empty
+      # A contains schema it can evaluate decides the branch outright.
+      expect(validator.validate([1], { 'not' => { 'contains' => { 'type' => 'integer' } } }))
+        .to contain_exactly(a_string_matching(/value satisfies the schema in not/))
+      expect(validator.validate([1], { 'if' => { 'contains' => { 'type' => 'string' } }, 'else' => false }))
+        .to contain_exactly(a_string_matching(/schema false accepts no value/))
     end
   end
 
@@ -124,10 +131,17 @@ RSpec.describe 'MCP 2026-07-28 JSON Schema handling — round 23' do
         .to contain_exactly(a_string_matching(/value satisfies the schema in not/))
     end
 
-    it 'still leaves the branch undecided while a required name is absent' do
-      expect(validator.validate({ 'a' => 1 }, { 'not' => { 'dependentRequired' => { 'a' => %w[b] } } })).to be_empty
+    it 'fails the branch outright while a required name is absent' do
+      # `dependentRequired` is evaluated, so a missing name is a definite
+      # failure rather than an unreachable verdict — which `if`/`else` shows
+      # and a bare `not` (empty either way) cannot.
+      absent = { 'dependentRequired' => { 'a' => %w[b] } }
+      expect(validator.validate({ 'a' => 1 }, { 'not' => absent })).to be_empty
+      expect(validator.validate({ 'a' => 1 }, { 'if' => absent, 'else' => false }))
+        .to contain_exactly(a_string_matching(/schema false accepts no value/))
       expect(validator.validate({ 'a' => 1, 'b' => 2 },
-                                { 'not' => { 'dependentRequired' => { 'a' => %w[b c] } } })).to be_empty
+                                { 'if' => { 'dependentRequired' => { 'a' => %w[b c] } }, 'else' => false }))
+        .to contain_exactly(a_string_matching(/schema false accepts no value/))
     end
 
     it 'reads the symbol key form of the instance as present' do

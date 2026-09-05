@@ -28,6 +28,34 @@ module MCPClient
         raise error
       end
 
+      # MCP 2026-07-28 basic "Implementation Requirements": a client "MUST
+      # handle unsupported dialects gracefully by returning an appropriate
+      # error indicating the dialect is not supported" — and, having done
+      # so, must not go on to act on the schema. MCPClient::Client refuses
+      # the dialect of the definition a call is prepared from, but the
+      # HeaderMismatch retry goes out under the definition the refresh
+      # brought instead, which this client never resolved. The rejection
+      # means the server did not execute the first attempt, so refusing the
+      # retry keeps the invariant the check is for: the call is never sent
+      # under a schema nothing could read.
+      # @param params [Hash] the tools/call params being re-sent
+      # @return [void]
+      # @raise [MCPClient::Errors::ValidationError] when the refreshed input
+      #   schema declares a dialect this client does not implement
+      def reject_unreadable_refreshed_schema!(params)
+        return unless params.is_a?(Hash)
+
+        name = (params['name'] || params[:name]).to_s
+        tool = known_tools_for_headers.find { |t| t.name.to_s == name }
+        dialect = tool && MCPClient::SchemaValidator.unsupported_dialect(tool.schema)
+        return unless dialect
+
+        raise MCPClient::Errors::ValidationError,
+              "Tool #{sanitize_log_text(name.inspect)} input schema declares the JSON Schema dialect " \
+              "#{sanitize_log_text(dialect.inspect)[0, 128]}: that dialect is not supported " \
+              "(supported: #{MCPClient::SchemaValidator::SUPPORTED_DIALECTS.join(', ')})"
+      end
+
       # The Mcp-Param-* headers for a tools/call request (MCP 2026-07-28
       # "Custom Headers from Tool Parameters"): the annotated arguments of the
       # tool, looked up in this transport's tool list (fetched on demand so a

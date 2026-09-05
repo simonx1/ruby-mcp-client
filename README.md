@@ -362,22 +362,29 @@ data = result['structuredContent']  # Type-safe structured data
 
 # Per MCP 2025-11-25, clients SHOULD validate structured results against the
 # tool's output schema, and a tool that declares an outputSchema must return
-# structuredContent in successful results. call_tool checks both automatically,
-# against the JSON Schema vocabulary this client evaluates: type, enum/const,
-# properties/required, patternProperties, additionalProperties, propertyNames,
-# minProperties/maxProperties, dependentRequired/dependentSchemas (draft-07
-# dependencies), items/prefixItems/additionalItems, minItems/maxItems,
-# uniqueItems, contains with minContains/maxContains, string bounds and
-# pattern (ECMAScript anchoring), numeric bounds and multipleOf,
-# allOf/anyOf/oneOf/not, if/then/else, and $ref/$defs/definitions inside the
-# document. What is NOT evaluated is what needs annotations collected across a
-# whole composition (unevaluatedItems, unevaluatedProperties) or a dynamic
-# scope ($dynamicRef, $recursiveRef), plus the two keywords that only annotate
-# (format, contentSchema). When a schema uses one of those, call_tool logs a
-# "validation is partial" warning naming them (in both modes), since data may
-# pass this check that a full validator would reject. By default a violation
-# (mismatch, or missing structuredContent on a successful result) logs a
-# warning; opt in to strict mode to raise instead:
+# structuredContent in successful results. call_tool checks both automatically
+# (so does call_tool_streaming, for a chunk that is a complete result, and so
+# does a task's result), against the JSON Schema vocabulary this client
+# evaluates: type, enum/const, properties/required, patternProperties,
+# additionalProperties, propertyNames, minProperties/maxProperties,
+# dependentRequired/dependentSchemas (draft-07 dependencies),
+# items/prefixItems/additionalItems, minItems/maxItems, uniqueItems (JSON
+# equality, so an object is never equal to an array), contains with
+# minContains/maxContains, string bounds and pattern (an ECMA-262 regular
+# expression, translated before it is matched), numeric bounds and multipleOf,
+# allOf/anyOf/oneOf/not, if/then/else, $ref/$defs/definitions inside the
+# document, and unevaluatedItems/unevaluatedProperties at a node that produces
+# every annotation they read (no allOf/anyOf/oneOf/if/$ref/dependentSchemas
+# beside them, and no contains beside unevaluatedItems). What is NOT evaluated
+# is unevaluatedItems/unevaluatedProperties where a composition produces those
+# annotations, the dynamic references ($dynamicRef, $recursiveRef), which need
+# a dynamic scope this client does not track, and the two keywords that only
+# annotate (format, contentSchema). When a schema uses one of those, call_tool
+# logs a "validation is partial" warning naming them (in both modes), since
+# data may pass this check that a full validator would reject; an unevaluated
+# keyword is never read as a match for not/oneOf/if either. By default a
+# violation (mismatch, or missing structuredContent on a successful result)
+# logs a warning; opt in to strict mode to raise instead:
 client = MCPClient::Client.new(
   mcp_server_configs: [...],
   validate_structured_content: :strict # raises MCPClient::Errors::ValidationError on violation
@@ -397,6 +404,15 @@ rejection makes the client refresh `tools/list` and retry with recomputed
 that is the one it is validated against. A `tools/list_changed` that merely
 arrives while the call is in flight never changes the definition the result is
 checked against — the server never saw the replacement.
+
+What counts as structured content follows the revision the session was
+negotiated to. MCP 2026-07-28 widened `structuredContent` to any JSON value,
+so a present `null`, array, string, number or boolean is structured content
+and is validated against the output schema. MCP 2025-11-25 types it as an
+object: on a session negotiated to that revision anything else is no
+structured content at all, and a tool that declares an `outputSchema` and
+sends one is reported as having returned none. A transport that cannot say
+which revision it negotiated is not assumed legacy.
 
 #### JSON Schema dialects and references
 
@@ -418,9 +434,13 @@ The same applies to an `outputSchema`: an unsupported dialect there raises a
 all — unlike a structured-content mismatch, which the
 `validate_structured_content` mode decides. The definition checked is the one
 the answered request actually went out under, so a `HeaderMismatch` retry
-under a refreshed schema is covered too. A schema that is merely unusable for
-another reason (a `$ref` that would need a network fetch, a document past the
-resource bounds, a malformed keyword value) is warned about, and for an input
+under a refreshed schema is covered too — and since the rejection means the
+server did not execute the attempt, a refreshed `inputSchema` whose dialect
+this client cannot read stops the retry before it is sent rather than after
+the tool has run. A schema that is merely unusable for another reason (a
+`$ref` that would need a network fetch, a document past the resource bounds,
+a malformed keyword value — the metadata keywords included, which must be
+written as the type JSON Schema gives them) is warned about, and for an input
 schema the call still goes out, since the server owns argument validation.
 
 Two schema resources may not answer to one URI: a document whose `$id`s (or
