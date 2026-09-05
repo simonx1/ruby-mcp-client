@@ -187,6 +187,12 @@ module MCPClient
     rescue MCPClient::Errors::ConnectionError, MCPClient::Errors::TransportError
       # Re-raise connection/transport errors directly to match test expectations
       raise
+    rescue MCPClient::Errors::ServerError => e
+      # 2026-07-28 protocol errors (typed -3202x, invalid result) carry
+      # actionable data such as requiredCapabilities; keep them intact.
+      raise if e.protocol_error?
+
+      raise MCPClient::Errors::ToolCallError, "Error calling tool '#{tool_name}': #{e.message}"
     rescue StandardError => e
       # For all other errors, wrap in ToolCallError
       raise MCPClient::Errors::ToolCallError, "Error calling tool '#{tool_name}': #{e.message}"
@@ -271,6 +277,12 @@ module MCPClient
       rpc_request('prompts/get', build_named_request_params(prompt_name, parameters))
     rescue MCPClient::Errors::ConnectionError, MCPClient::Errors::TransportError
       raise
+    rescue MCPClient::Errors::ServerError => e
+      # 2026-07-28 protocol errors (typed -3202x, invalid result) carry
+      # actionable data such as requiredCapabilities; keep them intact.
+      raise if e.protocol_error?
+
+      raise MCPClient::Errors::PromptGetError, "Error getting prompt '#{prompt_name}': #{e.message}"
     rescue StandardError => e
       raise MCPClient::Errors::PromptGetError, "Error getting prompt '#{prompt_name}': #{e.message}"
     end
@@ -314,9 +326,14 @@ module MCPClient
     # @return [Array<MCPClient::ResourceContent>] array of resource contents
     # @raise [MCPClient::Errors::ResourceReadError] if resource reading fails
     def read_resource(uri)
-      result = rpc_request('resources/read', { uri: uri })
+      result = require_complete_result!(rpc_request('resources/read', { uri: uri }), 'resources/read')
       contents = result['contents'] || []
       contents.map { |content| MCPClient::ResourceContent.from_json(content) }
+    rescue MCPClient::Errors::ServerError => e
+      raise if e.protocol_error?
+      raise resource_not_found_error(uri, e) if resource_not_found_response?(e)
+
+      raise MCPClient::Errors::ResourceReadError, "Error reading resource '#{uri}': #{e.message}"
     rescue MCPClient::Errors::ConnectionError, MCPClient::Errors::TransportError
       raise
     rescue StandardError => e

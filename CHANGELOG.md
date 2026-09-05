@@ -1,5 +1,68 @@
 # Changelog
 
+## Unreleased — MCP 2026-07-28
+
+Groundwork for the 2026-07-28 protocol revision (stateless, per-request
+metadata). Each feature lands in its own PR; this section accumulates them.
+
+### Protocol foundations
+
+- **Version constants.** `MCPClient::LATEST_PROTOCOL_VERSION` (`2026-07-28`),
+  `MODERN_PROTOCOL_VERSIONS` (per-request metadata revisions) and
+  `LEGACY_PROTOCOL_VERSIONS` (initialize-handshake revisions).
+  `SUPPORTED_PROTOCOL_VERSIONS` is now their union; `PROTOCOL_VERSION` stays
+  `2025-11-25` because it is the version the legacy `initialize` request asks
+  for, and a server answering `initialize` with a modern version is rejected.
+- **Typed JSON-RPC errors.** `MCPClient::Errors::ServerError` now carries the
+  JSON-RPC `code` and `data` (`ServerError.new(msg, code:, data:)`, fully
+  backward compatible). `ServerError.from_jsonrpc(error)` builds the
+  2026-07-28 spec-defined errors: `HeaderMismatchError` (-32020),
+  `MissingRequiredClientCapabilityError` (-32021, `#required_capabilities`)
+  and `UnsupportedProtocolVersionError` (-32022, `#supported`, `#requested`).
+  `MCPClient::Errors::Codes` holds the code constants and the allocation
+  policy helpers. All four transports raise these typed errors.
+- **Only a well-formed error identifies a modern server.**
+  `#modern_protocol_error?` (which suppresses the legacy `initialize`
+  fallback, and lets the error propagate through the public wrappers) is true
+  only for an error carrying the wire shape its schema mandates: the JSON-RPC
+  `message` string, plus `requiredCapabilities` as an object for -32021 and
+  `supported: string[]` with `requested: string` for -32022. Those are the
+  schema's types and nothing more — an empty `supported` list still marks a
+  modern server that named no version this client can retry with, which is a
+  failed negotiation rather than evidence of a legacy peer. An error object
+  with no JSON-RPC `message` at all is malformed at the JSON-RPC level and
+  does not even earn a typed class — it stays a plain `ServerError` with its
+  `code` and `data` preserved. A legacy endpoint or intermediary emitting a
+  bare -3202x code therefore cannot suppress the fallback.
+- **`resultType`.** Every result is checked: an absent field is treated as
+  `"complete"` (earlier-protocol servers, and modern ones that omit it), and
+  any unrecognized value raises `MCPClient::Errors::InvalidResultError` (a
+  `ServerError`, so it is answered rather than re-sent), as the spec
+  requires. `"input_required"` passes through for the multi round-trip
+  handling that follows, but only on a modern session: the pattern exists
+  only in 2026-07-28, so a handshake-era server claiming an unfinished result
+  is malformed. Operations that project a field out of the result
+  (`read_resource`) never flatten an unfinished one into an empty success —
+  they raise, with the whole result on the error's `data` so a host can drive
+  the round trip itself.
+- **Typed errors from HTTP error bodies.** 2026-07-28 servers carry their
+  protocol errors in the body of an HTTP 400 (and an unknown method as a 404
+  with -32601). The HTTP, Streamable HTTP and SSE transports now parse a
+  JSON-RPC error out of a 4xx body and raise the typed error (with the HTTP
+  status prefixed to the message, and the code, data and HTTP status
+  preserved), so a dual-era client can tell a modern rejection from a legacy
+  one. 5xx responses stay `TransientServerError`. The body is read whether it
+  arrives raw or already decoded by host-configured response middleware
+  (`faraday_config` with `conn.response :json`, with or without
+  `conn.response :raise_error`); a raw body is size-bounded and incrementally
+  gunzipped before it is parsed.
+- **Resource not found.** A `resources/read` error with the legacy `-32002`
+  code — or `-32602` from a modern (2026-07-28) server — now raises
+  `MCPClient::Errors::ResourceNotFound` on every transport instead of a
+  generic `ResourceReadError`. On a legacy session `-32602` stays the
+  generic Invalid params it always was. `protocol_version` / `modern?` are
+  now readable on every transport.
+
 ## 2.1.0 — Hostile-Server Hardening (2026-08-04)
 
 A security pass over every transport, driven by an external scan of the 2.0.0

@@ -11,7 +11,7 @@ module MCPClient
 
     # Lightweight response wrapper for Faraday exception payloads (Hashes),
     # so the exception path and the default path share one challenge pipeline.
-    NormalizedResponse = Struct.new(:status, :headers)
+    NormalizedResponse = Struct.new(:status, :headers, :body)
 
     # One auth-param (name = token / quoted-string) as it appears in a
     # WWW-Authenticate challenge (RFC 7235 §2.1, optional whitespace around '=').
@@ -273,7 +273,13 @@ module MCPClient
         # apply the same session-expiry recovery as the response path.
         return restart_session_and_resend(request, sent_session_id) if session_restart_applicable?(sent_session_id)
 
-        raise MCPClient::Errors::ServerError, "Client error: HTTP 404 #{e.message}"
+        raise client_error_from_exception(e, 404)
+      rescue Faraday::ClientError => e
+        # Other 4xx raised by raise_error middleware: same body inspection as
+        # the response path, so a 400 carrying a modern JSON-RPC error still
+        # becomes the typed error (never a retryable TransportError).
+        status = e.response.is_a?(Hash) ? (e.response[:status] || e.response['status']) : nil
+        raise client_error_from_exception(e, status || 400)
       rescue Faraday::ConnectionFailed => e
         raise MCPClient::Errors::ConnectionError, "Server connection lost: #{e.message}"
       rescue Faraday::TimeoutError => e
@@ -321,6 +327,18 @@ module MCPClient
       @mutex.synchronize { !@restarting_session }
     end
 
+    # Build the ServerError for a 4xx surfaced as a Faraday::ClientError by
+    # user-configured raise_error middleware, inspecting the body like the
+    # response path does.
+    # @param error [Faraday::ClientError] the middleware exception
+    # @param status [Integer] the HTTP status
+    # @return [MCPClient::Errors::ServerError]
+    def client_error_from_exception(error, status)
+      response = normalize_error_response(error.response) || NormalizedResponse.new(status, {}, nil)
+      response.status ||= status
+      jsonrpc_error_from_http_response(response, "Client error: HTTP #{status} #{error.message}".strip)
+    end
+
     # Apply headers to the HTTP request (can be overridden by subclasses)
     # @param req [Faraday::Request] HTTP request
     # @param _request [Hash] JSON-RPC request
@@ -363,7 +381,8 @@ module MCPClient
 
       status = raw[:status] || raw['status']
       headers = raw[:headers] || raw['headers'] || {}
-      NormalizedResponse.new(status, headers)
+      body = raw[:body] || raw['body']
+      NormalizedResponse.new(status, headers, body)
     end
 
     # Handle HTTP error responses
@@ -385,7 +404,11 @@ module MCPClient
       when 400..499
         # Deterministic client errors: the request was processed/rejected and
         # will not succeed on retry, so raise a plain (non-retryable) ServerError.
-        raise MCPClient::Errors::ServerError, "Client error: HTTP #{response.status}#{reason_text}"
+        # MCP 2026-07-28 carries its protocol errors in the body of a 400
+        # (HeaderMismatch, UnsupportedProtocolVersion,
+        # MissingRequiredClientCapability) and an unknown method as a 404
+        # with -32601, so a JSON-RPC error body becomes the typed error.
+        raise jsonrpc_error_from_http_response(response, "Client error: HTTP #{response.status}#{reason_text}")
       when 500..599
         # Server-side failures are plausibly transient: raise the retryable
         # subclass so with_retry can re-attempt them.

@@ -1,5 +1,9 @@
 # frozen_string_literal: true
 
+require 'json'
+require 'zlib'
+require 'stringio'
+
 module MCPClient
   # Shared retry/backoff logic for JSON-RPC transports
   module JsonRpcCommon
@@ -182,6 +186,22 @@ module MCPClient
       }
     end
 
+    # The protocol version in use with this server, once established: chosen
+    # via server/discover for a modern server or negotiated by initialize for
+    # a legacy one. nil until then.
+    # @return [String, nil]
+    def protocol_version
+      defined?(@protocol_version) ? @protocol_version : nil
+    end
+
+    # Whether this server speaks a modern (per-request metadata, no
+    # handshake) protocol revision (MCP 2026-07-28 basic/versioning
+    # "Terminology"). false until the era is established.
+    # @return [Boolean]
+    def modern?
+      MCPClient::MODERN_PROTOCOL_VERSIONS.include?(protocol_version)
+    end
+
     # Generate initialization parameters for MCP protocol
     # @return [Hash] the initialization parameters
     def initialization_params
@@ -202,7 +222,9 @@ module MCPClient
     # @raise [MCPClient::Errors::ConnectionError] if the version is unsupported
     def validate_protocol_version!(result)
       version = result['protocolVersion']
-      return version if MCPClient::SUPPORTED_PROTOCOL_VERSIONS.include?(version)
+      # Only handshake-based revisions are valid here: a server answering
+      # initialize with a modern (per-request metadata) version is confused.
+      return version if MCPClient::LEGACY_PROTOCOL_VERSIONS.include?(version)
 
       begin
         cleanup if respond_to?(:cleanup)
@@ -211,7 +233,7 @@ module MCPClient
       end
       raise MCPClient::Errors::ConnectionError,
             "Server negotiated unsupported protocol version #{version.inspect} " \
-            "(supported: #{MCPClient::SUPPORTED_PROTOCOL_VERSIONS.join(', ')}); disconnecting"
+            "(supported: #{MCPClient::LEGACY_PROTOCOL_VERSIONS.join(', ')}); disconnecting"
     end
 
     # The Implementation object sent as clientInfo: the host-provided info
@@ -272,14 +294,187 @@ module MCPClient
       instance_variable_defined?(:@sampling_tools_supported) && @sampling_tools_supported
     end
 
+    # Result types defined by the core protocol (basic/index.mdx "ResultType").
+    # Extensions add more (e.g. "task"); transports widen the accepted set
+    # via #accepted_result_types once such an extension is negotiated.
+    CORE_RESULT_TYPES = %w[complete input_required].freeze
+
+    # The only result type a handshake-era (legacy) server can validly send:
+    # the others were introduced with the discriminator itself.
+    LEGACY_RESULT_TYPES = %w[complete].freeze
+
+    # The resultType of a result object. MCP 2026-07-28 makes the field
+    # required, but "for backward compatibility with servers implementing
+    # earlier protocol versions, which do not include resultType, clients
+    # MUST treat an absent resultType as 'complete'". Non-object results
+    # (lenient handling of older servers) are likewise complete.
+    # @param result [Object] a JSON-RPC result
+    # @return [Object] the resultType value, 'complete' when absent
+    def self.result_type(result)
+      return 'complete' unless result.is_a?(Hash)
+      return result['resultType'] if result.key?('resultType')
+      return result[:resultType] if result.key?(:resultType)
+
+      'complete'
+    end
+
+    # Result types this transport accepts. Overridden (widened) by transports
+    # that negotiated a result-type-adding extension.
+    # @return [Array<String>]
+    def accepted_result_types
+      # input_required names the multi round-trip pattern, which exists only
+      # in modern revisions: a handshake-era server answering with it is
+      # malformed, and treating it as valid would let a wrapper flatten an
+      # unfinished result into an empty successful one.
+      modern? ? CORE_RESULT_TYPES : LEGACY_RESULT_TYPES
+    end
+
+    # Project a payload out of a result that has to be finished. This client
+    # recognizes InputRequiredResult (resultType "input_required") but does
+    # not drive multi round-trip requests yet, so an operation that would
+    # extract a field from it — and so drop the server's inputRequests and
+    # opaque requestState — surfaces it instead of presenting an unfinished
+    # answer as an empty successful one. The whole result rides on the
+    # error's `data`, so a host can still drive the round trip itself.
+    # @param result [Object] the JSON-RPC result
+    # @param method [String] the request method, for the message
+    # @return [Object] the result, when it is complete
+    # @raise [MCPClient::Errors::InvalidResultError] when it is not
+    def require_complete_result!(result, method)
+      type = MCPClient::JsonRpcCommon.result_type(result)
+      return result if type == 'complete'
+
+      raise MCPClient::Errors::InvalidResultError.new(
+        "Invalid result: #{method} answered with resultType #{type.to_s[0, 64].inspect}, which this " \
+        'client cannot carry through (multi round-trip requests are not implemented)', data: result
+      )
+    end
+
+    # Build the error for a 4xx response: the typed JSON-RPC error when the
+    # body is a JSON-RPC error response (with the HTTP status prefixed to the
+    # peer's message), otherwise a plain ServerError with the fallback text.
+    # @param response [Faraday::Response] the 4xx response
+    # @param fallback [String] message when the body carries no JSON-RPC error
+    # @return [MCPClient::Errors::ServerError]
+    def jsonrpc_error_from_http_response(response, fallback)
+      status = response.status
+      error = jsonrpc_error_in_body(response)
+      return MCPClient::Errors::ServerError.new(fallback).tap { |e| e.http_status = status } unless error
+
+      typed = MCPClient::Errors::ServerError.from_jsonrpc(error)
+      typed.class.new("#{fallback}: #{typed.message}", code: typed.code, data: typed.data)
+           .tap { |e| e.http_status = status }
+    end
+
+    # Ceiling on the size of an HTTP error body inspected for a JSON-RPC
+    # error. A protocol error response is a few hundred bytes; the body is
+    # peer-controlled, so anything larger is not parsed at all rather than
+    # handed to JSON.parse.
+    MAX_ERROR_BODY_BYTES = 64 * 1024
+
+    # Extract a JSON-RPC error object from an HTTP error body, if there is one.
+    # Only a JSON-RPC 2.0 error response is recognized; anything else is
+    # ignored.
+    # @param response [Faraday::Response] the HTTP response
+    # @return [Hash, nil] the JSON-RPC `error` member, or nil
+    def jsonrpc_error_in_body(response)
+      return nil unless response.respond_to?(:body)
+
+      data = decoded_error_body(response)
+      # Only a JSON-RPC 2.0 error response counts; an arbitrary JSON body
+      # with an "error" member is not a protocol error.
+      return nil unless data.is_a?(Hash) && (data['jsonrpc'] || data[:jsonrpc]) == '2.0'
+
+      error = data['error'] || data[:error]
+      error.is_a?(Hash) ? error : nil
+    end
+
+    # The error body as a decoded object.
+    #
+    # A host may configure the connection (faraday_config) with response
+    # middleware — `conn.response :json` — that decodes the body before it
+    # reaches this transport, on the exception path (`raise_error`) as well
+    # as the response path. That already-parsed body carries the same
+    # protocol error, so it is accepted as-is; only a raw String body is
+    # size-bounded, gunzipped and parsed here (the middleware has already
+    # spent the memory for the ones it decoded).
+    # @param response [Faraday::Response] the HTTP response
+    # @return [Object, nil] the decoded body, or nil when it cannot be read
+    def decoded_error_body(response)
+      body = response.body
+      return body if body.is_a?(Hash)
+      return nil unless body.is_a?(String) && !body.empty?
+      return nil if oversized_error_body?(body)
+
+      headers = response.respond_to?(:headers) ? response.headers || {} : {}
+      encoding = headers['content-encoding'] || headers['Content-Encoding'] || ''
+      body = gunzip_bounded(body) if encoding.include?('gzip')
+      return nil if body.nil?
+
+      JSON.parse(body)
+    rescue JSON::ParserError, Zlib::Error => e
+      @logger.debug("HTTP error body is not a JSON-RPC error: #{e.class}")
+      nil
+    end
+
+    # @param body [String] an HTTP error body
+    # @return [Boolean] whether it exceeds the inspection ceiling (logged)
+    def oversized_error_body?(body)
+      return false if body.bytesize <= MAX_ERROR_BODY_BYTES
+
+      @logger.debug("Ignoring HTTP error body of #{body.bytesize} bytes (over #{MAX_ERROR_BODY_BYTES})")
+      true
+    end
+
+    # Decompress a gzip error body, giving up once the expansion passes the
+    # inspection ceiling (a compressed 4xx body is peer-controlled too).
+    # @param body [String] gzip data
+    # @return [String, nil] the decompressed body, or nil when too large
+    def gunzip_bounded(body)
+      reader = Zlib::GzipReader.new(StringIO.new(body))
+      expanded = reader.read(MAX_ERROR_BODY_BYTES + 1) || ''
+      return expanded if expanded.bytesize <= MAX_ERROR_BODY_BYTES
+
+      @logger.debug("Ignoring gzip HTTP error body expanding past #{MAX_ERROR_BODY_BYTES} bytes")
+      nil
+    ensure
+      reader&.close
+    end
+
     # Process JSON-RPC response
     # @param response [Hash] the parsed JSON-RPC response
     # @return [Object] the result field from the response
     # @raise [MCPClient::Errors::ServerError] if the response contains an error
+    # @raise [MCPClient::Errors::InvalidResultError] if the result's resultType is unrecognized
     def process_jsonrpc_response(response)
-      raise MCPClient::Errors::ServerError, response['error']['message'] if response['error']
+      raise MCPClient::Errors::ServerError.from_jsonrpc(response['error']) if response['error']
 
-      response['result']
+      result = response['result']
+      validate_result_type!(result)
+      result
+    end
+
+    # "A resultType of any value unrecognized by the client MUST be
+    # considered invalid" (basic/index.mdx). The value is peer-controlled, so
+    # only its class or a short prefix reaches the exception message.
+    # @param result [Object] a JSON-RPC result
+    # @return [void]
+    # @raise [MCPClient::Errors::InvalidResultError]
+    def validate_result_type!(result)
+      unless result.is_a?(Hash)
+        # A modern result MUST be an object. Legacy servers occasionally
+        # answered list requests with a bare array; keep tolerating that.
+        return unless modern?
+
+        raise MCPClient::Errors::InvalidResultError, "Invalid result: expected an object, got #{result.class}"
+      end
+
+      type = MCPClient::JsonRpcCommon.result_type(result)
+      return if type.is_a?(String) && accepted_result_types.include?(type)
+
+      shown = type.is_a?(String) ? type[0, 64].inspect : type.class.name
+      raise MCPClient::Errors::InvalidResultError,
+            "Invalid result: unrecognized resultType #{shown} (accepted: #{accepted_result_types.join(', ')})"
     end
   end
 end

@@ -214,14 +214,16 @@ module MCPClient
         req = { 'jsonrpc' => '2.0', 'id' => req_id, 'method' => 'prompts/list', 'params' => params }
         send_request(req)
         res = wait_response(req_id)
-        if (err = res['error'])
-          raise MCPClient::Errors::ServerError, err['message']
-        end
-
-        result = res['result'] || {}
+        result = process_jsonrpc_response(res) || {}
         prompts = (result['prompts'] || []).map { |td| MCPClient::Prompt.from_json(td, server: self) }
         [prompts, result['nextCursor']]
       end
+    rescue MCPClient::Errors::ServerError => e
+      # 2026-07-28 protocol errors carry actionable data (requiredCapabilities,
+      # supported versions); keep them intact instead of wrapping.
+      raise if e.protocol_error?
+
+      raise MCPClient::Errors::PromptGetError, "Error listing prompts: #{e.message}"
     rescue StandardError => e
       raise MCPClient::Errors::PromptGetError, "Error listing prompts: #{e.message}"
     end
@@ -244,11 +246,13 @@ module MCPClient
       }
       send_request(req)
       res = wait_response(req_id)
-      if (err = res['error'])
-        raise MCPClient::Errors::ServerError, err['message']
-      end
+      process_jsonrpc_response(res)
+    rescue MCPClient::Errors::ServerError => e
+      # 2026-07-28 protocol errors carry actionable data (requiredCapabilities,
+      # supported versions); keep them intact instead of wrapping.
+      raise if e.protocol_error?
 
-      res['result']
+      raise MCPClient::Errors::PromptGetError, "Error calling prompt '#{prompt_name}': #{e.message}"
     rescue StandardError => e
       raise MCPClient::Errors::PromptGetError, "Error calling prompt '#{prompt_name}': #{e.message}"
     end
@@ -266,13 +270,15 @@ module MCPClient
       req = { 'jsonrpc' => '2.0', 'id' => req_id, 'method' => 'resources/list', 'params' => params }
       send_request(req)
       res = wait_response(req_id)
-      if (err = res['error'])
-        raise MCPClient::Errors::ServerError, err['message']
-      end
-
-      result = res['result'] || {}
+      result = process_jsonrpc_response(res) || {}
       resources = (result['resources'] || []).map { |td| MCPClient::Resource.from_json(td, server: self) }
       { 'resources' => resources, 'nextCursor' => result['nextCursor'] }
+    rescue MCPClient::Errors::ServerError => e
+      # 2026-07-28 protocol errors carry actionable data (requiredCapabilities,
+      # supported versions); keep them intact instead of wrapping.
+      raise if e.protocol_error?
+
+      raise MCPClient::Errors::ResourceReadError, "Error listing resources: #{e.message}"
     rescue StandardError => e
       raise MCPClient::Errors::ResourceReadError, "Error listing resources: #{e.message}"
     end
@@ -294,13 +300,14 @@ module MCPClient
       }
       send_request(req)
       res = wait_response(req_id)
-      if (err = res['error'])
-        raise MCPClient::Errors::ServerError, err['message']
-      end
-
-      result = res['result'] || {}
+      result = require_complete_result!(process_jsonrpc_response(res) || {}, 'resources/read')
       contents = result['contents'] || []
       contents.map { |content| MCPClient::ResourceContent.from_json(content) }
+    rescue MCPClient::Errors::ServerError => e
+      raise if e.protocol_error?
+      raise resource_not_found_error(uri, e) if resource_not_found_response?(e)
+
+      raise MCPClient::Errors::ResourceReadError, "Error reading resource '#{uri}': #{e.message}"
     rescue StandardError => e
       raise MCPClient::Errors::ResourceReadError, "Error reading resource '#{uri}': #{e.message}"
     end
@@ -318,13 +325,15 @@ module MCPClient
       req = { 'jsonrpc' => '2.0', 'id' => req_id, 'method' => 'resources/templates/list', 'params' => params }
       send_request(req)
       res = wait_response(req_id)
-      if (err = res['error'])
-        raise MCPClient::Errors::ServerError, err['message']
-      end
-
-      result = res['result'] || {}
+      result = process_jsonrpc_response(res) || {}
       templates = (result['resourceTemplates'] || []).map { |td| MCPClient::ResourceTemplate.from_json(td, server: self) }
       { 'resourceTemplates' => templates, 'nextCursor' => result['nextCursor'] }
+    rescue MCPClient::Errors::ServerError => e
+      # 2026-07-28 protocol errors carry actionable data (requiredCapabilities,
+      # supported versions); keep them intact instead of wrapping.
+      raise if e.protocol_error?
+
+      raise MCPClient::Errors::ResourceReadError, "Error listing resource templates: #{e.message}"
     rescue StandardError => e
       raise MCPClient::Errors::ResourceReadError, "Error listing resource templates: #{e.message}"
     end
@@ -346,13 +355,16 @@ module MCPClient
       }
       send_request(req)
       res = wait_response(req_id)
-      if (err = res['error'])
-        raise MCPClient::Errors::ServerError, err['message']
-      end
-
+      process_jsonrpc_response(res)
       true
     rescue MCPClient::Errors::CapabilityError
       raise
+    rescue MCPClient::Errors::ServerError => e
+      # 2026-07-28 protocol errors carry actionable data (requiredCapabilities,
+      # supported versions); keep them intact instead of wrapping.
+      raise if e.protocol_error?
+
+      raise MCPClient::Errors::ResourceReadError, "Error subscribing to resource '#{uri}': #{e.message}"
     rescue StandardError => e
       raise MCPClient::Errors::ResourceReadError, "Error subscribing to resource '#{uri}': #{e.message}"
     end
@@ -374,13 +386,16 @@ module MCPClient
       }
       send_request(req)
       res = wait_response(req_id)
-      if (err = res['error'])
-        raise MCPClient::Errors::ServerError, err['message']
-      end
-
+      process_jsonrpc_response(res)
       true
     rescue MCPClient::Errors::CapabilityError
       raise
+    rescue MCPClient::Errors::ServerError => e
+      # 2026-07-28 protocol errors carry actionable data (requiredCapabilities,
+      # supported versions); keep them intact instead of wrapping.
+      raise if e.protocol_error?
+
+      raise MCPClient::Errors::ResourceReadError, "Error unsubscribing from resource '#{uri}': #{e.message}"
     rescue StandardError => e
       raise MCPClient::Errors::ResourceReadError, "Error unsubscribing from resource '#{uri}': #{e.message}"
     end
@@ -399,14 +414,16 @@ module MCPClient
         req = { 'jsonrpc' => '2.0', 'id' => req_id, 'method' => 'tools/list', 'params' => params }
         send_request(req)
         res = wait_response(req_id)
-        if (err = res['error'])
-          raise MCPClient::Errors::ServerError, err['message']
-        end
-
-        result = res['result'] || {}
+        result = process_jsonrpc_response(res) || {}
         tools = (result['tools'] || []).map { |td| MCPClient::Tool.from_json(td, server: self) }
         [tools, result['nextCursor']]
       end
+    rescue MCPClient::Errors::ServerError => e
+      # 2026-07-28 protocol errors carry actionable data (requiredCapabilities,
+      # supported versions); keep them intact instead of wrapping.
+      raise if e.protocol_error?
+
+      raise MCPClient::Errors::ToolCallError, "Error listing tools: #{e.message}"
     rescue StandardError => e
       raise MCPClient::Errors::ToolCallError, "Error listing tools: #{e.message}"
     end
@@ -429,11 +446,13 @@ module MCPClient
       }
       send_request(req)
       res = wait_response(req_id)
-      if (err = res['error'])
-        raise MCPClient::Errors::ServerError, err['message']
-      end
+      process_jsonrpc_response(res)
+    rescue MCPClient::Errors::ServerError => e
+      # 2026-07-28 protocol errors carry actionable data (requiredCapabilities,
+      # supported versions); keep them intact instead of wrapping.
+      raise if e.protocol_error?
 
-      res['result']
+      raise MCPClient::Errors::ToolCallError, "Error calling tool '#{tool_name}': #{e.message}"
     rescue StandardError => e
       raise MCPClient::Errors::ToolCallError, "Error calling tool '#{tool_name}': #{e.message}"
     end
@@ -458,13 +477,15 @@ module MCPClient
       }
       send_request(req)
       res = wait_response(req_id)
-      if (err = res['error'])
-        raise MCPClient::Errors::ServerError, err['message']
-      end
-
-      res.dig('result', 'completion') || { 'values' => [] }
+      (process_jsonrpc_response(res) || {})['completion'] || { 'values' => [] }
     rescue MCPClient::Errors::CapabilityError
       raise
+    rescue MCPClient::Errors::ServerError => e
+      # 2026-07-28 protocol errors carry actionable data (requiredCapabilities,
+      # supported versions); keep them intact instead of wrapping.
+      raise if e.protocol_error?
+
+      raise MCPClient::Errors::ServerError, "Error requesting completion: #{e.message}"
     rescue StandardError => e
       raise MCPClient::Errors::ServerError, "Error requesting completion: #{e.message}"
     end
@@ -486,13 +507,15 @@ module MCPClient
       }
       send_request(req)
       res = wait_response(req_id)
-      if (err = res['error'])
-        raise MCPClient::Errors::ServerError, err['message']
-      end
-
-      res['result'] || {}
+      process_jsonrpc_response(res) || {}
     rescue MCPClient::Errors::CapabilityError
       raise
+    rescue MCPClient::Errors::ServerError => e
+      # 2026-07-28 protocol errors carry actionable data (requiredCapabilities,
+      # supported versions); keep them intact instead of wrapping.
+      raise if e.protocol_error?
+
+      raise MCPClient::Errors::ServerError, "Error setting log level: #{e.message}"
     rescue StandardError => e
       raise MCPClient::Errors::ServerError, "Error setting log level: #{e.message}"
     end

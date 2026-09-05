@@ -187,9 +187,13 @@ module MCPClient
 
           unless response.success?
             # 5xx failures are plausibly transient (retryable); 4xx and other
-            # statuses are deterministic and raise a plain (non-retryable) error.
-            error_class = (500..599).cover?(response.status) ? MCPClient::Errors::TransientServerError : MCPClient::Errors::ServerError
-            raise error_class, "Server returned error: #{response.status} #{response.reason_phrase}"
+            # statuses are deterministic and raise a plain (non-retryable)
+            # error — typed when the body carries a JSON-RPC error (MCP
+            # 2026-07-28 protocol errors ride in 400/404 bodies).
+            message = "Server returned error: #{response.status} #{response.reason_phrase}"
+            raise MCPClient::Errors::TransientServerError, message if (500..599).cover?(response.status)
+
+            raise jsonrpc_error_from_http_response(response, message)
           end
 
           response
@@ -308,6 +312,9 @@ module MCPClient
           # the Symbol :error key; deliver them to the caller as ServerError
           # (MCP lifecycle "Error Handling") instead of timing out.
           raise_sse_error_response(result[:error]) if result.is_a?(Hash) && result.key?(:error)
+          # Same resultType invariant as process_jsonrpc_response on the
+          # other transports: an unrecognized value is an invalid response.
+          validate_result_type!(result)
           return result
         end
 
@@ -319,10 +326,9 @@ module MCPClient
       # @param error [Hash, nil] the JSON-RPC error object ('code', 'message', 'data')
       # @raise [MCPClient::Errors::ServerError] always
       def raise_sse_error_response(error)
-        error ||= {}
-        message = error['message'] || 'Unknown server error'
-        message = "#{message} (code #{error['code']})" if error['code']
-        raise MCPClient::Errors::ServerError, message
+        typed = MCPClient::Errors::ServerError.from_jsonrpc(error)
+        message = typed.code ? "#{typed.message} (code #{typed.code})" : typed.message
+        raise typed.class.new(message, code: typed.code, data: typed.data)
       end
 
       # Parse a direct (non-SSE) JSON-RPC response
