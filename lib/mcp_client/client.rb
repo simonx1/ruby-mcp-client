@@ -38,6 +38,11 @@ module MCPClient
     # Placeholder written in place of a redacted value.
     REDACTED = '[REDACTED]'
 
+    # Where {#register_notification_handlers} leaves word, on the thread that
+    # is routing, that the caches for the notification in hand have already
+    # been dropped by the transport's invalidation hook.
+    CACHE_INVALIDATION_MARK = :mcp_client_cache_invalidation
+
     # Maximum characters of a peer-supplied log message written to the host
     # log. The remote server controls this content, so an unbounded message
     # would let it inflate log storage at will.
@@ -106,12 +111,7 @@ module MCPClient
       # Register default and user-defined notification handlers on each server
       @servers.each do |server|
         configure_server_identity(server, client_info, request_meta)
-        server.on_notification do |method, params|
-          # Default notification processing (e.g., cache invalidation, logging)
-          process_notification(server, method, params)
-          # Invoke user-defined listeners
-          @notification_listeners.each { |cb| cb.call(server, method, params) }
-        end
+        register_notification_handlers(server)
         # Register feature callbacks only for features the host actually
         # supports: transports derive their declared client capabilities from
         # the callbacks registered before connecting, and MCP forbids using
@@ -696,6 +696,24 @@ module MCPClient
       end
     end
 
+    # Open a long-lived notification stream on a server (MCP 2026-07-28
+    # subscriptions/listen). The subscription's notifications also flow
+    # through the client's regular notification handling (cache
+    # invalidation, on_notification listeners).
+    # @param notifications [Hash] the SubscriptionFilter: tools_list_changed,
+    #   prompts_list_changed, resources_list_changed (booleans),
+    #   resource_subscriptions, task_ids (arrays of strings)
+    # @param server [Integer, String, Symbol, MCPClient::ServerBase, nil] server selector
+    # @param ack_timeout [Numeric, false, nil] seconds to wait for the server's
+    #   acknowledgment before giving the listen up and cancelling it; nil takes
+    #   the transport's own read timeout, false waits for ever
+    # @yield [method, params] notifications delivered on the subscription
+    # @return [MCPClient::Subscription]
+    # @raise [MCPClient::Errors::CapabilityError] if the server is not a 2026-07-28 server
+    def listen(notifications:, server: nil, ack_timeout: nil, &listener)
+      select_server(server).listen(notifications: notifications, ack_timeout: ack_timeout, &listener)
+    end
+
     # Set the logging level on all connected servers (MCP 2025-06-18)
     # To set on a specific server, use: client.find_server('name').log_level = 'debug'
     # @param level [String] the log level ('debug', 'info', 'notice', 'warning', 'error',
@@ -766,39 +784,134 @@ module MCPClient
             "Server #{srv.name || srv.class.name} did not declare the tasks.#{operation} capability"
     end
 
-    # Process incoming JSON-RPC notifications with default handlers
-    # @param server [MCPClient::ServerBase] the server that emitted the notification
-    # @param method [String] JSON-RPC notification method
-    # @param params [Hash] parameters for the notification
+    # Wire this client's notification processing and the host's listeners onto
+    # a transport.
+    #
+    # The cache invalidation goes on the transport's own invalidation hook,
+    # which runs *before* a notification is delivered to a subscription's
+    # listeners — so a listener reacting to a `list_changed` notification
+    # re-fetches instead of reading the entry the notification just
+    # invalidated. Everything else this client does with a notification is host
+    # code or leads to it (logging, progress callbacks, task status), and stays
+    # on the callback that runs last, behind the delivery. A transport that
+    # emits no such hook — a host-supplied adapter written against the older
+    # interface, say — keeps the invalidation on `on_notification`, ahead of
+    # everything else there: it routes no subscriptions, so there is no
+    # delivery for it to be ahead of.
+    #
+    # Which of the two it is cannot be answered by whether the transport *has*
+    # the hook: every {MCPClient::ServerBase} subclass inherits it, so the
+    # answer was yes for every custom adapter as well, and one that fans its
+    # notifications out through `@notification_callback` alone — exactly what
+    # the interface used to be — silently stopped invalidating anything. The
+    # question is whether the hook actually *ran* for the notification in
+    # hand, and the hook answers it itself: every path that emits it does so
+    # immediately before the host callback and on the same thread
+    # ({MCPClient::JsonRpcCommon#notify_cache_invalidation}), so a callback
+    # that arrives without that mark is one nothing invalidated for. Having
+    # the hook still decides whether one is *registered* — a host may supply
+    # an object that is no ServerBase at all — but no longer decides who
+    # invalidates.
+    # @param server [MCPClient::ServerBase] the server to wire
     # @return [void]
-    def process_notification(server, method, params)
-      server_id = server.name ? "#{server.class}[#{server.name}]" : server.class
+    def register_notification_handlers(server)
+      if server.class.method_defined?(:on_cache_invalidation)
+        server.on_cache_invalidation do |method, _params|
+          invalidate_caches_for_notification(server, method)
+          Thread.current[CACHE_INVALIDATION_MARK] = [server, method]
+        end
+      end
+      server.on_notification do |method, params|
+        mark = Thread.current[CACHE_INVALIDATION_MARK]
+        Thread.current[CACHE_INVALIDATION_MARK] = nil
+        invalidate_caches_for_notification(server, method) unless mark_covers?(mark, server, method)
+        # Default notification processing (e.g., logging, progress)
+        process_notification(server, method, params)
+        # Invoke user-defined listeners
+        @notification_listeners.each { |cb| cb.call(server, method, params) }
+      end
+    end
+
+    # @param mark [Array, nil] what the invalidation hook left behind
+    # @param server [MCPClient::ServerBase] the transport routing now
+    # @param method [String] the notification being routed
+    # @return [Boolean] whether the mark is this notification's
+    def mark_covers?(mark, server, method)
+      mark.is_a?(Array) && mark[0].equal?(server) && mark[1] == method
+    end
+
+    # Drop the caches a notification invalidates.
+    #
+    # Registered on the transport's `on_cache_invalidation` hook, which runs
+    # before the notification is delivered to a subscription's listeners — so a
+    # listener that reacts to a `list_changed` notification by calling
+    # `list_tools` (or the prompt/resource equivalents) re-fetches instead of
+    # reading the entry the notification just invalidated. It used to ride on
+    # `on_notification`, which round 10 moved to the end of the routing order
+    # for good reason: that callback is host code and may block the very reader
+    # the delivery came from. Only the cache drops moved forward; everything
+    # else {#process_notification} does still runs behind the delivery.
+    # @param server [MCPClient::ServerBase] the server that emitted it
+    # @param method [String] JSON-RPC notification method
+    # @return [void]
+    def invalidate_caches_for_notification(server, method)
+      server_id = notification_server_id(server)
       case method
       when 'notifications/tools/list_changed'
         logger.warn("[#{server_id}] Tool list has changed, clearing tool cache")
         @tool_cache.clear
-      when 'notifications/resources/updated'
-        logger.warn("[#{server_id}] Resource #{params['uri']} updated")
       when 'notifications/prompts/list_changed'
         logger.warn("[#{server_id}] Prompt list has changed, clearing prompt cache")
         @prompt_cache.clear
       when 'notifications/resources/list_changed'
         logger.warn("[#{server_id}] Resource list has changed, clearing resource cache")
         @resource_cache.clear
+      end
+    end
+
+    # @param server [MCPClient::ServerBase] the server that emitted a notification
+    # @return [String] the identity used to prefix its log lines
+    def notification_server_id(server)
+      server.name ? "#{server.class}[#{server.name}]" : server.class.to_s
+    end
+
+    # Process incoming JSON-RPC notifications with default handlers
+    # @param server [MCPClient::ServerBase] the server that emitted the notification
+    # @param method [String] JSON-RPC notification method
+    # @param params [Hash] parameters for the notification
+    # @return [void]
+    def process_notification(server, method, params)
+      server_id = notification_server_id(server)
+      case method
+      when 'notifications/tools/list_changed', 'notifications/prompts/list_changed',
+           'notifications/resources/list_changed'
+        # Already handled, ahead of the delivery to any subscription listener
+        # (see {#invalidate_caches_for_notification}).
+        nil
+      when 'notifications/resources/updated'
+        logger.warn("[#{server_id}] Resource #{params['uri']} updated")
       when 'notifications/message'
         # MCP 2025-06-18: Handle logging messages from server
         handle_log_message(server_id, params)
       when 'notifications/tasks/status'
         # MCP 2025-11-25: task status update (params are a flat Task)
         handle_task_status_notification(server_id, params)
+      when 'notifications/subscriptions/acknowledged'
+        # MCP 2026-07-28: the transport already recorded the acknowledged
+        # filter on the Subscription; log for observability.
+        sub_id = params&.dig('_meta', 'io.modelcontextprotocol/subscriptionId')
+        logger.debug("[#{server_id}] Subscription #{sanitize_peer_log_text(sub_id.to_s)} acknowledged")
       when 'notifications/cancelled'
         # MCP 2025-11-25 cancellation utility: the server cancelled one of its
         # own in-flight requests (sampling/elicitation). Server-request
         # dispatch is synchronous per transport, so by the time this arrives
         # the handler has usually completed; receivers MAY ignore
-        # cancellations they cannot honor — log for observability.
-        logger.debug("[#{server_id}] Server cancelled request #{params&.dig('requestId')}: " \
-                     "#{params&.dig('reason') || 'no reason given'}")
+        # cancellations they cannot honor — log for observability. On MCP
+        # 2026-07-28 it only ever tears down a subscriptions/listen stream,
+        # which the transport handled before this point.
+        request_id = sanitize_peer_log_text(params&.dig('requestId').to_s)
+        reason = sanitize_peer_log_text((params&.dig('reason') || 'no reason given').to_s)
+        logger.debug("[#{server_id}] Server cancelled request #{request_id}: #{reason}")
       when 'notifications/progress'
         handle_progress_notification(server_id, params)
       else

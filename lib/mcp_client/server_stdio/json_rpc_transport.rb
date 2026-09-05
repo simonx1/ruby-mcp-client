@@ -23,6 +23,10 @@ module MCPClient
 
           begin
             connect
+            # The record of the process that is now the session. Everything the
+            # crash-loop bound needs is written on it, by its own lifecycle: see
+            # {MCPClient::ServerStdio::ChildSession}.
+            session = (@session = MCPClient::ServerStdio::ChildSession.new)
             start_reader
             start_stderr_reader
             negotiate_protocol
@@ -37,6 +41,214 @@ module MCPClient
           end
 
           @initialized = true
+          # The record is passed rather than read back: a cleanup on another
+          # thread can retire @session while this one is still handing the
+          # subscriptions to the process it established, and the crash-loop
+          # bound must be stamped on the process that actually received them.
+          reopen_subscriptions(session)
+        end
+      end
+
+      # @return [void]
+      def ensure_session_ready
+        ensure_initialized
+      end
+
+      # Send the subscriptions/listen request for a subscription (a fresh id
+      # each time it is opened or re-opened).
+      # @param subscription [MCPClient::Subscription]
+      # @return [void]
+      def open_subscription(subscription)
+        # The pipe this attempt writes to, taken before anything is recorded
+        # about it and written to whatever happens next.
+        #
+        # Reading the transport's *current* stdin at the write instead let a
+        # listen that was still pending when the process exited be written to
+        # the process that replaced it: the teardown had already forgotten that
+        # id (nothing written to a dead process is outstanding, and none of its
+        # ids may be cancelled on its successor), so the replacement was
+        # serving a second stream this client could no longer name — and the
+        # restart's own listen was the only one `close` cancelled. Pinning the
+        # pipe makes the bookkeeping follow the process actually written to: a
+        # write that lands late goes to the pipe it was recorded against, and
+        # once the teardown has closed that pipe it fails into the error paths
+        # below instead.
+        stdin = @stdin
+        id = next_id
+        # No caller waits on this id: the response, if any, is the server's
+        # graceful closure and is routed to the subscription itself.
+        @mutex.synchronize { @awaiting.delete(id) }
+        request = build_jsonrpc_request('subscriptions/listen', { 'notifications' => subscription.requested }, id)
+        # A {Subscription#close} racing with a re-open must not leave the
+        # server holding a subscription this client can no longer cancel:
+        # taking the id and registering it happen under the subscription's own
+        # lock (so a close that wins stops the re-open outright), and a close
+        # that cancelled this id while the request was still going out is
+        # named again below, once the server has seen the listen.
+        return unless subscription.with_open_id(id) { register_subscription(subscription) }
+
+        # Recorded before the write, and whatever the write does: from here on
+        # the server may be serving this listen, and {#cancel_subscription}
+        # has to be able to name it even after a later request has taken the
+        # subscription's own id (see {Subscription#record_outstanding_listen}).
+        # It is not cancellable until the write has finished, though — a close
+        # that named it while the pipe still held nothing would put
+        # `cancelled(n)` on the wire ahead of `listen(n)`. So this attempt
+        # marks it written and then cancels it itself, if that close has
+        # happened by then.
+        subscription.record_outstanding_listen(id)
+        begin
+          send_request(request, io: stdin)
+        ensure
+          subscription.mark_listen_written(id)
+        end
+        cancel_outstanding_listens(subscription, io: stdin) if subscription.closed_by_client?
+      rescue StandardError => e
+        fail_open_attempt(subscription, id, e)
+      end
+
+      # Undo the listen attempt that just failed — but only when the
+      # subscription is this attempt's to undo.
+      #
+      # A write can block long enough for the child to exit and for the
+      # restart that follows to take the subscription over. Two things can
+      # have happened by then, and neither is this attempt's to tear down:
+      #
+      # * the restart already re-opened it under a *newer id*. The registry is
+      #   keyed by listen id, so unregistering "the subscription" would delete
+      #   the new registration and finishing it would close a stream the fresh
+      #   process is serving. Naming the id the write went out with keeps this
+      #   attempt to its own. It only says so in the log — unless that newer
+      #   stream has itself already failed, in which case the caller must be
+      #   told rather than handed a closed handle with no explanation.
+      # * the subscription is one a session is being handed
+      #   ({MCPClient::Subscription#reestablishing?}): it is a stream the spec
+      #   requires to be re-sent, not one this caller asked for, so a write
+      #   that failed because the process was gone (stdin closed under it, an
+      #   EPIPE to a child that exited on sight, or a nested restart holding
+      #   the init lock) leaves it for the next session instead of ending it.
+      #   The question is asked of the subscription rather than of its state:
+      #   taking the new listen id has already moved it from :reconnecting to
+      #   :pending by the time the write raises, so the state says "being
+      #   opened" for the very hand-over that is failing.
+      # @param subscription [MCPClient::Subscription]
+      # @param id [Integer, String] the listen id this attempt sent under
+      # @param error [StandardError] why it failed
+      # @return [void]
+      # @raise [StandardError] the failure, when it was still this attempt's
+      def fail_open_attempt(subscription, id, error)
+        return fail_superseded_attempt(subscription, id, error) unless subscription.open_as?(id)
+
+        unregister_subscription_id(subscription, id)
+        return defer_reestablished_attempt(subscription, id, error) if subscription.reestablishing?
+
+        subscription.finish(
+          error: error.is_a?(MCPClient::Errors::MCPError) ? error : MCPClient::Errors::TransportError.new(error.message)
+        )
+        raise error
+      end
+
+      # Put a subscription whose hand-over could not be written back on the
+      # queue the next session drains, and say so.
+      #
+      # It has just been taken off that queue by {#reopen_subscriptions} and
+      # out of the registry above, so leaving it alone would strand it: no
+      # session would re-send it and no `cleanup` would find it again. The
+      # queue is where a subscription waiting for a process belongs, and the
+      # process that could not be written to is on its way out — its reader
+      # reaches EOF and restarts, and the crash-loop bound then decides
+      # whether another one is worth spawning.
+      # @param subscription [MCPClient::Subscription]
+      # @param id [Integer, String] the listen id this attempt sent under
+      # @param error [StandardError] why it failed
+      # @return [void]
+      def defer_reestablished_attempt(subscription, id, error)
+        subscription.mark_reconnecting
+        enqueue_reconnecting_subscriptions([subscription])
+        @logger.debug("subscriptions/listen #{id} failed while the subscription was being handed to a new " \
+                      "process (#{error.message}); it will be re-sent to the next one")
+      end
+
+      # A failure the subscription has already moved on from: harmless while
+      # the stream that replaced it stands, and the caller's answer when it
+      # does not.
+      # @param subscription [MCPClient::Subscription]
+      # @param id [Integer, String] the listen id this attempt sent under
+      # @param error [StandardError] why it failed
+      # @return [void]
+      # @raise [MCPClient::Errors::MCPError] the replacement's own failure
+      def fail_superseded_attempt(subscription, id, error)
+        replacement_error = subscription.closed? ? subscription.error : nil
+        if replacement_error
+          @logger.warn("subscriptions/listen #{id} failed (#{error.message}) and the stream that replaced it " \
+                       "failed too: #{sanitize_log_text(replacement_error.message)}")
+          raise replacement_error
+        end
+
+        @logger.debug("subscriptions/listen #{id} failed after the subscription was re-opened " \
+                      "(#{error.message}); the newer stream stands")
+      end
+
+      # After the process was re-established, re-send subscriptions/listen
+      # for every subscription the host still holds open ("the server holds
+      # no subscription state across reconnections").
+      #
+      # This is the one place a session is handed the subscriptions, so it is
+      # the one place that decides whether to hand them over at all:
+      #
+      # * a re-established session that turns out to be legacy cannot carry
+      #   them. On `protocol: :auto` the restarted process may negotiate an
+      #   older revision than the one that died, and {#cleanup} has already
+      #   moved the open subscriptions out of the registry — returning would
+      #   leave them :reconnecting for ever with the host never told.
+      # * neither can a session that would only continue a crash loop: if the
+      #   last process these subscriptions were given died less than
+      #   {MCPClient::ServerStdio::SUBSCRIPTION_RESTART_MIN_INTERVAL} after
+      #   receiving them, handing them over again would spawn the same corpse
+      #   for ever. Deciding here rather than at the restart is what makes the
+      #   bound hold: a process is re-established by whichever thread gets
+      #   there first — the reader's restart or a host request — and only the
+      #   re-send is common to both.
+      #
+      # Either way the subscriptions end with the error, so the host learns
+      # from `closed?`/`error` rather than waiting on a stream that is not
+      # coming back.
+      # @param session [MCPClient::ServerStdio::ChildSession, nil] the record of
+      #   the process being handed the subscriptions
+      # @return [void]
+      def reopen_subscriptions(session = @session)
+        pending = take_reconnecting_subscriptions
+        # A session handed nothing asks nothing, and must not spend the record
+        # either: the subscriptions are still open on the session this one
+        # replaced (a nested restart re-establishes the process between a
+        # hand-over and the next exit), and the process that carried them is
+        # still what the next hand-over has to be judged against.
+        return if pending.empty?
+
+        # The record of the process that last carried subscriptions answers
+        # exactly one question — whether handing them over again would only
+        # respawn the same corpse — and this is the moment it is asked. Asking
+        # spends it, whatever the answer: the loop it recorded is either
+        # broken here (these subscriptions are closed and never handed on) or
+        # replaced below by the record of the process that takes them. Left
+        # standing it outlived the loop it described, and the next hand-over —
+        # of a subscription opened directly on the replacement, which then ran
+        # healthily for hours — was refused for a crash it had no part in.
+        carrier = @subscription_carrier
+        @subscription_carrier = nil
+
+        refusal = reopen_refusal(carrier)
+        return fail_subscriptions(pending, refusal) if refusal
+
+        # Stamped on the process before the writes go out: one that exits
+        # while they are still going to it survived receiving them by no time
+        # at all, which is what the next hand-over needs to know.
+        session&.carrying_subscriptions
+        @subscription_carrier = session
+        pending.each do |subscription|
+          open_subscription(subscription)
+        rescue StandardError => e
+          @logger.warn("Could not re-establish subscription: #{e.message}")
         end
       end
 
@@ -66,6 +278,161 @@ module MCPClient
         cleanup
       rescue StandardError => e
         @logger.debug("Releasing the stdio transport did not complete cleanly: #{e.message}")
+      end
+
+      # Why this session must not be given the open subscriptions, if it must
+      # not (see {#reopen_subscriptions}).
+      # @param carrier [MCPClient::ServerStdio::ChildSession, nil] the record
+      #   of the process that last carried them
+      # @return [StandardError, nil]
+      def reopen_refusal(carrier)
+        unless modern?
+          return MCPClient::Errors::CapabilityError.new(
+            'the re-established server process negotiated ' \
+            "#{protocol_version || 'no version'}, which cannot carry a subscriptions/listen stream"
+          )
+        end
+        return nil unless crash_looping?(carrier)
+
+        @logger.error('MCP server process exited again right after it was given its subscriptions; closing them')
+        MCPClient::Errors::TransportError.new('MCP server process exited again right after a restart')
+      end
+
+      # Whether the process these subscriptions were last given to died too
+      # soon after receiving them for another process to be worth spawning.
+      # The two moments are stamped on that process's own record, by its own
+      # lifecycle, so this answer cannot be spoiled by whatever another thread
+      # is doing to another process.
+      # @param carrier [MCPClient::ServerStdio::ChildSession, nil] the record
+      #   of the process that last carried them
+      # @return [Boolean]
+      def crash_looping?(carrier)
+        carrier&.died_carrying_subscriptions?(
+          MCPClient::ServerStdio::SUBSCRIPTION_RESTART_MIN_INTERVAL
+        ) || false
+      end
+
+      # Put subscriptions on the queue the next session drains, at most once
+      # each.
+      #
+      # Two paths write to this queue and they overlap: {#cleanup} moves the
+      # open subscriptions onto it, and {#defer_reestablished_attempt} puts
+      # back a hand-over whose write failed — and the second happens inside
+      # the window the first leaves between taking the registry snapshot and
+      # writing it here. An unguarded Array `concat`ed by one and `<<`ed by
+      # the other is undefined in MRI: the same window can lose the entry, and
+      # a subscription no session re-sends and no `cleanup` finds again is a
+      # stream the spec says MUST be re-established, stranded with the host
+      # never told. Scanning that Array with `equal?` while another thread
+      # grows it does not make the append safe either — it only decided,
+      # unreliably, whether to make a second one. So both paths come through
+      # here, under the one lock that also guards the take, and membership is
+      # by identity: a handle appears on the queue once, and one hand-over
+      # goes out for it.
+      # @param subscriptions [Array<MCPClient::Subscription>] to enqueue
+      # @return [Array<MCPClient::Subscription>] the whole queue afterwards
+      def enqueue_reconnecting_subscriptions(subscriptions)
+        reconnecting_mutex.synchronize { enqueue_reconnecting_locked(subscriptions) }
+      end
+
+      # Hand the subscriptions of a process that is being torn down to the
+      # next one, forgetting the listen ids that process was holding: nothing
+      # written to it is outstanding any more, and none of those ids may be
+      # cancelled on the process that replaces it (see
+      # {MCPClient::Subscription#record_outstanding_listen}).
+      #
+      # Both steps happen under the lock a hand-over takes them off the queue
+      # under, so a session that is already re-sending them cannot have the
+      # ids it has just written forgotten by this teardown: it cannot reach
+      # its own writes until this has finished.
+      # @param subscriptions [Array<MCPClient::Subscription>] the ones still open
+      # @return [void]
+      def queue_subscriptions_of_ended_process(subscriptions)
+        reconnecting_mutex.synchronize do
+          enqueue_reconnecting_locked(subscriptions).each(&:discard_outstanding_listens)
+        end
+      end
+
+      # @param subscriptions [Array<MCPClient::Subscription>] to enqueue
+      # @return [Array<MCPClient::Subscription>] the whole queue afterwards
+      def enqueue_reconnecting_locked(subscriptions)
+        queue = (@reconnecting_subscriptions ||= [])
+        subscriptions.each do |subscription|
+          queue << subscription unless queue.any? { |queued| queued.equal?(subscription) }
+        end
+        queue.dup
+      end
+
+      # Take the subscriptions waiting for a process, leaving the queue empty.
+      # @return [Array<MCPClient::Subscription>]
+      def take_reconnecting_subscriptions
+        reconnecting_mutex.synchronize do
+          pending = (@reconnecting_subscriptions || []).select(&:reconnectable?)
+          @reconnecting_subscriptions = []
+          pending
+        end
+      end
+
+      # @return [Array<MCPClient::Subscription>] the subscriptions on the queue
+      #   that a process could still be re-sent to
+      def reconnecting_subscriptions
+        reconnecting_mutex.synchronize { (@reconnecting_subscriptions || []).select(&:reconnectable?) }
+      end
+
+      # @return [Mutex] guards the queue of subscriptions waiting for a process
+      #   (created by {MCPClient::ServerStdio#initialize}, so no two threads
+      #   ever race to make it)
+      def reconnecting_mutex
+        @reconnecting_mutex ||= Mutex.new
+      end
+
+      # Restart the process the reader just watched exit, for the
+      # subscriptions the host still holds.
+      #
+      # A subscription is a standing request the host does not repeat: while
+      # it only waits for notifications there is no RPC for
+      # {#ensure_initialized} to re-establish the process on, so leaving the
+      # restart to "the next request" leaves every subscription
+      # :reconnecting for ever, with the host neither notified nor served.
+      # Restarting is also what MCP 2026-07-28 stdio "Unexpected Termination"
+      # asks of a client, and re-sending the subscriptions afterwards is what
+      # this transport already promises. With no subscription open there is
+      # nothing standing, and the process stays lazily re-established on the
+      # next request.
+      #
+      # A server that keeps exiting must not be respawned in a loop; that
+      # bound is enforced where the subscriptions are handed over rather than
+      # here (see {#reopen_subscriptions}), because the process is
+      # re-established by whichever thread gets there first — this restart or
+      # a host request that raced it — and only the hand-over is common to
+      # both. A restart that fails outright ends them here instead. Either way
+      # the host learns from `closed?`/`error` rather than waiting on a stream
+      # that is never coming back.
+      # @return [void]
+      def restart_for_open_subscriptions
+        pending = reconnecting_subscriptions
+        return if pending.empty?
+
+        @logger.info("Re-establishing the server process for #{pending.size} open subscription(s)")
+        ensure_initialized
+      rescue StandardError => e
+        @logger.warn("Could not re-establish the server process: #{e.message}")
+        fail_reconnecting_subscriptions(e)
+      end
+
+      # End the subscriptions waiting for a process that is not coming back.
+      # @param error [StandardError] why it is not
+      # @return [void]
+      def fail_reconnecting_subscriptions(error)
+        fail_subscriptions(take_reconnecting_subscriptions, error)
+      end
+
+      # @param pending [Array<MCPClient::Subscription>] the subscriptions to end
+      # @param error [StandardError] why they ended
+      # @return [void]
+      def fail_subscriptions(pending, error)
+        failure = error.is_a?(MCPClient::Errors::MCPError) ? error : MCPClient::Errors::TransportError.new(error.message)
+        pending.each { |subscription| subscription.finish(gracefully: false, error: failure) }
       end
 
       # Establish the server's protocol era (MCP 2026-07-28
@@ -262,11 +629,16 @@ module MCPClient
 
       # Send a JSON-RPC request and return nothing
       # @param req [Hash] the JSON-RPC request
+      # @param io [IO, nil] the pipe to write to; defaults to the live process's
+      #   stdin, but a caller whose bookkeeping is tied to one particular
+      #   process pins that process's pipe instead (see {#open_subscription})
       # @return [void]
       # @raise [MCPClient::Errors::TransportError] on write errors
-      def send_request(req)
+      def send_request(req, io: @stdin)
         @logger.debug("Sending JSONRPC request: #{describe_jsonrpc_message(req)}")
-        @stdin.puts(req.to_json)
+        raise IOError, 'the server process is gone' unless io
+
+        io.puts(req.to_json)
       rescue StandardError => e
         # A request that failed to send will never receive a response, so drop
         # its awaiting marker; otherwise a broken transport (e.g. the server

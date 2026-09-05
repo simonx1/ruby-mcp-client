@@ -4,10 +4,13 @@ require 'json'
 require 'zlib'
 require 'stringio'
 require_relative 'header_params'
+require_relative 'subscription_support'
 
 module MCPClient
   # Shared retry/backoff logic for JSON-RPC transports
   module JsonRpcCommon
+    include SubscriptionSupport
+
     # JSON-RPC methods with arbitrary side effects that MUST NOT be re-sent
     # automatically. Even a "transient" failure (5xx, dropped connection,
     # malformed response) can arrive AFTER the server received the request,
@@ -84,6 +87,25 @@ module MCPClient
       return escaped if escaped.length <= MAX_PEER_LOG_TEXT_LENGTH
 
       "#{escaped[0, MAX_PEER_LOG_TEXT_LENGTH]}... (truncated from #{escaped.length} chars)"
+    end
+
+    # Tell a host layered above this transport to drop the caches a
+    # notification invalidates, surviving whatever it does with it.
+    #
+    # Called by every path that fans a notification out to the host — the
+    # subscription routing on stdio and both HTTP transports, the legacy SSE
+    # parser, and the synthetic tools/list_changed a HeaderMismatch refresh
+    # announces — and always before the notification reaches a subscription's
+    # listeners. See {MCPClient::ServerBase#on_cache_invalidation} for why the
+    # host's own callback cannot serve.
+    # @param method [String] notification method
+    # @param params [Hash, nil] notification params
+    # @return [void]
+    def notify_cache_invalidation(method, params)
+      @cache_invalidation_callback&.call(method, params)
+    rescue StandardError => e
+      @logger.warn("Cache invalidation callback error for #{sanitize_log_text(method)}: " \
+                   "#{sanitize_log_text(e.message)}")
     end
 
     # A log-safe description of a JSON-RPC message: its method and id only.

@@ -136,7 +136,194 @@ contents.each do |content|
   puts content.text if content.text?
   data = Base64.decode64(content.blob) if content.binary?
 end
+
+# Resource update subscriptions (per server)
+server = client.servers.first
+server.subscribe_resource('file:///example.txt')
+server.unsubscribe_resource('file:///example.txt')
 ```
+
+`subscribe_resource` answers `true` only once the server has confirmed the
+subscription, and raises otherwise — the server's own error, or
+`MCPClient::Errors::ResourceReadError` (including when the confirmation does
+not arrive within the transport's `read_timeout`). On a 2025-11-25 server the
+confirmation is the `resources/subscribe` response; on a 2026-07-28 one it is
+the `subscriptions/listen` acknowledgment naming that URI, which the call
+waits for. Updates then arrive as `notifications/resources/updated` through
+`on_notification`. Every later acknowledgment of that stream is rechecked too:
+a stream re-opened after a dropped HTTP connection or a stdio restart is a new
+listen request the server may acknowledge more narrowly, so one that comes back
+without the URI closes the subscription instead of leaving the resource
+reported as watched while nothing watches it — including one that arrives in
+the window between the acknowledgment `subscribe_resource` waited for and the
+URI being mapped to the stream, which is checked once more with the mapping in
+place before the call answers. A stream already mapped to the URI is reused
+only while the server is honouring that URI on it *now*: one that has dropped
+is waited for — through the HTTP re-open backoff or the stdio handshake, and
+on past the replacement request until the server answers it — rather than
+reported as a watch on the strength of what the stream that is gone had been
+granted, because no server-side subscription exists between listen attempts
+and the request that replaces one is a new listen the server holds no state
+for and may reject or acknowledge without the URI. Only a stream the server is
+actively honouring counts as a live watch, and one that does not become
+one — its replacement is refused, or nothing answers within the
+acknowledgment timeout — is closed as well as unmapped, so it cannot come back
+and deliver the same updates beside the stream that replaces it, and
+`unsubscribe_resource` is never left looking for a subscription the mapping no
+longer names. The subscriber waiting on its own
+listen request is a different matter and still gets its answer: a connection
+that drops the moment the acknowledgment arrives does not unanswer it, so the
+call does not wait out its acknowledgment timeout for a grant it already
+has — while a replacement request that has actually gone out is unanswered
+until the server answers *it*.
+
+On a 2026-07-28 server a host can also open a stream of its own with
+`server.listen(notifications: { tools_list_changed: true }) { |method, params| … }`
+and end it with `subscription.close`. A listen the server never acknowledges is
+given up on rather than left pending for ever: `ack_timeout:` bounds the wait
+for the acknowledgment (the transport's read timeout by default, `false` to
+wait for ever), and one that expires cancels the request and closes the handle
+with a `RequestTimeoutError`. The stream itself is not bounded — once
+acknowledged it runs for as long as the server keeps it. The block runs on the
+subscription's own dispatcher thread, never on the transport's reader, so a
+listener may issue requests of its own; the notifications waiting for it are bounded both in
+number (`MCPClient::Subscription::MAX_PENDING_NOTIFICATIONS`) and in the bytes
+they retain (`MCPClient::Subscription::MAX_PENDING_NOTIFICATION_BYTES`) — a
+count alone is not a memory bound when the peer chooses how big each payload
+is. Everything a queued notification retains is charged, its method name as
+well as its params: a peer tagging `{}` params with a multi-megabyte method
+name would otherwise pay two bytes apiece and put a thousand of them behind a
+slow listener without touching the byte ceiling. A listener that cannot keep
+up with the server loses **repeats**, not signals: whichever ceiling the
+arriving notification would breach, the queue gives up the oldest notification
+about the same thing as it (same method and
+same `uri`/`taskId`), or failing that the oldest of whichever thing has the
+most queued, so a stream watching several resources or tasks never loses the
+only queued update for a quiet one to make room for a busy one. Every MCP
+notification is a "look again" signal about state the host re-reads for itself,
+so a later notice of the same thing carries what the dropped one said, while
+the only notice of another thing carries what nothing else would. Two rules hold
+this together: every queued notification is charged exactly what it retains,
+and every eviction gives up an entry whose removal relieves the pressure that
+caused it — the byte budget considers only the entries charged against it, the
+count ceiling considers them all — so overflow always makes progress and no
+signal is spent on pressure that discarding it cannot relieve. A notification
+larger than the whole byte budget is not charged against it: it is held in a
+slot of its own, and there is only ever one such slot, so it is neither lost
+for being large nor able to displace anything else, and what the queue retains
+stays within the budget plus one peer-sized payload.
+`pending_notifications` / `pending_notification_bytes` /
+`dropped_notifications` report how far behind a listener fell. An incoming
+notification is routed in a fixed order: subscription bookkeeping (an
+acknowledgment, a server-side teardown) first, then the transport and client
+cache invalidation, then the delivery to the subscription's listeners, and the
+host's `on_notification` listeners **last**. Caches are therefore dropped
+*before* a notification reaches the listeners, so a listener reacting to a
+`list_changed` notification by calling `list_tools` (or the prompt or resource
+equivalents) always re-fetches rather than reading the entry the notification
+just invalidated. That holds for the client's caches as well as the
+transport's: the client drops its `tool_cache` / `prompt_cache` /
+`resource_cache` on the transport's `on_cache_invalidation` hook, which runs at
+the invalidation step, rather than on the host callback that runs after the
+delivery. A custom transport that emits no such hook — one written against the
+older interface, which only calls the notification callback — still has those
+caches dropped, on the callback and ahead of everything else there. Everything else the client does with a notification (logging,
+progress callbacks, task status) stays behind the delivery, because it is host
+code or leads to it. Transports that carry no subscription stream announce the
+same hook before their notification callback — the legacy SSE parser, and the
+synthetic `tools/list_changed` a `Mcp-Param-*` header-mismatch refresh emits —
+so nothing that invalidates a cache is announced on only one of the two.
+The host callback comes last because it is the only step
+that can block: it is host code and it runs on whatever thread is routing — on
+stdio the server process's sole reader — so a callback that issues a
+synchronous request of its own would otherwise hold up the delivery while
+waiting for a response only that reader can deliver. Queueing the delivery is
+all the routing thread does (the listeners themselves run on the
+subscription's dispatcher thread), so nothing host-supplied runs ahead of the
+callback either way. Being last, the callback can prevent nothing: one that
+raises is logged and stops neither the invalidation nor the delivery, and one
+that edits the payload it is handed can neither drop nor redirect it — the
+subscription a notification belongs to is resolved, and the delivery queued,
+before the callback sees it. The requested
+filter is copied and frozen when the subscription is created, so a caller that
+keeps and mutates the array it passed cannot change the request that goes out
+(Streamable HTTP builds it on the stream's own thread) or what a reconnect asks
+for. `unsupported` names the requested fields the acknowledgment did not really
+grant, read from its values rather than its keys: a `resourceSubscriptions`
+echoed with none of the requested URIs, or a flag acknowledged as `false`,
+counts as unsupported. `acknowledged` is a frozen copy of what the server
+granted, arrays and strings included: the notification it arrives in is handed
+to `on_notification` and to the subscription's listeners, and host code editing
+it in place must not be able to rewrite the subscription's own record of the
+watch. `active?` answers false while a dropped stream
+waits to re-open, and a closing response the client cannot recognize (an unknown
+`resultType`, a missing or scalar result) fails the subscription instead of
+closing it gracefully — as does one that is recognized but says the request has
+not finished (`input_required`, which is valid on `tools/call`,
+`resources/read` and `prompts/get` alone). On Streamable HTTP closing the SSE response stream *is*
+the cancellation, including against a connection that is still opening its
+socket: once `close` (or the transport's `cleanup`) returns, either the listen
+request was never sent — that session refuses to send one for a closed
+subscription, however long its connect takes — or its response stream has been
+closed. A listen POST the server answers with a 5xx is treated as a dropped
+stream and re-opened on the usual backoff, the way a connection failure or a
+read timeout on the very same request is: a brief 500 or 503 no longer ends a
+long-lived subscription for good. Only a 4xx, or an authorization challenge,
+is the server refusing this subscription, and those still end it.
+On stdio a server process that exits on its own is restarted at once
+while subscriptions are open, since a host that is only waiting for
+notifications never makes the request that would otherwise restart it, and the
+subscriptions are re-sent on the new process. An exit *during* the
+initialization that established the process counts too: a replacement that
+answers the discovery probe and then dies is noticed by its own reader, which
+waits out the initialization still in flight and then restarts — otherwise
+nothing noticed, the dead connection was marked initialized, the re-sent
+listens failed into the "wait for the next process" path, and no reader was
+left to establish one. If the process cannot be restarted, or if
+the process they were last re-sent to died less than
+`MCPClient::ServerStdio::SUBSCRIPTION_RESTART_MIN_INTERVAL` after receiving
+them, they end with that error rather than waiting for ever. Only an exit
+counts against that bound, never a teardown the client asked for: a host that
+calls `cleanup` and reconnects — which every `cleanup`/request cycle does —
+tears the process down whenever it likes, and reading that as a crash closed
+the very subscriptions the reconnect exists to carry across. The record of
+that process answers only that one question, and asking it spends it: a
+subscription opened directly on the replacement, after a refusal had already
+closed the ones the corpse carried, is judged on its own process's uptime
+rather than refused for a crash it had no part in. That interval runs
+from the moment that process received them, not from the moment a restart was
+attempted, so a server whose start-up alone takes longer is not credited with
+its own handshake and respawned for ever; both moments are recorded on the
+record of the process itself, and the question is asked in the one place the
+subscriptions are handed over, so the bound holds however a host request and
+the reader's own restart interleave — whichever of them re-establishes the
+process. A restarted process that negotiates a pre-2026-07-28 version cannot
+carry them either, and ends them with a `CapabilityError` rather than leaving
+them `:reconnecting`. A listen write that fails after the process is gone
+leaves the subscription for the next process to be re-sent to instead of
+closing it — including when it fails on the hand-over itself, where taking the
+new listen id has already moved the subscription off `:reconnecting` and the
+stream being torn down would have been the very one the restart was
+re-establishing. One that fails after a newer stream replaced it raises only
+if that newer stream has itself failed. The subscriptions waiting for a
+process live on a single queue behind one lock, and a handle is on it at most
+once: a `cleanup` moving the open subscriptions onto it overlaps a failed
+hand-over putting one back, and two threads appending to a bare Array can lose
+an entry — stranding a stream the spec requires to be re-sent — or duplicate
+it and send two listen requests for one subscription. `close` cancels what is
+actually outstanding: `notifications/cancelled` names every listen request the
+client wrote for that subscription on the live process, not only the id it
+happens to be on, while ids written to a process that has since gone are
+forgotten rather than cancelled on the one that replaced it. That accounting
+holds because a listen request is written to the pipe it was recorded against
+rather than to whichever process is current when the write finally happens: a
+write still pending when the process exits goes to the process it was opening
+on (failing into the paths above once its pipe is closed), never to the
+replacement, which would otherwise be serving a second stream whose id the
+teardown had already forgotten. On Streamable HTTP the mirror image is
+refused rather than deferred — a `listen` whose connection is closed while it
+is being opened raises `ConnectionError` instead of POSTing onto a transport
+the host has closed, which no later `cleanup` would find.
 
 ## MCP 2025-11-25 Features
 

@@ -442,18 +442,18 @@ RSpec.describe 'MCP 2026-07-28 stateless protocol (stdio) — verification round
 
       expect(server.list_tools.map(&:name)).to eq(['echo'])
       first_pid = transcript_pids(transcript).first
-      wait_for('the subprocess to exit') { !process_alive?(first_pid) }
-      # The reader thread notices the closed stdout and retires the
-      # handshake; waiting on that keeps the restart deterministic.
-      wait_for('the transport to be retired') { server.transport_retired? }
+      # Captured while they are still the live ones: the exit releases them.
       dead_pipes = %i[@stdin @stdout @stderr].map { |ivar| server.instance_variable_get(ivar) }
       dead_reader = server.instance_variable_get(:@reader_thread)
+      wait_for('the subprocess to exit') { !process_alive?(first_pid) }
+      # The reader thread notices the closed stdout and hands the exit on;
+      # waiting for it to finish keeps the restart deterministic.
+      wait_for('the old reader thread to finish') { !dead_reader.alive? }
 
       expect(server.list_tools.map(&:name)).to eq(['echo'])
 
       # The dead process's handles were released rather than overwritten.
       expect(dead_pipes.map(&:closed?)).to eq([true, true, true])
-      wait_for('the old reader thread to finish') { !dead_reader.alive? }
       expect(server.instance_variable_get(:@stdin)).not_to be(dead_pipes.first)
       pids = transcript_pids(transcript)
       expect(pids.size).to eq(2)
