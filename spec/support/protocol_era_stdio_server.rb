@@ -25,7 +25,23 @@
 #
 # TRANSCRIPT, when given, receives one line per event: `pid <n>` at startup and
 # the method name of every JSON-RPC message received.
+#
+# Every request is checked against the era it was sent in before it is
+# answered: a modern one MUST carry the required `_meta` fields, a 2025-11-25
+# one MUST carry none of them. A client that stops putting them on the wire —
+# or leaves them on a handshake it fell back to — is refused, so the wire
+# itself is pinned rather than only the sequence of method names.
 require 'json'
+
+# Per-request protocol fields a modern request MUST carry (MCP 2026-07-28
+# basic/index "Per-request protocol fields").
+REQUIRED_MODERN_META = %w[
+  io.modelcontextprotocol/protocolVersion
+  io.modelcontextprotocol/clientCapabilities
+].freeze
+
+# Reserved prefix: none of these keys belong on a 2025-11-25 request.
+MODERN_META_PREFIX = 'io.modelcontextprotocol/'
 
 MODE = ARGV[0] || 'modern'
 TRANSCRIPT = ARGV[1]
@@ -93,9 +109,43 @@ def handle_common(msg)
   end
 end
 
+# server/discover is a modern request whatever the mode — it is how the era is
+# probed. Everything else is modern only where the fixture speaks 2026-07-28;
+# in the fallback modes the rest of the session is the 2025-11-25 handshake.
+# @param msg [Hash] the request
+# @return [Boolean]
+def modern_request?(msg)
+  msg['method'] == 'server/discover' || %w[modern modern-one-shot future-only].include?(MODE)
+end
+
+# @param msg [Hash] the request
+# @return [String, nil] what is wrong with the request's `_meta`, nil when nothing is
+def meta_violation(msg)
+  params = msg['params']
+  meta = params.is_a?(Hash) ? params['_meta'] : nil
+  meta = {} unless meta.is_a?(Hash)
+  if modern_request?(msg)
+    missing = REQUIRED_MODERN_META.reject { |key| meta.key?(key) }
+    return "modern request is missing required _meta: #{missing.join(', ')}" if missing.any?
+  else
+    leaked = meta.keys.select { |key| key.to_s.start_with?(MODERN_META_PREFIX) }
+    return "2025-11-25 request carried modern _meta: #{leaked.join(', ')}" if leaked.any?
+  end
+
+  nil
+end
+
 # @param msg [Hash] the request
 # @return [void]
 def handle_request(msg)
+  # silent-probe never answers the probe, not even to complain about it.
+  return if MODE == 'silent-probe' && msg['method'] == 'server/discover'
+
+  if (violation = meta_violation(msg))
+    warn("era-fixture: #{msg['method']} #{violation}")
+    return respond_error(msg['id'], violation, -32_602)
+  end
+
   case MODE
   when 'modern'
     return respond(msg['id'], discover_result(['2026-07-28'])) if msg['method'] == 'server/discover'
@@ -111,9 +161,6 @@ def handle_request(msg)
     end
   when 'future-only'
     return respond(msg['id'], discover_result(['2099-01-01'])) if msg['method'] == 'server/discover'
-  when 'silent-probe'
-    # Deliberately no answer: the client must time the probe out and fall back.
-    return if msg['method'] == 'server/discover'
   end
 
   handle_common(msg)

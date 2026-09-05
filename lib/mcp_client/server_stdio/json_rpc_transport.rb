@@ -79,6 +79,18 @@ module MCPClient
         return if probe_modern_server
 
         perform_initialize
+      rescue StandardError
+        # Nothing was negotiated. The probe only PROPOSES its version, and a
+        # failure that never reached one of the classified outcomes — the
+        # host's request_meta provider raising, say, so no probe was even
+        # sent — would otherwise leave that proposal behind as a settled
+        # modern era. The next attempt would then take a legacy server's
+        # startup request for prohibited modern traffic and drop it, and a
+        # server waiting for that response answers nothing: the recovery
+        # deadlocks until it times out.
+        @protocol_version = nil
+        settle_era_probe
+        raise
       end
 
       # Send the server/discover probe with this client's preferred modern
@@ -185,17 +197,54 @@ module MCPClient
           send_cancellation_notification(req_id)
           raise
         end
+        interpret_discover_answer(res)
+      end
+
+      # Turn the probe's answer into a DiscoverResult, or into the failure
+      # that says what kind of server sent it.
+      #
+      # The stdio fallback rule is keyed to the probe being answered with an
+      # error, or not answered at all — never to a result. `resultType` does
+      # not exist before 2026-07-28, so a result carrying it came from a
+      # modern server even when the rest of it is unusable: treating that as
+      # a legacy answer would pin a dual-era server to the 2025-11-25
+      # handshake for the life of the process, and would make a modern-only
+      # server fail to connect after it had already answered the probe. Such
+      # an answer therefore fails the negotiation instead of falling back.
+      # A result with no 2026-07-28 marker at all is still a legacy answer: a
+      # permissive server answering an unknown method with some object.
+      # @param res [Hash] the JSON-RPC response to the probe
+      # @return [Hash] the applied DiscoverResult
+      # @raise [MCPClient::Errors::ConnectionError] when a modern server answered unusably
+      # @raise [MCPClient::Errors::ServerError] when a legacy server answered
+      def interpret_discover_answer(res)
+        modern_answer = modern_discover_answer?(res)
         result = process_jsonrpc_response(res)
-        # Not a DiscoverResult at all (a permissive legacy server answering
-        # an unknown method with some result): a legacy answer, not a
-        # malformed modern one.
         unless discover_result?(result)
-          raise MCPClient::Errors::ServerError, 'server/discover was answered without a DiscoverResult'
+          raise invalid_discover_answer(modern_answer, 'answered without a DiscoverResult')
         end
 
         apply_discover_result(result)
-      rescue MCPClient::Errors::InvalidResultError => e
-        raise MCPClient::Errors::ServerError, "server/discover was answered without a DiscoverResult (#{e.message})"
+      rescue MCPClient::Errors::InvalidResultError, MCPClient::Errors::InputRequiredError => e
+        raise invalid_discover_answer(modern_answer, "answered without a DiscoverResult (#{e.message})")
+      end
+
+      # @param res [Hash] the JSON-RPC response to the probe
+      # @return [Boolean] whether its result could only have come from a 2026-07-28 server
+      def modern_discover_answer?(res)
+        result = res.is_a?(Hash) ? res['result'] : nil
+        return false unless result.is_a?(Hash)
+
+        result.key?('resultType') || result.key?(:resultType) || discover_result?(result)
+      end
+
+      # @param modern_answer [Boolean] whether the answer identified a modern server
+      # @param message [String] what was wrong with it
+      # @return [StandardError] the failure the probe should propagate
+      def invalid_discover_answer(modern_answer, message)
+        return MCPClient::Errors::ServerError.new("server/discover was #{message}") unless modern_answer
+
+        MCPClient::Errors::ConnectionError.new("Server is modern but incompatible: server/discover was #{message}")
       end
 
       # Handshake: send initialize request and initialized notification
@@ -211,8 +260,13 @@ module MCPClient
           result = process_jsonrpc_response(res) || {}
         rescue MCPClient::Errors::UnsupportedProtocolVersionError => e
           # A modern-only server SHOULD name the versions it supports when
-          # rejecting initialize (basic/versioning): surface them, since a
-          # legacy-only configuration has no fall-forward path.
+          # rejecting initialize (basic/versioning). When one of them is
+          # mutual the era is settled after all — the fallback ran only
+          # because the probe was too slow — so go back to server/discover
+          # instead of ending the session. A legacy-only configuration has
+          # opted out of the modern era and gets the error.
+          return fall_forward_to_modern(e) if fall_forward_to_modern?(e)
+
           raise MCPClient::Errors::ConnectionError,
                 "Initialize failed: #{e.message} (server supports: #{e.supported.join(', ')})"
         rescue MCPClient::Errors::ServerError => e
@@ -229,6 +283,34 @@ module MCPClient
         # Send initialized notification
         notif = build_jsonrpc_notification('notifications/initialized', {})
         @stdin.puts(notif.to_json)
+      end
+
+      # Whether a rejected initialize handshake should send this connection
+      # back to the modern path. Only a well-formed rejection counts — a bare
+      # -32022 from a legacy endpoint identifies nothing — and only one that
+      # names a version this client speaks, since the retry has to declare
+      # one. A host that configured protocol: :legacy asked for the 2025-11-25
+      # handshake and gets the error instead.
+      # @param error [MCPClient::Errors::UnsupportedProtocolVersionError]
+      # @return [Boolean]
+      def fall_forward_to_modern?(error)
+        return false if @protocol_mode == :legacy
+
+        error.modern_protocol_error? && !select_protocol_version(error.supported).nil?
+      end
+
+      # Resume the modern path after a fallback handshake was refused by a
+      # modern server: the rejection settles the era, so server/discover is
+      # re-issued with a version the server named and initialize is never
+      # sent again.
+      # @param error [MCPClient::Errors::UnsupportedProtocolVersionError]
+      # @return [Hash] the DiscoverResult
+      def fall_forward_to_modern(error)
+        version = select_protocol_version(error.supported)
+        @logger.info('The server refused the initialize handshake and supports ' \
+                     "#{error.supported.join(', ')}; it is a modern server — retrying server/discover with #{version}")
+        @protocol_version = version
+        perform_discover
       end
 
       # Generate a new unique request ID and mark it as awaiting a response.

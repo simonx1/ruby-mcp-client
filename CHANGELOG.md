@@ -14,9 +14,19 @@ metadata). Each feature lands in its own PR; this section accumulates them.
   capabilities, instructions and `_meta` `serverInfo`, and never sends
   `initialize`. An `UnsupportedProtocolVersionError` also identifies a modern
   server — the probe is retried with an advertised version and the client
-  never falls back. Any other error, or a timeout, means a *legacy* server and
-  the `initialize` handshake runs as before. The era is cached for the life
-  of the process. The probe *declares* a protocol version without
+  never falls back. Any other *error*, or a timeout, means a *legacy* server
+  and the `initialize` handshake runs as before; a *result* never does. A
+  result carrying `resultType` could only have come from a 2026-07-28 server
+  (the field does not exist before it), so one that is not a usable
+  `DiscoverResult` fails the negotiation instead of downgrading the process
+  to the legacy handshake. A result with no 2026-07-28 marker at all is still
+  a legacy answer — a permissive server answering an unknown method. If the
+  fallback handshake is then refused with a well-formed
+  `UnsupportedProtocolVersionError` naming a version this client speaks — a
+  modern server that was simply too slow to answer the probe — the client
+  goes back to `server/discover` rather than ending the session; a host that
+  configured `protocol: :legacy` gets the error instead. The era is cached
+  for the life of the process. The probe *declares* a protocol version without
   establishing one: until it is answered `protocol_era` stays `nil`, and a
   server-initiated request (a legacy server MAY `ping` during initialization,
   and may answer nothing until the response arrives) is still handled. The
@@ -33,7 +43,9 @@ metadata). Each feature lands in its own PR; this section accumulates them.
   stale handles and negotiates again against a fresh subprocess
   (basic/transports/stdio "Unexpected Termination": clients SHOULD restart a
   server that terminated unexpectedly). The request that was in flight still
-  fails — the server may already have executed it, so it is never replayed.
+  fails — the server may already have executed it, so it is never replayed —
+  but an answer that had already arrived and was waiting to be handed to its
+  caller survives the restart rather than being discarded into a timeout.
 - **Per-request metadata.** Every request to a modern server carries
   `io.modelcontextprotocol/protocolVersion`, `clientInfo` and
   `clientCapabilities` in `_meta` (with `extensions` once declared via
@@ -45,8 +57,12 @@ metadata). Each feature lands in its own PR; this section accumulates them.
   from both `request_meta` and per-call `_meta`, so
   `server.send_client_info = false` really suppresses the client identity:
   a caller cannot reinstate it by passing its own
-  `io.modelcontextprotocol/clientInfo`. Legacy traffic is byte-for-byte
-  unchanged. `Client.new(request_meta:)` (a Hash or a callable evaluated per
+  `io.modelcontextprotocol/clientInfo`. That holds in either era: a dual-era
+  server reads a request carrying modern per-request `_meta` *as* a modern
+  request, so those keys are dropped from a 2025-11-25 request too rather
+  than serving one call statelessly under a session that negotiated the
+  handshake. Legacy traffic is otherwise byte-for-byte unchanged.
+  `Client.new(request_meta:)` (a Hash or a callable evaluated per
   request) merges default metadata into every request on every transport.
 - **Inline version retry.** A modern server answering any request with
   `UnsupportedProtocolVersionError` makes the client switch to a mutually

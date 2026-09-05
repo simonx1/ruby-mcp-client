@@ -8,8 +8,9 @@ require 'spec_helper'
 # - no initialize handshake; every request carries protocolVersion,
 #   clientInfo and clientCapabilities in _meta
 # - server/discover probes the server's era; a DiscoverResult or a recognized
-#   modern error means modern, anything else (or a timeout) means legacy and
-#   the client falls back to the initialize handshake
+#   modern error means modern, any other error (or a timeout) means legacy and
+#   the client falls back to the initialize handshake. A result carrying
+#   resultType is never a legacy answer: the field postdates 2025-11-25
 # - UnsupportedProtocolVersionError makes the client retry with a mutually
 #   supported version rather than fall back
 # - ping, logging/setLevel and notifications/roots/list_changed are gone in
@@ -36,12 +37,19 @@ RSpec.describe 'MCP 2026-07-28 stateless protocol (stdio)' do
   # Drive a ServerStdio without a real subprocess: the process spawn and the
   # reader threads are stubbed, requests are captured, and responses are
   # served from a queue keyed by request order (or by a block).
-  def script_stdio(server, responses)
+  #
+  # Only requests go through send_request. Notifications are written straight
+  # to the subprocess stdin, so an example that has something to say about one
+  # passes a `written` array and reads the raw lines out of it — asserting
+  # about a notification over the returned request list can never fail.
+  # @param written [Array<String>, nil] collects every line written to stdin
+  def script_stdio(server, responses, written: nil)
     sent = []
     allow(server).to receive(:connect).and_return(true)
     allow(server).to receive(:start_reader)
     allow(server).to receive(:start_stderr_reader)
-    stdin = double('stdin', puts: nil, flush: nil, closed?: true, close: nil)
+    stdin = double('stdin', flush: nil, closed?: true, close: nil)
+    allow(stdin).to receive(:puts) { |line| written << line if written }
     server.instance_variable_set(:@stdin, stdin)
     allow(server).to receive(:send_request) { |req| sent << req }
     allow(server).to receive(:wait_response) do |id, **_opts|
@@ -236,19 +244,69 @@ RSpec.describe 'MCP 2026-07-28 stateless protocol (stdio)' do
     end
 
     it 'carries the required _meta on every subsequent request and never sends initialize' do
+      written = []
       sent = script_stdio(server, [{ 'result' => discover_result }, { 'result' => { 'tools' => [] } },
-                                   { 'result' => { 'content' => [] } }])
+                                   { 'result' => { 'content' => [] } }], written: written)
 
       server.list_tools
       server.call_tool('echo', { 'x' => 1 })
 
-      expect(sent.map { |r| r['method'] }).not_to include('initialize', 'notifications/initialized')
+      expect(sent.map { |r| r['method'] }).not_to include('initialize')
+      # notifications/initialized is written straight to stdin, so it is the
+      # raw writes that have to be inspected for it, not the request list.
+      expect(written.map { |line| JSON.parse(line)['method'] }).not_to include('notifications/initialized')
       sent.each do |req|
         expect(req['params']['_meta'][META_VERSION]).to eq('2026-07-28')
         expect(req['params']['_meta'][META_CLIENT_CAPS]).to be_a(Hash)
       end
       expect(sent.last['params']['name']).to eq('echo')
       expect(sent.last['params']['arguments']).to eq({ 'x' => 1 })
+    end
+
+    # The spec requires the fields on EVERY request, and this PR rewires each
+    # of these methods individually; pagination is included because a second
+    # page must merge `_meta` into the params, not replace them.
+    it 'carries the required _meta on every rewired request method, pagination included' do
+      sent = script_stdio(server, [{ 'result' => discover_result },
+                                   { 'result' => { 'prompts' => [], 'nextCursor' => 'page-2' } },
+                                   { 'result' => { 'prompts' => [] } },
+                                   { 'result' => { 'messages' => [] } },
+                                   { 'result' => { 'resources' => [] } },
+                                   { 'result' => { 'contents' => [] } },
+                                   { 'result' => { 'resourceTemplates' => [] } },
+                                   { 'result' => { 'completion' => { 'values' => [] } } }])
+
+      server.list_prompts
+      server.get_prompt('greet', { 'name' => 'ada' })
+      server.list_resources
+      server.read_resource('file:///x')
+      server.list_resource_templates
+      server.rpc_request('completion/complete', { 'ref' => { 'type' => 'ref/prompt' } })
+
+      expect(sent.map { |r| r['method'] }).to eq(%w[server/discover prompts/list prompts/list prompts/get
+                                                    resources/list resources/read resources/templates/list
+                                                    completion/complete])
+      sent.each do |req|
+        meta = req['params']['_meta']
+        expect(meta[META_VERSION]).to eq('2026-07-28')
+        expect(meta[META_CLIENT_CAPS]).to eq({})
+        expect(meta[META_CLIENT_INFO]['name']).to eq('ruby-mcp-client')
+      end
+      expect(sent[2]['params']['cursor']).to eq('page-2')
+      expect(sent[3]['params']).to include('name' => 'greet', 'arguments' => { 'name' => 'ada' })
+      expect(sent[5]['params']['uri']).to eq('file:///x')
+      expect(sent[7]['params']['ref']).to eq({ 'type' => 'ref/prompt' })
+    end
+
+    it 'sends the host client_info instead of the default identity when one is configured' do
+      sent = script_stdio(server, [{ 'result' => discover_result }, { 'result' => { 'tools' => [] } }])
+      server.client_info = { 'name' => 'acme-host', 'version' => '3.1' }
+
+      server.list_tools
+
+      sent.each do |req|
+        expect(req['params']['_meta'][META_CLIENT_INFO]).to eq({ 'name' => 'acme-host', 'version' => '3.1' })
+      end
     end
 
     it 'picks the newest version this client speaks from supportedVersions' do
@@ -290,6 +348,22 @@ RSpec.describe 'MCP 2026-07-28 stateless protocol (stdio)' do
       expect(server.protocol_era).to eq(:modern)
     end
 
+    # An empty `supported` is still the shape the schema mandates, so the
+    # rejection still identifies a modern server. There is simply nothing to
+    # retry with: the negotiation fails, and the handshake is never sent.
+    it 'does not fall back when a well-formed rejection advertises no version at all' do
+      sent = script_stdio(server, [
+                            { 'error' => { 'code' => -32_022, 'message' => 'Unsupported protocol version',
+                                           'data' => { 'supported' => [], 'requested' => '2026-07-28' } } }
+                          ])
+
+      expect { server.list_tools }
+        .to raise_error(MCPClient::Errors::ToolCallError, /none of which this client speaks/)
+      expect(sent.map { |r| r['method'] }).to eq(['server/discover'])
+      expect(server.protocol_version).to be_nil
+      expect(server.protocol_era).to be_nil
+    end
+
     it 'does not fall back to initialize when the advertised versions are all unknown' do
       sent = script_stdio(server, [
                             { 'error' => { 'code' => -32_022, 'message' => 'Unsupported protocol version',
@@ -301,9 +375,10 @@ RSpec.describe 'MCP 2026-07-28 stateless protocol (stdio)' do
     end
 
     it 'falls back to the initialize handshake on any other error' do
+      written = []
       sent = script_stdio(server, [{ 'error' => { 'code' => -32_601, 'message' => 'Method not found' } },
                                    { 'result' => legacy_init_result },
-                                   { 'result' => { 'tools' => [] } }])
+                                   { 'result' => { 'tools' => [] } }], written: written)
 
       server.list_tools
 
@@ -312,6 +387,25 @@ RSpec.describe 'MCP 2026-07-28 stateless protocol (stdio)' do
       expect(server.protocol_version).to eq('2025-11-25')
       expect(sent.last['params']).not_to have_key('_meta')
       expect(server.server_info).to eq({ 'name' => 'legacy-server', 'version' => '1.0' })
+      # The same raw-write capture that shows a modern session never sends
+      # notifications/initialized shows a legacy one always does.
+      expect(written.map { |line| JSON.parse(line)['method'] }).to include('notifications/initialized')
+    end
+
+    # The handshake itself has to be a 2025-11-25 request, not just the calls
+    # after it: a client that forgot to drop the version the probe proposed
+    # would send a hybrid initialize that a dual-era server may read as modern.
+    it 'sends the fallback initialize as a 2025-11-25 request with no modern _meta' do
+      sent = script_stdio(server, [{ 'error' => { 'code' => -32_601, 'message' => 'Method not found' } },
+                                   { 'result' => legacy_init_result },
+                                   { 'result' => { 'tools' => [] } }])
+
+      server.list_tools
+
+      params = sent[1]['params']
+      expect(params['protocolVersion']).to eq('2025-11-25')
+      expect(params).to include('capabilities', 'clientInfo')
+      expect(params).not_to have_key('_meta')
     end
 
     # The stdio backward-compatibility rules key the fallback to the server
@@ -364,6 +458,67 @@ RSpec.describe 'MCP 2026-07-28 stateless protocol (stdio)' do
       expect(server.protocol_era).to eq(:legacy)
     end
 
+    # A modern server that started too slowly to answer the probe rejects the
+    # fallback handshake with a well-formed -32022. That rejection is a
+    # recognized modern error: it identifies the peer as modern and names a
+    # version to use, so the client goes back to server/discover rather than
+    # ending a session on a handshake this server was never going to accept.
+    it 'goes back to server/discover when the fallback initialize is refused with a modern -32022' do
+      sent = script_stdio(server, [
+                            MCPClient::Errors::RequestTimeoutError.new('timeout'),
+                            { 'error' => { 'code' => -32_022, 'message' => 'Unsupported protocol version',
+                                           'data' => { 'supported' => ['2026-07-28'],
+                                                       'requested' => '2025-11-25' } } },
+                            { 'result' => discover_result },
+                            { 'result' => { 'tools' => [] } }
+                          ])
+
+      server.list_tools
+
+      expect(sent.map { |r| r['method'] }).to eq(%w[server/discover initialize server/discover tools/list])
+      expect(server.protocol_era).to eq(:modern)
+      expect(server.protocol_version).to eq('2026-07-28')
+      expect(sent[2]['params']['_meta'][META_VERSION]).to eq('2026-07-28')
+      expect(sent.last['params']['_meta'][META_VERSION]).to eq('2026-07-28')
+    end
+
+    it 'does not fall forward when the rejected initialize names no version this client speaks' do
+      sent = script_stdio(server, [
+                            MCPClient::Errors::RequestTimeoutError.new('timeout'),
+                            { 'error' => { 'code' => -32_022, 'message' => 'Unsupported protocol version',
+                                           'data' => { 'supported' => ['2099-01-01'],
+                                                       'requested' => '2025-11-25' } } }
+                          ])
+
+      expect { server.list_tools }.to raise_error(MCPClient::Errors::ToolCallError, /2099-01-01/)
+      expect(sent.map { |r| r['method'] }).to eq(%w[server/discover initialize])
+      expect(server.protocol_version).to be_nil
+    end
+
+    # A bare -32022 is not evidence of a modern server: it identifies nothing
+    # and names nothing to retry with.
+    it 'does not fall forward on an initialize rejection that carries no supported list' do
+      sent = script_stdio(server, [
+                            MCPClient::Errors::RequestTimeoutError.new('timeout'),
+                            { 'error' => { 'code' => -32_022, 'message' => 'Unsupported protocol version' } }
+                          ])
+
+      expect { server.list_tools }.to raise_error(MCPClient::Errors::ToolCallError, /Initialize failed/)
+      expect(sent.map { |r| r['method'] }).to eq(%w[server/discover initialize])
+    end
+
+    it 'does not fall forward out of a handshake the host pinned with protocol: :legacy' do
+      server = MCPClient::ServerStdio.new(command: 'echo test', protocol: :legacy, read_timeout: 1)
+      sent = script_stdio(server, [
+                            { 'error' => { 'code' => -32_022, 'message' => 'Unsupported protocol version',
+                                           'data' => { 'supported' => ['2026-07-28'],
+                                                       'requested' => '2025-11-25' } } }
+                          ])
+
+      expect { server.list_tools }.to raise_error(MCPClient::Errors::ToolCallError, /2026-07-28/)
+      expect(sent.map { |r| r['method'] }).to eq(['initialize'])
+    end
+
     it 'waits at most discover_timeout for the probe' do
       server = MCPClient::ServerStdio.new(command: 'echo test', read_timeout: 30, discover_timeout: 2)
       timeouts = []
@@ -404,18 +559,79 @@ RSpec.describe 'MCP 2026-07-28 stateless protocol (stdio)' do
       expect { MCPClient::ServerStdio.new(command: 'echo', protocol: :bogus) }.to raise_error(ArgumentError, /protocol/)
     end
 
-    it 'treats a probe answer without supportedVersions as a legacy answer' do
-      sent = script_stdio(server, [{ 'result' => { 'resultType' => 'complete', 'capabilities' => {} } },
+    # A permissive legacy server answering an unknown method with some result
+    # object: nothing in that answer is from 2026-07-28, so it is a legacy
+    # answer and the handshake follows.
+    it 'treats a probe answer with neither resultType nor supportedVersions as a legacy answer' do
+      sent = script_stdio(server, [{ 'result' => { 'ok' => true } },
                                    { 'result' => legacy_init_result }, { 'result' => {} }])
 
       server.ping
 
       expect(sent.map { |r| r['method'] }).to eq(%w[server/discover initialize ping])
+      expect(server.protocol_era).to eq(:legacy)
+    end
+
+    # The stdio fallback rule is keyed to the probe being answered with an
+    # ERROR, or not answered at all — never to a result. `resultType` does not
+    # exist before 2026-07-28, so a result carrying it came from a modern
+    # server: falling back would pin a dual-era server to the legacy handshake
+    # for the life of the process, and would make a modern-only server fail to
+    # connect after it had already answered the probe.
+    it 'does not fall back when a modern-shaped probe answer omits supportedVersions' do
+      sent = script_stdio(server, [{ 'result' => { 'resultType' => 'complete', 'capabilities' => {} } }])
+
+      expect { server.list_tools }.to raise_error(MCPClient::Errors::ToolCallError, /modern but incompatible/i)
+      expect(sent.map { |r| r['method'] }).to eq(['server/discover'])
+      expect(server.protocol_era).to be_nil
+      expect(server.protocol_version).to be_nil
+    end
+
+    it 'does not fall back when the probe answers with an unrecognized resultType' do
+      sent = script_stdio(server, [{ 'result' => discover_result(extra: { 'resultType' => 'Complete' }) }])
+
+      expect { server.list_tools }.to raise_error(MCPClient::Errors::ToolCallError, /modern but incompatible/i)
+      expect(sent.map { |r| r['method'] }).to eq(['server/discover'])
+      expect(server.protocol_era).to be_nil
+    end
+
+    it 'does not fall back when the probe answers with an unfinished result' do
+      sent = script_stdio(server, [{ 'result' => { 'resultType' => 'input_required',
+                                                   'requestState' => 'opaque-state' } }])
+
+      expect { server.list_tools }.to raise_error(MCPClient::Errors::ToolCallError, /modern but incompatible/i)
+      expect(sent.map { |r| r['method'] }).to eq(['server/discover'])
     end
 
     it 'reports the era as unknown before the first request' do
       expect(server.protocol_era).to be_nil
       expect(server.protocol_version).to be_nil
+    end
+
+    # The probe only PROPOSES its version. A negotiation that ended in a
+    # failure — here the host's metadata provider raising, so nothing was
+    # even sent — has confirmed nothing, and must not leave that proposal
+    # behind looking like a settled modern era: the next attempt would then
+    # drop a legacy server's startup request and deadlock on the recovery.
+    it 'leaves no era behind when the negotiation fails before anything is sent' do
+      sent = script_stdio(server, [])
+      server.request_meta = -> { raise 'trace unavailable' }
+
+      expect { server.list_tools }.to raise_error(MCPClient::Errors::ToolCallError, /trace unavailable/)
+
+      expect(sent).to be_empty
+      expect(server.protocol_version).to be_nil
+      expect(server.protocol_era).to be_nil
+    end
+
+    it 'leaves no era behind when the fallback handshake itself fails' do
+      script_stdio(server, [{ 'error' => { 'code' => -32_601, 'message' => 'nope' } },
+                            { 'error' => { 'code' => -32_603, 'message' => 'Internal error' } }])
+
+      expect { server.list_tools }.to raise_error(MCPClient::Errors::ToolCallError, /Internal error/)
+
+      expect(server.protocol_version).to be_nil
+      expect(server.protocol_era).to be_nil
     end
   end
 
@@ -558,7 +774,9 @@ RSpec.describe 'MCP 2026-07-28 stateless protocol (stdio)' do
       client.roots = [{ 'uri' => 'file:///tmp', 'name' => 'tmp' }]
     end
 
-    it 'passes request_meta from the client to every server' do
+    # Assignment only: the verify spec is what puts the host's metadata on
+    # the wire of every configured server.
+    it 'assigns the client-level request_meta to every server it builds' do
       meta = { 'traceparent' => '00-abc-def-01' }
       client = MCPClient::Client.new(mcp_server_configs: [{ type: 'stdio', command: 'a' }], request_meta: meta)
       expect(client.servers.first.request_meta).to eq(meta)
@@ -638,7 +856,7 @@ RSpec.describe 'MCP 2026-07-28 stateless protocol (stdio) — review follow-ups'
     expect(server.modern?).to be(false)
   end
 
-  it 'never sends notifications/roots/list_changed to a modern server, even before the era is known' do
+  it 'never sends notifications/roots/list_changed to a modern server' do
     stdin_lines = []
     sent = script_stdio(server, [{ 'result' => discover_result }])
     server.instance_variable_set(:@stdin, double('stdin', flush: nil, closed?: true, close: nil).tap do |d|
@@ -674,7 +892,9 @@ RSpec.describe 'MCP 2026-07-28 stateless protocol (stdio) — review follow-ups'
     expect(server.capabilities).to eq({ 'tools' => {}, 'prompts' => {} })
   end
 
-  it 'waits the full read timeout for the probe by default' do
+  # Only the default value: the wait itself is pinned by the wait_response
+  # kwarg example above and by the real silent-probe subprocess run.
+  it 'defaults discover_timeout to the read timeout' do
     server = MCPClient::ServerStdio.new(command: 'echo test', read_timeout: 20)
     expect(server.discover_timeout).to eq(20)
   end
@@ -733,6 +953,31 @@ RSpec.describe 'MCP 2026-07-28 stateless protocol (stdio) — review follow-ups'
       end
       expect(sent.size).to eq(2)
     end
+
+    # An unfinished answer that asks for nothing is still unfinished. This
+    # client MAY retry such a result immediately, and if it ever does it MUST
+    # echo requestState unchanged — until then it surfaces the state rather
+    # than re-sending the call or presenting an empty result as the answer.
+    it 'surfaces an unfinished result that carries only requestState, without re-sending' do
+      sent = script_stdio(server, [{ 'result' => discover_result },
+                                   { 'result' => { 'resultType' => 'input_required',
+                                                   'requestState' => 'opaque-blob' } }])
+
+      expect { server.call_tool('t', {}) }.to raise_error(MCPClient::Errors::InputRequiredError) do |e|
+        expect(e.request_state).to eq('opaque-blob')
+        expect(e.input_requests).to eq({})
+      end
+      expect(sent.map { |r| r['method'] }).to eq(%w[server/discover tools/call])
+    end
+
+    it 'surfaces an unfinished prompts/get answer the same way' do
+      script_stdio(server, [{ 'result' => discover_result },
+                            { 'result' => { 'resultType' => 'input_required', 'requestState' => 'blob' } }])
+
+      expect { server.get_prompt('greet', {}) }.to raise_error(MCPClient::Errors::InputRequiredError) do |e|
+        expect(e.request_state).to eq('blob')
+      end
+    end
   end
 end
 
@@ -740,7 +985,8 @@ end
 # UnsupportedProtocolVersionError is conclusively modern; every
 # server/discover answer is validated; version renegotiation compares
 # against the version a request was actually sent with; a probe answered
-# with something that is not a DiscoverResult is a legacy server.
+# with a result that carries no 2026-07-28 marker is a legacy server, while
+# one that carries resultType is a modern server whose answer is unusable.
 RSpec.describe 'MCP 2026-07-28 stateless protocol (stdio) — probe and renegotiation edges' do
   def discover_result(versions: ['2026-07-28'], capabilities: { 'tools' => {} })
     { 'resultType' => 'complete', 'supportedVersions' => versions, 'capabilities' => capabilities }
@@ -781,7 +1027,7 @@ RSpec.describe 'MCP 2026-07-28 stateless protocol (stdio) — probe and renegoti
   end
 
   it 'falls back to initialize when the probe is answered with something that is not a DiscoverResult' do
-    sent = script_stdio(server, [{ 'result' => { 'resultType' => 'complete', 'capabilities' => {} } },
+    sent = script_stdio(server, [{ 'result' => { 'capabilities' => {} } },
                                  { 'result' => { 'protocolVersion' => '2025-11-25', 'capabilities' => {},
                                                  'serverInfo' => { 'name' => 'legacy', 'version' => '1' } } },
                                  { 'result' => { 'tools' => [] } }])
@@ -803,11 +1049,22 @@ RSpec.describe 'MCP 2026-07-28 stateless protocol (stdio) — probe and renegoti
     expect(server.protocol_era).to eq(:legacy)
   end
 
-  it 'refuses to fall back on a malformed DiscoverResult when protocol: :modern is configured' do
+  it 'refuses to fall back on a legacy-shaped probe result when protocol: :modern is configured' do
+    server = MCPClient::ServerStdio.new(command: 'echo test', protocol: :modern)
+    sent = script_stdio(server, [{ 'result' => { 'capabilities' => {} } }])
+
+    expect { server.ping }.to raise_error(MCPClient::Errors::ConnectionError, /legacy|initialize/i)
+    expect(sent.map { |r| r['method'] }).to eq(['server/discover'])
+  end
+
+  # A modern-shaped answer is a modern verdict whatever the configured mode:
+  # the classification comes from what the server sent, not from the host's
+  # willingness to fall back.
+  it 'names a modern-shaped malformed probe answer as an incompatibility under protocol: :modern too' do
     server = MCPClient::ServerStdio.new(command: 'echo test', protocol: :modern)
     sent = script_stdio(server, [{ 'result' => { 'resultType' => 'complete', 'capabilities' => {} } }])
 
-    expect { server.ping }.to raise_error(MCPClient::Errors::ConnectionError, /legacy|initialize/i)
+    expect { server.ping }.to raise_error(MCPClient::Errors::ConnectionError, /modern but incompatible/i)
     expect(sent.map { |r| r['method'] }).to eq(['server/discover'])
   end
 

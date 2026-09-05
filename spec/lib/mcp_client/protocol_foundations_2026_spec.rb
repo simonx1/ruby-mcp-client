@@ -598,8 +598,11 @@ RSpec.describe 'initialize handshake against the modern era' do
       .to raise_error(MCPClient::Errors::ConnectionError, /2026-07-28/)
   end
 
+  # A legacy-only configuration has no fall-forward path — a dual-era one
+  # goes back to server/discover instead, which the stdio suite pins — so the
+  # advertised versions are all this host can be given to act on.
   it 'names the versions a modern-only server advertises when it rejects initialize' do
-    server = MCPClient::ServerStdio.new(command: 'echo test')
+    server = MCPClient::ServerStdio.new(command: 'echo test', protocol: :legacy)
     allow(server).to receive(:next_id).and_return(1)
     allow(server).to receive(:send_request)
     allow(server).to receive(:wait_response).and_return(

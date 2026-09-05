@@ -21,6 +21,17 @@ require 'tmpdir'
 # to, one that never answers, one that outlives a dropped pipe — only exist
 # against a real process, so those are driven through
 # spec/support/protocol_era_stdio_server.rb rather than a stubbed transport.
+#
+# A later round added three more:
+#   5. restarting a subprocess that exited threw away a response that had
+#      already arrived and was waiting to be handed to its caller;
+#   6. per-call `_meta` reserved keys survived on a legacy request when the
+#      host had set no request_meta of its own — the one path that returns
+#      the caller's params untouched;
+#   7. the fixture answered requests without inspecting their `_meta`, so it
+#      could not tell a conforming client from one that had stopped putting
+#      the mandatory fields on the wire. It now refuses a modern request
+#      missing them, and a 2025-11-25 request carrying them.
 ERA_META = MCPClient::JsonRpcCommon
 ERA_FIXTURE_SERVER = File.expand_path('../../support/protocol_era_stdio_server.rb', __dir__)
 
@@ -295,6 +306,50 @@ RSpec.describe 'MCP 2026-07-28 stateless protocol (stdio) — verification round
       expect(meta).to eq({ 'traceparent' => '00-1-2-01' })
     end
 
+    # A legacy request with no host request_meta is the case that takes the
+    # "nothing to add, leave the params alone" path, and it is exactly the
+    # case a reserved key must not survive: a dual-era server reads a request
+    # carrying modern per-request _meta AS a modern request, so one call would
+    # be served statelessly while this session goes on believing it is
+    # 2025-11-25 and keeps answering server-initiated requests.
+    it 'drops reserved keys from per-call _meta on a legacy server with no host metadata at all' do
+      transport.protocol_version = '2025-11-25'
+      params = { 'text' => 'hi',
+                 '_meta' => { ERA_META::META_PROTOCOL_VERSION => '2026-07-28',
+                              ERA_META::META_CLIENT_CAPABILITIES => { 'elicitation' => {} },
+                              'progressToken' => 'p1' } }
+
+      request_params = transport.build_jsonrpc_request('tools/call', params, 1)['params']
+
+      expect(request_params['_meta']).to eq({ 'progressToken' => 'p1' })
+      expect(request_params['text']).to eq('hi')
+    end
+
+    it 'still leaves an ordinary legacy request untouched' do
+      transport.protocol_version = '2025-11-25'
+      params = { 'name' => 'echo', '_meta' => { 'progressToken' => 'p1' } }
+
+      expect(transport.build_jsonrpc_request('tools/call', params, 1)['params']).to eq(params)
+    end
+
+    # Ordinary keys merge the other way round: the host's request_meta is a
+    # default, and what the caller passes for one request wins over it.
+    it 'lets a per-call key override the host default without disturbing later requests' do
+      transport.protocol_version = '2026-07-28'
+      defaults = { 'traceparent' => '00-host-trace-01', 'baggage' => 'tier=free' }.freeze
+      transport.request_meta = defaults
+
+      overridden = transport.build_jsonrpc_request(
+        'tools/call', { '_meta' => { 'traceparent' => '00-call-trace-01' } }, 1
+      )['params']['_meta']
+      plain = transport.build_jsonrpc_request('tools/list', {}, 2)['params']['_meta']
+
+      expect(overridden['traceparent']).to eq('00-call-trace-01')
+      expect(overridden['baggage']).to eq('tier=free')
+      expect(plain['traceparent']).to eq('00-host-trace-01')
+      expect(defaults).to eq({ 'traceparent' => '00-host-trace-01', 'baggage' => 'tier=free' })
+    end
+
     it 'keeps the opt-out on the wire through the stdio transport' do
       server = MCPClient::ServerStdio.new(command: 'echo test', read_timeout: 1)
       sent, = script_stdio(server, [{ 'result' => discover_result }, { 'result' => { 'content' => [] } }])
@@ -303,6 +358,9 @@ RSpec.describe 'MCP 2026-07-28 stateless protocol (stdio) — verification round
       server.call_tool('echo', { '_meta' => { ERA_META::META_CLIENT_INFO => caller_identity } })
 
       expect(sent.last['params']['_meta']).not_to have_key(ERA_META::META_CLIENT_INFO)
+      # The identity was hoisted out of the tool arguments rather than left to
+      # ride along inside them.
+      expect(sent.last['params']['arguments']).not_to have_key('_meta')
       expect(sent.last['params']['_meta'][ERA_META::META_PROTOCOL_VERSION]).to eq('2026-07-28')
     end
   end
@@ -408,7 +466,12 @@ RSpec.describe 'MCP 2026-07-28 stateless protocol (stdio) — verification round
       tools = server.list_tools
       elapsed = Time.now - started
 
+      # Bounded on both sides: the probe must wait out discover_timeout, and
+      # it must not wait out read_timeout. A transport that ignored
+      # discover_timeout and used the general 5s read timeout instead would
+      # satisfy the lower bound on its own.
       expect(elapsed).to be >= 0.5
+      expect(elapsed).to be < 3
       expect(tools.map(&:name)).to eq(['echo'])
       expect(server.protocol_era).to eq(:legacy)
       expect(transcript_methods(transcript, 5))
@@ -508,8 +571,12 @@ RSpec.describe 'MCP 2026-07-28 stateless protocol (stdio) — verification round
       end
       expect(sent_first.map { |req| req['method'] }).to eq(%w[server/discover tools/list])
       expect(sent_second.map { |req| req['method'] }).to eq(%w[server/discover initialize tools/list])
-      # One evaluation per outgoing request, not one per client.
-      expect(calls).to be >= sent_first.size + sent_second.size
+      # Exactly one evaluation per outgoing request, not one per client and
+      # not a cached value reused across requests: >= would be satisfied by
+      # redundant evaluations, which is the other way to get this wrong.
+      expect(calls).to eq(sent_first.size + sent_second.size)
+      expect((sent_first + sent_second).map { |req| req['params']['_meta']['traceparent'] }.uniq.size)
+        .to eq(sent_first.size + sent_second.size)
     end
   end
 
@@ -621,6 +688,52 @@ RSpec.describe 'MCP 2026-07-28 stateless protocol (stdio) — verification round
       server.request_meta = nil
       responses << { 'result' => tool_list_result }
       expect(server.list_tools.map(&:name)).to eq(['echo'])
+    end
+  end
+
+  # Restarting a subprocess that exited is recovery for the SESSION, not a
+  # licence to throw away work that already completed. Two requests are in
+  # flight when the server dies: one has been answered and its response is
+  # sitting in the transport waiting to be handed over, the other has not.
+  # The restart must not turn the answered one into a timeout.
+  describe 'a restart keeps an answer that already arrived' do
+    # A transport with pipe doubles in place of a subprocess, so cleanup runs
+    # its whole sequence without one.
+    # @return [MCPClient::ServerStdio]
+    def detached_transport
+      server = MCPClient::ServerStdio.new(command: 'echo test', read_timeout: 1)
+      %i[@stdin @stdout @stderr].each do |ivar|
+        server.instance_variable_set(ivar, double(ivar.to_s, puts: nil, flush: nil, closed?: false, close: nil))
+      end
+      server
+    end
+
+    it 'hands a response received before the restart to the caller still waiting for it' do
+      server = detached_transport
+      answered = server.send(:next_id)
+      unanswered = server.send(:next_id)
+      server.instance_variable_get(:@pending)[answered] =
+        { 'jsonrpc' => '2.0', 'id' => answered, 'result' => tool_list_result }
+      server.instance_variable_set(:@initialized, true)
+      server.instance_variable_set(:@transport_retired, true)
+
+      # The other request observes the retirement first and restarts.
+      server.release_retired_transport
+
+      expect(server.send(:wait_response, answered)).to include('result' => tool_list_result)
+      # The one that was never answered still fails, as it would on any other
+      # broken transport: nothing is replayed.
+      expect { server.send(:wait_response, unanswered, timeout: 0.05) }
+        .to raise_error(MCPClient::Errors::RequestTimeoutError)
+    end
+
+    it 'stops treating the dead transport ids as outstanding' do
+      server = detached_transport
+      server.send(:next_id)
+
+      server.cleanup
+
+      expect(server.instance_variable_get(:@awaiting)).to be_empty
     end
   end
 

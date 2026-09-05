@@ -305,7 +305,7 @@ module MCPClient
     # @return [Hash, nil] params with `_meta` merged under the String key
     def with_request_meta(params)
       defaults = host_request_meta
-      return params if defaults.empty? && !modern?
+      return params if defaults.empty? && !modern? && !reserved_meta_supplied?(params)
 
       params = params.is_a?(Hash) ? params.dup : {}
       supplied = params.delete('_meta')
@@ -327,6 +327,26 @@ module MCPClient
       end
       params['_meta'] = meta
       params
+    end
+
+    # Whether a caller's params carry a `_meta` key the transport owns.
+    #
+    # A legacy request with no host defaults has nothing to merge and no
+    # protocol fields to add, so it is otherwise handed on untouched — but the
+    # reserved keys are the client's to set in every era. A dual-era server
+    # reads a request carrying modern per-request `_meta` AS a modern request
+    # (basic/versioning), so leaving a caller's copy on the wire would have
+    # one call served statelessly while this session goes on believing it
+    # negotiated 2025-11-25.
+    # @param params [Hash, nil] request params
+    # @return [Boolean]
+    def reserved_meta_supplied?(params)
+      return false unless params.is_a?(Hash)
+
+      supplied = params['_meta'] || params[:_meta]
+      return false unless supplied.is_a?(Hash)
+
+      supplied.any? { |key, _| PROTECTED_META_KEYS.include?(key.to_s) }
     end
 
     # The reserved per-request protocol fields for a modern server

@@ -783,10 +783,18 @@ module MCPClient
     rescue StandardError
       # Clean up resources during unexpected termination
     ensure
-      # Release any buffered responses / awaiting markers
+      # No further response can arrive on a transport that is being
+      # dismantled, so nothing is outstanding any more. Responses that
+      # already arrived are kept: they are answers this client received and
+      # has not handed to their caller yet, and a restart happening in that
+      # window must not turn a completed request into a timeout. Each one
+      # belongs to a caller that is about to take it out of the map, so
+      # keeping them cannot accumulate. Waiters are woken so a request that
+      # will never be answered re-checks its deadline rather than blocking on
+      # a reader thread that has been killed.
       @mutex.synchronize do
-        @pending.clear
         @awaiting.clear
+        @cond.broadcast
       end
       @stdin = @stdout = @stderr = @wait_thread = @reader_thread = @stderr_thread = nil
     end
