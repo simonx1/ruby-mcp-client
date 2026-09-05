@@ -1575,11 +1575,16 @@ RSpec.describe 'MCP 2026-07-28 MRTR verification — a continuation against a re
   it 'restarts the server and completes the continuation it was gathering answers for' do
     server = MCPClient::ServerStdio.new(command: [RbConfig.ruby, MRTR_STDIO_FIXTURE, 'mrtr-one-shot', transcript],
                                         read_timeout: 5, discover_timeout: 3)
+    dead_reader = nil
     server.on_elicitation_request do |_key, _params|
       # The fixture exits as soon as it has asked for input; a host handler is
-      # exactly where that wait happens, so the transport retires under it.
+      # exactly where that wait happens, so the process dies under it. The
+      # exit is handled where it happens -- the reader hands it on and the
+      # dead process's handles are released -- so waiting for that reader to
+      # finish is what makes the continuation's restart deterministic.
+      dead_reader ||= server.instance_variable_get(:@reader_thread)
       wait_for('the first subprocess to exit') { transcript_pids.first && !process_alive?(transcript_pids.first) }
-      wait_for('the transport to be retired') { server.transport_retired? }
+      wait_for('the reader of the dead process to finish') { dead_reader && !dead_reader.alive? }
       { 'action' => 'accept', 'content' => { 'name' => 'ada' } }
     end
 
