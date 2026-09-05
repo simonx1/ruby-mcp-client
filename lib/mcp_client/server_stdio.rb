@@ -202,7 +202,13 @@ module MCPClient
 
       # Dispatch JSON-RPC requests from server (has id AND method) - MCP 2025-06-18
       if msg['method'] && msg.key?('id')
-        if modern?
+        # Judged by the ESTABLISHED era, not by protocol_version: during the
+        # server/discover probe the latter is only the version this client
+        # proposed. A legacy server MAY ping while the probe is unanswered
+        # and then wait for the response before doing anything else, so
+        # treating its request as prohibited modern traffic deadlocks the
+        # negotiation.
+        if protocol_era == :modern
           # MCP 2026-07-28 stdio: "The server MUST NOT write JSON-RPC requests
           # to stdout" and "The client MUST NOT write JSON-RPC responses" —
           # server-to-client interactions travel in InputRequiredResult.

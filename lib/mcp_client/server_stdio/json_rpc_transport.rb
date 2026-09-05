@@ -17,13 +17,33 @@ module MCPClient
         @init_lock.synchronize do
           return if @initialized
 
-          connect
-          start_reader
-          start_stderr_reader
-          negotiate_protocol
+          begin
+            connect
+            start_reader
+            start_stderr_reader
+            negotiate_protocol
+          rescue StandardError
+            # A failed negotiation must not leave the subprocess, its pipes
+            # and its reader threads behind. @initialized stays false, so the
+            # next request runs connect again and overwrites @stdin/@stdout/
+            # @wait_thread — putting the first process permanently out of
+            # cleanup's reach.
+            release_failed_transport
+            raise
+          end
 
           @initialized = true
         end
+      end
+
+      # Tear down a transport whose handshake never completed. Failures are
+      # swallowed: the transport being unusable is often why negotiation
+      # failed, and the original error is the one worth raising.
+      # @return [void]
+      def release_failed_transport
+        cleanup
+      rescue StandardError => e
+        @logger.debug("Cleanup after a failed handshake did not complete: #{e.message}")
       end
 
       # Establish the server's protocol era (MCP 2026-07-28
@@ -51,7 +71,13 @@ module MCPClient
       # @raise [MCPClient::Errors::ConnectionError] if the server is modern but no
       #   version is mutually supported, or legacy while protocol: :modern is configured
       def probe_modern_server
+        # The probe DECLARES this version; it does not establish it. Until the
+        # answer arrives the era stays unknown, so an incoming server request
+        # is still handled — a legacy server MAY ping during initialization and
+        # the receiver MUST respond promptly, and a server waiting for that
+        # response answers nothing until it arrives.
         @protocol_version = MCPClient::LATEST_PROTOCOL_VERSION
+        begin_era_probe
         modern_confirmed = false
         begin
           perform_discover
@@ -61,6 +87,7 @@ module MCPClient
           # A well-formed rejection settles the era: whatever the retried
           # probe does next, this server is modern and never gets initialize.
           modern_confirmed = true
+          settle_era_probe
           retry_discover_with_advertised_version(e)
         end
         true
@@ -82,6 +109,9 @@ module MCPClient
 
         legacy_after_probe(e)
         false
+      ensure
+        # However the probe ended, it is no longer proposing anything.
+        settle_era_probe
       end
 
       # Not a recognized modern error: a legacy server (or one that never

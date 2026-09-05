@@ -16,16 +16,28 @@ metadata). Each feature lands in its own PR; this section accumulates them.
   server — the probe is retried with an advertised version and the client
   never falls back. Any other error, or a timeout, means a *legacy* server and
   the `initialize` handshake runs as before. The era is cached for the life
-  of the process.
+  of the process. The probe *declares* a protocol version without
+  establishing one: until it is answered `protocol_era` stays `nil`, and a
+  server-initiated request (a legacy server MAY `ping` during initialization,
+  and may answer nothing until the response arrives) is still handled.
+- **A failed negotiation releases the transport.** If discovery or the
+  handshake fails, the subprocess is shut down and its pipes and reader
+  threads are closed before the error is raised, so a retry cannot strand the
+  previous process behind overwritten handles.
 - **Per-request metadata.** Every request to a modern server carries
   `io.modelcontextprotocol/protocolVersion`, `clientInfo` and
   `clientCapabilities` in `_meta` (with `extensions` once declared via
-  `declare_extension`). Host-supplied `_meta` keys (`progressToken`,
+  `declare_extension`, whose identifiers follow the `_meta` key grammar with
+  a mandatory prefix — the name after the slash may be empty, so
+  `com.example/` is valid). Host-supplied `_meta` keys (`progressToken`,
   OpenTelemetry `traceparent`/`tracestate`/`baggage`, vendor keys) are
-  preserved; the reserved protocol keys cannot be overridden. Legacy traffic
-  is byte-for-byte unchanged. `Client.new(request_meta:)` (a Hash or a
-  callable evaluated per request) merges default metadata into every request
-  on every transport; `server.send_client_info = false` drops `clientInfo`.
+  preserved. The reserved protocol keys are transport-owned and are stripped
+  from both `request_meta` and per-call `_meta`, so
+  `server.send_client_info = false` really suppresses the client identity:
+  a caller cannot reinstate it by passing its own
+  `io.modelcontextprotocol/clientInfo`. Legacy traffic is byte-for-byte
+  unchanged. `Client.new(request_meta:)` (a Hash or a callable evaluated per
+  request) merges default metadata into every request on every transport.
 - **Inline version retry.** A modern server answering any request with
   `UnsupportedProtocolVersionError` makes the client switch to a mutually
   supported version from `data.supported` and re-send once (new id).
@@ -39,9 +51,11 @@ metadata). Each feature lands in its own PR; this section accumulates them.
   and `ServerStdio.new(protocol:, discover_timeout:)`: `:auto` (default,
   dual-era), `:modern` (fail instead of falling back), `:legacy` (skip the
   probe; the probe waits the full `read_timeout` by default so a slow-starting
-  modern server is not misclassified). New readers: `protocol_version`,
-  `protocol_era`, `modern?`, `supported_versions`. Initialization is
-  serialized, so concurrent first requests run the probe once.
+  modern server is not misclassified). New readers: `protocol_version` (the
+  version outgoing requests declare, which during the probe is only a
+  proposal), `protocol_era` (`:modern`, `:legacy`, or `nil` while the era is
+  unknown), `modern?`, `supported_versions`. Initialization is serialized, so
+  concurrent first requests run the probe once.
 - **Multi round-trip requests are not provoked yet.** Modern requests declare
   no `roots`, `sampling` or `elicitation` capability until the multi
   round-trip pattern lands, so a compliant server never returns an
