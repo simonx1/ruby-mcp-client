@@ -30,55 +30,6 @@ module MCPClient
         end
         param_headers.each { |k, v| req.headers[k] = v }
       end
-
-      # MCP 2026-07-28 "Custom Headers from Tool Parameters": after a
-      # HeaderMismatch the client SHOULD re-fetch tools/list (the tool's
-      # inputSchema may have changed its x-mcp-header annotations) and retry
-      # the original request once with the appropriate headers. The server
-      # rejected the request before executing it, so the retry cannot
-      # duplicate a side effect. A refresh that fails re-raises the rejection:
-      # that is the actionable error.
-      # @param error [MCPClient::Errors::HeaderMismatchError] the rejection
-      # @return [void]
-      def refresh_tools_after_header_mismatch(error)
-        @logger.warn("#{sanitize_log_text(error.message)}; refreshing tools/list and retrying tools/call once")
-        refresh_tools_cache
-      rescue MCPClient::Errors::MCPError => e
-        @logger.warn("tools/list refresh after HeaderMismatch failed: #{sanitize_log_text(e.message)}")
-        raise error
-      end
-
-      # The Mcp-Param-* headers for a tools/call request (MCP 2026-07-28
-      # "Custom Headers from Tool Parameters"): the annotated arguments of the
-      # tool, looked up in this transport's tool list (fetched on demand so a
-      # call issued before tools/list still carries them).
-      # @param request [Hash] the JSON-RPC request
-      # @return [Hash{String => String}]
-      # @raise [MCPClient::Errors::ValidationError] when an annotated argument cannot be mirrored
-      def mcp_param_headers(request)
-        return {} unless request['method'] == 'tools/call'
-
-        params = request['params']
-        return {} unless params.is_a?(Hash)
-
-        name = (params['name'] || params[:name]).to_s
-        tool = known_tools_for_headers.find { |t| t.name.to_s == name }
-        # The list these headers come from is the list this request goes out
-        # under: a host re-resolving the tool after the call reads that
-        # definition back instead of asking for a possibly newer one.
-        note_called_tool_definition(name, tool)
-        return {} unless tool
-
-        MCPClient::HeaderParams.headers_for(tool.schema, params['arguments'] || params[:arguments])
-      end
-
-      # The tool list used for header extraction, fetched on demand. Mirroring
-      # is a MUST, so a list that cannot be fetched fails the call rather than
-      # letting it go out without the headers an intermediary may route on.
-      # @return [Array<MCPClient::Tool>]
-      def known_tools_for_headers
-        @mutex.synchronize { @tools } || list_tools
-      end
     end
   end
 end

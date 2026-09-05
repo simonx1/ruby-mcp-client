@@ -1,5 +1,6 @@
 # frozen_string_literal: true
 
+require_relative 'request_meta_scope'
 require 'uri'
 require 'json'
 require 'monitor'
@@ -27,6 +28,10 @@ module MCPClient
     require_relative 'server_http/json_rpc_transport'
 
     include JsonRpcTransport
+    # Every operation that may weigh a cache decision runs inside a scope
+    # that reserves the host request_meta evaluation for the request it
+    # leads to, and drops it when the operation ends.
+    prepend MCPClient::RequestMetaScope
 
     # Default values for connection settings
     DEFAULT_READ_TIMEOUT = 30
@@ -162,14 +167,18 @@ module MCPClient
     # @raise [MCPClient::Errors::TransportError] if response isn't valid JSON
     # @raise [MCPClient::Errors::ToolCallError] for other errors during tool listing
     def list_tools
-      @mutex.synchronize do
-        return @tools if @tools
-      end
+      # MCP 2026-07-28 caching: a cached list is served only while fresh, and
+      # only from the entry that carries its hint.
+      cached = fresh_list_value(:tools) { @mutex.synchronize { @tools } }
+      return cached if cached
 
+      # Stale: the raw page cache must go too, or the re-fetch would be
+      # answered from memory.
+      @mutex.synchronize { @tools_data = nil }
       begin
         ensure_connected
 
-        fetch_tools_list
+        refetch_or_serve_stale(:tools, stale_list_entry(:tools)) { fetch_tools_list }
       rescue MCPClient::Errors::ConnectionError, MCPClient::Errors::TransportError, MCPClient::Errors::ServerError
         # Re-raise these errors directly
         raise
@@ -250,28 +259,40 @@ module MCPClient
     # @raise [MCPClient::Errors::TransportError] if response isn't valid JSON
     # @raise [MCPClient::Errors::PromptGetError] for other errors during prompt listing
     def list_prompts
-      @mutex.synchronize do
-        return @prompts if @prompts
-      end
+      cached = fresh_list_value(:prompts) { @mutex.synchronize { @prompts } }
+      return cached if cached
 
+      @mutex.synchronize { @prompts_data = nil }
       begin
         ensure_connected
-
-        # Follow nextCursor across pages so the full prompt list is returned.
-        prompts = request_paginated_list('prompts/list', 'prompts')
-
-        @mutex.synchronize do
-          @prompts = prompts.map do |prompt_data|
-            MCPClient::Prompt.from_json(prompt_data, server: self)
-          end
-        end
-
-        @mutex.synchronize { @prompts }
+        refetch_or_serve_stale(:prompts, stale_list_entry(:prompts)) { fetch_prompts_list }
       rescue MCPClient::Errors::ConnectionError, MCPClient::Errors::TransportError, MCPClient::Errors::ServerError
         raise
       rescue StandardError => e
         raise MCPClient::Errors::PromptGetError, "Error listing prompts: #{e.message}"
       end
+    end
+
+    # Fetch and cache the prompt list.
+    # @return [Array<MCPClient::Prompt>]
+    def fetch_prompts_list
+      ensure_connected
+
+      # Follow nextCursor across pages so the full prompt list is returned.
+      prompts = request_paginated_list('prompts/list', 'prompts')
+
+      prompts = prompts.map { |prompt_data| MCPClient::Prompt.from_json(prompt_data, server: self) }
+      @mutex.synchronize do
+        @prompts = attach_list_value(:prompts, prompts) ? prompts : nil
+      end
+
+      # This request's own list, never a re-read of @prompts (another
+      # request may have stored its list in between).
+      prompts
+    rescue MCPClient::Errors::ConnectionError, MCPClient::Errors::TransportError, MCPClient::Errors::ServerError
+      raise
+    rescue StandardError => e
+      raise MCPClient::Errors::PromptGetError, "Error listing prompts: #{e.message}"
     end
 
     # Get a prompt with the given parameters
@@ -300,28 +321,18 @@ module MCPClient
     # @return [Hash] result containing resources array and optional nextCursor
     # @raise [MCPClient::Errors::ResourceReadError] if resources list retrieval fails
     def list_resources(cursor: nil)
-      @mutex.synchronize do
-        return @resources_result if @resources_result && !cursor
-      end
+      cached = cursor ? nil : fresh_list_value(:resources) { @mutex.synchronize { @resources_result } }
+      return cached if cached
 
       begin
         ensure_connected
-
-        params = {}
-        params['cursor'] = cursor if cursor
-        result = rpc_request('resources/list', params)
-
-        resources = (result['resources'] || []).map do |resource_data|
-          MCPClient::Resource.from_json(resource_data, server: self)
+        unless cursor
+          return refetch_or_serve_stale(:resources, stale_list_entry(:resources)) do
+            fetch_resources_list(nil)
+          end
         end
 
-        resources_result = { 'resources' => resources, 'nextCursor' => result['nextCursor'] }
-
-        @mutex.synchronize do
-          @resources_result = resources_result unless cursor
-        end
-
-        resources_result
+        fetch_resources_list(cursor)
       rescue MCPClient::Errors::ConnectionError, MCPClient::Errors::TransportError, MCPClient::Errors::ServerError
         raise
       rescue StandardError => e
@@ -329,14 +340,45 @@ module MCPClient
       end
     end
 
+    # Fetch one page of resources/list, caching the first page.
+    # @param cursor [String, nil]
+    # @return [Hash]
+    def fetch_resources_list(cursor)
+      params = {}
+      params['cursor'] = cursor if cursor
+      epoch = cache_epoch(:resources)
+      result = fetching_list_page(:resources, cursor) { rpc_request('resources/list', params) }
+      record_cache_hint(:resources, result, epoch: epoch) unless cursor
+
+      resources = (result['resources'] || []).map do |resource_data|
+        MCPClient::Resource.from_json(resource_data, server: self)
+      end
+
+      resources_result = { 'resources' => resources, 'nextCursor' => result['nextCursor'] }
+
+      @mutex.synchronize do
+        unless cursor
+          @resources_result = attach_list_value(:resources, resources_result) ? resources_result : nil
+        end
+      end
+
+      resources_result
+    rescue MCPClient::Errors::ConnectionError, MCPClient::Errors::TransportError, MCPClient::Errors::ServerError
+      raise
+    rescue StandardError => e
+      raise MCPClient::Errors::ResourceReadError, "Error listing resources: #{e.message}"
+    end
+
     # Read a resource by its URI
     # @param uri [String] the URI of the resource to read
     # @return [Array<MCPClient::ResourceContent>] array of resource contents
     # @raise [MCPClient::Errors::ResourceReadError] if resource reading fails
     def read_resource(uri)
-      result = require_complete_result!(rpc_request('resources/read', { uri: uri }), 'resources/read')
-      contents = result['contents'] || []
-      contents.map { |content| MCPClient::ResourceContent.from_json(content) }
+      # The session exists before the cache epoch is snapshotted: a
+      # reconnect inside the request would otherwise advance it and drop
+      # the first read's entry.
+      ensure_connected
+      read_resource_with_cache(uri) { rpc_request('resources/read', { uri: uri }) }
     rescue MCPClient::Errors::ServerError => e
       raise if e.protocol_error?
       raise resource_not_found_error(uri, e) if resource_not_found_response?(e)
@@ -396,19 +438,51 @@ module MCPClient
     # @return [Hash] result containing resourceTemplates array and optional nextCursor
     # @raise [MCPClient::Errors::ResourceReadError] for other errors during resource template listing
     def list_resource_templates(cursor: nil)
+      # Only a list the server itself bounded is served from here: a
+      # positive ttlMs means no second request, while a list with no hint
+      # (a 2025-11-25 server) is asked for again, as it was before this
+      # transport cached anything (MCP 2026-07-28 caching).
+      cached = cursor ? nil : hinted_list_value(:templates)
+      return cached if cached
+
+      begin
+        ensure_connected
+        unless cursor
+          return refetch_or_serve_stale(:templates, stale_list_entry(:templates)) do
+            fetch_templates_list(nil)
+          end
+        end
+
+        fetch_templates_list(cursor)
+      rescue MCPClient::Errors::ConnectionError, MCPClient::Errors::TransportError, MCPClient::Errors::ServerError
+        raise
+      rescue StandardError => e
+        raise MCPClient::Errors::ResourceReadError, "Error listing resource templates: #{e.message}"
+      end
+    end
+
+    # Fetch one page of resources/templates/list, caching the first page.
+    # @param cursor [String, nil]
+    # @return [Hash]
+    def fetch_templates_list(cursor)
       params = {}
       params['cursor'] = cursor if cursor
-      result = rpc_request('resources/templates/list', params)
+      epoch = cache_epoch(:templates)
+      result = fetching_list_page(:templates, cursor) { rpc_request('resources/templates/list', params) }
+      record_cache_hint(:templates, result, epoch: epoch) unless cursor
 
       templates = (result['resourceTemplates'] || []).map do |template_data|
         MCPClient::ResourceTemplate.from_json(template_data, server: self)
       end
+      templates_result = { 'resourceTemplates' => templates, 'nextCursor' => result['nextCursor'] }
 
-      { 'resourceTemplates' => templates, 'nextCursor' => result['nextCursor'] }
-    rescue MCPClient::Errors::ConnectionError, MCPClient::Errors::TransportError, MCPClient::Errors::ServerError
-      raise
-    rescue StandardError => e
-      raise MCPClient::Errors::ResourceReadError, "Error listing resource templates: #{e.message}"
+      @mutex.synchronize do
+        unless cursor
+          @templates_result = attach_list_value(:templates, templates_result) ? templates_result : nil
+        end
+      end
+
+      templates_result
     end
 
     # Subscribe to resource updates
@@ -530,7 +604,26 @@ module MCPClient
 
         @tools = nil
         @tools_data = nil
+        @prompts = nil
+        @prompts_data = nil
+        @resources_result = nil
+        @resources_data = nil
+        @templates_result = nil
       end
+      # Cached results and their hints belong to the connection (and its
+      # authorization context) that was just torn down; outside @mutex, as
+      # the cache has its own lock.
+      clear_result_cache
+    ensure
+      # Everything this transport left on this thread — the notes of the
+      # entries it served and recorded, the credentials, parameters and
+      # metadata of its requests — describes a slice that will never be
+      # tagged and a request that will never be made. Dropped after the
+      # session was terminated, never before: the DELETE that terminates it
+      # is a request of this transport's own, and the recorder on its
+      # connection would put its Authorization fingerprint straight back on
+      # this thread.
+      forget_transport_thread_state
     end
 
     private
@@ -612,18 +705,11 @@ module MCPClient
     # @return [Array<Hash>] the tools data
     # @raise [MCPClient::Errors::ToolCallError] if tools list retrieval fails
     def request_tools_list
-      @mutex.synchronize do
-        return @tools_data.dup if @tools_data
-      end
-
       # Follow nextCursor across pages so the full tool list is returned even
-      # when the server paginates. A list invalidated while in flight is
-      # returned but not cached.
-      generation = @mutex.synchronize { tools_generation }
-      tools = request_paginated_list('tools/list', 'tools')
-
-      @mutex.synchronize { @tools_data = tools if tools_generation == generation }
-      tools.dup
+      # when the server paginates. The raw pages are this fetch's own: a
+      # shared copy could answer a concurrent caller under other
+      # credentials with a privately scoped list (MCP 2026-07-28 caching).
+      request_paginated_list('tools/list', 'tools')
     end
   end
 end

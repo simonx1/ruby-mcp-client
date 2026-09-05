@@ -5,6 +5,549 @@
 Groundwork for the 2026-07-28 protocol revision (stateless, per-request
 metadata). Each feature lands in its own PR; this section accumulates them.
 
+### Cacheable results (`ttlMs` / `cacheScope`)
+
+- **A result is bound to its own exchange, not to a request the response phase
+  nested inside it (round 35).** The credentials and the receipt time of an
+  HTTP exchange were both taken after `send_http_request` returned — after
+  every Faraday `on_complete` had run. A host response middleware that sent a
+  request of its own on that thread left *its* Authorization behind, and
+  Alice's `resources/read` was filed under Bob's context and handed to him
+  without a wire read; a middleware that merely took its time made a `ttlMs`
+  start counting from the end of its own work, so a result whose TTL had run
+  out long ago still read as fresh. The innermost middleware on the connection
+  now stamps both facts into the environment of the request it is handing to
+  the adapter, and the exchange reads them back from there.
+- **An invalid cursor discards the pages cached under it on every transport
+  (round 35).** Only the explicit-page listings dropped their cache when the
+  server rejected a cursor with `-32602`; an auto-paginated `tools/list` or
+  `prompts/list` restarted from the first page but left the previous sequence
+  in the cache, so a restart that then failed transiently served that sequence
+  back. Stdio did not restart at all — the same rejection surfaced as a
+  `ToolCallError` where the HTTP transports recovered. Both now behave alike: a
+  rejected cursor drops the entry the list is cached under, and every transport
+  restarts once from the first page.
+
+- **A private entry is bound to the credentials its request was sent with, not
+  to what the response phase left behind (verification round).** The
+  Authorization was recorded before the adapter sent the request and then read
+  back out of `response.env.request_headers` afterwards — a mutable structure
+  the response phase may rewrite. A host `on_complete` that deletes
+  `Authorization` for redaction, or a redirect handler that strips it, filed an
+  authenticated result under the anonymous context: Alice's `resources/read`
+  was then handed to the next request that carried no token at all, without
+  another wire read. What the recorder saw immediately before transmission is
+  now what binds the entry, and the environment answers only for a connection
+  that recorded nothing of its own. The context of the outer request is
+  restored after its response is parsed by putting that record back, rather
+  than by re-deriving it from an environment a nested request may have touched.
+- **A result is never reused across parameters host middleware may have
+  rewritten (verification round).** The parameters fingerprint describes the
+  request the transport built, before Faraday middleware can change its body.
+  Unknown request middleware already blocked *private* reuse through the
+  authorization check, but a `"public"` entry bypassed it: middleware writing a
+  changing locale into `params._meta` had an English read answer a French one,
+  with only the English request reaching the server. A stack the transport
+  cannot read off its own configuration now makes the effective parameters
+  opaque, and an opaque fingerprint matches nothing — `"public"` permits
+  sharing across callers, not across result-affecting parameters. What such
+  middleware was *configured* with does not matter here, so Faraday's own
+  `:authorization` middleware keeps caching on however its credential rotates:
+  it changes a header, never the body.
+- **A cleanup gives the cache a generation no request in flight can match
+  (verification round).** Generations were `base + per-key count + shared-read
+  count`, and a cleanup bumped the base while clearing the other counts — so a
+  key one invalidation had already bumped went from `0 + 1` to `1 + 0`,
+  unchanged. A read that started before the cleanup and arrived after it
+  therefore installed itself as fresh and answered the next read. The three
+  counts are now compared side by side instead of added up.
+- **A `tools/call` host code nests inside a call records into a slot of its own
+  (verification round).** Only the `call_tool` wrapper opened a definition
+  slot, so a raw `rpc_request('tools/call', ...)` a notification listener
+  issued while the outer call's response was being parsed overwrote the
+  definition that call went out under — and a host re-resolving the tool to
+  validate the result checked it against a newer definition it was never
+  answered under. The boundary a transport crosses to reach host code now opens
+  a definition slot as well as dropping the `request_meta` reservation.
+- **A cursor the server rejects takes the pages cached under it with it
+  (verification round).** A `-32602` for a cursor left the first page of that
+  sequence in the cache, so the next list handed the caller the same dead
+  cursor to follow. The pages cached for the list are now dropped when a
+  cursor-bearing page request is rejected; an automatically paginated list
+  restarts once from the first page rather than failing a caller who only asked
+  for a list, and an explicit `list_resources(cursor:)` /
+  `list_resource_templates(cursor:)` still raises, with the stale first page
+  gone.
+- **An unhinted template list is fetched again (verification round).** The HTTP,
+  Streamable HTTP and SSE transports served `resources/templates/list` through
+  `fresh_list_value`, under which a legacy list with no hint stays fresh for the
+  life of the connection — a compatibility regression, since template listing
+  fetched every time before results were cached at all. They now use
+  `hinted_list_value`, as stdio already did: only a list the server itself
+  bounded with a positive `ttlMs` is answered without a request.
+- **Client caches are dropped with the transport's.** A transport that
+  carries the caching mixin invalidates before it delivers a notification
+  to a subscription listener, and this client registers its own
+  invalidation there (`on_cache_invalidation`) rather than in the host
+  notification callback, which now runs after the delivery. A listener
+  reacting to `notifications/tools/list_changed` therefore cannot read a
+  stale client-level list.
+- **A reservation is adopted only by the operation it was opened for (round
+  34).** A `Client` listing opens a same-method reservation on every server
+  up front, and the transports adopted one on the rule "entered before the
+  operation dispatched, for the same method". A list a notification listener
+  ran on a server the loop had not reached yet therefore adopted *that*
+  server's reservation and spent the evaluation the freshness check had
+  already weighed for it: the nested request went out carrying another
+  request's tenant, baggage or one-time value, and the fetch the client then
+  made for that server was sent under an evaluation nothing had weighed. A
+  reservation is now handed to the one operation it was made for, by name
+  and once (`offer_request_meta_hold`), immediately before that operation is
+  invoked; an operation that merely uses the same method reserves its own.
+- **Host code the transport calls back into starts an operation of its own
+  (round 34).** The claim rule spent a reservation for any message whose
+  method equalled it, and several public entry points open no reservation of
+  their own — `rpc_request`, `Client#send_rpc`, `Client#call_tool_as_task`,
+  the HTTP transports' `fetch_prompts_list` / `fetch_resources_list`. A raw
+  `rpc_request('tools/list')` a notification listener issued from inside a
+  reconnect's handshake therefore spent the evaluation the interrupted
+  listing was holding, and that listing's own fetch went out under a
+  different one; wrapping `call_tool` and `get_prompt`, which weigh no cache
+  decision, had created a reservation a raw `tools/call` could spend the same
+  way. Every notification listener and server-request handler now runs behind
+  a boundary (`outside_request_meta_hold`): whatever it asks of the transport
+  — a nested list, a raw `rpc_request`, whatever method it names — reads the
+  host afresh and leaves the reservation to the request that holds it.
+- **`clear_cache` reaches the transports (round 34).** `Client#clear_cache`
+  erased only the client's aggregation maps, so a transport still holding a
+  list the server had bounded with a positive `ttlMs` answered the next
+  `list_tools`, `list_prompts` or `list_resources` from its own copy without
+  sending anything — the documented promise of fresh data was not kept. It
+  now drops the transport-level entry for each list kind too, as
+  `cache: false` already did.
+- **A held evaluation belongs to the request it was reserved for, and to no
+  other (round 33).** A cache decision reads the host's `request_meta` once
+  and reserves that evaluation for the request it leads to. The rule used to
+  be "the next message spends it, unless it is one of three handshake
+  methods", and each round found another message that was neither: the
+  `subscriptions/listen` a stdio reconnect re-opens, the
+  `notifications/cancelled` sent for a request that timed out, a request a
+  notification listener issues from inside a response's synchronous
+  dispatch. The reservation also survived its own operation: a list whose
+  reconnect or initialization raised left the evaluation on the thread, and
+  the next unrelated request on that worker went out carrying the aborted
+  decision's tenant, baggage or nonce. The rule is now the other way round
+  and enforced structurally, by `MCPClient::RequestMetaScope`: an operation
+  reserves the evaluation for the JSON-RPC method of the request it sends,
+  only that request claims it, everything else reads the host afresh, and
+  the scope drops the reservation from an `ensure` however the operation
+  ends. An operation that begins while another is already talking to the
+  server — a nested call from a notification listener — reserves its own.
+  The handshake allowlist and the "keep it isolated while the message is
+  built" workaround are gone with it.
+- **The client's listings hold their reservation for the listing only (round
+  33).** `Client#list_tools`, `#list_prompts` and `#list_resources` read the
+  parameters each server's fetch would carry before making it; when
+  `server.list_tools` then failed during a reconnect, the rescue moved on to
+  the next server (or the caller caught the error) with the evaluation still
+  held. The three loops now run inside a scope that opens the reservation on
+  every server and closes it on every exit.
+- **A `tools/call` keeps the definition it went out under against nested
+  calls (round 33).** The round-32 slot was a single per-thread,
+  per-transport entry, so a notification listener that called another tool
+  from inside the outer call's response dispatch overwrote it: the outer
+  call was then validated against the nested definition, or listed again and
+  validated against a newer one. Every call now records into a slot of its
+  own, handed to the caller waiting for it when the call returns.
+- **`cache: false` really re-lists (round 33).** When a modern server bounded
+  a list with a positive `ttlMs`, the transport answered `list_tools` from
+  its own copy without sending anything, so `Client#list_tools(cache: false)`
+  returned a cached list instead of fetching fresh; prompts and resources
+  behaved the same way. A forced refresh now drops the transport's entry for
+  that kind first, so the request reaches the server.
+- **A freshness check that aborts releases every server's held evaluation
+  (round 32).** With several cached servers, a check reads each server's
+  parameters in turn and each transport holds that evaluation for the fetch
+  the check is deciding on. When a later server's probe raised — an OAuth
+  refresh failing — no fetch followed for any of them, but the servers the
+  loop had already passed kept holding theirs: a later request on the same
+  worker thread went out carrying that decision's tenant, baggage or trace
+  id. Round 30 released the evaluation of the server whose own lookup
+  aborted; the client now releases every server's on an exceptional exit.
+- **A post-call re-resolve reads the definition the call went out under
+  (round 32).** A `tools/call` derives its `Mcp-Param-*` headers from the
+  transport's tool list, re-fetching it when the list is stale (a server that
+  sends `ttlMs: 0`, or a TTL that expires mid-call). The client then
+  re-resolved the tool by listing again, which fetched once more and could
+  answer with a newer definition than the request carried — validating the
+  result against a schema the call was never made with. The transport now
+  keeps the definition its request went out under and the client takes it
+  from there instead of triggering another re-fetch.
+- **`cleanup` forgets its thread state after terminating the session (round
+  32).** `ServerHTTP` and `ServerStreamableHTTP` cleared their thread-local
+  slots first and terminated the session afterwards; the DELETE that
+  terminates it runs the authorization recorder on its own connection, which
+  put the transport's Authorization fingerprint straight back on the thread.
+  A long-lived worker that built and disposed transports therefore kept one
+  fingerprint per transport after all. Both transports now drop the slots
+  once termination is done, and do so even when cleanup exits early or
+  raises.
+- **A reconnect's handshake no longer spends the metadata a list holds
+  (round 31).** A cache decision evaluates the host's `request_meta` once and
+  holds that evaluation for the request it leads to. That request reconnects
+  on its way out (`ensure_connected` cleans up and connects first), and the
+  `server/discover`, `initialize` and `notifications/initialized` of the
+  handshake used to consume the held evaluation, so the list itself then went
+  out carrying a different one than the decision weighed — and a callable
+  vending a one-time value had it spent on the handshake. The handshake now
+  reads the host afresh, as any message of its own does, and leaves the held
+  evaluation for the request it was held for.
+- **HTTP+SSE keeps its Authorization slot like every other transport (round
+  31).** `ServerSSE` wrote and read the per-transport authorization
+  thread-local inline instead of through `request_authorization_key`, so
+  `forget_transport_thread_state` did not know about it: a worker thread that
+  created and discarded SSE transports kept one authorization entry per
+  transport for its whole life, and an emptied slot read as an anonymous
+  request rather than as nothing recorded. The slot, its key and its
+  empty-slot semantics now live in one `MCPClient::RequestAuthorization`
+  mixin shared by every HTTP transport, and the round-30 cleanup guarantee is
+  covered on all four transports.
+- **The probe reads the Authorization the connection carries (round 30).**
+  A `faraday_config` block may set `conn.headers['Authorization']`, and every
+  request Faraday builds on that connection starts from that table. The
+  probe used to start from the transport's own headers alone, so it answered
+  "anonymous" for requests that go out with a bearer — a private entry of one
+  context could be matched against another. It now starts from the built
+  connection's header table (reading it runs no middleware and no host code)
+  with the transport's own headers laid over it, exactly as a real request
+  does, and reports the unknown context if that table cannot be read.
+- **A handler that carries a host callback is an unknown context (round
+  30).** A middleware class being inert says nothing when the host handed it
+  code to run: `Faraday::Response::Logger` takes a formatter whose `request`
+  method receives the mutable env, `follow_redirects` takes a redirect
+  callback, and a configuration block can define a singleton method on
+  either. Any handler installed with a block, or with a proc, method, class
+  or other callable among its arguments, now makes the context unknown. The
+  "no request phase" test also requires that Faraday's own constructor build
+  the instance: a middleware with a constructor of its own can give its
+  instances an `on_request` hook that no class-level test would ever see.
+- **A cache lookup that aborts releases the metadata it held (round 30).** A
+  freshness check reads the parameters the next request would carry, which
+  evaluates the host's `request_meta`, and holds that evaluation for the
+  request the decision leads to. When the authorization probe raised (an
+  OAuth refresh failing, say) no request was built and neither release path
+  ran, so a later request on that thread sent the previous tenant's
+  metadata. The held evaluation is now released when a lookup aborts.
+- **`cleanup` drops every thread-local slot a transport owns (round 30).**
+  It used to clear only the served-entry notes, leaving the per-object
+  authorization, request-parameter, round-trip and recorded-entry slots on
+  the thread: a long-lived worker that created and discarded transports
+  accumulated entries for its whole life. An anonymous request is now noted
+  with its own marker, so an emptied slot reads as "nothing recorded" rather
+  than as an anonymous request that never happened. The metadata held for
+  the *next* request is deliberately kept — `ensure_connected` cleans up
+  before it reconnects, in the middle of the very request that holds it.
+- **`follow_redirects` is framework middleware the probe steps over (round
+  30).** The gem depends on `faraday-follow_redirects`, so the ordinary
+  stack `faraday_config: ->(f) { f.response :follow_redirects }` with a
+  static bearer never got a private cache hit. The middleware has no request
+  phase and the only header it ever touches is the Authorization it
+  *deletes* on a cross-host redirect, which can cost a hit but never leak
+  one; `Faraday::Response::Json` joins the list for the same reason. A
+  redirect callback still makes the context unknown.
+- **Host middleware is never run by the freshness probe (round 29).** Four
+  rounds of reflection could not tell a middleware that vends a one-time
+  credential apart from an inert one: the rotating state can sit in a
+  constant, a global, a thread-local or the binding of a method, and none of
+  those are left behind by building a copy. So the probe no longer runs any
+  host code. It answers from what the transport itself knows — the
+  configured headers plus the OAuth provider — and treats a `faraday_config`
+  block as an unknown context (no private entry served) unless every
+  middleware it installs is either framework middleware that sets no
+  Authorization header, middleware with no request phase at all, or
+  Faraday's own Authorization middleware installed with literal
+  configuration. A statically configured bearer, with or without that
+  middleware, still gets its private cache hit. The prediction machinery
+  this replaces (`probe_stands_in_for?`, `probe_inert_middleware_class?`,
+  the `RubyVM::InstructionSequence` inspection and the reachable-state walk)
+  is gone; the rounds below describe the prediction rules it supersedes.
+- **`baggage` is application context (round 29).** W3C `baggage` carries
+  host-defined values such as a tenant, so it is no longer treated as a
+  per-request identifier: a result cached under one `baggage` is never
+  served to a request carrying another. `progressToken`, `traceparent` and
+  `tracestate` stay neutral.
+- **Metadata held for a request is released only when a value is served
+  (round 29).** A freshness check that matched an entry but found it stale
+  used to drop the `request_meta` evaluation it had made, so the request it
+  then sent read the host's callable again and a rotating trace id or nonce
+  was spent without ever going out. The evaluation is now released at the
+  points where a cached value really is handed back.
+- **An invalidated template list is dropped (round 29).**
+  `resources/list_changed` and `cleanup` now clear the transport's
+  `resources/templates/list` alongside the other lists, instead of keeping
+  the old list alive for the life of the connection.
+
+- **Only provably inert middleware is probed (round 28).** A middleware
+  copy shares its class, and a `define_method` request hook keeps the
+  binding it was defined in, so comparing two instances could never see a
+  nonce vended by `self.class` or closed over by a block. The rule is now
+  inverted for those: the probe runs a host request hook only when its class
+  holds nothing of its own (no class-level instance variable, class variable
+  or singleton method) and every method it defines was written with `def`;
+  anything else reports the unknown context with the counter untouched.
+  Faraday's own Authorization middleware and hooks that read a frozen holder
+  keep predicting the next request as before. A stdio
+  `resources/templates/list` now follows the server's hint like the other
+  lists: a 2025-11-25 list with no `ttlMs` is asked for again rather than
+  kept (an empty one included), while a positive `ttlMs` is still served
+  without a second request. A client-level cache hit reads the host's
+  `request_meta` once for the whole decision instead of twice, the note a
+  transport leaves on the thread for the cache above it is taken rather than
+  left behind (and dropped on cleanup), and an SSE response is dated from
+  the arrival of the chunk that carried it, so a slow notification callback
+  in the same chunk cannot stretch a `ttlMs` past what the server sent.
+
+- **Middleware the probe may neither build nor stand in for, and lists
+  taken under the lock (round 27).** Two middleware ivars that merely
+  compare equal are a stand-in only while nothing mutable is reachable
+  through both of them: Faraday rebuilds middleware as
+  `klass.new(app, **kwargs)`, so a fresh options hash around the very same
+  vendor now reports the unknown context instead of letting the probe spend
+  a one-time credential (a callable credential, `-> { token }`, is such
+  shared state too). A middleware copy is built only when every argument the
+  handler carries can hand its constructor nothing to spend, so a
+  constructor that consumes a nonce is never run; middleware with no
+  request hook is neither built nor compared, since it cannot change what a
+  request carries. The probe models the request with the metadata held for
+  the decision rather than evaluating the host's `request_meta` again. A
+  cached list is copied out under the cache lock and only while its entry is
+  still the one the cache holds, so a `list_changed` notification landing
+  during the lookup is never served past. Stdio serves a still-fresh hinted
+  `tools` / `prompts` / `resources` list instead of re-listing on every call
+  (an unhinted list is still left to the client's cache). And a re-fetch
+  that replaced the tool definitions (an expired `ttlMs` during a
+  `tools/call`) announces the change, so a result is validated against the
+  definitions its call was answered under.
+
+- **Unpredictable shared state, and empty legacy lists (round 26).** The
+  freshness probe now treats shared state as predictable only where it can
+  vend nothing but itself: a module or class a host middleware shares is no
+  longer assumed safe (it keeps state of its own that freezing never
+  reaches), and neither is a frozen wrapper — a `Data`, a custom object —
+  built around a mutable member. Anything else reports the unknown context,
+  so probing cannot spend a one-time credential. A logger, a lock and
+  deeply frozen holders stay predictable. An empty client-level snapshot is
+  a hit only where the servers bounded it themselves with a freshness hint;
+  a 2025-11-25 server records none, so its empty list is asked for again
+  instead of being kept for the life of the connection. A host
+  `request_meta` callable is evaluated once for a cache decision and the
+  request that decision leads to, instead of being spent again on the
+  request (a callable vending a one-time value no longer sends metadata the
+  decision never weighed). A cached `resources/read` is copied out under the
+  cache lock and only while its entry is still the one the cache holds, so
+  an invalidation landing during the lookup is never read past. And a
+  fetch identity is remembered on the thread only for the lists that attach
+  one and take it back out, so a discovery leaves nothing behind per
+  transport in long-lived worker threads.
+
+- **A probe that changes nothing, and empty snapshots (round 25).** The
+  freshness probe starts from a detached copy of the header table even when
+  the transport was configured with Faraday's own, so the `Authorization`
+  an OAuth provider applies while probing never lands in the headers real
+  requests are built from (a removed token cannot linger there). Host
+  middleware (`faraday_config`) that shares mutable state with the live
+  stack — a nonce or one-time token counter the fresh copy points at too —
+  is no longer run by the probe: it reports the unknown context instead, so
+  probing can neither spend a credential nor make the next request skip
+  one. Middleware sharing only immutable state is still predicted. The
+  client-level list caches track which servers have filled their slice, so
+  a completed snapshot whose lists are all empty is served while it is
+  fresh instead of re-issuing the list request on every call.
+
+- **One Authorization, and unpredictable middleware (round 24).** The
+  freshness probe resolves the `Authorization` a Faraday request would
+  really carry: the header table is case-insensitive, so a provider's
+  canonical write replaces a header configured under any other spelling
+  instead of leaving an older token behind for the fingerprint to find.
+  Host middleware (`faraday_config`) that keeps state of its own — a token
+  rotated per request, anything learned from an earlier response — is no
+  longer predicted from a fresh copy that has not seen those requests: the
+  probe reports the unknown context instead, so no private entry is served
+  for such a stack. Resource template lists are served from their fresh
+  entry on stdio too, which has no client-level cache above it.
+
+- **Generations, header spelling and arrival times (round 21).** Folding
+  the per-URI invalidation generations past `MAX_READ_GENERATIONS` jumps
+  the shared read generation past every count it absorbs, so no key's
+  generation stands still or goes back and a read still in flight cannot
+  be stored against a generation the fold left behind; the configured
+  `Authorization` header is found whatever its spelling (`Authorization:`,
+  `'AUTHORIZATION'`, a symbol), on every transport, so such a credential
+  no longer makes every private entry look foreign; a queued stdio line or
+  SSE event is dated from its arrival, before it is decoded.
+
+- **Templates, receipt times and copies (round 23).** Resource template
+  lists are cached like the other lists on every transport (served while
+  fresh, copied, served stale on a failed re-fetch on HTTP); a direct
+  (non-SSE) response is dated before it is parsed; resource contents are
+  copied iteratively; the client-level list caches forget a server's tag
+  with its slice (`clear_cache`, `list_changed`), so a partial refill
+  never serves a snapshot that omits a live server, and the freshness of
+  every slice's entry is re-read under the cache lock right before a copy
+  is handed out.
+- **Snapshots and stale fallbacks never outlive cleanup (round 22).** A
+  client-level snapshot is served only while every slice still comes from
+  the transport entry it was recorded against (re-checked under the cache
+  lock right before the copy; a placeholder identifies nothing), and
+  `Client#cleanup` clears the client caches; a stale list served on a
+  failed re-fetch must still be the entry in the slot — an entry a cleanup
+  replaced while the re-fetch was in flight is forgotten (its value is
+  dropped too). `MCPClient::DeepCopy` copies iteratively, so a peer
+  schema nested deeper than the Ruby stack allows cannot crash a client
+  cache hit.
+- **Cleanup placeholders and slice identity (round 19).** Clearing the
+  cache installs a stale placeholder for every list kind, recorded or
+  not, and a transport keeps a fetched list only when its hint was
+  attached (or the list carried none), so cleanup racing a first fetch
+  never leaves a hintless copy to serve — `ttlMs` 0 re-fetches on every
+  access; a client-level slice is identified by the very transport entry
+  it came from, never by "no entry" (a legacy list stays a hit only while
+  the transport still holds no entry). `cache_info` hands out detached
+  values (a caller mutating them cannot reach the entry's scope); the
+  per-URI invalidation generations are bounded (`MAX_READ_GENERATIONS`,
+  past which every read counts as invalidated, and the map is dropped
+  when the whole cache is cleared); the client identity a request
+  carries is part of the parameters a cached result is bound to, so
+  `client_info=` / `send_client_info=` re-fetch; the client-level
+  freshness check runs outside the cache lock and the copy is served only
+  when nothing changed meanwhile, so a freshness callback that clears the
+  client cache cannot deadlock.
+- **Client slices, per-key invalidation, capabilities (round 18).** A
+  client-level cache slice is tied to the very transport entry its list
+  came from (identity and the parameters that entry is bound to), so a
+  transport list refreshed on its own — rotated credentials, a concurrent
+  fetch, a re-fetch after the TTL elapsed — replaces that entry and the
+  slice with it; invalidation generations are kept per cache key
+  (`cache_epoch(key)`), so a resource updated while `tools/list` is in
+  flight no longer discards the tools hint; the client capabilities a
+  request advertises (`declare_extension`, newly registered handlers) are
+  part of the parameters a cached result is bound to; a re-fetch that
+  never built its request matches no stale entry, public ones included.
+- **Client caches and queued responses (round 17).** The client-level
+  tool, prompt and resource caches are tagged with the parameters of the
+  list they hold — read before the fetch, never the leftover of whatever
+  request ran last on the thread — so a transport hit under another
+  tenant cannot mislabel the slice; prompts are cached as copies like
+  tools and resources; the client maps and their tags live under one lock,
+  so a freshness check and the copy it approves are one snapshot and a
+  `list_changed` clear waits for it; an outer request's credentials and
+  parameters are restored even when parsing its response raises, so a
+  failed re-fetch is judged by its own context; a response queued by the
+  stdio reader or the SSE stream is dated from its arrival, not from when
+  the waiter woke.
+
+- **Client caches and receipt times (round 16).** `MCPClient::Client`'s
+  own tool, prompt and resource caches are bound to the effective
+  parameters each server's slice was filled under, so a later transport
+  fetch (or a callback) under other `request_meta` never makes them a
+  false hit, and they hand out copies. A result's TTL runs from the moment
+  its response was received — transports note that time before the
+  notifications the response carried are dispatched — not from the end of
+  those callbacks.
+
+- **Pages with differing parameters (round 15).** A paginated list whose
+  pages went out under differing effective parameters (the host's
+  `request_meta` changed between pages, e.g. from a notification callback)
+  is never served from the cache: like pages fetched under differing
+  credentials, it leaves a stale placeholder that no request's parameters
+  match (`CachedResult::MIXED_PARAMS`), on every transport including stdio.
+
+- **Round 13.** An uncacheable `resources/read` (a multi round-trip retry,
+  no `ttlMs`, `ttlMs` 0, stale on arrival) is not stored and drops the
+  per-URI slot only when it still holds the entry that read set out to
+  replace — another context's private entry, or one a later fetch
+  installed meanwhile, stays. The freshness probe carries the routing
+  headers a real modern POST carries (`MCP-Protocol-Version`,
+  `Mcp-Method`, `Mcp-Name`), so host middleware that authenticates by them
+  answers as for the request. Cached tools, prompts and resources lists
+  are handed out as copies (`MCPClient::DeepCopy`, mixed into `Tool`,
+  `Prompt`, `Resource` and `ResourceTemplate`): a caller cannot change the
+  cache or the `x-mcp-header` derivation through what it received.
+
+- **Freshness hints honoured.** `server/discover`, `tools/list`,
+  `prompts/list`, `resources/list`, `resources/templates/list` and
+  `resources/read` results carry `ttlMs` and `cacheScope`
+  (`MCPClient::CachedResult`). Cached lists are served only while fresh
+  (`now < received + ttlMs`; `0` means re-fetch on every access, a negative
+  or malformed value counts as `0`) and re-fetched on access once stale —
+  never in the background. An auto-paginated list is as fresh as its
+  shortest-lived page. Legacy servers (no `ttlMs`) keep the previous
+  cache-until-notification heuristic. `MCPClient::Client`'s own caches
+  consult every server's freshness before serving.
+- **Reads.** `resources/read` results that carry a `ttlMs` are cached per
+  URI while fresh (never the result of a multi round-trip retry; a read
+  without `ttlMs` — every legacy server — is not cached), and dropped on
+  `notifications/resources/updated` for that URI or on
+  `notifications/resources/list_changed`; list caches (tools, prompts,
+  resources and resource templates) are marked stale by their
+  `list_changed` notification regardless of TTL.
+- **Authorization context.** An entry cached with `cacheScope: "private"`
+  is bound to the `Authorization` the request that produced it went out
+  with, and is served (or offered as a stale fallback) only while the
+  transport would send the same credentials (on HTTP+SSE, the credentials
+  of the JSON-RPC POST that fetched it); a cached list is served only from
+  the entry that carries its hint, never from a copy left over from an
+  earlier request, and a re-fetch that fails before it applies its own
+  credentials has no private stale fallback; every cached result is
+  forgotten on `cleanup` / reconnect. A `resources/read` result that is not
+  an object is rejected, and a read's TTL runs from its receipt. On a 2026-07-28 server a list or page
+  without `ttlMs` counts as immediately stale, as the spec asks; legacy
+  servers keep the cache-until-notification heuristic.
+- **Stale on failure.** When a re-fetch fails transiently (5xx, connection
+  or transport error) the stale list is served with a warning, as the spec
+  allows — the stale copy is the entry captured before the re-fetch, judged
+  by that entry's own authorization context. A fetched list attaches only to
+  the entry its own fetch recorded (a later fetch wins), each request returns
+  its own list rather than a re-read of the transport's copy, and an
+  `Authorization` header added by Faraday middleware (`faraday_config`) is
+  part of the cache context: the header a request actually went out with is
+  recorded after it was sent, and the freshness probe runs the middleware
+  stack without sending anything; a request that fails before any response
+  under such middleware has the context recorded right before the adapter
+  sent it (a request that never got that far has no private stale
+  fallback), and the freshness probe runs only the request phase of the
+  middleware, so a host `raise_error` does not blind it. Raw list pages
+  are never handed from one fetch to another, and HTTP+SSE dates resource
+  and template lists from receipt. `server.cache_info(:tools | :prompts |
+  :resources | :templates | :discover)` and `cache_info(:read, uri)` expose
+  `ttl_ms`, `cache_scope`, `received_at` and `fresh`.
+- **Review round 11.** The freshness probe models its request on a real
+  JSON-RPC POST (endpoint, body of the last method sent) so path- or
+  body-aware host middleware answers as it would for the request, and it
+  gives up rather than guess (no private entry is served) when host
+  middleware overrides `call` and cannot be run without sending; the
+  read-cache epoch is taken once the session exists, so the first read on
+  a fresh connection is cached; a fetch that completes after its entry was
+  invalidated never overwrites the newer entry installed meanwhile; the
+  per-URI read cache keeps only results that are fresh on arrival, drops
+  expired ones as new ones are stored and holds at most `MAX_CACHED_READS`
+  (oldest evicted first). The freshness probe models the request of the
+  operation whose cache is checked (`tools/list`, `resources/read` with its
+  URI, ...) rather than the last request sent, so middleware that picks
+  credentials by method or body answers for that request; a result stays
+  bound to the credentials of its own request even when its SSE-framed
+  response dispatched a notification whose callback sent another request
+  on the same thread; an old fetch spanning two contexts never replaces
+  the entry a newer fetch installed after an invalidation.
+- **Effective parameters (round 14).** A cached list or read is bound to
+  the effective request parameters its request went out with — the host's
+  `request_meta` (vendor keys such as a tenant) without the reserved
+  protocol fields and the per-request identifiers (`progressToken`,
+  `traceparent`, `tracestate`) — and is served, fresh or as a
+  stale fallback, only to a request that would carry the same
+  (`CachedResult#params_fingerprint`); a result's binding survives a
+  nested request made by a notification callback.
+
 ### Subscriptions (`subscriptions/listen`)
 
 - **Long-lived notification streams.** `server.listen(notifications:)` and

@@ -277,8 +277,17 @@ RSpec.describe 'MCP 2026-07-28 x-mcp-header — the definition a call went out u
       end
     end
     client = strict_client
+    # Only the notification the *server* sent on the retry's own response
+    # stream may move the list on. The refresh a HeaderMismatch triggers
+    # announces a list_changed of its own, and reacting to that one would
+    # replace the definition before the retry even goes out — which is the
+    # host changing the answer, not the race this example is about.
+    retry_sent = false
     client.on_notification do |_srv, method, _params|
-      listed = tool_with_output(object_schema('v3'), header: 'Zone') if method.end_with?('list_changed')
+      next unless method.end_with?('list_changed')
+
+      listed = tool_with_output(object_schema('v3'), header: 'Zone') if retry_sent
+      retry_sent = true
     end
 
     result = client.call_tool('execute_sql', { 'region' => 'eu' })
@@ -490,6 +499,11 @@ RSpec.describe 'MCP 2026-07-28 x-mcp-header — recovery composition' do
   # Serve the annotated tool, answering the nth tools/call with the nth entry
   # of +answers+ (a lambda taking the request body). The header the tool is
   # annotated with flips to 'Zone' as soon as a HeaderMismatch is returned.
+  #
+  # The list is bounded with a ttlMs so that the only tools/list this example
+  # counts is the one a recovery asks for: a 2026-07-28 server that sends no
+  # ttlMs means "assume 0", and every attempt would then re-read the list it
+  # derives its Mcp-Param-* headers from.
   def stub_call_sequence(answers)
     header = 'Region'
     requests = []
@@ -499,7 +513,8 @@ RSpec.describe 'MCP 2026-07-28 x-mcp-header — recovery composition' do
       requests << { headers: request.headers.to_h, body: body }
       case body['method']
       when 'server/discover' then json_response(body['id'], modern_discover)
-      when 'tools/list' then json_response(body['id'], { 'tools' => [annotated_tool(header)] })
+      when 'tools/list'
+        json_response(body['id'], { 'tools' => [annotated_tool(header)], 'ttlMs' => 60_000 })
       when 'tools/call'
         calls += 1
         answer = answers[calls - 1] || ->(b) { json_response(b['id'], { 'content' => [] }) }
@@ -663,7 +678,11 @@ RSpec.describe 'MCP 2026-07-28 x-mcp-header — shared by both HTTP transports' 
           requests << { headers: request.headers.to_h, body: body }
           case body['method']
           when 'server/discover' then json_response(body['id'], modern_discover)
-          when 'tools/list' then json_response(body['id'], { 'tools' => [annotated_tool(header)] })
+          # Bounded, so the refresh is the only re-read in the sequence below:
+          # an unbounded list on a 2026-07-28 server is stale on arrival, and
+          # the retry would read it again to derive its own headers.
+          when 'tools/list'
+            json_response(body['id'], { 'tools' => [annotated_tool(header)], 'ttlMs' => 60_000 })
           when 'tools/call'
             if request.headers['Mcp-Param-Zone']
               json_response(body['id'], { 'content' => [] })
@@ -906,10 +925,14 @@ RSpec.describe 'MCP 2026-07-28 x-mcp-header — paginated and shrinking lists' d
       case body['method']
       when 'server/discover' then json_response(body['id'], modern_discover)
       when 'tools/list'
+        # Both pages carry the bound (the combined entry takes the shortest),
+        # so the call below mirrors from the list already followed rather than
+        # walking the pages again.
         if body['params']['cursor']
-          json_response(body['id'], { 'tools' => [annotated_tool('Region')] })
+          json_response(body['id'], { 'tools' => [annotated_tool('Region')], 'ttlMs' => 60_000 })
         else
-          json_response(body['id'], { 'tools' => [plain_tool('first')], 'nextCursor' => 'page2' })
+          json_response(body['id'],
+                        { 'tools' => [plain_tool('first')], 'nextCursor' => 'page2', 'ttlMs' => 60_000 })
         end
       else json_response(body['id'], { 'content' => [] })
       end
@@ -1001,12 +1024,18 @@ RSpec.describe 'MCP 2026-07-28 x-mcp-header — list_changed invalidation on bot
           body = JSON.parse(request.body)
           counts[body['method']] += 1
           n = counts[body['method']]
+          # Each list is bounded, so there is a cache for a notification to
+          # drop: a 2026-07-28 server that sends no ttlMs means "assume 0",
+          # and every list would then be re-read whatever was invalidated.
           case body['method']
           when 'server/discover' then json_response(body['id'], full_discover)
-          when 'tools/list' then json_response(body['id'], { 'tools' => [{ 'name' => "t#{n}" }] })
-          when 'prompts/list' then json_response(body['id'], { 'prompts' => [{ 'name' => "p#{n}" }] })
+          when 'tools/list'
+            json_response(body['id'], { 'tools' => [{ 'name' => "t#{n}" }], 'ttlMs' => 60_000 })
+          when 'prompts/list'
+            json_response(body['id'], { 'prompts' => [{ 'name' => "p#{n}" }], 'ttlMs' => 60_000 })
           when 'resources/list'
-            json_response(body['id'], { 'resources' => [{ 'uri' => "file:///r#{n}", 'name' => "r#{n}" }] })
+            json_response(body['id'], { 'resources' => [{ 'uri' => "file:///r#{n}", 'name' => "r#{n}" }],
+                                        'ttlMs' => 60_000 })
           end
         end
 

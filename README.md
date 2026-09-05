@@ -872,6 +872,56 @@ See [OAUTH.md](OAUTH.md) for full documentation.
 - **PKCE** — authorization refuses to proceed when the authorization server
   does not advertise `code_challenge_methods_supported` including `S256`.
 
+## Cacheable Results (MCP 2026-07-28)
+
+A 2026-07-28 server may bound a result with `ttlMs` (how long the client MAY
+consider it fresh, counted from receipt) and `cacheScope` (`"public"` or
+`"private"`). The transports honour both for `tools/list`, `prompts/list`,
+`resources/list`, `resources/templates/list`, `server/discover` and
+`resources/read`; `cache_info(:tools)` — or `cache_info(:read, uri)` — reports
+what was recorded. An absent `ttlMs` means 0 on a 2026-07-28 server, a missing
+or unrecognized `cacheScope` is treated as `"private"`, and a `resources/read`
+result is kept only when the server gave it a positive `ttlMs`.
+
+A cached result is served only to a request that would carry the same things
+the request that produced it did:
+
+- **the same authorization.** A `"private"` entry is bound to the
+  `Authorization` its own request actually went out with — what the adapter
+  sent, not what the response phase later left in the request environment — so
+  a rotated token, a revoked one, or an anonymous request never reads it.
+- **the same effective parameters.** The `_meta` a request carries (your
+  `request_meta` and its `baggage`, the client identity and capabilities) is
+  part of what a result is bound to, whatever its scope: `"public"` permits
+  sharing across callers, not across parameters a server may vary its answer
+  by.
+
+Anything the transport cannot read off its own configuration makes those
+unknowable, and reuse is then turned off rather than guessed at. Middleware of
+your own installed through `faraday_config` is such a case — anything with a
+request hook, and any handler carrying a callback of yours: it may set an
+`Authorization` or rewrite the request body, and no inspection can tell whether
+it does. Framework middleware the transport can read (Faraday's own retry,
+JSON, url-encoded, multipart, logger, follow-redirects, and `:authorization`
+configured with literal values) keeps caching on; an `:authorization` handed a
+proc keeps public entries but not private ones, since the credential it vends
+may differ from request to request.
+
+Two rules follow the protocol rather than the cache:
+
+- a `resources/templates/list` a server put **no** hint on is fetched again on
+  every call, as it was before results were cached at all; only a positive
+  `ttlMs` lets a template list be answered without a request;
+- a cursor the server rejects (`-32602`) ends the page sequence it belonged to.
+  The pages cached for that list are dropped, an automatically paginated list
+  restarts once from the first page, and an explicit `list_resources(cursor:)`
+  or `list_resource_templates(cursor:)` raises — after the first page cached
+  under the dead cursor has been discarded, so the next call really re-fetches.
+
+A re-fetch that fails for a transient reason may serve the stale copy ("Clients
+MAY serve stale responses if errors occur during re-fetching"); an
+authorization failure never does, so it reaches your auth flow instead.
+
 ## Server Notifications
 
 ```ruby

@@ -2,6 +2,7 @@
 
 # Load all MCPClient components
 require_relative 'mcp_client/errors'
+require_relative 'mcp_client/deep_copy'
 require_relative 'mcp_client/tool'
 require_relative 'mcp_client/prompt'
 require_relative 'mcp_client/resource'

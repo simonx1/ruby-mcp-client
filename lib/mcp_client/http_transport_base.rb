@@ -5,6 +5,8 @@ require_relative 'json_rpc_common'
 require_relative 'called_tool_definition'
 require_relative 'auth/oauth_provider'
 require_relative 'http_transport_base/listen_stream'
+require_relative 'http_transport_base/cache_support'
+require_relative 'http_transport_base/tool_listing'
 
 require_relative 'http_transport_base/param_headers'
 require_relative 'http_transport_base/request_recovery'
@@ -18,6 +20,8 @@ module MCPClient
     include ParamHeaders
     include RequestRecovery
     include ListenStream
+    include CacheSupport
+    include ToolListing
 
     # Lightweight response wrapper for Faraday exception payloads (Hashes),
     # so the exception path and the default path share one challenge pipeline.
@@ -147,6 +151,7 @@ module MCPClient
           req.headers['Mcp-Protocol-Version'] = @protocol_version if @protocol_version
           # MCP: authorization MUST be included in every HTTP request
           @oauth_provider&.apply_authorization(req)
+          note_request_authorization(authorization_header_value(req.headers))
         end
 
         if response.success?
@@ -486,8 +491,7 @@ module MCPClient
       @logger.debug("Sending JSON-RPC request: #{describe_jsonrpc_message(request)}")
 
       begin
-        response = send_http_request(request, timeout: timeout, extra_headers: extra_headers)
-        parse_response(response, request)
+        exchange_jsonrpc(request, timeout: timeout, extra_headers: extra_headers)
       rescue MCPClient::Errors::ConnectionError, MCPClient::Errors::TransportError, MCPClient::Errors::ServerError
         raise
       rescue JSON::ParserError => e
@@ -506,15 +510,12 @@ module MCPClient
     # @raise [MCPClient::Errors::ConnectionError] if connection fails
     def send_http_request(request, timeout: nil, extra_headers: {})
       conn = http_connection
-      # Capture the session id this request goes out with — the value
-      # apply_request_headers attaches — so a later 404 is attributed to the
-      # id that actually accompanied the request, not to whatever @session_id
-      # holds by 404-handling time (another caller may have completed a
-      # restart in between, and its fresh session must not be re-initialized).
+      # The session id this request goes out with: a later 404 is attributed
+      # to it, not to a fresh session another caller established meanwhile.
       sent_session_id = @mutex.synchronize { @session_id }
 
       begin
-        response = conn.post(@endpoint) do |req|
+        response = post_json_rpc(conn) do |req|
           apply_request_headers(req, request)
           apply_param_headers(req, extra_headers)
           # Per-request timeout override (MCP lifecycle: timeouts SHOULD be
@@ -533,6 +534,9 @@ module MCPClient
           end
           req.body = request.to_json
         end
+        # MCP 2026-07-28 caching: the result is bound to the Authorization
+        # the request went out with, middleware included.
+        note_sent_authorization(response)
 
         # MCP 2025-11-25 session management: HTTP 404 for a request carrying
         # Mcp-Session-Id means the session expired — the client MUST start a
@@ -652,111 +656,6 @@ module MCPClient
       @mutex.synchronize { !@restarting_session }
     end
 
-    # Drop the cached tool list and re-fetch it. Hosts layered above the
-    # transport (MCPClient::Client) keep their own tool cache, so the refresh
-    # is announced the way the server itself would: as a tools/list_changed
-    # notification.
-    # @return [void]
-    def refresh_tools_cache
-      invalidate_tools_cache
-      list_tools
-      # Announced on both hooks, in the order routing uses them, so a host
-      # whose cache invalidation runs ahead of subscription deliveries is told
-      # here too (see {MCPClient::ServerBase#on_cache_invalidation}).
-      notify_cache_invalidation('notifications/tools/list_changed', {})
-      @notification_callback&.call('notifications/tools/list_changed', {})
-    end
-
-    # Forget the cached tool list. The generation counter lets a list fetch
-    # that was already in flight recognise that it is stale and not
-    # overwrite a fresher list.
-    # @return [void]
-    def invalidate_tools_cache
-      @mutex.synchronize do
-        @tools = nil
-        @tools_data = nil
-        @tools_generation = tools_generation + 1
-      end
-    end
-
-    # @return [Integer] the current tool-list generation (bump on invalidation)
-    def tools_generation
-      @tools_generation ||= 0
-    end
-
-    # Fetch and cache the tool list, re-fetching when the cache was
-    # invalidated while the fetch was in flight (bounded).
-    # @return [Array<MCPClient::Tool>]
-    def fetch_tools_list
-      3.times do
-        generation = @mutex.synchronize { tools_generation }
-        tools_data = request_tools_list
-        # MCP 2026-07-28: tools with invalid x-mcp-header annotations are
-        # excluded from the list on this transport.
-        tools_data = reject_invalid_header_tools(tools_data) if modern?
-        tools = tools_data.map { |tool_data| MCPClient::Tool.from_json(tool_data, server: self) }
-        stored = store_tools(tools, generation)
-        return stored if stored
-      end
-      raise MCPClient::Errors::TransportError, 'tools/list kept changing while it was being fetched'
-    end
-
-    # Store a freshly fetched tool list unless the cache was invalidated
-    # while it was being fetched, in which case the fresher list wins.
-    # @param tools [Array<MCPClient::Tool>] the fetched list
-    # @param generation [Integer] tools_generation when the fetch started
-    # @return [Array<MCPClient::Tool>] the list to hand to the caller
-    def store_tools(tools, generation)
-      @mutex.synchronize do
-        return @tools = tools if tools_generation == generation
-
-        # Invalidated while in flight: this list is stale even if nothing
-        # newer was stored yet. Hand back whatever is current (nil makes the
-        # caller fetch again).
-        @tools
-      end
-    end
-
-    # Keep the transport's list caches in step with the server's list-changed
-    # notifications, so a re-list after a change (or the HeaderMismatch
-    # refresh) really fetches the new definitions.
-    # @param method [String] a notification method
-    # @return [void]
-    def invalidate_cache_for_notification(method)
-      case method
-      when 'notifications/tools/list_changed' then invalidate_tools_cache
-      when 'notifications/prompts/list_changed'
-        @mutex.synchronize do
-          @prompts = nil
-          @prompts_data = nil
-        end
-      when 'notifications/resources/list_changed'
-        @mutex.synchronize do
-          @resources_result = nil
-          @resources_data = nil
-        end
-      end
-    end
-
-    # Exclude tool definitions whose x-mcp-header annotations violate the
-    # transport constraints (MCP 2026-07-28: "Rejection means the client
-    # MUST exclude the invalid tool from the result of tools/list"), logging
-    # a warning with the tool name and the reason.
-    # @param tools_data [Array<Hash>] raw tool definitions
-    # @return [Array<Hash>] the acceptable definitions
-    def reject_invalid_header_tools(tools_data)
-      tools_data.reject do |data|
-        schema = data['inputSchema'] || data[:inputSchema] || data['schema'] || data[:schema]
-        errors = MCPClient::HeaderParams.validate_schema(schema)
-        next false if errors.empty?
-
-        name = data['name'] || data[:name]
-        @logger.warn("Rejecting tool #{sanitize_log_text(name.to_s.inspect)}: invalid x-mcp-header annotation: " \
-                     "#{sanitize_log_text(errors.join('; '))}")
-        true
-      end
-    end
-
     # Build the ServerError for a 4xx surfaced as a Faraday::ClientError by
     # user-configured raise_error middleware, inspecting the body like the
     # response path does.
@@ -769,16 +668,34 @@ module MCPClient
       jsonrpc_error_from_http_response(response, "Client error: HTTP #{status} #{error.message}".strip)
     end
 
+    # POST a JSON-RPC request; a failure before any response records the
+    # Authorization the request went out with when Faraday kept it.
+    # @param conn [Faraday::Connection]
+    # @yield [Faraday::Request]
+    # @return [Faraday::Response]
+    def post_json_rpc(conn, &)
+      conn.post(@endpoint, &)
+    rescue Faraday::Error => e
+      note_failed_request_authorization(e)
+      raise
+    end
+
     # Apply headers to the HTTP request (can be overridden by subclasses)
     # @param req [Faraday::Request] HTTP request
     # @param _request [Hash] JSON-RPC request
     def apply_request_headers(req, request)
+      # The freshness probe models its request on the last method sent.
+      @probe_method = request['method'] if request.is_a?(Hash) && request['method'].is_a?(String)
       # Apply all headers including custom ones
       @headers.each { |k, v| req.headers[k] = v }
 
       # Apply OAuth authorization if available
       @logger.debug("OAuth provider present: #{@oauth_provider ? 'yes' : 'no'}")
       @oauth_provider&.apply_authorization(req)
+      note_request_authorization(authorization_header_value(req.headers))
+      # Middleware installed through faraday_config may still change the
+      # header: the context of this attempt is known once it was sent.
+      note_request_authorization_pending if @faraday_config
 
       # MCP 2026-07-28: every POST carries MCP-Protocol-Version (matching the
       # body's _meta), Mcp-Method and, for named requests, Mcp-Name.
@@ -945,7 +862,9 @@ module MCPClient
       # Apply user's Faraday customizations after defaults
       @faraday_config&.call(conn)
 
-      conn
+      # MCP 2026-07-28 caching: the Authorization a request finally carries
+      # is recorded after the host's middleware ran.
+      record_sent_authorization(conn)
     end
 
     # Log HTTP response (to be overridden by specific transports)

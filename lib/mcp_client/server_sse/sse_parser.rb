@@ -12,7 +12,8 @@ module MCPClient
 
       # Parse and handle a raw SSE event payload.
       # @param event_data [String] the raw event chunk
-      def parse_and_handle_sse_event(event_data)
+      # @param arrived [Float, nil] monotonic time the chunk carrying it arrived
+      def parse_and_handle_sse_event(event_data, arrived = nil)
         event = parse_sse_event(event_data)
         return if event.nil?
 
@@ -22,23 +23,27 @@ module MCPClient
         when 'ping'
           # no-op
         when 'message'
-          handle_message_event(event)
+          handle_message_event(event, arrived)
         end
       end
 
       # Handle a "message" SSE event (payload is JSON-RPC over SSE)
       # @param event [Hash] the parsed SSE event (with :data, :id, etc)
-      def handle_message_event(event)
+      # @param arrived [Float, nil] monotonic time the chunk carrying it arrived
+      def handle_message_event(event, arrived = nil)
         return if event[:data].empty?
 
         begin
+          # Dated from the arrival of the chunk it came in, before any event
+          # of that chunk was decoded or dispatched.
+          arrived ||= monotonic_now if respond_to?(:monotonic_now, true)
           data = JSON.parse(event[:data])
 
           return if process_error_in_message?(data)
           return if process_server_request?(data)
           return if process_notification?(data)
 
-          process_response?(data)
+          process_response?(data, arrived)
         rescue MCPClient::Errors::ConnectionError
           raise
         rescue JSON::ParserError => e
@@ -86,9 +91,13 @@ module MCPClient
         return false unless data['method'] && !data.key?('id')
 
         # The legacy SSE transport carries no subscriptions/listen stream, so
-        # there is no delivery to run ahead of — but a host that registered its
-        # cache invalidation on the dedicated hook must still be told here
+        # there is no delivery to run ahead of — but the transport's own caches
+        # and a host that registered its invalidation on the dedicated hook
+        # must still be told, in the order routing uses them
         # (see {MCPClient::ServerBase#on_cache_invalidation}).
+        invalidate_cache_for_notification(data['method'], data['params']) if respond_to?(
+          :invalidate_cache_for_notification, true
+        )
         notify_cache_invalidation(data['method'], data['params'])
         @notification_callback&.call(data['method'], data['params'])
         true
@@ -96,8 +105,9 @@ module MCPClient
 
       # Process a JSON-RPC response (id => response)
       # @param data [Hash] the parsed JSON payload
+      # @param arrived [Float, nil] monotonic time the event arrived
       # @return [Boolean] true if we saw & handled a response
-      def process_response?(data)
+      def process_response?(data, arrived = nil)
         return false unless data['id']
 
         # Deliver the response to the waiting caller via @sse_results only.
@@ -115,6 +125,8 @@ module MCPClient
             return true
           end
 
+          # Dated from arrival: the waiter polls and may wake much later.
+          (@sse_result_arrivals ||= {})[data['id']] = arrived || monotonic_now if respond_to?(:monotonic_now, true)
           @sse_results[data['id']] =
             if data['error']
               # JSON-RPC error response: store the error under a Symbol key

@@ -1,15 +1,27 @@
 # frozen_string_literal: true
 
+require 'digest'
+
 require 'json'
 require 'zlib'
 require 'stringio'
 require_relative 'header_params'
 require_relative 'subscription_support'
+require_relative 'result_caching'
+require_relative 'request_metadata'
+require_relative 'round_trip_marker'
+require_relative 'result_completeness'
 
 module MCPClient
   # Shared retry/backoff logic for JSON-RPC transports
   module JsonRpcCommon
+    include RoundTripMarker
+    include ResultCompleteness
     include SubscriptionSupport
+    include ResultCaching
+    # The `_meta` a request carries, the fingerprint a cached result is bound
+    # to, and the evaluation a cache decision holds for the request it leads to.
+    include RequestMetadata
 
     # JSON-RPC methods with arbitrary side effects that MUST NOT be re-sent
     # automatically. Even a "transient" failure (5xx, dropped connection,
@@ -204,34 +216,65 @@ module MCPClient
       params
     end
 
+    # Transports that derive `Mcp-Param-*` headers from their tool list run a
+    # call inside a slot of its own for the definition it goes out under
+    # ({MCPClient::CalledToolDefinition}); the others have nothing to record
+    # and the call runs as it is.
+    # @yield the call
+    # @return [Object] the block value
+    def recording_called_tool_definition
+      yield
+    end
+    private :recording_called_tool_definition
+
+    # @see MCPClient::CalledToolDefinition#outside_called_tool_definition
+    # @yield the host code
+    # @return [Object] the block value
+    def outside_called_tool_definition
+      yield
+    end
+    private :outside_called_tool_definition
+
+    # Which claim a message being built makes on the evaluation the open
+    # operation reserved (see {MCPClient::RequestMetadata::HeldRequestMeta}).
+    #
+    # A probe is never sent: it models the reserved request, so it reads that
+    # request's evaluation without spending it. A real request spends the
+    # reservation only when it *is* the request the reservation was made for
+    # -- the one the operation holding it sends. Everything else -- a
+    # reconnect's handshake, a re-opened `subscriptions/listen`, a
+    # cancellation, and everything host code issues from behind the boundary
+    # a transport crosses to reach it ({MCPClient::RequestMetadata#outside_request_meta_hold}),
+    # raw `rpc_request` of the very same method included -- reads the host
+    # afresh and leaves the reservation for the request that holds it.
+    # @param method [String] the JSON-RPC method being built
+    # @param note [Boolean] whether the message is really going out
+    # @return [Symbol] :spend, :model or :none
+    def request_meta_claim(method, note)
+      return :model unless note
+
+      held = claimable_request_meta_hold
+      held && held.request_method == method ? :spend : :none
+    end
+
     # Build a JSON-RPC request object
     # @param method [String] JSON-RPC method name
     # @param params [Hash] parameters for the request
     # @param id [Integer] request ID
+    # @param note [Boolean] whether this request's effective parameters are
+    #   remembered as this thread's current request (a probe that is never
+    #   sent passes false)
     # @return [Hash] the JSON-RPC request object
-    def build_jsonrpc_request(method, params, id)
+    def build_jsonrpc_request(method, params, id, note: true)
+      effective = with_request_meta(params, claim: request_meta_claim(method, note))
+      note_request_params(effective) if note
       {
         'jsonrpc' => '2.0',
         'id' => id,
         'method' => method,
-        'params' => with_request_meta(params)
+        'params' => effective
       }
     end
-
-    # Reserved `_meta` keys (MCP 2026-07-28 basic/index "_meta").
-    META_PROTOCOL_VERSION = 'io.modelcontextprotocol/protocolVersion'
-    META_CLIENT_INFO = 'io.modelcontextprotocol/clientInfo'
-    META_CLIENT_CAPABILITIES = 'io.modelcontextprotocol/clientCapabilities'
-    META_LOG_LEVEL = 'io.modelcontextprotocol/logLevel'
-    META_SERVER_INFO = 'io.modelcontextprotocol/serverInfo'
-    META_SUBSCRIPTION_ID = 'io.modelcontextprotocol/subscriptionId'
-
-    # Per-request protocol fields the client owns. A host-supplied `_meta`
-    # may carry anything else (progressToken, trace context, vendor keys),
-    # but these are always set from the transport's own state so the body
-    # can never disagree with what the transport negotiated (on HTTP the
-    # MCP-Protocol-Version header must match the body).
-    PROTECTED_META_KEYS = [META_PROTOCOL_VERSION, META_CLIENT_INFO, META_CLIENT_CAPABILITIES].freeze
 
     # Log levels defined by the logging utility (RFC 5424 severities).
     LOG_LEVELS = %w[debug info notice warning error critical alert emergency].freeze
@@ -344,8 +387,8 @@ module MCPClient
     # untouched when there is nothing to add, so legacy traffic is unchanged.
     # @param params [Hash, nil] request params (String or Symbol keys)
     # @return [Hash, nil] params with `_meta` merged under the String key
-    def with_request_meta(params)
-      defaults = host_request_meta
+    def with_request_meta(params, claim: :none)
+      defaults = host_request_meta(claim)
       return params if defaults.empty? && !modern?
 
       params = params.is_a?(Hash) ? params.dup : {}
@@ -380,15 +423,37 @@ module MCPClient
       meta
     end
 
-    # Evaluate the host's request_meta for one request, dropping any
-    # reserved protocol keys it tries to set.
+    # The host's request_meta for one message, with any reserved protocol
+    # keys it tries to set dropped.
+    #
+    # A message that claims the open operation's reservation reads the
+    # evaluation held for it (making it, the first time, and holding it);
+    # `:spend` marks it spent, so the request it was held for carries it and
+    # nothing else ever does. `:none` reads the host afresh and leaves the
+    # reservation alone -- a host callable that vends a one-time value is
+    # never spent twice, and never on the wrong request.
+    # @param claim [Symbol] :spend, :model or :none
     # @return [Hash] String-keyed metadata (possibly empty)
-    def host_request_meta
+    def host_request_meta(claim = :none)
+      held = claim == :none ? nil : claimable_request_meta_hold
+      return spend_held_request_meta(held, claim) if held&.evaluated
+
       source = request_meta
       source = source.call if source.respond_to?(:call)
-      return {} unless source.is_a?(Hash)
+      meta = source.is_a?(Hash) ? source.transform_keys(&:to_s).except(*PROTECTED_META_KEYS) : {}
+      return meta unless held
 
-      source.transform_keys(&:to_s).except(*PROTECTED_META_KEYS)
+      held.evaluated = true
+      held.value = meta
+      spend_held_request_meta(held, claim)
+    end
+
+    # @param held [MCPClient::RequestMetadata::HeldRequestMeta]
+    # @param claim [Symbol]
+    # @return [Hash] the held evaluation
+    def spend_held_request_meta(held, claim)
+      held.spent = true if claim == :spend
+      held.value
     end
 
     # Apply a DiscoverResult (server/discover): choose the protocol version
@@ -422,6 +487,7 @@ module MCPClient
       @protocol_version = version
       @supported_versions = versions
       @last_discover_result = result
+      record_cache_hint(:discover, result)
       @capabilities = result['capabilities'].is_a?(Hash) ? result['capabilities'] : {}
       @instructions = result['instructions']
       info = result.dig('_meta', META_SERVER_INFO)
@@ -465,12 +531,15 @@ module MCPClient
     # @param params [Hash] parameters for the notification
     # @return [Hash] the JSON-RPC notification object
     def build_jsonrpc_notification(method, params)
+      # A notification is never the request a cache decision was made for: it
+      # reads the host afresh and leaves the reservation for that request.
+      effective = with_request_meta(params, claim: :none)
       {
         'jsonrpc' => '2.0',
         'method' => method,
         # Modern notifications carry the same _meta as requests: on HTTP the
         # MCP-Protocol-Version header must match the body.
-        'params' => with_request_meta(params)
+        'params' => effective
       }
     end
 
@@ -625,33 +694,6 @@ module MCPClient
       # malformed, and treating it as valid would let a wrapper flatten an
       # unfinished result into an empty successful one.
       modern? ? CORE_RESULT_TYPES : LEGACY_RESULT_TYPES
-    end
-
-    # Project a payload out of a result that has to be finished. This client
-    # recognizes InputRequiredResult (resultType "input_required") but does
-    # not drive multi round-trip requests yet, so an operation that would
-    # extract a field from it — and so drop the server's inputRequests and
-    # opaque requestState — surfaces it instead of presenting an unfinished
-    # answer as an empty successful one. The whole result rides on the
-    # error's `data`, so a host can still drive the round trip itself.
-    # An unfinished answer is the InputRequired condition and is reported as
-    # such, the same way #reject_unfulfillable_input_required! reports one
-    # that reaches the response parser; any other discriminator this client
-    # cannot carry through is an invalid result.
-    # @param result [Object] the JSON-RPC result
-    # @param method [String] the request method, for the message
-    # @return [Object] the result, when it is complete
-    # @raise [MCPClient::Errors::InputRequiredError] when it is unfinished
-    # @raise [MCPClient::Errors::InvalidResultError] when it is neither
-    def require_complete_result!(result, method)
-      type = MCPClient::JsonRpcCommon.result_type(result)
-      return result if type == 'complete'
-
-      message = "#{method} answered with resultType #{type.to_s[0, 64].inspect}, which this " \
-                'client cannot carry through'
-      raise MCPClient::Errors::InputRequiredError.new(message, data: result) if type == 'input_required'
-
-      raise MCPClient::Errors::InvalidResultError.new("Invalid result: #{message}", data: result)
     end
 
     # Build the error for a 4xx response: the typed JSON-RPC error when the
@@ -874,6 +916,7 @@ module MCPClient
         end
         result = yield(retry_params)
       end
+      mark_round_trip_result(round_trips.positive?)
       result
     end
 

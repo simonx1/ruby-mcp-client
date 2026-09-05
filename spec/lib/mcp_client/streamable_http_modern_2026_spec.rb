@@ -1104,7 +1104,10 @@ RSpec.describe 'MCP 2026-07-28 modern mode — a server that offers a session an
         result = case body['method']
                  when 'server/discover' then discover_result
                  when 'tools/call' then { 'content' => [] }
-                 else { 'tools' => [] }
+                 # Bounded, so the call reuses the list instead of reading it
+                 # again to derive its Mcp-Param-* headers: the three requests
+                 # below are the session layer's, not the cache's.
+                 else { 'tools' => [], 'ttlMs' => 60_000 }
                  end
         { status: 200, body: JSON.generate('jsonrpc' => '2.0', 'id' => body['id'], 'result' => result),
           headers: { 'Content-Type' => 'application/json', 'Mcp-Session-Id' => 'sess-modern' } }

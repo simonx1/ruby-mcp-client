@@ -1,8 +1,12 @@
 # frozen_string_literal: true
 
+require_relative 'deep_copy'
+
 module MCPClient
   # Representation of an MCP prompt
   class Prompt
+    include MCPClient::DeepCopy
+
     # @!attribute [r] name
     #   @return [String] the name of the prompt
     # @!attribute [r] title

@@ -72,9 +72,13 @@ RSpec.describe MCPClient::Client, 'caching' do
 
       # Both tools should be in the cache with different keys
       expect(client.tool_cache.size).to eq(3)
-      expect(client.tool_cache['123456:duplicate_tool']).to eq(tool1_from_server1)
-      expect(client.tool_cache['789012:duplicate_tool']).to eq(tool2_from_server2)
-      expect(client.tool_cache['123456:unique_tool']).to eq(unique_tool_from_server1)
+      # The cache keeps its own copies (MCP 2026-07-28 caching).
+      expect(client.tool_cache['123456:duplicate_tool'])
+        .to have_attributes(name: tool1_from_server1.name, description: tool1_from_server1.description)
+      expect(client.tool_cache['789012:duplicate_tool'])
+        .to have_attributes(name: tool2_from_server2.name, description: tool2_from_server2.description)
+      expect(client.tool_cache['123456:unique_tool'])
+        .to have_attributes(name: unique_tool_from_server1.name, description: unique_tool_from_server1.description)
     end
 
     it 'returns all tools including duplicates' do
@@ -145,8 +149,11 @@ RSpec.describe MCPClient::Client, 'caching' do
       client.list_prompts
 
       expect(client.prompt_cache.size).to eq(2)
-      expect(client.prompt_cache['123456:duplicate_prompt']).to eq(prompt1_from_server1)
-      expect(client.prompt_cache['789012:duplicate_prompt']).to eq(prompt2_from_server2)
+      # The client cache keeps its own copies (MCP 2026-07-28 caching)
+      expect(client.prompt_cache['123456:duplicate_prompt'])
+        .to have_attributes(name: prompt1_from_server1.name, description: prompt1_from_server1.description)
+      expect(client.prompt_cache['789012:duplicate_prompt'])
+        .to have_attributes(name: prompt2_from_server2.name, description: prompt2_from_server2.description)
     end
 
     it 'returns all prompts including duplicates' do
@@ -194,8 +201,11 @@ RSpec.describe MCPClient::Client, 'caching' do
       client.list_resources
 
       expect(client.resource_cache.size).to eq(2)
-      expect(client.resource_cache['123456:file://shared.txt']).to eq(resource1_from_server1)
-      expect(client.resource_cache['789012:file://shared.txt']).to eq(resource2_from_server2)
+      # The cache keeps its own copies (MCP 2026-07-28 caching).
+      expect(client.resource_cache['123456:file://shared.txt'])
+        .to have_attributes(uri: resource1_from_server1.uri, name: resource1_from_server1.name)
+      expect(client.resource_cache['789012:file://shared.txt'])
+        .to have_attributes(uri: resource2_from_server2.uri, name: resource2_from_server2.name)
     end
 
     it 'returns all resources including those with duplicate URIs' do

@@ -1,5 +1,6 @@
 # frozen_string_literal: true
 
+require_relative 'request_meta_scope'
 require 'open3'
 require 'monitor'
 require 'json'
@@ -13,6 +14,10 @@ module MCPClient
     require_relative 'server_stdio/json_rpc_transport'
 
     include JsonRpcTransport
+    # Every operation that may weigh a cache decision runs inside a scope
+    # that reserves the host request_meta evaluation for the request it
+    # leads to, and drops it when the operation ends.
+    prepend MCPClient::RequestMetaScope
 
     # @!attribute [r] command
     #   @return [String, Array] the command used to launch the server
@@ -280,6 +285,9 @@ module MCPClient
     # @param line [String] line of output to parse
     # @return [void]
     def handle_line(line)
+      # The response is dated from the arrival of its line, before it is
+      # decoded: parsing time is not freshness.
+      arrived = respond_to?(:monotonic_now, true) ? monotonic_now : nil
       msg = JSON.parse(line)
       @logger.debug("Received line: #{describe_jsonrpc_message(msg)}")
 
@@ -323,6 +331,8 @@ module MCPClient
         # responses are dropped so @pending cannot grow without bound.
         if @awaiting.key?(id)
           @pending[id] = msg
+          # Dated from arrival: the waiter may wake much later.
+          (@response_arrivals ||= {})[id] = arrived || monotonic_now if respond_to?(:monotonic_now, true)
           @cond.broadcast
         else
           @logger.debug("Discarding response for unknown or expired request id=#{id}")
@@ -356,14 +366,16 @@ module MCPClient
     # @raise [MCPClient::Errors::ServerError] if server returns an error
     # @raise [MCPClient::Errors::PromptGetError] for other errors during prompt listing
     def list_prompts
+      cached = hinted_list_value(:prompts)
+      return cached if cached
+
       ensure_initialized
-      collect_paginated('prompts') do |cursor|
-        params = {}
-        params['cursor'] = cursor if cursor
-        result = rpc_request('prompts/list', params) || {}
-        prompts = (result['prompts'] || []).map { |td| MCPClient::Prompt.from_json(td, server: self) }
-        [prompts, result['nextCursor']]
-      end
+      # A cursor the server rejects restarts the list from its first page,
+      # exactly as it does on the HTTP transports (MCP pagination).
+      page = { cursor: nil }
+      prompts = restarting_rejected_cursor('prompts', page) { collect_prompt_pages(page) }
+      attach_list_value(:prompts, prompts)
+      prompts
     rescue MCPClient::Errors::ServerError => e
       # 2026-07-28 protocol errors carry actionable data (requiredCapabilities,
       # supported versions); keep them intact instead of wrapping.
@@ -372,6 +384,31 @@ module MCPClient
       raise MCPClient::Errors::PromptGetError, "Error listing prompts: #{e.message}"
     rescue StandardError => e
       raise MCPClient::Errors::PromptGetError, "Error listing prompts: #{e.message}"
+    end
+
+    # Collect every page of prompts/list, recording what each page was
+    # answered under so the cache can bind the combined list to it.
+    # @param page [Hash] holds the cursor of the request in flight
+    # @return [Array<MCPClient::Prompt>]
+    def collect_prompt_pages(page)
+      pages = []
+      received_ats = []
+      fingerprints = []
+      epoch = cache_epoch(:prompts)
+      prompts = collect_paginated('prompts') do |cursor|
+        params = {}
+        params['cursor'] = cursor if cursor
+        started = monotonic_now
+        page[:cursor] = cursor
+        result = fetch_list_page(:prompts, cursor) { rpc_request('prompts/list', params) } || {}
+        pages << result
+        received_ats << response_received_at(since: started)
+        fingerprints << request_params_fingerprint
+        prompts = (result['prompts'] || []).map { |td| MCPClient::Prompt.from_json(td, server: self) }
+        [prompts, result['nextCursor']]
+      end
+      record_list_cache_hint('prompts/list', pages, received_ats, params: fingerprints, epoch: epoch)
+      prompts
     end
 
     # Get a prompt with the given parameters
@@ -399,12 +436,19 @@ module MCPClient
     # @raise [MCPClient::Errors::ServerError] if server returns an error
     # @raise [MCPClient::Errors::ResourceReadError] for other errors during resource listing
     def list_resources(cursor: nil)
+      cached = cursor ? nil : hinted_list_value(:resources)
+      return cached if cached
+
       ensure_initialized
       params = {}
       params['cursor'] = cursor if cursor
-      result = rpc_request('resources/list', params) || {}
+      epoch = cache_epoch(:resources)
+      result = fetching_list_page(:resources, cursor) { rpc_request('resources/list', params) } || {}
+      record_cache_hint(:resources, result, epoch: epoch) unless cursor
       resources = (result['resources'] || []).map { |td| MCPClient::Resource.from_json(td, server: self) }
-      { 'resources' => resources, 'nextCursor' => result['nextCursor'] }
+      resources_result = { 'resources' => resources, 'nextCursor' => result['nextCursor'] }
+      attach_list_value(:resources, resources_result) unless cursor
+      resources_result
     rescue MCPClient::Errors::ServerError => e
       # 2026-07-28 protocol errors carry actionable data (requiredCapabilities,
       # supported versions); keep them intact instead of wrapping.
@@ -422,15 +466,16 @@ module MCPClient
     # @raise [MCPClient::Errors::ResourceReadError] for other errors during resource reading
     def read_resource(uri)
       ensure_initialized
-      result = require_complete_result!(rpc_request('resources/read', { 'uri' => uri }) || {},
-                                        'resources/read')
-      contents = result['contents'] || []
-      contents.map { |content| MCPClient::ResourceContent.from_json(content) }
+      # A null result reaches the shared guard as-is: it is a malformed
+      # response, not an empty resource.
+      read_resource_with_cache(uri) { rpc_request('resources/read', { 'uri' => uri }) }
     rescue MCPClient::Errors::ServerError => e
       raise if e.protocol_error?
       raise resource_not_found_error(uri, e) if resource_not_found_response?(e)
 
       raise MCPClient::Errors::ResourceReadError, "Error reading resource '#{uri}': #{e.message}"
+    rescue MCPClient::Errors::TransportError
+      raise
     rescue StandardError => e
       raise MCPClient::Errors::ResourceReadError, "Error reading resource '#{uri}': #{e.message}"
     end
@@ -441,12 +486,23 @@ module MCPClient
     # @raise [MCPClient::Errors::ServerError] if server returns an error
     # @raise [MCPClient::Errors::ResourceReadError] for other errors during resource template listing
     def list_resource_templates(cursor: nil)
+      # Only a list the server itself bounded is served from here: a
+      # positive ttlMs means no second request, while a list with no hint
+      # (a 2025-11-25 server) is asked for again, as it was before this
+      # transport cached anything (MCP 2026-07-28 caching).
+      cached = cursor ? nil : hinted_list_value(:templates)
+      return cached if cached
+
       ensure_initialized
       params = {}
       params['cursor'] = cursor if cursor
-      result = rpc_request('resources/templates/list', params) || {}
+      epoch = cache_epoch(:templates)
+      result = fetching_list_page(:templates, cursor) { rpc_request('resources/templates/list', params) } || {}
+      record_cache_hint(:templates, result, epoch: epoch) unless cursor
       templates = (result['resourceTemplates'] || []).map { |td| MCPClient::ResourceTemplate.from_json(td, server: self) }
-      { 'resourceTemplates' => templates, 'nextCursor' => result['nextCursor'] }
+      templates_result = { 'resourceTemplates' => templates, 'nextCursor' => result['nextCursor'] }
+      attach_list_value(:templates, templates_result) unless cursor
+      templates_result
     rescue MCPClient::Errors::ServerError => e
       # 2026-07-28 protocol errors carry actionable data (requiredCapabilities,
       # supported versions); keep them intact instead of wrapping.
@@ -518,14 +574,19 @@ module MCPClient
     # @raise [MCPClient::Errors::ServerError] if server returns an error
     # @raise [MCPClient::Errors::ToolCallError] for other errors during tool listing
     def list_tools
+      # MCP 2026-07-28 caching: a list the server put a positive ttlMs on is
+      # served here while it is still fresh, so a host reaching for the
+      # transport directly does not re-list on every call.
+      cached = hinted_list_value(:tools)
+      return cached if cached
+
       ensure_initialized
-      collect_paginated('tools') do |cursor|
-        params = {}
-        params['cursor'] = cursor if cursor
-        result = rpc_request('tools/list', params) || {}
-        tools = (result['tools'] || []).map { |td| MCPClient::Tool.from_json(td, server: self) }
-        [tools, result['nextCursor']]
-      end
+      # A cursor the server rejects restarts the list from its first page,
+      # exactly as it does on the HTTP transports (MCP pagination).
+      page = { cursor: nil }
+      tools = restarting_rejected_cursor('tools', page) { collect_tool_pages(page) }
+      attach_list_value(:tools, tools)
+      tools
     rescue MCPClient::Errors::ServerError => e
       # 2026-07-28 protocol errors carry actionable data (requiredCapabilities,
       # supported versions); keep them intact instead of wrapping.
@@ -534,6 +595,31 @@ module MCPClient
       raise MCPClient::Errors::ToolCallError, "Error listing tools: #{e.message}"
     rescue StandardError => e
       raise MCPClient::Errors::ToolCallError, "Error listing tools: #{e.message}"
+    end
+
+    # Collect every page of tools/list, recording what each page was answered
+    # under so the cache can bind the combined list to it.
+    # @param page [Hash] holds the cursor of the request in flight
+    # @return [Array<MCPClient::Tool>]
+    def collect_tool_pages(page)
+      pages = []
+      received_ats = []
+      fingerprints = []
+      epoch = cache_epoch(:tools)
+      tools = collect_paginated('tools') do |cursor|
+        params = {}
+        params['cursor'] = cursor if cursor
+        started = monotonic_now
+        page[:cursor] = cursor
+        result = fetch_list_page(:tools, cursor) { rpc_request('tools/list', params) } || {}
+        pages << result
+        received_ats << response_received_at(since: started)
+        fingerprints << request_params_fingerprint
+        tools = (result['tools'] || []).map { |td| MCPClient::Tool.from_json(td, server: self) }
+        [tools, result['nextCursor']]
+      end
+      record_list_cache_hint('tools/list', pages, received_ats, params: fingerprints, epoch: epoch)
+      tools
     end
 
     # Call a tool with the given parameters
@@ -841,6 +927,11 @@ module MCPClient
     # within a reasonable time, then SIGKILL if it still does not exit.
     # @return [void]
     def cleanup
+      # Everything this transport left on this thread — the notes of the
+      # entries it served and recorded, the credentials, parameters and
+      # metadata of its requests — describes a slice that will never be
+      # tagged and a request that will never be made.
+      forget_transport_thread_state
       return unless @stdin
 
       # Past this point the reader threads speak for a transport that is
@@ -883,6 +974,7 @@ module MCPClient
       # Release any buffered responses / awaiting markers
       @mutex.synchronize do
         @pending.clear
+        @response_arrivals&.clear
         @awaiting.clear
       end
       # The process this session was is gone, whatever else went wrong above.
@@ -891,6 +983,8 @@ module MCPClient
       @session&.ended
       @session = nil
       @stdin = @stdout = @stderr = @wait_thread = @reader_thread = @stderr_thread = nil
+      # Cached results belong to the process that just ended.
+      clear_result_cache
       # The next request re-establishes the process and, on a modern
       # server, re-sends the subscriptions the host still holds.
       @initialized = false
