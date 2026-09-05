@@ -179,9 +179,14 @@ until the server answers *it*.
 
 On a 2026-07-28 server a host can also open a stream of its own with
 `server.listen(notifications: { tools_list_changed: true }) { |method, params| … }`
-and end it with `subscription.close`. The block runs on the subscription's own
-dispatcher thread, never on the transport's reader, so a listener may issue
-requests of its own; the notifications waiting for it are bounded both in
+and end it with `subscription.close`. A listen the server never acknowledges is
+given up on rather than left pending for ever: `ack_timeout:` bounds the wait
+for the acknowledgment (the transport's read timeout by default, `false` to
+wait for ever), and one that expires cancels the request and closes the handle
+with a `RequestTimeoutError`. The stream itself is not bounded — once
+acknowledged it runs for as long as the server keeps it. The block runs on the
+subscription's own dispatcher thread, never on the transport's reader, so a
+listener may issue requests of its own; the notifications waiting for it are bounded both in
 number (`MCPClient::Subscription::MAX_PENDING_NOTIFICATIONS`) and in the bytes
 they retain (`MCPClient::Subscription::MAX_PENDING_NOTIFICATION_BYTES`) — a
 count alone is not a memory bound when the peer chooses how big each payload
@@ -220,7 +225,9 @@ just invalidated. That holds for the client's caches as well as the
 transport's: the client drops its `tool_cache` / `prompt_cache` /
 `resource_cache` on the transport's `on_cache_invalidation` hook, which runs at
 the invalidation step, rather than on the host callback that runs after the
-delivery. Everything else the client does with a notification (logging,
+delivery. A custom transport that emits no such hook — one written against the
+older interface, which only calls the notification callback — still has those
+caches dropped, on the callback and ahead of everything else there. Everything else the client does with a notification (logging,
 progress callbacks, task status) stays behind the delivery, because it is host
 code or leads to it. Transports that carry no subscription stream announce the
 same hook before their notification callback — the legacy SSE parser, and the
@@ -251,7 +258,9 @@ it in place must not be able to rewrite the subscription's own record of the
 watch. `active?` answers false while a dropped stream
 waits to re-open, and a closing response the client cannot recognize (an unknown
 `resultType`, a missing or scalar result) fails the subscription instead of
-closing it gracefully. On Streamable HTTP closing the SSE response stream *is*
+closing it gracefully — as does one that is recognized but says the request has
+not finished (`input_required`, which is valid on `tools/call`,
+`resources/read` and `prompts/get` alone). On Streamable HTTP closing the SSE response stream *is*
 the cancellation, including against a connection that is still opening its
 socket: once `close` (or the transport's `cleanup`) returns, either the listen
 request was never sent — that session refuses to send one for a closed
