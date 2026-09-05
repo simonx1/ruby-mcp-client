@@ -212,11 +212,21 @@ stays within the budget plus one peer-sized payload.
 notification is routed in a fixed order: subscription bookkeeping (an
 acknowledgment, a server-side teardown) first, then the transport and client
 cache invalidation, then the delivery to the subscription's listeners, and the
-client's `on_notification` callback **last**. Caches are therefore dropped
+host's `on_notification` listeners **last**. Caches are therefore dropped
 *before* a notification reaches the listeners, so a listener reacting to a
 `list_changed` notification by calling `list_tools` (or the prompt or resource
 equivalents) always re-fetches rather than reading the entry the notification
-just invalidated. The host callback comes last because it is the only step
+just invalidated. That holds for the client's caches as well as the
+transport's: the client drops its `tool_cache` / `prompt_cache` /
+`resource_cache` on the transport's `on_cache_invalidation` hook, which runs at
+the invalidation step, rather than on the host callback that runs after the
+delivery. Everything else the client does with a notification (logging,
+progress callbacks, task status) stays behind the delivery, because it is host
+code or leads to it. Transports that carry no subscription stream announce the
+same hook before their notification callback — the legacy SSE parser, and the
+synthetic `tools/list_changed` a `Mcp-Param-*` header-mismatch refresh emits —
+so nothing that invalidates a cache is announced on only one of the two.
+The host callback comes last because it is the only step
 that can block: it is host code and it runs on whatever thread is routing — on
 stdio the server process's sole reader — so a callback that issues a
 synchronous request of its own would otherwise hold up the delivery while
@@ -254,10 +264,20 @@ is the server refusing this subscription, and those still end it.
 On stdio a server process that exits on its own is restarted at once
 while subscriptions are open, since a host that is only waiting for
 notifications never makes the request that would otherwise restart it, and the
-subscriptions are re-sent on the new process; if it cannot be restarted, or if
+subscriptions are re-sent on the new process. An exit *during* the
+initialization that established the process counts too: a replacement that
+answers the discovery probe and then dies is noticed by its own reader, which
+waits out the initialization still in flight and then restarts — otherwise
+nothing noticed, the dead connection was marked initialized, the re-sent
+listens failed into the "wait for the next process" path, and no reader was
+left to establish one. If the process cannot be restarted, or if
 the process they were last re-sent to died less than
 `MCPClient::ServerStdio::SUBSCRIPTION_RESTART_MIN_INTERVAL` after receiving
-them, they end with that error rather than waiting for ever. The record of
+them, they end with that error rather than waiting for ever. Only an exit
+counts against that bound, never a teardown the client asked for: a host that
+calls `cleanup` and reconnects — which every `cleanup`/request cycle does —
+tears the process down whenever it likes, and reading that as a crash closed
+the very subscriptions the reconnect exists to carry across. The record of
 that process answers only that one question, and asking it spends it: a
 subscription opened directly on the replacement, after a refusal had already
 closed the ones the corpse carried, is judged on its own process's uptime
@@ -285,7 +305,16 @@ it and send two listen requests for one subscription. `close` cancels what is
 actually outstanding: `notifications/cancelled` names every listen request the
 client wrote for that subscription on the live process, not only the id it
 happens to be on, while ids written to a process that has since gone are
-forgotten rather than cancelled on the one that replaced it.
+forgotten rather than cancelled on the one that replaced it. That accounting
+holds because a listen request is written to the pipe it was recorded against
+rather than to whichever process is current when the write finally happens: a
+write still pending when the process exits goes to the process it was opening
+on (failing into the paths above once its pipe is closed), never to the
+replacement, which would otherwise be serving a second stream whose id the
+teardown had already forgotten. On Streamable HTTP the mirror image is
+refused rather than deferred — a `listen` whose connection is closed while it
+is being opened raises `ConnectionError` instead of POSTing onto a transport
+the host has closed, which no later `cleanup` would find.
 
 ## MCP 2025-11-25 Features
 

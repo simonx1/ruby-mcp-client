@@ -94,21 +94,25 @@ module MCPClient
     # subscription's listeners are watching for.
     CONTROL_NOTIFICATIONS = %w[notifications/subscriptions/acknowledged notifications/cancelled].freeze
 
-    # Route an incoming notification, in four steps and in this order:
+    # Route an incoming notification, in this order:
     # subscription bookkeeping (acknowledgment, server-side teardown), then
     # transport and host cache invalidation, then the delivery to the owning
     # subscription's listeners, and last the host's `on_notification` callback
     # (so hosts still see subscription-delivered notifications exactly like
     # request-scoped ones).
     #
-    # The invalidations come first on purpose. A listener runs on the
-    # subscription's own dispatcher thread, so queuing its delivery makes the
-    # notification visible at once — and a listener that reacts to a
-    # list_changed notification by calling a cached list method
-    # (`client.list_tools`, say) would then read the very entry the
+    # The invalidations come first on purpose, the transport's and the host's
+    # alike. A listener runs on the subscription's own dispatcher thread, so
+    # queuing its delivery makes the notification visible at once — and a
+    # listener that reacts to a list_changed notification by calling a cached
+    # list method (`client.list_tools`, say) would then read the very entry the
     # notification says is stale. Dropping the caches before the delivery is
     # queued makes "the caches are already invalid when a listener sees the
     # notification" a guarantee instead of a race the scheduler usually wins.
+    # That is why the host's invalidation has a hook of its own
+    # ({MCPClient::ServerBase#on_cache_invalidation}) rather than riding on the
+    # host callback below: while it did, the guarantee held only for the
+    # transport's own caches and the host's were dropped after the delivery.
     #
     # The host callback comes last, because it is the only step that can
     # block. It is host code driven by the peer and it runs on whatever thread
@@ -137,6 +141,14 @@ module MCPClient
     def route_notification(method, params)
       handle_subscription_control(method, params)
       invalidate_cache_for_notification(method) if respond_to?(:invalidate_cache_for_notification, true)
+      # The host's caches go with the transport's, on their own hook rather
+      # than on the host callback below: that callback is deliberately last —
+      # it is the step that may block — and a client whose invalidation rode on
+      # it dropped its entries only after the delivery had been queued, so a
+      # listener could read the very list the notification says is stale. Only
+      # the invalidation is moved ahead; everything else the host does with a
+      # notification is still behind the delivery.
+      notify_cache_invalidation(method, params)
       deliver_subscription_notification(subscription_delivery_target(method, params), method, params)
       notify_host(method, params)
     end

@@ -85,6 +85,11 @@ module MCPClient
       def process_notification?(data)
         return false unless data['method'] && !data.key?('id')
 
+        # The legacy SSE transport carries no subscriptions/listen stream, so
+        # there is no delivery to run ahead of — but a host that registered its
+        # cache invalidation on the dedicated hook must still be told here
+        # (see {MCPClient::ServerBase#on_cache_invalidation}).
+        notify_cache_invalidation(data['method'], data['params'])
         @notification_callback&.call(data['method'], data['params'])
         true
       end

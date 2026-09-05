@@ -219,6 +219,23 @@ module MCPClient
       @notification_callback = block
     end
 
+    # Register a callback for the caches a notification invalidates, run
+    # *before* the notification is delivered to a subscription's listeners.
+    #
+    # A host layered above the transport (MCPClient::Client) keeps caches of
+    # its own, and they have to be gone by the time a listener reacting to a
+    # `list_changed` notification calls the cached list method. `on_notification`
+    # cannot serve for that: it is the last routing step, deliberately after
+    # the delivery, because it is host code that may block on the very reader
+    # the delivery came from. So the invalidation gets a hook of its own, ahead
+    # of the delivery, and only the invalidation goes on it.
+    # @yield [method, params] invoked before the notification is delivered
+    # @return [void]
+    # @see MCPClient::JsonRpcCommon#notify_cache_invalidation for where it runs
+    def on_cache_invalidation(&block)
+      @cache_invalidation_callback = block
+    end
+
     # Map a resources/read error response to ResourceNotFound. MCP 2026-07-28
     # (server/resources.mdx "Error Handling"): a missing resource is reported
     # with -32602 (Invalid params); "for backwards compatibility, clients

@@ -27,6 +27,13 @@ module MCPClient
       def initialize
         @carried_at = nil
         @ended_at = nil
+        @exited_unexpectedly = false
+      end
+
+      # @return [Boolean] whether this process went on its own rather than
+      #   being torn down by the client
+      def exited_unexpectedly?
+        @exited_unexpectedly
       end
 
       # @return [Float] monotonic seconds
@@ -53,10 +60,26 @@ module MCPClient
         @ended_at = ChildSession.now
       end
 
+      # This process exited on its own — the reader saw EOF on a stdin the
+      # client had not closed (see
+      # {MCPClient::ServerStdio#handle_server_exit}). Recorded separately from
+      # {#ended}, which every teardown stamps, because only an exit is a crash.
+      # @return [void]
+      def exited_unexpectedly
+        @exited_unexpectedly = true
+      end
+
       # Whether this process died too soon after being given the subscriptions
       # to be given them again — the crash loop the restart bound exists to
       # stop. A process that was never given any is not part of that loop, and
       # one that is still alive has not ended anything.
+      #
+      # Neither is a process the client itself shut down. A host that closes
+      # the transport and reconnects — as a `cleanup`/request cycle does, and
+      # as re-authenticating or re-configuring a server does — tears the
+      # process down whenever it likes, and reading that as the server crashing
+      # closed the very subscriptions the reconnect exists to carry across.
+      # Only an exit the reader actually watched happen counts.
       #
       # The interval is measured from the moment it received them, so a server
       # that is slow to start is credited with none of its own handshake, and a
@@ -66,7 +89,7 @@ module MCPClient
       #   {MCPClient::ServerStdio::SUBSCRIPTION_RESTART_MIN_INTERVAL})
       # @return [Boolean]
       def died_carrying_subscriptions?(min_uptime)
-        return false unless @carried_at && @ended_at
+        return false unless @exited_unexpectedly && @carried_at && @ended_at
 
         (@ended_at - @carried_at) < min_uptime
       end
