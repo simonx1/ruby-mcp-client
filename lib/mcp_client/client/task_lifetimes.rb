@@ -28,6 +28,8 @@ module MCPClient
       # whether or not anything of the previous one is still around — so on a
       # sessionless connection, where the epoch never moves and nothing else
       # prunes it, the map would otherwise grow with every task ever created.
+      # It bounds the ids of tasks that are over: a task still running keeps
+      # its lifetime however many ids follow it (see {#prune_task_lifetimes}).
       MAX_TRACKED_TASK_LIFETIMES = 4096
       # How far a prune goes once the cap is passed: dropping a batch keeps the
       # scan amortized instead of walking the map on every creation.
@@ -68,13 +70,19 @@ module MCPClient
       def start_task_lifetime(srv, task_id, epoch)
         answered_keys_mutex.synchronize do
           lookup = [srv.object_id, epoch, task_id]
-          @task_states&.delete(lookup)
+          @task_states ||= {}
+          drop_ended_session_state(lookup)
           lifetimes = (@task_lifetimes ||= {})
           generation = next_task_lifetime(lookup)
           # Re-inserted, so the ids created most recently are the last a prune
           # reaches (a Hash keeps a rewritten key where it was).
           lifetimes.delete(lookup)
           lifetimes[lookup] = generation
+          # The task exists from here until something says it is over, and its
+          # own bookkeeping — never the replaced task's — says so: a live
+          # entry is what keeps the prune below off the lifetime the handle
+          # this creation produces names.
+          @task_states[lookup] = new_task_state(lookup)
           prune_task_lifetimes(lifetimes)
           generation
         end
@@ -110,9 +118,16 @@ module MCPClient
       # {#check_task_lifetime_locked!}): the session's counter never restarts,
       # so a later creation under a pruned id is a number of its own and can
       # never read as the lifetime such a handle names.
-      # An id whose bookkeeping is still live — or whose keys a handler is
-      # still presenting — is never dropped: its lifetime is what tells that
-      # state, and the requests running against it, which task they belong to.
+      #
+      # Only the lifetimes of tasks this client no longer tracks are
+      # forgotten. A creation records the task's bookkeeping (see
+      # {#start_task_lifetime}) and a terminal poll, a cancellation, a TTL
+      # expiry or a `TaskNotFound` drops it again, so what the cap bounds is
+      # the ids of tasks that have ended — never a handle whose task is still
+      # running, whose absence from the registry the client has no business
+      # reading as the task being over. An id whose keys a handler is still
+      # presenting stays too: an abandoned handler outlives the bookkeeping,
+      # and its holds name the lifetime they belong to.
       # @return [void] (callers hold answered_keys_mutex)
       def prune_task_lifetimes(lifetimes)
         return if lifetimes.size <= MAX_TRACKED_TASK_LIFETIMES

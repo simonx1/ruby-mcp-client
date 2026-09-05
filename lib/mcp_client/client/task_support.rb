@@ -587,7 +587,6 @@ module MCPClient
       # @return [MCPClient::Task] the server's task, or a locally completed one
       def call_tool_as_modern_task(tool_name, parameters, srv, tool: nil)
         ensure_tasks_extension!(srv)
-        generation_before = tools_generation_of(srv)
         # The session the call reaches: a task it creates belongs to that
         # session, whatever session is live once the answer is parsed. The
         # call is written into that very session and no other — a transport
@@ -596,32 +595,54 @@ module MCPClient
         # one, and the wait would then refuse a task whose (possibly
         # non-idempotent) tool has already run.
         epoch = invocation_session_epoch(srv)
-        result = begin
-          pinned_to_session(srv, epoch) { srv.call_tool(tool_name, parameters) }
-        rescue MCPClient::Errors::ServerError => e
-          # Protocol errors (HeaderMismatch, missing capability, ...) keep
-          # their type; anything else is a failed creation.
-          raise if e.protocol_error?
+        # The call and the re-resolve that follows it share one slot for the
+        # definition the request went out under, exactly as #call_tool does:
+        # without it the transport's record dies with its own call and the
+        # re-resolve would list again, validating the answer against a
+        # definition newer than the one the call carried.
+        with_called_tool_definition(srv) do
+          generation_before = tools_generation_of(srv)
+          result = modern_task_tool_call(tool_name, parameters, srv, epoch)
+          next created_task(result, srv, epoch) if task_result?(result)
 
-          raise MCPClient::Errors::TaskError, 'Error creating task for tool ' \
-                                              "'#{sanitize_peer_log_text(tool_name.to_s)}': " \
-                                              "#{sanitize_peer_log_text(e.message)}"
-        rescue MCPClient::Errors::ToolCallError, MCPClient::Errors::TransportError,
-               MCPClient::Errors::ConnectionError => e
-          raise MCPClient::Errors::TaskError, 'Error creating task for tool ' \
-                                              "'#{sanitize_peer_log_text(tool_name.to_s)}': " \
-                                              "#{sanitize_peer_log_text(e.message)}"
+          MCPClient::Task.completed_locally(validated_sync_result(result, srv, tool, generation_before), server: srv)
         end
-        return created_task(result, srv, epoch) if task_result?(result)
+      end
 
-        # Answered synchronously: the result is validated against the tool's
-        # outputSchema exactly as #call_tool would — against the definition
-        # a mid-call HeaderMismatch refresh replaced, when it did.
-        if tool
-          tool = refreshed_tool(tool) || tool if tools_generation_of(srv) != generation_before
-          result = validate_structured_content!(tool, result)
-        end
-        MCPClient::Task.completed_locally(result, server: srv)
+      # The tools/call itself, with every failure to create a task reported as
+      # one.
+      # @param epoch [Integer, nil] the session the call belongs to
+      # @return [Object] the JSON-RPC result
+      # @raise [MCPClient::Errors::TaskError]
+      def modern_task_tool_call(tool_name, parameters, srv, epoch)
+        pinned_to_session(srv, epoch) { srv.call_tool(tool_name, parameters) }
+      rescue MCPClient::Errors::ServerError => e
+        # Protocol errors (HeaderMismatch, missing capability, ...) keep
+        # their type; anything else is a failed creation.
+        raise if e.protocol_error?
+
+        raise MCPClient::Errors::TaskError, 'Error creating task for tool ' \
+                                            "'#{sanitize_peer_log_text(tool_name.to_s)}': " \
+                                            "#{sanitize_peer_log_text(e.message)}"
+      rescue MCPClient::Errors::ToolCallError, MCPClient::Errors::TransportError,
+             MCPClient::Errors::ConnectionError => e
+        raise MCPClient::Errors::TaskError, 'Error creating task for tool ' \
+                                            "'#{sanitize_peer_log_text(tool_name.to_s)}': " \
+                                            "#{sanitize_peer_log_text(e.message)}"
+      end
+
+      # A call the server answered synchronously: the result is validated
+      # against the tool's outputSchema exactly as #call_tool would — against
+      # the definition the request went out under, which a mid-call
+      # HeaderMismatch refresh may since have replaced.
+      # @param tool [MCPClient::Tool, nil] the definition the call was made with
+      # @param generation_before [Integer, nil] the tool-list generation before the call
+      # @return [Object] the validated result
+      def validated_sync_result(result, srv, tool, generation_before)
+        return result unless tool
+
+        tool = refreshed_tool(tool) || tool if tools_generation_of(srv) != generation_before
+        validate_structured_content!(tool, result)
       end
 
       # The handle for a CreateTaskResult, which MUST carry a taskId.
@@ -750,10 +771,15 @@ module MCPClient
           # The whole deadline (caller timeout and task TTL) is enforced
           # before anything is delivered.
           raise_if_past_deadline!(wait)
-        rescue StandardError
-          # Nothing was delivered: the keys go back (except those answered
-          # through #update_task meanwhile) and so does the round.
+        rescue StandardError => e
+          # Nothing was delivered, but a request the host answered before the
+          # failure has been put to a person: those answers are kept — queued
+          # for the next poll to deliver, and their keys left answered — so a
+          # retry never asks for them again. Everything else goes back
+          # (except what #update_task answered meanwhile), and so does the
+          # round.
           unless abandoned
+            keep_partial_input_answers(state, pending, e)
             answered_keys_mutex.synchronize do
               answered.subtract(pending.keys - state[:submitted].to_a)
               state[:rounds] -= 1 if state[:rounds].positive?
@@ -779,6 +805,27 @@ module MCPClient
         pending.keys
       end
 
+      # Hold on to the answers a round trip produced before it failed. The
+      # host answered those requests, so they are recorded (their keys stay
+      # answered) and left pending, which is what a later poll retransmits —
+      # the failure ends this wait, and nothing of what a person already
+      # typed is thrown away with it. Only keys this round reserved count: an
+      # answer for anything else was never this handler's to give.
+      # @param state [Hash] the task bookkeeping the round was reserved in
+      # @param pending [Hash] the requests this round put to the host
+      # @param error [StandardError] what ended the round
+      # @return [void]
+      def keep_partial_input_answers(state, pending, error)
+        return unless error.is_a?(MCPClient::Errors::InputRequiredError)
+
+        answers = error.answered_so_far.select { |key, _| pending.key?(key) }
+        return if answers.empty?
+
+        logger.debug("Task #{shown_task_id(state[:lookup].last)}: keeping #{answers.size} answer(s) the host gave " \
+                     'before the input round failed; they go out with the next update')
+        queue_task_update(state, answers)
+      end
+
       # Whether the answers a handler just produced still belong to the task
       # they were asked for: the session must not have restarted under the
       # host, the bookkeeping they were built in must still be what the id
@@ -802,19 +849,52 @@ module MCPClient
         end
       end
 
-      # Whether a task request's error means the task is gone. A rejection of
-      # the supplied inputResponses (tasks/update) is about the params,
-      # whatever else the message says: the task still exists. tasks/get
-      # answers -32602 for an unknown task; tasks/update and tasks/cancel use
-      # it for other reasons too, so there only an explicit indication counts.
+      # Whether a task request's error means the task is gone.
+      #
+      # On a 2026-07-28 server that answered with a JSON-RPC code, the code
+      # decides: the revision specifies -32602 for a task id that names
+      # nothing, and every other code is a failure of the request rather than
+      # a report about the task. An internal error (-32603) whose message
+      # happens to say "expired" is the server telling us something went
+      # wrong, not that the task is missing — reading it as a missing task
+      # would delete the task's bookkeeping, and with it the answers an
+      # unconfirmed tasks/update still owes the server.
+      #
+      # Anything else (a legacy server, or an error carrying no code at all)
+      # is left to the message, as before.
+      # @param modern [Boolean] whether the server negotiated MCP 2026-07-28
       # @return [Boolean]
       def task_not_found_error?(error, method, modern)
-        return false if method != 'tasks/get' && error.message.match?(/inputResponses/i)
-        return true if error.message.match?(/not found|unknown task|no such task|invalid taskId|expired/i)
-        return false if method != 'tasks/get' && error.message.match?(/params/i)
+        code = error.respond_to?(:code) ? error.code : nil
+        return modern_task_not_found?(error, method, code) if modern && code.is_a?(Integer)
 
-        modern && error.respond_to?(:code) && error.code == MCPClient::Errors::Codes::INVALID_PARAMS &&
-          (method.nil? || method == 'tasks/get')
+        legacy_task_not_found?(error, method)
+      end
+
+      # tasks/get answers -32602 for an unknown task; tasks/update and
+      # tasks/cancel use it for bad params too, so there the message still has
+      # to say the task is the problem — and a rejection of the supplied
+      # inputResponses never is.
+      # @param code [Integer] the JSON-RPC error code the server sent
+      # @return [Boolean]
+      def modern_task_not_found?(error, method, code)
+        return false unless code == MCPClient::Errors::Codes::INVALID_PARAMS
+        return true if method == 'tasks/get'
+        return false if error.message.match?(/inputResponses/i)
+        return true if error.message.match?(/not found|unknown task|no such task|invalid taskId/i)
+
+        # A caller that named no request keeps the reading it had: the params
+        # are the request's problem, anything else the task's.
+        method.nil? && !error.message.match?(/params/i)
+      end
+
+      # The pre-2026 heuristic: those servers reported a missing task in the
+      # message, with no code that says it.
+      # @return [Boolean]
+      def legacy_task_not_found?(error, method)
+        return false if method != 'tasks/get' && error.message.match?(/inputResponses/i)
+
+        error.message.match?(/not found|unknown task|no such task|invalid taskId|expired/i)
       end
 
       # Run a host handler or a task RPC within what is left of the wait:

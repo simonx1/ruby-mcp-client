@@ -236,14 +236,28 @@ RSpec.describe 'MCP 2026-07-28 tasks extension — round 38' do
   describe 'the lifetimes a prune forgets' do
     let(:cap) { MCPClient::Client::TaskRegistry::MAX_TRACKED_TASK_LIFETIMES }
 
+    # Ids whose tasks are over: a prune only forgets the lifetime of a task
+    # this client no longer tracks, so the crowd has to be a crowd of ended
+    # tasks — a live one keeps its lifetime however many ids follow it.
     def crowd_out(client, count = nil)
-      (count || (cap + 1)).times { |i| creation(client, result: create_result('taskId' => "other-#{i}")) }
+      (count || (cap + 1)).times do |i|
+        creation(client, result: create_result('taskId' => "other-#{i}"))
+        client.send(:forget_task_keys, stdio, "other-#{i}")
+      end
+    end
+
+    # The wait that was following the task ended (its TTL ran out, a poll
+    # found it terminal), so the client keeps no bookkeeping for it — while
+    # the host still holds the handle.
+    def no_longer_tracked(client, task_id = 'task-1')
+      client.send(:forget_task_keys, stdio, task_id)
     end
 
     it 'never lets a re-created id read as the lifetime a pruned handle names' do
       client = client_for
       negotiated
       handle = creation(client)
+      no_longer_tracked(client)
 
       crowd_out(client)
       recreated = creation(client)
@@ -255,6 +269,7 @@ RSpec.describe 'MCP 2026-07-28 tasks extension — round 38' do
       client = client_for
       negotiated
       handle = creation(client)
+      no_longer_tracked(client)
       allow(client).to receive(:task_rpc)
 
       crowd_out(client)
@@ -267,6 +282,7 @@ RSpec.describe 'MCP 2026-07-28 tasks extension — round 38' do
       client = client_for
       negotiated
       handle = creation(client)
+      no_longer_tracked(client)
       allow(client).to receive(:task_rpc)
 
       crowd_out(client)

@@ -17,6 +17,11 @@ module MCPClient
     # Fulfil every input request through the handler registered for its
     # method. There is no per-key error channel in InputResponses, so any
     # request this client cannot honour fails the whole round trip.
+    #
+    # The answers produced before the failure travel with the error
+    # ({MCPClient::Errors::InputRequiredError#answered_so_far}): a request the
+    # host already answered has been put to a person, and a caller that can
+    # keep it — the tasks extension's poll loop — must not ask them again.
     # @param input_requests [Hash] the InputRequests map
     # @param result [Hash] the InputRequiredResult (for error data)
     # @return [Hash] the InputResponses map
@@ -27,9 +32,13 @@ module MCPClient
                                                         data: result)
       end
 
-      input_requests.to_h do |key, request|
-        [key, fulfil_input_request(key, request, result)]
+      responses = {}
+      input_requests.each do |key, request|
+        responses[key] = fulfil_input_request(key, request, result)
+      rescue MCPClient::Errors::InputRequiredError => e
+        raise e.with_answered_so_far(responses)
       end
+      responses
     end
 
     # @param key [String] the server-assigned request key

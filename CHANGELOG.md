@@ -7,6 +7,43 @@ metadata). Each feature lands in its own PR; this section accumulates them.
 
 ### Tasks extension (`io.modelcontextprotocol/tasks`)
 
+- **The lifetime cap forgets tasks that ended, never one that is running
+  (verification round).** A creation recorded the id's lifetime but no
+  bookkeeping for the task it started, and the prune exempts only ids whose
+  bookkeeping is live — so a handle retained across 4096 further creations (an
+  ordinary batch submission, the legacy `call_tool_as_task` included) was
+  crowded out, and `get_task`, `update_task` and `cancel_task` through it
+  raised `TaskReplacedError` although the server had neither expired nor
+  replaced the task. A creation now records the task's own bookkeeping, so what
+  the cap bounds is the ids of tasks this client no longer tracks — a terminal
+  poll, a cancellation, a TTL expiry or a `TaskNotFound` makes an id prunable,
+  and nothing else does.
+- **On a 2026-07-28 server the error code decides whether a task is missing
+  (verification round).** The legacy message heuristic ran first, so a
+  `tasks/get` answered `{"code":-32603,"message":"Upstream credential
+  expired"}` raised `TaskNotFound` and deleted the task's bookkeeping with it —
+  losing the pending payload and answered keys of an unconfirmed
+  `tasks/update`, so a resumed wait could neither retransmit nor avoid
+  prompting the host again. A modern error that carries a JSON-RPC code is now
+  read by the code: -32602 is the revision's missing-task answer, and every
+  other code is a failed request that takes nothing of the task with it. Legacy
+  servers, and errors with no code at all, keep the message heuristic.
+- **Both new call paths validate against the definition the call went out
+  under (verification round).** Neither `call_tool_as_task` on a modern server
+  nor a task chunk of `call_tool_streaming` opened the slot that holds the
+  definition a `tools/call` request carried, so the transport's record died
+  with its own call and the re-resolve listed again — validating the result
+  against a definition newer than the call's own (a list bounded by `ttlMs: 0`,
+  or one whose TTL ran out during the call, re-fetches on every access). Both
+  now wrap the call and its re-resolve exactly as `call_tool` does.
+- **An input round that fails part way keeps the answers already given
+  (verification round).** `fulfil_input_requests` answered the requests in
+  order and threw the whole map away when one failed, and the wait then gave
+  every key back — so a retry put a request the host (and possibly a person)
+  had already answered to it a second time. The answers produced before the
+  failure now travel with the `InputRequiredError`
+  (`#answered_so_far`); the wait records them, leaves them pending for the next
+  `tasks/update`, and hands back only the keys nobody answered.
 - **A streaming `tools/call` is pinned while it is enumerated, not only while
   it is built (round 38).** Every built-in transport answers
   `call_tool_streaming` with a lazy `Enumerator`: round 37's pin only wrapped
