@@ -8,7 +8,7 @@ RSpec.describe MCPClient::ServerSSE::SseParser do
     Class.new do
       include MCPClient::ServerSSE::SseParser
 
-      attr_reader :rpc_endpoint, :sse_connected, :connection_established, :notification_calls
+      attr_reader :rpc_endpoint, :sse_connected, :connection_established, :notification_calls, :routing_order
 
       def initialize
         @mutex = Mutex.new
@@ -17,9 +17,11 @@ RSpec.describe MCPClient::ServerSSE::SseParser do
         @connection_cv = cv
         @base_url = 'https://example.com/sse'
         @logger = Logger.new(StringIO.new)
+        @routing_order = []
         @notification_callback = proc { |m, p|
           @notification_calls ||= []
           @notification_calls << [m, p]
+          @routing_order << :host_callback
         }
         @sse_results = {}
         @pending_request_ids = Set.new
@@ -27,6 +29,12 @@ RSpec.describe MCPClient::ServerSSE::SseParser do
       end
 
       def record_activity; end
+
+      # Supplied by MCPClient::JsonRpcCommon on the real transport: the hook a
+      # host layered above it drops its caches on, ahead of the host callback.
+      def notify_cache_invalidation(_method, _params)
+        @routing_order << :cache_invalidation
+      end
 
       def authorization_error?(_msg, _code) = false
 
@@ -154,6 +162,15 @@ RSpec.describe MCPClient::ServerSSE::SseParser do
       raw = "event: message\ndata: #{notification.to_json}\n\n"
       parser.parse_and_handle_sse_event(raw)
       expect(parser.notification_calls).to eq([['n', { 'a' => 1 }]])
+    end
+
+    # This transport carries no subscriptions/listen stream, but a host that
+    # registered its cache invalidation on the dedicated hook must still be
+    # told — and told first, the way every other transport tells it.
+    it 'invalidates the host caches before calling the notification callback' do
+      notification = { method: 'notifications/tools/list_changed', params: {} }
+      parser.parse_and_handle_sse_event("event: message\ndata: #{notification.to_json}\n\n")
+      expect(parser.routing_order).to eq(%i[cache_invalidation host_callback])
     end
 
     it 'delivers a JSON-RPC response into @sse_results without touching @tools_data' do

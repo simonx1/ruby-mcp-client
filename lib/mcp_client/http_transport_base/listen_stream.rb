@@ -33,9 +33,20 @@ module MCPClient
       # mix. CRLF is matched first so one CRLF is never read as two.
       EVENT_TERMINATOR = /(?:\r\n|\r(?!\n)|\n){2}/
 
+      # Ready the connection a subscription is about to be opened on, and mark
+      # this connection as one listen streams may still be opened on.
+      #
+      # {#open_subscription} asks that question again under the very lock
+      # {#close_listen_streams} closes them under, which is what a `listen`
+      # paused between the two needs: it used to register and POST regardless,
+      # so a `cleanup` landing in that window closed the registries while they
+      # were still empty and the stream that arrived afterwards ran on a
+      # transport the host had closed — unreachable to a later `cleanup`, which
+      # returns at once on a transport that is already disconnected.
       # @return [void]
       def ensure_session_ready
         ensure_connected
+        listen_threads_mutex.synchronize { @listen_streams_closed = false }
       end
 
       # Open a subscriptions/listen stream (MCP 2026-07-28): the request is a
@@ -49,7 +60,8 @@ module MCPClient
 
         # The thread is held until both registries name it, so a cancellation
         # that arrives the moment this returns always finds the stream to
-        # close and the thread to wait for.
+        # close and the thread to wait for — and it never starts at all when
+        # the connection it was readied on has since been closed.
         started = Thread::Queue.new
         thread = Thread.new do
           Thread.current.name = 'MCP-listen'
@@ -57,10 +69,8 @@ module MCPClient
           started.pop
           run_listen_stream(subscription)
         end
-        listen_threads_mutex.synchronize do
-          listen_wakeups[subscription] ||= Thread::Queue.new
-          listen_threads[subscription] = thread
-        end
+        return refuse_listen_on_closed_connection(subscription, thread) unless claim_listen_stream(subscription, thread)
+
         started << :go
       end
 
@@ -101,7 +111,14 @@ module MCPClient
       # no longer send anything: it leaves the loop and cleans up after itself.
       # @return [void]
       def close_listen_streams
-        threads = listen_threads_mutex.synchronize { listen_threads.dup.tap { listen_threads.clear } }
+        threads = listen_threads_mutex.synchronize do
+          # Under the lock a stream is claimed under: a listen that was readied
+          # on this connection and has not claimed its place yet is refused
+          # rather than left running on a transport that is gone
+          # (see {#ensure_session_ready}).
+          @listen_streams_closed = true
+          listen_threads.dup.tap { listen_threads.clear }
+        end
         # Both registries move together under their own lock; the
         # Subscriptions are finished outside it, since a subscription being
         # opened holds its own lock while taking this one.
@@ -119,6 +136,40 @@ module MCPClient
       end
 
       private
+
+      # Put the stream in the per-stream bookkeeping, unless the connection it
+      # was readied on has been closed since (see {#ensure_session_ready}).
+      # Both happen under the one lock {#close_listen_streams} takes, so a
+      # `cleanup` either finds this stream and closes it or stops it here.
+      # @param subscription [MCPClient::Subscription]
+      # @param thread [Thread] the stream's own thread, not yet released
+      # @return [Boolean] false when the connection was closed under it
+      def claim_listen_stream(subscription, thread)
+        listen_threads_mutex.synchronize do
+          next false if @listen_streams_closed
+
+          listen_wakeups[subscription] ||= Thread::Queue.new
+          listen_threads[subscription] = thread
+          true
+        end
+      end
+
+      # End a listen the connection was closed under, before anything is sent:
+      # its thread is still waiting to be released, so killing it holds nothing
+      # up and no request ever goes out.
+      # @param subscription [MCPClient::Subscription]
+      # @param thread [Thread] the stream's own thread, still waiting
+      # @return [void]
+      # @raise [MCPClient::Errors::ConnectionError] always
+      def refuse_listen_on_closed_connection(subscription, thread)
+        thread.kill
+        unregister_subscription(subscription)
+        error = MCPClient::Errors::ConnectionError.new(
+          'the connection was closed while the subscription was being opened'
+        )
+        subscription.finish(gracefully: false, error: error)
+        raise error
+      end
 
       # Wake a subscription's thread if it is waiting to re-open, and close the
       # response stream it is reading: that ends the reader without killing it.

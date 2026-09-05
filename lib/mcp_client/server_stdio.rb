@@ -171,12 +171,14 @@ module MCPClient
     # @return [Thread] the reader thread
     def start_reader
       generation = @transport_generation
+      # The record of the process this reader belongs to, so an EOF can be
+      # told from the EOF of a process that has since been replaced.
+      session = @session
       @reader_thread = Thread.new do
         @stdout.each_line do |line|
           handle_line(line)
         end
-        # EOF without cleanup: the server exited on its own.
-        handle_server_exit if @initialized && @stdin && !@shutting_down
+        handle_reader_eof(session)
       rescue StandardError
         # Reader thread aborted unexpectedly
       ensure
@@ -204,6 +206,43 @@ module MCPClient
 
       @transport_retired = true
       @logger.debug('Server stdout closed; the transport will be re-established on the next request')
+    end
+
+    # EOF on the process's stdout: unless the client closed its stdin, the
+    # server exited on its own.
+    #
+    # Waiting out an initialization still in flight is what makes an exit
+    # *during* one recoverable. The handling used to be skipped outright while
+    # `@initialized` was false — which is exactly the state a process that
+    # answered the discovery probe and then exited leaves behind. Nothing else
+    # noticed: {JsonRpcTransport#ensure_initialized} went on to mark the dead
+    # connection initialized and re-send the open subscriptions to it, the
+    # failed writes were deferred back onto the queue for "the next process",
+    # and with this reader already gone there was no one left to establish one.
+    # The subscriptions stayed :reconnecting for ever, with the host neither
+    # served nor told.
+    #
+    # The lock is that initialization finishing, and taking it cannot deadlock:
+    # the reader is never the thread inside it, and by the time it is waiting
+    # here it can deliver no further responses, so anything that thread is
+    # still waiting for is already bounded by its own timeout.
+    # @param session [MCPClient::ServerStdio::ChildSession, nil] the record of
+    #   the process this reader was started for
+    # @return [void]
+    def handle_reader_eof(session)
+      @init_lock.synchronize { nil } unless @initialized
+      return unless @stdin && !@shutting_down && current_session?(session)
+
+      handle_server_exit(session)
+    end
+
+    # Whether the process a reader was started for is still the live one. A
+    # reader whose process has already been torn down and replaced must not
+    # tear down its successor.
+    # @param session [MCPClient::ServerStdio::ChildSession, nil]
+    # @return [Boolean]
+    def current_session?(session)
+      session.nil? || @session.equal?(session)
     end
 
     # Spawn a thread to continuously drain the subprocess stderr.
@@ -865,11 +904,18 @@ module MCPClient
     # request spawn a fresh process and re-open live subscriptions — and a
     # host that is only waiting for notifications makes no such request, so
     # an open subscription restarts the process here instead.
+    # @param session [MCPClient::ServerStdio::ChildSession, nil] the record of
+    #   the process that exited; the crash-loop bound only counts an exit this
+    #   path recorded, never a teardown the host asked for
+    #   (see {JsonRpcTransport#crash_looping?})
     # @return [void]
-    def handle_server_exit
+    def handle_server_exit(session = @session)
       return if @shutting_down
 
       @logger.warn('MCP server process ended unexpectedly')
+      # Stamped before the teardown, on the record the teardown retires: this
+      # is the one path that knows the process was not asked to go.
+      session&.exited_unexpectedly
       cleanup
       restart_for_open_subscriptions
     end
@@ -915,22 +961,26 @@ module MCPClient
     # subscription's own id is named as well, so a handle a caller closes
     # before any write was recorded is still cancelled the way it always was.
     # @param subscription [MCPClient::Subscription]
+    # @param io [IO, nil] the pipe to cancel on; defaults to the live process's
+    #   stdin, and is pinned by a caller that is cancelling ids it wrote to one
+    #   particular process (see {JsonRpcTransport#open_subscription})
     # @return [void]
-    def cancel_outstanding_listens(subscription)
+    def cancel_outstanding_listens(subscription, io: @stdin)
       ids = subscription.take_outstanding_listens
       ids |= [subscription.id] if subscription.id
-      ids.each { |id| send_subscription_cancellation(id) }
+      ids.each { |id| send_subscription_cancellation(id, io: io) }
     end
 
     # Tell the server the client closed a subscriptions/listen request.
     # @param id [Integer, String, nil] the listen request id
+    # @param io [IO, nil] the pipe to write the cancellation to
     # @return [void]
-    def send_subscription_cancellation(id)
-      return unless @stdin && id
+    def send_subscription_cancellation(id, io: @stdin)
+      return unless io && id
 
       notif = build_jsonrpc_notification('notifications/cancelled',
                                          { 'requestId' => id, 'reason' => 'Client closed subscription' })
-      @stdin.puts(notif.to_json)
+      io.puts(notif.to_json)
     rescue StandardError => e
       @logger.debug("Failed to send subscription cancellation: #{e.message}")
     end

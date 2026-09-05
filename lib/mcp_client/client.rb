@@ -106,12 +106,7 @@ module MCPClient
       # Register default and user-defined notification handlers on each server
       @servers.each do |server|
         configure_server_identity(server, client_info, request_meta)
-        server.on_notification do |method, params|
-          # Default notification processing (e.g., cache invalidation, logging)
-          process_notification(server, method, params)
-          # Invoke user-defined listeners
-          @notification_listeners.each { |cb| cb.call(server, method, params) }
-        end
+        register_notification_handlers(server)
         # Register feature callbacks only for features the host actually
         # supports: transports derive their declared client capabilities from
         # the callbacks registered before connecting, and MCP forbids using
@@ -781,25 +776,84 @@ module MCPClient
             "Server #{srv.name || srv.class.name} did not declare the tasks.#{operation} capability"
     end
 
-    # Process incoming JSON-RPC notifications with default handlers
-    # @param server [MCPClient::ServerBase] the server that emitted the notification
-    # @param method [String] JSON-RPC notification method
-    # @param params [Hash] parameters for the notification
+    # Wire this client's notification processing and the host's listeners onto
+    # a transport.
+    #
+    # The cache invalidation goes on the transport's own invalidation hook,
+    # which runs *before* a notification is delivered to a subscription's
+    # listeners — so a listener reacting to a `list_changed` notification
+    # re-fetches instead of reading the entry the notification just
+    # invalidated. Everything else this client does with a notification is host
+    # code or leads to it (logging, progress callbacks, task status), and stays
+    # on the callback that runs last, behind the delivery. A transport with no
+    # such hook — a host-supplied one, say — keeps both on `on_notification`,
+    # with the invalidation first: it routes no subscriptions, so there is no
+    # delivery for it to be ahead of. Asked of the class rather than the
+    # instance, since the answer is the transport's nature, not its state.
+    # @param server [MCPClient::ServerBase] the server to wire
     # @return [void]
-    def process_notification(server, method, params)
-      server_id = server.name ? "#{server.class}[#{server.name}]" : server.class
+    def register_notification_handlers(server)
+      hooked = server.class.method_defined?(:on_cache_invalidation)
+      server.on_cache_invalidation { |method, _params| invalidate_caches_for_notification(server, method) } if hooked
+      server.on_notification do |method, params|
+        invalidate_caches_for_notification(server, method) unless hooked
+        # Default notification processing (e.g., logging, progress)
+        process_notification(server, method, params)
+        # Invoke user-defined listeners
+        @notification_listeners.each { |cb| cb.call(server, method, params) }
+      end
+    end
+
+    # Drop the caches a notification invalidates.
+    #
+    # Registered on the transport's `on_cache_invalidation` hook, which runs
+    # before the notification is delivered to a subscription's listeners — so a
+    # listener that reacts to a `list_changed` notification by calling
+    # `list_tools` (or the prompt/resource equivalents) re-fetches instead of
+    # reading the entry the notification just invalidated. It used to ride on
+    # `on_notification`, which round 10 moved to the end of the routing order
+    # for good reason: that callback is host code and may block the very reader
+    # the delivery came from. Only the cache drops moved forward; everything
+    # else {#process_notification} does still runs behind the delivery.
+    # @param server [MCPClient::ServerBase] the server that emitted it
+    # @param method [String] JSON-RPC notification method
+    # @return [void]
+    def invalidate_caches_for_notification(server, method)
+      server_id = notification_server_id(server)
       case method
       when 'notifications/tools/list_changed'
         logger.warn("[#{server_id}] Tool list has changed, clearing tool cache")
         @tool_cache.clear
-      when 'notifications/resources/updated'
-        logger.warn("[#{server_id}] Resource #{params['uri']} updated")
       when 'notifications/prompts/list_changed'
         logger.warn("[#{server_id}] Prompt list has changed, clearing prompt cache")
         @prompt_cache.clear
       when 'notifications/resources/list_changed'
         logger.warn("[#{server_id}] Resource list has changed, clearing resource cache")
         @resource_cache.clear
+      end
+    end
+
+    # @param server [MCPClient::ServerBase] the server that emitted a notification
+    # @return [String] the identity used to prefix its log lines
+    def notification_server_id(server)
+      server.name ? "#{server.class}[#{server.name}]" : server.class.to_s
+    end
+
+    # Process incoming JSON-RPC notifications with default handlers
+    # @param server [MCPClient::ServerBase] the server that emitted the notification
+    # @param method [String] JSON-RPC notification method
+    # @param params [Hash] parameters for the notification
+    # @return [void]
+    def process_notification(server, method, params)
+      server_id = notification_server_id(server)
+      case method
+      when 'notifications/tools/list_changed', 'notifications/prompts/list_changed',
+           'notifications/resources/list_changed'
+        # Already handled, ahead of the delivery to any subscription listener
+        # (see {#invalidate_caches_for_notification}).
+        nil
+      when 'notifications/resources/updated'
+        logger.warn("[#{server_id}] Resource #{params['uri']} updated")
       when 'notifications/message'
         # MCP 2025-06-18: Handle logging messages from server
         handle_log_message(server_id, params)

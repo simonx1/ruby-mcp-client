@@ -91,7 +91,19 @@ metadata). Each feature lands in its own PR; this section accumulates them.
   caches that notification invalidates had been dropped, and read the very
   entry it says is stale. Routing drops both caches first and delivers
   afterwards, making that a guarantee rather than a race the scheduler
-  usually happens to win. The host's `on_notification` callback now runs
+  usually happens to win. The client's own caches get there through a hook of
+  their own — `ServerBase#on_cache_invalidation`, run at the invalidation step
+  — rather than riding on the host callback: while they did, moving that
+  callback to the end (below) moved the client's `tool_cache`, `prompt_cache`
+  and `resource_cache` with it, and the guarantee held only for the
+  transport's caches. Only the invalidation moved forward; everything else the
+  client does with a notification (logging, progress callbacks, task status)
+  is host code or leads to it and stays behind the delivery. Paths that fan a
+  notification out without routing a subscription announce the hook too — the
+  legacy SSE parser, and the synthetic `tools/list_changed` a `Mcp-Param-*`
+  header-mismatch refresh emits — so no transport is left invalidating on only
+  one of the two. A transport that does not define the hook keeps both on
+  `on_notification`, with the invalidation first. The host's `on_notification` callback now runs
   **last**, after the delivery has been queued, because it is the only step
   that can block: it is host code driven by the peer and it runs on whatever
   thread is routing — on stdio the process's sole stdout reader — so a
@@ -146,11 +158,29 @@ metadata). Each feature lands in its own PR; this section accumulates them.
   re-established straight away while subscriptions are open, rather than on
   the next request: a subscription is a standing request the host does not
   repeat, so a host that is only waiting for notifications would otherwise
-  leave every one of them `:reconnecting` for ever. A restart that fails, or
+  leave every one of them `:reconnecting` for ever. An exit *during* the
+  initialization that established the process counts as one: the reader used
+  to skip the handling outright while `@initialized` was still false, which is
+  exactly what a replacement that answers the discovery probe and then dies
+  leaves behind — initialization went on to mark the dead connection
+  initialized and re-send the open subscriptions to it, the failed writes were
+  deferred back onto the "wait for the next process" queue, and with that
+  reader already gone there was no one left to establish one. The reader now
+  waits out an initialization still in flight and then handles the exit; the
+  lock it waits on is that initialization finishing, and it can deliver no
+  further responses by then, so whatever the initializing thread is waiting
+  for is already bounded by its own timeout. A restart that fails, or
   a process that exits again less than `SUBSCRIPTION_RESTART_MIN_INTERVAL`
   after the subscriptions were re-sent to it (a crash loop), closes those
   subscriptions with the error instead, so the host learns from
   `closed?`/`error` rather than waiting on a stream that is not coming back.
+  Only an exit counts against that bound. Every teardown stamps the moment the
+  process ended, but a `cleanup` the host asked for is not the server
+  crashing: a host that closes the transport and reconnects — which a
+  `cleanup`/request cycle does, and so does re-authenticating or
+  re-configuring a server — did so within the interval and had the very
+  subscriptions the reconnect exists to carry across closed for a crash that
+  never happened.
   The record of the process that carried them answers that one question and
   is spent by asking it: it used to outlive the loop it described, so a
   subscription opened directly on the replacement — a process that then ran
@@ -200,7 +230,22 @@ metadata). Each feature lands in its own PR; this section accumulates them.
   to be on — a second listen for it left the server serving the first stream
   with the client no longer able to refer to it — while ids written to a
   process that has since been torn down are forgotten rather than cancelled on
-  the process that replaced it.
+  the process that replaced it. That accounting now holds for a write that
+  lands late, too: a listen request goes to the pipe it was recorded against
+  rather than to whichever process is current when the write finally happens.
+  Reading the live stdin at the write instead let a listen still pending when
+  the process exited be written to the *replacement*, whose teardown had
+  already forgotten that id — so the server served a second stream the client
+  could no longer name, and `close` cancelled only the restart's own listen.
+  The mirror image on Streamable HTTP is refused rather than deferred: a
+  `listen` paused between readying the connection and sending the request used
+  to register and POST after a `cleanup` had closed the (then empty)
+  registries, leaving a live stream on a disconnected transport that no later
+  `cleanup` could find — `cleanup` returns at once on a transport that is
+  already disconnected. The stream is claimed under the very lock the close
+  takes, so a `cleanup` either finds it or stops it, and a `listen` it stops
+  raises `ConnectionError` instead of returning a handle to a stream that was
+  never opened.
   Taking a new id is atomic with closure on both, so a `close` racing with a
   re-open either stops it or cancels the id that went out — never leaving
   the server holding a stream the client can no longer cancel. Events are

@@ -21,10 +21,6 @@ module MCPClient
           release_retired_transport if transport_retired?
           return if @initialized
 
-          # Whether this session is one a subscription restart is establishing
-          # is decided before it exists and carried through: a restart that
-          # overlaps this one must not answer the question on its behalf.
-          restart = restarting_for_subscriptions?
           begin
             connect
             # The record of the process that is now the session. Everything the
@@ -63,6 +59,21 @@ module MCPClient
       # @param subscription [MCPClient::Subscription]
       # @return [void]
       def open_subscription(subscription)
+        # The pipe this attempt writes to, taken before anything is recorded
+        # about it and written to whatever happens next.
+        #
+        # Reading the transport's *current* stdin at the write instead let a
+        # listen that was still pending when the process exited be written to
+        # the process that replaced it: the teardown had already forgotten that
+        # id (nothing written to a dead process is outstanding, and none of its
+        # ids may be cancelled on its successor), so the replacement was
+        # serving a second stream this client could no longer name — and the
+        # restart's own listen was the only one `close` cancelled. Pinning the
+        # pipe makes the bookkeeping follow the process actually written to: a
+        # write that lands late goes to the pipe it was recorded against, and
+        # once the teardown has closed that pipe it fails into the error paths
+        # below instead.
+        stdin = @stdin
         id = next_id
         # No caller waits on this id: the response, if any, is the server's
         # graceful closure and is routed to the subscription itself.
@@ -81,8 +92,8 @@ module MCPClient
         # has to be able to name it even after a later request has taken the
         # subscription's own id (see {Subscription#record_outstanding_listen}).
         subscription.record_outstanding_listen(id)
-        send_request(request)
-        cancel_outstanding_listens(subscription) if subscription.closed_by_client?
+        send_request(request, io: stdin)
+        cancel_outstanding_listens(subscription, io: stdin) if subscription.closed_by_client?
       rescue StandardError => e
         fail_open_attempt(subscription, id, e)
       end
@@ -609,11 +620,16 @@ module MCPClient
 
       # Send a JSON-RPC request and return nothing
       # @param req [Hash] the JSON-RPC request
+      # @param io [IO, nil] the pipe to write to; defaults to the live process's
+      #   stdin, but a caller whose bookkeeping is tied to one particular
+      #   process pins that process's pipe instead (see {#open_subscription})
       # @return [void]
       # @raise [MCPClient::Errors::TransportError] on write errors
-      def send_request(req)
+      def send_request(req, io: @stdin)
         @logger.debug("Sending JSONRPC request: #{describe_jsonrpc_message(req)}")
-        @stdin.puts(req.to_json)
+        raise IOError, 'the server process is gone' unless io
+
+        io.puts(req.to_json)
       rescue StandardError => e
         # A request that failed to send will never receive a response, so drop
         # its awaiting marker; otherwise a broken transport (e.g. the server

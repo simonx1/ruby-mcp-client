@@ -1182,14 +1182,19 @@ RSpec.describe MCPClient::Client do
     end
 
     it 'handles tools/list_changed notification by clearing cache' do
+      # The handler the client actually registered on the transport, rather
+      # than a private method called by hand: the cache drop moved onto the
+      # transport's cache-invalidation hook (ahead of any subscription
+      # delivery), and a transport without that hook keeps it here.
+      handler = nil
+      allow(mock_server).to receive(:on_notification) { |&block| handler = block }
       # Stub list_tools to populate the cache
       allow(mock_server).to receive(:list_tools).and_return([mock_tool])
 
       client.list_tools # Fill cache
       expect(client.tool_cache).not_to be_empty
 
-      # Manually trigger process_notification with tools/list_changed
-      client.send(:process_notification, client.servers.first, 'notifications/tools/list_changed', {})
+      handler.call('notifications/tools/list_changed', {})
 
       expect(client.tool_cache).to be_empty
     end
