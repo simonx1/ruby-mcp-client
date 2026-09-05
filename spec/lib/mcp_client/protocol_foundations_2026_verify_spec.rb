@@ -755,12 +755,15 @@ end
 
 # --- Round 3, finding B: a read must never be flattened while incomplete ----
 #
-# read_resource projects `contents` out of the result. This client does not
-# drive multi round-trip requests yet, so an InputRequiredResult reaching the
-# wrapper must surface — presenting a continuation as an empty successful
-# read loses the requestState and lies about the outcome.
+# read_resource projects `contents` out of the result, so an unfinished result
+# reaching the wrapper must surface: presenting a continuation as an empty
+# successful read loses the requestState and lies about the outcome. The
+# transports below stub the request layer, which pins the wrapper's own guard
+# (require_complete_result!) whatever the round-trip resolver does; the stdio
+# context drives the real resolver with a round trip it cannot fulfil.
 RSpec.describe 'read_resource never presents an unfinished read as an empty one' do
   let(:incomplete) { { 'resultType' => 'input_required', 'requestState' => 'continue-later' } }
+  let(:unfinished_message) { /input/ }
 
   shared_examples 'surfaces an incomplete resources/read result' do
     it 'raises instead of returning an empty content list on a modern session' do
@@ -768,7 +771,7 @@ RSpec.describe 'read_resource never presents an unfinished read as an empty one'
       stub_read_result(incomplete)
 
       expect { server.read_resource('file:///x.txt') }
-        .to raise_error(MCPClient::Errors::InputRequiredError, /input/) do |e|
+        .to raise_error(MCPClient::Errors::InputRequiredError, unfinished_message) do |e|
           expect(e).not_to be_a(MCPClient::Errors::ResourceReadError)
           expect(e.protocol_error?).to be(true)
           # The continuation is preserved, not discarded: a host can drive
@@ -789,11 +792,25 @@ RSpec.describe 'read_resource never presents an unfinished read as an empty one'
 
   context 'with ServerStdio' do
     let(:server) { MCPClient::ServerStdio.new(command: 'echo test') }
+    # The only context that reaches the round-trip resolver, so its unfinished
+    # answer asks for something no handler is registered for: the round trip
+    # ends on the first answer instead of being retried ten times.
+    let(:incomplete) do
+      { 'resultType' => 'input_required', 'requestState' => 'continue-later',
+        'inputRequests' => { 'a' => { 'method' => 'elicitation/create', 'params' => { 'message' => 'Who?' } } } }
+    end
+    let(:unfinished_message) { /no handler is registered/ }
 
+    # Answers exactly one resources/read; a retry finds nothing left, so an
+    # unfinished read that is quietly retried fails the example rather than
+    # sleeping its way to the round-trip ceiling.
     def stub_read_result(result)
       server.instance_variable_set(:@initialized, true)
       allow(server).to receive(:send_request)
-      allow(server).to receive(:wait_response).and_return({ 'jsonrpc' => '2.0', 'id' => 1, 'result' => result })
+      answers = [{ 'jsonrpc' => '2.0', 'id' => 1, 'result' => result }]
+      allow(server).to receive(:wait_response) do
+        answers.shift or raise 'resources/read was sent twice'
+      end
     end
 
     include_examples 'surfaces an incomplete resources/read result'

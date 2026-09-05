@@ -188,10 +188,6 @@ RSpec.describe 'MCP 2026-07-28 multi round-trip requests' do
       expect { server.list_tools }.to raise_error(MCPClient::Errors::InvalidResultError, /input_required/)
     end
 
-    it 'documents ten as the round-trip ceiling' do
-      expect(MCPClient::JsonRpcCommon::MAX_INPUT_ROUND_TRIPS).to eq(10)
-    end
-
     it 'completes on the tenth round trip' do
       server.on_elicitation_request { |_k, _p| { 'action' => 'accept', 'content' => { 'name' => 'x' } } }
       responses = [{ 'result' => discover_result }] +
@@ -472,13 +468,45 @@ RSpec.describe 'MCP 2026-07-28 multi round-trip requests — review follow-ups' 
     http.cleanup
   end
 
-  it 'lets MCPClient::Client wire its handlers to a plain HTTP server' do
+  it 'drives a MCPClient::Client sampling round trip against a plain HTTP server' do
     http = MCPClient::ServerHTTP.new(base_url: 'https://example.com', endpoint: '/mcp', retries: 0)
     allow(MCPClient::ServerFactory).to receive(:create).and_return(http)
+    asked = []
     client = MCPClient::Client.new(mcp_server_configs: [{ type: 'http', base_url: 'x' }],
-                                   elicitation_handler: ->(_m, _s) { { 'name' => 'x' } })
-    expect(http.instance_variable_get(:@elicitation_request_callback)).not_to be_nil
-    expect(http.instance_variable_get(:@roots_list_request_callback)).not_to be_nil
+                                   sampling_handler: lambda { |messages, _prefs, _system, max_tokens|
+                                     asked << [messages, max_tokens]
+                                     { 'role' => 'assistant', 'model' => 'm', 'stopReason' => 'endTurn',
+                                       'content' => { 'type' => 'text', 'text' => 'Paris' } }
+                                   })
+    sampling = { 'method' => 'sampling/createMessage',
+                 'params' => { 'messages' => [{ 'role' => 'user',
+                                                'content' => { 'type' => 'text', 'text' => 'Capital?' } }],
+                               'maxTokens' => 100 } }
+    bodies = []
+    stub_request(:post, 'https://example.com/mcp').to_return do |request|
+      body = JSON.parse(request.body)
+      bodies << body
+      result = case body['method']
+               when 'server/discover' then discover_result
+               when 'tools/list' then { 'tools' => [{ 'name' => 'ask', 'inputSchema' => { 'type' => 'object' } }] }
+               when 'tools/call'
+                 if body['params'].key?('inputResponses')
+                   { 'content' => [{ 'type' => 'text', 'text' => 'answered' }] }
+                 else
+                   { 'resultType' => 'input_required', 'requestState' => 'st',
+                     'inputRequests' => { 's' => sampling } }
+                 end
+               end
+      { status: 200, body: JSON.generate('jsonrpc' => '2.0', 'id' => body['id'], 'result' => result),
+        headers: { 'Content-Type' => 'application/json' } }
+    end
+
+    expect(client.call_tool('ask', {})['content'].first['text']).to eq('answered')
+    expect(asked.size).to eq(1)
+    expect(asked.first.last).to eq(100)
+    expect(bodies.last['params']['inputResponses']['s'])
+      .to include('role' => 'assistant', 'content' => { 'type' => 'text', 'text' => 'Paris' })
+    expect(bodies.last['params']['requestState']).to eq('st')
     client.cleanup
   end
 end
@@ -665,7 +693,7 @@ RSpec.describe 'MCP 2026-07-28 multi round-trip requests — round 2' do
     expect { server.call_tool('t', {}) }.to raise_error(MCPClient::Errors::InputRequiredError, /params/)
   end
 
-  it 'sanitizes the peer-controlled mode and schema text in the client elicitation logs' do
+  it 'escapes the peer-controlled elicitation mode in the client logs' do
     output = StringIO.new
     stdio = MCPClient::ServerStdio.new(command: 'echo test', read_timeout: 1)
     client = client_with(stdio, logger: Logger.new(output), elicitation_handler: ->(_m, _d) { { 'name' => 'x' } })
@@ -676,6 +704,10 @@ RSpec.describe 'MCP 2026-07-28 multi round-trip requests — round 2' do
                                          'inputRequests' => { 'a' => bad_mode } } }])
 
     expect { client.call_tool('c', {}) }.to raise_error(MCPClient::Errors::InputRequiredError)
+    # The mode is rejected, and the forged log line it carries is written as
+    # one escaped line rather than becoming a second entry of its own.
+    expect(output.string).to include('Rejecting elicitation request with unsupported mode')
+    expect(output.string).to include('\x0AWARN forged')
     expect(output.string).not_to include("\nWARN forged")
   end
 

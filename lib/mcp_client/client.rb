@@ -1516,14 +1516,21 @@ module MCPClient
       ElicitationValidator.validate_content(response['content'], schema)
     end
 
-    # Ensure the action value conforms to MCP spec (accept, decline, cancel)
-    # Falls back to accept for unknown action values.
+    # Ensure the action value conforms to MCP spec (accept, decline, cancel).
+    # An action outside that set is not consent the user gave, so it is
+    # answered as cancel — the verdict URL mode reaches for the same handler
+    # result — rather than rewritten into an accept. (A handler that returns
+    # bare content and no action at all is the documented convenience shape
+    # and never reaches here; see #normalize_elicitation_result.)
+    # @param result [Hash] the normalized ElicitResult
+    # @return [Hash] the result, with an unrecognized action answered as cancel
     def normalised_action_response(result)
       action = result['action']
       return result if %w[accept decline cancel].include?(action)
 
-      @logger.warn("Unknown elicitation action '#{sanitize_peer_log_text(action.to_s)}', defaulting to accept")
-      result.merge('action' => 'accept')
+      @logger.warn("Unknown elicitation action '#{sanitize_peer_log_text(action.to_s)}'; answering cancel " \
+                   '(consent is explicit)')
+      result.merge('action' => 'cancel')
     end
 
     # Normalize roots array - convert Hashes to Root objects (MCP 2025-06-18)

@@ -49,7 +49,24 @@ metadata). Each feature lands in its own PR; this section accumulates them.
   that may be answered with `input_required` either: such an answer is
   refused before any protocol version or capability it carries is applied or
   cached, so a probe can never adopt a version out of an unfinished result
-  and hand that result back as the first heartbeat.
+  and hand that result back as the first heartbeat. Because `resultType`
+  exists only in 2026-07-28, that refusal settles the era: it raises
+  `MCPClient::Errors::ModernServerError`, so neither the probe's `initialize`
+  fallback nor `MCPClient.connect`'s legacy SSE/HTTP+POST fallbacks are tried
+  against a server that answered `server/discover` — whether or not the
+  unfinished answer also carried a `supportedVersions` list.
+- **Round trips survive the transports they run on.** The keys of an
+  `InputRequiredResult` are read in the protocol's own spelling however the
+  host's JSON middleware parsed them, so a symbolizing response parser cannot
+  make `inputRequests`/`requestState` invisible and produce a retry that
+  fulfils nothing. On stdio, a subprocess that exits between two rounds (a
+  handler waiting for a person takes as long as it takes) is restarted for
+  the continuation rather than written to as a dead pipe.
+- **Elicitation actions.** `ElicitResult.action` is `accept`, `decline` or
+  `cancel`; a handler that answers with anything else is now taken as `cancel`
+  (consent is explicit) instead of having its answer rewritten to `accept`. A
+  handler that returns bare content and no action at all is unchanged: that is
+  still an `accept` carrying the content.
 
 ### Custom headers from tool parameters (`x-mcp-header`)
 

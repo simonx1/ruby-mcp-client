@@ -385,10 +385,14 @@ module MCPClient
         @logger.warn("#{e.message}; re-issuing server/discover as a new request")
         send_discover_request(deadline)
       end
-      # A 2xx that is not a DiscoverResult (e.g. a permissive legacy endpoint
-      # answering any method) is not a modern answer: let the probe treat it
-      # as legacy rather than fail on a malformed modern result. A result
-      # carrying a resultType is the exception — see #invalid_discover_answer.
+      # The input_required rejection comes first: an InputRequiredResult need
+      # only carry `requestState`, so an unfinished discover answer does not
+      # have to look like a DiscoverResult at all, and testing the shape first
+      # would classify it as a permissive legacy endpoint. Any other 2xx that
+      # is not a DiscoverResult is a legacy answer the probe may fall back on
+      # — unless it carries a resultType, which only a modern server writes
+      # (see #invalid_discover_answer).
+      reject_input_required_discover!(result)
       raise invalid_discover_answer(result, 'answered without a DiscoverResult') unless discover_result?(result)
 
       apply_discover_result(result)

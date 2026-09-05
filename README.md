@@ -392,6 +392,11 @@ client = MCPClient::Client.new(
 )
 ```
 
+In form mode the handler may return the content on its own (`{ 'field' =>
+'value' }`), which is sent as an `accept`. An explicit `action` must be one of
+`accept`, `decline` or `cancel` — any other value is answered `cancel`, since
+it is not consent the user gave.
+
 In URL mode the handler's second argument is
 `{ 'mode' => 'url', 'url' => ..., 'elicitationId' => ... }` and its answer is
 consent, not data: only an explicit `action` of `accept`, `decline` or `cancel`

@@ -522,18 +522,39 @@ module MCPClient
     # discover answer is invalid and MUST NOT be applied or cached: the probe
     # would otherwise adopt a protocol version out of an unfinished result
     # and hand that result back as the first heartbeat. The rejection is a
-    # ConnectionError, not an InvalidResultError, because a server answering
-    # server/discover at all is modern — it must never be mistaken for a
-    # legacy server and retried with the initialize handshake.
+    # ModernServerError, not an InvalidResultError, because a server
+    # answering server/discover with a 2026-07-28-only discriminator is
+    # modern: the era is settled, so it must never be retried with the
+    # initialize handshake, and MCPClient.connect must not send it on to the
+    # legacy SSE and HTTP+POST transports either.
     # @param result [Hash] the server/discover result
     # @return [void]
-    # @raise [MCPClient::Errors::ConnectionError] if the result is an InputRequiredResult
+    # @raise [MCPClient::Errors::ModernServerError] if the result is an InputRequiredResult
     def reject_input_required_discover!(result)
       return unless MCPClient::JsonRpcCommon.result_type(result) == 'input_required'
 
-      raise MCPClient::Errors::ConnectionError,
+      raise MCPClient::Errors::ModernServerError,
             'Server answered server/discover with an input_required result; multi round-trip requests are ' \
             "only valid for #{MRTR_METHODS.join(', ')}"
+    end
+
+    # Check a server/discover answer before anything is read out of it.
+    #
+    # The input_required rejection has to come first: an InputRequiredResult
+    # need only carry `requestState` ("At least one of inputRequests or
+    # requestState MUST be present"), so an unfinished discover answer does
+    # not have to look like a DiscoverResult at all. Testing the shape first
+    # would classify that answer as a permissive legacy endpoint answering an
+    # unknown method — and send initialize to a modern server.
+    # @param result [Object] the server/discover result
+    # @return [void]
+    # @raise [MCPClient::Errors::ModernServerError] on an input_required answer
+    # @raise [MCPClient::Errors::ServerError] when the answer is not a DiscoverResult
+    def require_discover_result!(result)
+      reject_input_required_discover!(result)
+      return if discover_result?(result)
+
+      raise MCPClient::Errors::ServerError, 'server/discover was answered without a DiscoverResult'
     end
 
     # Validate a log level name (logging utility levels).
@@ -706,6 +727,27 @@ module MCPClient
       return result[:resultType] if result.key?(:resultType)
 
       'complete'
+    end
+
+    # Restore the wire spelling of a peer's own JSON object. JSON object keys
+    # are always strings, but a host's response middleware may symbolize the
+    # keys of everything it parses (Faraday's :json parser with
+    # symbolize_names) — the middleware ::result_type already tolerates for
+    # the resultType discriminator. Undoing it once, on the protocol object
+    # about to be read, keeps every lookup below (and the params the input
+    # handlers see) on the shape the protocol defines. Values are returned
+    # untouched, so an opaque requestState is still echoed verbatim.
+    # @param value [Object] a parsed JSON value
+    # @return [Object] the same value with Symbol keys spelled as Strings
+    def self.restore_wire_keys(value)
+      case value
+      when Hash
+        value.to_h { |key, member| [key.is_a?(Symbol) ? key.to_s : key, restore_wire_keys(member)] }
+      when Array
+        value.map { |member| restore_wire_keys(member) }
+      else
+        value
+      end
     end
 
     # Result types this transport accepts. Overridden (widened) by transports
@@ -991,6 +1033,11 @@ module MCPClient
       round_trips = 0
       delay = INPUT_RETRY_DELAY
       while MCPClient::JsonRpcCommon.result_type(result) == 'input_required'
+        # Read on the wire spelling, whatever the transport's JSON middleware
+        # did to the keys: a symbolized inputRequests/requestState would
+        # otherwise be invisible here and the retry would go out with neither
+        # the fulfilled answers nor the state the server MUST get back.
+        result = MCPClient::JsonRpcCommon.restore_wire_keys(result)
         unless modern? && MRTR_METHODS.include?(method)
           raise MCPClient::Errors::InvalidResultError,
                 "Invalid result: input_required is only valid for #{MRTR_METHODS.join(', ')} " \

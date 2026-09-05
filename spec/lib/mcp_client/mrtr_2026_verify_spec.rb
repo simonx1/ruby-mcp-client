@@ -1,6 +1,7 @@
 # frozen_string_literal: true
 
 require 'spec_helper'
+require 'tmpdir'
 require 'webmock/rspec'
 
 # Verification pass over the MCP 2026-07-28 multi round-trip work:
@@ -430,6 +431,52 @@ RSpec.describe 'MCP 2026-07-28 MRTR verification — pacing, logs and plain HTTP
     expect(headers_seen.last['Mcp-Param-Zone']).to eq('eu')
     http.cleanup
   end
+
+  # The one HeaderMismatch refresh belongs to the logical request, not to each
+  # attempt: the round trips are one tools/call as far as the caller is
+  # concerned. A continuation that mismatches again is not going to be fixed
+  # by a second tools/list, so the error surfaces instead of looping.
+  it 'spends the single HeaderMismatch refresh across the whole round trip' do
+    http = MCPClient::ServerHTTP.new(base_url: 'https://example.com', endpoint: '/mcp', retries: 0)
+    http.on_elicitation_request { |_key, _params| { 'action' => 'accept', 'content' => { 'name' => 'ada' } } }
+    header = 'Region'
+    bodies = []
+    mismatch = lambda do |id, name|
+      { status: 400, headers: { 'Content-Type' => 'application/json' },
+        body: JSON.generate('jsonrpc' => '2.0', 'id' => id,
+                            'error' => { 'code' => -32_020, 'message' => "Header mismatch: Mcp-Param-#{name}" }) }
+    end
+    stub_request(:post, 'https://example.com/mcp').to_return do |request|
+      body = JSON.parse(request.body)
+      bodies << body
+      calls = bodies.count { |b| b['method'] == 'tools/call' }
+      case body['method']
+      when 'server/discover' then json_response(body['id'], discover_result)
+      when 'tools/list'
+        schema = { 'type' => 'object',
+                   'properties' => { 'region' => { 'type' => 'string', 'x-mcp-header' => header } } }
+        json_response(body['id'], { 'tools' => [{ 'name' => 'q', 'inputSchema' => schema }] })
+      when 'tools/call'
+        case calls
+        when 1
+          header = 'Zone'
+          mismatch.call(body['id'], 'Zone')
+        when 2 then json_response(body['id'], input_required({ 'a' => form_elicit_request }, state: 'st'))
+        else mismatch.call(body['id'], 'District')
+        end
+      end
+    end
+
+    http.list_tools
+    expect { http.call_tool('q', { 'region' => 'eu' }) }.to raise_error(MCPClient::Errors::HeaderMismatchError)
+
+    # Three tools/call requests: the mismatched original, the refreshed one
+    # that answered input_required, and the continuation that mismatched
+    # again — with no second refresh behind it.
+    expect(bodies.count { |b| b['method'] == 'tools/call' }).to eq(3)
+    expect(bodies.count { |b| b['method'] == 'tools/list' }).to eq(2)
+    http.cleanup
+  end
 end
 
 # A stdio transport whose wire is a Ruby block: each response is computed from
@@ -486,10 +533,15 @@ RSpec.describe 'MCP 2026-07-28 MRTR verification — concurrent round trips' do
     # every thread inside its own round trip until all four are there: the
     # answers must still be routed per request, never through the transport.
     inside = Queue.new
-    deadline = Process.clock_gettime(Process::CLOCK_MONOTONIC) + 5
+    seen = Queue.new
+    deadline = Process.clock_gettime(Process::CLOCK_MONOTONIC) + 2
     server.on_elicitation_request do |key, _params|
       inside << key
       sleep(0.001) while inside.size < 4 && Process.clock_gettime(Process::CLOCK_MONOTONIC) < deadline
+      # What this thread saw when it gave up waiting. Four means every round
+      # trip really was in flight at once; a resolver that serialized them
+      # would let each thread through on its own with fewer.
+      seen << inside.size
       { 'action' => 'accept', 'content' => { 'key' => key } }
     end
 
@@ -497,7 +549,7 @@ RSpec.describe 'MCP 2026-07-28 MRTR verification — concurrent round trips' do
               .map { |name| Thread.new { [name, server.call_tool(name, {})] } }
               .to_h(&:value)
 
-    expect(inside.size).to eq(4)
+    expect(Array.new(4) { seen.pop }).to all(eq(4))
     # Each thread's own final result came back to it, not another thread's.
     expect(results.transform_values { |r| r['content'].first['text'] })
       .to eq({ 'alpha' => 'alpha', 'beta' => 'beta', 'gamma' => 'gamma', 'delta' => 'delta' })
@@ -590,6 +642,10 @@ RSpec.describe 'MCP 2026-07-28 MRTR verification — continuation fields are reb
 
   before { server.on_elicitation_request { |_key, _params| { 'action' => 'accept', 'content' => { 'n' => 1 } } } }
 
+  # A result carrying neither field is more than the server is allowed to send
+  # ("At least one of inputRequests or requestState MUST be present"); the
+  # client tolerates it, and drops everything the previous round left behind.
+  # The valid one-field-at-a-time shapes are covered further down.
   it 'drops both continuation fields once the server stops sending them' do
     sent = script_stdio(server, [{ 'result' => discover_result },
                                  { 'result' => input_required({ 'a' => form_elicit_request }, state: 'st1') },
@@ -633,22 +689,37 @@ RSpec.describe 'MCP 2026-07-28 MRTR verification — continuation fields are reb
     expect(calls[2]['params']['inputResponses'].keys).to eq(['second'])
   end
 
+  # Each attempt keeps exactly what the LATEST result asked for, so every
+  # spelling of a stale continuation field has to go — including the ones the
+  # fresh values would not have overwritten. The two rounds are the shapes the
+  # server may send: inputs without state, then state without inputs.
   it 'ignores continuation fields the caller supplied, in either key spelling' do
     caller_params = { 'uri' => 'file:///r', 'inputResponses' => { 'stale' => { 'action' => 'accept' } },
-                      requestState: 'stale-state' }
+                      inputResponses: { 'stale' => { 'action' => 'accept' } },
+                      'requestState' => 'stale-string', requestState: 'stale-symbol' }
     untouched = { 'uri' => 'file:///r', 'inputResponses' => { 'stale' => { 'action' => 'accept' } },
-                  requestState: 'stale-state' }
+                  inputResponses: { 'stale' => { 'action' => 'accept' } },
+                  'requestState' => 'stale-string', requestState: 'stale-symbol' }
     sent = script_stdio(server, [{ 'result' => discover_result },
-                                 { 'result' => input_required({ 'a' => form_elicit_request }, state: 'fresh') },
+                                 { 'result' => input_required({ 'a' => form_elicit_request }, state: nil) },
+                                 { 'result' => input_required(nil, state: 'fresh') },
                                  { 'result' => { 'contents' => [] } }])
 
     server.rpc_request('resources/read', caller_params)
 
-    retry_params = sent.last['params']
-    expect(retry_params['inputResponses'].keys).to eq(['a'])
-    expect(retry_params['requestState']).to eq('fresh')
-    expect(retry_params).not_to have_key(:requestState)
-    expect(retry_params).not_to have_key(:inputResponses)
+    reads = sent.select { |r| r['method'] == 'resources/read' }
+    expect(reads.size).to eq(3)
+    # The server sent inputRequests and no state: neither spelling of the
+    # caller's requestState may be presented as one.
+    expect(reads[1]['params']['inputResponses'].keys).to eq(['a'])
+    expect(reads[1]['params']).not_to have_key(:inputResponses)
+    expect(reads[1]['params']).not_to have_key('requestState')
+    expect(reads[1]['params']).not_to have_key(:requestState)
+    # And now state without inputRequests: no answers ride along.
+    expect(reads[2]['params']['requestState']).to eq('fresh')
+    expect(reads[2]['params']).not_to have_key(:requestState)
+    expect(reads[2]['params']).not_to have_key('inputResponses')
+    expect(reads[2]['params']).not_to have_key(:inputResponses)
     expect(caller_params).to eq(untouched)
   end
 
@@ -882,6 +953,40 @@ RSpec.describe 'MCP 2026-07-28 MRTR verification — a continuation survives the
     server.cleanup
   end
 
+  # Every other Streamable HTTP round trip here is answered with application/
+  # json. The unfinished result and the completion can equally arrive as SSE
+  # events, behind a notification on the same stream.
+  it 'drives a round trip whose answers arrive as SSE events' do
+    server = MCPClient::ServerStreamableHTTP.new(base_url: 'https://example.com', endpoint: '/mcp', retries: 0)
+    server.on_elicitation_request { |_key, _params| { 'action' => 'accept', 'content' => { 'name' => 'ada' } } }
+    bodies = []
+    stub_request(:post, url).to_return do |request|
+      body = JSON.parse(request.body)
+      bodies << body
+      calls = bodies.count { |b| b['method'] == 'tools/call' }
+      next json_response(body['id'], discover_result) if body['method'] == 'server/discover'
+
+      result = if calls == 1
+                 input_required({ 'a' => form_elicit_request }, state: 'st')
+               else
+                 { 'content' => [{ 'type' => 'text', 'text' => 'done' }] }
+               end
+      stream = sse_event('jsonrpc' => '2.0', 'method' => 'notifications/progress',
+                         'params' => { 'progressToken' => 'p', 'progress' => calls }) +
+               sse_event('jsonrpc' => '2.0', 'id' => body['id'], 'result' => result)
+      { status: 200, body: stream, headers: { 'Content-Type' => 'text/event-stream' } }
+    end
+
+    expect(server.call_tool('t', {})['content'].first['text']).to eq('done')
+
+    calls = bodies.select { |b| b['method'] == 'tools/call' }
+    expect(calls.size).to eq(2)
+    expect(calls[0]['id']).not_to eq(calls[1]['id'])
+    expect(calls[1]['params']['requestState']).to eq('st')
+    expect(calls[1]['params']['inputResponses']['a']).to eq({ 'action' => 'accept', 'content' => { 'name' => 'ada' } })
+    server.cleanup
+  end
+
   it 'keeps the continuation through a version renegotiation of the retry' do
     # This client speaks exactly one modern revision, so a second one has to
     # exist for the server to negotiate down to.
@@ -983,12 +1088,15 @@ RSpec.describe 'MCP 2026-07-28 MRTR verification — overlapping round trips wit
     end
     server = MrtrScriptedStdio.new(command: 'echo test', read_timeout: 5, responder: responder)
     inside = Queue.new
-    deadline = Process.clock_gettime(Process::CLOCK_MONOTONIC) + 5
+    seen = Queue.new
+    deadline = Process.clock_gettime(Process::CLOCK_MONOTONIC) + 2
     server.on_elicitation_request do |key, params|
       raise "unexpected key #{key}" unless key == 'k'
 
       inside << params['message']
       sleep(0.001) while inside.size < 2 && Process.clock_gettime(Process::CLOCK_MONOTONIC) < deadline
+      # Both round trips have to be in flight for this to prove anything.
+      seen << inside.size
       raise 'the user closed the dialog' if params['message'] == 'doomed'
 
       { 'action' => 'accept', 'content' => { 'for' => params['message'] } }
@@ -1002,6 +1110,7 @@ RSpec.describe 'MCP 2026-07-28 MRTR verification — overlapping round trips wit
     end
 
     expect(fine.value['content'].first['text']).to eq('fine')
+    expect(Array.new(2) { seen.pop }).to all(eq(2))
     expect(doomed.value).to be_a(MCPClient::Errors::InputRequiredError)
     expect(doomed.value.request_state).to eq('state-doomed')
     retries = server.sent.select { |r| r['method'] == 'tools/call' && r['params'].key?('inputResponses') }
@@ -1217,5 +1326,433 @@ RSpec.describe 'MCP 2026-07-28 MRTR verification — an input_required discover 
     expect { http.connect }.to raise_error(MCPClient::Errors::MCPError, /input_required/)
     expect(bodies).to eq(['server/discover'])
     http.cleanup
+  end
+end
+
+# Review round 5 (grok): an InputRequiredResult is allowed to carry only
+# `requestState` — "At least one of inputRequests or requestState MUST be
+# present" (basic/patterns/mrtr) — so an unfinished discover answer need not
+# have the DiscoverResult shape at all. The shape test must therefore not be
+# what decides the era: `resultType: "input_required"` exists only in
+# 2026-07-28, so a peer that sent it is modern and must never be retried with
+# the legacy initialize handshake.
+RSpec.describe 'MCP 2026-07-28 MRTR verification — an unfinished discover without supportedVersions' do
+  include MrtrVerifyHelpers
+
+  let(:state_only_discover) { { 'resultType' => 'input_required', 'requestState' => 'pending-discovery' } }
+
+  it 'does not fall back to initialize on an auto-negotiating stdio transport' do
+    server = modern_stdio
+    sent = script_stdio(server, [{ 'result' => state_only_discover },
+                                 { 'result' => { 'protocolVersion' => '2025-11-25', 'capabilities' => {} } },
+                                 { 'result' => { 'tools' => [] } }])
+
+    expect { server.list_tools }.to raise_error(MCPClient::Errors::MCPError, /input_required/)
+    expect(sent.map { |r| r['method'] }).to eq(['server/discover'])
+    expect(server.instance_variable_get(:@protocol_version)).to be_nil
+  end
+
+  it 'does not fall back to initialize on an auto-negotiating plain HTTP transport' do
+    http = MCPClient::ServerHTTP.new(base_url: 'https://example.com', endpoint: '/mcp', retries: 0)
+    bodies = []
+    stub_request(:post, 'https://example.com/mcp').to_return do |request|
+      body = JSON.parse(request.body)
+      bodies << body['method']
+      json_response(body['id'], state_only_discover)
+    end
+
+    expect { http.connect }.to raise_error(MCPClient::Errors::MCPError, /input_required/)
+    expect(bodies).to eq(['server/discover'])
+    http.cleanup
+  end
+
+  it 'does not fall back to initialize on an auto-negotiating Streamable HTTP transport' do
+    server = MCPClient::ServerStreamableHTTP.new(base_url: 'https://example.com', endpoint: '/mcp', retries: 0)
+    bodies = []
+    stub_request(:post, 'https://example.com/mcp').to_return do |request|
+      body = JSON.parse(request.body)
+      bodies << body['method']
+      json_response(body['id'], state_only_discover)
+    end
+
+    expect { server.connect }.to raise_error(MCPClient::Errors::MCPError, /input_required/)
+    expect(bodies).to eq(['server/discover'])
+    server.cleanup
+  end
+
+  # The era the rejection settles is cached like any other modern verdict, so
+  # a second attempt on the same transport does not reopen the question.
+  it 'keeps the modern verdict for a later connect on the same transport' do
+    http = MCPClient::ServerHTTP.new(base_url: 'https://example.com', endpoint: '/mcp', retries: 0)
+    bodies = []
+    stub_request(:post, 'https://example.com/mcp').to_return do |request|
+      body = JSON.parse(request.body)
+      bodies << body['method']
+      json_response(body['id'], state_only_discover)
+    end
+
+    2.times { expect { http.connect }.to raise_error(MCPClient::Errors::MCPError, /input_required/) }
+
+    expect(bodies).to eq(%w[server/discover server/discover])
+    expect(http.instance_variable_get(:@confirmed_era)).to eq(:modern)
+    http.cleanup
+  end
+end
+
+# Review round 5 (codex): the rejection has to survive MCPClient.connect's
+# transport detector too. A server that answered server/discover is modern,
+# so the legacy SSE and HTTP+POST fallbacks cannot do better — and trying
+# them buries the actionable message in a "tried all transports" list.
+RSpec.describe 'MCP 2026-07-28 MRTR verification — an unfinished discover through MCPClient.connect' do
+  include MrtrVerifyHelpers
+
+  let(:ambiguous_url) { 'https://example.com/api' }
+
+  it 'stops at the modern verdict instead of trying the legacy SSE transport' do
+    post_stub = stub_request(:post, ambiguous_url).to_return do |request|
+      json_response(JSON.parse(request.body)['id'],
+                    { 'resultType' => 'input_required', 'supportedVersions' => ['2026-07-28'],
+                      'capabilities' => { 'tools' => {} }, 'requestState' => 'pending-discovery' })
+    end
+    get_stub = stub_request(:get, ambiguous_url).to_return(status: 200, body: '')
+
+    expect { MCPClient.connect(ambiguous_url, retries: 0) }
+      .to raise_error(MCPClient::Errors::ModernServerError, /input_required/)
+
+    expect(post_stub).to have_been_requested.once
+    expect(get_stub).not_to have_been_requested
+  end
+
+  it 'stops there for the requestState-only shape as well' do
+    post_stub = stub_request(:post, ambiguous_url).to_return do |request|
+      json_response(JSON.parse(request.body)['id'],
+                    { 'resultType' => 'input_required', 'requestState' => 'pending-discovery' })
+    end
+    get_stub = stub_request(:get, ambiguous_url).to_return(status: 200, body: '')
+
+    expect { MCPClient.connect(ambiguous_url, retries: 0) }
+      .to raise_error(MCPClient::Errors::ModernServerError, /input_required/)
+
+    expect(post_stub).to have_been_requested.once
+    expect(get_stub).not_to have_been_requested
+  end
+end
+
+# Review round 5 (grok): ::result_type accepts a symbol-keyed `resultType`
+# because a host's response middleware may symbolize the keys of everything
+# it parses (Faraday's :json parser with symbolize_names). The rest of the
+# InputRequiredResult has to survive that middleware too: reading only the
+# String spelling would enter the round-trip loop and then retry WITHOUT
+# fulfilling inputRequests and WITHOUT echoing requestState — both client
+# MUSTs (basic/patterns/mrtr "Client Requirements").
+RSpec.describe 'MCP 2026-07-28 MRTR verification — a symbolized InputRequiredResult' do
+  include MrtrVerifyHelpers
+
+  let(:server) { modern_stdio }
+
+  it 'fulfils a symbol-keyed inputRequests map and echoes its symbol-keyed requestState' do
+    seen = []
+    server.on_elicitation_request do |key, params|
+      seen << [key, params]
+      { 'action' => 'accept', 'content' => { 'name' => 'ada' } }
+    end
+    symbolized = { resultType: 'input_required',
+                   inputRequests: { 'a' => { method: 'elicitation/create',
+                                             params: { mode: 'form', message: 'Who?',
+                                                       requestedSchema: { type: 'object' } } } },
+                   requestState: 'symbol-state' }
+    sent = script_stdio(server, [{ 'result' => discover_result },
+                                 { 'result' => symbolized },
+                                 { 'result' => { 'content' => [] } }])
+
+    server.call_tool('greet', {})
+
+    calls = sent.select { |r| r['method'] == 'tools/call' }
+    expect(calls.size).to eq(2)
+    expect(calls[1]['params']['requestState']).to eq('symbol-state')
+    expect(calls[1]['params']['inputResponses'])
+      .to eq({ 'a' => { 'action' => 'accept', 'content' => { 'name' => 'ada' } } })
+    # The handler is host code written against the wire shape, so it sees the
+    # protocol's own spelling however the transport parsed it.
+    expect(seen.map(&:first)).to eq(['a'])
+    expect(seen.first.last).to include('mode' => 'form', 'message' => 'Who?')
+  end
+
+  it 'refuses a symbol-keyed tool-enabled sampling request without the declaration' do
+    sampled = false
+    server.on_sampling_request { |_key, _params| sampled = true }
+    sent = script_stdio(server, [{ 'result' => discover_result },
+                                 { 'result' => { resultType: 'input_required',
+                                                 inputRequests: {
+                                                   'c' => { method: 'sampling/createMessage',
+                                                            params: { messages: [], tools: [{ name: 't' }] } }
+                                                 },
+                                                 requestState: 'st' } }])
+
+    expect { server.call_tool('t', {}) }.to raise_error(MCPClient::Errors::InputRequiredError, /sampling.tools/)
+    expect(sampled).to be(false)
+    expect(sent.count { |r| r['method'] == 'tools/call' }).to eq(1)
+  end
+
+  it 'reports a symbol-keyed unfulfillable round trip with its requests and state' do
+    script_stdio(server, [{ 'result' => discover_result },
+                          { 'result' => { resultType: 'input_required',
+                                          inputRequests: { 'a' => { method: 'elicitation/create', params: {} } },
+                                          requestState: 'sym' } }])
+
+    expect { server.call_tool('t', {}) }.to raise_error(MCPClient::Errors::InputRequiredError) do |error|
+      expect(error.request_state).to eq('sym')
+      expect(error.input_requests).to eq({ 'a' => { 'method' => 'elicitation/create', 'params' => {} } })
+    end
+  end
+end
+
+# Review round 5 (codex): ensure_initialized runs once, before the resolver;
+# every continuation round after that goes straight to the wire. On stdio the
+# subprocess can exit while the host is gathering the input — a real prompt
+# waits for a person — and MCP 2026-07-28 basic/transports/stdio ("Unexpected
+# Termination") says a client SHOULD restart a server that terminated
+# unexpectedly. Writing the continuation to the dead process's pipe instead
+# loses the whole call to a broken pipe, with the gathered answers in it.
+MRTR_STDIO_FIXTURE = File.expand_path('../../support/protocol_era_stdio_server.rb', __dir__)
+
+RSpec.describe 'MCP 2026-07-28 MRTR verification — a continuation against a retired stdio process', :slow do
+  around do |example|
+    Dir.mktmpdir('mcp-mrtr') do |dir|
+      @transcript = File.join(dir, 'transcript.log')
+      example.run
+    end
+  end
+
+  attr_reader :transcript
+
+  after do
+    transcript_pids.each do |pid|
+      Process.kill('KILL', pid)
+    rescue Errno::ESRCH, Errno::EPERM
+      nil
+    end
+  end
+
+  # @param path [String] transcript path
+  # @return [Array<String>] the lines the fixture has flushed so far
+  def transcript_lines
+    File.exist?(transcript) ? File.readlines(transcript).map(&:strip).reject(&:empty?) : []
+  rescue Errno::ENOENT
+    []
+  end
+
+  # @return [Array<Integer>] pids of every fixture process spawned
+  def transcript_pids
+    transcript_lines.grep(/\Apid /).map { |line| Integer(line.split.last) }
+  end
+
+  # @return [Array<String>] the JSON-RPC methods the fixture processes received
+  def transcript_methods
+    transcript_lines.grep_v(/\Apid /)
+  end
+
+  # @param pid [Integer]
+  # @return [Boolean] whether the process still exists (a reaped child does not)
+  def process_alive?(pid)
+    Process.kill(0, pid)
+    true
+  rescue Errno::ESRCH, Errno::EPERM
+    false
+  end
+
+  # @param what [String] what is being waited for, for the failure message
+  # @return [void]
+  def wait_for(what, timeout: 5)
+    deadline = Time.now + timeout
+    sleep 0.02 until yield || Time.now > deadline
+    raise "timed out after #{timeout}s waiting for #{what}" unless yield
+  end
+
+  it 'restarts the server and completes the continuation it was gathering answers for' do
+    server = MCPClient::ServerStdio.new(command: [RbConfig.ruby, MRTR_STDIO_FIXTURE, 'mrtr-one-shot', transcript],
+                                        read_timeout: 5, discover_timeout: 3)
+    server.on_elicitation_request do |_key, _params|
+      # The fixture exits as soon as it has asked for input; a host handler is
+      # exactly where that wait happens, so the transport retires under it.
+      wait_for('the first subprocess to exit') { transcript_pids.first && !process_alive?(transcript_pids.first) }
+      wait_for('the transport to be retired') { server.transport_retired? }
+      { 'action' => 'accept', 'content' => { 'name' => 'ada' } }
+    end
+
+    result = server.call_tool('greet', {})
+
+    # The continuation reached a fresh process with the gathered answer and
+    # the state it was issued against, both intact.
+    expect(result['content'].first['text']).to eq('ada/st')
+    expect(transcript_pids.uniq.size).to eq(2)
+    expect(transcript_methods).to eq(%w[server/discover tools/call server/discover tools/call])
+  ensure
+    server&.cleanup
+  end
+end
+
+# Review round 5 (grok, codex): the boundaries of the round-trip loop that had
+# no example — an inputRequests map that is present but empty, and the three
+# ways a registered handler can still fail the round trip (schema-invalid
+# content, a rejected sampling request, an unknown action).
+RSpec.describe 'MCP 2026-07-28 MRTR verification — round-trip boundaries' do
+  include MrtrVerifyHelpers
+
+  def greet_tool
+    { 'name' => 'c', 'inputSchema' => { 'type' => 'object' } }
+  end
+
+  it 'retries an empty inputRequests map at once, with an empty inputResponses map' do
+    server = modern_stdio
+    sent = script_stdio(server, [{ 'result' => discover_result },
+                                 { 'result' => { 'resultType' => 'input_required', 'inputRequests' => {},
+                                                 'requestState' => 'st' } },
+                                 { 'result' => { 'content' => [] } }])
+
+    server.call_tool('t', {})
+
+    calls = sent.select { |r| r['method'] == 'tools/call' }
+    expect(calls.size).to eq(2)
+    # Present-but-empty is not the same as omitted: the server asked for
+    # nothing rather than for something out of band, so the answer is an empty
+    # map and the retry is not paced.
+    expect(calls[1]['params']['inputResponses']).to eq({})
+    expect(calls[1]['params']['requestState']).to eq('st')
+    expect(server).not_to have_received(:sleep)
+  end
+
+  # requestState is opaque: "" is a value the server chose, not an absence, so
+  # it is echoed. Only an omitted state is omitted from the retry.
+  it 'echoes an empty requestState rather than omitting it' do
+    server = modern_stdio
+    server.on_elicitation_request { |_key, _params| { 'action' => 'accept', 'content' => {} } }
+    sent = script_stdio(server, [{ 'result' => discover_result },
+                                 { 'result' => input_required({ 'a' => form_elicit_request }, state: '') },
+                                 { 'result' => { 'content' => [] } }])
+
+    server.call_tool('t', {})
+
+    expect(sent.last['params']).to have_key('requestState')
+    expect(sent.last['params']['requestState']).to eq('')
+  end
+
+  # A continuation is an independent request with an id of its own, so the
+  # cancellation a timeout owes the server has to name that id — the original
+  # request's was answered a round ago.
+  it 'cancels a timed-out continuation by the continuation own request id' do
+    server = modern_stdio
+    server.on_elicitation_request { |_key, _params| { 'action' => 'accept', 'content' => {} } }
+    sent = []
+    written = []
+    allow(server).to receive(:connect).and_return(true)
+    allow(server).to receive(:start_reader)
+    allow(server).to receive(:start_stderr_reader)
+    stdin = double('stdin', flush: nil, closed?: false, close: nil)
+    allow(stdin).to receive(:puts) { |line| written << line }
+    server.instance_variable_set(:@stdin, stdin)
+    allow(server).to receive(:send_request) { |request| sent << request }
+    answers = [{ 'result' => discover_result },
+               { 'result' => input_required({ 'a' => form_elicit_request }, state: 'st') },
+               :timeout]
+    allow(server).to receive(:wait_response) do |id, **_opts|
+      answer = answers.shift or raise 'no scripted response left'
+      raise MCPClient::Errors::RequestTimeoutError, 'Timeout waiting for response' if answer == :timeout
+
+      answer.merge('jsonrpc' => '2.0', 'id' => id)
+    end
+
+    expect { server.rpc_request('resources/read', { 'uri' => 'file:///r' }) }
+      .to raise_error(MCPClient::Errors::RequestTimeoutError)
+
+    reads = sent.select { |request| request['method'] == 'resources/read' }
+    expect(reads.size).to eq(2)
+    expect(reads.last['params']).to include('requestState' => 'st')
+    cancelled = written.map { |line| JSON.parse(line) }.select { |m| m['method'] == 'notifications/cancelled' }
+    expect(cancelled.size).to eq(1)
+    expect(cancelled.first['params']['requestId']).to eq(reads.last['id'])
+    expect(reads.last['id']).not_to eq(reads.first['id'])
+  end
+
+  # Spec SHOULD (client/elicitation): the client validates the content against
+  # requestedSchema and does not transmit content that violates it. There is
+  # no per-key error channel in InputResponses, so the round trip fails.
+  it 'fails the round trip when the handler content violates the requestedSchema' do
+    stdio = modern_stdio
+    client = client_with(stdio, elicitation_handler: ->(_message, _schema) { { 'name' => 42 } })
+    request = { 'method' => 'elicitation/create',
+                'params' => { 'mode' => 'form', 'message' => 'Who?',
+                              'requestedSchema' => { 'type' => 'object',
+                                                     'properties' => { 'name' => { 'type' => 'string' } },
+                                                     'required' => ['name'] } } }
+    sent = script_stdio(stdio, [{ 'result' => discover_result },
+                                { 'result' => { 'tools' => [greet_tool] } },
+                                { 'result' => input_required({ 'a' => request }, state: 'st') }])
+
+    expect { client.call_tool('c', {}) }
+      .to raise_error(MCPClient::Errors::InputRequiredError, /schema validation/)
+    expect(sent.count { |r| r['method'] == 'tools/call' }).to eq(1)
+  end
+
+  # A nil sampling result is the host's rejection signal (-1 "User rejected
+  # sampling request" on the legacy back-channel). On the round-trip path
+  # there is nowhere to write that error, so the original call fails.
+  it 'fails the round trip when the Client sampling handler rejects with nil' do
+    stdio = modern_stdio
+    # An empty handler returns nil, which is the host's rejection signal.
+    client = client_with(stdio, sampling_handler: ->(_messages, _prefs, _system, _max) {})
+    sent = script_stdio(stdio, [{ 'result' => discover_result },
+                                { 'result' => { 'tools' => [greet_tool] } },
+                                { 'result' => input_required({ 's' => sampling_request }, state: 'st') }])
+
+    expect { client.call_tool('c', {}) }
+      .to raise_error(MCPClient::Errors::InputRequiredError, /Sampling rejected/)
+    expect(sent.count { |r| r['method'] == 'tools/call' }).to eq(1)
+  end
+
+  # ElicitResult.action is exactly accept | decline | cancel. An action
+  # outside that set is not consent the user gave, so it is answered as cancel
+  # — the same verdict URL mode reaches for the same handler result — rather
+  # than rewritten into an accept and transmitted with the content attached.
+  it 'answers cancel when the form handler returns an action outside the schema' do
+    stdio = modern_stdio
+    client = client_with(stdio, elicitation_handler: lambda { |_message, _schema|
+      { 'action' => 'submit', 'content' => { 'name' => 'ada' } }
+    })
+    sent = script_stdio(stdio, [{ 'result' => discover_result },
+                                { 'result' => { 'tools' => [greet_tool] } },
+                                { 'result' => input_required({ 'a' => form_elicit_request }, state: 'st') },
+                                { 'result' => { 'content' => [] } }])
+
+    client.call_tool('c', {})
+
+    expect(sent.last['params']['inputResponses']['a']).to eq({ 'action' => 'cancel' })
+  end
+
+  # "If mode is not specified, form mode is assumed" (client/elicitation).
+  it 'treats an elicitation request without a mode as form mode' do
+    stdio = modern_stdio
+    seen = nil
+    client = client_with(stdio, elicitation_handler: lambda { |message, schema|
+      seen = [message, schema]
+      { 'name' => 'ada' }
+    })
+    request = { 'method' => 'elicitation/create',
+                'params' => { 'message' => 'Who?',
+                              'requestedSchema' => { 'type' => 'object',
+                                                     'properties' => { 'name' => { 'type' => 'string' } } } } }
+    sent = script_stdio(stdio, [{ 'result' => discover_result },
+                                { 'result' => { 'tools' => [greet_tool] } },
+                                { 'result' => input_required({ 'a' => request }, state: 'st') },
+                                { 'result' => { 'content' => [] } }])
+
+    client.call_tool('c', {})
+
+    # The handler was given the requestedSchema (form mode), not a URL-mode
+    # payload, and its content was transmitted with the accept action form
+    # mode carries. URL mode would have stripped the content.
+    expect(seen).to eq(['Who?', { 'type' => 'object', 'properties' => { 'name' => { 'type' => 'string' } } }])
+    expect(sent.last['params']['inputResponses']['a'])
+      .to eq({ 'action' => 'accept', 'content' => { 'name' => 'ada' } })
   end
 end

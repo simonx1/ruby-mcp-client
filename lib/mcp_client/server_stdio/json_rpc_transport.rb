@@ -250,6 +250,7 @@ module MCPClient
         # not recorded: apply_discover_result records it once the whole
         # result has validated.
         result = process_jsonrpc_response(res, method: 'server/discover')
+        reject_input_required_discover!(result)
         unless discover_result?(result)
           raise invalid_discover_answer(modern_answer, 'answered without a DiscoverResult')
         end
@@ -525,6 +526,14 @@ module MCPClient
         # recovery, so a retry that carries inputResponses/requestState keeps
         # them through transport retries, version renegotiation and the like.
         result = resolve_input_round_trips(method, params, timeout) do |attempt_params|
+          # Every round is its own request, and the subprocess may have exited
+          # between two of them — the host handler that gathers the input
+          # waits for a person. MCP 2026-07-28 basic/transports/stdio
+          # ("Unexpected Termination"): the client SHOULD restart a server
+          # that terminated unexpectedly. The continuation is then re-issued
+          # against the fresh process with the answers and the state it was
+          # gathered for, rather than written to a dead pipe.
+          ensure_initialized
           with_retry(method) do
             sent_version = nil
             begin
