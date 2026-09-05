@@ -221,7 +221,10 @@ RSpec.describe 'MCP 2026-07-28 x-mcp-header custom headers' do
       names = server.list_tools.map(&:name)
 
       expect(names).to eq(['execute_sql'])
+      # The warning names the tool and why its annotation was rejected, so the
+      # host can act on it rather than just learn something was dropped.
       expect(log_output.string).to match(/WARN.*broken.*x-mcp-header/)
+      expect(log_output.string).to include('x-mcp-header at "a" must be on a primitive property')
     end
 
     it 'mirrors annotated arguments into Mcp-Param-{name} headers on tools/call' do
@@ -413,7 +416,8 @@ RSpec.describe 'MCP 2026-07-28 x-mcp-header — review follow-ups' do
     end
 
     it 'still walks every schema-bearing keyword for misplaced annotations' do
-      %w[additionalProperties contains propertyNames unevaluatedProperties].each do |keyword|
+      %w[additionalProperties contains propertyNames unevaluatedProperties
+         else unevaluatedItems additionalItems items].each do |keyword|
         schema = { 'type' => 'object',
                    'properties' => { 'a' => { 'type' => 'object',
                                               keyword => { 'type' => 'string', 'x-mcp-header' => 'A' } } } }
@@ -425,6 +429,37 @@ RSpec.describe 'MCP 2026-07-28 x-mcp-header — review follow-ups' do
       end
       schema = { 'type' => 'object', 'prefixItems' => [{ 'type' => 'string', 'x-mcp-header' => 'A' }] }
       expect(described_class.validate_schema(schema)).not_to be_empty
+      # Tuple-form `items` is an array of subschemas, and each is walked.
+      tuple = { 'type' => 'object',
+                'properties' => { 'a' => { 'type' => 'array',
+                                           'items' => [{ 'type' => 'string' },
+                                                       { 'type' => 'string', 'x-mcp-header' => 'A' }] } } }
+      expect(described_class.validate_schema(tuple)).to include(match(/not statically reachable/))
+    end
+
+    it 'rejects duplicate header names however deeply the two properties are nested' do
+      input = { 'type' => 'object',
+                'properties' => {
+                  'left' => { 'type' => 'object',
+                              'properties' => { 'region' => { 'type' => 'string', 'x-mcp-header' => 'Region' } } },
+                  'right' => { 'type' => 'object',
+                               'properties' => { 'zone' => { 'type' => 'string', 'x-mcp-header' => 'region' } } }
+                } }
+      expect(described_class.validate_schema(input)).to include(match(/unique/i))
+    end
+
+    it 'keeps identically named properties at distinct paths apart' do
+      input = { 'type' => 'object',
+                'properties' => {
+                  'a' => { 'type' => 'object',
+                           'properties' => { 'id' => { 'type' => 'string', 'x-mcp-header' => 'A-Id' } } },
+                  'b' => { 'type' => 'object',
+                           'properties' => { 'id' => { 'type' => 'string', 'x-mcp-header' => 'B-Id' } } }
+                } }
+      expect(described_class.validate_schema(input)).to eq([])
+      expect(described_class.annotations(input)).to eq([[%w[a id], 'A-Id'], [%w[b id], 'B-Id']])
+      expect(described_class.headers_for(input, { 'a' => { 'id' => '1' }, 'b' => { 'id' => '2' } }))
+        .to eq({ 'Mcp-Param-A-Id' => '1', 'Mcp-Param-B-Id' => '2' })
     end
   end
 
@@ -548,9 +583,11 @@ RSpec.describe 'MCP 2026-07-28 x-mcp-header — hardening' do
   end
 
   it 'keeps the HeaderMismatch error when the refresh itself fails' do
+    methods = []
     lists = 0
     stub_request(:post, url).to_return do |request|
       body = JSON.parse(request.body)
+      methods << body['method']
       case body['method']
       when 'server/discover' then json_response(body['id'], discover_result)
       when 'tools/list'
@@ -560,8 +597,22 @@ RSpec.describe 'MCP 2026-07-28 x-mcp-header — hardening' do
       end
     end
 
-    expect { server.call_tool('execute_sql', { 'region' => 'eu' }) }
-      .to raise_error(MCPClient::Errors::HeaderMismatchError)
+    error = nil
+    begin
+      server.call_tool('execute_sql', { 'region' => 'eu' })
+    rescue MCPClient::Errors::HeaderMismatchError => e
+      error = e
+    end
+
+    # The rejection is re-raised whole -- its code, its HTTP status and its
+    # message -- rather than replaced by the refresh's own failure.
+    expect(error).not_to be_nil
+    expect(error.code).to eq(-32_020)
+    expect(error.message).to include('Header mismatch').and include('400')
+    expect(error.message).not_to include('503')
+    # One refresh was attempted, and the call was not re-sent after it failed.
+    expect(lists).to eq(2)
+    expect(methods.count('tools/call')).to eq(1)
   end
 
   it 'sanitizes peer-controlled text in the refresh warning' do
@@ -592,33 +643,71 @@ RSpec.describe 'MCP 2026-07-28 x-mcp-header — hardening' do
       end
     end
 
-    server.list_tools
+    expect(server.list_tools).to be_empty
 
+    # The warning is written, and the newline in the property name is escaped
+    # into it rather than ending the line.
+    expect(log_output.string).to match(/WARN.*Rejecting tool.*x-mcp-header/)
+    expect(log_output.string).to include('a\\nWARN forged')
     expect(log_output.string).not_to include("\nWARN forged")
   end
 
-  it 'does not let a concurrent stale list_tools overwrite a refreshed tool list' do
-    header = 'Region'
+  # The stale fetch is held at the server until it really is stale, rather
+  # than raced with sleeps: the ordering is what is under test.
+  def stub_held_list(url, header_source, in_flight, release)
     stub_request(:post, url).to_return do |request|
       body = JSON.parse(request.body)
       case body['method']
       when 'server/discover' then json_response(body['id'], discover_result)
       when 'tools/list'
-        current = header
-        sleep 0.05 if current == 'Region' # the stale fetch is slow
+        current = header_source.call
+        if current == 'Region'
+          in_flight << true
+          release.pop(timeout: 5)
+        end
         json_response(body['id'], { 'tools' => [tool(current)] })
       else json_response(body['id'], { 'content' => [] })
       end
     end
+  end
+
+  it 'does not let a concurrent stale list_tools overwrite a refreshed tool list' do
+    header = 'Region'
+    in_flight = Queue.new
+    release = Queue.new
+    stub_held_list(url, -> { header }, in_flight, release)
     server.connect
 
     stale = Thread.new { server.list_tools }
-    sleep 0.01
+    in_flight.pop(timeout: 5)
     header = 'Zone'
     server.send(:refresh_tools_cache)
-    stale.join
+    release << true
 
+    # The stale list is neither cached nor handed back to the caller that
+    # fetched it: that caller gets the fresher list too.
+    expect(stale.value.first.schema['properties']['region']['x-mcp-header']).to eq('Zone')
     expect(server.list_tools.first.schema['properties']['region']['x-mcp-header']).to eq('Zone')
+  end
+
+  it 'gives up when the tool list keeps changing while it is being fetched' do
+    lists = 0
+    stub_request(:post, url).to_return do |request|
+      body = JSON.parse(request.body)
+      case body['method']
+      when 'server/discover' then json_response(body['id'], discover_result)
+      when 'tools/list'
+        lists += 1
+        # A list_changed lands while this very fetch is in flight, every time.
+        server.send(:invalidate_tools_cache)
+        json_response(body['id'], { 'tools' => [tool('Region')] })
+      else json_response(body['id'], { 'content' => [] })
+      end
+    end
+
+    expect { server.list_tools }
+      .to raise_error(MCPClient::Errors::TransportError, %r{tools/list kept changing})
+    expect(lists).to eq(3)
   end
 end
 
@@ -680,13 +769,20 @@ RSpec.describe 'MCP 2026-07-28 x-mcp-header — round 2' do
 
     it 'discards a stale in-flight list even when the cache was emptied meanwhile' do
       header = 'Region'
+      in_flight = Queue.new
+      release = Queue.new
+      lists = 0
       stub_request(:post, url).to_return do |request|
         body = JSON.parse(request.body)
         case body['method']
         when 'server/discover' then json_response(body['id'], discover_result)
         when 'tools/list'
+          lists += 1
           current = header
-          sleep 0.05 if current == 'Region'
+          if current == 'Region'
+            in_flight << true
+            release.pop(timeout: 5)
+          end
           json_response(body['id'], { 'tools' => [tool(current)] })
         else json_response(body['id'], { 'content' => [] })
         end
@@ -694,11 +790,15 @@ RSpec.describe 'MCP 2026-07-28 x-mcp-header — round 2' do
       server.connect
 
       stale = Thread.new { server.list_tools }
-      sleep 0.01
+      in_flight.pop(timeout: 5)
       header = 'Zone'
       server.send(:invalidate_tools_cache) # e.g. notifications/tools/list_changed arrived
-      stale.join
+      release << true
 
+      # Nothing newer was stored, so the stale fetch has to fetch again rather
+      # than keep -- or return -- what it already has.
+      expect(stale.value.first.schema['properties']['region']['x-mcp-header']).to eq('Zone')
+      expect(lists).to eq(2)
       expect(server.list_tools.first.schema['properties']['region']['x-mcp-header']).to eq('Zone')
     end
 
@@ -714,8 +814,11 @@ RSpec.describe 'MCP 2026-07-28 x-mcp-header — round 2' do
         end
       end
 
-      server.list_tools
+      expect(server.list_tools).to be_empty
 
+      # The warning is still written; only the peer-controlled name is capped.
+      expect(log_output.string).to match(/WARN.*Rejecting tool.*x-mcp-header/)
+      expect(log_output.string).to include('... (truncated from 10002 chars)')
       expect(log_output.string.length).to be < 6_000
     end
   end
@@ -724,22 +827,36 @@ RSpec.describe 'MCP 2026-07-28 x-mcp-header — round 2' do
     let(:url) { 'https://example.com/mcp' }
 
     it 'validates against the refreshed definition even if a listener refilled the client cache' do
-      output = { 'type' => 'object', 'properties' => { 'ok' => { 'type' => 'boolean' } }, 'required' => ['ok'] }
+      # The first definition leaves `zone` unannotated, so the first attempt
+      # carries no mirrored header and is rejected; the refreshed definition
+      # annotates it, and the retry's header really is extracted from that.
+      annotated = false
+      requests = []
       stub_request(:post, url).to_return do |request|
         body = JSON.parse(request.body)
+        requests << { headers: request.headers.to_h, body: body }
+        zone = { 'type' => 'string' }
+        zone['x-mcp-header'] = 'Zone' if annotated
         result = case body['method']
                  when 'server/discover'
                    { 'resultType' => 'complete', 'supportedVersions' => ['2026-07-28'],
                      'capabilities' => { 'tools' => {} } }
                  when 'tools/list'
-                   { 'tools' => [{ 'name' => 't', 'inputSchema' => { 'type' => 'object' },
+                   output = if annotated
+                              { 'type' => 'object', 'properties' => { 'rows' => { 'type' => 'integer' } },
+                                'required' => ['rows'] }
+                            else
+                              { 'type' => 'object', 'properties' => { 'ok' => { 'type' => 'boolean' } },
+                                'required' => ['ok'] }
+                            end
+                   { 'tools' => [{ 'name' => 't',
+                                   'inputSchema' => { 'type' => 'object', 'properties' => { 'zone' => zone } },
                                    'outputSchema' => output }] }
                  when 'tools/call'
                    if request.headers['Mcp-Param-Zone']
                      { 'content' => [], 'structuredContent' => { 'rows' => 1 } }
                    else
-                     output = { 'type' => 'object', 'properties' => { 'rows' => { 'type' => 'integer' } },
-                                'required' => ['rows'] }
+                     annotated = true
                      next { status: 400, headers: { 'Content-Type' => 'application/json' },
                             body: JSON.generate('jsonrpc' => '2.0', 'id' => body['id'],
                                                 'error' => { 'code' => -32_020, 'message' => 'Header mismatch' }) }
@@ -755,15 +872,14 @@ RSpec.describe 'MCP 2026-07-28 x-mcp-header — round 2' do
       )
       # A host listener that eagerly re-lists on every list change refills the client cache mid-call.
       client.on_notification { |_srv, method, _p| client.list_tools if method == 'notifications/tools/list_changed' }
-      # The refreshed definition also gains the annotation; the first list lacks it so the call is rejected once.
-      allow(MCPClient::HeaderParams).to receive(:headers_for).and_wrap_original do |m, schema, args|
-        refreshed = client.list_tools.first.output_schema['required'] == ['rows']
-        m.call(schema, args).merge(refreshed ? { 'Mcp-Param-Zone' => 'z' } : {})
-      end
 
-      result = client.call_tool('t', {})
+      result = client.call_tool('t', { 'zone' => 'z' })
 
       expect(result['structuredContent']).to eq({ 'rows' => 1 })
+      calls = requests.select { |r| r[:body]['method'] == 'tools/call' }
+      expect(calls.size).to eq(2)
+      expect(calls[0][:headers]).not_to have_key('Mcp-Param-Zone')
+      expect(calls[1][:headers]['Mcp-Param-Zone']).to eq('z')
       client.cleanup
     end
   end

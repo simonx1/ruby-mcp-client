@@ -178,37 +178,51 @@ module MCPClient
         method = 'server/discover'
       end
 
-      header_refresh_done = false
       result = with_retry(method) do
-        sent_version = protocol_version
-        # One budget for the exchange and the one replacement the re-issue
-        # rule allows: the maximum timeout the spec asks for holds "regardless
-        # of progress", and a lost stream is not progress. The probe already
-        # shares its deadline with its own replacement.
+        # One budget for the exchange and every replacement it may need: the
+        # maximum timeout the spec asks for holds "regardless of progress",
+        # and neither a lost stream nor a rejected header set is progress. The
+        # probe already shares its deadline with its own replacement.
         budget = timeout || @read_timeout
-        deadline = budget && (monotonic_now + budget)
-        begin
-          send_request_and_parse(method, params, timeout, deadline)
-        rescue MCPClient::Errors::UnsupportedProtocolVersionError => e
-          # MCP 2026-07-28 basic/versioning: select a mutually supported
-          # version from the error's list and retry. The server rejected the
-          # request before processing it, so a re-send cannot duplicate a side
-          # effect. Compared against the version THIS request went out with:
-          # a concurrent request may already have moved the transport on.
-          version = select_protocol_version(e.supported)
-          raise unless modern? && version && version != sent_version
+        send_with_recovery(method, params, timeout, budget && (monotonic_now + budget))
+      end
+      # Every server/discover answer is validated and applied: a later
+      # heartbeat may advertise new versions or capabilities.
+      result = apply_discover_result(result) if method == 'server/discover'
+      result
+    end
 
-          @logger.info("Server does not support protocol version #{sent_version}; " \
-                       "retrying #{method} with #{version}")
-          @protocol_version = version
-          send_request_and_parse(method, params, timeout, deadline)
-        end
+    # One with_retry attempt: the request itself plus the two 2026-07-28
+    # recoveries it may need.
+    #
+    # Both re-sends `retry` the same guarded block rather than running inside
+    # their own rescue clause, so either recovery's re-send is still covered by
+    # the other — a HeaderMismatch retry whose stream closes is re-issued, and
+    # a re-issue that is rejected for its headers still refreshes tools/list.
+    # Each recovery fires at most once, so the pair is bounded at three sends.
+    #
+    # Both flags are scoped to this attempt, which is all a tools/call ever
+    # gets — with_retry refuses to re-attempt a NON_IDEMPOTENT_METHODS
+    # request — and gives an idempotent method one re-issue per attempt.
+    #
+    # The deadline is the caller's, shared by every send this attempt makes:
+    # a recovery replaces the request, it does not buy it more time.
+    # @param method [String] JSON-RPC method name
+    # @param params [Hash] parameters for the request
+    # @param timeout [Numeric, nil] per-request timeout override
+    # @param deadline [Float, nil] monotonic instant this attempt must finish by
+    # @return [Object] result from the JSON-RPC response
+    def send_with_recovery(method, params, timeout, deadline = nil)
+      stream_reissued = false
+      header_refreshed = false
+      begin
+        send_request_with_version_retry(method, params, timeout, deadline)
       rescue MCPClient::Errors::HeaderMismatchError => e
-        raise unless modern? && method == 'tools/call' && !header_refresh_done
+        raise unless modern? && method == 'tools/call' && !header_refreshed
 
-        header_refresh_done = true
+        header_refreshed = true
         refresh_tools_after_header_mismatch(e)
-        send_request_and_parse(method, params, timeout)
+        retry
       rescue MCPClient::Errors::ResponseStreamClosedError => e
         # Modern Streamable HTTP has no resumption: "a broken response stream
         # loses the in-flight request; clients MUST re-issue it as a new
@@ -217,20 +231,48 @@ module MCPClient
         # makes closing the response stream itself the cancellation signal —
         # the server MUST treat the broken stream as a cancellation and stop
         # work — so the re-issue is the behaviour the protocol expects rather
-        # than a blind replay. Exactly one re-issue happens, for every
-        # method: with_retry never retries a ResponseStreamClosedError, so a
-        # second broken stream surfaces instead of looping.
+        # than a blind replay. Exactly one re-issue happens, for every method:
+        # this flag bounds the attempt, and with_retry never re-attempts a
+        # ResponseStreamClosedError, so a second broken stream surfaces
+        # instead of looping.
         #
         # A stream that closed between (or inside) SSE events reaches here
         # from the parser; one that died at the socket reaches here from
         # connection_failure_error. Both are the same loss.
+        raise if stream_reissued
+
+        stream_reissued = true
         @logger.warn("#{e.message}; re-issuing #{method} as a new request")
+        retry
+      end
+    end
+
+    # Send the request, renegotiating the protocol version once if the server
+    # rejects the one it went out with.
+    # @param method [String] JSON-RPC method name
+    # @param params [Hash] parameters for the request
+    # @param timeout [Numeric, nil] per-request timeout override
+    # @param deadline [Float, nil] monotonic instant the exchange and its
+    #   renegotiated replacement must finish by
+    # @return [Object] result from the JSON-RPC response
+    def send_request_with_version_retry(method, params, timeout, deadline = nil)
+      sent_version = protocol_version
+      begin
+        send_request_and_parse(method, params, timeout, deadline)
+      rescue MCPClient::Errors::UnsupportedProtocolVersionError => e
+        # MCP 2026-07-28 basic/versioning: select a mutually supported
+        # version from the error's list and retry. The server rejected the
+        # request before processing it, so a re-send cannot duplicate a side
+        # effect. Compared against the version THIS request went out with:
+        # a concurrent request may already have moved the transport on.
+        version = select_protocol_version(e.supported)
+        raise unless modern? && version && version != sent_version
+
+        @logger.info("Server does not support protocol version #{sent_version}; " \
+                     "retrying #{method} with #{version}")
+        @protocol_version = version
         send_request_and_parse(method, params, timeout, deadline)
       end
-      # Every server/discover answer is validated and applied: a later
-      # heartbeat may advertise new versions or capabilities.
-      result = apply_discover_result(result) if method == 'server/discover'
-      result
     end
 
     # One request/response exchange with its own JSON-RPC id.

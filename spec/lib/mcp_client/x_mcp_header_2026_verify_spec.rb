@@ -463,3 +463,570 @@ RSpec.describe 'MCP 2026-07-28 x-mcp-header — safe integer boundary' do
     end
   end
 end
+
+# Review round 3 (codex): a modern tools/call may need either of the two
+# 2026-07-28 recoveries -- refresh-and-retry after a HeaderMismatch, re-issue
+# after a broken response stream -- and either one's re-send can run into the
+# other. They must compose, in both orders, and stay bounded.
+RSpec.describe 'MCP 2026-07-28 x-mcp-header — recovery composition' do
+  include_context 'with x-mcp-header wire helpers'
+
+  let(:server) { MCPClient::ServerStreamableHTTP.new(base_url: base_url, endpoint: endpoint, retries: 0) }
+
+  after { server.cleanup }
+
+  def annotated_tool(header)
+    { 'name' => 'execute_sql',
+      'inputSchema' => { 'type' => 'object',
+                         'properties' => { 'region' => { 'type' => 'string', 'x-mcp-header' => header } } } }
+  end
+
+  # A POST answered on an SSE stream that closes without ever carrying the
+  # response: on a modern session that request is lost and MUST be re-issued.
+  def closed_stream
+    sse_response([{ 'jsonrpc' => '2.0', 'method' => 'notifications/progress', 'params' => { 'progress' => 1 } }])
+  end
+
+  # Serve the annotated tool, answering the nth tools/call with the nth entry
+  # of +answers+ (a lambda taking the request body). The header the tool is
+  # annotated with flips to 'Zone' as soon as a HeaderMismatch is returned.
+  def stub_call_sequence(answers)
+    header = 'Region'
+    requests = []
+    calls = 0
+    stub_request(:post, url).to_return do |request|
+      body = JSON.parse(request.body)
+      requests << { headers: request.headers.to_h, body: body }
+      case body['method']
+      when 'server/discover' then json_response(body['id'], modern_discover)
+      when 'tools/list' then json_response(body['id'], { 'tools' => [annotated_tool(header)] })
+      when 'tools/call'
+        calls += 1
+        answer = answers[calls - 1] || ->(b) { json_response(b['id'], { 'content' => [] }) }
+        header = 'Zone' if answer == :mismatch
+        answer == :mismatch ? header_mismatch(body['id'], 'Mcp-Param-Zone missing') : answer.call(body)
+      end
+    end
+    requests
+  end
+
+  let(:closed) { ->(_body) { closed_stream } }
+  let(:ok) { ->(body) { json_response(body['id'], { 'content' => [] }) } }
+
+  it 're-issues the HeaderMismatch retry when its own response stream closes' do
+    requests = stub_call_sequence([:mismatch, closed, ok])
+
+    expect(server.call_tool('execute_sql', { 'region' => 'eu' })).to eq({ 'content' => [] })
+
+    posted = calls_in(requests)
+    expect(posted.size).to eq(3)
+    expect(posted.map { |c| c[:headers]['Mcp-Param-Region'] }).to eq(['eu', nil, nil])
+    expect(posted.map { |c| c[:headers]['Mcp-Param-Zone'] }).to eq([nil, 'eu', 'eu'])
+    expect(posted.map { |c| c[:body]['id'] }.uniq.size).to eq(3)
+    expect(requests.count { |r| r[:body]['method'] == 'tools/list' }).to eq(2)
+  end
+
+  it 'refreshes tools/list when the re-issue after a broken stream is rejected for its headers' do
+    requests = stub_call_sequence([closed, :mismatch, ok])
+
+    expect(server.call_tool('execute_sql', { 'region' => 'eu' })).to eq({ 'content' => [] })
+
+    posted = calls_in(requests)
+    expect(posted.size).to eq(3)
+    expect(posted.map { |c| c[:headers]['Mcp-Param-Region'] }).to eq(%w[eu eu] + [nil])
+    expect(posted.map { |c| c[:headers]['Mcp-Param-Zone'] }).to eq([nil, nil, 'eu'])
+    expect(posted.map { |c| c[:body]['id'] }.uniq.size).to eq(3)
+    expect(requests.count { |r| r[:body]['method'] == 'tools/list' }).to eq(2)
+  end
+
+  it 'stays bounded: each recovery fires once, then the failure surfaces' do
+    requests = stub_call_sequence([:mismatch, closed, closed])
+
+    expect { server.call_tool('execute_sql', { 'region' => 'eu' }) }
+      .to raise_error(MCPClient::Errors::ResponseStreamClosedError, /closed before delivering the response/)
+
+    expect(calls_in(requests).size).to eq(3)
+  end
+
+  it 'stays bounded in the other order too' do
+    requests = stub_call_sequence([closed, :mismatch, :mismatch])
+
+    expect { server.call_tool('execute_sql', { 'region' => 'eu' }) }
+      .to raise_error(MCPClient::Errors::HeaderMismatchError)
+
+    expect(calls_in(requests).size).to eq(3)
+  end
+end
+
+# Review round 3 (codex): the plain HTTP transport also answers a POST on an
+# SSE stream and dispatches the server messages that stream carries, so host
+# code it reaches can nest a tools/call inside an outer one -- exactly as on
+# Streamable HTTP, and with the same requirement that the nested call not
+# displace the definition the outer call recorded for itself.
+RSpec.describe 'MCP 2026-07-28 x-mcp-header — nested calls on both HTTP transports' do
+  include_context 'with x-mcp-header wire helpers'
+
+  let(:progress) do
+    { 'jsonrpc' => '2.0', 'method' => 'notifications/progress',
+      'params' => { 'progressToken' => 'p', 'progress' => 1 } }
+  end
+  let(:other_tool) { { 'name' => 'other', 'inputSchema' => { 'type' => 'object' } } }
+
+  def annotated(header, required)
+    { 'name' => 'execute_sql',
+      'inputSchema' => { 'type' => 'object',
+                         'properties' => { 'region' => { 'type' => 'string', 'x-mcp-header' => header } } },
+      'outputSchema' => { 'type' => 'object', 'properties' => { required => { 'type' => 'boolean' } },
+                          'required' => [required] } }
+  end
+
+  # A modern server that rejects the first tools/call for its headers, moving
+  # both the annotation and the outputSchema on, and answers the retry on an
+  # SSE stream carrying a progress notification ahead of the result.
+  def stub_refreshing_server
+    listed = [annotated('Region', 'v1'), other_tool]
+    stub_request(:post, url).to_return do |request|
+      body = JSON.parse(request.body)
+      case body['method']
+      when 'server/discover' then json_response(body['id'], modern_discover)
+      when 'tools/list' then json_response(body['id'], { 'tools' => listed })
+      when 'tools/call'
+        if body['params']['name'] == 'other'
+          json_response(body['id'], { 'content' => [] })
+        elsif request.headers['Mcp-Param-Zone']
+          sse_response([progress,
+                        { 'jsonrpc' => '2.0', 'id' => body['id'],
+                          'result' => { 'content' => [], 'structuredContent' => { 'v2' => true } } }])
+        else
+          listed = [annotated('Zone', 'v2'), other_tool]
+          header_mismatch(body['id'], 'Mcp-Param-Zone missing')
+        end
+      end
+    end
+  end
+
+  def strict_client_for(factory)
+    MCPClient::Client.new(
+      mcp_server_configs: [MCPClient.public_send(factory, base_url: base_url, endpoint: endpoint, retries: 0)],
+      validate_structured_content: :strict, logger: Logger.new(File::NULL)
+    )
+  end
+
+  { 'plain HTTP' => :http_config, 'Streamable HTTP' => :streamable_http_config }.each do |label, factory|
+    it "keeps the answering definition on #{label} when a listener nests a call to another tool" do
+      stub_refreshing_server
+      client = strict_client_for(factory)
+      nested = []
+      client.on_notification do |srv, method, _params|
+        nested << srv.call_tool('other', {}) if method == 'notifications/progress'
+      end
+
+      result = client.call_tool('execute_sql', { 'region' => 'eu' })
+
+      expect(result['structuredContent']).to eq({ 'v2' => true })
+      expect(nested).to eq([{ 'content' => [] }])
+      client.cleanup
+    end
+  end
+end
+
+# Review round 3 (codex): behaviour the earlier examples pinned on one HTTP
+# transport only, plus the distinctions four surviving mutations showed were
+# unpinned -- legacy gating of the HeaderMismatch recovery, the sentinel
+# escaping of an argument on the wire, and modern structured-output rejection.
+RSpec.describe 'MCP 2026-07-28 x-mcp-header — shared by both HTTP transports' do
+  include_context 'with x-mcp-header wire helpers'
+
+  def annotated_tool(header)
+    { 'name' => 'execute_sql',
+      'inputSchema' => { 'type' => 'object',
+                         'properties' => { 'region' => { 'type' => 'string', 'x-mcp-header' => header },
+                                           'shard' => { 'type' => 'integer', 'x-mcp-header' => 'Shard' } } } }
+  end
+
+  def legacy_initialize(id)
+    json_response(id, { 'protocolVersion' => '2025-11-25', 'capabilities' => { 'tools' => {} },
+                        'serverInfo' => { 'name' => 'legacy', 'version' => '1' } })
+  end
+
+  [MCPClient::ServerHTTP, MCPClient::ServerStreamableHTTP].each do |klass|
+    context klass.name.split('::').last do
+      let(:server) { klass.new(base_url: base_url, endpoint: endpoint, retries: 0) }
+
+      after { server.cleanup }
+
+      it 'refreshes tools/list and retries once after a HeaderMismatch, re-deriving the headers' do
+        header = 'Region'
+        requests = []
+        stub_request(:post, url).to_return do |request|
+          body = JSON.parse(request.body)
+          requests << { headers: request.headers.to_h, body: body }
+          case body['method']
+          when 'server/discover' then json_response(body['id'], modern_discover)
+          when 'tools/list' then json_response(body['id'], { 'tools' => [annotated_tool(header)] })
+          when 'tools/call'
+            if request.headers['Mcp-Param-Zone']
+              json_response(body['id'], { 'content' => [] })
+            else
+              header = 'Zone'
+              header_mismatch(body['id'], 'Mcp-Param-Zone missing')
+            end
+          end
+        end
+
+        expect(server.call_tool('execute_sql', { 'region' => 'eu' })).to eq({ 'content' => [] })
+
+        expect(requests.map { |r| r[:body]['method'] })
+          .to eq(%w[server/discover tools/list tools/call tools/list tools/call])
+        calls = calls_in(requests)
+        expect(calls.map { |c| param_headers(c[:headers]) })
+          .to eq([{ 'Mcp-Param-Region' => 'eu' }, { 'Mcp-Param-Zone' => 'eu' }])
+      end
+
+      it 'surfaces the second rejection in full, with its code, message and HTTP status' do
+        requests = []
+        stub_request(:post, url).to_return do |request|
+          body = JSON.parse(request.body)
+          requests << body['method']
+          case body['method']
+          when 'server/discover' then json_response(body['id'], modern_discover)
+          when 'tools/list' then json_response(body['id'], { 'tools' => [annotated_tool('Region')] })
+          else header_mismatch(body['id'], requests.count('tools/call') == 1 ? 'first' : 'second')
+          end
+        end
+
+        error = nil
+        begin
+          server.call_tool('execute_sql', { 'region' => 'eu' })
+        rescue MCPClient::Errors::HeaderMismatchError => e
+          error = e
+        end
+
+        expect(error).not_to be_nil
+        expect(error.message).to include('second').and include('400')
+        expect(error.message).not_to include('first')
+        expect(error.code).to eq(-32_020)
+        expect(requests.count('tools/call')).to eq(2)
+      end
+
+      it 'does not refresh after a HeaderMismatch on a method other than tools/call' do
+        requests = []
+        stub_request(:post, url).to_return do |request|
+          body = JSON.parse(request.body)
+          requests << body['method']
+          case body['method']
+          when 'server/discover' then json_response(body['id'], modern_discover)
+          else header_mismatch(body['id'], 'not a call')
+          end
+        end
+
+        expect { server.list_tools }.to raise_error(MCPClient::Errors::HeaderMismatchError)
+        expect(requests.count('tools/list')).to eq(1)
+      end
+
+      it 'does not refresh after an ordinary server error on tools/call' do
+        requests = []
+        stub_request(:post, url).to_return do |request|
+          body = JSON.parse(request.body)
+          requests << body['method']
+          case body['method']
+          when 'server/discover' then json_response(body['id'], modern_discover)
+          when 'tools/list' then json_response(body['id'], { 'tools' => [annotated_tool('Region')] })
+          else
+            { status: 200, headers: { 'Content-Type' => 'application/json' },
+              body: JSON.generate('jsonrpc' => '2.0', 'id' => body['id'],
+                                  'error' => { 'code' => -32_602, 'message' => 'Invalid params' }) }
+          end
+        end
+
+        expect { server.call_tool('execute_sql', { 'region' => 'eu' }) }.to raise_error(MCPClient::Errors::MCPError)
+        expect(requests.count('tools/call')).to eq(1)
+        expect(requests.count('tools/list')).to eq(1)
+      end
+
+      it 'rejects an argument that cannot be mirrored before the call goes out' do
+        requests = []
+        stub_request(:post, url).to_return do |request|
+          body = JSON.parse(request.body)
+          requests << body['method']
+          case body['method']
+          when 'server/discover' then json_response(body['id'], modern_discover)
+          when 'tools/list' then json_response(body['id'], { 'tools' => [annotated_tool('Region')] })
+          else json_response(body['id'], { 'content' => [] })
+          end
+        end
+        server.list_tools
+
+        [[{ 'region' => { 'nested' => 1 } }, /primitive/], [[1, 2], /primitive/],
+         [{ 'shard' => Float::INFINITY }, /primitive/], [{ 'shard' => Float::NAN }, /primitive/],
+         [{ 'shard' => 2**53 }, /safe/]].each do |value, message|
+          args = value.is_a?(Hash) ? value : { 'region' => value }
+          expect { server.call_tool('execute_sql', args) }
+            .to raise_error(MCPClient::Errors::ValidationError, message), value.inspect
+        end
+
+        expect(requests).not_to include('tools/call')
+      end
+
+      # Mutation: not escaping a sentinel-shaped argument on the parameter
+      # path. The wire values, not the encoder in isolation, are what an
+      # intermediary reads back.
+      it 'encodes every argument on the wire the way the value-encoding rules require' do
+        tool = { 'name' => 'encode', 'inputSchema' => {
+          'type' => 'object',
+          'properties' => { 'text' => { 'type' => 'string', 'x-mcp-header' => 'Text' },
+                            'n' => { 'type' => 'integer', 'x-mcp-header' => 'N' },
+                            'flag' => { 'type' => 'boolean', 'x-mcp-header' => 'Flag' } }
+        } }
+        requests = []
+        stub_request(:post, url).to_return do |request|
+          body = JSON.parse(request.body)
+          requests << { headers: request.headers.to_h, body: body }
+          case body['method']
+          when 'server/discover' then json_response(body['id'], modern_discover)
+          when 'tools/list' then json_response(body['id'], { 'tools' => [tool] })
+          else json_response(body['id'], { 'content' => [] })
+          end
+        end
+        server.list_tools
+
+        cases = {
+          # A value already shaped like the sentinel is itself encoded, so the
+          # peer cannot mistake it for an encoded one.
+          { 'text' => '=?base64?literal?=' } => { 'Mcp-Param-Text' => '=?base64?PT9iYXNlNjQ/bGl0ZXJhbD89?=' },
+          { 'text' => '' } => { 'Mcp-Param-Text' => '=?base64??=' },
+          { 'text' => "a\r\nb" } => { 'Mcp-Param-Text' => '=?base64?YQ0KYg==?=' },
+          { 'text' => 'Hello, 世界' } => { 'Mcp-Param-Text' => '=?base64?SGVsbG8sIOS4lueVjA==?=' },
+          { 'text' => 'us-west1' } => { 'Mcp-Param-Text' => 'us-west1' },
+          { 'flag' => false } => { 'Mcp-Param-Flag' => 'false' },
+          { 'n' => 0 } => { 'Mcp-Param-N' => '0' },
+          { 'n' => 42.0 } => { 'Mcp-Param-N' => '42' }
+        }
+        cases.each do |args, expected|
+          requests.clear
+          server.call_tool('encode', args)
+          expect(param_headers(calls_in(requests).first[:headers])).to eq(expected), args.inspect
+        end
+      end
+
+      # Mutation: allowing the HeaderMismatch recovery on a legacy session.
+      # The Mcp-Param namespace does not exist there, so there is nothing to
+      # re-derive and the rejection is simply the server's answer.
+      it 'never refreshes or retries after a HeaderMismatch on a legacy session' do
+        requests = []
+        stub_request(:get, url).to_return(status: 405, body: '')
+        stub_request(:post, url).to_return do |request|
+          body = JSON.parse(request.body)
+          requests << body['method']
+          case body['method']
+          when 'initialize' then legacy_initialize(body['id'])
+          when 'notifications/initialized' then { status: 202, body: '' }
+          when 'tools/list' then json_response(body['id'], { 'tools' => [annotated_tool('Region')] })
+          else header_mismatch(body['id'], 'Mcp-Param-Zone missing')
+          end
+        end
+        legacy = klass.new(base_url: base_url, endpoint: endpoint, retries: 0, protocol: :legacy)
+
+        expect { legacy.call_tool('execute_sql', { 'region' => 'eu' }) }
+          .to raise_error(MCPClient::Errors::HeaderMismatchError, /Mcp-Param-Zone missing/)
+
+        expect(requests.count('tools/call')).to eq(1)
+        expect(requests).not_to include('tools/list')
+        legacy.cleanup
+      end
+    end
+  end
+end
+
+# Mutation: disabling structured-output validation on a modern session. Every
+# other modern example expects acceptance, so a client that validated nothing
+# would still pass them.
+RSpec.describe 'MCP 2026-07-28 x-mcp-header — modern structured-output rejection' do
+  include_context 'with x-mcp-header wire helpers'
+
+  def tool(header, required)
+    { 'name' => 'execute_sql',
+      'inputSchema' => { 'type' => 'object',
+                         'properties' => { 'region' => { 'type' => 'string', 'x-mcp-header' => header } } },
+      'outputSchema' => { 'type' => 'object', 'properties' => { required => { 'type' => 'boolean' } },
+                          'required' => [required] } }
+  end
+
+  it 'rejects a retry result the refreshed definition forbids, naming the refreshed requirement' do
+    listed = tool('Region', 'v1')
+    stub_request(:post, url).to_return do |request|
+      body = JSON.parse(request.body)
+      case body['method']
+      when 'server/discover' then json_response(body['id'], modern_discover)
+      when 'tools/list' then json_response(body['id'], { 'tools' => [listed] })
+      when 'tools/call'
+        if request.headers['Mcp-Param-Zone']
+          json_response(body['id'], { 'content' => [], 'structuredContent' => { 'v1' => true } })
+        else
+          listed = tool('Zone', 'v2')
+          header_mismatch(body['id'], 'Mcp-Param-Zone missing')
+        end
+      end
+    end
+    client = MCPClient::Client.new(
+      mcp_server_configs: [MCPClient.streamable_http_config(base_url: base_url, endpoint: endpoint, retries: 0)],
+      validate_structured_content: :strict, logger: Logger.new(File::NULL)
+    )
+
+    expect { client.call_tool('execute_sql', { 'region' => 'eu' }) }
+      .to raise_error(MCPClient::Errors::ValidationError, /missing required property 'v2'/)
+    client.cleanup
+  end
+end
+
+# Review round 3 (codex): the changed list-cache path is also the paginated
+# one, and a refresh may take an annotation away as easily as add one.
+RSpec.describe 'MCP 2026-07-28 x-mcp-header — paginated and shrinking lists' do
+  include_context 'with x-mcp-header wire helpers'
+
+  let(:server) { MCPClient::ServerStreamableHTTP.new(base_url: base_url, endpoint: endpoint, retries: 0) }
+
+  after { server.cleanup }
+
+  def plain_tool(name)
+    { 'name' => name, 'inputSchema' => { 'type' => 'object' } }
+  end
+
+  def annotated_tool(header)
+    { 'name' => 'execute_sql',
+      'inputSchema' => { 'type' => 'object',
+                         'properties' => { 'region' => { 'type' => 'string', 'x-mcp-header' => header } } } }
+  end
+
+  it 'mirrors an annotated tool that only appears on a later page of tools/list' do
+    requests = []
+    stub_request(:post, url).to_return do |request|
+      body = JSON.parse(request.body)
+      requests << { headers: request.headers.to_h, body: body }
+      case body['method']
+      when 'server/discover' then json_response(body['id'], modern_discover)
+      when 'tools/list'
+        if body['params']['cursor']
+          json_response(body['id'], { 'tools' => [annotated_tool('Region')] })
+        else
+          json_response(body['id'], { 'tools' => [plain_tool('first')], 'nextCursor' => 'page2' })
+        end
+      else json_response(body['id'], { 'content' => [] })
+      end
+    end
+
+    expect(server.list_tools.map(&:name)).to eq(%w[first execute_sql])
+    server.call_tool('execute_sql', { 'region' => 'eu' })
+
+    expect(requests.count { |r| r[:body]['method'] == 'tools/list' }).to eq(2)
+    expect(param_headers(calls_in(requests).first[:headers])).to eq({ 'Mcp-Param-Region' => 'eu' })
+  end
+
+  it 'sends no mirrored header when the refreshed definition drops the annotation' do
+    annotated = true
+    requests = []
+    stub_request(:post, url).to_return do |request|
+      body = JSON.parse(request.body)
+      requests << { headers: request.headers.to_h, body: body }
+      case body['method']
+      when 'server/discover' then json_response(body['id'], modern_discover)
+      when 'tools/list'
+        json_response(body['id'], { 'tools' => [annotated ? annotated_tool('Region') : plain_tool('execute_sql')] })
+      when 'tools/call'
+        if param_headers(request.headers).empty?
+          json_response(body['id'], { 'content' => [] })
+        else
+          annotated = false
+          header_mismatch(body['id'], 'Mcp-Param-Region is not expected')
+        end
+      end
+    end
+
+    expect(server.call_tool('execute_sql', { 'region' => 'eu' })).to eq({ 'content' => [] })
+
+    calls = calls_in(requests)
+    expect(calls.size).to eq(2)
+    expect(param_headers(calls[0][:headers])).to eq({ 'Mcp-Param-Region' => 'eu' })
+    expect(param_headers(calls[1][:headers])).to be_empty
+  end
+
+  it 'fails the call when the refreshed definition no longer carries the tool at all' do
+    listed = [annotated_tool('Region')]
+    requests = []
+    stub_request(:post, url).to_return do |request|
+      body = JSON.parse(request.body)
+      requests << body['method']
+      case body['method']
+      when 'server/discover' then json_response(body['id'], modern_discover)
+      when 'tools/list' then json_response(body['id'], { 'tools' => listed })
+      when 'tools/call'
+        listed = []
+        header_mismatch(body['id'], 'Mcp-Param-Zone missing')
+      end
+    end
+
+    # The retry still goes out -- the server, not the client, decides whether an
+    # unlisted tool exists -- but it carries no mirrored header to re-derive.
+    expect { server.call_tool('execute_sql', { 'region' => 'eu' }) }
+      .to raise_error(MCPClient::Errors::HeaderMismatchError)
+    expect(requests.count('tools/call')).to eq(2)
+  end
+end
+
+# Review round 3 (codex): the notification-driven cache invalidation this PR
+# added covers prompts and resources as well as tools, and the plain HTTP
+# dispatcher only started calling it here.
+RSpec.describe 'MCP 2026-07-28 x-mcp-header — list_changed invalidation on both HTTP transports' do
+  include_context 'with x-mcp-header wire helpers'
+
+  def full_discover
+    { 'resultType' => 'complete', 'supportedVersions' => ['2026-07-28'],
+      'capabilities' => { 'tools' => {}, 'prompts' => {}, 'resources' => {} } }
+  end
+
+  { MCPClient::ServerHTTP => :dispatch_sse_message,
+    MCPClient::ServerStreamableHTTP => :dispatch_server_message }.each do |klass, dispatcher|
+    context klass.name.split('::').last do
+      let(:server) { klass.new(base_url: base_url, endpoint: endpoint, retries: 0) }
+
+      after { server.cleanup }
+
+      def notify(server, dispatcher, method)
+        server.send(dispatcher, { 'jsonrpc' => '2.0', 'method' => method, 'params' => {} })
+      end
+
+      it 'drops each cache only on its own list_changed notification' do
+        counts = Hash.new(0)
+        stub_request(:post, url).to_return do |request|
+          body = JSON.parse(request.body)
+          counts[body['method']] += 1
+          n = counts[body['method']]
+          case body['method']
+          when 'server/discover' then json_response(body['id'], full_discover)
+          when 'tools/list' then json_response(body['id'], { 'tools' => [{ 'name' => "t#{n}" }] })
+          when 'prompts/list' then json_response(body['id'], { 'prompts' => [{ 'name' => "p#{n}" }] })
+          when 'resources/list'
+            json_response(body['id'], { 'resources' => [{ 'uri' => "file:///r#{n}", 'name' => "r#{n}" }] })
+          end
+        end
+
+        expect(server.list_tools.map(&:name)).to eq(['t1'])
+        expect(server.list_prompts.map(&:name)).to eq(['p1'])
+        expect(server.list_resources['resources'].map(&:name)).to eq(['r1'])
+
+        # A tools change leaves the other two caches alone.
+        notify(server, dispatcher, 'notifications/tools/list_changed')
+        expect(server.list_tools.map(&:name)).to eq(['t2'])
+        expect(server.list_prompts.map(&:name)).to eq(['p1'])
+        expect(server.list_resources['resources'].map(&:name)).to eq(['r1'])
+
+        notify(server, dispatcher, 'notifications/prompts/list_changed')
+        expect(server.list_prompts.map(&:name)).to eq(['p2'])
+
+        notify(server, dispatcher, 'notifications/resources/list_changed')
+        expect(server.list_resources['resources'].map(&:name)).to eq(['r2'])
+        expect(server.list_tools.map(&:name)).to eq(['t2'])
+      end
+    end
+  end
+end
