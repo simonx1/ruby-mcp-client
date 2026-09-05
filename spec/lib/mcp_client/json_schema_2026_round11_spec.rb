@@ -14,22 +14,23 @@ RSpec.describe 'MCP 2026-07-28 JSON Schema handling — round 11' do
 
   describe 'partially evaluated branches' do
     it 'does not reject a value because a not branch it cannot decide seemed to match' do
-      expect(validator.validate(3, { 'not' => { 'multipleOf' => 2 } })).to be_empty
-      expect(validator.validate(4, { 'not' => { 'multipleOf' => 2 } })).to be_empty
+      # `unevaluatedItems` needs the annotations a whole composition produces,
+      # so a branch carrying one is a verdict this validator cannot reach.
+      expect(validator.validate([1], { 'not' => { 'unevaluatedItems' => false } })).to be_empty
       # A decided branch still asserts.
       expect(validator.validate('x', { 'not' => { 'type' => 'string' } })).to contain_exactly(a_string_matching(/not/))
-      # A branch that fails on a supported keyword is decided even when it
-      # also carries an unsupported one.
-      undecided_then_failing = { 'not' => { 'allOf' => [{ 'multipleOf' => 2 }, { 'type' => 'string' }] } }
-      expect(validator.validate(3, undecided_then_failing)).to be_empty
-      # multipleOf does not apply to a string, so that branch is decided by
-      # its type alone and matches: not rejects the string.
+      # A branch that fails on an evaluated keyword is decided even when it
+      # also carries an unevaluated one.
+      undecided_then_failing = { 'not' => { 'allOf' => [{ 'unevaluatedItems' => false }, { 'type' => 'string' }] } }
+      expect(validator.validate([1], undecided_then_failing)).to be_empty
+      # unevaluatedItems does not apply to a string, so that branch is decided
+      # by its type alone and matches: not rejects the string.
       expect(validator.validate('x', undecided_then_failing)).to contain_exactly(a_string_matching(/not/))
     end
 
     it 'does not count an undecided oneOf branch as a match' do
-      schema = { 'oneOf' => [{ 'multipleOf' => 2 }, { 'type' => 'integer' }] }
-      expect(validator.validate(3, schema)).to be_empty
+      schema = { 'oneOf' => [{ 'unevaluatedItems' => false }, { 'type' => 'array' }] }
+      expect(validator.validate([1], schema)).to be_empty
       decided = { 'oneOf' => [{ 'type' => 'number' }, { 'type' => 'integer' }] }
       expect(validator.validate(3, decided)).to contain_exactly(a_string_matching(/oneOf/))
     end
@@ -37,17 +38,25 @@ RSpec.describe 'MCP 2026-07-28 JSON Schema handling — round 11' do
     it 'skips a conditional whose if it cannot decide, unless the branches agree' do
       # Neither branch can be selected, but both reject the value, so the
       # instance is rejected whichever way the condition goes.
-      agreed = { 'if' => { 'multipleOf' => 2 }, 'then' => { 'type' => 'string' }, 'else' => { 'type' => 'string' } }
-      expect(validator.validate(3, agreed)).to contain_exactly(a_string_matching(/expected type string/))
-      schema = { 'if' => { 'multipleOf' => 2 }, 'then' => { 'type' => 'string' }, 'else' => { 'type' => 'integer' } }
-      expect(validator.validate(3, schema)).to be_empty
+      condition = { 'unevaluatedItems' => false }
+      agreed = { 'if' => condition, 'then' => { 'type' => 'string' }, 'else' => { 'type' => 'string' } }
+      expect(validator.validate([1], agreed)).to contain_exactly(a_string_matching(/expected type string/))
+      schema = { 'if' => condition, 'then' => { 'type' => 'string' }, 'else' => { 'type' => 'array' } }
+      expect(validator.validate([1], schema)).to be_empty
       decided = { 'if' => { 'type' => 'integer' }, 'then' => { 'type' => 'string' } }
       expect(validator.validate(3, decided)).to contain_exactly(a_string_matching(/expected type string/))
     end
 
     it 'keeps treating a partial pass as a pass where that is the permissive direction' do
-      expect(validator.validate(3, { 'anyOf' => [{ 'multipleOf' => 2 }] })).to be_empty
-      expect(validator.validate(3, { 'allOf' => [{ 'multipleOf' => 2 }] })).to be_empty
+      expect(validator.validate([1], { 'anyOf' => [{ 'unevaluatedItems' => false }] })).to be_empty
+      expect(validator.validate([1], { 'allOf' => [{ 'unevaluatedItems' => false }] })).to be_empty
+      # An assertion this validator does evaluate decides those compositions
+      # rather than passing them: an unevaluated one is not a licence to
+      # accept what the schema rejects.
+      expect(validator.validate(4, { 'anyOf' => [{ 'multipleOf' => 3 }] }))
+        .to contain_exactly(a_string_matching(/anyOf/))
+      expect(validator.validate(4, { 'allOf' => [{ 'multipleOf' => 3 }] }))
+        .to contain_exactly(a_string_matching(%r{allOf/0}))
     end
   end
 

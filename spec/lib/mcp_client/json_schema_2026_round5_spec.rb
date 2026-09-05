@@ -20,11 +20,13 @@ RSpec.describe 'MCP 2026-07-28 JSON Schema handling — round 5' do
         'dependencies' => { 'credit_card' => ['billing_address'] } }
     end
 
-    it 'accepts the draft-07 property form of dependencies and reports it as unevaluated' do
+    it 'applies the draft-07 property form of dependencies' do
       schema = dependencies.merge('$schema' => draft7)
       expect(validator.check_schema(schema)).to be_empty
       expect(validator.validate({ 'credit_card' => '4111', 'billing_address' => 'x' }, schema)).to be_empty
-      expect(validator.unsupported_keywords(schema)).to eq(['dependencies'])
+      expect(validator.validate({ 'credit_card' => '4111' }, schema))
+        .to contain_exactly(a_string_matching(/requires property 'billing_address'/))
+      expect(validator.unsupported_keywords(schema)).to eq([])
     end
 
     it 'ignores dependencies entirely under 2020-12, where the keyword does not exist' do

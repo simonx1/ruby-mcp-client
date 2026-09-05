@@ -141,12 +141,14 @@ RSpec.describe MCPClient::SchemaValidator do
       expect(described_class.validate(1, schema)).to contain_exactly(a_string_matching(/string or null/))
     end
 
-    it 'ignores JSON Schema keywords outside the supported subset' do
-      # The remaining 2020-12 vocabulary (uniqueItems, format, ...) is
-      # documented as out of scope: unrecognized keywords must be ignored,
-      # not misapplied.
+    it 'applies the standard assertions and ignores only what it documents as out of scope' do
+      # uniqueItems is a standard assertion: leaving it unevaluated would
+      # accept an array the schema rejects. `format` only annotates in
+      # 2020-12, so it decides nothing about the instance.
       schema = { 'type' => 'array', 'uniqueItems' => true, 'format' => 'custom' }
-      expect(described_class.validate([1, 1], schema)).to be_empty
+      expect(described_class.validate([1, 1], schema)).to contain_exactly(a_string_matching(/unique/))
+      expect(described_class.validate([1, 2], schema)).to be_empty
+      expect(described_class.validate(['not-an-email'], { 'items' => { 'format' => 'email' } })).to be_empty
     end
 
     it 'handles symbol-keyed schemas and data' do
@@ -169,15 +171,12 @@ RSpec.describe MCPClient::SchemaValidator do
     end
 
     it 'detects top-level unsupported keywords' do
-      schema = { 'type' => 'object', 'additionalProperties' => false, 'uniqueItems' => true }
-      expect(described_class.unsupported_keywords(schema)).to contain_exactly('additionalProperties', 'uniqueItems')
+      schema = { 'type' => 'object', 'unevaluatedProperties' => false, 'format' => 'custom' }
+      expect(described_class.unsupported_keywords(schema)).to contain_exactly('unevaluatedProperties', 'format')
     end
 
     it 'detects every keyword in the unsupported list' do
-      keywords = %w[$dynamicRef $recursiveRef
-                    additionalProperties patternProperties propertyNames dependentSchemas dependencies
-                    additionalItems contains minContains maxContains uniqueItems contentSchema
-                    multipleOf format dependentRequired minProperties maxProperties
+      keywords = %w[$dynamicRef $recursiveRef contentSchema format
                     unevaluatedProperties unevaluatedItems]
       expect(described_class::UNSUPPORTED_KEYWORDS).to match_array(keywords)
       keywords.each do |keyword|
@@ -187,9 +186,10 @@ RSpec.describe MCPClient::SchemaValidator do
       end
     end
 
-    it 'detects unapplied 2020-12 assertion keywords nested in property subschemas' do
+    it 'reports only the assertions it cannot evaluate, applying the rest' do
       schema = {
-        # additionalItems and the items tuple only exist before 2020-12.
+        # additionalItems and the items tuple only exist before 2020-12,
+        # where `format` also asserts.
         '$schema' => 'http://json-schema.org/draft-07/schema#',
         'type' => 'object',
         'properties' => {
@@ -200,25 +200,31 @@ RSpec.describe MCPClient::SchemaValidator do
           'names' => { 'type' => 'object', 'propertyNames' => { 'pattern' => '^a' } }
         }
       }
-      expect(described_class.unsupported_keywords(schema)).to contain_exactly(
-        'format', 'multipleOf', 'uniqueItems', 'contains', 'additionalItems', 'propertyNames'
-      )
+      expect(described_class.unsupported_keywords(schema)).to contain_exactly('format')
+      expect(described_class.validate({ 'count' => 3 }, schema)).to contain_exactly(a_string_matching(/multiple of 5/))
+      expect(described_class.validate({ 'tags' => %w[a a] }, schema)).to contain_exactly(a_string_matching(/unique/))
+      expect(described_class.validate({ 'tags' => [1] }, schema))
+        .to contain_exactly(a_string_matching(/items matching contains/))
+      expect(described_class.validate({ 'pair' => %w[a b] }, schema))
+        .to contain_exactly(a_string_matching(/additionalItems is false/))
+      expect(described_class.validate({ 'names' => { 'b' => 1 } }, schema))
+        .to contain_exactly(a_string_matching(/propertyNames/))
     end
 
     it 'detects unsupported keywords nested in properties and items' do
       schema = {
         'type' => 'object',
         'properties' => {
-          'a' => { 'multipleOf' => 2 },
+          'a' => { '$dynamicRef' => '#x' },
           'b' => { 'type' => 'array', 'items' => { 'format' => 'email' } }
         }
       }
-      expect(described_class.unsupported_keywords(schema)).to contain_exactly('multipleOf', 'format')
+      expect(described_class.unsupported_keywords(schema)).to contain_exactly('$dynamicRef', 'format')
     end
 
     it 'detects unsupported keywords nested inside applicator schemas' do
-      schema = { 'anyOf' => [{ 'type' => 'object', 'patternProperties' => { '^x' => { 'type' => 'string' } } }] }
-      expect(described_class.unsupported_keywords(schema)).to contain_exactly('patternProperties')
+      schema = { 'anyOf' => [{ 'type' => 'object', 'unevaluatedProperties' => false }] }
+      expect(described_class.unsupported_keywords(schema)).to contain_exactly('unevaluatedProperties')
     end
 
     it 'does not mistake property names for keywords' do
@@ -267,8 +273,8 @@ RSpec.describe MCPClient::SchemaValidator do
     end
 
     it 'handles symbol-keyed schemas' do
-      schema = { type: 'object', additionalProperties: false, properties: { a: { anyOf: [{ format: 'email' }] } } }
-      expect(described_class.unsupported_keywords(schema)).to contain_exactly('additionalProperties', 'format')
+      schema = { type: 'object', unevaluatedProperties: false, properties: { a: { anyOf: [{ format: 'email' }] } } }
+      expect(described_class.unsupported_keywords(schema)).to contain_exactly('unevaluatedProperties', 'format')
     end
 
     it 'returns an empty array for non-hash input' do
@@ -438,7 +444,7 @@ RSpec.describe MCPClient::Client do
             'conditions' => { 'type' => 'string', 'format' => 'custom' }
           },
           'required' => %w[temperature conditions],
-          'additionalProperties' => false
+          'unevaluatedProperties' => false
         }
       end
       let(:result) do
@@ -450,7 +456,7 @@ RSpec.describe MCPClient::Client do
       it 'warns that validation is partial, naming the unsupported keywords, in the default mode' do
         expect(build_client.call_tool('get_weather', {})).to eq(result)
         expect(log_output.string).to match(/get_weather.*validation is partial: schema uses unsupported keywords/)
-        expect(log_output.string).to include('format').and include('additionalProperties')
+        expect(log_output.string).to include('format').and include('unevaluatedProperties')
       end
 
       it 'warns that validation is partial in :strict mode instead of silently passing' do
@@ -458,7 +464,7 @@ RSpec.describe MCPClient::Client do
 
         expect(client.call_tool('get_weather', {})).to eq(result)
         expect(log_output.string).to match(/get_weather.*validation is partial: schema uses unsupported keywords/)
-        expect(log_output.string).to include('format').and include('additionalProperties')
+        expect(log_output.string).to include('format').and include('unevaluatedProperties')
       end
 
       it 'still validates and reports mismatches on the supported subset' do
@@ -478,7 +484,7 @@ RSpec.describe MCPClient::Client do
       end
     end
 
-    context 'when the output schema uses unapplied assertion keywords (format/uniqueItems)' do
+    context 'when the output schema mixes an unapplied annotation with applied assertions' do
       let(:output_schema) do
         {
           'type' => 'object',
@@ -494,12 +500,13 @@ RSpec.describe MCPClient::Client do
 
       before { allow(mock_server).to receive(:call_tool).and_return(result) }
 
-      it 'warns that validation is partial instead of passing silently in :strict mode' do
+      it 'warns that validation is partial and still rejects what it evaluates in :strict mode' do
         client = build_client(validate_structured_content: :strict)
 
-        expect(client.call_tool('get_weather', {})).to eq(result)
+        expect { client.call_tool('get_weather', {}) }
+          .to raise_error(MCPClient::Errors::ValidationError, /unique/)
         expect(log_output.string).to match(/get_weather.*validation is partial: schema uses unsupported keywords/)
-        expect(log_output.string).to include('format').and include('uniqueItems')
+        expect(log_output.string).to include('format')
       end
     end
 

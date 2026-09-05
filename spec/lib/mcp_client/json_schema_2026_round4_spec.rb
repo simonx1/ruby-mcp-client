@@ -20,11 +20,18 @@ RSpec.describe 'MCP 2026-07-28 JSON Schema handling — round 4' do
     fat = { 'type' => 'object', 'properties' => {} }
     (validator::MAX_ERRORS + 20).times { |i| fat['properties']["p#{i}"] = { 'type' => 'string' } }
     fat['required'] = fat['properties'].keys
-    schema = { 'anyOf' => [fat, { 'type' => 'integer' }] }
-    expect(validator.validate(1, schema)).to be_empty
+    # An object, so the branch really runs its required list and produces the
+    # hundred-odd errors: an integer would be decided by `type` alone and the
+    # branch would never reach the error cap this example is about.
+    data = { 'other' => 1 }
+    # The branch really runs: on its own it produces past the error cap.
+    expect(validator.validate(data, fat)).to contain_exactly(a_string_matching(/more than .* validation errors/))
 
-    expect(validator.validate(1, { 'not' => fat })).to be_empty
-    expect(validator.validate(1, { 'if' => fat, 'then' => false })).to be_empty
+    expect(validator.validate(data, { 'anyOf' => [fat, { 'type' => 'object' }] })).to be_empty
+    expect(validator.validate(data, { 'not' => fat })).to be_empty
+    expect(validator.validate(data, { 'if' => fat, 'then' => false })).to be_empty
+    # And a branch the value satisfies still decides the composition.
+    expect(validator.validate(1, { 'anyOf' => [fat, { 'type' => 'integer' }] })).to be_empty
   end
 
   it 'rejects applicator values that are not schemas' do

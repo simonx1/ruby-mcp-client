@@ -46,6 +46,10 @@ RSpec.describe 'MCP 2026-07-28 JSON Schema handling — round 2' do
 
       errors = validator.validate(1, schema)
 
+      # The schema recurses without bound on one value, so the walk must end
+      # in an abort rather than in silence: a validator that produced nothing
+      # would satisfy the size assertions too.
+      expect(errors).to contain_exactly(a_string_matching(/aborted|hops|nodes visited|budget/))
       expect(errors.size).to be <= validator::MAX_ERRORS
       expect(errors.sum(&:bytesize)).to be < 20_000
     end
@@ -134,11 +138,15 @@ RSpec.describe 'MCP 2026-07-28 JSON Schema handling — round 2' do
 
     it 'reports draft-specific keywords it does not evaluate under the dialect that defines them' do
       draft7 = 'http://json-schema.org/draft-07/schema#'
+      # The draft-specific applicators are evaluated; only what needs a
+      # dynamic scope or a composition-wide annotation is reported.
       expect(validator.unsupported_keywords({ '$schema' => draft7, 'items' => [], 'additionalItems' => false }))
-        .to eq(['additionalItems'])
-      expect(validator.unsupported_keywords({ '$schema' => draft7, 'dependencies' => {} })).to eq(['dependencies'])
+        .to eq([])
+      expect(validator.unsupported_keywords({ '$schema' => draft7, 'dependencies' => {} })).to eq([])
       expect(validator.unsupported_keywords({ '$schema' => validator::DRAFT_2019_09, '$recursiveRef' => '#' }))
         .to eq(['$recursiveRef'])
+      expect(validator.unsupported_keywords({ '$schema' => validator::DRAFT_2019_09,
+                                              'unevaluatedItems' => false })).to eq(['unevaluatedItems'])
     end
 
     it 'treats $dynamicRef to another document as unusable' do
@@ -203,6 +211,22 @@ RSpec.describe 'MCP 2026-07-28 JSON Schema handling — round 2' do
         expect(e.message.bytesize).to be < 5000
       }
       expect(log_output.string).not_to include("\nWARN forged")
+    end
+
+    it 'truncates a violation whose errors run past the message limit' do
+      # Enough genuine errors to overrun MAX_VIOLATION_TEXT, so the cap is
+      # what keeps the message small rather than the schema being small.
+      properties = (0...validator::MAX_ERRORS).to_h { |i| ["p#{i}#{'x' * 60}", { 'type' => 'string' }] }
+      client = client_with([tool({ 'type' => 'object', 'properties' => properties })],
+                           validate_structured_content: :strict)
+      content = properties.keys.to_h { |name| [name, 1] }
+      allow(mock_server).to receive(:call_tool).and_return({ 'content' => [], 'structuredContent' => content })
+
+      expect { client.call_tool('tool', {}) }.to raise_error(MCPClient::Errors::ValidationError) { |e|
+        joined = validator.validate(content, { 'type' => 'object', 'properties' => properties }).join('; ')
+        expect(joined.bytesize).to be > MCPClient::Client::MAX_VIOLATION_TEXT
+        expect(e.message.bytesize).to be < MCPClient::Client::MAX_VIOLATION_TEXT + 200
+      }
     end
 
     it 're-checks an input schema when the tool definition changes' do

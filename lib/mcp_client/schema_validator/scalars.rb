@@ -47,13 +47,67 @@ module MCPClient
         remaining = pattern_budget_remaining(deadline)
         raise Aborted, "validation time budget exhausted before pattern #{clip(pattern.inspect)}" if remaining.zero?
 
-        return [] if data.match?(Regexp.new(pattern, timeout: remaining))
+        return [] if data.match?(ecma_regexp(pattern, remaining))
 
         ["#{path}: string does not match pattern #{clip(pattern.inspect)}"]
       rescue Regexp::TimeoutError
         raise Aborted, "pattern #{clip(pattern.inspect)} exceeded the #{PATTERN_MATCH_TIMEOUT}s matching budget"
       rescue RegexpError
         []
+      end
+
+      # A `pattern` compiled with ECMAScript's anchor semantics. JSON Schema
+      # 2020-12 Core Section 4.3 requires patterns to be interpreted as
+      # ECMA-262 regular expressions, where `^` and `$` match only at the
+      # ends of the subject; Ruby's match at every line boundary, so "a\nb"
+      # satisfied "^a$" here and not there — accepting a string the schema
+      # rejects, and (through `not`) rejecting one it accepts.
+      # @param pattern [String] the peer's pattern
+      # @param timeout [Float] seconds the match may take
+      # @return [Regexp]
+      # @raise [RegexpError] when the pattern is not a usable expression
+      def ecma_regexp(pattern, timeout)
+        Regexp.new(ecma_anchors(pattern), timeout: timeout)
+      end
+
+      # Rewrite the anchors of an ECMA-262 pattern to Ruby's absolute ones,
+      # leaving every escaped `^` / `$` and every one inside a character
+      # class as written.
+      # @param pattern [String]
+      # @return [String]
+      def ecma_anchors(pattern)
+        rewritten = +''
+        in_class = false
+        escaped = false
+        pattern.each_char do |char|
+          if escaped
+            escaped = false
+            next rewritten << char
+          end
+
+          in_class = ecma_anchor_char(char, rewritten, in_class)
+          escaped = char == '\\'
+        end
+        rewritten
+      end
+
+      # What each ECMA-262 anchor means in Ruby: the ends of the subject,
+      # never a line boundary.
+      ECMA_ANCHORS = { '^' => '\\A', '$' => '\\z' }.freeze
+
+      # Copy one character of a pattern, translating an anchor outside a
+      # character class.
+      # @return [Boolean] whether the scan is inside a character class after it
+      def ecma_anchor_char(char, rewritten, in_class)
+        case char
+        when '[' then in_class = true
+        when ']' then in_class = false
+        when '^', '$'
+          rewritten << (in_class ? char : ECMA_ANCHORS[char])
+          return in_class
+        end
+        rewritten << char
+        in_class
       end
 
       # Time left in the validation-wide budget.
@@ -95,7 +149,28 @@ module MCPClient
         if exclusive_max.is_a?(Numeric) && data >= exclusive_max
           errors << "#{path}: value #{shown} must be less than exclusiveMaximum #{clip_value(exclusive_max)}"
         end
+        factor = schema['multipleOf']
+        if factor.is_a?(Numeric) && factor.positive? && !multiple_of?(data, factor)
+          errors << "#{path}: value #{shown} is not a multiple of #{clip_value(factor)}"
+        end
         errors
+      end
+
+      # Whether dividing the value by the factor gives an integer (JSON
+      # Schema 2020-12 Validation Section 6.2.1). The division is exact:
+      # 0.0075 is a multiple of 0.0001, which binary floating point says it
+      # is not, so the decimal each number was written as decides.
+      # @param data [Numeric] the instance
+      # @param factor [Numeric] the multipleOf value
+      # @return [Boolean]
+      def multiple_of?(data, factor)
+        return (data % factor).zero? if data.is_a?(Integer) && factor.is_a?(Integer)
+
+        (Rational(data.to_s) / Rational(factor.to_s)).denominator == 1
+      rescue ArgumentError, ZeroDivisionError, FloatDomainError, TypeError
+        # A value no decimal describes (an infinity a Ruby caller passed in;
+        # JSON carries none) falls back to the floating-point remainder.
+        (data % factor).zero?
       end
     end
   end

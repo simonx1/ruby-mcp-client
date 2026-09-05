@@ -42,8 +42,8 @@ RSpec.describe 'MCP 2026-07-28 JSON Schema handling — verification round' do
 
     it 'scans a long chain of shallow references for unsupported keywords' do
       scanned = chained_refs(400)
-      scanned['$defs']['400'] = { 'uniqueItems' => true }
-      expect(on_thread { validator.unsupported_keywords(scanned) }).to contain_exactly('uniqueItems')
+      scanned['$defs']['400'] = { 'unevaluatedItems' => false }
+      expect(on_thread { validator.unsupported_keywords(scanned) }).to contain_exactly('unevaluatedItems')
     end
 
     it 'validates against a long chain on the hop budget, never on the call stack' do
@@ -194,8 +194,8 @@ RSpec.describe 'MCP 2026-07-28 JSON Schema handling — verification round' do
     end
 
     it 'scans a modern definitions bag for unsupported keywords' do
-      schema = { 'type' => 'array', 'definitions' => { 'x' => { 'uniqueItems' => true } } }
-      expect(validator.unsupported_keywords(schema)).to contain_exactly('uniqueItems')
+      schema = { 'type' => 'array', 'definitions' => { 'x' => { 'unevaluatedItems' => false } } }
+      expect(validator.unsupported_keywords(schema)).to contain_exactly('unevaluatedItems')
     end
 
     it 'leaves $defs unknown to draft-07' do
@@ -260,8 +260,8 @@ RSpec.describe 'MCP 2026-07-28 JSON Schema handling — verification round' do
         { 'type' => [] } => /type must be/,
         { 'type' => ['objekt'] } => /type must be/,
         { 'enum' => 'a' } => /enum must be an array/,
-        { 'required' => 'a' } => /required must be an array of property names/,
-        { 'required' => [1] } => /required must be an array of property names/,
+        { 'required' => 'a' } => /required must be an array of distinct property names/,
+        { 'required' => [1] } => /required must be an array of distinct property names/,
         { 'pattern' => 5 } => /pattern must be a string/,
         { 'minLength' => 'a' } => /minLength must be a non-negative integer/,
         { 'maxItems' => -1 } => /maxItems must be a non-negative integer/,
@@ -287,32 +287,42 @@ RSpec.describe 'MCP 2026-07-28 JSON Schema handling — verification round' do
   end
 
   describe 'a condition the validator cannot decide' do
+    # `unevaluatedItems` is decided by the annotations a whole composition
+    # produces, which this validator does not collect, so a condition
+    # carrying one is genuinely undecidable — unlike the standard assertions,
+    # which are evaluated and decide their condition outright.
+    let(:undecidable) { { 'unevaluatedItems' => false } }
+
     it 'reports a failure both branches agree on' do
-      schema = { 'if' => { 'multipleOf' => 2 }, 'then' => false, 'else' => false }
-      expect(validator.validate(3, schema)).to contain_exactly(a_string_matching(/if/))
-      expect(validator.validate(4, schema)).to contain_exactly(a_string_matching(/if/))
+      schema = { 'if' => undecidable, 'then' => false, 'else' => false }
+      expect(validator.validate([1], schema)).to contain_exactly(a_string_matching(/if/))
+      expect(validator.validate([1, 2], schema)).to contain_exactly(a_string_matching(/if/))
     end
 
     it 'reports it when both branches assert the same rejected type' do
-      schema = { 'if' => { 'multipleOf' => 2 }, 'then' => { 'type' => 'string' },
-                 'else' => { 'type' => 'string' } }
-      expect(validator.validate(3, schema)).to contain_exactly(a_string_matching(/expected type string/))
+      schema = { 'if' => undecidable, 'then' => { 'type' => 'string' }, 'else' => { 'type' => 'string' } }
+      expect(validator.validate([1], schema)).to contain_exactly(a_string_matching(/expected type string/))
       expect(validator.validate('x', schema)).to be_empty
     end
 
     it 'stays silent when the branches genuinely disagree' do
-      schema = { 'if' => { 'multipleOf' => 2 }, 'then' => { 'type' => 'string' },
-                 'else' => { 'type' => 'integer' } }
-      expect(validator.validate(3, schema)).to be_empty
+      schema = { 'if' => undecidable, 'then' => { 'type' => 'string' }, 'else' => { 'type' => 'array' } }
+      expect(validator.validate([1], schema)).to be_empty
     end
 
     it 'stays silent when only one branch is written' do
-      expect(validator.validate(3, { 'if' => { 'multipleOf' => 2 }, 'then' => false })).to be_empty
-      expect(validator.validate(3, { 'if' => { 'multipleOf' => 2 }, 'else' => false })).to be_empty
+      expect(validator.validate([1], { 'if' => undecidable, 'then' => false })).to be_empty
+      expect(validator.validate([1], { 'if' => undecidable, 'else' => false })).to be_empty
     end
 
     it 'does not treat an unconditional failure as a match for not' do
-      schema = { 'not' => { 'if' => { 'multipleOf' => 2 }, 'then' => false, 'else' => false } }
+      schema = { 'not' => { 'if' => undecidable, 'then' => false, 'else' => false } }
+      expect(validator.validate([1], schema)).to be_empty
+    end
+
+    it 'applies the branch a condition the validator does evaluate selects' do
+      schema = { 'if' => { 'multipleOf' => 2 }, 'then' => { 'type' => 'string' }, 'else' => { 'type' => 'integer' } }
+      expect(validator.validate(4, schema)).to contain_exactly(a_string_matching(/expected type string/))
       expect(validator.validate(3, schema)).to be_empty
     end
   end

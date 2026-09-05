@@ -7,6 +7,77 @@ metadata). Each feature lands in its own PR; this section accumulates them.
 
 ### JSON Schema handling
 
+- **The standard assertions are evaluated, patterns are ECMAScript, and
+  unsupported dialects are refused wherever they appear (second verification
+  round).** MCP 2026-07-28 basic "Implementation Requirements" makes JSON
+  Schema 2020-12 support mandatory, and a standard assertion left unevaluated
+  is not a smaller report but a wrong verdict. Eight fixes:
+
+  - *Every decidable standard keyword is now applied.* `multipleOf`,
+    `uniqueItems`, `contains` (item by item, with `minContains` /
+    `maxContains`), `minProperties` / `maxProperties`, `patternProperties`,
+    `additionalProperties`, `propertyNames`, `dependentRequired` /
+    `dependentSchemas` (and both halves of draft-07 `dependencies`) and
+    `additionalItems` were reported as "unsupported" and skipped. Skipping
+    them left a composition branch *undecided*, and an undecided branch is
+    accepted wherever the composition is monotonic — so
+    `{"allOf": [{"multipleOf": 3}]}` admitted `4`, `{"not": {"multipleOf":
+    2}}` admitted `4`, `{"uniqueItems": true}` admitted `[1, 1]`, and
+    `{"contains": {"type": "string"}}` admitted `[1, 2]`. All of them are
+    evaluated now (`uniqueItems` under JSON equality, so `[1, 1.0]` is not
+    unique, and `multipleOf` by exact division, so `0.0075` is a multiple of
+    `0.0001`), and the partial-coverage report is left with only what
+    genuinely cannot be decided: the two keywords read off the annotations a
+    whole composition produces (`unevaluatedItems`, `unevaluatedProperties`),
+    the dynamic references, and the two keywords that only annotate (`format`,
+    `contentSchema`). A node whose own `type` already rejected the value no
+    longer evaluates the keywords for the type it does not have.
+  - *A `pattern` is an ECMA-262 regular expression.* Ruby's `^` and `$` match
+    at every line boundary, ECMAScript's only at the ends of the subject
+    (JSON Schema 2020-12 Core Section 4.3), so `"a\nb"` satisfied `"^a$"`
+    here and not there — and through `not` was *rejected* although the schema
+    accepts it. The anchors are rewritten before matching (an escaped one, and
+    one inside a character class, stays literal); `patternProperties` keys are
+    matched the same way.
+  - *An unsupported output dialect is an error in both modes.* It was routed
+    through the structured-content violation path, so the default `:warn` mode
+    logged it and returned the result. The client cannot read the schema at
+    all, which the spec's "MUST ... return an appropriate error indicating the
+    dialect is not supported" does not leave to the host's mode.
+  - *A refreshed input dialect is refused too.* The check covered the
+    definition a call was prepared from, not the one it was answered under: a
+    transport's `HeaderMismatch` recovery re-derives the call's `Mcp-Param-*`
+    headers from a refreshed `tools/list`, and a refreshed `inputSchema`
+    declaring an unsupported dialect passed unnoticed. The result of a call is
+    now checked against the answering definition's dialect as well as its
+    output schema, on `call_tool`, on the streaming path and on a task's
+    result.
+  - *`structuredContent: null` is structured content only from 2026-07-28 on.*
+    MCP 2025-11-25 knows object structured content only, so on a session
+    negotiated to that revision a present null is again what it was there: no
+    structured content at all. A transport that cannot say which revision it
+    negotiated is not assumed legacy.
+  - *Two schema resources may not answer to one URI.* Colliding `$id`s were
+    resolved by luck — whichever the walk met first — while colliding anchor
+    names were already reported. A duplicate resource URI now makes the
+    document unusable (JSON Schema 2020-12 Core Section 9.1.2).
+  - *The preflight reads the remaining keyword shapes.* `{"required":
+    ["a","a"]}`, `{"$id": "urn:root#bad"}`, `{"$anchor": "not a name"}`,
+    `{"minContains": -1}`, `{"multipleOf": 0}`, `{"uniqueItems": "yes"}`,
+    `{"minProperties": -1}`, a malformed `dependentRequired` and a
+    `$dynamicRef` that is not a string were all accepted as usable schemas.
+    Each is now reported: the elements of `required` must be unique, a modern
+    `$id` carries no non-empty fragment, an anchor holds a plain name, and the
+    numeric bounds hold the numbers their keywords are defined to hold.
+  - *An absolute reference into the bundled document is accounted for like the
+    bare pointer it addresses.* Only a bare fragment was recognised as a
+    pointer, so booleans reached through `urn:root#/x-bools/bN` were not
+    charged toward the subschema bound while the identical `#/x-bools/bN`
+    were: 1,100 references to 1,100 booleans passed the preflight under one
+    spelling and were rejected under the other. A reference is retargeted to
+    its bundled resource before its pointer is read, so both spellings count
+    the same.
+
 - **The preflight runs off the call stack, an unsupported input dialect is an
   error, bundled references resolve, and `definitions` is the modern `$defs`
   (verification round).** Seven fixes:

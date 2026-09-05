@@ -49,18 +49,26 @@ RSpec.describe 'MCP 2026-07-28 JSON Schema handling — round 12' do
     end
 
     it 'ignores an unevaluated assertion that does not apply to the instance' do
-      expect(validator.validate('x', { 'not' => { 'multipleOf' => 2 } })).to contain_exactly(a_string_matching(/not/))
-      expect(validator.validate('x', { 'not' => { 'additionalProperties' => false } }))
+      expect(validator.validate('x', { 'not' => { 'unevaluatedProperties' => false } }))
         .to contain_exactly(a_string_matching(/not/))
-      expect(validator.validate(3, { 'not' => { 'uniqueItems' => true } })).to contain_exactly(a_string_matching(/not/))
+      expect(validator.validate(3, { 'not' => { 'unevaluatedItems' => false } }))
+        .to contain_exactly(a_string_matching(/not/))
     end
 
     it 'stays undecided for an unevaluated assertion that applies to the instance' do
-      expect(validator.validate(3, { 'not' => { 'multipleOf' => 2 } })).to be_empty
-      expect(validator.validate({ 'a' => 1 }, { 'not' => { 'additionalProperties' => false } })).to be_empty
-      expect(validator.validate([1, 1], { 'not' => { 'uniqueItems' => true } })).to be_empty
-      expect(validator.validate([1], { 'oneOf' => [{ 'type' => 'array' }, { 'contains' => { 'type' => 'integer' } }] }))
+      expect(validator.validate({ 'a' => 1 }, { 'not' => { 'unevaluatedProperties' => false } })).to be_empty
+      expect(validator.validate([1], { 'not' => { 'unevaluatedItems' => false } })).to be_empty
+      expect(validator.validate([1], { 'oneOf' => [{ 'type' => 'array' }, { 'unevaluatedItems' => false }] }))
         .to be_empty
+    end
+
+    it 'decides a branch whose only assertion the validator now evaluates' do
+      expect(validator.validate([1, 1], { 'not' => { 'uniqueItems' => true } })).to be_empty
+      expect(validator.validate([1, 2], { 'not' => { 'uniqueItems' => true } }))
+        .to contain_exactly(a_string_matching(/not/))
+      expect(validator.validate({ 'a' => 1 }, { 'not' => { 'additionalProperties' => false } })).to be_empty
+      expect(validator.validate({}, { 'not' => { 'additionalProperties' => false } }))
+        .to contain_exactly(a_string_matching(/not/))
     end
   end
 end
