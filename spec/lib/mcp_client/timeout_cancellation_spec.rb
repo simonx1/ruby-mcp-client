@@ -87,7 +87,7 @@ RSpec.describe 'Request timeouts and cancellation (MCP 2025-11-25)' do
       allow(server).to receive(:http_connection).and_return(conn)
       calls = []
       allow(conn).to receive(:post) do |_endpoint, &blk|
-        req = Struct.new(:headers, :body, :options).new({}, nil, Struct.new(:timeout).new(nil))
+        req = Struct.new(:headers, :body, :options).new({}, nil, Struct.new(:timeout, :context).new(nil, nil))
         blk&.call(req)
         body = req.body && JSON.parse(req.body)
         calls << body
@@ -111,7 +111,7 @@ RSpec.describe 'Request timeouts and cancellation (MCP 2025-11-25)' do
       conn = double('conn')
       allow(server).to receive(:http_connection).and_return(conn)
       allow(conn).to receive(:post) do |_endpoint, &blk|
-        req = Struct.new(:headers, :body, :options).new({}, nil, Struct.new(:timeout).new(nil))
+        req = Struct.new(:headers, :body, :options).new({}, nil, Struct.new(:timeout, :context).new(nil, nil))
         blk&.call(req)
         captured_options = req.options
         Struct.new(:status, :headers, :body, :success?).new(

@@ -443,6 +443,11 @@ again once with a fresh request id; if that stream breaks too, it raises
 other ambiguous failure is unchanged and still never re-sent, because in none of
 those cases was the server told to stop.
 
+A response that *did* arrive is not ambiguous, so it is never replaced: the
+client reads response bodies as they stream in, and a socket that dies after
+the final SSE event returns the result it already carried instead of calling
+the tool a second time.
+
 ### Response Size Limits (Streamable HTTP)
 
 A gzip-encoded response is decompressed incrementally and abandoned once it

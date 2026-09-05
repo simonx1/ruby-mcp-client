@@ -248,6 +248,123 @@ RSpec.describe 'MCP 2026-07-28 Streamable HTTP modern mode — verification' do
         expect(methods_sent(requests)).to eq(%w[server/discover server/discover])
       end
 
+      # SSE line terminators are CRLF, CR or LF (HTML spec, event stream
+      # parsing). A parser that only knows LF sees one unsplittable line here,
+      # finds no response, and re-issues a request the server already answered.
+      it 'reads a response stream framed with bare CR line endings' do
+        requests = stub_posts(
+          'server/discover' => discover_result,
+          'tools/call' => lambda do |body, _reqs|
+            sse_response("event: message\rdata: #{JSON.generate('jsonrpc' => '2.0', 'id' => body['id'],
+                                                                'result' => { 'content' => [] })}\r\r")
+          end
+        )
+
+        expect(server.call_tool('t', {})).to eq({ 'content' => [] })
+        expect(requests.count { |r| r['method'] == 'tools/call' }).to eq(1)
+      end
+
+      # A modern server that answers server/discover with 404 -32601 is
+      # non-conforming but usable, and this transport tolerates it. It answers
+      # the same way every time, so the second connection must be tolerated
+      # exactly like the first rather than failing on the cached verdict.
+      it 'tolerates a discovery 404 on a reconnect, not only on the first connect' do
+        requests = stub_posts(
+          'server/discover' => lambda do |body, _reqs|
+            { status: 404, headers: { 'Content-Type' => 'application/json' },
+              body: JSON.generate('jsonrpc' => '2.0', 'id' => body['id'],
+                                  'error' => { 'code' => -32_601, 'message' => 'Method not found' }) }
+          end,
+          'initialize' => ->(_body, _reqs) { raise 'initialize must not be sent to a modern server' }
+        )
+
+        2.times do
+          server.connect
+          expect(server.protocol_era).to eq(:modern)
+          server.cleanup
+        end
+
+        expect(methods_sent(requests)).to eq(%w[server/discover server/discover])
+      end
+
+      # 2025-11-25 has resumption and no re-issue rule: a POST stream that
+      # ends without the response must not put a tools/call back on the wire.
+      it 'never re-POSTs a legacy tools/call whose response stream ends empty' do
+        requests = stub_posts(
+          'server/discover' => ->(_body, _reqs) { { status: 400, body: 'Bad Request' } },
+          'initialize' => lambda do |body, _reqs|
+            json_response(body['id'], { 'protocolVersion' => '2025-11-25', 'capabilities' => {},
+                                        'serverInfo' => { 'name' => 'legacy', 'version' => '1' } })
+          end,
+          'notifications/initialized' => ->(_body, _reqs) { { status: 202, body: '' } },
+          'tools/call' => ->(_body, _reqs) { keep_alive_only }
+        )
+        stub_request(:get, url).to_return(status: 405, body: '')
+
+        expect { server.call_tool('t', {}) }.to raise_error(MCPClient::Errors::MCPError)
+
+        expect(server.protocol_era).to eq(:legacy)
+        expect(requests.count { |r| r['method'] == 'tools/call' }).to eq(1)
+      end
+
+      # Every modern request MUST carry clientCapabilities in _meta, and
+      # SHOULD carry clientInfo. Both are pinned on stdio; this asserts them on
+      # the HTTP wire so dropping either from required_request_meta cannot pass
+      # here, and that the header keeps matching the body.
+      it 'carries clientCapabilities and clientInfo in _meta on every modern POST' do
+        requests = stub_posts('server/discover' => discover_result, 'tools/call' => { 'content' => [] })
+        headers = []
+        stub_request(:post, url).to_return do |request|
+          headers << request.headers
+          body = JSON.parse(request.body)
+          requests << body
+          result = body['method'] == 'server/discover' ? discover_result : { 'content' => [] }
+          json_response(body['id'], result)
+        end
+
+        server.call_tool('t', {})
+
+        metas = requests.map { |r| r.dig('params', '_meta') }
+        expect(metas).to all(include('io.modelcontextprotocol/clientCapabilities'))
+        expect(metas).to all(include('io.modelcontextprotocol/clientInfo'))
+        expect(metas.last['io.modelcontextprotocol/clientInfo']).to include('name', 'version')
+        expect(headers.last['Mcp-Protocol-Version'])
+          .to eq(metas.last['io.modelcontextprotocol/protocolVersion'])
+      end
+
+      # Two calls recovering at the same time must not cross: each replacement
+      # request carries its own arguments and each caller gets its own result.
+      # The existing concurrency examples cover establishing the connection,
+      # not simultaneous recovery.
+      it 'recovers two concurrent broken streams without crossing their arguments' do
+        broken = {}
+        requests = []
+        mutex = Mutex.new
+        stub_request(:post, url).to_return do |request|
+          body = JSON.parse(request.body)
+          mutex.synchronize { requests << body }
+          next json_response(body['id'], discover_result) if body['method'] == 'server/discover'
+
+          name = body.dig('params', 'name')
+          first = mutex.synchronize { broken[name] ? false : (broken[name] = true) }
+          first ? keep_alive_only : json_response(body['id'], { 'content' => [{ 'text' => name }] })
+        end
+        server.connect
+
+        results = %w[alpha beta].map do |name|
+          Thread.new { [name, server.call_tool(name, { 'arg' => name })] }
+        end.to_h(&:value)
+
+        expect(results).to eq('alpha' => { 'content' => [{ 'text' => 'alpha' }] },
+                              'beta' => { 'content' => [{ 'text' => 'beta' }] })
+        %w[alpha beta].each do |name|
+          sent = requests.select { |r| r.dig('params', 'name') == name }
+          expect(sent.size).to eq(2)
+          expect(sent[1]['id']).not_to eq(sent[0]['id'])
+          expect(sent.map { |r| r.dig('params', 'arguments') }).to all(eq({ 'arg' => name }))
+        end
+      end
+
       # --- 5. The modern verdict is cached like the legacy one.
 
       it 'never falls back to initialize once the server has been confirmed modern' do
@@ -267,6 +384,79 @@ RSpec.describe 'MCP 2026-07-28 Streamable HTTP modern mode — verification' do
         expect { server.connect }.to raise_error(MCPClient::Errors::ConnectionError, /modern but incompatible/)
         expect(methods_sent(requests)).to eq(%w[server/discover server/discover])
       end
+    end
+  end
+
+  # --- A gzip body that stops before its footer.
+
+  describe "#{MCPClient::ServerStreamableHTTP} gzip bodies" do
+    let(:server) { MCPClient::ServerStreamableHTTP.new(base_url: 'https://example.com', endpoint: '/mcp', retries: 0) }
+
+    after { server.cleanup }
+
+    def gzip(payload)
+      buffer = StringIO.new(+'', 'wb')
+      writer = Zlib::GzipWriter.new(buffer)
+      writer.write(payload)
+      writer.close
+      buffer.string
+    end
+
+    def gzip_response(body, truncate: 0)
+      compressed = gzip(body)
+      { status: 200, body: compressed[0, compressed.bytesize - truncate],
+        headers: { 'Content-Type' => 'text/event-stream', 'Content-Encoding' => 'gzip' } }
+    end
+
+    # Streamable HTTP always offers gzip, so a stream cut inside the encoded
+    # body surfaces as a decode failure rather than a socket failure. No
+    # response was delivered either way, so the request is lost and MUST be
+    # re-issued with a new id.
+    it 're-issues a request whose gzip body stops before its footer' do
+      calls = 0
+      requests = stub_posts(
+        'server/discover' => discover_result,
+        'tools/call' => lambda do |body, _reqs|
+          calls += 1
+          event = "event: message\ndata: #{JSON.generate('jsonrpc' => '2.0', 'id' => body['id'],
+                                                         'result' => { 'content' => [] })}\n\n"
+          calls == 1 ? gzip_response(event, truncate: 12) : gzip_response(event)
+        end
+      )
+
+      expect(server.call_tool('t', {})).to eq({ 'content' => [] })
+
+      tool_calls = requests.select { |r| r['method'] == 'tools/call' }
+      expect(tool_calls.size).to eq(2)
+      expect(tool_calls[0]['id']).not_to eq(tool_calls[1]['id'])
+    end
+  end
+
+  # --- protocol: :modern outranks the URL-suffix heuristic.
+
+  describe 'MCPClient.connect on a /sse URL' do
+    let(:sse_url) { 'https://example.com/sse' }
+
+    # A path is not a protocol declaration. Selecting the legacy-only SSE
+    # transport for protocol: :modern would drop the option and open a GET
+    # stream instead of probing a perfectly good modern endpoint.
+    it 'uses the modern Streamable HTTP transport when the caller asked for protocol: :modern' do
+      post_stub = stub_request(:post, sse_url).to_return(
+        status: 200,
+        body: JSON.generate('jsonrpc' => '2.0', 'id' => 1,
+                            'result' => { 'resultType' => 'complete', 'supportedVersions' => ['2026-07-28'],
+                                          'capabilities' => { 'tools' => {} } }),
+        headers: { 'Content-Type' => 'application/json' }
+      )
+      get_stub = stub_request(:get, sse_url).to_return(status: 200, body: '')
+
+      client = MCPClient.connect(sse_url, retries: 0, protocol: :modern)
+
+      expect(client.servers.first).to be_a(MCPClient::ServerStreamableHTTP)
+      expect(client.servers.first.protocol_era).to eq(:modern)
+      expect(post_stub).to have_been_requested.once
+      expect(get_stub).not_to have_been_requested
+      client.cleanup
     end
   end
 
@@ -383,7 +573,8 @@ RSpec.describe 'MCP 2026-07-28 Streamable HTTP modern mode — verification' do
   end
 end
 
-# A real HTTP server on 127.0.0.1 that can end a response *mid-stream*.
+# A real HTTP (or HTTPS) server on 127.0.0.1 that can end a response
+# *mid-stream*.
 #
 # The WebMock broken-stream fixtures above return a **completed** HTTP
 # response whose SSE body happens to carry no result. That is not the failure
@@ -393,18 +584,65 @@ end
 # that — status line, SSE headers, one chunk, then close, with no terminating
 # chunk — so the re-issue path is exercised against the error a real network
 # failure raises.
+#
+# With `tls: true` it does the same over TLS, the transport production
+# Streamable HTTP actually runs on: the socket is torn down under the TLS
+# session (no close_notify), so Faraday raises SSLError rather than
+# ConnectionFailed. Those two are siblings, not subclasses, so only the TLS
+# fixture proves the re-issue path is reached from both.
 class MidStreamCloseServer
-  # Reply token: send SSE headers and one chunk, then close the socket.
+  # Reply token: send SSE headers and one keep-alive chunk, then close the
+  # socket — the response never arrived.
   CLOSE_MID_STREAM = :close_mid_stream
+  # Reply token pair [DELIVER_THEN_CLOSE, reply]: send the complete final SSE
+  # event, then close without the terminating chunk. The response *did*
+  # arrive; only the framing after it is missing.
+  DELIVER_THEN_CLOSE = :deliver_then_close
+  # Reply token pair [DELIVER_UNTERMINATED, reply]: cut the socket before the
+  # event's blank line, so the event was never dispatched even though the JSON
+  # on its data line happens to be complete.
+  DELIVER_UNTERMINATED = :deliver_unterminated
+  # Reply token pair [DRIP_FOREVER, interval]: stream SSE keep-alive comments
+  # forever, `interval` seconds apart. Below the client's socket timeout the
+  # stream never goes idle and only an overall deadline can end the request;
+  # above it the socket timeout fires and the client tears the stream down.
+  DRIP_FOREVER = :drip_forever
+  # Reply token triple [HTTP_STATUS, code, body]: a complete, plain response.
+  HTTP_STATUS = :http_status
+
+  # A self-signed certificate for 127.0.0.1, built once for the whole file
+  # because key generation is the expensive part.
+  TLS_KEY = OpenSSL::PKey::RSA.new(2048)
+  TLS_CERT = begin
+    cert = OpenSSL::X509::Certificate.new
+    cert.version = 2
+    cert.serial = 1
+    cert.subject = OpenSSL::X509::Name.parse('/CN=127.0.0.1')
+    cert.issuer = cert.subject
+    cert.public_key = TLS_KEY.public_key
+    cert.not_before = Time.now - 60
+    cert.not_after = Time.now + 3600
+    factory = OpenSSL::X509::ExtensionFactory.new
+    factory.subject_certificate = cert
+    factory.issuer_certificate = cert
+    cert.add_extension(factory.create_extension('subjectAltName', 'IP:127.0.0.1', false))
+    cert.sign(TLS_KEY, OpenSSL::Digest.new('SHA256'))
+    cert
+  end
 
   # @return [Integer] the ephemeral port the server listens on
   attr_reader :port
 
+  # @param tls [Boolean] whether to serve HTTPS with the self-signed certificate
   # @yieldparam message [Hash] the JSON-RPC message the client POSTed
-  # @yieldreturn [Hash, Symbol] a JSON-RPC reply, or CLOSE_MID_STREAM
-  def initialize(&responder)
+  # @yieldreturn [Hash, Symbol, Array] a JSON-RPC reply, or one of the reply tokens
+  def initialize(tls: false, &responder)
     @responder = responder
+    @tls = tls
     @received = []
+    @received_headers = []
+    @connections = 0
+    @aborted = false
     @mutex = Mutex.new
     @listener = TCPServer.new('127.0.0.1', 0)
     @port = @listener.addr[1]
@@ -414,6 +652,31 @@ class MidStreamCloseServer
   # @return [Array<Hash>] every JSON-RPC message received, in order
   def received
     @mutex.synchronize { @received.dup }
+  end
+
+  # @return [Array<Hash>] the HTTP headers of each received request, in order
+  def received_headers
+    @mutex.synchronize { @received_headers.dup }
+  end
+
+  # Counted at TCP accept, before any TLS handshake, so a connection that
+  # never completes still counts as an attempt.
+  # @return [Integer] how many TCP connections the client opened
+  def connections
+    @mutex.synchronize { @connections }
+  end
+
+  # True once a DRIP_FOREVER response failed to write, i.e. the client tore
+  # the response stream down. On modern Streamable HTTP that teardown *is* the
+  # cancellation signal, so it is the only thing a timed-out request sends.
+  # @return [Boolean]
+  def stream_aborted?
+    @mutex.synchronize { @aborted }
+  end
+
+  # @return [String] the base URL clients should use
+  def base_url
+    "#{@tls ? 'https' : 'http'}://127.0.0.1:#{@port}"
   end
 
   # @return [void]
@@ -428,19 +691,37 @@ class MidStreamCloseServer
 
   def accept_loop
     loop do
-      client = @listener.accept
+      socket = @listener.accept
+      @mutex.synchronize { @connections += 1 }
+      client = nil
       begin
+        client = wrap(socket)
         serve(client)
       rescue StandardError
         nil
       ensure
-        begin
-          client.close
-        rescue StandardError
-          nil
-        end
+        close_client(client || socket)
       end
     end
+  rescue StandardError
+    nil
+  end
+
+  def wrap(socket)
+    return socket unless @tls
+
+    context = OpenSSL::SSL::SSLContext.new
+    context.cert = TLS_CERT
+    context.key = TLS_KEY
+    ssl = OpenSSL::SSL::SSLSocket.new(socket, context)
+    ssl.accept
+    ssl
+  end
+
+  # A TLS socket is closed at the TCP layer so no close_notify is sent: an
+  # orderly TLS shutdown would look to the client like a clean end of body.
+  def close_client(client)
+    client.is_a?(OpenSSL::SSL::SSLSocket) ? client.io.close : client.close
   rescue StandardError
     nil
   end
@@ -450,7 +731,10 @@ class MidStreamCloseServer
 
     headers = read_headers(client)
     message = JSON.parse(client.read(headers['content-length'].to_i).to_s)
-    @mutex.synchronize { @received << message }
+    @mutex.synchronize do
+      @received << message
+      @received_headers << headers
+    end
     write_reply(client, @responder.call(message))
   end
 
@@ -467,31 +751,64 @@ class MidStreamCloseServer
   end
 
   def write_reply(client, reply)
-    if reply == CLOSE_MID_STREAM
-      chunk = ": keep-alive\n\n"
-      client.write("HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\n" \
-                   "Transfer-Encoding: chunked\r\nConnection: close\r\n\r\n")
-      client.write(format("%<size>x\r\n%<chunk>s\r\n", size: chunk.bytesize, chunk: chunk))
-    else
-      body = JSON.generate(reply)
-      client.write("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n" \
-                   "Content-Length: #{body.bytesize}\r\nConnection: close\r\n\r\n#{body}")
+    token, payload, extra = reply.is_a?(Array) ? reply : [reply, nil, nil]
+
+    case token
+    when CLOSE_MID_STREAM then write_sse_chunk(client, ": keep-alive\n\n")
+    when DELIVER_THEN_CLOSE then write_sse_chunk(client, "event: message\ndata: #{JSON.generate(payload)}\n\n")
+    when DELIVER_UNTERMINATED then write_sse_chunk(client, "event: message\ndata: #{JSON.generate(payload)}\n")
+    when DRIP_FOREVER then drip(client, payload || 0.02)
+    when HTTP_STATUS then write_plain(client, payload, extra.to_s)
+    else write_plain(client, 200, JSON.generate(token))
     end
     client.flush
+  end
+
+  def write_sse_head(client)
+    client.write("HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\n" \
+                 "Transfer-Encoding: chunked\r\nConnection: close\r\n\r\n")
+  end
+
+  # One chunk and no terminating zero chunk: the body stops mid-stream.
+  def write_sse_chunk(client, chunk)
+    write_sse_head(client)
+    client.write(format("%<size>x\r\n%<chunk>s\r\n", size: chunk.bytesize, chunk: chunk))
+  end
+
+  def drip(client, interval)
+    write_sse_head(client)
+    chunk = ": keep-alive\n\n"
+    loop do
+      client.write(format("%<size>x\r\n%<chunk>s\r\n", size: chunk.bytesize, chunk: chunk))
+      client.flush
+      sleep interval
+    end
+  rescue StandardError
+    @mutex.synchronize { @aborted = true }
+    raise
+  end
+
+  def write_plain(client, status, body)
+    client.write("HTTP/1.1 #{status} OK\r\nContent-Type: application/json\r\n" \
+                 "Content-Length: #{body.bytesize}\r\nConnection: close\r\n\r\n#{body}")
   end
 end
 
 RSpec.describe 'MCP 2026-07-28 Streamable HTTP — a response stream that really breaks' do
   before do
-    # The shared server/discover stub in spec_helper would intercept the probe
-    # before it reached the local socket.
-    WebMock.reset!
-    WebMock.allow_net_connect!
+    # WebMock is turned off entirely rather than merely allowed to connect:
+    # its Net::HTTP adapter reads the whole body before handing the response
+    # to the streaming block, which would hide exactly the mid-body failures
+    # (and the read-time deadline) these examples exist to exercise. Disabling
+    # it also drops the shared server/discover stub from spec_helper, which
+    # would otherwise intercept the probe before it reached the local socket.
+    WebMock.disable!
   end
 
   after do
     @server&.cleanup
     @fixture&.stop
+    WebMock.enable!
     WebMock.disable_net_connect!(allow_localhost: true)
   end
 
@@ -504,12 +821,15 @@ RSpec.describe 'MCP 2026-07-28 Streamable HTTP — a response stream that really
       'capabilities' => { 'tools' => {} } }
   end
 
-  def start_server(&responder)
-    @fixture = MidStreamCloseServer.new(&responder)
+  def start_server(tls: false, &responder)
+    @fixture = MidStreamCloseServer.new(tls: tls, &responder)
   end
 
   def transport(klass, **opts)
-    @server = klass.new(base_url: "http://127.0.0.1:#{@fixture.port}", endpoint: '/mcp', retries: 0, **opts)
+    # The fixture's certificate is self-signed, so verification is turned off
+    # for the TLS runs; nothing else about the exchange changes.
+    opts = { faraday_config: ->(conn) { conn.ssl[:verify] = false } }.merge(opts)
+    @server = klass.new(base_url: @fixture.base_url, endpoint: '/mcp', retries: 0, **opts)
   end
 
   def methods_received
@@ -535,6 +855,224 @@ RSpec.describe 'MCP 2026-07-28 Streamable HTTP — a response stream that really
         tool_calls = @fixture.received.select { |r| r['method'] == 'tools/call' }
         expect(tool_calls.size).to eq(2)
         expect(tool_calls[0]['id']).not_to eq(tool_calls[1]['id'])
+      end
+
+      # The re-issued request must be the *same* operation: only the JSON-RPC
+      # id may change. Sending the tool name with different (or no) arguments
+      # would satisfy "one replacement POST" while calling something else.
+      it 're-issues tools/call with the original arguments and mirrored headers' do
+        calls = 0
+        start_server do |message|
+          case message['method']
+          when 'server/discover' then jsonrpc(message, discovery)
+          when 'tools/call'
+            calls += 1
+            calls == 1 ? MidStreamCloseServer::CLOSE_MID_STREAM : jsonrpc(message, { 'content' => [] })
+          else jsonrpc(message, { 'tools' => [] })
+          end
+        end
+        arguments = { 'amount' => 10, 'nested' => { 'currency' => 'EUR', 'lines' => [1, 2] } }
+
+        expect(transport(klass).call_tool('charge', arguments)).to eq({ 'content' => [] })
+
+        indexes = @fixture.received.each_index.select { |i| @fixture.received[i]['method'] == 'tools/call' }
+        expect(indexes.size).to eq(2)
+        first, second = indexes.map { |i| @fixture.received[i] }
+        expect(second['id']).not_to eq(first['id'])
+        expect(second['params']).to eq(first['params'])
+        expect(second['params']).to include('name' => 'charge', 'arguments' => arguments)
+        headers = indexes.map { |i| @fixture.received_headers[i] }
+        expect(headers.map { |h| h['mcp-name'] }).to eq(%w[charge charge])
+        expect(headers.map { |h| h['mcp-method'] }).to eq(%w[tools/call tools/call])
+      end
+
+      # Production Streamable HTTP is HTTPS: the net_http adapter turns a TLS
+      # session that dies mid-body into Faraday::SSLError, a *sibling* of
+      # ConnectionFailed. A classification that only names ConnectionFailed
+      # never reaches the re-issue path here.
+      it 're-issues tools/call when an HTTPS response stream dies mid-body' do
+        calls = 0
+        start_server(tls: true) do |message|
+          case message['method']
+          when 'server/discover' then jsonrpc(message, discovery)
+          when 'tools/call'
+            calls += 1
+            calls == 1 ? MidStreamCloseServer::CLOSE_MID_STREAM : jsonrpc(message, { 'content' => [] })
+          else jsonrpc(message, { 'tools' => [] })
+          end
+        end
+
+        expect(transport(klass).call_tool('charge', { 'amount' => 10 })).to eq({ 'content' => [] })
+
+        tool_calls = @fixture.received.select { |r| r['method'] == 'tools/call' }
+        expect(tool_calls.size).to eq(2)
+        expect(tool_calls[0]['id']).not_to eq(tool_calls[1]['id'])
+        expect(tool_calls[1]['params']).to eq(tool_calls[0]['params'])
+      end
+
+      it 're-issues the server/discover probe when an HTTPS response stream dies mid-body' do
+        probes = 0
+        start_server(tls: true) do |message|
+          case message['method']
+          when 'server/discover'
+            probes += 1
+            probes == 1 ? MidStreamCloseServer::CLOSE_MID_STREAM : jsonrpc(message, discovery)
+          when 'initialize' then raise 'initialize must not be sent after a lost response stream'
+          else jsonrpc(message, { 'tools' => [] })
+          end
+        end
+
+        transport(klass).connect
+
+        expect(@server.protocol_era).to eq(:modern)
+        expect(methods_received).to eq(%w[server/discover server/discover])
+      end
+
+      # The re-issue rule is about an in-flight request that was *lost*. A
+      # response that was fully delivered settles its request, so a socket
+      # that dies after the last event must not cause the tool to run twice.
+      it 'keeps a delivered result when the socket dies after the final SSE event' do
+        start_server do |message|
+          case message['method']
+          when 'server/discover' then jsonrpc(message, discovery)
+          when 'tools/call'
+            [MidStreamCloseServer::DELIVER_THEN_CLOSE, jsonrpc(message, { 'content' => [{ 'type' => 'text' }] })]
+          else jsonrpc(message, { 'tools' => [] })
+          end
+        end
+
+        expect(transport(klass).call_tool('charge', { 'amount' => 10 }))
+          .to eq({ 'content' => [{ 'type' => 'text' }] })
+        expect(@fixture.received.count { |r| r['method'] == 'tools/call' }).to eq(1)
+      end
+
+      it 'keeps a delivered result when an HTTPS socket dies after the final SSE event' do
+        start_server(tls: true) do |message|
+          case message['method']
+          when 'server/discover' then jsonrpc(message, discovery)
+          when 'tools/call' then [MidStreamCloseServer::DELIVER_THEN_CLOSE, jsonrpc(message, { 'content' => [] })]
+          else jsonrpc(message, { 'tools' => [] })
+          end
+        end
+
+        expect(transport(klass).call_tool('charge', { 'amount' => 10 })).to eq({ 'content' => [] })
+        expect(@fixture.received.count { |r| r['method'] == 'tools/call' }).to eq(1)
+      end
+
+      it 'surfaces a delivered JSON-RPC error rather than re-issuing when the socket then dies' do
+        start_server do |message|
+          case message['method']
+          when 'server/discover' then jsonrpc(message, discovery)
+          when 'tools/call'
+            [MidStreamCloseServer::DELIVER_THEN_CLOSE,
+             { 'jsonrpc' => '2.0', 'id' => message['id'],
+               'error' => { 'code' => -32_000, 'message' => 'card declined' } }]
+          else jsonrpc(message, { 'tools' => [] })
+          end
+        end
+
+        expect { transport(klass).call_tool('charge', { 'amount' => 10 }) }
+          .to raise_error(MCPClient::Errors::MCPError, /card declined/)
+        expect(@fixture.received.count { |r| r['method'] == 'tools/call' }).to eq(1)
+      end
+
+      # An SSE event is only dispatched by its terminating blank line, so a
+      # final event whose JSON happens to be complete but whose terminator
+      # never arrived carries no delivered response.
+      it 're-issues when the final SSE event was cut before its terminator' do
+        calls = 0
+        start_server do |message|
+          case message['method']
+          when 'server/discover' then jsonrpc(message, discovery)
+          when 'tools/call'
+            calls += 1
+            if calls == 1
+              [MidStreamCloseServer::DELIVER_UNTERMINATED, jsonrpc(message, { 'content' => [] })]
+            else
+              jsonrpc(message, { 'content' => [{ 'type' => 'text' }] })
+            end
+          else jsonrpc(message, { 'tools' => [] })
+          end
+        end
+
+        expect(transport(klass).call_tool('charge', { 'amount' => 10 }))
+          .to eq({ 'content' => [{ 'type' => 'text' }] })
+        expect(@fixture.received.count { |r| r['method'] == 'tools/call' }).to eq(2)
+      end
+
+      # A TLS handshake that never completes proves the request never left the
+      # client, so there is nothing in flight to replace. Counting connections
+      # (rather than the exception the failed connect returns) is what pins
+      # that: a classifier that called every socket failure an interrupted
+      # exchange would open a second one.
+      it 'opens exactly one connection when the TLS handshake fails' do
+        start_server(tls: true) { |message| jsonrpc(message, discovery) }
+        # No faraday_config: the self-signed certificate fails verification.
+        @server = klass.new(base_url: @fixture.base_url, endpoint: '/mcp', retries: 0)
+
+        expect { @server.connect }.to raise_error(MCPClient::Errors::ConnectionError) do |error|
+          expect(error).not_to be_a(MCPClient::Errors::ResponseStreamClosedError)
+        end
+        expect(@fixture.connections).to eq(1)
+        expect(@fixture.received).to be_empty
+      end
+
+      # MCP 2026-07-28 cancellation/timeouts: implementations SHOULD enforce a
+      # maximum timeout regardless of progress. Faraday's socket timeout only
+      # measures the gap between reads, which a keep-alive drip resets forever.
+      it 'bounds discovery with discover_timeout while the server keeps the stream alive' do
+        start_server do |message|
+          message['method'] == 'server/discover' ? MidStreamCloseServer::DRIP_FOREVER : jsonrpc(message, {})
+        end
+        server = transport(klass, discover_timeout: 0.2, read_timeout: 30)
+
+        started = Process.clock_gettime(Process::CLOCK_MONOTONIC)
+        Timeout.timeout(15) do
+          expect { server.connect }.to raise_error(MCPClient::Errors::MCPError)
+        end
+        expect(Process.clock_gettime(Process::CLOCK_MONOTONIC) - started).to be < 10
+      end
+
+      # MCP 2026-07-28 makes closing the response stream the cancellation
+      # signal, so a timed-out modern request must actually tear the socket
+      # down and send nothing else. Injecting Faraday::TimeoutError from a
+      # stub would only show the second half.
+      it 'closes the response stream on timeout and sends no cancellation' do
+        start_server do |message|
+          if message['method'] == 'server/discover'
+            jsonrpc(message, discovery)
+          else
+            # Slower than the client's socket timeout, so the read times out
+            # and Faraday aborts the connection.
+            [MidStreamCloseServer::DRIP_FOREVER, 0.5]
+          end
+        end
+        server = transport(klass, read_timeout: 0.2)
+        server.connect
+
+        expect { server.rpc_request('tools/list', {}) }
+          .to raise_error(MCPClient::Errors::RequestTimeoutError)
+
+        deadline = Process.clock_gettime(Process::CLOCK_MONOTONIC) + 5
+        sleep 0.05 until @fixture.stream_aborted? || Process.clock_gettime(Process::CLOCK_MONOTONIC) > deadline
+        expect(@fixture.stream_aborted?).to be(true)
+        expect(methods_received).not_to include('notifications/cancelled')
+      end
+
+      # A notification has no response to lose, so a broken socket is a plain
+      # connection failure and never enters the re-issue path.
+      it 'does not enter response-stream recovery for a notification' do
+        start_server do |message|
+          message['method'] == 'server/discover' ? jsonrpc(message, discovery) : MidStreamCloseServer::CLOSE_MID_STREAM
+        end
+        server = transport(klass)
+        server.connect
+
+        expect { server.rpc_notify('notifications/progress', { 'progressToken' => 'p', 'progress' => 1 }) }
+          .to raise_error(MCPClient::Errors::TransportError) do |error|
+            expect(error).not_to be_a(MCPClient::Errors::ResponseStreamClosedError)
+          end
+        expect(@fixture.received.count { |r| r['method'] == 'notifications/progress' }).to eq(1)
       end
 
       it 're-issues the server/discover probe when the socket ends mid-stream' do
@@ -565,15 +1103,26 @@ RSpec.describe 'MCP 2026-07-28 Streamable HTTP — a response stream that really
         expect(@fixture.received.count { |r| r['method'] == 'tools/call' }).to eq(2)
       end
 
-      it 'does not re-issue when the connection was never established' do
+      it 'attempts exactly one request when the connection was never established' do
         start_server { |message| jsonrpc(message, discovery) }
         port = @fixture.port
         @fixture.stop
-        server = klass.new(base_url: "http://127.0.0.1:#{port}", endpoint: '/mcp', retries: 0)
+        attempts = 0
+        counter = Class.new(Faraday::Middleware) do
+          define_method(:on_request) { |_env| attempts += 1 }
+        end
+        server = klass.new(base_url: "http://127.0.0.1:#{port}", endpoint: '/mcp', retries: 0,
+                           faraday_config: ->(conn) { conn.builder.insert(0, counter) })
 
         expect { server.connect }.to raise_error(MCPClient::Errors::ConnectionError) do |error|
           expect(error).not_to be_a(MCPClient::Errors::ResponseStreamClosedError)
         end
+        # Counting what went on the wire, not merely inspecting the exception
+        # connect returns: that exception is a ConnectionError either way, so
+        # a classifier that treated every socket failure as an interrupted
+        # exchange would slip past an assertion about it while quietly
+        # putting a replacement request on the wire.
+        expect(attempts).to eq(1)
       ensure
         server&.cleanup
       end

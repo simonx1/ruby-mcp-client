@@ -86,6 +86,15 @@ module MCPClient
         process_jsonrpc_response(data)
       rescue JSON::ParserError => e
         raise MCPClient::Errors::TransportError, "Invalid JSON response from server: #{describe_parse_error(e)}"
+      rescue Zlib::Error => e
+        # Streamable HTTP always offers gzip, so a stream that stops before the
+        # gzip footer arrives here rather than as a socket failure. No response
+        # was delivered, which on a modern server means the in-flight request
+        # is lost and MUST be re-issued with a new id.
+        raise MCPClient::Errors::TransportError, "Invalid gzip response from server: #{e.message}" unless modern?
+
+        raise MCPClient::Errors::ResponseStreamClosedError,
+              "Response stream closed before delivering the response: #{e.message}"
       end
 
       # Incrementally decompress a gzip response body, aborting once the
@@ -207,7 +216,9 @@ module MCPClient
         retry_ms = nil
         current_event = { type: 'message', data_lines: [], id: nil }
 
-        sse_body.lines.each do |line|
+        # SSE line terminators are CRLF, CR or LF; a server framing its events
+        # with bare CR still delimits them, so normalize before splitting.
+        normalize_sse_newlines(sse_body).lines.each do |line|
           line = line.strip
 
           if line.empty?

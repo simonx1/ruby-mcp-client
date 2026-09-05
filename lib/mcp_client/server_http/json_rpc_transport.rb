@@ -68,7 +68,9 @@ module MCPClient
       # @param sse_body [String] the text/event-stream body
       # @return [Array<Hash>] the JSON-RPC messages carried by its data lines
       def sse_messages(sse_body)
-        sse_body.split(/\r?\n\r?\n/).filter_map do |event|
+        # SSE line terminators are CRLF, CR or LF; a server framing its events
+        # with bare CR still delimits them, so normalize before splitting.
+        normalize_sse_newlines(sse_body).split("\n\n").filter_map do |event|
           data_lines = event.lines.map(&:chomp).select { |l| l.start_with?('data:') }
           next if data_lines.empty?
 

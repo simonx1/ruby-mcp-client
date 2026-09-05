@@ -101,7 +101,7 @@ module MCPClient
 
     # Connect to a single server
     def connect_single(target, **options, &)
-      transport = options[:transport]&.to_sym || detect_transport(target)
+      transport = options[:transport]&.to_sym || detect_transport(target, options)
 
       case transport
       when :stdio
@@ -229,7 +229,9 @@ module MCPClient
     end
 
     # Detect transport type from target
-    def detect_transport(target)
+    # @param target [String, Array] the connection target
+    # @param options [Hash] the connect options, consulted for protocol:
+    def detect_transport(target, options = {})
       return :stdio if target.is_a?(Array) && stdio_command_array?(target)
       return :stdio if stdio_target?(target)
 
@@ -246,6 +248,11 @@ module MCPClient
       end
 
       path = uri.path.to_s.downcase
+      # A URL path is not a protocol declaration: protocol: :modern asks for a
+      # 2026-07-28 server, which only Streamable HTTP can speak. Honouring the
+      # /sse suffix there would select the legacy-only SSE transport, which
+      # drops the option and opens a GET stream instead of probing.
+      return :streamable_http if modern_only?(options)
       return :sse if path.end_with?('/sse')
       return :streamable_http if path.end_with?('/mcp')
 
@@ -338,7 +345,7 @@ module MCPClient
 
     # Build config hash for a target
     def build_config_for_target(target, **options, &)
-      transport = options[:transport]&.to_sym || detect_transport(target)
+      transport = options[:transport]&.to_sym || detect_transport(target, options)
 
       case transport
       when :stdio

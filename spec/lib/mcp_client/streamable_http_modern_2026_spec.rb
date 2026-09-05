@@ -1136,11 +1136,16 @@ RSpec.describe 'MCP 2026-07-28 modern mode — a server that offers a session an
       # Nothing on a modern connection assigns a session id, so plant one to
       # exercise that guard rather than trusting it by inspection.
       server.instance_variable_set(:@session_id, 'sess-planted')
+      delete_stub = stub_request(:delete, url).to_return(status: 200, body: '')
 
       server.call_tool('t', {})
+      server.cleanup
 
       expect(requests.last).not_to have_key('Mcp-Session-Id')
-      server.cleanup
+      # Teardown must not DELETE it either: a modern connection has no session
+      # layer at all, so the id is dropped rather than terminated.
+      expect(delete_stub).not_to have_been_requested
+      expect(server.instance_variable_get(:@session_id)).to be_nil
     end
   end
 end

@@ -13,7 +13,8 @@ metadata). Each feature lands in its own PR; this section accumulates them.
   is retried with an advertised version; `HeaderMismatch` and
   `MissingRequiredClientCapability` are surfaced), marks the server modern. A
   404 carrying -32601 is a modern server without discovery support
-  (tolerated, capabilities unknown). Any other 4xx — or a 2xx that is not a
+  (tolerated, capabilities unknown, on every connection rather than only the
+  first). Any other 4xx — or a 2xx that is not a
   `DiscoverResult` — is a legacy server: the `initialize` handshake runs as
   before. **Both verdicts are cached** for the transport, so a server once
   found modern never gets `initialize` on a later connection, however a later
@@ -32,7 +33,11 @@ metadata). Each feature lands in its own PR; this section accumulates them.
   `ConnectionError` subclass), which `MCPClient.connect` re-raises for an
   ambiguous URL instead of falling through to the legacy SSE and HTTP+POST
   transports. `MCPClient.connect(url, protocol: :modern)` likewise no longer
-  falls back to those legacy-only transports. This covers a server whose
+  falls back to those legacy-only transports, and now outranks the URL-suffix
+  heuristic: a URL ending in `/sse` is a path, not a protocol declaration, so
+  asking for a modern server selects Streamable HTTP there instead of the
+  legacy-only SSE transport (which silently drops the option). This covers a
+  server whose
   `DiscoverResult` (or well-formed `-32022` list) advertises no version this
   client speaks: discovery settled the era even though it settled no version,
   so the era is cached and a later connection never sends `initialize`.
@@ -63,14 +68,39 @@ metadata). Each feature lands in its own PR; this section accumulates them.
   during `tools/call` is never re-sent, because in none of those cases was
   the server told to stop.
 
-  All three ways a stream can be lost take that one path: a break between SSE
+  Every way a stream can be lost takes that one path: a break between SSE
   events, a break inside an event's JSON, and **a socket that dies mid-body**.
   The last is what a broken stream actually looks like on the wire — Faraday
   raises rather than handing back a truncated body — and it previously
-  surfaced as a plain `ConnectionError` with no replacement request. A socket
-  failure that proves the request never reached the server (connection
-  refused, DNS, unreachable network), and a notification (which has no
-  response to lose), still raise `ConnectionError`.
+  surfaced as a plain `ConnectionError` with no replacement request. That now
+  includes the failures production Streamable HTTP actually raises: an
+  **HTTPS** body whose TLS session dies mid-read (`Faraday::SSLError`, a
+  *sibling* of `ConnectionFailed`, not a subclass), a **gzip** body that stops
+  before its footer (Streamable HTTP always offers gzip), and a generic
+  `IOError` ("closed stream"). A socket failure that proves the request never
+  reached the server (connection refused, DNS, unreachable network, **a TLS
+  handshake that never completed**), and a notification (which has no response
+  to lose), still raise `ConnectionError` and are never replaced.
+
+  **A response that did arrive settles its request.** The re-issue rule is
+  about an in-flight request that was *lost*, so a socket that dies after the
+  final SSE event must not make a `tools/call` run twice. Response bodies are
+  now read as they stream in, so the bytes that arrived survive the failure
+  Faraday raises: if they carry this request's complete answer, that answer is
+  returned (or its JSON-RPC error raised) instead of a replacement request
+  going out. A final event whose terminating blank line never arrived was
+  never dispatched and does not count as delivered.
+- **SSE framing follows the specification's line terminators.** Both HTTP
+  parsers now treat CRLF, CR and LF alike, so a server that frames its events
+  with bare CR is read rather than mistaken for a stream that delivered
+  nothing (and, on a modern server, re-issued).
+- **`discover_timeout` bounds the whole probe** (2026-07-28
+  cancellation/timeouts: implementations "SHOULD always enforce a maximum
+  timeout regardless of progress"). It used to set only Faraday's socket
+  timeout, which measures the gap between reads: a probe answered with an
+  endless drip of SSE keep-alives never timed out and blocked every caller
+  waiting on the connection. One deadline now covers the probe and its
+  re-issue.
 - **Plain HTTP + SSE response streams.** `ServerHTTP` now advertises and
   parses `text/event-stream` responses. On a **legacy** stream the server may
   still send requests, so a `ping` is answered with an empty result and any

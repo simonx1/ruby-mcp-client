@@ -1,6 +1,8 @@
 # frozen_string_literal: true
 
 require 'net/http'
+require 'openssl'
+require 'zlib'
 require_relative 'json_rpc_common'
 require_relative 'auth/oauth_provider'
 
@@ -24,14 +26,74 @@ module MCPClient
     AUTH_PARAMS_RUN = /\A(?:[\s,]*#{AUTH_PARAM})*/
 
     # Socket-level failures that can only occur once the exchange was under
-    # way: the peer reset or closed the connection, or the response head was
-    # truncated. Failures proving the request never reached the server
-    # (connection refused, DNS failure, unreachable network) are deliberately
-    # absent — there is nothing in flight to replace.
+    # way: the peer reset or closed the connection, the response head was
+    # truncated, or the encoded body stopped short. Failures proving the
+    # request never reached the server (connection refused, DNS failure,
+    # unreachable network) are deliberately absent — there is nothing in
+    # flight to replace.
+    #
+    # IOError covers EOFError and Net::HTTP's own "closed stream"; Zlib::Error
+    # covers a gzip body (Streamable HTTP always offers gzip) that stops
+    # before its footer; OpenSSL::SSL::SSLError covers an HTTPS body whose TLS
+    # session dies mid-read, which is what production Streamable HTTP actually
+    # raises — see tls_handshake_failure? for the one OpenSSL case that means
+    # the exchange never started.
     INTERRUPTED_EXCHANGE_ERRORS = [
-      EOFError, Errno::ECONNRESET, Errno::ECONNABORTED, Errno::EPIPE,
-      Net::HTTPBadResponse, Net::ProtocolError
+      IOError, Errno::ECONNRESET, Errno::ECONNABORTED, Errno::EPIPE,
+      Net::HTTPBadResponse, Net::ProtocolError, Zlib::Error, OpenSSL::SSL::SSLError
     ].freeze
+
+    # Faraday exception classes that can carry a broken response stream. TLS
+    # failures are a sibling of ConnectionFailed, not a subclass, so both must
+    # be named for an HTTPS stream to reach the re-issue path at all.
+    INTERRUPTED_EXCHANGE_FARADAY_ERRORS = [Faraday::ConnectionFailed, Faraday::SSLError].freeze
+
+    # Innermost Faraday middleware: streams the response body into a
+    # per-request buffer so that
+    #
+    # 1. a socket failure mid-body still leaves the bytes that did arrive
+    #    (Faraday discards a partially read body and raises), letting a
+    #    response that was fully delivered settle its request instead of being
+    #    re-issued and executed twice; and
+    # 2. a deadline can be enforced while the body is arriving, which a socket
+    #    timeout alone cannot do for a stream that keeps dripping keep-alives.
+    #
+    # It restores the buffer as the response body, and being the innermost
+    # handler its on_complete runs before any user middleware (raise_error and
+    # friends) looks at that body.
+    class ResponseBodyCapture < Faraday::Middleware
+      # @param env [Faraday::Env] the outgoing request environment
+      # @return [void]
+      def on_request(env)
+        state = env.request&.context
+        buffer = state && state[:mcp_body_buffer]
+        return unless buffer
+
+        # The retry middleware sits above this one and replays the whole inner
+        # stack, so each attempt must start from an empty buffer.
+        buffer.clear
+        env.request.on_data = lambda do |chunk, _size, _env|
+          buffer << chunk.to_s
+          deadline = state[:mcp_deadline]
+          raise Faraday::TimeoutError, 'Request exceeded its deadline' if deadline && monotonic_now > deadline
+        end
+      end
+
+      # @param env [Faraday::Env] the completed request environment
+      # @return [void]
+      def on_complete(env)
+        state = env.request&.context
+        buffer = state && state[:mcp_body_buffer]
+        env.body = buffer.dup if buffer && env.body.to_s.empty?
+      end
+
+      private
+
+      # @return [Float] a monotonic clock reading in seconds
+      def monotonic_now
+        Process.clock_gettime(Process::CLOCK_MONOTONIC)
+      end
+    end
 
     # Generic JSON-RPC request: send method with params and return result
     # @param method [String] JSON-RPC method name
@@ -150,6 +212,14 @@ module MCPClient
     # @return [Boolean] true if termination was successful
     # @raise [MCPClient::Errors::ConnectionError] if termination fails
     def terminate_session
+      # MCP 2026-07-28 removed the session layer: a modern connection has no
+      # session to terminate and MUST NOT send the DELETE, whatever a
+      # non-conforming server (or a caller) put in @session_id.
+      if modern?
+        @session_id = nil
+        return true
+      end
+
       return true unless @session_id
 
       conn = http_connection
@@ -342,7 +412,19 @@ module MCPClient
     # @return [Boolean] true when the server is modern despite the failure
     # @raise [MCPClient::Errors::MCPError] when the failure settles nothing or the server is modern
     def modern_despite_probe_failure?(error, modern_confirmed)
-      raise modern_probe_failure(error) if modern_confirmed || error.modern_protocol_error_for_probe?
+      raise modern_probe_failure(error) if error.modern_protocol_error_for_probe?
+
+      # A 404 with -32601 is a complete answer rather than a failed exchange:
+      # the server is modern and simply has no discovery support. It answers
+      # that way on every connect, so a reconnect must tolerate it exactly as
+      # the first connect did — checked before the cached modern verdict,
+      # which would otherwise turn the second identical answer into a failure.
+      if unknown_method_404?(error)
+        accept_modern_server_without_discover(error)
+        return true
+      end
+
+      raise modern_probe_failure(error) if modern_confirmed
 
       if error.era_inconclusive?
         # The exchange never completed (broken response stream, timeout, 5xx):
@@ -350,11 +432,6 @@ module MCPClient
         # the transport failure. Only a genuine rejection means legacy.
         @protocol_version = nil
         raise error
-      end
-
-      if unknown_method_404?(error)
-        accept_modern_server_without_discover(error)
-        return true
       end
 
       treat_probe_failure_as_legacy(error)
@@ -434,8 +511,15 @@ module MCPClient
     # Send server/discover and apply the DiscoverResult.
     # @return [Hash] the DiscoverResult
     def perform_discover
+      # MCP 2026-07-28 cancellation/timeouts: implementations SHOULD enforce a
+      # maximum timeout regardless of progress. Faraday's socket timeout only
+      # bounds the gap between bytes, so a probe answered with an endless
+      # trickle of SSE keep-alives would never time out and every caller
+      # waiting on the connection monitor would block with it. One deadline
+      # covers the probe and its one re-issue.
+      deadline = @discover_timeout && (monotonic_now + @discover_timeout)
       result = begin
-        send_discover_request
+        send_discover_request(deadline)
       rescue MCPClient::Errors::ResponseStreamClosedError => e
         # The probe goes through the same recovery as every other modern
         # request: a broken response stream loses it and it MUST be re-issued
@@ -443,7 +527,7 @@ module MCPClient
         # surface as a plain transport failure and be mistaken for a legacy
         # rejection, permanently misclassifying a modern server.
         @logger.warn("#{e.message}; re-issuing server/discover as a new request")
-        send_discover_request
+        send_discover_request(deadline)
       end
       # A 2xx that is not a DiscoverResult (e.g. a permissive legacy endpoint
       # answering any method) is not a modern answer: let the probe treat it
@@ -458,11 +542,17 @@ module MCPClient
     end
 
     # One server/discover exchange with its own JSON-RPC id.
+    # @param deadline [Float, nil] monotonic instant the whole probe must finish by
     # @return [Object] the JSON-RPC result
-    def send_discover_request
+    def send_discover_request(deadline = nil)
       request_id = @mutex.synchronize { @request_id += 1 }
       request = build_jsonrpc_request('server/discover', {}, request_id)
-      send_jsonrpc_request(request, timeout: @discover_timeout)
+      send_jsonrpc_request(request, timeout: @discover_timeout, deadline: deadline)
+    end
+
+    # @return [Float] a monotonic clock reading in seconds
+    def monotonic_now
+      Process.clock_gettime(Process::CLOCK_MONOTONIC)
     end
 
     # @param result [Object] a JSON-RPC result
@@ -508,11 +598,11 @@ module MCPClient
     # @raise [MCPClient::Errors::ConnectionError] if connection fails
     # @raise [MCPClient::Errors::TransportError] if response isn't valid JSON
     # @raise [MCPClient::Errors::ToolCallError] for other errors during request execution
-    def send_jsonrpc_request(request, timeout: nil)
+    def send_jsonrpc_request(request, timeout: nil, deadline: nil)
       @logger.debug("Sending JSON-RPC request: #{describe_jsonrpc_message(request)}")
 
       begin
-        response = send_http_request(request, timeout: timeout)
+        response = send_http_request(request, timeout: timeout, deadline: deadline)
         parse_response(response, request)
       rescue MCPClient::Errors::ConnectionError, MCPClient::Errors::TransportError, MCPClient::Errors::ServerError
         raise
@@ -530,7 +620,7 @@ module MCPClient
     # @param request [Hash] the JSON-RPC request
     # @return [Faraday::Response] the HTTP response
     # @raise [MCPClient::Errors::ConnectionError] if connection fails
-    def send_http_request(request, timeout: nil)
+    def send_http_request(request, timeout: nil, deadline: nil)
       conn = http_connection
       # Capture the session id this request goes out with — the value
       # apply_request_headers attaches — so a later 404 is attributed to the
@@ -538,25 +628,13 @@ module MCPClient
       # holds by 404-handling time (another caller may have completed a
       # restart in between, and its fresh session must not be re-initialized).
       sent_session_id = @mutex.synchronize { @session_id }
+      # ResponseBodyCapture fills this in as the body arrives, so the bytes
+      # that made it are still here when Faraday raises instead of returning.
+      capture = { mcp_body_buffer: +'', mcp_deadline: deadline }
 
       begin
         response = conn.post(@endpoint) do |req|
-          apply_request_headers(req, request)
-          # Per-request timeout override (MCP lifecycle: timeouts SHOULD be
-          # configurable on a per-request basis)
-          req.options.timeout = timeout if timeout
-          # The wire header must match the captured id exactly: a restart
-          # completing between capture and header attachment would otherwise
-          # attach a different (or fresh) session than the one attributed to
-          # this request at 404-handling time.
-          if req.headers.key?('Mcp-Session-Id')
-            if sent_session_id
-              req.headers['Mcp-Session-Id'] = sent_session_id
-            else
-              req.headers.delete('Mcp-Session-Id')
-            end
-          end
-          req.body = request.to_json
+          prepare_http_request(req, request, sent_session_id, timeout, capture)
         end
 
         return restart_session_and_resend(request, sent_session_id) if expired_session?(response, sent_session_id)
@@ -583,7 +661,12 @@ module MCPClient
         # becomes the typed error (never a retryable TransportError).
         status = e.response.is_a?(Hash) ? (e.response[:status] || e.response['status']) : nil
         raise client_error_from_exception(e, status || 400)
-      rescue Faraday::ConnectionFailed => e
+      rescue *INTERRUPTED_EXCHANGE_FARADAY_ERRORS => e
+        # The body may have been fully delivered before the socket died; if it
+        # was, that response settles the request and must not be replaced.
+        salvaged = salvaged_response(capture[:mcp_body_buffer], request, e)
+        return salvaged if salvaged
+
         raise connection_failure_error(e, request)
       rescue Faraday::TimeoutError => e
         raise MCPClient::Errors::RequestTimeoutError, "Request timed out: #{e.message}"
@@ -600,6 +683,33 @@ module MCPClient
       end
     end
 
+    # Fill in one outgoing Faraday POST: headers, capture state, timeout and body.
+    # @param req [Faraday::Request] the request being built
+    # @param request [Hash] the JSON-RPC message to send
+    # @param sent_session_id [String, nil] the session id captured for this request
+    # @param timeout [Numeric, nil] per-request timeout override
+    # @param capture [Hash] ResponseBodyCapture state for this request
+    # @return [void]
+    def prepare_http_request(req, request, sent_session_id, timeout, capture)
+      apply_request_headers(req, request)
+      req.options.context = (req.options.context || {}).merge(capture)
+      # Per-request timeout override (MCP lifecycle: timeouts SHOULD be
+      # configurable on a per-request basis)
+      req.options.timeout = timeout if timeout
+      # The wire header must match the captured id exactly: a restart
+      # completing between capture and header attachment would otherwise
+      # attach a different (or fresh) session than the one attributed to
+      # this request at 404-handling time.
+      if req.headers.key?('Mcp-Session-Id')
+        if sent_session_id
+          req.headers['Mcp-Session-Id'] = sent_session_id
+        else
+          req.headers.delete('Mcp-Session-Id')
+        end
+      end
+      req.body = request.to_json
+    end
+
     # Translate a Faraday socket failure into the MCP error the caller must
     # act on.
     #
@@ -614,7 +724,7 @@ module MCPClient
     #
     # A failure that never got the request out, and a notification (which has
     # no response to lose), stay a plain ConnectionError.
-    # @param error [Faraday::ConnectionFailed] the socket failure
+    # @param error [Faraday::ConnectionFailed, Faraday::SSLError] the socket failure
     # @param request [Hash] the JSON-RPC message that was being sent
     # @return [MCPClient::Errors::MCPError] the error to raise
     def connection_failure_error(error, request)
@@ -627,14 +737,112 @@ module MCPClient
       MCPClient::Errors::ConnectionError.new("Server connection lost: #{error.message}")
     end
 
-    # Faraday wraps every socket failure in ConnectionFailed, whether the
-    # connection was never established or it broke with a request in flight;
-    # only the wrapped exception distinguishes them.
-    # @param error [Faraday::ConnectionFailed] the socket failure
+    # Faraday wraps every socket failure in ConnectionFailed (or, for TLS, in
+    # SSLError), whether the connection was never established or it broke with
+    # a request in flight; only the wrapped exception distinguishes them.
+    # @param error [Faraday::ConnectionFailed, Faraday::SSLError] the socket failure
     # @return [Boolean] true when the exchange had started when it broke
     def interrupted_exchange?(error)
       cause = (error.wrapped_exception if error.respond_to?(:wrapped_exception)) || error.cause
+      return false if tls_handshake_failure?(cause)
+
       INTERRUPTED_EXCHANGE_ERRORS.any? { |klass| cause.is_a?(klass) }
+    end
+
+    # OpenSSL names the failing operation in its message. A handshake that
+    # never completed ("SSL_connect ... certificate verify failed") means the
+    # request never left this client, so there is nothing in flight to
+    # replace; a body that dies mid-read ("SSL_read: unexpected eof while
+    # reading") is a broken response stream like any other.
+    # @param cause [Exception, nil] the exception Faraday wrapped
+    # @return [Boolean] true when TLS failed before the request was sent
+    def tls_handshake_failure?(cause)
+      cause.is_a?(OpenSSL::SSL::SSLError) && cause.message.to_s.include?('SSL_connect')
+    end
+
+    # The response that did arrive before the socket died, when the stream
+    # carried this request's complete answer.
+    #
+    # Faraday discards a partially read body and raises, so without the
+    # streamed capture a break after the final SSE event is indistinguishable
+    # from a break before it — and re-issuing there would run a tools/call the
+    # server already executed a second time. MCP 2026-07-28's re-issue rule is
+    # about an in-flight request that was *lost*; a delivered response settles
+    # its request, however the socket ends afterwards.
+    # @param partial_body [String, nil] the bytes captured before the failure
+    # @param request [Hash] the JSON-RPC message that was being sent
+    # @param error [Faraday::Error] the socket failure
+    # @return [NormalizedResponse, nil] a response carrying the delivered answer
+    def salvaged_response(partial_body, request, error)
+      return nil unless modern? && request.is_a?(Hash) && request.key?('id')
+      return nil unless interrupted_exchange?(error)
+
+      body = partial_body.to_s
+      return nil if body.empty?
+
+      sse = sse_framed_body?(body)
+      # A truncated stream's last event has no terminating blank line, so it
+      # was never dispatched (HTML SSE parsing rules) and must be dropped
+      # before asking whether the answer arrived.
+      body = complete_sse_events(body) if sse
+      return nil if body.empty? || !body_carries_response?(body, sse, request['id'])
+
+      @logger.warn("Response stream closed after the response arrived (#{error.message}); " \
+                   "keeping the delivered #{request['method']} response instead of re-issuing it")
+      NormalizedResponse.new(200, { 'content-type' => sse ? 'text/event-stream' : 'application/json' }, body)
+    end
+
+    # Per the SSE specification a line is terminated by CRLF, CR or LF alone;
+    # normalizing to LF lets one set of framing rules serve all three.
+    # @param body [String] a response body
+    # @return [String] the body with LF line terminators
+    def normalize_sse_newlines(body)
+      body.gsub(/\r\n|\r/, "\n")
+    end
+
+    # @param body [String] a response body
+    # @return [Boolean] whether the body is SSE-framed rather than plain JSON
+    def sse_framed_body?(body)
+      normalize_sse_newlines(body).each_line.any? { |line| line.match?(/\A(?::|(?:data|event|id|retry):)/) }
+    end
+
+    # @param body [String] an SSE body that may end mid-event
+    # @return [String] the prefix up to and including the last event terminator
+    def complete_sse_events(body)
+      normalized = normalize_sse_newlines(body)
+      index = normalized.rindex("\n\n")
+      index ? normalized[0, index + 2] : +''
+    end
+
+    # Side-effect-free check for this request's answer, so the real parser
+    # (which dispatches notifications and tracks event ids) still runs exactly
+    # once, on the salvaged response.
+    # @param body [String] the complete portion of the body
+    # @param sse [Boolean] whether the body is SSE-framed
+    # @param request_id [Integer, String] id of the originating request
+    # @return [Boolean] whether the body carries a response to this request
+    def body_carries_response?(body, sse, request_id)
+      payloads = sse ? sse_data_payloads(body) : [body]
+      payloads.any? do |payload|
+        message = begin
+          JSON.parse(payload)
+        rescue JSON::ParserError
+          nil
+        end
+        message.is_a?(Hash) && !message.key?('method') &&
+          (message['id'] == request_id || message['id'].to_s == request_id.to_s)
+      end
+    end
+
+    # @param body [String] an LF-normalized SSE body
+    # @return [Array<String>] the joined data payload of each event
+    def sse_data_payloads(body)
+      body.split("\n\n").filter_map do |event|
+        lines = event.lines.map(&:chomp).select { |line| line.start_with?('data:') }
+        next if lines.empty?
+
+        lines.map { |line| line.sub(/\Adata:\s*/, '') }.join("\n")
+      end
     end
 
     # Start a new session after the server invalidated the current one, then
@@ -916,6 +1124,12 @@ module MCPClient
 
       # Apply user's Faraday customizations after defaults
       @faraday_config&.call(conn)
+
+      # Appended last, so it is the innermost handler: its on_complete puts
+      # the streamed body back before any user middleware (raise_error and
+      # friends) inspects it, and the retry middleware above it re-enters it
+      # on every attempt.
+      conn.builder.use(ResponseBodyCapture)
 
       conn
     end
