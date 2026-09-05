@@ -280,6 +280,10 @@ RSpec.describe 'MCP 2026-07-28 tasks extension — round 33' do
     it "does not unmark the replacement session's keys when an ended delivery is dropped" do
       client = stdio_client
       wait = wait_joined_on(client, stdio)
+      # The delivery below is about the session that ended, not about one
+      # coming up under it: a first connection would retire the replacement's
+      # bookkeeping for the same reason this delivery must not.
+      allow(stdio).to receive(:ensure_session_ready)
       stdio.send(:bump_session_epoch)
       # The new session reserved the reused key for what is a different
       # request; the ended session's delivery must not give it back.

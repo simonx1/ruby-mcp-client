@@ -115,6 +115,5 @@ module MCPClient
 
       params.is_a?(Hash) && (params.key?('tools') || params.key?('toolChoice'))
     end
-
   end
 end
