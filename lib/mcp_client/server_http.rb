@@ -22,9 +22,7 @@ module MCPClient
   #   `ping` gets the empty result it requires). For elicitation support, use
   #   one of these transports instead:
   #   - ServerStdio: Full bidirectional JSON-RPC over stdin/stdout
-  #   - ServerSSE: Server requests via SSE stream, client responses via HTTP POST
   #   - ServerStreamableHTTP: Server requests via SSE-formatted responses, client responses via HTTP POST
-  #   - ServerStdio: Full bidirectional JSON-RPC over stdin/stdout
   #   - ServerSSE: Server requests via SSE stream, client responses via HTTP POST — but the
   #     HTTP+SSE transport is deprecated (SEP-2596; earliest removal three months after
   #     SEP-2596 reaches Final), so prefer ServerStreamableHTTP for a new integration
