@@ -601,11 +601,10 @@ module MCPClient
         # re-resolve would list again, validating the answer against a
         # definition newer than the one the call carried.
         with_called_tool_definition(srv) do
-          generation_before = tools_generation_of(srv)
           result = modern_task_tool_call(tool_name, parameters, srv, epoch)
           next created_task(result, srv, epoch) if task_result?(result)
 
-          MCPClient::Task.completed_locally(validated_sync_result(result, srv, tool, generation_before), server: srv)
+          MCPClient::Task.completed_locally(validated_sync_result(result, srv, tool), server: srv)
         end
       end
 
@@ -636,13 +635,11 @@ module MCPClient
       # the definition the request went out under, which a mid-call
       # HeaderMismatch refresh may since have replaced.
       # @param tool [MCPClient::Tool, nil] the definition the call was made with
-      # @param generation_before [Integer, nil] the tool-list generation before the call
       # @return [Object] the validated result
-      def validated_sync_result(result, srv, tool, generation_before)
+      def validated_sync_result(result, srv, tool)
         return result unless tool
 
-        tool = refreshed_tool(tool) || tool if tools_generation_of(srv) != generation_before
-        validate_structured_content!(tool, result)
+        validate_structured_content!(called_tool_definition(srv, tool.name) || tool, result)
       end
 
       # The handle for a CreateTaskResult, which MUST carry a taskId.

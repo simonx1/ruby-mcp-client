@@ -331,27 +331,23 @@ module MCPClient
           unregister_progress_callback(token) if token
         end
 
-        # The transport may have refreshed the tool list mid-call (MCP
-        # 2026-07-28 HeaderMismatch recovery); validate against the definition
-        # the call was actually answered under. It is captured here, before a
-        # task's result is waited for: a tools/list_changed refresh that lands
+        # MCP 2026-07-28 HeaderMismatch recovery re-derives a call's
+        # Mcp-Param-* headers from a refreshed tools/list, so the attempt that
+        # was answered may have gone out under a definition this client never
+        # resolved. Validate against that one -- never against the transport's
+        # current list, which a tools/list_changed racing the call may already
+        # have replaced with a definition the server never used. It is read
+        # here, before a task's result is waited for: a refresh that lands
         # during a wait that may take minutes belongs to another invocation and
         # says nothing about the definition this one was answered under.
-        tool = refreshed_tool(tool) || tool if tools_generation_of(server) != generation_before
+        called = called_tool_definition(server, tool_name)
 
         # MCP 2026-07-28 tasks extension: the server may have turned the call
         # into a task; drive it to its final result so the contract of this
         # method does not change.
         result = complete_task_result(tool_name, server, result, task_epoch)
 
-        # MCP 2026-07-28 HeaderMismatch recovery re-derives a call's
-        # Mcp-Param-* headers from a refreshed tools/list, so the attempt that
-        # was answered may have gone out under a definition this client never
-        # resolved. Validate against that one -- never against the transport's
-        # current list, which a tools/list_changed racing the call may already
-        # have replaced with a definition the server never used.
-        tool = called_tool_definition(server, tool_name) || tool
-        validate_structured_content!(tool, result)
+        validate_structured_content!(called || tool, result)
       end
     end
 
@@ -490,7 +486,6 @@ module MCPClient
       raise MCPClient::Errors::ServerNotFound, "No server found for tool '#{tool_name}'" unless server
 
       begin
-        generation_before = tasks_extension? ? tools_generation_of(server) : nil
         task_epoch = tasks_extension? ? invocation_session_epoch(server) : nil
         # Use the streaming API if it's available, opened in the session the
         # epoch was sampled for: a chunk that comes back as a task is stamped
@@ -502,7 +497,7 @@ module MCPClient
         stream = pinned_to_session(server, task_epoch) { server.call_tool_streaming(tool_name, parameters) }
         return stream unless task_epoch || (tasks_extension? && modern_server?(server))
 
-        streamed_call_chunks(stream, tool, tool_name, server, epoch: task_epoch, generation: generation_before)
+        streamed_call_chunks(stream, tool, tool_name, server, epoch: task_epoch)
       rescue MCPClient::Errors::ConnectionError => e
         # Add server identity information to the error for better context
         server_id = server.name ? "#{server.class}[#{server.name}]" : server.class.name
@@ -641,9 +636,8 @@ module MCPClient
     # @param stream [Enumerator] the transport's lazy stream
     # @param tool [MCPClient::Tool] the definition the call was validated against
     # @param epoch [Integer, nil] the session the call belongs to
-    # @param generation [Integer, nil] the tool-definition generation before the call
     # @return [Enumerator]
-    def streamed_call_chunks(stream, tool, tool_name, server, epoch:, generation:)
+    def streamed_call_chunks(stream, tool, tool_name, server, epoch:)
       resolve = tasks_extension? && modern_server?(server)
       Enumerator.new do |yielder|
         pinned_to_session(server, epoch) do
@@ -654,6 +648,8 @@ module MCPClient
           # the re-resolve would list again, validating the result against a
           # definition newer than the one the call carried.
           with_called_tool_definition(server) do
+            called = nil
+            read_called = false
             stream.each do |chunk|
               # MCP 2026-07-28 tasks extension: a chunk may be a task; resolve
               # it to the call's result, validated as #call_tool does — against
@@ -661,11 +657,16 @@ module MCPClient
               # may have replaced.
               next yielder << chunk unless resolve && task_result?(chunk)
 
-              # The definition in force when the chunk arrived, captured
-              # before the task is waited for (see #call_tool).
-              current = tools_generation_of(server) == generation ? tool : (refreshed_tool(tool) || tool)
+              # The definition the stream's one request went out under, read
+              # before a task is waited for (see #call_tool) and read once:
+              # every chunk belongs to that same request, and the record
+              # describes it rather than whatever the list holds later.
+              unless read_called
+                called = called_tool_definition(server, tool_name)
+                read_called = true
+              end
               result = complete_task_result(tool_name, server, chunk, epoch)
-              yielder << validate_structured_content!(current, result)
+              yielder << validate_structured_content!(called || tool, result)
             end
           end
         end

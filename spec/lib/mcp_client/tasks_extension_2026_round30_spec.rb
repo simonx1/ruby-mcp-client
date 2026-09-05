@@ -251,6 +251,10 @@ RSpec.describe 'MCP 2026-07-28 tasks extension — round 30' do
     it 'does not drop a reused task id bookkeeping when an abandoned poll comes back terminal' do
       client = client_for(stdio)
       negotiated(stdio)
+      # The bookkeeping below belongs to the session this transport is in:
+      # establishing one is what a real call does before recording anything,
+      # and a session that came up meanwhile would (rightly) retire it.
+      allow(stdio).to receive(:ensure_session_ready)
       abandoned = client.send(:task_state, stdio, 'task-1')
       client.send(:forget_task_keys, stdio, 'task-1')
       client.send(:remember_answered_keys, stdio, 'task-1', ['k1'])

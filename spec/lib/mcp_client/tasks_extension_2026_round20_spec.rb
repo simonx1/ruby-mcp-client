@@ -157,17 +157,17 @@ RSpec.describe 'MCP 2026-07-28 tasks extension — round 20' do
     client = client_for(stdio, validate_structured_content: :strict)
     script_stdio(stdio, [{ 'result' => discover_result }, tool_list])
     client.list_tools
-    generation = 1
-    stdio.define_singleton_method(:tools_generation) { generation }
+    stdio.singleton_class.include(MCPClient::CalledToolDefinition)
     strict_tool = MCPClient::Tool.new(name: 'slow', description: 'd', schema: { 'type' => 'object' },
                                       output_schema: { 'type' => 'object',
                                                        'properties' => { 'n' => { 'type' => 'string' } },
                                                        'required' => ['n'] }, server: stdio)
     allow(stdio).to receive(:call_tool_streaming) do
       Enumerator.new do |y|
-        # A HeaderMismatch refresh replaced the tool while the stream ran.
-        generation = 2
+        # A HeaderMismatch refresh replaced the tool while the stream ran;
+        # the attempt that was answered went out under the refreshed one.
         allow(stdio).to receive(:list_tools).and_return([strict_tool])
+        stdio.send(:note_called_tool_definition, 'slow', strict_tool)
         y << task_result
       end
     end

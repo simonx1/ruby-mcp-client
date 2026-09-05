@@ -19,15 +19,16 @@ RSpec.describe 'MCP 2026-07-28 tasks extension — round 27' do
   it 'validates a synchronous call_tool_as_task answer against the refreshed tool' do
     loose = tool_with([])
     strict = tool_with(['b'])
-    generation = 1
-    stdio.define_singleton_method(:tools_generation) { generation }
+    stdio.singleton_class.include(MCPClient::CalledToolDefinition)
     allow(MCPClient::ServerFactory).to receive(:create).and_return(stdio)
     allow(stdio).to receive_messages(list_tools: [loose], modern?: true, ping: true,
                                      capabilities: { 'tools' => {}, 'extensions' => { TASKS_EXT => {} } })
     allow(stdio).to receive(:call_tool) do
-      # A HeaderMismatch refresh replaced the definition while the call ran.
-      generation = 2
+      # A HeaderMismatch refresh replaced the definition while the call ran;
+      # the attempt that was answered went out under the refreshed one, and
+      # the transport records it as the HTTP transports do.
       allow(stdio).to receive(:list_tools).and_return([strict])
+      stdio.send(:note_called_tool_definition, 'sync', strict)
       { 'content' => [], 'structuredContent' => {} }
     end
     client = MCPClient::Client.new(mcp_server_configs: [{ type: 'stdio', command: 'x' }], extensions: [TASKS_EXT],
@@ -39,14 +40,13 @@ RSpec.describe 'MCP 2026-07-28 tasks extension — round 27' do
   it 'accepts a synchronous answer the refreshed tool allows' do
     strict = tool_with(['a'])
     loose = tool_with([])
-    generation = 1
-    stdio.define_singleton_method(:tools_generation) { generation }
+    stdio.singleton_class.include(MCPClient::CalledToolDefinition)
     allow(MCPClient::ServerFactory).to receive(:create).and_return(stdio)
     allow(stdio).to receive_messages(list_tools: [strict], modern?: true, ping: true,
                                      capabilities: { 'tools' => {}, 'extensions' => { TASKS_EXT => {} } })
     allow(stdio).to receive(:call_tool) do
-      generation = 2
       allow(stdio).to receive(:list_tools).and_return([loose])
+      stdio.send(:note_called_tool_definition, 'sync', loose)
       { 'content' => [], 'structuredContent' => {} }
     end
     client = MCPClient::Client.new(mcp_server_configs: [{ type: 'stdio', command: 'x' }], extensions: [TASKS_EXT],
