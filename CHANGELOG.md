@@ -21,6 +21,16 @@ metadata). Each feature lands in its own PR; this section accumulates them.
   and `UnsupportedProtocolVersionError` (-32022, `#supported`, `#requested`).
   `MCPClient::Errors::Codes` holds the code constants and the allocation
   policy helpers. All four transports raise these typed errors.
+- **Only a well-formed error identifies a modern server.**
+  `#modern_protocol_error?` (which suppresses the legacy `initialize`
+  fallback, and lets the error propagate through the public wrappers) is true
+  only for an error carrying the wire shape its schema mandates: the JSON-RPC
+  `message` string, plus `requiredCapabilities` as an object for -32021 and
+  `supported: string[]` (non-empty) with `requested: string` for -32022. An
+  error object with no JSON-RPC `message` is malformed at the JSON-RPC level
+  and does not even earn a typed class — it stays a plain `ServerError` with
+  its `code` and `data` preserved. A legacy endpoint or intermediary emitting
+  a bare -3202x code therefore cannot suppress the fallback.
 - **`resultType`.** Every result is checked: an absent field is treated as
   `"complete"` (earlier-protocol servers), `"input_required"` passes through
   for the multi round-trip handling that follows, and any unrecognized value
@@ -30,9 +40,13 @@ metadata). Each feature lands in its own PR; this section accumulates them.
   protocol errors in the body of an HTTP 400 (and an unknown method as a 404
   with -32601). The HTTP, Streamable HTTP and SSE transports now parse a
   JSON-RPC error out of a 4xx body and raise the typed error (with the HTTP
-  status prefixed to the message and the code preserved), so a dual-era
-  client can tell a modern rejection from a legacy one. 5xx responses stay
-  `TransientServerError`.
+  status prefixed to the message, and the code, data and HTTP status
+  preserved), so a dual-era client can tell a modern rejection from a legacy
+  one. 5xx responses stay `TransientServerError`. The body is read whether it
+  arrives raw or already decoded by host-configured response middleware
+  (`faraday_config` with `conn.response :json`, with or without
+  `conn.response :raise_error`); a raw body is size-bounded and incrementally
+  gunzipped before it is parsed.
 - **Resource not found.** A `resources/read` error with the legacy `-32002`
   code — or `-32602` from a modern (2026-07-28) server — now raises
   `MCPClient::Errors::ResourceNotFound` on every transport instead of a

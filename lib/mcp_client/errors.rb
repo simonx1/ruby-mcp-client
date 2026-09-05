@@ -133,31 +133,52 @@ module MCPClient
       # Build the most specific error for a JSON-RPC error object: the typed
       # 2026-07-28 errors for the spec-reserved codes, a plain ServerError
       # otherwise. The message is peer-supplied and passed through as-is.
+      #
+      # A JSON-RPC 2.0 error object MUST carry a string `message`. One that
+      # does not is malformed at the JSON-RPC level, so it never earns a
+      # typed class — and so can never identify a modern server (see
+      # ModernProtocolError) — even though its code and data are still
+      # preserved on the plain ServerError for the caller to inspect.
       # @param error [Hash, nil] the JSON-RPC `error` member ('code', 'message', 'data')
       # @return [MCPClient::Errors::ServerError]
       def self.from_jsonrpc(error)
         error = {} unless error.is_a?(Hash)
-        message = error['message'] || error[:message] || 'Unknown server error'
+        message = error['message'] || error[:message]
         code = error['code'] || error[:code]
         code = nil unless code.is_a?(Integer)
         data = error.key?('data') ? error['data'] : error[:data]
 
-        klass = case code
-                when Codes::HEADER_MISMATCH then HeaderMismatchError
-                when Codes::MISSING_REQUIRED_CLIENT_CAPABILITY then MissingRequiredClientCapabilityError
-                when Codes::UNSUPPORTED_PROTOCOL_VERSION then UnsupportedProtocolVersionError
-                else ServerError
-                end
-        klass.new(message, code: code, data: data)
+        klass = wire_message?(message) ? error_class_for(code) : ServerError
+        klass.new(message || 'Unknown server error', code: code, data: data)
       end
 
+      # @param message [Object] the error object's `message` member
+      # @return [Boolean] whether it is the non-empty string JSON-RPC requires
+      def self.wire_message?(message)
+        message.is_a?(String) && !message.empty?
+      end
+
+      # @param code [Integer, nil] a JSON-RPC error code
+      # @return [Class] the error class that code maps to
+      def self.error_class_for(code)
+        case code
+        when Codes::HEADER_MISMATCH then HeaderMismatchError
+        when Codes::MISSING_REQUIRED_CLIENT_CAPABILITY then MissingRequiredClientCapabilityError
+        when Codes::UNSUPPORTED_PROTOCOL_VERSION then UnsupportedProtocolVersionError
+        else ServerError
+        end
+      end
+      private_class_method :wire_message?, :error_class_for
+
       # Whether this is one of the 2026-07-28 spec-defined protocol errors,
-      # carrying the data its schema mandates. Only such a well-formed error
-      # identifies a modern server: a legacy endpoint or intermediary that
-      # happens to emit a bare -3202x code must not suppress the fallback.
+      # carrying the wire shape its schema mandates. Only such a well-formed
+      # error identifies a modern server: a legacy endpoint or intermediary
+      # that happens to emit a bare -3202x code must not suppress the
+      # fallback. A plain ServerError never does — including the one
+      # from_jsonrpc builds for an error object with no string `message`.
       # @return [Boolean]
       def modern_protocol_error?
-        Codes.modern_error_code?(code) && well_formed?
+        false
       end
 
       # Whether the error is protocol-level (a modern spec error or an
@@ -173,27 +194,56 @@ module MCPClient
       def well_formed?
         true
       end
+
+      private
+
+      # A member of the error's `data` object, accepting both key spellings:
+      # JSON.parse yields String keys, but a host's response middleware may
+      # symbolize them before the body reaches us.
+      # @param name [String] the member name
+      # @return [Object, nil] the member's value, or nil when data has none
+      def data_member(name)
+        return nil unless data.is_a?(Hash)
+
+        data.key?(name) ? data[name] : data[name.to_sym]
+      end
+    end
+
+    # Recognition shared by the three 2026-07-28 spec-defined errors. Only
+    # ServerError.from_jsonrpc assigns these classes, and only to an error
+    # object that is well-formed at the JSON-RPC level (it carries a string
+    # `message`); #well_formed? adds the per-code data requirements from the
+    # spec's schema.
+    module ModernProtocolError
+      # @return [Boolean] whether the error identifies a modern (2026-07-28+) server
+      def modern_protocol_error?
+        Codes.modern_error_code?(code) && well_formed?
+      end
     end
 
     # -32020 HeaderMismatch (MCP 2026-07-28, Streamable HTTP): the HTTP
     # headers mirrored from the request body (Mcp-Method, Mcp-Name,
     # Mcp-Param-*, MCP-Protocol-Version) are missing, malformed, or do not
-    # match the body.
-    class HeaderMismatchError < ServerError; end
+    # match the body. Its schema mandates no data.
+    class HeaderMismatchError < ServerError
+      include ModernProtocolError
+    end
 
     # -32021 MissingRequiredClientCapability (MCP 2026-07-28): processing the
     # request needs a capability the client did not declare in its
     # per-request clientCapabilities.
     class MissingRequiredClientCapabilityError < ServerError
+      include ModernProtocolError
+
       # @return [Hash] the capabilities the server requires (data.requiredCapabilities)
       def required_capabilities
-        caps = data.is_a?(Hash) ? (data['requiredCapabilities'] || data[:requiredCapabilities]) : nil
+        caps = data_member('requiredCapabilities')
         caps.is_a?(Hash) ? caps : {}
       end
 
-      # @return [Boolean] whether data.requiredCapabilities is present, as the schema requires
+      # @return [Boolean] whether data.requiredCapabilities is the object the schema requires
       def well_formed?
-        data.is_a?(Hash) && (data['requiredCapabilities'] || data[:requiredCapabilities]).is_a?(Hash)
+        data_member('requiredCapabilities').is_a?(Hash)
       end
     end
 
@@ -201,20 +251,31 @@ module MCPClient
     # implement the protocol version the request declared. `supported` lists
     # the versions it does implement so the client can retry with one.
     class UnsupportedProtocolVersionError < ServerError
+      include ModernProtocolError
+
       # @return [Array<String>] protocol versions the server supports (data.supported)
       def supported
-        list = data.is_a?(Hash) ? (data['supported'] || data[:supported]) : nil
+        list = data_member('supported')
         list.is_a?(Array) ? list.grep(String) : []
       end
 
       # @return [String, nil] the protocol version the request asked for (data.requested)
       def requested
-        data.is_a?(Hash) ? (data['requested'] || data[:requested]) : nil
+        data_member('requested')
       end
 
-      # @return [Boolean] whether data.supported is present, as the schema requires
+      # The schema types this error's data as `supported: string[]` and
+      # `requested: string`, and the client can only act on it — retry with a
+      # version the server named — when `supported` actually holds versions.
+      # Anything else is malformed, and must not pass for a modern server's
+      # rejection of the request.
+      # @return [Boolean] whether data carries the shape the schema requires
       def well_formed?
-        data.is_a?(Hash) && (data['supported'] || data[:supported]).is_a?(Array)
+        list = data_member('supported')
+        return false unless list.is_a?(Array) && !list.empty?
+        return false unless list.all? { |version| version.is_a?(String) && !version.empty? }
+
+        requested.is_a?(String) && !requested.empty?
       end
     end
 

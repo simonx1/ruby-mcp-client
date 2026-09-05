@@ -344,14 +344,36 @@ module MCPClient
     MAX_ERROR_BODY_BYTES = 64 * 1024
 
     # Extract a JSON-RPC error object from an HTTP error body, if there is one.
-    # Only a small (MAX_ERROR_BODY_BYTES) JSON-RPC 2.0 error response is
-    # recognized; anything else is ignored.
+    # Only a JSON-RPC 2.0 error response is recognized; anything else is
+    # ignored.
     # @param response [Faraday::Response] the HTTP response
     # @return [Hash, nil] the JSON-RPC `error` member, or nil
     def jsonrpc_error_in_body(response)
       return nil unless response.respond_to?(:body)
 
+      data = decoded_error_body(response)
+      # Only a JSON-RPC 2.0 error response counts; an arbitrary JSON body
+      # with an "error" member is not a protocol error.
+      return nil unless data.is_a?(Hash) && (data['jsonrpc'] || data[:jsonrpc]) == '2.0'
+
+      error = data['error'] || data[:error]
+      error.is_a?(Hash) ? error : nil
+    end
+
+    # The error body as a decoded object.
+    #
+    # A host may configure the connection (faraday_config) with response
+    # middleware — `conn.response :json` — that decodes the body before it
+    # reaches this transport, on the exception path (`raise_error`) as well
+    # as the response path. That already-parsed body carries the same
+    # protocol error, so it is accepted as-is; only a raw String body is
+    # size-bounded, gunzipped and parsed here (the middleware has already
+    # spent the memory for the ones it decoded).
+    # @param response [Faraday::Response] the HTTP response
+    # @return [Object, nil] the decoded body, or nil when it cannot be read
+    def decoded_error_body(response)
       body = response.body
+      return body if body.is_a?(Hash)
       return nil unless body.is_a?(String) && !body.empty?
       return nil if oversized_error_body?(body)
 
@@ -360,13 +382,7 @@ module MCPClient
       body = gunzip_bounded(body) if encoding.include?('gzip')
       return nil if body.nil?
 
-      data = JSON.parse(body)
-      # Only a JSON-RPC 2.0 error response counts; an arbitrary JSON body
-      # with an "error" member is not a protocol error.
-      return nil unless data.is_a?(Hash) && data['jsonrpc'] == '2.0'
-
-      error = data['error']
-      error.is_a?(Hash) ? error : nil
+      JSON.parse(body)
     rescue JSON::ParserError, Zlib::Error => e
       @logger.debug("HTTP error body is not a JSON-RPC error: #{e.class}")
       nil
