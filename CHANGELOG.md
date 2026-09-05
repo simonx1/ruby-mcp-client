@@ -10,8 +10,10 @@ metadata). Each feature lands in its own PR; this section accumulates them.
 - **`Mcp-Param-{name}` headers.** On a modern Streamable HTTP (or plain HTTP)
   session, arguments of tool parameters annotated with `x-mcp-header` are
   mirrored into request headers on `tools/call`: strings as-is (Base64
-  sentinel when not header-safe), integers in decimal, booleans lowercase;
-  absent or null arguments produce no header. The tool list is fetched on
+  sentinel when not header-safe -- an empty string is a legal HTTP field
+  value and travels as one; a String in another Ruby encoding is converted to
+  UTF-8, the encoding the body carries, before that is decided), integers in
+  decimal, booleans lowercase; absent or null arguments produce no header. The tool list is fetched on
   demand when a tool is called before `tools/list`. An argument that cannot
   be mirrored (a float, an object, an integer outside the IEEE754 safe
   range) fails the call locally with `ValidationError`.
@@ -26,7 +28,10 @@ metadata). Each feature lands in its own PR; this section accumulates them.
   protocol meaning, keep sending it.
 - **Invalid annotations reject the tool.** A definition whose `x-mcp-header`
   is empty, not an HTTP field-name token, not case-insensitively unique, on a
-  non-primitive property, or not statically reachable through `properties`
+  non-primitive property (a primitive unioned with `null`, which is how JSON
+  Schema spells a nullable one, is a primitive property: a null *value* has
+  its own rule, which omits the header), or not statically reachable through
+  `properties`
   keys alone (inside `items`, composition/conditional keywords, `$defs`, a
   `$ref` target or at the root) is excluded from `tools/list` with a warning
   naming the tool. `MCPClient::HeaderParams` exposes the validation and
@@ -39,9 +44,13 @@ metadata). Each feature lands in its own PR; this section accumulates them.
   request whose response stream broke, in either order: a HeaderMismatch
   retry whose stream closes is re-issued, and a re-issue rejected for its
   headers still refreshes `tools/list`. Each recovery is spent once, so a
-  call is sent at most three times. Transport list caches now follow
-  `list_changed` notifications, and a refresh cannot be overwritten by a
-  stale concurrent fetch.
+  call is sent at most three times. Neither recovery fires for an error that
+  escaped host code the transport called back into while parsing a response —
+  a notification listener's own rejected `tools/call` is that request's
+  failure, and the request whose response reached the listener has already
+  been executed. Transport list caches now follow `list_changed`
+  notifications, and neither they nor the client-level tool cache can be
+  overwritten by a fetch that started before the refresh.
 - **A result is validated against the definition its call went out under.**
   The transport records the definition each `tools/call` request derived its
   `Mcp-Param-*` headers from (`MCPClient::CalledToolDefinition`), and

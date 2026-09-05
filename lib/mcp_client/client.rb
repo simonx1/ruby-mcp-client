@@ -88,6 +88,12 @@ module MCPClient
         MCPClient::ServerFactory.create(config, logger: @logger)
       end
       @tool_cache = {}
+      # Bumped whenever the tool cache is emptied, so a list_tools that was
+      # already in flight can tell that its definitions were superseded while
+      # it ran (MCP 2026-07-28: a HeaderMismatch refresh announces itself as a
+      # tools/list_changed).
+      @tool_cache_generation = 0
+      @cache_mutex = Mutex.new
       # Active progressToken -> callback registrations (MCP progress utility)
       @progress_callbacks = {}
       @progress_mutex = Mutex.new
@@ -281,15 +287,20 @@ module MCPClient
     # @raise [MCPClient::Errors::ConnectionError] on authorization failures
     # @raise [MCPClient::Errors::ToolCallError] if no tools could be retrieved from any server
     def list_tools(cache: true)
-      return @tool_cache.values if cache && !@tool_cache.empty?
+      cached = @cache_mutex.synchronize { @tool_cache.values if cache && !@tool_cache.empty? }
+      return cached if cached
 
+      # Read before the fetch so a cache emptied while it runs is noticed.
+      # The mutex is never held across a request: a response may dispatch a
+      # notification, on this very thread, that empties the cache again.
+      generation = @cache_mutex.synchronize { @tool_cache_generation }
       tools = []
       connection_errors = []
+      fetched = {}
 
       servers.each do |server|
         server.list_tools.each do |tool|
-          cache_key = cache_key_for(server, tool.name)
-          @tool_cache[cache_key] = tool
+          fetched[cache_key_for(server, tool.name)] = tool
           tools << tool
         end
       rescue MCPClient::Errors::ConnectionError => e
@@ -302,6 +313,12 @@ module MCPClient
         connection_errors << e
         @logger.error("Server error: #{e.message}")
       end
+
+      # A tools/list_changed while this fetch ran -- the one a HeaderMismatch
+      # refresh announces included -- already replaced these definitions.
+      # They still answer this caller, but caching them would hand the
+      # superseded ones to the next.
+      @cache_mutex.synchronize { @tool_cache.merge!(fetched) if @tool_cache_generation == generation }
 
       # If we didn't get any tools from any server but have servers configured, report failure
       if tools.empty? && !servers.empty?
@@ -398,7 +415,7 @@ module MCPClient
     # Clear the cached tools so that next list_tools will fetch fresh data
     # @return [void]
     def clear_cache
-      @tool_cache.clear
+      clear_tool_cache
       @prompt_cache.clear
       @resource_cache.clear
     end
@@ -784,7 +801,7 @@ module MCPClient
       case method
       when 'notifications/tools/list_changed'
         logger.warn("[#{server_id}] Tool list has changed, clearing tool cache")
-        @tool_cache.clear
+        clear_tool_cache
       when 'notifications/resources/updated'
         logger.warn("[#{server_id}] Resource #{params['uri']} updated")
       when 'notifications/prompts/list_changed'
@@ -1138,6 +1155,16 @@ module MCPClient
       end
 
       matching_tools.first
+    end
+
+    # Empty the tool cache and move its generation on, so a list_tools that
+    # is already fetching does not put the emptied definitions back.
+    # @return [void]
+    def clear_tool_cache
+      @cache_mutex.synchronize do
+        @tool_cache.clear
+        @tool_cache_generation += 1
+      end
     end
 
     # Run one call with a slot of its own for the definition the transport's

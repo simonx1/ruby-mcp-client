@@ -149,8 +149,13 @@ RSpec.describe 'MCP 2026-07-28 x-mcp-header — configured Mcp-Param headers' do
     requests = stub_strict_server
     server.list_tools
 
-    lists = requests.select { |r| r[:body]['method'] == 'tools/list' }
-    expect(param_headers(lists.first[:headers])).to be_empty
+    # Every modern request, the probe that establishes the session included:
+    # the namespace is derived from a tools/call's arguments, so a configured
+    # value has nothing to stand for anywhere else either.
+    expect(requests.map { |r| r[:body]['method'] }).to start_with('server/discover', 'tools/list')
+    requests.each do |request|
+      expect(param_headers(request[:headers])).to be_empty, request[:body]['method']
+    end
   end
 
   it 'leaves a configured header alone on a legacy session, where the namespace has no meaning' do
@@ -630,6 +635,207 @@ RSpec.describe 'MCP 2026-07-28 x-mcp-header — nested calls on both HTTP transp
   end
 end
 
+# Review round 4 (codex): a request a notification listener issues is an
+# exchange of its own. Its rejection travelled up through the response the
+# listener was reached from, into that call's recovery frame, which refreshed
+# tools/list and re-sent a request the server had already executed.
+RSpec.describe 'MCP 2026-07-28 x-mcp-header — a call nested by a listener that fails' do
+  include_context 'with x-mcp-header wire helpers'
+
+  let(:progress) do
+    { 'jsonrpc' => '2.0', 'method' => 'notifications/progress',
+      'params' => { 'progressToken' => 'p', 'progress' => 1 } }
+  end
+  let(:charge) do
+    { 'name' => 'charge',
+      'inputSchema' => { 'type' => 'object',
+                         'properties' => { 'region' => { 'type' => 'string', 'x-mcp-header' => 'Region' } } } }
+  end
+  let(:audit) { { 'name' => 'audit', 'inputSchema' => { 'type' => 'object' } } }
+
+  # A modern server that executes `charge`, answering it on an SSE stream that
+  # carries a progress notification ahead of the result, and answers every
+  # `audit` with +failure+ -- so the nested call exhausts its own recovery and
+  # raises out of the listener.
+  def stub_server(sent, &failure)
+    stub_request(:post, url).to_return do |request|
+      body = JSON.parse(request.body)
+      sent << [body['method'], body.dig('params', 'name')]
+      case body['method']
+      when 'server/discover' then json_response(body['id'], modern_discover)
+      when 'tools/list' then json_response(body['id'], { 'tools' => [charge, audit] })
+      when 'tools/call'
+        if body['params']['name'] == 'audit'
+          failure.call(body)
+        else
+          sse_response([progress, { 'jsonrpc' => '2.0', 'id' => body['id'], 'result' => { 'content' => [] } }])
+        end
+      end
+    end
+  end
+
+  def client_for(factory)
+    MCPClient::Client.new(
+      mcp_server_configs: [MCPClient.public_send(factory, base_url: base_url, endpoint: endpoint, retries: 0)],
+      logger: Logger.new(File::NULL)
+    )
+  end
+
+  def nesting_client(factory)
+    client_for(factory).tap do |client|
+      client.on_notification do |server, method, _params|
+        server.call_tool('audit', {}) if method == 'notifications/progress'
+      end
+    end
+  end
+
+  { 'plain HTTP' => :http_config, 'Streamable HTTP' => :streamable_http_config }.each do |label, factory|
+    it "does not re-send the executed #{label} call whose listener's own call was rejected" do
+      sent = []
+      stub_server(sent) { |body| header_mismatch(body['id'], 'Mcp-Param-Audit missing') }
+      client = nesting_client(factory)
+
+      expect { client.call_tool('charge', { 'region' => 'eu' }) }
+        .to raise_error(MCPClient::Errors::HeaderMismatchError, /Mcp-Param-Audit missing/)
+      expect(sent).to eq([['server/discover', nil], ['tools/list', nil], ['tools/call', 'charge'],
+                          ['tools/call', 'audit'], ['tools/list', nil], ['tools/call', 'audit']])
+      client.cleanup
+    end
+
+    it "does not re-send the executed #{label} call whose listener's own call lost its stream" do
+      sent = []
+      # An SSE stream that carries no response at all: the nested call is lost
+      # and re-issues itself once, which is lost the same way.
+      stub_server(sent) { sse_response([]) }
+      client = nesting_client(factory)
+
+      expect { client.call_tool('charge', { 'region' => 'eu' }) }
+        .to raise_error(MCPClient::Errors::ResponseStreamClosedError)
+      expect(sent).to eq([['server/discover', nil], ['tools/list', nil], ['tools/call', 'charge'],
+                          ['tools/call', 'audit'], ['tools/call', 'audit']])
+      client.cleanup
+    end
+  end
+end
+
+# Review round 4 (codex): every call needs a slot of its own, not just every
+# nesting level. Two calls in flight on one transport record the definitions
+# they went out under at the same time, and each result is validated against
+# its own.
+RSpec.describe 'MCP 2026-07-28 x-mcp-header — two calls in flight at once' do
+  include_context 'with x-mcp-header wire helpers'
+
+  # Before the rejection the tool is annotated `Region` and promises `<name>1`;
+  # after it, `Zone` and `<name>2`. So a result validated against the wrong
+  # definition -- the pre-call one, or the other call's -- is rejected.
+  def versioned_tool(name, version)
+    { 'name' => name,
+      'inputSchema' => { 'type' => 'object',
+                         'properties' => { 'region' => { 'type' => 'string',
+                                                         'x-mcp-header' => version == 1 ? 'Region' : 'Zone' } } },
+      'outputSchema' => { 'type' => 'object', 'properties' => { "#{name}#{version}" => { 'type' => 'boolean' } },
+                          'required' => ["#{name}#{version}"] } }
+  end
+
+  # Both retries are held at the server until both have arrived, so the two
+  # calls really are recording and reading their definitions at once.
+  def stub_paired_server(arrived, release)
+    versions = { 'a' => 1, 'b' => 1 }
+    stub_request(:post, url).to_return do |request|
+      body = JSON.parse(request.body)
+      case body['method']
+      when 'server/discover' then json_response(body['id'], modern_discover)
+      when 'tools/list'
+        json_response(body['id'], { 'tools' => versions.map { |n, v| versioned_tool(n, v) } })
+      when 'tools/call'
+        name = body['params']['name']
+        if request.headers['Mcp-Param-Zone']
+          arrived << name
+          release.pop(timeout: 5)
+          json_response(body['id'], { 'content' => [], 'structuredContent' => { "#{name}2" => true } })
+        else
+          versions[name] = 2
+          header_mismatch(body['id'], 'Mcp-Param-Zone missing')
+        end
+      end
+    end
+  end
+
+  it 'validates each result against the definition its own call went out under' do
+    arrived = Queue.new
+    release = Queue.new
+    stub_paired_server(arrived, release)
+    client = MCPClient::Client.new(
+      mcp_server_configs: [MCPClient.streamable_http_config(base_url: base_url, endpoint: endpoint, retries: 0)],
+      validate_structured_content: :strict, logger: Logger.new(File::NULL)
+    )
+    client.list_tools
+
+    calls = %w[a b].map { |name| Thread.new { client.call_tool(name, { 'region' => 'eu' }) } }
+    2.times { expect(arrived.pop(timeout: 5)).not_to be_nil }
+    2.times { release << true }
+
+    expect(calls.map { |t| t.value['structuredContent'] }).to eq([{ 'a2' => true }, { 'b2' => true }])
+    client.cleanup
+  end
+
+  # The slots are per thread as well as per transport: two calls that overlap
+  # each read back the definition they recorded, whichever recorded last.
+  it 'keeps one call\'s recorded definition out of another\'s slot' do
+    server = MCPClient::ServerStreamableHTTP.new(base_url: base_url, endpoint: endpoint, retries: 0)
+    opened = Queue.new
+    recorded = Queue.new
+    start = Queue.new
+    proceed = Queue.new
+    read = {}
+    # Fully overlapping: both slots are open before either records, and both
+    # have recorded before either reads back.
+    threads = %w[a b].map do |name|
+      Thread.new do
+        server.send(:called_tool_definition_slot) do
+          opened << name
+          start.pop(timeout: 5)
+          server.send(:note_called_tool_definition, name, MCPClient::Tool.from_json({ 'name' => name }, server: nil))
+          recorded << name
+          proceed.pop(timeout: 5)
+          read[name] = server.send(:take_called_tool_definition, name)&.first
+        end
+      end
+    end
+    2.times { expect(opened.pop(timeout: 5)).not_to be_nil }
+    2.times { start << true }
+    2.times { expect(recorded.pop(timeout: 5)).not_to be_nil }
+    2.times { proceed << true }
+    threads.each { |t| t.join(5) }
+
+    expect(read.transform_values { |tool| tool&.name }).to eq({ 'a' => 'a', 'b' => 'b' })
+    expect(Thread.current[server.send(:called_tool_definition_key)]).to be_nil
+    server.cleanup
+  end
+
+  it 'leaves nothing on the thread when a call raises' do
+    stub_request(:post, url).to_return do |request|
+      body = JSON.parse(request.body)
+      case body['method']
+      when 'server/discover' then json_response(body['id'], modern_discover)
+      when 'tools/list' then json_response(body['id'], { 'tools' => [versioned_tool('a', 1)] })
+      when 'tools/call' then header_mismatch(body['id'], 'Mcp-Param-Zone missing')
+      end
+    end
+    client = MCPClient::Client.new(
+      mcp_server_configs: [MCPClient.streamable_http_config(base_url: base_url, endpoint: endpoint, retries: 0)],
+      logger: Logger.new(File::NULL)
+    )
+    server = client.servers.first
+    key = server.send(:called_tool_definition_key)
+
+    expect { client.call_tool('a', { 'region' => 'eu' }) }.to raise_error(MCPClient::Errors::HeaderMismatchError)
+
+    expect(Thread.current[key]).to be_nil
+    client.cleanup
+  end
+end
+
 # Review round 3 (codex): behaviour the earlier examples pinned on one HTTP
 # transport only, plus the distinctions four surviving mutations showed were
 # unpinned -- legacy gating of the HeaderMismatch recovery, the sentinel
@@ -794,10 +1000,18 @@ RSpec.describe 'MCP 2026-07-28 x-mcp-header — shared by both HTTP transports' 
           # A value already shaped like the sentinel is itself encoded, so the
           # peer cannot mistake it for an encoded one.
           { 'text' => '=?base64?literal?=' } => { 'Mcp-Param-Text' => '=?base64?PT9iYXNlNjQ/bGl0ZXJhbD89?=' },
-          { 'text' => '' } => { 'Mcp-Param-Text' => '=?base64??=' },
+          # The markers are case-sensitive, so this one is not sentinel-shaped.
+          { 'text' => '=?BASE64?SGVsbG8=?=' } => { 'Mcp-Param-Text' => '=?BASE64?SGVsbG8=?=' },
+          # An empty string is a legal HTTP field value and travels as one.
+          { 'text' => '' } => { 'Mcp-Param-Text' => '' },
           { 'text' => "a\r\nb" } => { 'Mcp-Param-Text' => '=?base64?YQ0KYg==?=' },
           { 'text' => 'Hello, 世界' } => { 'Mcp-Param-Text' => '=?base64?SGVsbG8sIOS4lueVjA==?=' },
           { 'text' => 'us-west1' } => { 'Mcp-Param-Text' => 'us-west1' },
+          # Only whitespace at the edges makes a value unsafe: interior spaces
+          # travel as they are, and so does the case of every character.
+          { 'text' => 'us west 1' } => { 'Mcp-Param-Text' => 'us west 1' },
+          { 'text' => 'US-West-1' } => { 'Mcp-Param-Text' => 'US-West-1' },
+          { 'text' => "\tindented" } => { 'Mcp-Param-Text' => '=?base64?CWluZGVudGVk?=' },
           { 'flag' => false } => { 'Mcp-Param-Flag' => 'false' },
           { 'n' => 0 } => { 'Mcp-Param-N' => '0' },
           { 'n' => 42.0 } => { 'Mcp-Param-N' => '42' }
@@ -955,7 +1169,7 @@ RSpec.describe 'MCP 2026-07-28 x-mcp-header — paginated and shrinking lists' d
     requests = []
     stub_request(:post, url).to_return do |request|
       body = JSON.parse(request.body)
-      requests << body['method']
+      requests << { headers: request.headers.to_h, body: body }
       case body['method']
       when 'server/discover' then json_response(body['id'], modern_discover)
       when 'tools/list' then json_response(body['id'], { 'tools' => listed })
@@ -969,7 +1183,13 @@ RSpec.describe 'MCP 2026-07-28 x-mcp-header — paginated and shrinking lists' d
     # unlisted tool exists -- but it carries no mirrored header to re-derive.
     expect { server.call_tool('execute_sql', { 'region' => 'eu' }) }
       .to raise_error(MCPClient::Errors::HeaderMismatchError)
-    expect(requests.count('tools/call')).to eq(2)
+    calls = calls_in(requests)
+    expect(calls.size).to eq(2)
+    expect(param_headers(calls[0][:headers])).to eq({ 'Mcp-Param-Region' => 'eu' })
+    # Nothing of the definition the first attempt went out under survives into
+    # the retry: the refreshed list has no definition to derive one from.
+    expect(param_headers(calls[1][:headers])).to be_empty
+    expect(server.list_tools).to be_empty
   end
 end
 
@@ -1025,6 +1245,35 @@ RSpec.describe 'MCP 2026-07-28 x-mcp-header — list_changed invalidation on bot
 
         notify(server, dispatcher, 'notifications/resources/list_changed')
         expect(server.list_resources['resources'].map(&:name)).to eq(['r2'])
+        expect(server.list_tools.map(&:name)).to eq(['t2'])
+      end
+
+      # Mutation: invalidating only on a modern session. Nothing about
+      # notifications/tools/list_changed is new in 2026-07-28 -- a 2025-11-25
+      # server announcing a changed list must be believed just the same.
+      it 'drops the tool cache on a legacy session too' do
+        lists = 0
+        stub_request(:get, url).to_return(status: 405, body: '')
+        stub_request(:post, url).to_return do |request|
+          body = JSON.parse(request.body)
+          case body['method']
+          when 'server/discover' then { status: 400, body: 'Bad Request' }
+          when 'initialize'
+            json_response(body['id'], { 'protocolVersion' => '2025-11-25',
+                                        'capabilities' => { 'tools' => {} },
+                                        'serverInfo' => { 'name' => 'legacy', 'version' => '1' } })
+          when 'notifications/initialized' then { status: 202, body: '' }
+          when 'tools/list'
+            lists += 1
+            json_response(body['id'], { 'tools' => [{ 'name' => "t#{lists}" }] })
+          end
+        end
+
+        expect(server.list_tools.map(&:name)).to eq(['t1'])
+        expect(server.protocol_version).to eq('2025-11-25')
+        expect(server.list_tools.map(&:name)).to eq(['t1'])
+
+        notify(server, dispatcher, 'notifications/tools/list_changed')
         expect(server.list_tools.map(&:name)).to eq(['t2'])
       end
     end

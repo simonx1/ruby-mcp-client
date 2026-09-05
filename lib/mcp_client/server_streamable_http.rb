@@ -1162,12 +1162,12 @@ module MCPClient
     # @param message [Hash] the parsed JSON-RPC message
     def dispatch_server_message(message)
       # Host code reached from here -- a notification listener, a handler for
-      # a server-initiated request -- may issue a tools/call of its own while
-      # the response that carried this message is still being parsed. Give it
-      # a slot of its own for the definition that call goes out under, so the
-      # call still waiting for this response keeps its own
-      # (MCPClient::CalledToolDefinition).
-      called_tool_definition_slot { dispatch_server_message_now(message) }
+      # a server-initiated request -- may issue a request of its own while the
+      # response that carried this message is still being parsed. That request
+      # is an exchange of its own, and the call still waiting for this response
+      # must keep both its recorded definition and its own failures
+      # (HttpTransportBase::RequestRecovery#dispatching_to_host).
+      dispatching_to_host { dispatch_server_message_now(message) }
     end
 
     # @param message [Hash] the parsed JSON-RPC message

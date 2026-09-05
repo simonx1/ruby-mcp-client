@@ -30,8 +30,10 @@ module MCPClient
 
     # Header value that may travel as-is: visible ASCII (0x21-0x7E), spaces
     # and tabs only in the interior (RFC 9110 field values; MCP 2026-07-28
-    # Streamable HTTP "Value Encoding").
-    HEADER_SAFE_VALUE = /\A[\x21-\x7E](?:[\x20-\x7E\t]*[\x21-\x7E])?\z/
+    # Streamable HTTP "Value Encoding"). RFC 9110 field values may also be
+    # empty, so an empty string travels as an empty field value rather than
+    # as an encoding of nothing.
+    HEADER_SAFE_VALUE = /\A(?:[\x21-\x7E](?:[\x20-\x7E\t]*[\x21-\x7E])?)?\z/
 
     # The Base64 sentinel format; a plain value matching it must itself be
     # encoded to avoid ambiguity.
@@ -88,15 +90,21 @@ module MCPClient
     # Encode a parameter value for an MCP request header (Mcp-Name,
     # Mcp-Param-*): strings as-is when header-safe, integers in decimal,
     # booleans lowercase; anything not safely representable — non-ASCII,
-    # control characters, leading/trailing whitespace, an empty string, or a
-    # value that looks like the sentinel — as `=?base64?<b64 of UTF-8>?=`.
+    # control characters, leading/trailing whitespace, or a value that looks
+    # like the sentinel — as `=?base64?<b64 of UTF-8>?=`.
+    #
+    # A Ruby String carries an encoding of its own, and the value being
+    # mirrored is the one the JSON body carries: UTF-8. The conversion
+    # therefore comes first — deciding header safety on, say, UTF-16 bytes
+    # would be deciding it on a different string (and an ASCII pattern cannot
+    # even be matched against one).
     # @param value [String, Integer, true, false] the parameter value
     # @return [String] the header value
     def encode_header_value(value)
-      text = value.to_s
+      text = value.to_s.encode('UTF-8')
       return text if text.match?(HEADER_SAFE_VALUE) && !text.match?(BASE64_SENTINEL)
 
-      "=?base64?#{[text.encode('UTF-8')].pack('m0')}?="
+      "=?base64?#{[text].pack('m0')}?="
     end
 
     # Encode one mirrored argument, enforcing the primitive-type and safe
@@ -182,13 +190,19 @@ module MCPClient
       end
     end
 
-    # Whether a property schema declares exactly one of the primitive types
-    # (a single-element type array names the same type as the bare string).
+    # Whether a property schema declares exactly one of the primitive types.
+    #
+    # A type array naming the one type is the same declaration as the bare
+    # string, and JSON Schema has no other way to spell a nullable primitive
+    # than to union it with "null": the constraint is on the property's type,
+    # while a null *value* has its own rule -- the header is omitted -- so
+    # dropping the whole tool over `["string", "null"]` would reject a schema
+    # the transport can mirror perfectly well.
     # @api private
     def primitive_type?(node)
       type = node.key?('type') ? node['type'] : node[:type]
-      type = type.first if type.is_a?(Array) && type.size == 1
-      type.is_a?(String) && PRIMITIVE_TYPES.include?(type)
+      declared = Array(type) - ['null']
+      declared.size == 1 && declared.first.is_a?(String) && PRIMITIVE_TYPES.include?(declared.first)
     end
 
     # @api private

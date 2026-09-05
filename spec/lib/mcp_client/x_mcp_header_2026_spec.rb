@@ -61,11 +61,24 @@ RSpec.describe 'MCP 2026-07-28 x-mcp-header custom headers' do
         expect(described_class.validate_schema(input)).to include(match(/unique/i))
       end
 
-      it 'rejects number, array, object, missing and multi-typed properties' do
+      it 'rejects number, array, object, null-only and missing types' do
         [{ 'type' => 'number' }, { 'type' => 'array', 'items' => { 'type' => 'string' } },
-         { 'type' => 'object' }, {}, { 'type' => %w[string null] }].each do |prop|
+         { 'type' => 'object' }, {}, { 'type' => 'null' }, { 'type' => [] },
+         { 'type' => %w[number null] }, { 'type' => %w[string object] },
+         { 'type' => %w[string integer] }].each do |prop|
           errors = described_class.validate_schema(schema('a' => prop.merge('x-mcp-header' => 'A')))
           expect(errors).to include(match(/primitive/)), "expected #{prop.inspect} to be rejected"
+        end
+      end
+
+      it 'accepts a nullable primitive, which JSON Schema spells as a union with null' do
+        # The constraint is on the property's type; a null *value* is covered
+        # by its own rule, which omits the header. Rejecting the union would
+        # drop the whole tool from tools/list over a schema the spec allows.
+        [%w[string null], %w[integer null], %w[boolean null], %w[null boolean]].each do |type|
+          input = schema('a' => { 'type' => type, 'x-mcp-header' => 'A' })
+          expect(described_class.validate_schema(input)).to eq([]), "expected #{type.inspect} to be accepted"
+          expect(described_class.annotations(input)).to eq([[['a'], 'A']])
         end
       end
 
@@ -85,8 +98,25 @@ RSpec.describe 'MCP 2026-07-28 x-mcp-header custom headers' do
         ]
         unreachable.each do |input|
           errors = described_class.validate_schema(input)
-          expect(errors).not_to be_empty, "expected #{input.inspect} to be rejected"
+          expect(errors).to include(match(/statically reachable/)), "expected #{input.inspect} to be rejected"
         end
+      end
+
+      it 'rejects an annotation at the schema root even when the root is a primitive' do
+        # The root is not on a `properties` path, so nothing can name it --
+        # and here its type is not what is wrong with it.
+        errors = described_class.validate_schema({ 'type' => 'string', 'x-mcp-header' => 'Root' })
+        expect(errors).to eq(['x-mcp-header at the schema root is not statically reachable via properties keys ' \
+                              'from the schema root'])
+      end
+
+      it 'accepts a header name that collides with a standard one, which the prefix keeps apart' do
+        # `Mcp-Param-Method` is a mirrored parameter; `Mcp-Method` is the
+        # standard request header. The prefix means the two never meet.
+        input = schema('m' => { 'type' => 'string', 'x-mcp-header' => 'Method' })
+        expect(described_class.validate_schema(input)).to eq([])
+        expect(described_class.headers_for(input, { 'm' => 'tools/call' }))
+          .to eq({ 'Mcp-Param-Method' => 'tools/call' })
       end
 
       it 'accepts schemas without any annotation, whatever else they contain' do
@@ -130,6 +160,15 @@ RSpec.describe 'MCP 2026-07-28 x-mcp-header custom headers' do
       it 'Base64-encodes values that are not header-safe' do
         headers = described_class.headers_for(input, { 'region' => 'Hello, 世界' })
         expect(headers).to eq({ 'Mcp-Param-Region' => '=?base64?SGVsbG8sIOS4lueVjA==?=' })
+      end
+
+      it 'converts a string in another Ruby encoding before deciding how to encode it' do
+        # A Ruby String carries its own encoding; the mirrored value is the
+        # one the JSON body carries, which is UTF-8.
+        args = { 'region' => '東京'.encode('UTF-16LE'), 'db' => { 'tenant' => 'acme'.encode('UTF-16LE') } }
+        expect(described_class.headers_for(input, args))
+          .to eq({ 'Mcp-Param-Region' => '=?base64?5p2x5Lqs?=', 'Mcp-Param-Tenant' => 'acme' })
+        expect(JSON.parse(JSON.generate(args))).to eq({ 'region' => '東京', 'db' => { 'tenant' => 'acme' } })
       end
 
       it 'rejects integers outside the IEEE754 safe range' do
@@ -225,6 +264,22 @@ RSpec.describe 'MCP 2026-07-28 x-mcp-header custom headers' do
       # host can act on it rather than just learn something was dropped.
       expect(log_output.string).to match(/WARN.*broken.*x-mcp-header/)
       expect(log_output.string).to include('x-mcp-header at "a" must be on a primitive property')
+    end
+
+    it 'keeps a tool whose annotated property is a nullable primitive, and mirrors it' do
+      nullable = { 'name' => 'nullable', 'inputSchema' => {
+        'type' => 'object',
+        'properties' => { 'region' => { 'type' => %w[string null], 'x-mcp-header' => 'Region' } }
+      } }
+      requests = stub_server(tools: [nullable])
+
+      expect(server.list_tools.map(&:name)).to eq(['nullable'])
+      server.call_tool('nullable', { 'region' => 'eu' })
+      server.call_tool('nullable', { 'region' => nil })
+
+      calls = requests.select { |r| r[:body]['method'] == 'tools/call' }
+      expect(calls[0][:headers]['Mcp-Param-Region']).to eq('eu')
+      expect(calls[1][:headers].keys.grep(/\AMcp-Param-/)).to be_empty
     end
 
     it 'mirrors annotated arguments into Mcp-Param-{name} headers on tools/call' do
@@ -346,7 +401,9 @@ RSpec.describe 'MCP 2026-07-28 x-mcp-header custom headers' do
       expect(server.list_tools.map(&:name)).to eq(%w[execute_sql broken])
       server.call_tool('execute_sql', { 'region' => 'eu', 'query' => 'x' })
       call = requests.find { |r| r[:body]['method'] == 'tools/call' }
-      expect(call[:headers].keys.grep(/\AMcp-Param-/)).to be_empty
+      # HTTP field names are case-insensitive: a header emitted under any
+      # spelling would still be one a legacy session must not carry.
+      expect(call[:headers].keys.select { |k| k.to_s.downcase.start_with?('mcp-param-') }).to be_empty
     end
   end
 
@@ -882,5 +939,90 @@ RSpec.describe 'MCP 2026-07-28 x-mcp-header — round 2' do
       expect(calls[1][:headers]['Mcp-Param-Zone']).to eq('z')
       client.cleanup
     end
+  end
+end
+
+# Review round 4 (codex): the transport's generation guard protects its own
+# list, not the tool cache MCPClient::Client keeps above it. A client-level
+# list_tools that started before a HeaderMismatch refresh must not put the
+# definitions the refresh replaced back into that cache.
+RSpec.describe 'MCP 2026-07-28 x-mcp-header — a client list racing the refresh' do
+  let(:url) { 'https://example.com/mcp' }
+
+  def json_response(id, result)
+    { status: 200, body: JSON.generate('jsonrpc' => '2.0', 'id' => id, 'result' => result),
+      headers: { 'Content-Type' => 'application/json' } }
+  end
+
+  # The same tool before and after the refresh: the required argument and the
+  # mirrored header both move on, so a call validated against the superseded
+  # definition is recognisable by the parameter it demands.
+  def tool(required, header)
+    { 'name' => 'execute_sql',
+      'inputSchema' => { 'type' => 'object',
+                         'properties' => { required => { 'type' => 'string' },
+                                           'region' => { 'type' => 'string', 'x-mcp-header' => header } },
+                         'required' => [required] } }
+  end
+
+  # A modern server that rejects a tools/call carrying the superseded header
+  # and moves the definition on as it does.
+  def stub_refreshing_server
+    listed = tool('old', 'Region')
+    stub_request(:post, url).to_return do |request|
+      body = JSON.parse(request.body)
+      case body['method']
+      when 'server/discover'
+        json_response(body['id'], { 'resultType' => 'complete', 'supportedVersions' => ['2026-07-28'],
+                                    'capabilities' => { 'tools' => {} } })
+      when 'tools/list' then json_response(body['id'], { 'tools' => [listed] })
+      when 'tools/call'
+        if request.headers['Mcp-Param-Zone']
+          json_response(body['id'], { 'content' => [] })
+        else
+          listed = tool('new', 'Zone')
+          { status: 400, headers: { 'Content-Type' => 'application/json' },
+            body: JSON.generate('jsonrpc' => '2.0', 'id' => body['id'],
+                                'error' => { 'code' => -32_020, 'message' => 'Mcp-Param-Zone missing' }) }
+        end
+      end
+    end
+  end
+
+  it 'drops a list fetched before the refresh instead of caching the superseded definition' do
+    stub_refreshing_server
+    client = MCPClient::Client.new(
+      mcp_server_configs: [MCPClient.streamable_http_config(base_url: 'https://example.com', endpoint: '/mcp',
+                                                            retries: 0)],
+      logger: Logger.new(File::NULL)
+    )
+    server = client.servers.first
+    # Held at the seam under test: the transport has answered with the
+    # definitions of the moment, and the client has not cached them yet.
+    listed = Queue.new
+    release = Queue.new
+    holding = true
+    allow(server).to receive(:list_tools).and_wrap_original do |original|
+      tools = original.call
+      if holding
+        holding = false
+        listed << true
+        release.pop(timeout: 5)
+      end
+      tools
+    end
+
+    stale = Thread.new { client.list_tools }
+    listed.pop(timeout: 5)
+    # The refresh this rejection triggers replaces the definition and clears
+    # the client cache through notifications/tools/list_changed.
+    expect(client.call_tool('execute_sql', { 'old' => 'x', 'region' => 'eu' })).to eq({ 'content' => [] })
+    release << true
+    stale.join(5)
+
+    # The next call is resolved against the refreshed definition, not the one
+    # the held fetch carried.
+    expect(client.call_tool('execute_sql', { 'new' => 'y', 'region' => 'eu' })).to eq({ 'content' => [] })
+    client.cleanup
   end
 end

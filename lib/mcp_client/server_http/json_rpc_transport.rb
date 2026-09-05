@@ -166,11 +166,11 @@ module MCPClient
       # @return [void]
       def dispatch_sse_message(message)
         # Host code reached from here -- a notification listener -- may issue a
-        # tools/call of its own while the response that carried this message is
-        # still being parsed. Give it a slot of its own for the definition that
-        # call goes out under, so the call still waiting for this response keeps
-        # its own (MCPClient::CalledToolDefinition).
-        called_tool_definition_slot { dispatch_sse_message_now(message) }
+        # request of its own while the response that carried this message is
+        # still being parsed. That request is an exchange of its own, and the
+        # call still waiting for this response must keep both its recorded
+        # definition and its own failures (HttpTransportBase::RequestRecovery#dispatching_to_host).
+        dispatching_to_host { dispatch_sse_message_now(message) }
       end
 
       # @param message [Hash] a JSON-RPC request or notification
