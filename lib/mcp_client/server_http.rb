@@ -301,7 +301,7 @@ module MCPClient
 
         params = {}
         params['cursor'] = cursor if cursor
-        result = rpc_request('resources/list', params)
+        result = require_complete_result!(rpc_request('resources/list', params), 'resources/list')
 
         resources = (result['resources'] || []).map do |resource_data|
           MCPClient::Resource.from_json(resource_data, server: self)
@@ -351,11 +351,17 @@ module MCPClient
       require_capability!('completions', method: 'completion/complete')
       params = { ref: ref, argument: argument }
       params[:context] = context if context
-      result = rpc_request('completion/complete', params)
+      result = require_complete_result!(rpc_request('completion/complete', params), 'completion/complete')
       result['completion'] || { 'values' => [] }
     rescue MCPClient::Errors::ConnectionError, MCPClient::Errors::TransportError,
            MCPClient::Errors::CapabilityError
       raise
+    rescue MCPClient::Errors::ServerError => e
+      # 2026-07-28 protocol errors (typed -3202x, invalid result) carry
+      # actionable data such as requiredCapabilities; keep them intact.
+      raise if e.protocol_error?
+
+      raise MCPClient::Errors::ServerError, "Error requesting completion: #{e.message}"
     rescue StandardError => e
       raise MCPClient::Errors::ServerError, "Error requesting completion: #{e.message}"
     end
@@ -372,6 +378,12 @@ module MCPClient
     rescue MCPClient::Errors::ConnectionError, MCPClient::Errors::TransportError,
            MCPClient::Errors::CapabilityError
       raise
+    rescue MCPClient::Errors::ServerError => e
+      # 2026-07-28 protocol errors (typed -3202x, invalid result) carry
+      # actionable data such as requiredCapabilities; keep them intact.
+      raise if e.protocol_error?
+
+      raise MCPClient::Errors::ServerError, "Error setting log level: #{e.message}"
     rescue StandardError => e
       raise MCPClient::Errors::ServerError, "Error setting log level: #{e.message}"
     end
@@ -383,7 +395,8 @@ module MCPClient
     def list_resource_templates(cursor: nil)
       params = {}
       params['cursor'] = cursor if cursor
-      result = rpc_request('resources/templates/list', params)
+      result = require_complete_result!(rpc_request('resources/templates/list', params),
+                                        'resources/templates/list')
 
       templates = (result['resourceTemplates'] || []).map do |template_data|
         MCPClient::ResourceTemplate.from_json(template_data, server: self)

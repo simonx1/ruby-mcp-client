@@ -336,6 +336,13 @@ module MCPClient
     # opaque requestState — surfaces it instead of presenting an unfinished
     # answer as an empty successful one. The whole result rides on the
     # error's `data`, so a host can still drive the round trip itself.
+    #
+    # Every field projector goes through this, not just resources/read: MRTR
+    # permits an unfinished result on exactly tools/call, prompts/get and
+    # resources/read, so one on a list or a completion is malformed anyway —
+    # and reading it as a finished empty page would drop a whole page of a
+    # paginated list, or a completion, without a word. tools/call and
+    # prompts/get return the entire result and so never project.
     # @param result [Object] the JSON-RPC result
     # @param method [String] the request method, for the message
     # @return [Object] the result, when it is complete

@@ -994,8 +994,9 @@ module MCPClient
     # declared outputSchema (MCP 2025-11-25 server/tools spec: "Clients SHOULD
     # validate structured results against this schema"; a tool declaring an
     # outputSchema must return structuredContent in successful results). Error
-    # results (isError: true) are exempt: the conformance requirements apply to
-    # successful results only. Validation covers the common JSON Schema
+    # results (isError: true) and unfinished ones (resultType
+    # "input_required") are exempt: the conformance requirements apply to
+    # successful, finished results only. Validation covers the common JSON Schema
     # keywords; the full 2020-12 vocabulary is out of scope (see
     # MCPClient::SchemaValidator), and when the schema uses keywords outside
     # that subset a partial-coverage warning is logged in both modes so :strict
@@ -1010,6 +1011,12 @@ module MCPClient
     def validate_structured_content!(tool, result)
       return result unless tool.structured_output? && result.is_a?(Hash)
       return result if result['isError'] || result[:isError]
+      # An unfinished result (MCP 2026-07-28 resultType "input_required") is
+      # not a successful one either: it carries the continuation instead of
+      # the tool's output. Checking it for structuredContent would fail the
+      # call on a conformance rule that does not apply yet, and would throw
+      # the continuation away with it.
+      return result unless MCPClient::JsonRpcCommon.result_type(result) == 'complete'
 
       warn_partial_schema_coverage(tool)
 

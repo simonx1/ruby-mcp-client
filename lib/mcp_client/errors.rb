@@ -185,9 +185,33 @@ module MCPClient
         false
       end
 
+      # Whether the error identifies a modern server *on a Streamable HTTP
+      # POST*. Beyond the transport-agnostic reserved codes, Streamable HTTP
+      # backward compatibility names one more recognized modern error: an
+      # unknown method answered with HTTP 404 and a JSON-RPC -32601 body.
+      # That pairing is why this predicate is separate rather than a wider
+      # code list — on stdio a bare -32601 is exactly what a legacy peer
+      # answers a modern probe with, so folding it into #modern_protocol_error?
+      # would suppress the initialize fallback that must happen there.
+      #
+      # The JSON-RPC 2.0 envelope is already required upstream: only
+      # #jsonrpc_error_from_http_response sets http_status, and it assigns a
+      # code solely from a body that carried `"jsonrpc": "2.0"` and an error
+      # object. An error that never arrived over HTTP has no status and is
+      # therefore never recognized here.
+      # @return [Boolean]
+      def modern_http_protocol_error?
+        return true if modern_protocol_error?
+
+        http_status == 404 && code == Codes::METHOD_NOT_FOUND
+      end
+
       # Whether the error is protocol-level (a modern spec error or an
       # invalid result) rather than an application-level failure. Public
       # transport methods let these propagate instead of wrapping them.
+      # A 404 + -32601 is deliberately NOT one: it says the peer is modern,
+      # but "method not found" is an ordinary application failure that the
+      # calling wrapper should keep describing in its own terms.
       # @return [Boolean]
       def protocol_error?
         modern_protocol_error?
@@ -245,9 +269,19 @@ module MCPClient
         caps.is_a?(Hash) ? caps : {}
       end
 
-      # @return [Boolean] whether data.requiredCapabilities is the object the schema requires
+      # The schema types this error's data as `requiredCapabilities:
+      # ClientCapabilities`, an object whose members (experimental, roots,
+      # sampling, elicitation, and any extension) are themselves objects. A
+      # body whose members are arrays or scalars is not that type, and must
+      # not claim the signal that separates a well-formed modern rejection
+      # from a legacy peer or an intermediary emitting a bare -32021. The
+      # member NAMES are deliberately not checked: the capability set is
+      # extensible, and an unknown-but-well-typed one still comes from a peer
+      # that speaks the schema.
+      # @return [Boolean] whether data.requiredCapabilities is ClientCapabilities-shaped
       def well_formed?
-        data_member('requiredCapabilities').is_a?(Hash)
+        caps = data_member('requiredCapabilities')
+        caps.is_a?(Hash) && caps.each_value.all?(Hash)
       end
     end
 

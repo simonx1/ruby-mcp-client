@@ -11,6 +11,14 @@ module MCPClient
       include OriginPolicy
       include JsonRpcCommon
 
+      # Returned by #check_for_result when nothing has arrived for the
+      # request yet. The stored result is whatever `result` member the
+      # response carried, so `null` and `false` are answers the client must
+      # deliver (and validate) rather than truthiness the waiter can read as
+      # "still outstanding" — doing that waited out the whole read timeout
+      # and cancelled a request the server had already answered.
+      NO_RESULT = Object.new.freeze
+
       # Generic JSON-RPC request: send method with params and return result
       # @param method [String] JSON-RPC method name
       # @param params [Hash] parameters for the request
@@ -280,7 +288,7 @@ module MCPClient
       def wait_for_result_with_timeout(request_id, start_time, timeout)
         loop do
           result = check_for_result(request_id)
-          return result if result
+          return result unless result.equal?(NO_RESULT)
 
           unless connection_active?
             raise MCPClient::Errors::ConnectionError,
@@ -298,27 +306,28 @@ module MCPClient
 
       # Check if a result is available for the given request ID
       # @param request_id [Integer] the request ID to check
-      # @return [Hash, nil] the result if available, nil otherwise
+      # @return [Object] the result if one has arrived, NO_RESULT otherwise
       # @raise [MCPClient::Errors::ServerError] if the stored result is a JSON-RPC error response
       def check_for_result(request_id)
+        arrived = false
         result = nil
         @mutex.synchronize do
-          result = @sse_results.delete(request_id) if @sse_results.key?(request_id)
+          if @sse_results.key?(request_id)
+            arrived = true
+            result = @sse_results.delete(request_id)
+          end
         end
+        return NO_RESULT unless arrived
 
-        if result
-          record_activity
-          # SseParser#process_response? stores JSON-RPC error responses under
-          # the Symbol :error key; deliver them to the caller as ServerError
-          # (MCP lifecycle "Error Handling") instead of timing out.
-          raise_sse_error_response(result[:error]) if result.is_a?(Hash) && result.key?(:error)
-          # Same resultType invariant as process_jsonrpc_response on the
-          # other transports: an unrecognized value is an invalid response.
-          validate_result_type!(result)
-          return result
-        end
-
-        nil
+        record_activity
+        # SseParser#process_response? stores JSON-RPC error responses under
+        # the Symbol :error key; deliver them to the caller as ServerError
+        # (MCP lifecycle "Error Handling") instead of timing out.
+        raise_sse_error_response(result[:error]) if result.is_a?(Hash) && result.key?(:error)
+        # Same resultType invariant as process_jsonrpc_response on the
+        # other transports: an unrecognized value is an invalid response.
+        validate_result_type!(result)
+        result
       end
 
       # Raise a ServerError for a JSON-RPC error response received over SSE,

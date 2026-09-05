@@ -116,10 +116,20 @@ RSpec.describe MCPClient::ServerSSE::JsonRpcTransport do
       expect(transport.instance_variable_get(:@sse_results)).to be_empty
     end
 
-    it 'returns nil when no result' do
+    it 'returns the no-result sentinel when nothing has arrived' do
       transport.instance_variable_set(:@mutex, Mutex.new)
       transport.instance_variable_set(:@sse_results, {})
-      expect(transport.send(:check_for_result, 2)).to be_nil
+      expect(transport.send(:check_for_result, 2))
+        .to be(MCPClient::ServerSSE::JsonRpcTransport::NO_RESULT)
+    end
+
+    it 'distinguishes a stored nil result from nothing having arrived' do
+      # A JSON-RPC `result: null` is an answer; reading it as "still
+      # outstanding" made the caller wait out its whole read timeout.
+      transport.instance_variable_set(:@mutex, Mutex.new)
+      transport.instance_variable_set(:@sse_results, { 3 => nil })
+      expect(transport.send(:check_for_result, 3)).to be_nil
+      expect(transport.instance_variable_get(:@sse_results)).to be_empty
     end
   end
 end

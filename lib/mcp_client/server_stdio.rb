@@ -214,7 +214,7 @@ module MCPClient
         req = { 'jsonrpc' => '2.0', 'id' => req_id, 'method' => 'prompts/list', 'params' => params }
         send_request(req)
         res = wait_response(req_id)
-        result = process_jsonrpc_response(res) || {}
+        result = require_complete_result!(process_jsonrpc_response(res) || {}, 'prompts/list')
         prompts = (result['prompts'] || []).map { |td| MCPClient::Prompt.from_json(td, server: self) }
         [prompts, result['nextCursor']]
       end
@@ -270,7 +270,7 @@ module MCPClient
       req = { 'jsonrpc' => '2.0', 'id' => req_id, 'method' => 'resources/list', 'params' => params }
       send_request(req)
       res = wait_response(req_id)
-      result = process_jsonrpc_response(res) || {}
+      result = require_complete_result!(process_jsonrpc_response(res) || {}, 'resources/list')
       resources = (result['resources'] || []).map { |td| MCPClient::Resource.from_json(td, server: self) }
       { 'resources' => resources, 'nextCursor' => result['nextCursor'] }
     rescue MCPClient::Errors::ServerError => e
@@ -325,7 +325,7 @@ module MCPClient
       req = { 'jsonrpc' => '2.0', 'id' => req_id, 'method' => 'resources/templates/list', 'params' => params }
       send_request(req)
       res = wait_response(req_id)
-      result = process_jsonrpc_response(res) || {}
+      result = require_complete_result!(process_jsonrpc_response(res) || {}, 'resources/templates/list')
       templates = (result['resourceTemplates'] || []).map { |td| MCPClient::ResourceTemplate.from_json(td, server: self) }
       { 'resourceTemplates' => templates, 'nextCursor' => result['nextCursor'] }
     rescue MCPClient::Errors::ServerError => e
@@ -414,7 +414,7 @@ module MCPClient
         req = { 'jsonrpc' => '2.0', 'id' => req_id, 'method' => 'tools/list', 'params' => params }
         send_request(req)
         res = wait_response(req_id)
-        result = process_jsonrpc_response(res) || {}
+        result = require_complete_result!(process_jsonrpc_response(res) || {}, 'tools/list')
         tools = (result['tools'] || []).map { |td| MCPClient::Tool.from_json(td, server: self) }
         [tools, result['nextCursor']]
       end
@@ -477,7 +477,8 @@ module MCPClient
       }
       send_request(req)
       res = wait_response(req_id)
-      (process_jsonrpc_response(res) || {})['completion'] || { 'values' => [] }
+      result = require_complete_result!(process_jsonrpc_response(res) || {}, 'completion/complete')
+      result['completion'] || { 'values' => [] }
     rescue MCPClient::Errors::CapabilityError
       raise
     rescue MCPClient::Errors::ServerError => e

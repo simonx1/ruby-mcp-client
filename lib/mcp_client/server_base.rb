@@ -281,7 +281,7 @@ module MCPClient
     def request_paginated_list(method, key)
       collect_paginated(key) do |cursor|
         params = cursor ? { cursor: cursor } : {}
-        result = rpc_request(method, params)
+        result = require_complete_result!(rpc_request(method, params), method)
         case result
         when Hash
           [result[key] || [], result['nextCursor']]

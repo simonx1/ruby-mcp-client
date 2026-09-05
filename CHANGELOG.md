@@ -33,7 +33,17 @@ metadata). Each feature lands in its own PR; this section accumulates them.
   with no JSON-RPC `message` at all is malformed at the JSON-RPC level and
   does not even earn a typed class — it stays a plain `ServerError` with its
   `code` and `data` preserved. A legacy endpoint or intermediary emitting a
-  bare -3202x code therefore cannot suppress the fallback.
+  bare -3202x code therefore cannot suppress the fallback. For -32021 that
+  check follows the schema all the way down: `requiredCapabilities` is typed
+  as `ClientCapabilities`, so its members must be objects too — a body
+  claiming `{"elicitation": []}` is malformed and does not identify a modern
+  server. `#modern_http_protocol_error?` is the Streamable-HTTP-specific
+  predicate: it additionally recognizes an unknown method answered with HTTP
+  404 and a JSON-RPC -32601 body, which that transport's backward
+  compatibility rules name as a modern-server signal. It is deliberately
+  separate from `#modern_protocol_error?`, because on stdio a bare -32601 is
+  exactly what a legacy peer answers a modern probe with and must keep the
+  `initialize` fallback alive.
 - **`resultType`.** Every result is checked: an absent field is treated as
   `"complete"` (earlier-protocol servers, and modern ones that omit it), and
   any unrecognized value raises `MCPClient::Errors::InvalidResultError` (a
@@ -41,10 +51,14 @@ metadata). Each feature lands in its own PR; this section accumulates them.
   requires. `"input_required"` passes through for the multi round-trip
   handling that follows, but only on a modern session: the pattern exists
   only in 2026-07-28, so a handshake-era server claiming an unfinished result
-  is malformed. Operations that project a field out of the result
-  (`read_resource`) never flatten an unfinished one into an empty success —
-  they raise, with the whole result on the error's `data` so a host can drive
-  the round trip itself.
+  is malformed. No operation that projects a field out of the result
+  (`read_resource`, every `*/list` including each page of a paginated one,
+  and `completion/complete`) flattens an unfinished one into an empty
+  success — they raise, with the whole result on the error's `data` so a host
+  can drive the round trip itself. `call_tool` and `get_prompt` return the
+  whole result and so pass a continuation through untouched; `Client#call_tool`
+  skips its `outputSchema` conformance check for one, since an unfinished
+  result carries the continuation rather than the tool's output.
 - **Typed errors from HTTP error bodies.** 2026-07-28 servers carry their
   protocol errors in the body of an HTTP 400 (and an unknown method as a 404
   with -32601). The HTTP, Streamable HTTP and SSE transports now parse a
@@ -62,6 +76,18 @@ metadata). Each feature lands in its own PR; this section accumulates them.
   generic `ResourceReadError`. On a legacy session `-32602` stays the
   generic Invalid params it always was. `protocol_version` / `modern?` are
   now readable on every transport.
+- **Protocol errors survive every public method.** `call_tool`, `get_prompt`,
+  `read_resource`, the list operations, `complete` and `log_level=` re-raise a
+  typed protocol error instead of wrapping it in a `ToolCallError` /
+  `PromptGetError` / `ResourceReadError` / bare `ServerError`, so the `code`,
+  the `data` and — for -32021 — `requiredCapabilities` reach the host that has
+  to act on them. Ordinary application errors are still wrapped as before.
+- **An SSE result of `null` or `false` is an answer.** The SSE transport
+  stored whatever `result` member arrived, and the waiter's truthiness check
+  could not tell one from "nothing has arrived yet": the caller waited out its
+  whole read timeout and sent a cancellation for a request the server had
+  already answered. Arrival is now tracked separately from the value, so such
+  a response is delivered (and `resultType`-validated) immediately.
 
 ## 2.1.0 — Hostile-Server Hardening (2026-08-04)
 
