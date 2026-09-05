@@ -1148,6 +1148,17 @@ module MCPClient
     # interleaved on a POST SSE response stream.
     # @param message [Hash] the parsed JSON-RPC message
     def dispatch_server_message(message)
+      # Host code reached from here -- a notification listener, a handler for
+      # a server-initiated request -- may issue a tools/call of its own while
+      # the response that carried this message is still being parsed. Give it
+      # a slot of its own for the definition that call goes out under, so the
+      # call still waiting for this response keeps its own
+      # (MCPClient::CalledToolDefinition).
+      called_tool_definition_slot { dispatch_server_message_now(message) }
+    end
+
+    # @param message [Hash] the parsed JSON-RPC message
+    def dispatch_server_message_now(message)
       if modern? && message['method'] && message.key?('id')
         # MCP 2026-07-28: "The server MUST NOT send independent JSON-RPC
         # requests on this stream" — server-to-client interactions are

@@ -2,6 +2,7 @@
 
 require 'net/http'
 require_relative 'json_rpc_common'
+require_relative 'called_tool_definition'
 require_relative 'auth/oauth_provider'
 
 module MCPClient
@@ -9,6 +10,7 @@ module MCPClient
   # Contains common functionality shared between HTTP and Streamable HTTP transports
   module HttpTransportBase
     include JsonRpcCommon
+    include CalledToolDefinition
 
     # Lightweight response wrapper for Faraday exception payloads (Hashes),
     # so the exception path and the default path share one challenge pipeline.
@@ -542,7 +544,7 @@ module MCPClient
       begin
         response = conn.post(@endpoint) do |req|
           apply_request_headers(req, request)
-          extra_headers.each { |k, v| req.headers[k] = v }
+          apply_param_headers(req, extra_headers)
           # Per-request timeout override (MCP lifecycle: timeouts SHOULD be
           # configurable on a per-request basis)
           req.options.timeout = timeout if timeout
@@ -640,6 +642,27 @@ module MCPClient
       INTERRUPTED_EXCHANGE_ERRORS.any? { |klass| cause.is_a?(klass) }
     end
 
+    # Attach the computed `Mcp-Param-*` headers (MCP 2026-07-28 "Custom
+    # Headers from Tool Parameters"). On a modern session that namespace is
+    # derived from the call's arguments and from nothing else -- the client
+    # MUST omit the header for an argument that is absent or null -- so a
+    # configured header of that name is cleared first: leaving it would let
+    # it stand for an argument the extraction omitted, which no tools/list
+    # refresh can correct. The clearing matches HTTP's case-insensitive field
+    # names, whatever spelling the host configured.
+    # @param req [Faraday::Request] the outgoing request
+    # @param param_headers [Hash{String => String}] the computed headers
+    # @return [void]
+    def apply_param_headers(req, param_headers)
+      if modern?
+        # The names are collected before any is dropped: the header set is
+        # being mutated.
+        configured = req.headers.keys.select { |name| MCPClient::HeaderParams.mirrored_header?(name) }
+        configured.each { |name| req.headers.delete(name) }
+      end
+      param_headers.each { |k, v| req.headers[k] = v }
+    end
+
     # Start a new session after the server invalidated the current one, then
     # resend the original request once. The @restarting_session flag prevents
     # a second restart if the fresh session also answers 404.
@@ -710,6 +733,10 @@ module MCPClient
 
       name = (params['name'] || params[:name]).to_s
       tool = known_tools_for_headers.find { |t| t.name.to_s == name }
+      # The list these headers come from is the list this request goes out
+      # under: a host re-resolving the tool after the call reads that
+      # definition back instead of asking for a possibly newer one.
+      note_called_tool_definition(name, tool)
       return {} unless tool
 
       MCPClient::HeaderParams.headers_for(tool.schema, params['arguments'] || params[:arguments])
@@ -750,7 +777,6 @@ module MCPClient
     def tools_generation
       @tools_generation ||= 0
     end
-    public :tools_generation
 
     # Fetch and cache the tool list, re-fetching when the cache was
     # invalidated while the fetch was in flight (bounded).
