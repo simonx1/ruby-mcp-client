@@ -14,6 +14,9 @@ module MCPClient
   module HeaderParams
     ANNOTATION = 'x-mcp-header'
     HEADER_PREFIX = 'Mcp-Param-'
+    # HTTP field names are case-insensitive, so membership of the mirrored
+    # namespace is decided on the lower-cased name.
+    HEADER_PREFIX_DOWNCASE = HEADER_PREFIX.downcase.freeze
 
     # HTTP field-name token: 1*tchar (RFC 9110 Section 5.6.2)
     TOKEN = /\A[!#$%&'*+\-.^_`|~0-9A-Za-z]+\z/
@@ -57,6 +60,15 @@ module MCPClient
       found = []
       walk(schema, [], root: true, reachable: false, errors: [], seen: {}, found: found)
       found
+    end
+
+    # Whether an HTTP header name belongs to the mirrored namespace, which
+    # the client owns on a modern session: its members are derived from the
+    # call's arguments and from nothing else.
+    # @param name [String, Symbol] an HTTP header name
+    # @return [Boolean]
+    def mirrored_header?(name)
+      name.to_s.downcase.start_with?(HEADER_PREFIX_DOWNCASE)
     end
 
     # The `Mcp-Param-*` headers for one tools/call.
