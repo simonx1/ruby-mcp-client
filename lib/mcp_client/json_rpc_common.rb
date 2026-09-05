@@ -193,15 +193,46 @@ module MCPClient
     LOG_LEVELS = %w[debug info notice warning error critical alert emergency].freeze
 
     # Extension identifiers follow the `_meta` key naming rules with a
-    # mandatory prefix: dotted labels, a slash, then a name.
+    # mandatory prefix (basic/versioning "Extension Negotiation"): dotted
+    # labels, a slash, then a name. The name is optional — basic/index says
+    # of it "Unless empty, MUST begin and end with an alphanumeric
+    # character" — so a prefix on its own (`com.example/`) is a valid
+    # identifier.
     EXTENSION_ID_PATTERN = %r{\A(?:[A-Za-z](?:[A-Za-z0-9-]*[A-Za-z0-9])?\.)*[A-Za-z](?:[A-Za-z0-9-]*[A-Za-z0-9])?/
-                              [A-Za-z0-9](?:[A-Za-z0-9._-]*[A-Za-z0-9])?\z}x
+                              (?:[A-Za-z0-9](?:[A-Za-z0-9._-]*[A-Za-z0-9])?)?\z}x
 
+    # The server's established protocol era.
+    #
+    # Deliberately not the same question as {#modern?}: while a
+    # server/discover probe is in flight, protocol_version holds the version
+    # the probe *proposes*, which is what outgoing requests must declare but
+    # says nothing about what the server speaks. Anything that reacts to the
+    # peer — above all, whether a server-initiated request is prohibited —
+    # must consult the era, not the tentative outgoing version.
     # @return [Symbol, nil] :modern, :legacy, or nil before the era is known
     def protocol_era
-      return nil if protocol_version.nil?
+      return nil if era_probe_in_flight? || protocol_version.nil?
 
       modern? ? :modern : :legacy
+    end
+
+    # Begin proposing a protocol version that the server has not confirmed:
+    # until the probe settles, the era is unknown.
+    # @return [void]
+    def begin_era_probe
+      @era_probe_in_flight = true
+    end
+
+    # The probe has been answered (or given up on): the era is now whatever
+    # protocol_version says.
+    # @return [void]
+    def settle_era_probe
+      @era_probe_in_flight = false
+    end
+
+    # @return [Boolean] whether protocol_version is only a proposal so far
+    def era_probe_in_flight?
+      defined?(@era_probe_in_flight) ? @era_probe_in_flight : false
     end
 
     # Protocol versions a modern server advertised in its DiscoverResult.
@@ -278,6 +309,13 @@ module MCPClient
       symbol_meta = params.delete(:_meta)
       supplied = symbol_meta if supplied.nil?
       supplied = supplied.is_a?(Hash) ? supplied.transform_keys(&:to_s) : {}
+      # The reserved protocol fields are transport-owned in per-call `_meta`
+      # exactly as they are in request_meta. Merging the transport's own
+      # values over the caller's is not enough: a field the transport omits
+      # (clientInfo, once the host set send_client_info = false) has nothing
+      # to overwrite the caller's value with, so it would be transmitted
+      # anyway. Drop them before the defaults are merged.
+      supplied = supplied.except(*PROTECTED_META_KEYS)
 
       meta = defaults.merge(supplied)
       if modern?
