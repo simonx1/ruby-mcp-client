@@ -13,6 +13,10 @@ RSpec.describe MCPClient::Client, 'Roots (MCP 2025-06-18)' do
     allow(mock_server).to receive(:respond_to?).with(:on_sampling_request).and_return(true)
     allow(mock_server).to receive(:respond_to?).with(:modern?).and_return(true)
     allow(mock_server).to receive(:modern?).and_return(false)
+    # A legacy session that declared roots: only declared capabilities may be
+    # used, so notify_roots_changed asks the transport what it declared.
+    allow(mock_server).to receive(:respond_to?).with(:client_capabilities).and_return(true)
+    allow(mock_server).to receive(:client_capabilities).and_return({ 'roots' => { 'listChanged' => true } })
     allow(mock_server).to receive(:on_elicitation_request)
     allow(mock_server).to receive(:on_roots_list_request)
     allow(mock_server).to receive(:on_sampling_request)

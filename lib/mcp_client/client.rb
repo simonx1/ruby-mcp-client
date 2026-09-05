@@ -1425,7 +1425,12 @@ module MCPClient
       return { 'action' => 'accept' } if result == true
 
       action = result.is_a?(Hash) ? (result['action'] || result[:action]) : nil
-      return { 'action' => action.to_s } if %w[accept decline cancel].include?(action.to_s)
+      if %w[accept decline cancel].include?(action.to_s)
+        # ElicitResult carries `_meta` in every mode; only `content` is
+        # form-mode-specific, and format_elicitation_response strips it.
+        meta = result['_meta'] || result[:_meta]
+        return { 'action' => action.to_s, '_meta' => meta }.compact
+      end
 
       unless result.nil? || result == false
         @logger.warn('URL-mode elicitation handler gave no explicit action; answering cancel (consent is explicit)')
@@ -1505,19 +1510,31 @@ module MCPClient
       { 'roots' => @roots.map(&:to_h) }
     end
 
+    # Whether a server may be told the roots list changed. MCP forbids using a
+    # capability that was not declared during initialization, so the
+    # notification goes only to sessions whose declared client capabilities
+    # include roots: a transport that registers the handlers for the modern
+    # multi round-trip pattern but has no server-request channel to serve
+    # them on (plain HTTP on a legacy session) declares none, however it
+    # answers respond_to?.
+    # @param server [Object] an MCP server transport
+    # @return [Boolean]
+    def roots_list_changed_recipient?(server)
+      return false unless server.respond_to?(:on_roots_list_request)
+      # notifications/roots/list_changed was removed in MCP 2026-07-28: a
+      # modern server reads roots through the multi round-trip pattern when it
+      # needs them, and has no channel to be told they changed.
+      return false if server.respond_to?(:modern?) && server.modern?
+      return true unless server.respond_to?(:client_capabilities)
+
+      server.client_capabilities.key?('roots')
+    end
+
     # Send notification to all servers that roots have changed (MCP 2025-06-18)
     # @return [void]
     def notify_roots_changed
       @servers.each do |server|
-        # Only notify sessions where the roots capability could be declared:
-        # MCP forbids using capabilities that were not negotiated, and
-        # transports without a server-request channel (plain HTTP) never
-        # declare roots.
-        next unless server.respond_to?(:on_roots_list_request)
-        # notifications/roots/list_changed was removed in MCP 2026-07-28: a
-        # modern server reads roots through the multi round-trip pattern
-        # when it needs them, and has no channel to be told they changed.
-        next if server.respond_to?(:modern?) && server.modern?
+        next unless roots_list_changed_recipient?(server)
 
         begin
           server.rpc_notify('notifications/roots/list_changed', {})

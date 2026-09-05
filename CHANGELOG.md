@@ -19,7 +19,17 @@ metadata). Each feature lands in its own PR; this section accumulates them.
   retried immediately; the round trip never leaks into other requests.
 - **Capabilities.** Modern requests once again declare `elicitation`
   (`form` and `url`), `roots` (without `listChanged`) and `sampling` (with
-  `tools` when opted in) when the corresponding handler is registered.
+  `tools` when opted in) when the corresponding handler is registered. Only
+  declared capabilities are used: a `sampling/createMessage` input request
+  carrying `tools` or `toolChoice` fails the round trip (the sampler is never
+  invoked) unless the host opted into `sampling.tools`, and
+  `notifications/roots/list_changed` is sent only to a session that declared
+  `roots` — registering the plain HTTP handlers, which serve the modern round
+  trips, does not make a legacy plain HTTP session a recipient.
+- **URL-mode elicitation answers keep `_meta`.** An ElicitResult carries
+  `_meta` in every mode; a URL-mode answer now passes the handler's `_meta`
+  through (on both the round-trip and the legacy server-request path) while
+  `content`, which is form-mode only, is still stripped.
 - **Recovery keeps the round trip.** Transport-level recovery of an attempt
   (retries, version renegotiation, the HeaderMismatch refresh, a re-issued
   stream) re-sends the attempt's own `inputResponses`/`requestState`. An

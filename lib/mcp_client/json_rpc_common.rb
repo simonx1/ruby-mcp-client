@@ -899,6 +899,12 @@ module MCPClient
           '(the capability was not declared)', data: result
         )
       end
+      if undeclared_sampling_tool_use?(request_method, request['params'])
+        raise MCPClient::Errors::InputRequiredError.new(
+          "Server requested tool-enabled #{shown_method} (key #{shown_key}) but the sampling.tools " \
+          'capability was not declared', data: result
+        )
+      end
 
       begin
         response = instance_variable_get(handler_ivar).call(key, request['params'] || {})
@@ -923,6 +929,21 @@ module MCPClient
       end
 
       response
+    end
+
+    # SEP-1577 (sampling tool calling): a server MUST NOT send `tools` or
+    # `toolChoice` to a client that did not declare the sampling.tools
+    # sub-capability. On a server-initiated request the client answers -32602;
+    # InputResponses has no per-request error channel, so on the multi
+    # round-trip path the whole round trip fails instead — the sampler is
+    # never invoked with a request this client never advertised support for.
+    # @param method [String] the input request method
+    # @param params [Hash, nil] the input request params
+    # @return [Boolean] whether this is tool-enabled sampling without the declaration
+    def undeclared_sampling_tool_use?(method, params)
+      return false unless method == 'sampling/createMessage' && !sampling_tools_supported?
+
+      params.is_a?(Hash) && (params.key?('tools') || params.key?('toolChoice'))
     end
 
     # Notifications the 2026-07-28 revision removed; never written to a
