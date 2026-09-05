@@ -1981,7 +1981,9 @@ RSpec.describe 'the HTTP handshake refuses an initialize result naming a modern 
                                           'serverInfo' => { 'name' => 's', 'version' => '1' })
 
       expect { server.connect }.to raise_error(MCPClient::Errors::ConnectionError, /2026-07-28/)
-      expect(posted).to eq(['initialize'])
+      # The modern probe runs first and is refused, so the handshake is what
+      # answers with the version this transport cannot speak that way.
+      expect(posted).to eq(%w[server/discover initialize])
       expect(server.instance_variable_get(:@initialized)).to be_falsey
       expect(server.instance_variable_get(:@connection_established)).to be_falsey
     end
