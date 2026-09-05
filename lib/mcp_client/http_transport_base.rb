@@ -1,5 +1,6 @@
 # frozen_string_literal: true
 
+require 'net/http'
 require_relative 'json_rpc_common'
 require_relative 'auth/oauth_provider'
 
@@ -21,6 +22,16 @@ module MCPClient
     # auth-scheme introducing the next challenge — while commas inside quoted
     # values are consumed by the quoted-string branch, not treated as boundaries.
     AUTH_PARAMS_RUN = /\A(?:[\s,]*#{AUTH_PARAM})*/
+
+    # Socket-level failures that can only occur once the exchange was under
+    # way: the peer reset or closed the connection, or the response head was
+    # truncated. Failures proving the request never reached the server
+    # (connection refused, DNS failure, unreachable network) are deliberately
+    # absent — there is nothing in flight to replace.
+    INTERRUPTED_EXCHANGE_ERRORS = [
+      EOFError, Errno::ECONNRESET, Errno::ECONNABORTED, Errno::EPIPE,
+      Net::HTTPBadResponse, Net::ProtocolError
+    ].freeze
 
     # Generic JSON-RPC request: send method with params and return result
     # @param method [String] JSON-RPC method name
@@ -68,9 +79,13 @@ module MCPClient
         # makes closing the response stream itself the cancellation signal —
         # the server MUST treat the broken stream as a cancellation and stop
         # work — so the re-issue is the behaviour the protocol expects rather
-        # than a blind replay. Exactly one re-issue happens: with_retry
-        # refuses to retry a NON_IDEMPOTENT_METHODS request, so a second
-        # broken stream surfaces instead of looping.
+        # than a blind replay. Exactly one re-issue happens, for every
+        # method: with_retry never retries a ResponseStreamClosedError, so a
+        # second broken stream surfaces instead of looping.
+        #
+        # A stream that closed between (or inside) SSE events reaches here
+        # from the parser; one that died at the socket reaches here from
+        # connection_failure_error. Both are the same loss.
         @logger.warn("#{e.message}; re-issuing #{method} as a new request")
         send_request_and_parse(method, params, timeout)
       end
@@ -307,10 +322,14 @@ module MCPClient
       end
       @confirmed_era = :modern
       true
-    rescue MCPClient::Errors::ConnectionError
+    rescue MCPClient::Errors::ConnectionError => e
       # A DiscoverResult (or advertised list) with no mutual version, or an
-      # authorization failure: nothing was negotiated.
+      # authorization failure: nothing was negotiated. The first of those
+      # still settles the era — the server answered server/discover as a
+      # modern server — so cache it, exactly as a probe failure that reaches
+      # modern_probe_failure does. An authorization failure settles nothing.
       @protocol_version = nil
+      @confirmed_era = :modern if e.is_a?(MCPClient::Errors::ModernServerError)
       raise
     rescue MCPClient::Errors::ServerError, MCPClient::Errors::TransportError => e
       modern_despite_probe_failure?(e, modern_confirmed)
@@ -358,7 +377,9 @@ module MCPClient
     def retry_discover_with_advertised_version(error)
       version = select_protocol_version(error.supported)
       unless version
-        raise MCPClient::Errors::ConnectionError,
+        # The rejection was well-formed, so the server is modern: the typed
+        # error stops MCPClient.connect from trying the legacy transports.
+        raise MCPClient::Errors::ModernServerError,
               "Server rejected protocol version #{@protocol_version} and supports only " \
               "#{error.supported.join(', ')}, none of which this client speaks"
       end
@@ -555,7 +576,7 @@ module MCPClient
         status = e.response.is_a?(Hash) ? (e.response[:status] || e.response['status']) : nil
         raise client_error_from_exception(e, status || 400)
       rescue Faraday::ConnectionFailed => e
-        raise MCPClient::Errors::ConnectionError, "Server connection lost: #{e.message}"
+        raise connection_failure_error(e, request)
       rescue Faraday::TimeoutError => e
         raise MCPClient::Errors::RequestTimeoutError, "Request timed out: #{e.message}"
       rescue Faraday::ServerError => e
@@ -569,6 +590,43 @@ module MCPClient
       rescue Faraday::Error => e
         raise MCPClient::Errors::TransportError, "HTTP request failed: #{e.message}"
       end
+    end
+
+    # Translate a Faraday socket failure into the MCP error the caller must
+    # act on.
+    #
+    # A response stream that dies mid-body is what a broken stream actually
+    # looks like on the wire: Faraday raises rather than handing back a
+    # truncated body, so it never reaches the SSE parser that recognises a
+    # stream which closed *between* events. MCP 2026-07-28 has no resumption
+    # — "a broken response stream loses the in-flight request; clients MUST
+    # re-issue it as a new request with a new request ID" (changelog, major
+    # change 9) — and the rule does not care where the break landed. Raising
+    # ResponseStreamClosedError puts both breaks on the one re-issue path.
+    #
+    # A failure that never got the request out, and a notification (which has
+    # no response to lose), stay a plain ConnectionError.
+    # @param error [Faraday::ConnectionFailed] the socket failure
+    # @param request [Hash] the JSON-RPC message that was being sent
+    # @return [MCPClient::Errors::MCPError] the error to raise
+    def connection_failure_error(error, request)
+      if modern? && request.is_a?(Hash) && request.key?('id') && interrupted_exchange?(error)
+        return MCPClient::Errors::ResponseStreamClosedError.new(
+          "Response stream closed before delivering the response: #{error.message}"
+        )
+      end
+
+      MCPClient::Errors::ConnectionError.new("Server connection lost: #{error.message}")
+    end
+
+    # Faraday wraps every socket failure in ConnectionFailed, whether the
+    # connection was never established or it broke with a request in flight;
+    # only the wrapped exception distinguishes them.
+    # @param error [Faraday::ConnectionFailed] the socket failure
+    # @return [Boolean] true when the exchange had started when it broke
+    def interrupted_exchange?(error)
+      cause = (error.wrapped_exception if error.respond_to?(:wrapped_exception)) || error.cause
+      INTERRUPTED_EXCHANGE_ERRORS.any? { |klass| cause.is_a?(klass) }
     end
 
     # Start a new session after the server invalidated the current one, then

@@ -16,7 +16,10 @@ module MCPClient
   # @note Elicitation Support (MCP 2025-06-18)
   #   This transport does NOT support server-initiated elicitation requests.
   #   The HTTP transport uses a pure request-response architecture where only the client
-  #   can initiate requests. For elicitation support, use one of these transports instead:
+  #   can initiate requests. A legacy server that sends one on an SSE response
+  #   stream is answered with JSON-RPC -32601 rather than left waiting (a
+  #   `ping` gets the empty result it requires). For elicitation support, use
+  #   one of these transports instead:
   #   - ServerStdio: Full bidirectional JSON-RPC over stdin/stdout
   #   - ServerSSE: Server requests via SSE stream, client responses via HTTP POST
   #   - ServerStreamableHTTP: Server requests via SSE-formatted responses, client responses via HTTP POST
@@ -545,11 +548,19 @@ module MCPClient
     # @return [void]
     # @raise [MCPClient::Errors::ConnectionError] if connection is not established
     def ensure_connected
-      return if @mutex.synchronize { @connection_established && @initialized }
+      # Serialized on the transport monitor (reentrant, so the nested
+      # cleanup/connect may take it again): checking the flags and acting on
+      # them must be one step. Otherwise a caller that observed "disconnected"
+      # can be overtaken by one that reconnects, and then tear that fresh
+      # connection down — terminating its session and re-running the era
+      # probe.
+      @mutex.synchronize do
+        return if @connection_established && @initialized
 
-      @logger.debug('Connection not active, attempting to reconnect before request')
-      cleanup
-      connect
+        @logger.debug('Connection not active, attempting to reconnect before request')
+        cleanup
+        connect
+      end
     end
 
     # Request the tools list using JSON-RPC

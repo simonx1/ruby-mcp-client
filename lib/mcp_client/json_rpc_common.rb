@@ -47,6 +47,12 @@ module MCPClient
         # side effect (and re-does the oversized decode).
         raise if e.is_a?(MCPClient::Errors::RequestTimeoutError)
         raise if e.is_a?(MCPClient::Errors::ResponseTooLargeError)
+        # A broken response stream is already handled where it is raised: the
+        # transport issues the one replacement request MCP 2026-07-28 calls
+        # for and this error means that replacement was lost too. Retrying
+        # here would silently turn "re-issue once" into retries + 1 rounds of
+        # two attempts each.
+        raise if e.is_a?(MCPClient::Errors::ResponseStreamClosedError)
 
         if NON_IDEMPOTENT_METHODS.include?(method)
           @logger.debug("Not retrying non-idempotent #{method} after error: #{e.message}")
@@ -365,7 +371,11 @@ module MCPClient
 
       version = select_protocol_version(versions)
       unless version
-        raise MCPClient::Errors::ConnectionError,
+        # A DiscoverResult settles the era even when it settles no version:
+        # only a modern server answers server/discover with one. Raising the
+        # typed error keeps MCPClient.connect from trying the legacy
+        # transports, which cannot do better against a modern server.
+        raise MCPClient::Errors::ModernServerError,
               "Server supports protocol versions #{versions.join(', ')}, none of which this client speaks " \
               "(modern versions supported: #{MCPClient::MODERN_PROTOCOL_VERSIONS.join(', ')})"
       end

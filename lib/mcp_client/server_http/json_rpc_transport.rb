@@ -46,7 +46,7 @@ module MCPClient
         messages.select { |m| m['method'] }.each { |m| dispatch_sse_message(m) }
         responses = messages.reject { |m| m['method'] }
         matched = responses.find { |m| request_id.nil? || m['id'] == request_id || m['id'].to_s == request_id.to_s }
-        matched ||= responses.first if responses.size == 1
+        matched ||= tolerated_id_mismatch(responses, request_id)
         return matched if matched
 
         # The stream closed without the response: on a modern server the
@@ -69,16 +69,69 @@ module MCPClient
         end
       end
 
-      # Route a non-response message: notifications go to the callback,
-      # server-initiated requests are dropped.
+      # The only response on a stream, when its id is not the one asked for.
+      #
+      # A legacy server that echoes ids loosely — a string where an integer
+      # went out, or an id an intermediary rewrote — still gets the benefit of
+      # the doubt. A modern one does not: no response to THIS request arrived,
+      # so the request was lost and MCP 2026-07-28 says to re-issue it rather
+      # than complete it with the answer to something else.
+      # @param responses [Array<Hash>] the responses the stream carried
+      # @param request_id [Integer, String, nil] id of the originating request
+      # @return [Hash, nil] the response to accept, or nil to treat as lost
+      def tolerated_id_mismatch(responses, request_id)
+        return nil if modern? || responses.size != 1
+
+        @logger.warn("SSE response id #{responses.first['id'].inspect} does not match request id " \
+                     "#{request_id.inspect}; accepting the only response on the stream")
+        responses.first
+      end
+
+      # Route a non-response message: notifications go to the callback, and a
+      # server-initiated request is answered on a legacy stream and dropped on
+      # a modern one.
       # @param message [Hash] a JSON-RPC request or notification
       # @return [void]
       def dispatch_sse_message(message)
-        if message.key?('id')
-          @logger.warn("Ignoring server-initiated request #{message['method']} on a response stream")
-        else
+        unless message.key?('id')
           @notification_callback&.call(message['method'], message['params'])
+          return
         end
+
+        # MCP 2026-07-28: "The server MUST NOT send independent JSON-RPC
+        # requests on this stream" and clients MUST NOT POST responses to it,
+        # so there is nothing to answer with.
+        if modern?
+          @logger.warn("Ignoring server-initiated request #{message['method']} on a response stream")
+          return
+        end
+
+        answer_server_request(message)
+      end
+
+      # Answer a server-initiated request on a legacy (2025-11-25 and earlier)
+      # response stream, where the server may send one and a receiver "MUST
+      # respond promptly" to ping. This transport serves no other
+      # server-initiated method — it has no elicitation, roots or sampling
+      # callbacks — so those get the JSON-RPC method-not-found answer rather
+      # than silence, which would leave the server waiting.
+      # @param message [Hash] the server's JSON-RPC request
+      # @return [void]
+      def answer_server_request(message)
+        send_http_request(server_request_answer(message))
+      rescue StandardError => e
+        @logger.error("Failed to answer server request #{message['method']}: #{e.message}")
+      end
+
+      # @param message [Hash] the server's JSON-RPC request
+      # @return [Hash] the JSON-RPC response to POST back
+      def server_request_answer(message)
+        answer = { 'jsonrpc' => '2.0', 'id' => message['id'] }
+        return answer.merge('result' => {}) if message['method'] == 'ping'
+
+        @logger.warn("Answering unsupported server request #{message['method']} with method not found")
+        answer.merge('error' => { 'code' => MCPClient::Errors::Codes::METHOD_NOT_FOUND,
+                                  'message' => "Method not found: #{message['method']}" })
       end
 
       # @param json [String] one SSE event's data

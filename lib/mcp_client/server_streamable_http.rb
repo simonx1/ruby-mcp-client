@@ -670,11 +670,19 @@ module MCPClient
     # @return [void]
     # @raise [MCPClient::Errors::ConnectionError] if connection is not established
     def ensure_connected
-      return if @mutex.synchronize { @connection_established && @initialized }
+      # Serialized on the transport monitor (reentrant, so the nested
+      # cleanup/connect may take it again): checking the flags and acting on
+      # them must be one step. Otherwise a caller that observed "disconnected"
+      # can be overtaken by one that reconnects, and then tear that fresh
+      # connection down — terminating its session and re-running the era
+      # probe.
+      @mutex.synchronize do
+        return if @connection_established && @initialized
 
-      @logger.debug('Connection not active, attempting to reconnect before request')
-      cleanup
-      connect
+        @logger.debug('Connection not active, attempting to reconnect before request')
+        cleanup
+        connect
+      end
     end
 
     # Request the tools list using JSON-RPC

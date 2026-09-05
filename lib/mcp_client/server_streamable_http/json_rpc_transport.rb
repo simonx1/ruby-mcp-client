@@ -297,7 +297,13 @@ module MCPClient
                     responses.find { |msg| msg['id'] == request_id || msg['id'].to_s == request_id.to_s }
                   end
 
-        if matched.nil? && responses.length == 1
+        # A legacy server that echoes ids loosely — a string where an integer
+        # went out, or an id an intermediary rewrote — gets the benefit of the
+        # doubt when its stream carried exactly one response. A modern one
+        # does not: no response to THIS request arrived, so the request was
+        # lost and MCP 2026-07-28 says to re-issue it rather than complete it
+        # with the answer to something else.
+        if matched.nil? && responses.length == 1 && !modern?
           matched = responses.first
           @logger.warn(
             "SSE response id #{matched['id'].inspect} does not match request id #{request_id.inspect}; " \
