@@ -31,6 +31,13 @@ module MCPClient
     attr_reader :name, :title, :description, :schema, :output_schema, :annotations, :server, :task_support,
                 :icons, :meta
 
+    # @!attribute [r] schema_identity
+    #   @return [Object] a token naming this tool definition: every copy the
+    #     client cache hands out carries the same one, and a definition
+    #     fetched again carries a new one, so once-per-definition checks of
+    #     its schemas can be keyed without hashing a peer-supplied document
+    attr_reader :schema_identity
+
     # Initialize a new Tool
     # @param name [String] the name of the tool
     # @param description [String] the description of the tool
@@ -42,18 +49,26 @@ module MCPClient
     # @param task_support [String, nil] execution.taskSupport value (MCP 2025-11-25)
     # @param icons [Array<Hash>, nil] optional icons for display in user interfaces (MCP 2025-11-25)
     # @param meta [Hash, nil] optional `_meta` metadata attached to the tool (MCP 2025-11-25)
+    # @param output_schema_declared [Boolean, nil] whether the definition carried
+    #   an outputSchema member at all; nil means "whenever a schema was given"
     def initialize(name:, description:, schema:, title: nil, output_schema: nil, annotations: nil, server: nil,
-                   task_support: nil, icons: nil, meta: nil)
+                   task_support: nil, icons: nil, meta: nil, output_schema_declared: nil)
       @name = name
       @title = title
       @description = description
       @schema = schema
       @output_schema = output_schema
+      # An explicit `"outputSchema": null` declares a schema — an unusable
+      # one — and is not the same as leaving the member out.
+      @output_schema_declared = output_schema_declared.nil? ? !output_schema.nil? : output_schema_declared
       @annotations = annotations
       @server = server
       @task_support = task_support
       @icons = icons
       @meta = meta
+      # A frozen object is copied by reference by DeepCopy, so the token
+      # survives every copy of this definition.
+      @schema_identity = Object.new.freeze
     end
 
     # Create a Tool instance from JSON data
@@ -64,7 +79,11 @@ module MCPClient
       # Some servers (Playwright MCP CLI) use 'inputSchema' instead of 'schema'
       # Handle both string and symbol keys
       schema = data['inputSchema'] || data[:inputSchema] || data['schema'] || data[:schema]
-      output_schema = data['outputSchema'] || data[:outputSchema]
+      # By key presence: a boolean false schema is a schema (one that
+      # accepts nothing), not an absent one, and neither is an explicit null
+      # (an unusable schema root, like any other non-schema value).
+      output_schema_declared = data.key?('outputSchema') || data.key?(:outputSchema)
+      output_schema = data.key?('outputSchema') ? data['outputSchema'] : data[:outputSchema]
       annotations = data['annotations'] || data[:annotations]
       title = data['title'] || data[:title]
       execution = data['execution'] || data[:execution]
@@ -77,6 +96,7 @@ module MCPClient
         schema: schema,
         title: title,
         output_schema: output_schema,
+        output_schema_declared: output_schema_declared,
         annotations: annotations,
         server: server,
         task_support: task_support,
@@ -183,7 +203,11 @@ module MCPClient
     # Check if the tool supports structured outputs (MCP 2025-06-18)
     # @return [Boolean] true if the tool has an output schema defined
     def structured_output?
-      !@output_schema.nil? && !@output_schema.empty?
+      # Any declared schema counts: a boolean schema (true: any value;
+      # false: none), the empty schema `{}` (any value) and an explicit null
+      # (a schema root the validator rejects) included. Only the absence of
+      # outputSchema means no structured output.
+      @output_schema_declared
     end
 
     # Whether task-augmented execution is allowed for this tool (MCP 2025-11-25).

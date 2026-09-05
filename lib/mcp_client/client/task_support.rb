@@ -647,7 +647,7 @@ module MCPClient
       def validated_sync_result(result, tool)
         return result unless tool
 
-        validate_structured_content!(tool, result)
+        validate_called_result!(tool, result)
       end
 
       # The result a task delivered, validated against the definition the
@@ -661,7 +661,7 @@ module MCPClient
       def validated_task_result(task, result)
         return result unless task.is_a?(MCPClient::Task) && task.called_tool
 
-        validate_structured_content!(task.called_tool, result)
+        validate_called_result!(task.called_tool, result)
       end
 
       # The handle for a CreateTaskResult, which MUST carry a taskId.

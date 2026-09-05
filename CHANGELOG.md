@@ -5,8 +5,477 @@
 Groundwork for the 2026-07-28 protocol revision (stateless, per-request
 metadata). Each feature lands in its own PR; this section accumulates them.
 
+### JSON Schema handling
+
+- **The standard assertions are evaluated, patterns are ECMAScript, and
+  unsupported dialects are refused wherever they appear (second verification
+  round).** MCP 2026-07-28 basic "Implementation Requirements" makes JSON
+  Schema 2020-12 support mandatory, and a standard assertion left unevaluated
+  is not a smaller report but a wrong verdict. Eight fixes:
+
+  - *Every decidable standard keyword is now applied.* `multipleOf`,
+    `uniqueItems`, `contains` (item by item, with `minContains` /
+    `maxContains`), `minProperties` / `maxProperties`, `patternProperties`,
+    `additionalProperties`, `propertyNames`, `dependentRequired` /
+    `dependentSchemas` (and both halves of draft-07 `dependencies`) and
+    `additionalItems` were reported as "unsupported" and skipped. Skipping
+    them left a composition branch *undecided*, and an undecided branch is
+    accepted wherever the composition is monotonic — so
+    `{"allOf": [{"multipleOf": 3}]}` admitted `4`, `{"not": {"multipleOf":
+    2}}` admitted `4`, `{"uniqueItems": true}` admitted `[1, 1]`, and
+    `{"contains": {"type": "string"}}` admitted `[1, 2]`. All of them are
+    evaluated now (`uniqueItems` under JSON equality, so `[1, 1.0]` is not
+    unique, and `multipleOf` by exact division, so `0.0075` is a multiple of
+    `0.0001`), and the partial-coverage report is left with only what
+    genuinely cannot be decided: the two keywords read off the annotations a
+    whole composition produces (`unevaluatedItems`, `unevaluatedProperties`),
+    the dynamic references, and the two keywords that only annotate (`format`,
+    `contentSchema`). A node whose own `type` already rejected the value no
+    longer evaluates the keywords for the type it does not have.
+  - *A `pattern` is an ECMA-262 regular expression.* Ruby's `^` and `$` match
+    at every line boundary, ECMAScript's only at the ends of the subject
+    (JSON Schema 2020-12 Core Section 4.3), so `"a\nb"` satisfied `"^a$"`
+    here and not there — and through `not` was *rejected* although the schema
+    accepts it. The anchors are rewritten before matching (an escaped one, and
+    one inside a character class, stays literal); `patternProperties` keys are
+    matched the same way.
+  - *An unsupported output dialect is an error in both modes.* It was routed
+    through the structured-content violation path, so the default `:warn` mode
+    logged it and returned the result. The client cannot read the schema at
+    all, which the spec's "MUST ... return an appropriate error indicating the
+    dialect is not supported" does not leave to the host's mode.
+  - *A refreshed input dialect is refused too.* The check covered the
+    definition a call was prepared from, not the one it was answered under: a
+    transport's `HeaderMismatch` recovery re-derives the call's `Mcp-Param-*`
+    headers from a refreshed `tools/list`, and a refreshed `inputSchema`
+    declaring an unsupported dialect passed unnoticed. The result of a call is
+    now checked against the answering definition's dialect as well as its
+    output schema, on `call_tool`, on the streaming path and on a task's
+    result.
+  - *`structuredContent: null` is structured content only from 2026-07-28 on.*
+    MCP 2025-11-25 knows object structured content only, so on a session
+    negotiated to that revision a present null is again what it was there: no
+    structured content at all. A transport that cannot say which revision it
+    negotiated is not assumed legacy.
+  - *Two schema resources may not answer to one URI.* Colliding `$id`s were
+    resolved by luck — whichever the walk met first — while colliding anchor
+    names were already reported. A duplicate resource URI now makes the
+    document unusable (JSON Schema 2020-12 Core Section 9.1.2).
+  - *The preflight reads the remaining keyword shapes.* `{"required":
+    ["a","a"]}`, `{"$id": "urn:root#bad"}`, `{"$anchor": "not a name"}`,
+    `{"minContains": -1}`, `{"multipleOf": 0}`, `{"uniqueItems": "yes"}`,
+    `{"minProperties": -1}`, a malformed `dependentRequired` and a
+    `$dynamicRef` that is not a string were all accepted as usable schemas.
+    Each is now reported: the elements of `required` must be unique, a modern
+    `$id` carries no non-empty fragment, an anchor holds a plain name, and the
+    numeric bounds hold the numbers their keywords are defined to hold.
+  - *An absolute reference into the bundled document is accounted for like the
+    bare pointer it addresses.* Only a bare fragment was recognised as a
+    pointer, so booleans reached through `urn:root#/x-bools/bN` were not
+    charged toward the subschema bound while the identical `#/x-bools/bN`
+    were: 1,100 references to 1,100 booleans passed the preflight under one
+    spelling and were rejected under the other. A reference is retargeted to
+    its bundled resource before its pointer is read, so both spellings count
+    the same.
+
+- **The preflight runs off the call stack, an unsupported input dialect is an
+  error, bundled references resolve, and `definitions` is the modern `$defs`
+  (verification round).** Seven fixes:
+
+  - *The preflight and the coverage scan no longer recurse.* Round 27 made
+    validation iterative, but `check_schema` and `unsupported_keywords` — both
+    of which the client runs *before* `validate`, so its `SystemStackError`
+    rescue could not cover them — still spent an interpreter frame per `$ref`
+    hop. A shallow document below every structural bound whose references
+    chain through 400 schemas (`{"$ref": "#/$defs/0", "$defs": {"0": {"allOf":
+    [{"$ref": "#/$defs/1"}]}, ...}}`) raised `SystemStackError` out of
+    `Client#call_tool` on a transport's reader thread, as its input or its
+    output schema. Both now read the document from an explicit stack, in the
+    same depth-first document order, so only the resource bounds decide.
+  - *An unsupported input dialect is an error the caller sees.* A tool whose
+    `inputSchema` declared, say, `{"$schema": "urn:unknown-dialect"}` had its
+    parameter check silently skipped: the request went out and its result came
+    back successfully, in `:strict` mode as much as in `:warn`. MCP 2026-07-28
+    basic "Implementation Requirements" says a client "MUST handle unsupported
+    dialects gracefully by returning an appropriate error indicating the
+    dialect is not supported", so `call_tool` now raises
+    `MCPClient::Errors::ValidationError` naming the dialect and refuses to
+    send the call. SEP-2106 assigns no JSON-RPC code to this, so it is a
+    library error rather than an invented wire one. An input schema that is
+    unusable for any *other* reason is still only warned about, and the call
+    still goes out.
+  - *A reference to a resource the document bundles resolves inside it.*
+    `{"$defs": {"s": {"$id": "urn:example:s", "type": "string"}}, "$ref":
+    "urn:example:s"}` was rejected as an external reference although its
+    target is right there; so were relative references resolving against the
+    base an enclosing `$id` establishes, and the empty reference `""`, which
+    names the current resource. References are now resolved as URI references
+    (RFC 3986 Section 5.2) against the base of the resource holding them, and
+    only one naming a resource the document does not carry is external —
+    which is what bundling (JSON Schema 2020-12 Core Section 9.3.1) needs.
+    Nothing is fetched, as before.
+  - *`definitions` is the deprecated `$defs` of the modern dialects.* Under
+    2020-12 and 2019-09 it was treated as an unknown container: an `$anchor`
+    declared in it named nothing (`{"definitions": {"x": {"$anchor": "x",
+    "type": "integer"}}, "$ref": "#x"}` rejected `1` as unresolvable), and
+    what it held was neither preflighted nor scanned for unsupported
+    keywords. The meta-schema of both dialects retains `definitions`, and
+    2020-12 Validation Appendix A asks implementations to give it the
+    behaviour of `$defs`; it now has it. `$defs` remains unknown to draft-07,
+    which does not define it.
+  - *2019-09 and draft-07 anchor names admit a colon.* Both spell a plain
+    name `[A-Za-z][-A-Za-z0-9.:_]*`, where 2020-12 spells it
+    `[A-Za-z_][-A-Za-z0-9._]*`. The 2020-12 syntax was applied to every
+    dialect, so a legal `{"$anchor": "a:b"}` under 2019-09 named nothing and
+    `"#a:b"` was reported unresolvable. Each dialect's own syntax now
+    applies, at the resource the reference resolves in.
+  - *Malformed keyword values are rejected at preflight.* `{"allOf": []}` and
+    `{"prefixItems": []}` were accepted and then read as permissive, though
+    both keywords are defined to hold a non-empty array; a `$defs` entry that
+    is not a schema was exempted unless a reference reached it; and the
+    assertion keywords the validator evaluates (`type`, `enum`, `required`,
+    `pattern`, `minLength` / `maxLength`, `minItems` / `maxItems`, `minimum` /
+    `maximum`) were read whatever they held. All of them now make the schema
+    unusable, naming the keyword at fault, rather than passing data off as
+    checked.
+  - *An undecidable condition still reports a failure both branches agree
+    on.* `validate(3, {"if" => {"multipleOf" => 2}, "then" => false, "else"
+    => false})` returned no errors, and so did validating `4`: the `if` uses a
+    keyword this validator does not evaluate, so neither branch was applied.
+    Exactly one of `then` and `else` is applied whichever way the condition
+    goes (JSON Schema 2020-12 Section 10.2.2), so a value both of them reject
+    is invalid — and is now reported, under `:strict` as a raised violation.
+    A conditional whose branches genuinely disagree, or that writes only one
+    of them, stays undecided as before.
+
+- **Schemas applied to one value no longer consume the call stack, and a
+  draft-07 `$id` fragment is percent-decoded (round 27).** Round 26 stopped
+  *counting* the schemas a node applies to the same instance value against
+  the depth bound, but each of them still cost a Ruby stack frame: a
+  recursive schema composed through N `$defs` mixins applied N of them per
+  instance level, so the stack grew with the product of the instance depth
+  and the mixin count. Eight `allOf` mixins aborted a 90-level instance with
+  `validation aborted: schema too deeply recursive for this stack` on the
+  main thread, and four of them aborted a 99-level one on a `Thread` — the
+  stack a transport's reader actually runs on — so a conforming
+  `structuredContent` failed the validation the MCP tools spec says a client
+  SHOULD perform. The same-instance applications — a `$ref` hop, an `allOf`
+  / `anyOf` / `oneOf` / `not` / `if` branch, a `then` / `else` — are now
+  applied iteratively on an explicit stack, so a frame is spent only on a
+  step into a child value and `MAX_NODE_DEPTH` genuinely bounds the stack:
+  every mixin count reaches the full 256 levels the bound names, on a thread
+  as on the main stack, and an instance nested past it aborts as
+  `instance nested deeper than 256` rather than on the stack. The
+  `SystemStackError` rescue stays as a backstop. Separately, a draft-07 `$id`
+  is a URI reference, so the plain name it declares is now percent-decoded
+  (RFC 3986 Section 2.1) exactly as a `$ref`'s fragment already was:
+  `$id: "#foo%2Dbar"` declares the anchor `foo-bar`, and the matching
+  `$ref: "#foo%2Dbar"` resolves instead of being reported unresolvable.
+
+- **The instance-depth bound counts descents into the instance (round 26).**
+  The depth budget the walk applies (round 25) counted every frame of the
+  walk, `$ref` hops and `allOf` / `anyOf` / `oneOf` / `if` branches applied to
+  the *same* instance value included. A recursive schema composed through a
+  handful of `$defs` mixins spends several such frames per instance level, so
+  the count ran up at a multiple of the data's depth and JSON a peer can
+  legitimately send — nesting under `JSON.parse`'s default `max_nesting` of
+  100 — aborted with `validation aborted: instance or schema nesting deeper
+  than 512`: a `SchemaValidationError` under `:strict`, a false mismatch
+  under `:warn`. Only a step into a child value — an array item or a property
+  value — is counted now, the way the validate-time `$ref` hop budget already
+  works, and same-instance recursion stays bounded by `MAX_REF_DEPTH` and
+  `MAX_NODE_VISITS` as before. The bound is 256 levels of instance nesting,
+  and because it cannot bound what a single level costs on the stack,
+  `SchemaValidator.validate` also catches `SystemStackError` and reports it as
+  one aborted validation: an instance nested past what the stack can carry
+  still ends as a validation error rather than an exception escaping a tool
+  call, on a transport's reader thread as much as on the main one.
+
+- **A `$ref` to a non-schema member, unsatisfiable `contains` bounds and a
+  depth-bounded walk (round 25).** The keyword scan no longer raises
+  `ArgumentError` when a local `$ref` points at a member that is not a schema
+  object (`{"$ref": "#/x", "x": true}`, `{"definitions": {}, "x": 1.5,
+  "$ref": "#/x"}`): such a target has no lexical depth at all, so the depth
+  the scan compares stays a number and an accepted schema can no longer turn
+  a successful call into an exception. `contains` bounds that no count can
+  satisfy — `minContains` above `maxContains`, the default `minContains` of 1
+  beside `maxContains: 0` — now fail on the bounds alone, before any appeal
+  to an item schema this validator cannot decide, so `anyOf` / `if` /
+  `oneOf` / `not` no longer fail open on them; bounds the array's length
+  genuinely cannot settle (`minContains: 0, maxContains: 0` over an
+  undecidable item schema) stay unevaluated as before. The walk over an
+  instance is bounded at 512 levels of nesting, so data nested deeper than
+  the interpreter's stack allows — reachable through the public
+  `SchemaValidator.validate`, which unlike the wire path is not gated by
+  `JSON.parse`'s `max_nesting` — aborts with a single validation error
+  instead of a `SystemStackError` that escapes the validator. (What that
+  bound counts, and its value, are corrected in round 26 above.)
+
+- **Malformed percent escapes, contains bounds the length settles and the
+  `$ref` hop budget (round 24).** A `$ref` fragment holding a malformed
+  percent escape (`#/$defs/a%ZZ`, `#/$defs/a%`) decodes to nothing and is
+  unresolvable (RFC 3986 Section 2.1), instead of falling back to the
+  undecoded text and resolving onto a member literally spelled that way, so
+  such a schema is reported unusable. The number of items a `contains` can
+  match is between none and the array's length whatever its item schema
+  says, so every bound that range settles is now decided rather than left
+  open: any `contains` rejects an array shorter than `minContains` (the
+  empty array by default), and a `contains` of `false` matches nothing — so
+  `not` / `if` / `oneOf` / `anyOf` no longer fail open on them. The
+  validation-time `$ref` hop budget counts the references applied to one
+  instance value and starts over below each property and item, so a
+  recursive schema (`{"items": {"$ref": "#"}}`) describes data nested deeper
+  than 32 levels instead of aborting on it.
+
+- **The pointer to an empty-named member, decided `contains` and satisfied
+  dependencies (round 23).** The JSON pointer `/` (`#/`, `#%2F`) addresses
+  the member named `""` (RFC 6901 Section 5) instead of the whole document,
+  so a `$ref` to it resolves rather than being reported as a cyclic chain,
+  and `#/` without such a member is unresolvable. A `contains` whose schema
+  matches every item (`true` / `{}`) is decided against the array's own
+  length — the default `minContains` of 1 rejects the empty array, and
+  `maxContains` bounds it — instead of only leaving a branch undecided, so
+  `not` / `if` / `oneOf` / `anyOf` no longer fail open on it. A
+  `dependentRequired` (or draft-07 `dependencies`) list whose names the
+  instance already carries cannot fail, so those branches are decided too.
+
+- **Adopted subtrees, data-keyword identifiers and readable fragments
+  (round 22).** A subtree a pointer enters through a data keyword
+  (`default`, `enum`, `const`, `examples`) is normalized and indexed once,
+  memoized by the identity of what the document holds, and the rest of the
+  pointer is walked through that copy: a nested pointer such as
+  `#/default/$defs/i` lands on the object the index already knows, with the
+  resource, dialect and subschema charge it gave it, instead of a second
+  copy attributed to the referrer. Such a subtree declares no anchors of
+  its own unless an `$id` really starts a resource there, so an `$anchor`
+  written inside a data keyword no longer collides with the document's
+  names or makes `#name` resolvable depending on member order; `validate`
+  reuses the index the preflight built, so an accepted schema validates the
+  way it was checked. A `$ref` fragment whose percent-escapes are not valid
+  UTF-8 resolves to nothing instead of raising. A property, definition or
+  pattern named `enum`, `const`, `default` or `examples` is a schema
+  position like any other. A composition branch its supported assertions
+  already rejected is not measured for the keywords the validator does not
+  evaluate. The once-per-definition input-schema and coverage checks are
+  forgotten with the tool-cache entries they name.
+
+- **Bounded coverage matching and adopted targets (round 21).** The pattern
+  matching behind the `patternProperties` / `additionalProperties` /
+  `unevaluatedProperties` coverage checks runs under the validation
+  deadline and the same regexp timeout as `pattern`, so a backtracking
+  expression cannot hold the calling thread. Every schema a pointer adopts
+  from a data or vendor keyword is charged against
+  `MAX_STRUCTURAL_OBJECTS` — string keys included, which is what arrives
+  over the wire — and its reachable positions are indexed within the
+  existing bounds, so a nested `$ref` such as `#/default/$defs/i` resolves
+  and the schemas inside an adopted resource keep its dialect. Dependency
+  triggers are looked up in both key forms. An explicit
+  `"outputSchema": null` in `tools/list` is a declaration, not an absent
+  field: the client still requires `structuredContent` and reports the null
+  schema as unusable, like any other invalid schema root.
+
+- **Inert assertions and unvisited positions (round 20).** Under `not` /
+  `oneOf` / `if`, `contains` of `true` / `{}` on an array that already
+  holds the items `minContains` requires, `unevaluatedItems` once such a
+  `contains` (or an `items` schema) evaluated every item, `patternProperties`
+  matching nothing or only tautologies, and a dependency whose present
+  trigger cannot fail (an empty required list, `true`, `{}`) decide
+  nothing; a boolean in a position the preflight walk never visits — beside
+  a draft-07 `$ref`, or behind an opaque keyword — is charged toward
+  `MAX_SUBSCHEMAS` when a reference reaches it; the unsupported-keyword
+  scan follows a pointer into a data keyword at the target's own position;
+  a symbol-keyed target adopted from a data keyword is copied within the
+  structural budget.
+
+- **Definition identity (round 19).** `Tool#schema_identity` names a tool
+  definition: every copy the client cache hands out carries the same
+  token and a definition fetched again carries a new one, so the
+  once-per-definition checks of a tool's schemas (unusable input schema,
+  partial output-schema coverage) run once across cache hits and again
+  after a refresh, without hashing a peer-supplied document.
+  `MCPClient::DeepCopy.copy` is iterative, so copying a document nested
+  deeper than the Ruby stack allows cannot overflow it.
+
+- **Dialect-opaque pointers and charged booleans (round 17).** A pointer
+  step through a keyword the dialect in force does not define
+  (`prefixItems` under draft-07) is opaque data, so it cannot undercount a
+  target's depth; every distinct boolean a `$ref` reaches counts once
+  toward `MAX_SUBSCHEMAS`; under draft-07 `format` is an unevaluated
+  assertion (a string branch carrying one is undecided) while 2019-09 and
+  2020-12 keep it an annotation; a companion keyword the dialect does not
+  define (`minContains` under draft-07) changes nothing.
+
+- **Pointer depth by the dialect in force, ineffective assertions
+  (round 18).** The depth of what a pointer `$ref` reaches is classified by
+  the dialect in force at each node — an embedded resource's own `$schema`
+  takes over when the pointer enters it — and once the pointer crossed a
+  keyword that dialect does not define, every token counts, a lexical depth
+  recorded under another grammar never overriding it (a 2020-12
+  `prefixItems` boolean inside a draft-07 document is legal at the bound; a
+  draft-07 `prefixItems` nest reached by pointer is out of bounds). A
+  boolean the preflight walk already admitted is not charged a second time
+  when a reference reaches it. A schema a pointer reaches under a data or
+  vendor keyword is indexed on arrival (a `$ref` written in it resolves in
+  its resource) and normalized when given with symbol keys. Under `not`,
+  `oneOf` and `if`, an unevaluated assertion that cannot change this
+  instance decides nothing: `unevaluatedItems` when the tuple or an `items`
+  schema covers every item, `additionalProperties` / `unevaluatedProperties`
+  when every property is covered, `uniqueItems` below two items,
+  `maxContains` / `maxProperties` the instance cannot exceed,
+  `minProperties` it already satisfies, a dependency none of whose
+  triggers is present.
+- **Round 12.** A `$id` resource the anchor index could not reach (beyond
+  the depth bound) counts as truncation and a reference from a schema the
+  index does not know is unresolvable, never resolved against the document
+  root; a branch of `not` / `oneOf` / `if` is undecided only while an
+  unevaluated assertion that applies to the instance remains — annotations
+  (`format`, `contentSchema`) and assertions of another instance type
+  decide nothing, so a branch settled by its evaluated keywords is a full
+  verdict (`ANNOTATION_KEYWORDS`, `UNSUPPORTED_ASSERTIONS_BY_TYPE`).
+- **Definite verdicts (round 13).** A branch that fails on an evaluated
+  assertion leaves no uncertainty behind, `anyOf` passes as soon as any
+  branch definitely passes (whatever the order of an undecided one), and
+  `oneOf` fails as soon as two branches definitely pass; uncertainty only
+  counts where it could still change the outcome.
+
+- **Dialects.** `MCPClient::SchemaValidator` treats a schema without
+  `$schema` as JSON Schema 2020-12, accepts 2020-12, 2019-09 and draft-07
+  (`SUPPORTED_DIALECTS`), and reports any other declared dialect as an
+  error ("dialect ... is not supported") instead of validating permissively.
+  `SchemaValidator.check_schema` reports why a schema is unusable; an
+  unusable `outputSchema` is a structured-content violation (warning or
+  `ValidationError` in `:strict` mode) and an unusable `inputSchema` is
+  logged once per tool.
+- **`$ref`.** References inside the schema document (`#`, `#/$defs/...`,
+  `#/definitions/...`, any JSON pointer, with `~0`/`~1` and percent
+  escapes) are resolved, recursively, with a hop limit. A `$ref` to a
+  network URI, another document, a `urn:` or `file:` is never dereferenced
+  and makes the schema unusable rather than permissive; an unresolvable
+  local `$ref` is an error too.
+- **Composition.** `allOf`, `anyOf`, `oneOf`, `not`, `if`/`then`/`else`,
+  `prefixItems` (2020-12) / tuple-form `items` (draft-07, 2019-09) and
+  boolean schemas (root or nested) are evaluated (they are no longer
+  reported as unsupported keywords); under draft-07 a `$ref` replaces its
+  siblings. Resource bounds apply: nesting depth (`MAX_SCHEMA_DEPTH`),
+  total subschemas (`MAX_SUBSCHEMAS`, boolean subschemas included), `$ref`
+  chain length (`MAX_REF_DEPTH`, checked at preflight too), nodes visited
+  (`MAX_NODE_VISITS`), errors produced (`MAX_ERRORS`) and the
+  per-validation time budget; hitting a bound aborts the validation with
+  a single error, never with a pass, even under `not` or `oneOf`. Values
+  quoted in messages are clipped, and the client sanitizes and bounds the
+  violation text it logs or raises. Errors inside `anyOf` / `oneOf` /
+  `not` / `if` candidates are only a verdict and do not count toward the
+  error bound; positional keywords follow the dialect (`prefixItems` in
+  2020-12, where an `items` array is invalid; an `items` array in draft-07
+  and 2019-09); a present but malformed `$schema` makes the schema
+  unusable; an `outputSchema` of `false` is preserved by `Tool.from_json`.
+  Plain-name fragments are scoped to their schema resource (a subschema
+  whose `$id` is a URI starts a new resource; `#name` never crosses into or
+  out of an embedded resource), a draft-07 `$id` is a plain name only when
+  it is a pure fragment, keywords beside a draft-07 `$ref` contribute no
+  anchors, `$defs` belongs to 2019-09 / 2020-12 and `definitions` to
+  draft-07 (the other bag is unknown to the dialect and not walked, though
+  JSON pointers into it still resolve and what a `$ref` reaches is
+  preflighted), and the unsupported-keyword scan stops at the subschema
+  bound and runs once per tool output schema. Pointer fragments are
+  relative to the schema resource the `$ref` sits in (`#` and `#/$defs/x`
+  inside an embedded resource are that resource's), the unsupported-keyword
+  scan follows local `$ref`s (a target in a definition bag the dialect does
+  not walk is scanned too), an `if` without `then` or `else` is not
+  evaluated, and a document with more than `MAX_STRUCTURAL_OBJECTS` objects
+  is rejected while it is being normalized rather than copied whole.
+  The keyword grammar follows the dialect (`DIALECT_KEYWORDS`): a keyword
+  the dialect does not define (`prefixItems` or `$dynamicRef` in draft-07,
+  `dependencies` or `additionalItems` in 2020-12, ...) is ignored rather
+  than shape-checked or reported, draft-07 `dependencies` accepts property
+  name arrays, `exclusiveMinimum` / `exclusiveMaximum` are numbers in
+  every supported dialect (draft-07 included; the draft-04 boolean form is
+  a schema problem) and are applied independently of `minimum` /
+  `maximum`, each validation error counts once toward `MAX_ERRORS`,
+  percent-encoded plain-name fragments are decoded before the anchor
+  lookup, a draft-07 `$ref` hides its sibling applicators at
+  preflight too, plain-name fragments (`#name`) resolve to `$anchor` /
+  `$dynamicAnchor` (2019-09, 2020-12) or `$id: "#name"` (draft-07), and an
+  external `$recursiveRef` (2019-09) makes the schema unusable like an
+  external `$dynamicRef`. `Tool#structured_output?` is true for any
+  provided `outputSchema`, the empty schema `{}` included, so such a tool's
+  successful result must carry `structuredContent`.
+- **structuredContent.** Any JSON value is accepted, including `null`:
+  presence is decided by the `structuredContent` key, and the value —
+  object, array, scalar or null — is validated against the output schema.
+  The `x-mcp-header` annotation is ignored by the validator.
+- **Resources and anchors (round 9).** Plain-name anchors come only from
+  schema positions the dialect walks: a definition bag the dialect does
+  not define (`definitions` under 2020-12, `$defs` under draft-07) stays
+  pointer-addressable but is never a source of names, and nothing beside a
+  draft-07 `$ref` but its `definitions` is. An embedded resource root (a
+  subschema whose `$id` is a URI) may declare its own `$schema`, which is
+  the dialect for that resource at preflight, in the anchor index, in the
+  keyword scan and during validation (a malformed or unsupported embedded
+  `$schema` makes the schema unusable like at the root; a `$schema` that is
+  not at a resource root is ignored). The structural bound counts array
+  members too, so a wide array of boolean schemas is rejected before it is
+  copied, and numeric bound errors clip the values they quote.
+- **Reference chains and anchors (round 10).** A `$ref` chain is
+  followed by where each hop lands, not by the text of its fragment, so a
+  reference entering an embedded resource whose own `$ref` reuses the same
+  fragment is not a cycle (a chain returning to a schema it reached still
+  is); an `$anchor` / `$dynamicAnchor` (or draft-07 fragment `$id`)
+  declared more than once within one schema resource makes the schema
+  unusable instead of binding references to whichever declaration was met
+  first. A resource (`$id` URI) reached through a definition bag the
+  dialect does not walk names its own anchors (nothing outside it sees
+  them); the structural bound counts object entries too, so a wide map of
+  leaf values is rejected before it is copied, and the copy runs under the
+  validation deadline.
+- **Undecided branches and bounds (round 11).** A branch the validator
+  can only partly evaluate (it carries an unsupported assertion such as
+  `multipleOf`) is no verdict for `not`, `oneOf` or `if`: it is neither a
+  match nor a mismatch, so `{"not": {"multipleOf": 2}}` never rejects a
+  value (anyOf / allOf keep treating a partial pass as a pass, the
+  permissive direction). A document nested deeper than
+  `MAX_SCHEMA_DEPTH` schema levels can hold is rejected while it is
+  copied instead of keeping the rest raw; the client keys its once-per
+  schema checks by the schema object, never by hashing a peer document
+  whole. Under draft-07 a URI `$id` beside a `$ref` is ignored with the
+  other siblings (it starts no resource); an anchor index that stopped at
+  its bound before reaching every object makes the schema unusable; a JSON
+  Pointer token with `~` not followed by `0` or `1` is unresolvable (RFC
+  6901).
+- **Decided compositions and effective assertions (round 14).** `anyOf`,
+  `oneOf` and `allOf` stop evaluating branches once the outcome is
+  definite (any pass, two passes, the first failure), so a later branch
+  can no longer abort a decided validation (`{"anyOf": [true, {"$ref":
+  "#"}]}` accepts everything); an unevaluated assertion counts as
+  uncertainty under `not` / `oneOf` / `if` only when it can still change
+  the result (`minContains` / `maxContains` need `contains`,
+  `additionalItems` a tuple `items`, and tautological values such as
+  `additionalProperties: true`, `uniqueItems: false`, `minProperties: 0`
+  or an empty dependency map decide nothing); a referenced target is
+  bounded by its own lexical depth, not the referring location, a boolean
+  target is not charged per reference, and boolean subschemas obey the
+  depth bound.
+- **Positions and assertions (round 15).** Lexical depths follow each
+  resource's own dialect, so the bounds verdict cannot depend on key
+  order; the unsupported-keyword scan reads a referenced target at its
+  own lexical depth; a boolean a pointer reaches obeys the depth bound at
+  its own position; a tautological `additionalItems` beside a tuple
+  decides nothing; an input schema the validator cannot interpret asserts
+  nothing (the call goes out without the `required` check).
+
 ### Authorization (RFC 9207 issuer validation, client registration)
 
+- **Pointer depth and instance-aware assertions (round 16).** The depth
+  of what a pointer `$ref` reaches is counted in schema steps along the
+  percent-decoded pointer (`#/properties/b` and `#/allOf/0` are one below
+  the enclosing schema), so a boolean legal at the bound is not rejected
+  when referenced; every token under a data or unknown keyword
+  (`default`, `enum`, `const`, `examples`, vendor keys) is a step, so a
+  document hidden there obeys `MAX_SCHEMA_DEPTH` too (and an object
+  reached that way is walked at its own position). An unevaluated
+  assertion is uncertainty only when it can still change this instance:
+  `additionalItems: false` decides nothing when the tuple covers every
+  item, and `contains` decides nothing when `minContains` is 0.
 - **Issuer validation.** `OAuthProvider#start_authorization_flow` records
   the selected authorization server's `issuer` with the PKCE record;
   `complete_authorization_flow(code, state, iss:)` (and
