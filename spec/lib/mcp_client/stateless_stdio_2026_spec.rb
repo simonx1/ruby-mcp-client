@@ -618,7 +618,8 @@ RSpec.describe 'MCP 2026-07-28 stateless protocol (stdio)' do
       sent = script_stdio(server, [{ 'result' => { 'resultType' => 'input_required',
                                                    'requestState' => 'opaque-state' } }])
 
-      expect { server.list_tools }.to raise_error(MCPClient::Errors::ToolCallError, /modern but incompatible/i)
+      expect { server.list_tools }
+        .to raise_error(MCPClient::Errors::ToolCallError, /input_required result; multi round-trip requests/i)
       expect(sent.map { |r| r['method'] }).to eq(['server/discover'])
     end
 
@@ -955,29 +956,32 @@ RSpec.describe 'MCP 2026-07-28 stateless protocol (stdio) — review follow-ups'
       expect(sent.size).to eq(2)
     end
 
-    # An unfinished answer that asks for nothing is still unfinished. This
-    # client MAY retry such a result immediately, and if it ever does it MUST
-    # echo requestState unchanged — until then it surfaces the state rather
-    # than re-sending the call or presenting an empty result as the answer.
-    it 'surfaces an unfinished result that carries only requestState, without re-sending' do
+    # An unfinished answer that asks for nothing is still unfinished: the
+    # round-trip resolver re-sends the call with requestState echoed back
+    # unchanged, under a new id, rather than presenting an empty result as
+    # the answer.
+    it 'retries an unfinished result that carries only requestState, echoing the state' do
+      allow(server).to receive(:sleep)
       sent = script_stdio(server, [{ 'result' => discover_result },
                                    { 'result' => { 'resultType' => 'input_required',
-                                                   'requestState' => 'opaque-blob' } }])
+                                                   'requestState' => 'opaque-blob' } },
+                                   { 'result' => { 'resultType' => 'complete', 'content' => [] } }])
 
-      expect { server.call_tool('t', {}) }.to raise_error(MCPClient::Errors::InputRequiredError) do |e|
-        expect(e.request_state).to eq('opaque-blob')
-        expect(e.input_requests).to eq({})
-      end
-      expect(sent.map { |r| r['method'] }).to eq(%w[server/discover tools/call])
+      expect(server.call_tool('t', {})['content']).to eq([])
+      expect(sent.map { |r| r['method'] }).to eq(%w[server/discover tools/call tools/call])
+      expect(sent.last['params']['requestState']).to eq('opaque-blob')
+      expect(sent.last['id']).not_to eq(sent[1]['id'])
     end
 
-    it 'surfaces an unfinished prompts/get answer the same way' do
-      script_stdio(server, [{ 'result' => discover_result },
-                            { 'result' => { 'resultType' => 'input_required', 'requestState' => 'blob' } }])
+    it 'retries an unfinished prompts/get answer the same way' do
+      allow(server).to receive(:sleep)
+      sent = script_stdio(server, [{ 'result' => discover_result },
+                                   { 'result' => { 'resultType' => 'input_required',
+                                                   'requestState' => 'blob' } },
+                                   { 'result' => { 'resultType' => 'complete', 'messages' => [] } }])
 
-      expect { server.get_prompt('greet', {}) }.to raise_error(MCPClient::Errors::InputRequiredError) do |e|
-        expect(e.request_state).to eq('blob')
-      end
+      expect(server.get_prompt('greet', {})['messages']).to eq([])
+      expect(sent.last['params']['requestState']).to eq('blob')
     end
   end
 end

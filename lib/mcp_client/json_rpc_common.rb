@@ -1039,9 +1039,10 @@ module MCPClient
         # the fulfilled answers nor the state the server MUST get back.
         result = MCPClient::JsonRpcCommon.restore_wire_keys(result)
         unless modern? && MRTR_METHODS.include?(method)
-          raise MCPClient::Errors::InvalidResultError,
-                "Invalid result: input_required is only valid for #{MRTR_METHODS.join(', ')} " \
-                "on an MCP 2026-07-28 server, not #{method} (#{protocol_version})"
+          raise MCPClient::Errors::InvalidResultError.new(
+            "Invalid result: input_required is only valid for #{MRTR_METHODS.join(', ')} " \
+            "on an MCP 2026-07-28 server, not #{method} (#{protocol_version})", data: result
+          )
         end
 
         round_trips += 1
