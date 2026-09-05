@@ -19,11 +19,21 @@ metadata). Each feature lands in its own PR; this section accumulates them.
   of the process. The probe *declares* a protocol version without
   establishing one: until it is answered `protocol_era` stays `nil`, and a
   server-initiated request (a legacy server MAY `ping` during initialization,
-  and may answer nothing until the response arrives) is still handled.
+  and may answer nothing until the response arrives) is still handled. The
+  exception is `protocol: :modern`, which has already ruled out the legacy
+  fallback that accommodation exists for: it never runs a host callback for a
+  server request and never writes a JSON-RPC response, probe in flight or not.
 - **A failed negotiation releases the transport.** If discovery or the
   handshake fails, the subprocess is shut down and its pipes and reader
   threads are closed before the error is raised, so a retry cannot strand the
   previous process behind overwritten handles.
+- **An unexpected exit is recoverable.** If the subprocess behind a completed
+  handshake exits, the reader thread retires the transport instead of leaving
+  the session writing to a dead process's pipes: the next request closes the
+  stale handles and negotiates again against a fresh subprocess
+  (basic/transports/stdio "Unexpected Termination": clients SHOULD restart a
+  server that terminated unexpectedly). The request that was in flight still
+  fails — the server may already have executed it, so it is never replayed.
 - **Per-request metadata.** Every request to a modern server carries
   `io.modelcontextprotocol/protocolVersion`, `clientInfo` and
   `clientCapabilities` in `_meta` (with `extensions` once declared via
@@ -56,12 +66,17 @@ metadata). Each feature lands in its own PR; this section accumulates them.
   proposal), `protocol_era` (`:modern`, `:legacy`, or `nil` while the era is
   unknown), `modern?`, `supported_versions`. Initialization is serialized, so
   concurrent first requests run the probe once.
-- **Multi round-trip requests are not provoked yet.** Modern requests declare
+- **Multi round-trip requests are not driven yet.** Modern requests declare
   no `roots`, `sampling` or `elicitation` capability until the multi
-  round-trip pattern lands, so a compliant server never returns an
-  `input_required` result; if one does anyway it raises
+  round-trip pattern lands, so a compliant server has no input it may ask
+  this client for (basic/patterns/mrtr: a server MUST NOT send an
+  `inputRequests` the client has not declared support for). It may still
+  answer `prompts/get`, `resources/read` or `tools/call` with an
+  `input_required` result carrying only the opaque `requestState`, which a
+  client MAY retry immediately. Either shape raises
   `MCPClient::Errors::InputRequiredError` (exposing `input_requests` and
-  `request_state`) instead of being mistaken for the operation's result.
+  `request_state`) instead of being mistaken for the operation's result;
+  echoing the state back on a retry is left to the multi round-trip PR.
 
 ### Protocol foundations
 

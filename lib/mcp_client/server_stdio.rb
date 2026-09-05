@@ -93,6 +93,10 @@ module MCPClient
       @sampling_request_callback = nil # MCP 2025-11-25
       @reader_thread = nil
       @stderr_thread = nil
+      # Bumped whenever a subprocess is spawned or torn down, so a reader
+      # thread only ever speaks for the transport it was started for.
+      @transport_generation = 0
+      @transport_retired = false
     end
 
     # Server info from the initialize response
@@ -124,6 +128,7 @@ module MCPClient
       else
         @stdin, @stdout, @stderr, @wait_thread = Open3.popen3(@command)
       end
+      @transport_generation += 1
       pin_pipe_encodings
       true
     rescue StandardError => e
@@ -146,13 +151,38 @@ module MCPClient
     # Spawn a reader thread to collect JSON-RPC responses
     # @return [Thread] the reader thread
     def start_reader
+      generation = @transport_generation
       @reader_thread = Thread.new do
         @stdout.each_line do |line|
           handle_line(line)
         end
       rescue StandardError
         # Reader thread aborted unexpectedly
+      ensure
+        retire_transport(generation)
       end
+    end
+
+    # The subprocess closed its stdout: it has exited (or its pipes were
+    # dropped), so no response will ever arrive on this transport again. MCP
+    # 2026-07-28 basic/transports/stdio ("Unexpected Termination") says a
+    # client SHOULD restart a server that terminated unexpectedly, so retire
+    # the handshake rather than let it describe a process that no longer
+    # exists: the next request releases these handles and negotiates again
+    # against a fresh subprocess.
+    #
+    # Nothing is restarted or replayed from here. A request that was in
+    # flight may already have been executed server-side, so it fails as it
+    # would on any other broken transport; only the session is recoverable.
+    # A deliberate shutdown bumps the generation first, so its own reader
+    # reaching EOF is not mistaken for an unexpected exit.
+    # @param generation [Integer] the transport this reader was started for
+    # @return [void]
+    def retire_transport(generation)
+      return unless generation == @transport_generation
+
+      @transport_retired = true
+      @logger.debug('Server stdout closed; the transport will be re-established on the next request')
     end
 
     # Spawn a thread to continuously drain the subprocess stderr.
@@ -202,17 +232,12 @@ module MCPClient
 
       # Dispatch JSON-RPC requests from server (has id AND method) - MCP 2025-06-18
       if msg['method'] && msg.key?('id')
-        # Judged by the ESTABLISHED era, not by protocol_version: during the
-        # server/discover probe the latter is only the version this client
-        # proposed. A legacy server MAY ping while the probe is unanswered
-        # and then wait for the response before doing anything else, so
-        # treating its request as prohibited modern traffic deadlocks the
-        # negotiation.
-        if protocol_era == :modern
+        if modern_peer?
           # MCP 2026-07-28 stdio: "The server MUST NOT write JSON-RPC requests
           # to stdout" and "The client MUST NOT write JSON-RPC responses" —
           # server-to-client interactions travel in InputRequiredResult.
-          @logger.warn("Ignoring server-initiated request #{msg['method']}: not permitted by MCP #{protocol_version}")
+          @logger.warn("Ignoring server-initiated request #{msg['method']}: " \
+                       'a modern MCP server MUST NOT write JSON-RPC requests to stdout')
         else
           handle_server_request(msg)
         end
@@ -243,6 +268,24 @@ module MCPClient
     rescue JSON::ParserError, EncodingError
       # Skip non-JSONRPC or undecodable lines in the output stream so a single
       # bad line cannot kill the reader thread
+    end
+
+    # Whether a server-initiated request is prohibited traffic.
+    #
+    # Judged by the ESTABLISHED era, not by protocol_version: during the
+    # server/discover probe the latter is only the version this client
+    # proposed. A legacy server MAY ping while the probe is unanswered and
+    # then wait for the response before doing anything else, so treating its
+    # request as prohibited modern traffic deadlocks the negotiation.
+    #
+    # The one exception is a client configured protocol: :modern, which has
+    # already ruled out the legacy fallback that the accommodation exists
+    # for. It will never speak legacy, so it never runs a host callback for a
+    # server request nor writes the response back — not even while its own
+    # probe is still in flight.
+    # @return [Boolean]
+    def modern_peer?
+      protocol_era == :modern || @protocol_mode == :modern
     end
 
     # List all prompts available from the MCP server
@@ -725,6 +768,10 @@ module MCPClient
     def cleanup
       return unless @stdin
 
+      # Past this point the reader threads speak for a transport that is
+      # being dismantled on purpose: their EOF must not retire whatever
+      # replaces it.
+      @transport_generation += 1
       @stdin.close unless @stdin.closed?
       terminate_server_process
       @stdout.close unless @stdout.closed?

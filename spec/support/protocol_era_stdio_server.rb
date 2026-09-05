@@ -11,6 +11,9 @@
 #
 # MODE is one of:
 #   modern            answer server/discover with a DiscoverResult
+#   modern-one-shot   like modern, but exit as soon as one tools/list has
+#                     been answered, so an unexpected termination after a
+#                     successful handshake is observable
 #   legacy            reject server/discover, then run the initialize handshake
 #   legacy-ping-first like legacy, but send a `ping` request before answering
 #                     anything and refuse to process further input until the
@@ -96,6 +99,16 @@ def handle_request(msg)
   case MODE
   when 'modern'
     return respond(msg['id'], discover_result(['2026-07-28'])) if msg['method'] == 'server/discover'
+  when 'modern-one-shot'
+    return respond(msg['id'], discover_result(['2026-07-28'])) if msg['method'] == 'server/discover'
+
+    if msg['method'] == 'tools/list'
+      respond(msg['id'], { 'tools' => tools })
+      # Terminate unexpectedly, with the pipes still open on the client side:
+      # the client is expected to notice and restart the server rather than
+      # keep writing to a dead process.
+      exit 0
+    end
   when 'future-only'
     return respond(msg['id'], discover_result(['2099-01-01'])) if msg['method'] == 'server/discover'
   when 'silent-probe'

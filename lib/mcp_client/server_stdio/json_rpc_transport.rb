@@ -12,9 +12,13 @@ module MCPClient
       # @return [void]
       # @raise [MCPClient::Errors::ConnectionError] if initialization fails
       def ensure_initialized
-        return if @initialized
+        return if @initialized && !transport_retired?
 
         @init_lock.synchronize do
+          # The subprocess behind a completed handshake exited under it:
+          # release its pipes and reader threads before connect overwrites
+          # the handles, then negotiate again against the fresh process.
+          release_retired_transport if transport_retired?
           return if @initialized
 
           begin
@@ -28,7 +32,7 @@ module MCPClient
             # next request runs connect again and overwrites @stdin/@stdout/
             # @wait_thread — putting the first process permanently out of
             # cleanup's reach.
-            release_failed_transport
+            release_transport
             raise
           end
 
@@ -36,14 +40,32 @@ module MCPClient
         end
       end
 
-      # Tear down a transport whose handshake never completed. Failures are
-      # swallowed: the transport being unusable is often why negotiation
-      # failed, and the original error is the one worth raising.
+      # @return [Boolean] whether the subprocess behind the handshake exited
+      def transport_retired?
+        @transport_retired
+      end
+
+      # Discard a transport whose subprocess exited after a successful
+      # handshake, so the next negotiation starts from a clean slate rather
+      # than on top of the dead process's handles.
       # @return [void]
-      def release_failed_transport
+      def release_retired_transport
+        @logger.info('The MCP server subprocess exited; restarting it for this request')
+        @initialized = false
+        @transport_retired = false
+        release_transport
+      end
+
+      # Tear down a transport that is not going to be used again — a
+      # handshake that never completed, or a subprocess that exited under a
+      # completed one. Failures are swallowed: the transport being unusable
+      # is often the reason it is being released, and the original error is
+      # the one worth raising.
+      # @return [void]
+      def release_transport
         cleanup
       rescue StandardError => e
-        @logger.debug("Cleanup after a failed handshake did not complete: #{e.message}")
+        @logger.debug("Releasing the stdio transport did not complete cleanly: #{e.message}")
       end
 
       # Establish the server's protocol era (MCP 2026-07-28
@@ -155,7 +177,7 @@ module MCPClient
       # @return [Hash] the DiscoverResult
       def perform_discover
         req_id = next_id
-        req = build_jsonrpc_request('server/discover', {}, req_id)
+        req = build_registered_request('server/discover', {}, req_id)
         send_request(req)
         begin
           res = wait_response(req_id, timeout: @discover_timeout)
@@ -182,7 +204,7 @@ module MCPClient
       def perform_initialize
         # Initialize request
         init_id = next_id
-        init_req = build_jsonrpc_request('initialize', initialization_params, init_id)
+        init_req = build_registered_request('initialize', initialization_params, init_id)
         send_request(init_req)
         res = wait_response(init_id)
         begin
@@ -220,6 +242,22 @@ module MCPClient
           @awaiting[id] = true
           id
         end
+      end
+
+      # Build a JSON-RPC request under an id {#next_id} has already registered
+      # as outstanding. Building can fail — the host's request_meta provider
+      # is evaluated here and may raise — and a request that was never built
+      # is never sent and never answered, so its marker has to go with it;
+      # otherwise every such failure leaks an entry into @awaiting.
+      # @param method [String] JSON-RPC method
+      # @param params [Hash, nil] parameters for the request
+      # @param req_id [Integer] the registered request id
+      # @return [Hash] the JSON-RPC request
+      def build_registered_request(method, params, req_id)
+        build_jsonrpc_request(method, params, req_id)
+      rescue StandardError
+        @mutex.synchronize { @awaiting.delete(req_id) }
+        raise
       end
 
       # Send a JSON-RPC request and return nothing
@@ -278,7 +316,7 @@ module MCPClient
       # @raise [MCPClient::Errors::TransportError] on transport errors
       # @raise [MCPClient::Errors::ToolCallError] on tool call errors
       def rpc_request(method, params = {}, timeout: nil)
-        freshly_probed = !@initialized
+        freshly_probed = !@initialized || transport_retired?
         ensure_initialized
         if method == 'ping' && modern?
           # `ping` was removed in MCP 2026-07-28; the mandatory server/discover
@@ -291,16 +329,17 @@ module MCPClient
         end
 
         result = with_retry(method) do
-          sent_version = protocol_version
+          sent_version = nil
           begin
-            send_request_and_wait(method, params, timeout)
+            send_request_and_wait(method, params, timeout) { |version| sent_version = version }
           rescue MCPClient::Errors::UnsupportedProtocolVersionError => e
             # MCP 2026-07-28 basic/versioning: "The client SHOULD select a
             # mutually supported version from the supported list and retry
             # the request". The server rejected the request before
             # processing it, so re-sending cannot duplicate a side effect.
-            # Compared against the version THIS request went out with: a
-            # concurrent request may already have moved the transport on.
+            # Compared against the version THIS request declared, read back
+            # from the request itself: a concurrent request may have moved
+            # the transport on while this one was being built.
             version = select_protocol_version(e.supported)
             raise unless modern? && version && version != sent_version
 
@@ -326,10 +365,12 @@ module MCPClient
       # @param method [String] JSON-RPC method
       # @param params [Hash] parameters for the request
       # @param timeout [Numeric, nil] per-request timeout override
+      # @yieldparam version [String, nil] the protocol version the request declares
       # @return [Object] result from the JSON-RPC response
       def send_request_and_wait(method, params, timeout)
         req_id = next_id
-        req = build_jsonrpc_request(method, params, req_id)
+        req = build_registered_request(method, params, req_id)
+        yield declared_protocol_version(req) if block_given?
         send_request(req)
         begin
           res = wait_response(req_id, timeout: timeout)
@@ -340,6 +381,18 @@ module MCPClient
           raise
         end
         process_jsonrpc_response(res)
+      end
+
+      # The protocol version a built request declares in its `_meta`. Read
+      # back from the request rather than from the transport: building it
+      # evaluates the host's metadata provider, during which a concurrent
+      # request may settle the transport on a different version.
+      # @param req [Hash] a JSON-RPC request
+      # @return [String, nil] the declared version, nil for a legacy request
+      def declared_protocol_version(req)
+        params = req['params']
+        meta = params.is_a?(Hash) ? params['_meta'] : nil
+        meta.is_a?(Hash) ? meta[JsonRpcCommon::META_PROTOCOL_VERSION] : nil
       end
 
       # Best-effort notifications/cancelled for a request the client stopped
