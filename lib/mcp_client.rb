@@ -23,6 +23,8 @@ require_relative 'mcp_client/server_sse'
 require_relative 'mcp_client/server_http'
 require_relative 'mcp_client/server_streamable_http'
 require_relative 'mcp_client/server_factory'
+require_relative 'mcp_client/client/task_support'
+require_relative 'mcp_client/client/task_api'
 require_relative 'mcp_client/client'
 require_relative 'mcp_client/version'
 require_relative 'mcp_client/config_parser'
@@ -133,7 +135,8 @@ module MCPClient
       client = Client.new(
         mcp_server_configs: configs,
         logger: options[:logger],
-        sampling_handler: options[:sampling_handler]
+        sampling_handler: options[:sampling_handler],
+        extensions: options[:extensions]
       )
 
       # Connect all servers
@@ -171,7 +174,8 @@ module MCPClient
       client = Client.new(
         mcp_server_configs: [config],
         logger: options[:logger],
-        sampling_handler: options[:sampling_handler]
+        sampling_handler: options[:sampling_handler],
+        extensions: options[:extensions]
       )
       client.servers.first.connect
       client

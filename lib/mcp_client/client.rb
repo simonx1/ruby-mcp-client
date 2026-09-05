@@ -4,12 +4,16 @@ require 'logger'
 require 'securerandom'
 require_relative 'deep_copy'
 require_relative 'client/list_aggregation'
+require_relative 'client/task_support'
+require_relative 'client/task_api'
 
 module MCPClient
   # MCP Client for integrating with the Model Context Protocol
   # This is the main entry point for using MCP tools
   class Client
     include ListAggregation
+    include MCPClient::Client::TaskSupport
+    include MCPClient::Client::TaskApi
 
     # Elicitation modes implemented by this client (MCP 2025-11-25).
     # Requests with a mode outside this set are rejected with -32602.
@@ -71,15 +75,19 @@ module MCPClient
     #   (a Hash, or a callable returning one, evaluated per request) — e.g. OpenTelemetry
     #   trace context (`traceparent`, `tracestate`, `baggage`, MCP 2026-07-28) or
     #   vendor-prefixed keys. Reserved protocol keys cannot be set this way.
+    # @param extensions [Array<String>, Hash{String => Hash}, nil] MCP 2026-07-28 extensions to declare
+    #   in every request's clientCapabilities (identifier, or identifier => settings), e.g.
+    #   `['io.modelcontextprotocol/tasks']` to let servers answer tools/call with a task
     def initialize(mcp_server_configs: [], logger: nil, elicitation_handler: nil, roots: nil, sampling_handler: nil,
                    sampling_supports_tools: false, client_info: nil, validate_structured_content: :warn,
-                   request_meta: nil)
+                   request_meta: nil, extensions: nil)
       unless STRUCTURED_CONTENT_MODES.include?(validate_structured_content)
         raise ArgumentError, "validate_structured_content must be one of #{STRUCTURED_CONTENT_MODES.inspect}, " \
                              "got #{validate_structured_content.inspect}"
       end
 
       @validate_structured_content = validate_structured_content
+      @extensions = normalize_extensions(extensions)
       # Preserve a caller-supplied logger's formatter (only tag progname), and
       # install the default formatter solely on a logger we create ourselves.
       # Overwriting the formatter of an application's logger would silently
@@ -296,6 +304,14 @@ module MCPClient
       # request _meta and route matching notifications/progress to the
       # caller's callback while the request is active.
       parameters, token = setup_progress_tracking(parameters, progress)
+      # The session the call is made in: a task it comes back as belongs to
+      # that session, not to one that replaced it while the answer was read.
+      # The call goes into that very session and no other — a transport that
+      # reconnects inside the request would otherwise run the tool in the
+      # replacement session while the task is stamped with the sampled one,
+      # and the wait would then refuse a task whose (possibly non-idempotent)
+      # tool has already run, inviting a duplicate retry.
+      task_epoch = tasks_extension? ? invocation_session_epoch(server) : nil
 
       # The call and the re-resolve that follows it share one slot for the
       # definition the transport's request goes out under, so a call that a
@@ -303,7 +319,7 @@ module MCPClient
       # there.
       with_called_tool_definition(server) do
         result = begin
-          server.call_tool(tool_name, parameters)
+          pinned_to_session(server, task_epoch) { server.call_tool(tool_name, parameters) }
         rescue MCPClient::Errors::ConnectionError => e
           # Add server identity information to the error for better context
           server_id = server.name ? "#{server.class}[#{server.name}]" : server.class.name
@@ -320,9 +336,18 @@ module MCPClient
         # was answered may have gone out under a definition this client never
         # resolved. Validate against that one -- never against the transport's
         # current list, which a tools/list_changed racing the call may already
-        # have replaced with a definition the server never used.
-        tool = called_tool_definition(server, tool_name) || tool
-        validate_structured_content!(tool, result)
+        # have replaced with a definition the server never used. It is read
+        # here, before a task's result is waited for: a refresh that lands
+        # during a wait that may take minutes belongs to another invocation and
+        # says nothing about the definition this one was answered under.
+        called = called_tool_definition(server, tool_name)
+
+        # MCP 2026-07-28 tasks extension: the server may have turned the call
+        # into a task; drive it to its final result so the contract of this
+        # method does not change.
+        result = complete_task_result(tool_name, server, result, task_epoch)
+
+        validate_structured_content!(called || tool, result)
       end
     end
 
@@ -358,6 +383,7 @@ module MCPClient
       servers.each(&:cleanup)
       # The transports forgot their results; the slices built from them go too.
       clear_cache
+      clear_task_states
     end
 
     # The list kinds this client caches, each with the transport-level cache
@@ -460,8 +486,18 @@ module MCPClient
       raise MCPClient::Errors::ServerNotFound, "No server found for tool '#{tool_name}'" unless server
 
       begin
-        # Use the streaming API if it's available
-        server.call_tool_streaming(tool_name, parameters)
+        task_epoch = tasks_extension? ? invocation_session_epoch(server) : nil
+        # Use the streaming API if it's available, opened in the session the
+        # epoch was sampled for: a chunk that comes back as a task is stamped
+        # with that session, so the call must not have been written into the
+        # one that replaced it (see #call_tool). The stream every built-in
+        # transport hands back is lazy, so the call itself goes out under the
+        # pin the enumeration takes (see #streamed_call_chunks) — this one
+        # covers a transport that sends while building it.
+        stream = pinned_to_session(server, task_epoch) { server.call_tool_streaming(tool_name, parameters) }
+        return stream unless task_epoch || (tasks_extension? && modern_server?(server))
+
+        streamed_call_chunks(stream, tool, tool_name, server, epoch: task_epoch)
       rescue MCPClient::Errors::ConnectionError => e
         # Add server identity information to the error for better context
         server_id = server.name ? "#{server.class}[#{server.name}]" : server.class.name
@@ -529,158 +565,6 @@ module MCPClient
       srv.complete(ref: ref, argument: argument, context: context)
     end
 
-    # Call a tool as a task (task-augmented tools/call, MCP 2025-11-25).
-    #
-    # Instead of blocking for the result, the server accepts the request and
-    # immediately returns a task handle; the actual result is retrieved later
-    # via {#get_task_result} once the task reaches a terminal status. The server
-    # must advertise the tasks.requests.tools.call capability, and the tool must
-    # declare execution.taskSupport of 'optional' or 'required'.
-    # @param tool_name [String] the name of the tool to call
-    # @param parameters [Hash] the parameters to pass to the tool
-    # @param ttl [Integer, nil] optional requested task lifetime in milliseconds
-    # @param server [String, Symbol, Integer, MCPClient::ServerBase, nil] optional server to use
-    # @return [MCPClient::Task] the created task (status typically 'working')
-    # @raise [MCPClient::Errors::ToolNotFound] if the tool is not found
-    # @raise [MCPClient::Errors::ValidationError] if required parameters are missing
-    # @raise [MCPClient::Errors::TaskError] if the server or tool does not support tasks, or creation fails
-    def call_tool_as_task(tool_name, parameters, ttl: nil, server: nil)
-      tool = resolve_tool(tool_name, server: server)
-      validate_params!(tool, parameters)
-
-      srv = tool.server
-      raise MCPClient::Errors::ServerNotFound, "No server found for tool '#{tool_name}'" unless srv
-
-      unless server_supports_task_tool_call?(srv)
-        raise MCPClient::Errors::TaskError,
-              'Server does not support task-augmented tools/call (no tasks.requests.tools.call capability)'
-      end
-      unless tool.supports_task?
-        raise MCPClient::Errors::TaskError,
-              "Tool '#{tool_name}' does not support task execution (execution.taskSupport is forbidden/unset)"
-      end
-
-      task_params = {}
-      task_params[:ttl] = ttl if ttl
-      # Keep _meta (string or symbol key) as a top-level request field rather
-      # than a tool argument, so request metadata is preserved and does not fail
-      # tool input-schema validation.
-      meta_key = [:_meta, '_meta'].find { |k| parameters.key?(k) }
-      arguments = meta_key ? parameters.reject { |k, _| k == meta_key } : parameters
-      rpc_params = { name: tool_name, arguments: arguments, task: task_params }
-      rpc_params[:_meta] = parameters[meta_key] if meta_key
-
-      begin
-        result = srv.rpc_request('tools/call', rpc_params)
-        MCPClient::Task.from_create_result(result, server: srv)
-      rescue MCPClient::Errors::ServerError, MCPClient::Errors::TransportError, MCPClient::Errors::ConnectionError => e
-        raise MCPClient::Errors::TaskError, "Error creating task for tool '#{tool_name}': #{e.message}"
-      end
-    end
-
-    # Get the current state of a task (tasks/get, MCP 2025-11-25)
-    # @param task_id [String, MCPClient::Task] the task to query; passing the
-    #   Task handle returned by #call_tool_as_task routes to its own server
-    # @param server [Integer, String, Symbol, MCPClient::ServerBase, nil] server selector
-    # @return [MCPClient::Task] the task with current status
-    # @raise [ArgumentError] if the server is ambiguous in a multi-server client
-    # @raise [MCPClient::Errors::ServerNotFound] if no server is available
-    # @raise [MCPClient::Errors::TaskNotFound] if the task does not exist
-    # @raise [MCPClient::Errors::TaskError] if retrieving the task fails
-    def get_task(task_id, server: nil)
-      srv = select_task_server(task_id, server, 'get_task')
-      task_id = task_identifier(task_id)
-
-      begin
-        result = srv.rpc_request('tasks/get', { taskId: task_id })
-        MCPClient::Task.from_json(result, server: srv)
-      rescue MCPClient::Errors::ServerError => e
-        raise task_error_from(e, task_id, 'getting')
-      rescue MCPClient::Errors::TransportError, MCPClient::Errors::ConnectionError => e
-        raise MCPClient::Errors::TaskError, "Error getting task '#{task_id}': #{e.message}"
-      end
-    end
-
-    # Retrieve the result of a completed task (tasks/result, MCP 2025-11-25).
-    # Returns exactly what the underlying request would have returned (e.g. a
-    # CallToolResult hash with 'content'/'isError'/'structuredContent'); it is
-    # NOT wrapped in a Task. Blocks on the server until the task is terminal.
-    #
-    # NOTE: structured-content validation (see #validate_structured_content!)
-    # does not cover task-delivered results yet: a task ID alone does not
-    # identify which tool (and therefore which outputSchema) produced the
-    # result, and the client keeps no task-to-tool registry. Callers who need
-    # validation here can run MCPClient::SchemaValidator.validate themselves.
-    # @param task_id [String, MCPClient::Task] the task; passing the Task
-    #   handle returned by #call_tool_as_task routes to its own server
-    # @param server [Integer, String, Symbol, MCPClient::ServerBase, nil] server selector
-    # @return [Object] the underlying task result
-    # @raise [ArgumentError] if the server is ambiguous in a multi-server client
-    # @raise [MCPClient::Errors::TaskNotFound] if the task does not exist
-    # @raise [MCPClient::Errors::TaskError] if retrieval fails
-    def get_task_result(task_id, server: nil)
-      srv = select_task_server(task_id, server, 'get_task_result')
-      task_id = task_identifier(task_id)
-
-      begin
-        srv.rpc_request('tasks/result', { taskId: task_id })
-      rescue MCPClient::Errors::ServerError => e
-        raise task_error_from(e, task_id, 'getting result for')
-      rescue MCPClient::Errors::TransportError, MCPClient::Errors::ConnectionError => e
-        raise MCPClient::Errors::TaskError, "Error getting result for task '#{task_id}': #{e.message}"
-      end
-    end
-
-    # List tasks known to a server (tasks/list, paginated, MCP 2025-11-25)
-    # @param cursor [String, nil] optional pagination cursor
-    # @param server [Integer, String, Symbol, MCPClient::ServerBase, nil] server selector
-    # @return [Hash] { tasks: Array<MCPClient::Task>, next_cursor: String, nil }
-    # @raise [MCPClient::Errors::TaskError] if listing fails
-    def list_tasks(cursor: nil, server: nil)
-      srv = select_server(server)
-      ensure_task_capability!(srv, 'list')
-
-      params = cursor ? { cursor: cursor } : {}
-
-      begin
-        result = srv.rpc_request('tasks/list', params) || {}
-        tasks = (result['tasks'] || []).map { |t| MCPClient::Task.from_json(t, server: srv) }
-        { tasks: tasks, next_cursor: result['nextCursor'] }
-      rescue MCPClient::Errors::ServerError, MCPClient::Errors::TransportError, MCPClient::Errors::ConnectionError => e
-        raise MCPClient::Errors::TaskError, "Error listing tasks: #{e.message}"
-      end
-    end
-
-    # Cancel a task (tasks/cancel, MCP 2025-11-25)
-    # @param task_id [String, MCPClient::Task] the task to cancel; passing the
-    #   Task handle returned by #call_tool_as_task routes to its own server
-    # @param server [Integer, String, Symbol, MCPClient::ServerBase, nil] server selector
-    # @return [MCPClient::Task] the task with updated (cancelled) status
-    # @raise [ArgumentError] if the server is ambiguous in a multi-server client
-    # @raise [MCPClient::Errors::ServerNotFound] if no server is available
-    # @raise [MCPClient::Errors::TaskNotFound] if the task does not exist
-    # @raise [MCPClient::Errors::TaskError] if cancellation fails (including cancelling a terminal task)
-    def cancel_task(task_id, server: nil)
-      srv = select_task_server(task_id, server, 'cancel_task')
-      task_id = task_identifier(task_id)
-      ensure_task_capability!(srv, 'cancel')
-
-      begin
-        result = srv.rpc_request('tasks/cancel', { taskId: task_id })
-        MCPClient::Task.from_json(result, server: srv)
-      rescue MCPClient::Errors::ServerError => e
-        # A terminal task cannot be cancelled (-32602); that is an error, not a
-        # missing task, so keep it as a TaskError.
-        if e.message.match?(/terminal/i)
-          raise MCPClient::Errors::TaskError, "Error cancelling task '#{task_id}': #{e.message}"
-        end
-
-        raise task_error_from(e, task_id, 'cancelling')
-      rescue MCPClient::Errors::TransportError, MCPClient::Errors::ConnectionError => e
-        raise MCPClient::Errors::TaskError, "Error cancelling task '#{task_id}': #{e.message}"
-      end
-    end
-
     # Open a long-lived notification stream on a server (MCP 2026-07-28
     # subscriptions/listen). The subscription's notifications also flow
     # through the client's regular notification handling (cache
@@ -696,7 +580,20 @@ module MCPClient
     # @return [MCPClient::Subscription]
     # @raise [MCPClient::Errors::CapabilityError] if the server is not a 2026-07-28 server
     def listen(notifications:, server: nil, ack_timeout: nil, &listener)
-      select_server(server).listen(notifications: notifications, ack_timeout: ack_timeout, &listener)
+      srv = select_server(server)
+      filter = MCPClient::Subscription.normalize_filter(notifications)
+      if filter.key?('taskIds')
+        unless tasks_extension?
+          raise MCPClient::Errors::CapabilityError,
+                'Task notifications (taskIds) require the tasks extension: pass ' \
+                "extensions: ['#{MCPClient::JsonRpcCommon::TASKS_EXTENSION}'] to MCPClient::Client.new"
+        end
+        # The server must have negotiated the extension too (it answers a
+        # taskIds filter from a non-declaring client with -32021).
+        ensure_task_capability!(srv, 'listen')
+      end
+
+      srv.listen(notifications: notifications, ack_timeout: ack_timeout, &listener)
     end
 
     # Set the logging level on all connected servers (MCP 2025-06-18)
@@ -723,6 +620,59 @@ module MCPClient
 
     private
 
+    # The chunks of a streaming tools/call, still in the session the call was
+    # sampled for.
+    #
+    # Every built-in transport answers call_tool_streaming with a lazy
+    # Enumerator: nothing is sent until the host enumerates it, and the pin
+    # around the construction is long gone by then (pins are per thread, and
+    # the consumer may not even be the thread that opened the stream). The
+    # call is therefore made under a pin taken inside the enumeration itself,
+    # so a session that ended meanwhile stops the call at the wire instead of
+    # running a (possibly non-idempotent) tool in the session that replaced
+    # the sampled one — where the task it answers with would be stamped with
+    # a session it never belonged to, and the wait would refuse the very task
+    # that ran.
+    # @param stream [Enumerator] the transport's lazy stream
+    # @param tool [MCPClient::Tool] the definition the call was validated against
+    # @param epoch [Integer, nil] the session the call belongs to
+    # @return [Enumerator]
+    def streamed_call_chunks(stream, tool, tool_name, server, epoch:)
+      resolve = tasks_extension? && modern_server?(server)
+      Enumerator.new do |yielder|
+        pinned_to_session(server, epoch) do
+          # The call and the re-resolve that follows it share one slot for the
+          # definition the request went out under (see #call_tool). The call
+          # happens inside this enumeration, so the slot is opened here:
+          # without it the transport's record dies with its own call_tool and
+          # the re-resolve would list again, validating the result against a
+          # definition newer than the one the call carried.
+          with_called_tool_definition(server) do
+            called = nil
+            read_called = false
+            stream.each do |chunk|
+              # MCP 2026-07-28 tasks extension: a chunk may be a task; resolve
+              # it to the call's result, validated as #call_tool does — against
+              # the definition a mid-stream refresh (HeaderMismatch recovery)
+              # may have replaced.
+              next yielder << chunk unless resolve && task_result?(chunk)
+
+              # The definition the stream's one request went out under, read
+              # before a task is waited for (see #call_tool) and read once:
+              # every chunk belongs to that same request, and the record
+              # describes it rather than whatever the list holds later.
+              unless read_called
+                called = called_tool_definition(server, tool_name)
+                read_called = true
+              end
+              result = complete_task_result(tool_name, server, chunk, epoch)
+              yielder << validate_structured_content!(called || tool, result)
+            end
+          end
+        end
+      end
+    end
+
     # Hand the host's identity and request metadata to a transport.
     # @param server [MCPClient::ServerBase] the transport
     # @param client_info [Hash, nil] Implementation info sent as clientInfo
@@ -733,6 +683,28 @@ module MCPClient
       # legacy servers, per-request _meta on modern ones)
       server.client_info = client_info if client_info && server.respond_to?(:client_info=)
       server.request_meta = request_meta if request_meta && server.respond_to?(:request_meta=)
+      return if @extensions.empty? || !server.respond_to?(:declare_extension)
+
+      @extensions.each { |identifier, settings| server.declare_extension(identifier, settings) }
+    end
+
+    # @param extensions [Array, Hash, nil] the extensions option
+    # @return [Hash{String => Hash}] identifier => settings
+    def normalize_extensions(extensions)
+      case extensions
+      when nil then {}
+      when Hash then extensions.to_h { |identifier, settings| [identifier.to_s, settings || {}] }
+      when Array then extensions.to_h { |identifier| [identifier.to_s, {}] }
+      else
+        raise ArgumentError, 'extensions must be an Array of identifiers or a Hash of identifier => settings, ' \
+                             "got #{extensions.class}"
+      end
+    end
+
+    # @param srv [MCPClient::ServerBase]
+    # @return [Boolean] whether the server negotiated an MCP 2026-07-28 revision
+    def modern_server?(srv)
+      srv.respond_to?(:modern?) && srv.modern?
     end
 
     # Whether every server's cached list of a kind is still fresh (MCP
@@ -908,35 +880,13 @@ module MCPClient
       srv.respond_to?(:capabilities) && !srv.capabilities.nil?
     end
 
-    # Enforce the tasks.<operation> capability gate for a server (MCP
-    # lifecycle: "Only use capabilities that were successfully negotiated").
-    # When the negotiated capability set is not yet known, first trigger the
-    # handshake with a cheap standard request (ping) and then re-apply the
-    # gate against the freshly negotiated set, so a previously uninitialized
-    # server that negotiates no tasks capability never receives the
-    # prohibited request.
-    # @param srv [MCPClient::ServerBase] the selected server
-    # @param operation [String] the tasks sub-capability ('list' or 'cancel')
+    # Process incoming JSON-RPC notifications with default handlers
+    # @param server [MCPClient::ServerBase] the server that emitted the notification
+    # @param method [String] JSON-RPC notification method
+    # @param params [Hash] parameters for the notification
     # @return [void]
-    # @raise [MCPClient::Errors::CapabilityError] if the negotiated set lacks the capability
-    def ensure_task_capability!(srv, operation)
-      if !capabilities_known?(srv) && srv.respond_to?(:ping)
-        begin
-          srv.ping
-        rescue MCPClient::Errors::MCPError
-          # Initialization failed; fall through and let the task request
-          # itself surface the failure via the normal error path.
-        end
-      end
-
-      return if !capabilities_known?(srv) || srv.capability?('tasks', operation)
-
-      raise MCPClient::Errors::CapabilityError,
-            "Server #{srv.name || srv.class.name} did not declare the tasks.#{operation} capability"
-    end
-
-    # Wire this client's notification processing and the host's listeners onto
-    # a transport.
+    # Wire this client's own notification processing and the host's listeners
+    # onto the transport.
     #
     # The cache invalidation goes on the transport's own invalidation hook,
     # which runs *before* a notification is delivered to a subscription's
@@ -1059,9 +1009,12 @@ module MCPClient
       when 'notifications/message'
         # MCP 2025-06-18: Handle logging messages from server
         handle_log_message(server_id, params)
-      when 'notifications/tasks/status'
-        # MCP 2025-11-25: task status update (params are a flat Task)
-        handle_task_status_notification(server_id, params)
+      when 'notifications/tasks/status', 'notifications/tasks'
+        # (both handled below; the legacy method carries the flat 2025 shape)
+        # MCP 2025-11-25: task status update (params are a flat Task);
+        # MCP 2026-07-28 tasks extension: notifications/tasks carries a
+        # DetailedTask (only ever on a subscriptions/listen stream).
+        handle_task_status_notification(server_id, params, method)
       when 'notifications/subscriptions/acknowledged'
         # MCP 2026-07-28: the transport already recorded the acknowledged
         # filter on the Subscription; log for observability.
@@ -1204,40 +1157,6 @@ module MCPClient
         redacted = value.is_a?(Hash) ? value.transform_values { REDACTED } : REDACTED
         [key, redacted]
       end
-    end
-
-    # Resolve which server a task operation targets.
-    #
-    # Task IDs are only unique within the server that issued them, so silently
-    # defaulting to the first configured server can poll, read or cancel an
-    # unrelated task on the wrong server. Resolution order:
-    #   1. an explicit server: argument wins;
-    #   2. a Task handle carries the server that issued it;
-    #   3. a bare ID with exactly one configured server is unambiguous;
-    #   4. anything else is ambiguous and fails closed.
-    # @param task [String, MCPClient::Task] the task or its ID
-    # @param server_arg [Integer, String, Symbol, MCPClient::ServerBase, nil] explicit selector
-    # @param operation [String] calling method name, for the error message
-    # @return [MCPClient::ServerBase]
-    # @raise [ArgumentError] when the target server cannot be determined
-    def select_task_server(task, server_arg, operation)
-      # nil, not falsiness: `server: false` is an invalid selector that
-      # select_server rejects with ArgumentError, and treating it as "omitted"
-      # would silently route a read or a cancel somewhere instead of failing.
-      return select_server(server_arg) unless server_arg.nil?
-      return task.server if task.is_a?(MCPClient::Task) && task.server
-      return select_server(nil) if @servers.size <= 1
-
-      raise ArgumentError,
-            "#{operation} is ambiguous with multiple servers configured: task IDs are only unique per server. " \
-            'Pass the Task returned by call_tool_as_task, or name the server explicitly ' \
-            "(e.g. #{operation}(id, server: 'name'))."
-    end
-
-    # @param task [String, MCPClient::Task] a task or its ID
-    # @return [String] the task ID
-    def task_identifier(task)
-      task.is_a?(MCPClient::Task) ? task.task_id : task
     end
 
     # Select a server based on index, name, type, or instance
@@ -1421,62 +1340,6 @@ module MCPClient
       return nil unless server.respond_to?(:take_called_tool_definition, true)
 
       server.send(:take_called_tool_definition, tool_name.to_s)&.first
-    end
-
-    # Reject a plain (synchronous) call for a tool whose execution.taskSupport is
-    # 'required'. A compliant server would reject a non-task-augmented tools/call
-    # for such a tool, so fail fast and point the caller at call_tool_as_task.
-    # @param tool [MCPClient::Tool] the resolved tool
-    # @param tool_name [String] the tool name (for the message)
-    # @raise [MCPClient::Errors::ToolCallError] if the tool requires task execution
-    def reject_task_required!(tool, tool_name)
-      # Tasks Tool-Level Negotiation rule 1: without tasks.requests.tools.call
-      # in the server capabilities, taskSupport is disregarded entirely and
-      # the tool is invoked as a plain call.
-      return unless tool.task_required? && server_supports_task_tool_call?(tool.server)
-
-      raise MCPClient::Errors::ToolCallError,
-            "Tool '#{tool_name}' requires task-augmented execution; call it with call_tool_as_task instead"
-    end
-
-    # Whether a server advertised support for task-augmented tools/call, i.e.
-    # capabilities.tasks.requests.tools.call.
-    # @param srv [MCPClient::ServerBase] the server
-    # @return [Boolean]
-    def server_supports_task_tool_call?(srv)
-      caps = srv.respond_to?(:capabilities) ? srv.capabilities : nil
-      return false unless caps.is_a?(Hash)
-
-      tasks = caps['tasks'] || caps[:tasks]
-      requests = tasks && (tasks['requests'] || tasks[:requests])
-      tools = requests && (requests['tools'] || requests[:tools])
-      call = tools && (tools['call'] || tools[:call])
-      !call.nil?
-    end
-
-    # Map a ServerError from a task operation to TaskNotFound or TaskError.
-    # @param error [MCPClient::Errors::ServerError] the server error
-    # @param task_id [String] the task id
-    # @param action [String] a verb phrase for the error message (e.g. 'getting')
-    # @return [MCPClient::Errors::TaskNotFound, MCPClient::Errors::TaskError]
-    def task_error_from(error, task_id, action)
-      if error.message.match?(/not found|unknown task|expired/i)
-        return MCPClient::Errors::TaskNotFound.new("Task '#{task_id}' not found")
-      end
-
-      MCPClient::Errors::TaskError.new("Error #{action} task '#{task_id}': #{error.message}")
-    end
-
-    # Handle a notifications/tasks/status notification (MCP 2025-11-25).
-    # The params are a flat Task.
-    # @param server_id [String] server identifier for the log prefix
-    # @param params [Hash] the flat task params
-    # @return [void]
-    def handle_task_status_notification(server_id, params)
-      task = MCPClient::Task.from_json(params)
-      logger.info("[#{server_id}] Task #{task.task_id} status: #{task.status}")
-    rescue StandardError => e
-      logger.debug("[#{server_id}] Failed to parse task status notification: #{e.message}")
     end
 
     # Remove one server's entries from a client-level cache.

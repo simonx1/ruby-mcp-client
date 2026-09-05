@@ -40,6 +40,13 @@ module MCPClient
     # Raised when there's a connection error with an MCP server
     class ConnectionError < MCPError; end
 
+    # Raised when a request pinned to a server session (see
+    # {MCPClient::JsonRpcCommon#pinned_to_session}) reaches the wire after that
+    # session ended: nothing was written, so the caller may drop the payload.
+    # A subclass of ConnectionError so existing rescues treat it as the
+    # connection failure it is.
+    class SessionChangedError < ConnectionError; end
+
     # Raised when a request requires a server capability that was not
     # negotiated during initialization (MCP lifecycle: "Only use capabilities
     # that were successfully negotiated")
@@ -328,6 +335,25 @@ module MCPClient
         data.is_a?(Hash) ? (data['requestState'] || data[:requestState]) : nil
       end
 
+      # The answers this client had already produced when the round trip
+      # failed part way through. An input request answered before the failure
+      # was put to the host — and, through it, possibly to a person — so a
+      # caller that can hold on to it (the tasks extension's poll loop keeps
+      # it pending for the next tasks/update) never asks for it twice. Empty
+      # unless a partial fulfilment recorded any.
+      # @return [Hash{String => Hash}] key => InputResponse
+      def answered_so_far
+        @answered_so_far || {}
+      end
+
+      # Record the answers produced before this failure.
+      # @param responses [Hash] key => InputResponse
+      # @return [self]
+      def with_answered_so_far(responses)
+        @answered_so_far = responses.is_a?(Hash) ? responses.dup.freeze : nil
+        self
+      end
+
       # @return [Boolean] always true: a protocol-level condition, never wrapped
       def protocol_error?
         true
@@ -433,5 +459,12 @@ module MCPClient
 
     # Raised when there's an error creating or managing a task
     class TaskError < MCPError; end
+
+    # Raised when a request names a task the server has since replaced: task
+    # ids are unique only within a server session, and a fresh
+    # CreateTaskResult under an id ended the task that answered to it before.
+    # A subclass of TaskError so existing rescues keep treating it as the task
+    # failure it is.
+    class TaskReplacedError < TaskError; end
   end
 end

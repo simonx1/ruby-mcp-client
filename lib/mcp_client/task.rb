@@ -1,8 +1,14 @@
 # frozen_string_literal: true
 
+require 'time'
+require_relative 'errors'
+
 module MCPClient
   # Represents an MCP Task for long-running, task-augmented operations.
-  # Conforms to the MCP 2025-11-25 Tasks utility.
+  # Conforms to the MCP 2025-11-25 Tasks utility and to the MCP 2026-07-28
+  # tasks extension (io.modelcontextprotocol/tasks), whose flat Task uses
+  # `ttlMs` / `pollIntervalMs` and whose DetailedTask (tasks/get,
+  # notifications/tasks) inlines `inputRequests`, `result` or `error`.
   #
   # Task statuses: working, input_required, completed, failed, cancelled.
   # A task begins in `working`; completed/failed/cancelled are terminal.
@@ -13,7 +19,12 @@ module MCPClient
     # Statuses from which a task will not transition further
     TERMINAL_STATUSES = %w[completed failed cancelled].freeze
 
-    attr_reader :task_id, :status, :status_message, :created_at, :last_updated_at, :ttl, :poll_interval, :server
+    attr_reader :task_id, :status, :status_message, :created_at, :last_updated_at, :ttl, :poll_interval, :server,
+                :input_requests, :result, :error, :session_epoch, :task_generation, :called_tool
+
+    # 2026-07-28 names of the retention and polling hints (milliseconds).
+    alias ttl_ms ttl
+    alias poll_interval_ms poll_interval
 
     # Create a new Task
     # @param task_id [String] unique task identifier
@@ -24,8 +35,24 @@ module MCPClient
     # @param ttl [Integer, nil] retention duration in milliseconds since creation (nil = unspecified)
     # @param poll_interval [Integer, nil] suggested polling interval in milliseconds
     # @param server [MCPClient::ServerBase, nil] the server this task belongs to
+    # @param input_requests [Hash, nil] outstanding inputRequests (2026-07-28 DetailedTask, input_required)
+    # @param result [Hash, nil] the final result (2026-07-28 DetailedTask, completed)
+    # @param error [Hash, nil] the JSON-RPC error (2026-07-28 DetailedTask, failed)
+    # @param modern [Boolean] whether the task uses the 2026-07-28 field names (ttlMs, pollIntervalMs)
+    # @param detailed [Boolean] whether this is a DetailedTask (tasks/get, notifications/tasks) whose
+    #   result / error / inputRequests are authoritative, as opposed to a creation seed
+    # @param ttl_reported [Boolean, nil] whether the source hash carried the ttl / ttlMs field at all,
+    #   whatever its value (nil: derived from ttl, for a task not built from peer data)
+    # @param session_epoch [Integer, nil] the server session this handle is about: the session the
+    #   request that produced it was pinned to, which is not necessarily the one that is live by the
+    #   time the handle is built (nil: sampled from the server, for a handle built outside a request)
+    # @param task_generation [Integer, nil] which task under this id the handle names, for a handle
+    #   built from a CreateTaskResult: a task id is unique within a session, so a later creation
+    #   under the same id ends this task (nil: a handle that names whatever the id means now)
     def initialize(task_id:, status: 'working', status_message: nil, created_at: nil,
-                   last_updated_at: nil, ttl: nil, poll_interval: nil, server: nil)
+                   last_updated_at: nil, ttl: nil, poll_interval: nil, server: nil,
+                   input_requests: nil, result: nil, error: nil, modern: false, detailed: false,
+                   ttl_reported: nil, session_epoch: nil, task_generation: nil)
       validate_status!(status)
       @task_id = task_id
       @status = status
@@ -33,8 +60,30 @@ module MCPClient
       @created_at = created_at
       @last_updated_at = last_updated_at
       @ttl = ttl
+      # An explicit null ttlMs is a reported TTL (an unlimited one); a hash
+      # without the field reports nothing, so an observation of it must not
+      # be read as the server lifting a TTL it never mentioned.
+      @ttl_reported = ttl_reported.nil? ? !ttl.nil? : ttl_reported
       @poll_interval = poll_interval
       @server = server
+      # The server session this handle was seen in: task ids are per session
+      # and reusable, so what a handle kept across a restart says (its TTL
+      # backstop, its polling interval) is about a task that no longer
+      # exists. nil for a server that reports no session.
+      #
+      # It is the session the request that produced the handle was pinned to,
+      # passed in by the caller that sent it: sampling the server here would
+      # stamp a handle built from an answer of the session that has just
+      # ended with the session that replaced it, whose task-1 is another task.
+      @session_epoch = session_epoch || (server.respond_to?(:session_epoch) ? server.session_epoch : nil)
+      # Which task under this (reusable) id the handle names; see the tasks
+      # extension's per-creation lifetime in {MCPClient::Client::TaskRegistry}.
+      @task_generation = task_generation
+      @input_requests = input_requests
+      @result = result
+      @error = error
+      @modern = modern
+      @detailed = detailed
     end
 
     # Build a Task from a flat Task hash. This is the shape of GetTaskResult,
@@ -42,28 +91,74 @@ module MCPClient
     # notifications/tasks/status notification.
     # @param json [Hash] the flat task hash
     # @param server [MCPClient::ServerBase, nil] optional server reference
+    # @param detailed [Boolean] whether the hash is a DetailedTask (see #detailed?)
+    # @param session_epoch [Integer, nil] the server session the request that
+    #   returned this hash was pinned to (see #initialize)
+    # @param task_generation [Integer, nil] which task under this id the hash
+    #   describes, for a CreateTaskResult (see #initialize)
     # @return [Task]
-    def self.from_json(json, server: nil)
-      data = json || {}
+    # @raise [MCPClient::Errors::InvalidResultError] when the peer data is not
+    #   an object or names a status that is not a task status
+    def self.from_json(json, server: nil, detailed: false, session_epoch: nil, task_generation: nil)
+      raise MCPClient::Errors::InvalidResultError, 'Invalid task: not an object' unless json.is_a?(Hash)
+
+      data = json
+
+      modern = modern_shape?(data)
       new(
         task_id: extract_field(data, 'taskId', :task_id),
         status: extract_field(data, 'status') || 'working',
         status_message: extract_field(data, 'statusMessage', :status_message),
         created_at: extract_field(data, 'createdAt', :created_at),
         last_updated_at: extract_field(data, 'lastUpdatedAt', :last_updated_at),
-        ttl: extract_field(data, 'ttl'),
-        poll_interval: extract_field(data, 'pollInterval', :poll_interval),
-        server: server
+        ttl: modern ? extract_field(data, 'ttlMs', :ttl_ms) : extract_field(data, 'ttl'),
+        ttl_reported: modern ? field_present?(data, 'ttlMs', :ttl_ms) : field_present?(data, 'ttl'),
+        poll_interval: if modern
+                         extract_field(data, 'pollIntervalMs', :poll_interval_ms)
+                       else
+                         extract_field(data, 'pollInterval', :poll_interval)
+                       end,
+        input_requests: extract_field(data, 'inputRequests', :input_requests),
+        result: extract_field(data, 'result'),
+        error: extract_field(data, 'error'),
+        modern: modern,
+        detailed: detailed,
+        server: server,
+        session_epoch: session_epoch,
+        task_generation: task_generation
       )
+    rescue ArgumentError => e
+      raise MCPClient::Errors::InvalidResultError, "Invalid task: #{e.message}"
     end
+
+    # A task that never left the client: the server answered the request
+    # synchronously, so there is nothing to poll. It has no task id.
+    # @param result [Object] the request's result
+    # @param server [MCPClient::ServerBase, nil]
+    # @return [Task] a completed task carrying the result
+    def self.completed_locally(result, server: nil)
+      new(task_id: nil, status: 'completed', result: result, server: server, modern: true, detailed: true)
+    end
+
+    # Whether a task hash uses the 2026-07-28 field names.
+    # @param data [Hash]
+    # @return [Boolean]
+    def self.modern_shape?(data)
+      %w[ttlMs pollIntervalMs].any? { |k| data.key?(k) } ||
+        %i[ttlMs pollIntervalMs ttl_ms poll_interval_ms].any? { |k| data.key?(k) } ||
+        extract_field(data, 'resultType') == 'task'
+    end
+    private_class_method :modern_shape?
 
     # Build a Task from a CreateTaskResult, which wraps the task under `task`.
     # @param result [Hash] the CreateTaskResult ({ 'task' => { ... } })
     # @param server [MCPClient::ServerBase, nil] optional server reference
+    # @param session_epoch [Integer, nil] the server session the creating
+    #   request was pinned to (see #initialize)
     # @return [Task]
-    def self.from_create_result(result, server: nil)
+    def self.from_create_result(result, server: nil, session_epoch: nil)
       task_data = (result && (result['task'] || result[:task])) || result
-      from_json(task_data, server: server)
+      from_json(task_data, server: server, session_epoch: session_epoch)
     end
 
     # Read a value by camelCase string key, falling back to a snake_case symbol.
@@ -78,17 +173,163 @@ module MCPClient
     end
     private_class_method :extract_field
 
+    # Whether a field is present at all, whatever its value (an explicit
+    # null included). Mirrors the key lookup of {.extract_field}.
+    # @return [Boolean]
+    def self.field_present?(data, str_key, sym_key = nil)
+      data.key?(str_key) || data.key?(str_key.to_sym) || (!sym_key.nil? && data.key?(sym_key))
+    end
+    private_class_method :field_present?
+
     # Convert to a spec-shaped, JSON-serializable hash
     # @return [Hash]
     def to_h
-      # ttl is a REQUIRED Task field whose value may be null, so it is always
-      # included (even when nil). The other optional fields are omitted when nil.
-      hash = { 'taskId' => @task_id, 'status' => @status, 'ttl' => @ttl }
+      # ttl / ttlMs is a REQUIRED Task field whose value may be null, so it is
+      # always included (even when nil). The other optional fields are omitted
+      # when nil.
+      hash = { 'taskId' => @task_id, 'status' => @status, (@modern ? 'ttlMs' : 'ttl') => @ttl }
       hash['statusMessage'] = @status_message if @status_message
       hash['createdAt'] = @created_at if @created_at
       hash['lastUpdatedAt'] = @last_updated_at if @last_updated_at
-      hash['pollInterval'] = @poll_interval if @poll_interval
+      hash[@modern ? 'pollIntervalMs' : 'pollInterval'] = @poll_interval if @poll_interval
+      hash['inputRequests'] = @input_requests if @input_requests
+      hash['result'] = @result unless @result.nil?
+      hash['error'] = @error if @error
       hash
+    end
+
+    # Whether the task uses the 2026-07-28 shape (ttlMs / pollIntervalMs).
+    # @return [Boolean]
+    def modern?
+      @modern
+    end
+
+    # Whether the task came from tasks/get or notifications/tasks (a
+    # DetailedTask, whose result, error and inputRequests are authoritative)
+    # rather than from the CreateTaskResult seed, which carries none of them.
+    # @return [Boolean]
+    def detailed?
+      @detailed
+    end
+
+    # Whether the terminal payload the status implies is present and well
+    # formed: a result object (a CallToolResult) for completed, an error
+    # object for failed (cancelled needs none).
+    # @return [Boolean]
+    def payload_present?
+      case @status
+      when 'completed' then self.class.complete_result_object?(@result)
+      when 'failed' then jsonrpc_error_object?(@error)
+      else terminal?
+      end
+    end
+
+    # Whether a failed task's error is a JSON-RPC error object ("The
+    # request failed due to a JSON-RPC error": an integer code and a
+    # string message, as the JSON-RPC error shape requires).
+    # @param error [Object]
+    # @return [Boolean]
+    def jsonrpc_error_object?(error)
+      self.class.jsonrpc_error_object?(error)
+    end
+
+    # A completed task's result is the final result of the original request
+    # (a CallToolResult): an object that is a complete result, so a
+    # resultType it carries must be "complete" (or absent).
+    # @param result [Object]
+    # @return [Boolean]
+    def self.complete_result_object?(result)
+      return false unless result.is_a?(Hash)
+
+      # Only an absent discriminator gets the compatibility default; a
+      # present null is an unrecognized result type.
+      key = ['resultType', :resultType].find { |k| result.key?(k) }
+      key.nil? || result[key] == 'complete'
+    end
+
+    # @param error [Object]
+    # @return [Boolean] whether it is a JSON-RPC error object (integer code, string message)
+    def self.jsonrpc_error_object?(error)
+      return false unless error.is_a?(Hash)
+
+      code = error['code'] || error[:code]
+      message = error['message'] || error[:message]
+      code.is_a?(Integer) && message.is_a?(String)
+    end
+
+    # Whether the observation this task was built from carried a ttl / ttlMs
+    # field at all. It separates "no TTL reported" from a reported TTL that
+    # yields no deadline (an explicit null, or a value the clock cannot
+    # represent): both of the latter mean the task has no backstop, while the
+    # former says nothing about one.
+    # @return [Boolean]
+    def ttl_reported?
+      @ttl_reported
+    end
+
+    # Seconds left before the TTL backstop (createdAt + ttlMs), nil when
+    # unknown or unlimited.
+    # @param now [Time]
+    # @return [Float, nil]
+    def ttl_remaining(now: Time.now)
+      return nil unless @ttl.is_a?(Numeric) && @created_at.is_a?(String)
+
+      (Time.iso8601(@created_at) + (@ttl / 1000.0)) - now
+    rescue ArgumentError, RangeError, TypeError # FloatDomainError is a RangeError
+      # An unparseable timestamp, or a peer-supplied ttlMs too large for a
+      # Time: no backstop, never a raw exception out of a poll.
+      nil
+    end
+
+    # A copy of this handle naming a definite lifetime of its (reusable) task
+    # id: the task one CreateTaskResult started, as opposed to whatever the
+    # id means later (see {MCPClient::Client::TaskRegistry}). Used by the
+    # creation paths that build the handle before the lifetime it starts is
+    # counted.
+    # @param generation [Integer, nil] the lifetime the handle names
+    # @return [Task]
+    def with_task_generation(generation)
+      copy = dup
+      copy.instance_variable_set(:@task_generation, generation)
+      copy
+    end
+
+    # A copy of this handle naming the tool definition the request that
+    # created the task went out under, so the result the task delivers can be
+    # validated against the very schema a synchronous answer would have been
+    # (see {MCPClient::Client#get_task_result}). A task id alone identifies no
+    # tool, so only a handle carries this.
+    # @param tool [MCPClient::Tool, nil] the definition the creating tools/call carried
+    # @return [Task]
+    def with_called_tool(tool)
+      return self unless tool
+
+      copy = dup
+      copy.instance_variable_set(:@called_tool, tool)
+      copy
+    end
+
+    # Whether this task exists on the server (has an id) as opposed to a
+    # request the server answered synchronously (see .completed_locally).
+    # @return [Boolean]
+    def remote?
+      !@task_id.nil?
+    end
+
+    # MCP 2026-07-28 TTL backstop: "if the task's observable status has not
+    # reflected the update after createdAt plus ttlMs has elapsed, the client
+    # MAY consider the task to no longer be usable".
+    # @param now [Time] the current time
+    # @return [Boolean] whether createdAt + ttl has passed (false when unknown or unlimited)
+    def ttl_elapsed?(now: Time.now)
+      return false unless @ttl.is_a?(Numeric) && @created_at.is_a?(String)
+
+      created = Time.iso8601(@created_at)
+      now > created + (@ttl / 1000.0)
+    rescue ArgumentError, RangeError, TypeError # FloatDomainError is a RangeError
+      # Like #ttl_remaining: an unparseable timestamp or an overflowing
+      # ttlMs is no backstop, never a raw exception for a host that polls.
+      false
     end
 
     # Convert to JSON string
@@ -121,9 +362,26 @@ module MCPClient
       @status == 'working'
     end
 
+    # @return [Boolean] whether the task completed (its result is available)
+    def completed?
+      @status == 'completed'
+    end
+
+    # @return [Boolean] whether the task failed with a JSON-RPC error
+    def failed?
+      @status == 'failed'
+    end
+
+    # @return [Boolean] whether the task was cancelled
+    def cancelled?
+      @status == 'cancelled'
+    end
+
     # Check equality
     def ==(other)
       return false unless other.is_a?(Task)
+      # A locally completed task has no server-side identity: only itself.
+      return equal?(other) if task_id.nil?
 
       task_id == other.task_id && status == other.status
     end
@@ -131,6 +389,8 @@ module MCPClient
     alias eql? ==
 
     def hash
+      return object_id.hash if task_id.nil?
+
       [task_id, status].hash
     end
 

@@ -482,6 +482,7 @@ module MCPClient
       # metadata of its requests — describes a slice that will never be
       # tagged and a request that will never be made.
       forget_transport_thread_state
+      bump_session_epoch
       @mutex.synchronize do
         # Set flags first before killing threads to prevent race conditions
         # where threads might check flags after they're set but before they're killed

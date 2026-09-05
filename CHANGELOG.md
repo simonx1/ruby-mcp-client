@@ -5,6 +5,523 @@
 Groundwork for the 2026-07-28 protocol revision (stateless, per-request
 metadata). Each feature lands in its own PR; this section accumulates them.
 
+### Tasks extension (`io.modelcontextprotocol/tasks`)
+
+- **A cleanup no longer restarts the lifetime counters (round 39).**
+  `Client#cleanup` dropped everything the task registry held, the per-session
+  counter that numbers task lifetimes included. Ending a connection is not
+  ending a session — a 2026-07-28 HTTP transport is sessionless and its tasks
+  outlive a cleanup — so the next creation in that session was numbered from
+  zero again: a task handle retained across the cleanup named the task that
+  replaced its own, and `cancel_task` through it cancelled the replacement.
+  Meanwhile, before any replacement existed, `get_task` through that handle
+  raised `TaskReplacedError` for a task still running on the server. What an
+  id names is no longer bookkeeping that a cleanup forgets: the lifetimes and
+  their counters stay (a session that really ends still takes its own with it,
+  and the prune still bounds the ids of tasks nothing tracks), while the
+  answered keys, pending answers and in-flight holds are dropped as before.
+- **A task-delivered result is validated against the tool that produced it
+  (round 39).** `call_tool_as_task` handed back a remote handle without the
+  definition its creating `tools/call` went out under, and `get_task_result`
+  then returned whatever the task delivered: with `validate_structured_content:
+  :strict`, a `structuredContent` its tool's `outputSchema` forbids came back
+  unchecked, where the same call through `call_tool` raised `ValidationError`.
+  The handle a creation returns now carries that definition — the one the
+  request was answered under, which a mid-call HeaderMismatch refresh may have
+  replaced — and `get_task_result` validates against it, on the legacy
+  `tasks/result` path too. A task named by a bare id identifies no tool and is
+  returned unvalidated, as before.
+- **A finished legacy task leaves nothing on the books (round 39).** A
+  successful `tasks/result`, and a `tasks/cancel` answered with a terminal
+  task, left the task's bookkeeping registered as live. Since the prune exempts
+  ids whose bookkeeping is live, a host that submitted tasks and read their
+  results — never calling `get_task` — grew both registries without bound and
+  scanned an ever longer lifetime map on every creation. Both paths now release
+  the task's bookkeeping the way a terminal poll does; an acknowledgement that
+  still reports the task working leaves it alone.
+- **An expired task is a missing task on `tasks/update` and `tasks/cancel`
+  (round 39).** A 2026-07-28 server answering `{"code":-32602,"message":"Task
+  has expired"}` produced a generic `TaskError`, and the task's bookkeeping
+  survived, although the legacy matcher has always read an expiry as the task
+  being gone. The modern matcher now agrees, so the documented `TaskNotFound`
+  is raised and the bookkeeping is released. A `-32602` that rejects the
+  supplied `inputResponses` is still the request's failure, not the task's.
+- **The polling pace a server asks for is kept (round 39).** Every
+  `pollIntervalMs` was capped at one hour, so a task paced at two hours was
+  polled twice as often as its server asked — the opposite of what the polling
+  SHOULD is for. The bound is now a day: it still catches an interval the clock
+  cannot represent (or one that is merely absurd) without shortening a pace a
+  server can plausibly mean.
+- **A pre-write refusal keeps its type through the transports (round 39).** The
+  guard that holds a task request to the lifetime it is about is checked
+  immediately before the wire; a creation landing between the request path's
+  own check and that one made the transports raise `TaskReplacedError` from
+  inside their broad rescues, which turned it into a `TransportError` (stdio)
+  or a `ToolCallError` (HTTP, SSE). A definite "this was not sent" then reached
+  `update_task` as an ambiguous transport failure, which keeps the answers
+  pending for a task that no longer exists. The three transports now re-raise
+  it unchanged, as they already do for a session that ended under the request.
+- **The lifetime cap forgets tasks that ended, never one that is running
+  (verification round).** A creation recorded the id's lifetime but no
+  bookkeeping for the task it started, and the prune exempts only ids whose
+  bookkeeping is live — so a handle retained across 4096 further creations (an
+  ordinary batch submission, the legacy `call_tool_as_task` included) was
+  crowded out, and `get_task`, `update_task` and `cancel_task` through it
+  raised `TaskReplacedError` although the server had neither expired nor
+  replaced the task. A creation now records the task's own bookkeeping, so what
+  the cap bounds is the ids of tasks this client no longer tracks — a terminal
+  poll, a cancellation, a TTL expiry or a `TaskNotFound` makes an id prunable,
+  and nothing else does.
+- **On a 2026-07-28 server the error code decides whether a task is missing
+  (verification round).** The legacy message heuristic ran first, so a
+  `tasks/get` answered `{"code":-32603,"message":"Upstream credential
+  expired"}` raised `TaskNotFound` and deleted the task's bookkeeping with it —
+  losing the pending payload and answered keys of an unconfirmed
+  `tasks/update`, so a resumed wait could neither retransmit nor avoid
+  prompting the host again. A modern error that carries a JSON-RPC code is now
+  read by the code: -32602 is the revision's missing-task answer, and every
+  other code is a failed request that takes nothing of the task with it. Legacy
+  servers, and errors with no code at all, keep the message heuristic.
+- **Both new call paths validate against the definition the call went out
+  under (verification round).** Neither `call_tool_as_task` on a modern server
+  nor a task chunk of `call_tool_streaming` opened the slot that holds the
+  definition a `tools/call` request carried, so the transport's record died
+  with its own call and the re-resolve listed again — validating the result
+  against a definition newer than the call's own (a list bounded by `ttlMs: 0`,
+  or one whose TTL ran out during the call, re-fetches on every access). Both
+  now wrap the call and its re-resolve exactly as `call_tool` does.
+- **An input round that fails part way keeps the answers already given
+  (verification round).** `fulfil_input_requests` answered the requests in
+  order and threw the whole map away when one failed, and the wait then gave
+  every key back — so a retry put a request the host (and possibly a person)
+  had already answered to it a second time. The answers produced before the
+  failure now travel with the `InputRequiredError`
+  (`#answered_so_far`); the wait records them, leaves them pending for the next
+  `tasks/update`, and hands back only the keys nobody answered.
+- **A streaming `tools/call` is pinned while it is enumerated, not only while
+  it is built (round 38).** Every built-in transport answers
+  `call_tool_streaming` with a lazy `Enumerator`: round 37's pin only wrapped
+  its construction and was gone by the time `each` reached the transport's
+  `call_tool`, so a session that ended before the host consumed the stream ran
+  the (possibly non-idempotent) tool in the replacement session while the task
+  it answered with carried the sampled epoch — and `wait_for_task` then refused
+  the very task that had run. The call now goes out under a pin taken inside
+  the enumeration, in the thread that consumes it.
+- **A task request is bound to the lifetime it is about, at the wire (round
+  38).** `check_handle_lifetime!` was a preflight: a `CreateTaskResult` a
+  concurrent call recorded after the check left the caller already past the
+  guard, so `get_task` handed back the replacement's answer stamped with the
+  old lifetime, `update_task` queued its answers in the replacement's state and
+  sent them for it, and `cancel_task` cancelled the replacement. Every task
+  request now carries a lifetime pin: the transport refuses to write it once
+  the id names another task (checked where the session pin is, immediately
+  before the wire), the answer is re-checked before it is acted on, and
+  `update_task` resolves the bookkeeping its answers belong to in the same
+  locked step as the check. The refusal is a `TaskReplacedError`, a new
+  subclass of `TaskError`. On the read path a terminal or
+  `TaskNotFound` answer now forgets only the bookkeeping of the lifetime it
+  asked about: a bare-id `tasks/get`, and a detailed terminal handle that names
+  no lifetime, no longer delete the keys of a task that took the id over since.
+- **Task lifetimes stay distinguishable after a prune (round 38).** The
+  lifetime of an id was a per-id count starting at 0, so evicting an id an
+  outstanding handle still named (the map keeps 4096 ids) let a later creation
+  under that id start at 0 again and the stale handle pass the guard, free to
+  update or cancel the replacement. Lifetimes are now numbers of a
+  monotonic per-session counter — one counter per session, so the map costs
+  what it did — never reused and never restarted; a handle whose lifetime the
+  prune forgot is refused rather than sent on a guess. Establishing a lifetime
+  and reading it back is a single locked step as well: two concurrent creations
+  of one id used to stamp both handles with the later of the two.
+- **A lifetime is established for every creation, and every handle names the
+  one it belongs to (round 37).** Round 36 gave each `CreateTaskResult` its own
+  lifetime, but only recorded one when the id was already on the books: two
+  creations under the same id with no wait in between — or one made after a
+  terminal poll, a TTL expiry or a `TaskNotFound` had dropped the id's
+  bookkeeping — left both handles naming the same lifetime, so the older one
+  could still `update_task`, `cancel_task` or `wait_for_task` the task that
+  replaced it. Every observed creation now moves the id's generation, on the
+  legacy `call_tool_as_task` path as well, and `get_task` propagates the
+  lifetime of the handle it was asked about instead of dropping it — a
+  refreshed handle used to pass the replacement guard unchecked and operate on
+  whatever the id named later. A detailed terminal handle waited on again after
+  its id was reused no longer deletes the live task's bookkeeping, and a
+  `tasks/cancel` the server answers with an unknown task forgets the keys of
+  the session it was pinned to rather than those of a session that replaced it
+  under the request. The lifetime counters, which by design outlive the tasks
+  they belong to, are bounded: the ids created longest ago are dropped once
+  more than 4096 are tracked, never one whose bookkeeping is still live.
+- **A task-producing `tools/call` is written into the session it was sampled
+  for (round 37).** `call_tool`, `call_tool_as_task` and `call_tool_streaming`
+  now pin the creating call to the epoch they sampled for it, as every other
+  task request already was. A transport that reconnects inside the request
+  (a stdio child that exited, an HTTP 404 recovery) could otherwise run the
+  tool in the replacement session while the returned task was stamped with the
+  sampled one, and the wait would then refuse a task whose possibly
+  non-idempotent tool had already run — inviting a duplicate retry.
+- **The task bookkeeping cleanups are bounded (round 37).** A `tasks/update`
+  that the server definitely rejected now gives back only the keys whose
+  pending value it still owns: a newer answer for the same key, queued while
+  the older update was on the wire, keeps its pending payload and its
+  answered/submitted markers, so a later poll no longer puts the same input
+  request to the host again. A task request through a custom transport that
+  implements only the documented two-argument `rpc_request(method, params)` is
+  bounded on the wall clock instead of silently losing its computed timeout, so
+  a hung `tasks/get` can no longer block a wait that has no caller deadline for
+  the task's whole lifetime; the session pin is applied inside that bound.
+  Answers whose task another waiter already saw terminal or missing are
+  discarded rather than delivered, and a malformed `pollIntervalMs` (a string,
+  a negative integer) is now an `InvalidResultError` instead of silently
+  becoming the default polling interval.
+- **Every `CreateTaskResult` starts an isolated task lifetime, and closing a
+  sessionless connection ends none (round 36).** A task id is unique within a
+  session, so a server that answers with an id whose previous task is still on
+  the client's books has ended that task and started another. The per-task
+  bookkeeping is now stamped with a per-creation lifetime: the new task gets an
+  answered set, an in-flight registry entry and a pending update of its own, so
+  an input key a handler of the previous task is still presenting no longer
+  suppresses the same key on the new one, and that handler's answer is
+  discarded instead of being delivered to the new task through `tasks/update`.
+  A wait whose task id was handed out again ends with a `TaskError` rather than
+  reporting the new task's outcome, and a `Task` handle built from a
+  `CreateTaskResult` names the task that creation started — `wait_for_task`,
+  `get_task`, `get_task_result`, `update_task` and `cancel_task` refuse a
+  handle whose task was replaced, as they already refuse one whose session
+  ended. Conversely, an MCP 2026-07-28 HTTP transport has no session at all (no
+  `initialize` handshake, no `Mcp-Session-Id`): its `cleanup` closes a
+  connection, it does not reset a task namespace, so it no longer moves the
+  session epoch. A task on such a server lives for its own `ttlMs` in the
+  server's id namespace and survives a reconnect together with its answered
+  keys and its undelivered `tasks/update` — previously every reconnect (and
+  `ensure_connected` performs one after any transient failure) discarded that
+  bookkeeping, so a handler could be asked to answer the same input request
+  twice, an unconfirmed answer was never retransmitted, and the task's own
+  handles were refused for a session that never existed. A session a handshake
+  *did* open still ends with the connection, and round 35's other epoch moves
+  (`terminate_session`, a changed session id, the 404 recovery, a restarted
+  stdio process, an ended SSE stream) are unchanged.
+- **Every path that replaces an HTTP session moves the session epoch (round
+  35).** The 404 recovery already did (round 32), but it is not the only way
+  a session is replaced without a `cleanup`: `terminate_session` — the
+  host's own DELETE, and the one `cleanup` sends — now ends the epoch too,
+  whatever the server answers, and so does a handshake that lands a
+  different session id on a live one. Anything keyed by the session that
+  ended (task ids, answered and pending input keys) therefore dies with it
+  instead of colouring an id the next session reuses: a task handle from
+  a terminated session is refused rather than sent into its successor.
+- **A task handle carries the session its request was sent in (round 33).**
+  A `Task` is now stamped with the session epoch the request that produced
+  it was pinned to, instead of sampling the server when the object happens
+  to be built: a session that ends between the answer and the handle (a
+  stdio child exiting, a concurrent 404 recovery) no longer stamps the
+  handle with the *successor* session, where the reused task id names an
+  unrelated task, and a wait accepts a terminal payload only when it is
+  stamped with the very session it polled. Task requests that name their
+  task with a bare id are pinned to the session live at the call, so an
+  HTTP 404 recovery cannot replay `tasks/get` / `tasks/result` /
+  `tasks/cancel` into the replacement session; a session that ends under
+  such a request is reported as a `TaskError` (the documented failure) by
+  `get_task`, and `update_task` now reports answers the pin dropped instead
+  of returning `true` for a delivery that never went out. On the HTTP
+  transports the captured session id is now attached to the request
+  unconditionally, so a concurrent recovery clearing `@session_id` can no
+  longer send an in-flight pinned request with no session header at all,
+  and a 404 moves the session epoch the moment it ends the session rather
+  than after the replacement handshake succeeded — a handshake that fails
+  leaves the transport uninitialized instead of leaving requests treating
+  the dead session as current. A `tools/call` answered with a task is
+  validated against the tool definition in force when the call was made:
+  an unrelated `tools/list_changed` refresh landing during a wait that may
+  take minutes no longer changes the schema the result is checked against.
+- **An HTTP session restart moves the epoch, and a wait ends with its
+  session (round 32).** The automatic recovery from an expired HTTP session
+  (a 404 answering a request that carried an `Mcp-Session-Id`, which the
+  client answers with a fresh `initialize`) now ends the session it
+  replaces: the session epoch moves, so the task bookkeeping keyed by it —
+  answered keys, pending answers, in-flight holds, rounds — dies with the
+  old session instead of colouring a reused task id in the new one, and a
+  wait notices the move exactly as it does for a cleanup or a restarted
+  stdio process. A request pinned to the ended session is no longer resent
+  into its replacement (the 404 recovery resent it without re-checking the
+  pin), and every transport now checks the pin in the same critical section
+  that picks the session the request goes out on — the HTTP session id, the
+  stdio pipe, the SSE endpoint — so a cleanup or reconnect completing after
+  the check cannot put the request on the replacement session's wire. A
+  wait no longer follows a restart into the new session at all: a
+  terminal payload that came back from a poll pinned to the wait's own
+  session *is* the task's outcome even when the session ends right after,
+  and short of that the wait fails (`TaskError`) rather than polling an id
+  the replacement session may have reused for an unrelated task —
+  `wait_for_task` and `get_task` refuse a task handle whose session has
+  ended (as `update_task` and `cancel_task` already did), and so does the
+  legacy `tasks/result`, which is now pinned to the handle's session too. A
+  session that moves while the wait sleeps between polls ends it there
+  rather than being silently joined. A `tasks/update` the session guard
+  drops now gives its keys back in the state the answers were built in,
+  never in the replacement session's.
+- **Polls are pinned to their session, terminal results never cross it
+  (round 31).** `tasks/get` is now pinned to the session the wait joined,
+  like `tasks/update`: a reconnect inside `rpc_request` makes the transport
+  refuse the poll (counted as a lost poll) instead of asking the
+  replacement session about a reused task id. Every observation is checked
+  against the session again before it is acted on, terminal ones included,
+  so another lifetime's `result` — or `error` — can never become the
+  outcome of `call_tool` / `wait_for_task`; the input requests of an
+  observation are re-checked once more after the pending update is
+  retransmitted, so a session that ended under that round trip cannot put a
+  dead task's elicitation to the host. Bookkeeping is forgotten only in the
+  session it belongs to (a terminal poll, and a terminal task handle kept
+  across a restart, no longer wipe the replacement session's answered
+  keys), and an explicit `update_task` / `cancel_task` for a task handle is
+  pinned to the handle's session and refused when that session has ended.
+- **An ended session's observation is discarded, the epoch holds at the
+  send (round 30).** A `tasks/get` answer that came back after the server
+  session ended is no longer acted on: the wait joins the replacement
+  session and polls it again instead of presenting the dead session's
+  `inputRequests` to the host, enforcing its TTL backstop (which also
+  forgot the new session's bookkeeping) or pacing the next poll by its
+  `pollIntervalMs`; a task handle a host kept across a restart no longer
+  seeds a wait with the TTL and pace of a task that no longer exists. The
+  session a `tasks/update` belongs to is now enforced at the wire: the
+  request is pinned to it, so a reconnect inside `rpc_request`'s own
+  `ensure_initialized` / `ensure_connected` makes the transport drop the
+  payload instead of writing an ended session's answers into the next one,
+  and a failure to establish the session is no longer swallowed. Answers
+  queued behind an update that hangs are recorded as pending before the
+  task's update lock is taken (so a wait that gives up while queued leaves
+  them retransmittable) and a confirmed delivery clears only the keys it
+  carried; a handler's keys, its in-flight hold and its input round are
+  reserved in the state the wait captured; and the session epoch is read
+  under the registry lock everywhere.
+- **The epoch guard reaches the wire (round 29).** A `tasks/update`
+  establishes the transport's session *before* it compares the session
+  epoch, so a reconnect inside `rpc_request` (`ensure_initialized`) can no
+  longer slip an ended session's `inputResponses` into the next one; a
+  rejected update releases its keys — and forgets a task the server reports
+  gone — in the state it was built from rather than in whatever the current
+  epoch resolves to, so keys the new session already answered stay answered;
+  a wait refreshes its session before enforcing a TTL deadline, dropping the
+  previous session's backstop (and its last observation) instead of ending
+  the wait on a task that no longer exists; and a `tasks/get` or
+  `tasks/update` abandoned on the caller's wall clock keeps the bookkeeping
+  consistent — the answers stay pending and the task's update lock is
+  replaced, so a retry of `wait_for_task(timeout:)` retransmits them without
+  asking the host again, while the abandoned call's late completion touches
+  only the state it captured and never a reused task id's.
+- **Answers stay in their session, waits stay bounded (round 28).** The
+  session epoch an input handler answered in is carried through the whole
+  update path and compared again under the per-task update lock, so a
+  restart between the check and the send drops the payload instead of
+  answering an unrelated task in the new session; `wait_for_task(timeout:)`
+  now bounds the complete poll/update RPC by wall clock (the call runs on
+  its own thread joined with the remaining budget), so a transport that
+  implements only `rpc_request(method, params)` — or one whose retry
+  backoff outruns its per-attempt timeout — can no longer block a wait past
+  its deadline; a TTL extension whose `ttlMs` is valid but too large for the
+  clock lifts the previous backstop like an explicit `ttlMs: null`, while an
+  observation that carries no `ttlMs` at all keeps the last one.
+- **In-flight holds per task (round 26).** The keys a running input handler
+  presents are in flight from the moment it starts (not only once it is
+  abandoned) and each watcher touches only the registry entry it owns, so
+  another task's finishing handler can never drop a live reservation and a
+  TTL retry never asks the host twice for one key; a `tasks/update` binds
+  its answered keys and its pending payload to the same session state; a
+  synchronous answer to `call_tool_as_task` on a 2026-07-28 server is
+  validated against the tool's `outputSchema` like `call_tool`; an
+  overflowing `ttlMs` means no backstop rather than a raw exception.
+- **Synchronous answers and overflow (round 27).** A synchronous answer to
+  `call_tool_as_task` on a 2026-07-28 server is validated against the tool
+  definition a mid-call HeaderMismatch refresh replaced, exactly like
+  `call_tool`; `Task#ttl_elapsed?` treats an overflowing `ttlMs` as no
+  backstop instead of raising, like `ttl_remaining`.
+- **In-flight holds survive forgets (round 23).** The keys an abandoned
+  input handler is still presenting stay reserved apart from the task's
+  bookkeeping, so the TTL backstop, a gone task or a terminal lookup
+  cannot let a retry present them again while the host is answering; a
+  round whose delivery the deadline forbade (or whose handler failed) is
+  refunded; an explicit missing-task message (`unknown task`, `not
+  found`) makes `TaskNotFound` even when it mentions params; every task
+  payload needs a string `taskId`; `tasks/update` goes out without a
+  `timeout:` keyword when no bound applies, so transports implementing
+  only `rpc_request(method, params)` keep working. A `tasks/update` or `tasks/cancel` that reports the task gone forgets its bookkeeping like a `tasks/get` that does.
+- **Holds across sessions (round 25).** The watcher of an abandoned input
+  handler releases exactly the hold it took (the in-flight set of the
+  session the handler started in), never one a later session's retry
+  placed under the same task id and key after a restart — the hold's set
+  is fixed when the handler starts, so a handler that times out after a
+  restart holds keys in its own session, not the new one; a read of the
+  registry allocates nothing and emptied entries are dropped; a fresh
+  CreateTaskResult is a new task lifetime (earlier bookkeeping under that
+  id is forgotten); tasks/get and tasks/update go through a transport that
+  implements only `rpc_request(method, params)` (the timeout keyword is
+  sent only to transports that accept it).
+- **Abandoned handlers (round 22).** A handler round that outlived the
+  wait spends no input round (retries of a timed-out wait cannot exhaust
+  the per-task budget on one outstanding request), and the keys an
+  abandoned handler still presents stay reserved until it finishes, so a
+  retry polls instead of asking the host again. A `-32602` on
+  `tasks/update` or `tasks/cancel` is `TaskNotFound` only on an explicit
+  indication; a terminal-task or invalid-response rejection stays a
+  `TaskError`. A nested result whose `resultType` is present but not
+  `"complete"` is invalid.
+
+- **Task shape (round 16).** A task timestamp (`createdAt`,
+  `lastUpdatedAt`) that is not an ISO 8601 timestamp is an
+  `InvalidResultError` — in a `tasks/get` result and in a
+  `CreateTaskResult` — so it can never lift the TTL backstop, which only an
+  explicit `ttlMs` null does; `Client#get_task` also requires the payload a
+  status implies (`completed` ⇒ an object `result`, `failed` ⇒ a JSON-RPC
+  error object, `input_required` ⇒ an `inputRequests` object).
+- **The validated task is the handle (round 18).** A 2026-07-28
+  `CreateTaskResult` builds the task handle from the flat Task it was
+  validated as; an extra `task` property (the legacy 2025 wrapper) never
+  replaces it, and a task object that is not an object or names an
+  unknown status is an `InvalidResultError` (`Task.from_json`), never a
+  `NoMethodError` or `ArgumentError`.
+- **Bounded probes and null payloads (round 19).** The caller's `timeout:`
+  bounds the capability probe (initialization, discovery) that
+  `wait_for_task` may need before its first poll: a spent budget sends
+  nothing, and a probe outliving the remaining budget ends the wait with
+  the timed-out `TaskError` (the transports take no per-call handshake
+  budget, so the probe runs on its own thread and is abandoned). A null or
+  non-object task payload (`Task.from_json(nil)`, a `notifications/tasks`
+  without params) is an `InvalidResultError`, never an empty working task.
+- **Waits and lookups (round 17).** The caller's `timeout:` bounds the
+  whole `wait_for_task`, capability probe (initialization, discovery)
+  included; a task request never outlives the transport's configured
+  `read_timeout` (`ServerBase#read_timeout`); `get_task` forgets a task's
+  bookkeeping when it returns a terminal task or reports it gone; a
+  completed task's nested result must be a complete result (a
+  `resultType` other than `"complete"` is an `InvalidResultError`); a
+  `CreateTaskResult` must carry the whole Task shape (status, parseable
+  timestamps, a `ttlMs` key).
+- **Retransmissions and sessions (round 14).** A retransmitted
+  `tasks/update` carries only what is still pending once the task's update
+  lock is held, so an answer a concurrent, confirmed update superseded is
+  never sent again (an explicit answer is newer than a pending one for the
+  same key and wins); the bookkeeping of a previous server session is
+  dropped when the session ends, and `Client#cleanup` forgets every task.
+  A wait that outlives a server restart follows the new session (a reused
+  task id or input key is a new request and is answered again), and the
+  session epoch never runs backwards: a request that read it before the
+  restart gets the current session's state and can neither delete it nor
+  bring the ended session back. A modern `tasks/get` result must carry
+  every field the Task shape requires (`status`, `createdAt`,
+  `lastUpdatedAt`, and `ttlMs` — null for unlimited, but present) and a
+  failed task's `error` must be a JSON-RPC error object (integer `code`,
+  string `message`); anything else is an `InvalidResultError` rather than
+  a wait driven on made-up state.
+- **Handlers, sessions and probes (round 20).** An input handler runs
+  within what is left of the wait (with a deadline it runs on its own
+  thread and the wait ends with the timed-out `TaskError` when it
+  outlives the budget; the handler thread is abandoned and its answer
+  dropped) and the deadline is enforced before anything is delivered;
+  answers produced while the server session restarted are discarded and
+  the task is polled again rather than delivered to a possibly reused
+  task id; one capability probe runs per server at a time, so a wait that
+  timed out on the handshake leaves it to finish and the next wait joins
+  it instead of tearing the session down; a completed task's result with
+  an explicit `resultType: null` is invalid; a streamed task result is
+  validated against the tool a mid-stream refresh replaced; a
+  `notifications/tasks` whose params are not a DetailedTask is a logged
+  parse failure.
+
+- **Opt-in extension.** `MCPClient::Client.new(extensions:
+  ['io.modelcontextprotocol/tasks'])` (or a `identifier => settings` Hash)
+  declares extensions in every request's `clientCapabilities`;
+  `Client#tasks_extension?` reports it. Transports accept `resultType
+  "task"` only once the extension is declared, only from a 2026-07-28
+  server, and only for `tools/call` — anywhere else it is an
+  `InvalidResultError`.
+- **Transparent tasks.** When a server answers `tools/call` with a
+  `CreateTaskResult`, `Client#call_tool` (and `call_tool_streaming`) polls
+  `tasks/get` at the server's `pollIntervalMs` (honoured as given, with a
+  50 ms floor, and clamped to what is left of the caller's timeout and of
+  the task's TTL), answers `input_required` states through `tasks/update`
+  with the registered elicitation / sampling / roots handlers (each
+  `inputRequests` key answered once across polls), and returns the final
+  result — or raises the failed task's JSON-RPC error (`ServerError` with
+  its code) / `TaskError` for a cancelled task. A creation result that
+  already claims a terminal or `input_required` status is confirmed by
+  `tasks/get`, since only a DetailedTask carries the result, error or
+  input requests. The `createdAt + ttlMs` backstop ends the wait with a
+  `TaskError`.
+- **Task lifecycle API.** `call_tool_as_task` returns the `MCPClient::Task`
+  handle (a locally completed task when the server answered
+  synchronously); `get_task` returns the DetailedTask (`input_requests`,
+  `result`, `error`); `wait_for_task(task, timeout:)` waits for a terminal
+  task; `update_task(task, input_responses)` sends `tasks/update`;
+  `cancel_task` sends `tasks/cancel` (an acknowledgement — cancellation is
+  eventually consistent); `get_task_result` waits and returns the result.
+  `list_tasks` raises on a 2026-07-28 server (`tasks/list` was removed).
+  `MCPClient::Task` gained `ttl_ms`, `poll_interval_ms`, `completed?`,
+  `failed?`, `cancelled?`, `remote?` and `ttl_elapsed?`.
+- **Gates and errors.** Task requests require both the client declaration
+  and the server's `capabilities.extensions` entry (`CapabilityError`
+  otherwise, including for `listen(notifications: { task_ids: [...] })`);
+  `-32602` on `tasks/get`, `tasks/update` and `tasks/cancel` maps to
+  `TaskNotFound`, `-32021` propagates as
+  `MissingRequiredClientCapabilityError`, and a failed creation is a
+  `TaskError`. Task notifications (`notifications/tasks`) reach the
+  client's notification listeners. On Streamable HTTP, `tasks/get`,
+  `tasks/update` and `tasks/cancel` carry `Mcp-Name: <taskId>`.
+- **Waiting semantics.** The caller's timeout and the task's TTL backstop
+  are tracked separately, so a later, longer `ttlMs` extends the wait and
+  the TTL of the created task bounds polls that never come back; a poll
+  that returns after the deadline ends the wait; a `tasks/update` the
+  server rejected gives its keys back (the request is presented again),
+  while one whose acknowledgement was lost is retransmitted first. Task
+  results resolved on the streaming path are validated like `call_tool`'s.
+  `MCPClient.connect(..., extensions: [...])` forwards the option, and
+  `require 'mcp_client/client'` loads on its own. A `tasks/update` whose
+  outcome is ambiguous (timeout, transport failure, 5xx, untyped server
+  error) is not the end of the wait: the payload stays pending and goes out
+  again with the next poll, so `call_tool` survives a lost acknowledgement;
+  only a JSON-RPC rejection gives the keys back, and a confirmed update
+  (including one sent through `update_task`) drops any pending payload.
+  `tasks/update` requests are bounded like polls, the caller's deadline is
+  enforced before a late terminal task is accepted and before any new
+  handler round, a later observation with `ttlMs` null lifts the TTL
+  backstop, a timed-out first poll is paced by the created task's
+  `pollIntervalMs`, a completed task's `result` must be an object, the
+  input-round limit is applied atomically with the key reservation, and
+  `list_tasks` errors are sanitized.
+- **Per-server handles.** A `tasks/update` carries every response still
+  pending from an earlier delivery that could not be confirmed, so no answer
+  is left behind once a later update lands; a handle from another server
+  neither seeds a wait on the server named explicitly (no TTL, no pace) nor
+  colours the acknowledgement of a cancel there; symbol-keyed camelCase
+  task fields (`ttlMs:`, `pollIntervalMs:`) count as the modern shape.
+- **Local handles and the standalone entry point.** `get_task_result` on a
+  handle the server completed synchronously returns its result without
+  selecting or probing a server; an answer lost twice is still carried by
+  the update that answers the next key; `mcp_client/client/task_support`
+  requires the task model and the JSON-RPC common module, so
+  `require 'mcp_client/client'` drives a wait and answers
+  `tasks_extension?` on its own.
+- **Session-scoped bookkeeping.** Updates to one task are serialized, so a
+  concurrent update that read an empty pending slot can never confirm and
+  wipe an answer another delivery had just left pending. Task bookkeeping
+  (answered keys, pending answers, input rounds) is keyed by the
+  transport's `session_epoch` (bumped by every `cleanup`, including a
+  restarted stdio process) and dropped once the task is gone
+  (`TaskNotFound`) or past its TTL, so a reused task id never inherits
+  it. A poll that times out before the server ever said a pace waits the
+  default interval, not the busy-loop floor.
+
+- **Rejections, notifications and bounds (round 21).** A `tasks/update`
+  rejection about the supplied `inputResponses` is a `TaskError`, never a
+  `TaskNotFound` (the task still exists); the legacy
+  `notifications/tasks/status` keeps its flat 2025 shape while
+  `notifications/tasks` requires a DetailedTask; an input handler is bounded
+  by the task's TTL as well as the caller's timeout, and the whole deadline
+  is enforced before delivery; a wait reads the server's session epoch and
+  the answered set it points at in one step; `mcp_client/task` requires the
+  error definitions it raises.
+- **Bounded pace (round 28).** A `pollIntervalMs` the clock cannot
+  represent, or that is merely enormous, is bounded to
+  `MAX_TASK_POLL_INTERVAL` (one hour) rather than handed to `sleep`, and
+  still clamped to what is left of the caller's timeout and the TTL.
+
 ### Cacheable results (`ttlMs` / `cacheScope`)
 
 - **A result is bound to its own exchange, not to a request the response phase

@@ -938,6 +938,7 @@ module MCPClient
       # being dismantled on purpose: their EOF must not retire whatever
       # replaces it.
       @transport_generation += 1
+      bump_session_epoch
       # The reader thread will see EOF once stdin closes; that is a shutdown,
       # not an unexpected exit.
       @shutting_down = true

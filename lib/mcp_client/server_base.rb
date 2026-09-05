@@ -7,6 +7,10 @@ module MCPClient
     #   @return [String] the name of the server
     attr_reader :name
 
+    # @!attribute [r] read_timeout
+    #   @return [Numeric, nil] the configured per-request timeout in seconds, when the transport has one
+    attr_reader :read_timeout
+
     # Initialize the server with a name
     # @param name [String, nil] server name
     # Server-declared instructions from the initialize result, if any
@@ -158,6 +162,25 @@ module MCPClient
     def cleanup
       raise NotImplementedError, 'Subclasses must implement cleanup'
     end
+
+    # How many times this transport's session ended (cleanup, a restarted
+    # stdio process, a reconnect). Anything scoped to a session — task ids
+    # and their bookkeeping — is keyed by it, so state from a previous
+    # session never colours the next one.
+    # @return [Integer]
+    def session_epoch
+      @session_epoch || 0
+    end
+
+    protected
+
+    # Mark the current session as ended.
+    # @return [void]
+    def bump_session_epoch
+      @session_epoch = session_epoch + 1
+    end
+
+    public
 
     # Send a JSON-RPC request and return the result
     # @param method [String] JSON-RPC method name

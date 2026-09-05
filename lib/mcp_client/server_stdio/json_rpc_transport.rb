@@ -638,7 +638,21 @@ module MCPClient
         @logger.debug("Sending JSONRPC request: #{describe_jsonrpc_message(req)}")
         raise IOError, 'the server process is gone' unless io
 
+        # The pin is checked in the same critical section the handles are
+        # swapped under, so a restart completing between the caller's check
+        # and this write cannot carry a request of the ended session; the
+        # write itself goes to the pipe this request was recorded against,
+        # never to whichever pipe the transport holds by now.
+        @mutex.synchronize { check_session_pin! }
         io.puts(req.to_json)
+      rescue MCPClient::Errors::SessionChangedError, MCPClient::Errors::TaskReplacedError
+        # A refusal, not a failure: the pin (or the caller's own pre-write
+        # guard, see {MCPClient::SessionPin#guarded_writes}) turned the write
+        # down. Nothing was written, nothing will answer this id, and the
+        # refusal keeps its type — a definite "this request is not to be
+        # sent" must not reach the caller as an ambiguous transport failure.
+        @mutex.synchronize { @awaiting.delete(req['id']) } if req.is_a?(Hash) && req['id']
+        raise
       rescue StandardError => e
         # A request that failed to send will never receive a response, so drop
         # its awaiting marker; otherwise a broken transport (e.g. the server
@@ -748,6 +762,10 @@ module MCPClient
       # @yieldparam version [String, nil] the protocol version the request declares
       # @return [Object] result from the JSON-RPC response
       def send_request_and_wait(method, params, timeout)
+        # As late as a request pinned to a session can be held back: every
+        # reconnect on the way here (ensure_initialized, a retry after the
+        # child exited) has happened by now.
+        check_session_pin!
         req_id = next_id
         req = build_registered_request(method, params, req_id)
         clear_response_received_at if respond_to?(:clear_response_received_at, true)

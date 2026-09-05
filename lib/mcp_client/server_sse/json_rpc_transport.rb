@@ -122,6 +122,10 @@ module MCPClient
       # @raise [MCPClient::Errors::TransportError] if response isn't valid JSON
       # @raise [MCPClient::Errors::ToolCallError] for other errors during request execution
       def send_jsonrpc_request(request, timeout: nil)
+        # As late as a request pinned to a session can be held back: every
+        # reconnect on the way here (ensure_initialized, a retry after the
+        # stream dropped) has happened by now.
+        check_session_pin!
         @logger.debug("Sending JSON-RPC request: #{describe_jsonrpc_message(request)}")
         record_activity
         # Register the id BEFORE posting: the SSE stream may deliver the
@@ -141,7 +145,12 @@ module MCPClient
             note_response_received_at if respond_to?(:note_response_received_at, true)
             parse_direct_response(response)
           end
-        rescue MCPClient::Errors::ConnectionError, MCPClient::Errors::TransportError, MCPClient::Errors::ServerError
+        # A pre-write refusal keeps its type: the late pin check inside the
+        # POST turns a request down (or the caller's own guard does, see
+        # {MCPClient::SessionPin#guarded_writes}) and nothing was written,
+        # which is not an error of executing the request.
+        rescue MCPClient::Errors::ConnectionError, MCPClient::Errors::TransportError,
+               MCPClient::Errors::ServerError, MCPClient::Errors::TaskReplacedError
           raise
         rescue JSON::ParserError => e
           raise MCPClient::Errors::TransportError, "Invalid JSON response from server: #{describe_parse_error(e)}"
@@ -182,7 +191,15 @@ module MCPClient
       def post_json_rpc_request(request)
         uri = URI.parse(@base_url)
         base = "#{uri.scheme}://#{uri.host}:#{uri.port}"
-        rpc_ep = @mutex.synchronize { @rpc_endpoint }
+        # The endpoint this request goes to, and the pin checked in the same
+        # critical section: a reconnect completing between the check in
+        # #send_jsonrpc_request and this capture would otherwise post a
+        # request of the ended session to the session that replaced it
+        # (cleanup bumps the epoch before it takes this monitor).
+        rpc_ep = @mutex.synchronize do
+          check_session_pin!
+          @rpc_endpoint
+        end
 
         @rpc_conn ||= create_json_rpc_connection(base)
 

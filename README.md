@@ -374,7 +374,10 @@ client = MCPClient::Client.new(
   mcp_server_configs: [...],
   validate_structured_content: :strict # raises MCPClient::Errors::ValidationError on violation
 )
-# Task-delivered results (get_task_result) are not validated yet.
+# A task-delivered result (get_task_result) is validated the same way when the
+# task is named with the Task handle call_tool_as_task returned: the handle
+# carries the definition its creating call went out under. A bare task ID
+# identifies no tool, so a result fetched by ID is not validated.
 ```
 
 A result is checked against the tool definition the request that produced it
@@ -1005,7 +1008,11 @@ than the peer's:
   chunks. Server configurations are logged with credential-bearing keys redacted.
 - **Host exceptions are not reflected to the server.** A raising elicitation,
   sampling or roots handler yields a constant JSON-RPC error message; the detail
-  stays in your local log.
+  stays in your local log. When a server asks for several inputs at once (MCP
+  2026-07-28 multi round-trip requests) and one of them fails, the answers your
+  handler already produced are kept rather than thrown away: a task's poll loop
+  sends them with its next `tasks/update` and never puts an answered request to
+  your handler a second time.
 
 ## Requirements
 
