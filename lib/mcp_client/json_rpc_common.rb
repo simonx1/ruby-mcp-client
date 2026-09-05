@@ -626,7 +626,7 @@ module MCPClient
       return result if type == 'complete'
 
       message = "#{method} answered with resultType #{type.to_s[0, 64].inspect}, which this " \
-                'client cannot carry through (multi round-trip requests are not implemented)'
+                'client cannot carry through'
       raise MCPClient::Errors::InputRequiredError.new(message, data: result) if type == 'input_required'
 
       raise MCPClient::Errors::InvalidResultError.new("Invalid result: #{message}", data: result)
