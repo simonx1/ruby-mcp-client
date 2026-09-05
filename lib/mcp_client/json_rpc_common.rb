@@ -34,6 +34,7 @@ module MCPClient
     include RequestMetadata
     # Requests may be pinned to the session they belong to (see SessionPin).
     include SessionPin
+
     # Input requests of a multi-round tool call (see InputRoundTrips).
 
     # JSON-RPC methods with arbitrary side effects that MUST NOT be re-sent

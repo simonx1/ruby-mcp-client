@@ -522,7 +522,7 @@ module MCPClient
       @logger.debug("Sending JSON-RPC request: #{describe_jsonrpc_message(request)}")
 
       begin
-        exchange_jsonrpc(request, timeout: timeout, extra_headers: extra_headers)
+        exchange_jsonrpc(request, timeout: timeout, deadline: deadline, extra_headers: extra_headers)
       # A pre-write refusal keeps its type: the late pin check inside
       # #send_http_request turns a request down (or the caller's own guard
       # does, see {MCPClient::SessionPin#guarded_writes}) and nothing was
