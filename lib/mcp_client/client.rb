@@ -1496,19 +1496,6 @@ module MCPClient
       server.send(:take_called_tool_definition, tool_name.to_s)&.first
     end
 
-    # The definition the transport's own tools/call request went out under,
-    # taken from the transport so it is spent on this one re-resolve.
-    # @param tool [MCPClient::Tool] the tool as resolved before the call
-    # @return [Array(MCPClient::Tool, nil), nil] a one-element array holding
-    #   the definition the call carried (its element is nil when the list no
-    #   longer carried the tool), or nil when the transport recorded none
-    def called_tool_definition(tool)
-      server = tool.server
-      return nil unless server.respond_to?(:take_called_tool_definition, true)
-
-      server.send(:take_called_tool_definition, tool.name.to_s)
-    end
-
     # Reject a plain (synchronous) call for a tool whose execution.taskSupport is
     # 'required'. A compliant server would reject a non-task-augmented tools/call
     # for such a tool, so fail fast and point the caller at call_tool_as_task.

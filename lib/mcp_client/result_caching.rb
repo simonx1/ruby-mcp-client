@@ -949,7 +949,6 @@ module MCPClient
         uri = params.is_a?(Hash) ? params['uri'] : nil
         invalidate_read_cache(uri) if uri.is_a?(String)
       end
-      @cache_invalidation_callback&.call(method, params)
     end
   end
 end
