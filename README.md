@@ -183,8 +183,11 @@ and end it with `subscription.close`. A listen the server never acknowledges is
 given up on rather than left pending for ever: `ack_timeout:` bounds the wait
 for the acknowledgment (the transport's read timeout by default, `false` to
 wait for ever), and one that expires cancels the request and closes the handle
-with a `RequestTimeoutError`. The stream itself is not bounded — once
-acknowledged it runs for as long as the server keeps it. The block runs on the
+with a `RequestTimeoutError`. It bounds every listen request made for that
+subscription, not only the first: an HTTP stream re-opened after a drop, and a
+subscription re-sent to the process that replaced the one it was on, are new
+requests the server has to acknowledge afresh. The stream itself is not
+bounded — once acknowledged it runs for as long as the server keeps it. The block runs on the
 subscription's own dispatcher thread, never on the transport's reader, so a
 listener may issue requests of its own; the notifications waiting for it are bounded both in
 number (`MCPClient::Subscription::MAX_PENDING_NOTIFICATIONS`) and in the bytes

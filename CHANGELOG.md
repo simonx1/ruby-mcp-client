@@ -20,7 +20,15 @@ metadata). Each feature lands in its own PR; this section accumulates them.
   `RequestTimeoutError`, rather than staying `:pending` for the life of the
   process with nothing to tell the host why. Pass `ack_timeout: false` to wait
   for ever, or a number of seconds to bound it per request; an acknowledged
-  subscription runs for as long as the server keeps it either way.
+  subscription runs for as long as the server keeps it either way. Every listen
+  request re-issued for that subscription carries the same deadline, not only
+  the first: an HTTP stream re-opened after a drop and a stdio subscription
+  re-sent to the process that replaced the one it was on are each a new request
+  the server holds no state for and has to acknowledge afresh. Without that, a
+  replacement the server accepted and then never acknowledged left the handle
+  `:pending` with nothing to tell the host why — indefinitely on stdio, and for
+  as long as the peer kept the stream alive with SSE comments on Streamable
+  HTTP.
   The server's `notifications/subscriptions/acknowledged` records the subset
   it honours (`acknowledged`, `unsupported`); notifications tagged with
   `io.modelcontextprotocol/subscriptionId` are demultiplexed to the
@@ -87,7 +95,11 @@ metadata). Each feature lands in its own PR; this section accumulates them.
   stream it had not. On stdio a `notifications/cancelled` never precedes the
   listen request it names: a `close` racing the write of a listen leaves that
   id for the writer to cancel once it is actually on the wire, since "the
-  cancelled request MUST have been previously issued". The requested filter is copied and frozen when the
+  cancelled request MUST have been previously issued". The writer sends it
+  however that write ends — a write that put the request on the pipe and then
+  raised is one the server may well be serving, and leaving the cancellation on
+  the success path left it holding a stream this client had stopped reading and
+  could no longer name. The requested filter is copied and frozen when the
   subscription is created: the listen request is built from it on a background
   thread after `listen` returns, and again on every reconnect, so a caller that
   kept the array it passed could otherwise change what goes out. `unsupported`
@@ -251,9 +263,14 @@ metadata). Each feature lands in its own PR; this section accumulates them.
   to be on — a second listen for it left the server serving the first stream
   with the client no longer able to refer to it — while ids written to a
   process that has since been torn down are forgotten rather than cancelled on
-  the process that replaced it. That accounting now holds for a write that
-  lands late, too: a listen request goes to the pipe it was recorded against
-  rather than to whichever process is current when the write finally happens.
+  the process that replaced it. Each id is recorded together with the pipe it
+  was written to, so that holds even for an attempt that had not chosen its id
+  when the teardown ran: forgetting a process's ids cannot reach one recorded
+  afterwards, and the `close` that followed named it on the replacement — a
+  request that process had never been sent. That accounting now holds for a
+  write that lands late, too: a listen request goes to the pipe it was recorded
+  against rather than to whichever process is current when the write finally
+  happens.
   Reading the live stdin at the write instead let a listen still pending when
   the process exited be written to the *replacement*, whose teardown had
   already forgotten that id — so the server served a second stream the client

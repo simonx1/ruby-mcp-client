@@ -210,6 +210,10 @@ RSpec.describe 'MCP 2026-07-28 subscriptions/listen, verification pass 2' do
 
     after { server.cleanup }
 
+    # The handle and its error only. That the expiry also *closes the response
+    # stream* — the cancellation signal on this transport, which no
+    # `notifications/cancelled` stands in for — needs a peer holding one open
+    # to be visible, and is pinned in verify3.
     it 'ends the handle on the deadline' do
       stub_request(:post, 'https://example.com/mcp')
         .to_return(status: 200, headers: { 'Content-Type' => 'text/event-stream' }, body: ": keep-alive\n\n")

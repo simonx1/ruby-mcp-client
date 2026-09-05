@@ -355,7 +355,7 @@ RSpec.describe 'MCP 2026-07-28 subscriptions/listen' do
                                        'result' => { 'resultType' => 'complete', '_meta' => { SUB_ID_META => id } } })
                                end
                              ])
-      stub_const('MCPClient::HttpTransportBase::LISTEN_RECONNECT_DELAY', 0.01)
+      stub_const('MCPClient::HttpTransportBase::ListenStream::LISTEN_RECONNECT_DELAY', 0.01)
 
       subscription = server.listen(notifications: { tools_list_changed: true })
       wait_until { subscription.state == :closed }
@@ -369,7 +369,7 @@ RSpec.describe 'MCP 2026-07-28 subscriptions/listen' do
 
     it 'closes the stream to cancel and does not reconnect' do
       requests = stub_server([->(id) { sse(ack(id, { 'toolsListChanged' => true })) }])
-      stub_const('MCPClient::HttpTransportBase::LISTEN_RECONNECT_DELAY', 0.5)
+      stub_const('MCPClient::HttpTransportBase::ListenStream::LISTEN_RECONNECT_DELAY', 0.5)
 
       subscription = server.listen(notifications: { tools_list_changed: true })
       wait_until { subscription.acknowledged }
@@ -702,14 +702,24 @@ RSpec.describe 'MCP 2026-07-28 subscriptions/listen — round 2' do
   describe MCPClient::Subscription do
     let(:server) { instance_double(MCPClient::ServerStdio) }
 
-    it 'does not reopen a subscription the client closed, even if a reconnect assigns a new id' do
+    # Through the step a reconnect actually takes: `with_open_id` is where a
+    # transport takes the new listen id, registers it and sends the request as
+    # one operation, and a handle the host closed stops all three. Asserting it
+    # of `assign_id` pinned a different helper — one no reconnect goes through
+    # — so a `with_open_id` that revived a closed handle stayed green.
+    it 'refuses the new listen id a reconnect takes for a subscription the client closed' do
       subscription = described_class.new(server: server, requested: { 'toolsListChanged' => true })
-      subscription.assign_id(1)
       allow(server).to receive(:cancel_subscription) { |s| s.finish(by_client: true) }
+      expect(subscription.with_open_id(1) { nil }).to be(true)
       subscription.close
 
-      subscription.assign_id(2)
+      sent = false
+      expect(subscription.with_open_id(2) { sent = true }).to be(false)
 
+      # Nothing went out under the new id, and the handle still names the one
+      # the cancellation was for.
+      expect(sent).to be(false)
+      expect(subscription.id).to eq(1)
       expect(subscription.state).to eq(:closed)
       expect(subscription).not_to be_reconnectable
     end

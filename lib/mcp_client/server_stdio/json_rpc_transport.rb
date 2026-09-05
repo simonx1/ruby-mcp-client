@@ -112,13 +112,20 @@ module MCPClient
         # `cancelled(n)` on the wire ahead of `listen(n)`. So this attempt
         # marks it written and then cancels it itself, if that close has
         # happened by then.
-        subscription.record_outstanding_listen(id)
+        #
+        # Both of those happen however the write ends. A write that raised may
+        # still have put the request on the pipe, and the id is recorded for
+        # exactly that reason; leaving the cancellation on the success path
+        # left the server serving a stream this client had stopped reading and
+        # could no longer name. The pipe is named on both, so the cancellation
+        # goes to the process the request went to and to no other.
+        subscription.record_outstanding_listen(id, stdin)
         begin
           send_request(request, io: stdin)
         ensure
           subscription.mark_listen_written(id)
+          cancel_outstanding_listens(subscription, io: stdin) if subscription.closed_by_client?
         end
-        cancel_outstanding_listens(subscription, io: stdin) if subscription.closed_by_client?
       rescue StandardError => e
         fail_open_attempt(subscription, id, e)
       end
@@ -263,6 +270,11 @@ module MCPClient
         @subscription_carrier = session
         pending.each do |subscription|
           open_subscription(subscription)
+          # A re-sent listen is a new request the replacement has to
+          # acknowledge, so it carries the deadline the first one did: a
+          # process that takes it and then says nothing is otherwise bounded
+          # by nothing at all on stdio.
+          rearm_acknowledgment_deadline(subscription)
         rescue StandardError => e
           @logger.warn("Could not re-establish subscription: #{e.message}")
         end

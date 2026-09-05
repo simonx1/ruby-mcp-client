@@ -1019,7 +1019,7 @@ module MCPClient
     end
 
     # Tell the server the client has stopped reading every listen request it
-    # wrote for this subscription on the live process.
+    # wrote for this subscription on the process this pipe belongs to.
     #
     # Not just the one the subscription is on: a second listen written for it
     # on one process — a hand-over the queue duplicated, say — leaves the
@@ -1033,13 +1033,18 @@ module MCPClient
     # client wrote is recorded ({MCPClient::Subscription#record_outstanding_listen}),
     # so a written id is here already; an id that is only assigned is the
     # opener's to cancel, once it has actually written it.
+    #
+    # Ids written to a pipe other than this one are left where they are: the
+    # process reading this one was never sent those requests, and naming them
+    # on it would cancel requests it has never seen
+    # ({MCPClient::Subscription#take_outstanding_listens}).
     # @param subscription [MCPClient::Subscription]
     # @param io [IO, nil] the pipe to cancel on; defaults to the live process's
     #   stdin, and is pinned by a caller that is cancelling ids it wrote to one
     #   particular process (see {JsonRpcTransport#open_subscription})
     # @return [void]
     def cancel_outstanding_listens(subscription, io: @stdin)
-      subscription.take_outstanding_listens.each { |id| send_subscription_cancellation(id, io: io) }
+      subscription.take_outstanding_listens(io).each { |id| send_subscription_cancellation(id, io: io) }
     end
 
     # Tell the server the client closed a subscriptions/listen request.

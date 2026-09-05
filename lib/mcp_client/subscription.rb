@@ -85,6 +85,10 @@ module MCPClient
     attr_reader :error
     # @return [String, nil] the reason a server-side teardown gave, if any
     attr_reader :close_reason
+    # @return [Numeric, false, nil] the acknowledgment deadline the host asked
+    #   for; every listen request re-issued for this subscription is bounded by
+    #   it, not only the first
+    attr_reader :ack_timeout
 
     # Normalize and validate a SubscriptionFilter given with String or Symbol,
     # camelCase or snake_case keys.
@@ -121,10 +125,16 @@ module MCPClient
 
     # @param server [MCPClient::ServerBase] owning transport
     # @param requested [Hash] normalized filter
+    # @param ack_timeout [Numeric, false, nil] the acknowledgment deadline the
+    #   host asked for, kept for the requests re-issued later (see
+    #   {MCPClient::SubscriptionSupport#rearm_acknowledgment_deadline}). Set
+    #   here rather than assigned afterwards: a transport may re-open the
+    #   stream before `listen` has returned the handle.
     # @yield [method, params] optional listener for notifications on this subscription
-    def initialize(server:, requested:, &listener)
+    def initialize(server:, requested:, ack_timeout: nil, &listener)
       @server = server
       @requested = requested
+      @ack_timeout = ack_timeout
       @listeners = []
       @listeners << listener if listener
       @state = :pending
@@ -146,8 +156,9 @@ module MCPClient
       # Whether a transport is handing this subscription to a new session:
       # see {#reestablishing?}.
       @reestablishing = false
-      # The listen ids the transport has written for this subscription on the
-      # session it is on, and not yet cancelled: see {#record_outstanding_listen}.
+      # The listen ids the transport has written for this subscription, and
+      # not yet cancelled, each paired with the pipe it was written to: see
+      # {#record_outstanding_listen}.
       @outstanding_listens = []
       # Of those, the ones whose write has not finished yet. They are not
       # cancellable: see {#take_outstanding_listens}.
@@ -333,6 +344,13 @@ module MCPClient
 
     # --- transport-facing state transitions -------------------------------
 
+    # Put the subscription on a listen id, without the registration and the
+    # write {#with_open_id} holds its lock across. No transport opens or
+    # re-opens a stream this way — {#with_open_id} is the step every one of
+    # them takes — so a guarantee about opening or reconnecting is one this
+    # method cannot stand in for.
+    # @param id [Integer, String] the listen request id
+    # @return [void]
     # @api private
     def assign_id(id)
       @mutex.synchronize do
@@ -385,12 +403,24 @@ module MCPClient
     # received is ignored, while failing to cancel one it did receive is not.
     # Recorded *before* the write for that reason, and marked written by
     # {#mark_listen_written} whichever way the write ends.
+    #
+    # The pipe it is written to is recorded with it, because forgetting the
+    # ids of a process that is gone ({#discard_outstanding_listens}) cannot
+    # reach an attempt that has not recorded its id yet. One paused here while
+    # its process was torn down recorded afterwards, with nothing left to
+    # forget it, and the `close` that followed named it on the process that
+    # replaced it — a request that one had never been sent, while
+    # "the cancelled request MUST have been previously issued"
+    # (basic/patterns/cancellation). Recording the pipe makes the id
+    # cancellable on that pipe alone, whenever it is recorded.
     # @param id [Integer, String] the listen request id
+    # @param io [IO, nil] the pipe the request is being written to; nil leaves
+    #   the id cancellable wherever the caller is cancelling
     # @return [void]
     # @api private
-    def record_outstanding_listen(id)
+    def record_outstanding_listen(id, io = nil)
       @mutex.synchronize do
-        @outstanding_listens << id unless @outstanding_listens.include?(id)
+        @outstanding_listens << [id, io] unless @outstanding_listens.any? { |(known, _)| known == id }
         @unwritten_listens << id unless @unwritten_listens.include?(id)
       end
     end
@@ -419,13 +449,23 @@ module MCPClient
     # transport that is writing it cancels it itself once the write is done
     # and it finds the subscription closed — the one moment at which the
     # cancellation can name a request the server has actually been sent.
+    #
+    # Nor is an id written to a *different* pipe among them: the process on
+    # this one was never sent that request (see {#record_outstanding_listen}).
+    # Those are left recorded rather than dropped, since the caller that pins
+    # a pipe is not always the one that will cancel on the pipe they went to.
+    # @param io [IO, nil] cancel only what was written to this pipe; nil takes
+    #   every written id, and an id recorded against no pipe is taken by any
+    #   caller
     # @return [Array] the recorded ids that have been written, oldest first
     # @api private
-    def take_outstanding_listens
+    def take_outstanding_listens(io = nil)
       @mutex.synchronize do
-        taken = @outstanding_listens.reject { |id| @unwritten_listens.include?(id) }
-        @outstanding_listens -= taken
-        taken
+        taken, kept = @outstanding_listens.partition do |(id, recorded_io)|
+          !@unwritten_listens.include?(id) && cancellable_on?(recorded_io, io)
+        end
+        @outstanding_listens = kept
+        taken.map(&:first)
       end
     end
 
@@ -608,6 +648,17 @@ module MCPClient
     def acknowledges_resource?(uri)
       granted = @acknowledged.is_a?(Hash) ? @acknowledged['resourceSubscriptions'] : nil
       granted.is_a?(Array) && granted.include?(uri)
+    end
+
+    # Whether a recorded listen id may be cancelled by a caller writing to a
+    # given pipe. An id recorded against no pipe belongs to a transport that
+    # does not pin one, and a caller that names none is cancelling wherever
+    # the ids went. Called with the lock held.
+    # @param recorded [IO, nil] the pipe the request was written to
+    # @param io [IO, nil] the pipe the caller is cancelling on
+    # @return [Boolean]
+    def cancellable_on?(recorded, io)
+      recorded.nil? || io.nil? || recorded.equal?(io)
     end
 
     # The answer {#wait_until_settled} reports. A drop does not unask the

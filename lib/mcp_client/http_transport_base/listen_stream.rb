@@ -347,6 +347,12 @@ module MCPClient
           # step: a close that lands in between must not leave a stream the
           # host can no longer cancel.
           break unless subscription.with_open_id(next_request_id) { register_subscription(subscription) }
+
+          # The request about to go out is unanswered, so it carries the same
+          # acknowledgment deadline the first one did: a server that accepts
+          # the replacement and then keeps it alive with SSE comments alone
+          # resets nothing else.
+          rearm_acknowledgment_deadline(subscription)
         end
         # The subscription may still be marked open after an unrecoverable drop.
         unless subscription.closed?

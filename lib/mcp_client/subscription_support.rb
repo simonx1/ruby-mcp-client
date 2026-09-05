@@ -43,10 +43,33 @@ module MCPClient
               "#{protocol_version || 'no version'} (use resources/subscribe and server notifications instead)"
       end
 
-      subscription = MCPClient::Subscription.new(server: self, requested: filter, &listener)
+      subscription = MCPClient::Subscription.new(server: self, requested: filter, ack_timeout: ack_timeout, &listener)
       open_subscription(subscription)
       await_acknowledgment_deadline(subscription, ack_timeout)
       subscription
+    end
+
+    # Put the same deadline on a listen request a transport has just
+    # re-issued: an HTTP stream re-opened after a drop, or a stdio
+    # subscription re-sent to the process that replaced the one it was on.
+    #
+    # Each of those is a new JSON-RPC request, for which the server holds no
+    # subscription state and which it has to acknowledge afresh, so the
+    # "implementations SHOULD establish timeouts for all sent requests"
+    # (basic/patterns/cancellation "Timeouts") that bounded the first bounds it
+    # too. It used to bound only the first: the watchdog `listen` started
+    # retires at the first acknowledgment, and a replacement the server
+    # accepted and then never acknowledged left the handle `:pending` with
+    # nothing to tell the host why — indefinitely on stdio, and for as long as
+    # the peer kept sending SSE comments on Streamable HTTP.
+    #
+    # Watchdogs do not pile up behind a stream that keeps dropping: the first
+    # to expire closes the handle, and every other one is woken by that and
+    # retires at once.
+    # @param subscription [MCPClient::Subscription]
+    # @return [Thread, nil] the watchdog, for tests; nil when there is none
+    def rearm_acknowledgment_deadline(subscription)
+      await_acknowledgment_deadline(subscription, subscription.ack_timeout)
     end
 
     # Arrange for an unacknowledged listen to be given up on.
@@ -54,7 +77,8 @@ module MCPClient
     # Started only once the request is on its way, so nothing is cancelled
     # before it exists; it waits on the subscription's own settling signal, so
     # an acknowledgment (or any other end) retires it at once rather than
-    # leaving a thread asleep for the whole deadline.
+    # leaving a thread asleep for the whole deadline. Every re-issued request
+    # gets one too ({#rearm_acknowledgment_deadline}).
     # @param subscription [MCPClient::Subscription]
     # @param ack_timeout [Numeric, false, nil] see {#listen}
     # @return [Thread, nil] the watchdog, for tests; nil when there is none
@@ -471,6 +495,13 @@ module MCPClient
       # No watchdog: this caller waits for the acknowledgment itself, on the
       # same timeout, and reports a stream that never arrives as its own
       # failure rather than through a handle something else closed.
+      #
+      # That choice carries to the requests a reconnect re-issues, which
+      # therefore have no deadline of their own either — and want none: a
+      # mapped stream that comes back without being acknowledged is waited for
+      # and then discarded by {#settled_resource_subscription} the next time
+      # the URI is asked about, which is the answer this caller's contract is
+      # written in.
       subscription = listen(notifications: { 'resourceSubscriptions' => [uri] }, ack_timeout: false)
       begin
         confirm_resource_subscription(subscription, uri)
