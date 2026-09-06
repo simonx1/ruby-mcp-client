@@ -152,8 +152,9 @@ RSpec.describe 'MCP 2026-07-28 deprecations (round 7)' do
 
     context 'with a transport driven directly' do
       let(:server) { MCPClient::ServerStdio.new(command: 'true', logger: logger) }
+      let(:sent) { [] }
 
-      before { allow(server).to receive(:send_message) }
+      before { allow(server).to receive(:send_message) { |message| sent << message } }
 
       it 'stays silent for a handler that answers with no roots' do
         server.on_roots_list_request { |_id, _params| { 'roots' => [] } }
@@ -167,6 +168,8 @@ RSpec.describe 'MCP 2026-07-28 deprecations (round 7)' do
         server.send(:handle_server_request, { 'id' => 1, 'method' => 'roots/list', 'params' => {} })
 
         expect(MCPClient::Deprecations.emitted?(:roots)).to be(true)
+        expect(sent).to eq([{ 'jsonrpc' => '2.0', 'id' => 1,
+                              'result' => { 'roots' => [{ 'uri' => 'file:///workspace' }] } }])
       end
 
       # The handler is host code and its answer is a plain Ruby Hash that
@@ -179,6 +182,11 @@ RSpec.describe 'MCP 2026-07-28 deprecations (round 7)' do
         server.send(:handle_server_request, { 'id' => 1, 'method' => 'roots/list', 'params' => {} })
 
         expect(MCPClient::Deprecations.emitted?(:roots)).to be(true)
+        # The answer reaches the peer as it was given: the wire form of a
+        # symbol-keyed root is the same JSON as the string-keyed one.
+        expect(sent.size).to eq(1)
+        expect(sent.first['id']).to eq(1)
+        expect(JSON.parse(JSON.generate(sent.first['result']))).to eq({ 'roots' => [{ 'uri' => 'file:///workspace' }] })
       end
 
       it 'stays silent for a symbol-keyed answer that carries no root' do

@@ -269,6 +269,18 @@ metadata). Each feature lands in its own PR; this section accumulates them.
 - A 2025-11-25 `sampling/createMessage` request reaching a transport with no sampling handler is answered with `-32601` (Method not found) by every transport, as `Client#handle_sampling_request` already did: sampling.mdx § Error Handling reserves `-1` for "User rejected sampling request", and a capability the client never declared is an unsupported method, not a rejection.
 - A 2025-11-25 `sampling/createMessage` carrying `tools`/`toolChoice` is refused by the transport itself with `-32602` when `sampling.tools` was never declared (SEP-1577: "The client MUST return an error if this field is provided but ClientCapabilities.sampling.tools is not declared") — on the server-initiated path as on the multi round-trip one, after the Sampling/includeContext notices a served-or-refused request owes. A host driving a transport directly no longer depends on its own callback for the check.
 
+- **A diagnostic never changes the answer (round 15).** The line the
+  transports log when refusing a tool-enabled `sampling/createMessage` a host
+  never declared `sampling.tools` for is written guarded, so a logger that
+  fails on it leaves the SEP-1577 refusal (`-32602`) on the wire instead of
+  the dispatcher's `-32603`. The stdio transport's answer to a sampling
+  request with no handler (`-32601`, no notice spent) and its service of a
+  tool-enabled request once `declare_sampling_tools` was called are pinned
+  transport-direct. The retry guarantee's one boundary is named: a standard
+  `Logger` over an open device that fails to write reports that on `$stderr`
+  only and returns as if it had written, so that notice is spent — a closed
+  device is recognised, a broken one is not.
+
 ### JSON Schema handling
 
 - **Dynamic references bind against the evaluation path, `contains`

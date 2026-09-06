@@ -376,7 +376,10 @@ module MCPClient
         # A device that cannot say whether it is closed is taken as open: a
         # notice written to a working stream is the point, and treating an
         # unknown device as dead would suppress every notice a host with a
-        # custom log device should see.
+        # custom log device should see. An OPEN device that fails to write is
+        # the one failure this cannot see: ::Logger's device rescues it and
+        # reports on $stderr only, returning as if it had written, so such a
+        # notice is spent (the documented boundary of the retry guarantee).
         device.respond_to?(:closed?) && device.closed?
       end
 

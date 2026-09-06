@@ -520,7 +520,10 @@ warning. A notice costs the deprecated operation exactly what one
 or writes nowhere (`Logger.new(nil)`, or one whose device has been closed) is
 swallowed, so the feature keeps working and the notice stays owed to a later
 use — but a logger that blocks, blocks its caller here just as it does
-everywhere else in the library. A logger the host wrapped is asked through
+everywhere else in the library. One failure is beyond reach: a standard
+`Logger` over an open device that fails to write hides that from its caller
+(it reports it on `$stderr` only and returns as if it had written), so that
+notice is spent; a closed device is recognised, a broken one is not. A logger the host wrapped is asked through
 the wrapper (`warn?`, and the device of the `Delegator` it holds), so a
 tagged, broadcast or hand-rolled wrapper above WARN leaves the notice owed
 rather than spending it on a line nobody reads; a wrapper that filters on

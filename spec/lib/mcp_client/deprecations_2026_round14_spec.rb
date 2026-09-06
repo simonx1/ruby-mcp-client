@@ -279,7 +279,7 @@ RSpec.describe 'MCP 2026-07-28 deprecations (round 14)' do
       { 'mode' => 'url', 'message' => 'Visit to authorize', 'url' => 'https://example.com/auth' }
     end
 
-    before do
+    let!(:client) do
       allow(MCPClient::ServerFactory).to receive(:create).and_return(server)
       MCPClient::Client.new(
         mcp_server_configs: [{ type: 'stdio', command: 'true' }], logger: logger,
@@ -294,7 +294,9 @@ RSpec.describe 'MCP 2026-07-28 deprecations (round 14)' do
     end
 
     it 'does not finish the interaction: the outcome is still the continuation the server answers' do
-      server.on_notification { |method, params| notified << [method, params] }
+      # Observed through the Client's own listener list, so the Client's
+      # notification routing stays in the path and is what is being watched.
+      client.on_notification { |_server, method, params| notified << [method, params] }
       sent = script_stdio(server, [
                             { 'result' => discover_result },
                             { 'result' => input_required('k1' => { 'method' => 'elicitation/create',
@@ -312,6 +314,35 @@ RSpec.describe 'MCP 2026-07-28 deprecations (round 14)' do
       expect(seen.size).to eq(2)
       # The removed notification is still handed to a generic listener as the
       # raw method it was sent under; nothing in the client acted on it.
+      expect(notified).to eq([['notifications/elicitation/complete', { 'elicitationId' => 'elic-1' }]] * 2)
+      expect(output.string).not_to match(/error/i)
+    end
+
+    # The same notification arriving as a PEER MESSAGE on the stream — read
+    # by the transport's own line handling between the continuation and the
+    # retry, as a stale server would send it — is routed like any other
+    # notification and finishes nothing either.
+    it 'does not finish the interaction when the notification arrives on the stream' do
+      client.on_notification { |_server, method, params| notified << [method, params] }
+      complete = { 'jsonrpc' => '2.0', 'method' => 'notifications/elicitation/complete',
+                   'params' => { 'elicitationId' => 'elic-1' } }
+      sent = script_stdio(server, [
+                            { 'result' => discover_result },
+                            lambda { |_request|
+                              server.send(:handle_line, "#{JSON.generate(complete)}\n")
+                              { 'result' => input_required('k1' => { 'method' => 'elicitation/create',
+                                                                     'params' => url_params }) }
+                            },
+                            done
+                          ])
+
+      result = server.call_tool('authorize', {})
+
+      expect(result['content'].first['text']).to eq('done')
+      expect(sent.map { |request| request['method'] }).to eq(%w[server/discover tools/call tools/call])
+      expect(sent.last.dig('params', 'inputResponses')).to eq({ 'k1' => { 'action' => 'accept' } })
+      expect(seen.size).to eq(1)
+      # Delivered once from the stream, once more from inside the handler.
       expect(notified).to eq([['notifications/elicitation/complete', { 'elicitationId' => 'elic-1' }]] * 2)
       expect(output.string).not_to match(/error/i)
     end

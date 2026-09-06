@@ -815,7 +815,14 @@ module MCPClient
     def refused_undeclared_sampling_tools?(request_id, params)
       return false unless undeclared_sampling_tool_use?('sampling/createMessage', params)
 
-      @logger.warn('Rejecting tool-enabled sampling request: sampling.tools capability not declared')
+      # The line is a courtesy to the host; the refusal is the answer the peer
+      # is owed. A logger that fails here must not turn Invalid params into
+      # the dispatcher's Internal error.
+      begin
+        @logger.warn('Rejecting tool-enabled sampling request: sampling.tools capability not declared')
+      rescue StandardError
+        nil
+      end
       send_error_response(request_id, -32_602,
                           'Invalid params: tools/toolChoice provided but the sampling.tools ' \
                           'capability was not declared')
