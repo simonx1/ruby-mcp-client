@@ -80,7 +80,11 @@ RSpec.describe 'MCP 2026-07-28 subscriptions/listen — round 12' do
   end
 
   it 'survives the process exiting: the replacement is negotiated, the listen re-sent and delivery resumes' do
-    server.connect
+    # The listen establishes the process itself. An explicit `connect` first
+    # would spawn a child that `ensure_initialized` then replaces with a
+    # second one (the transport re-spawns on its first request, as it always
+    # has), and the two children racing for the generation file is what made
+    # this example flaky: whichever read it first decided who was generation 1.
     deliveries = Thread::Queue.new
     subscription = server.listen(notifications: { tools_list_changed: true }) do |method, params|
       deliveries << [method, params['generation'], params['listenId']]
