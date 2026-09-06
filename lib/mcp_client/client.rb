@@ -427,6 +427,34 @@ module MCPClient
       @notification_listeners << block
     end
 
+    # Register the host's control over a multi round-trip request's
+    # out-of-band wait on every server (MCP 2026-07-28 client/elicitation
+    # "URL Mode": manual retry/cancel controls). See
+    # {MCPClient::JsonRpcCommon#on_input_required_wait} for the contract.
+    # @param block [Proc] callback that receives an InputRequiredWait
+    # @return [void]
+    def on_input_required_wait(&block)
+      @input_required_wait_handler = block
+      @servers.each do |server|
+        server.on_input_required_wait(&block) if server.respond_to?(:on_input_required_wait)
+      end
+    end
+
+    # Resume a multi round-trip request from the continuation an
+    # {MCPClient::Errors::InputRequiredError} carries, on the transport that
+    # raised it. The result is the transport's, as {#call_tool} would have
+    # returned it before validation.
+    # @param error [MCPClient::Errors::InputRequiredError] a resumable error
+    # @param timeout [Numeric, nil] per-request timeout for the resumed request
+    # @return [Object] the final (complete) result
+    # @raise [ArgumentError] if the error carries no continuation or names no transport
+    def resume_input_required(error, timeout: nil)
+      transport = error.respond_to?(:transport) ? error.transport : nil
+      raise ArgumentError, 'the error names no transport to resume on' unless transport
+
+      transport.resume_input_required(error, timeout: timeout)
+    end
+
     # Set the roots for this client (MCP 2025-06-18)
     # When roots are changed, a notification is sent to all connected servers
     # @param new_roots [Array<MCPClient::Root, Hash>] the new roots to set
@@ -1624,6 +1652,15 @@ module MCPClient
       end
 
       messages = params['messages'] || []
+      # Both parties SHOULD validate message content (sampling.mdx
+      # "Security Considerations"): the role, the content, a user message of
+      # tool results carrying nothing else, and every assistant tool use
+      # answered by the message that follows it.
+      if (problem = sampling_history_problem(messages))
+        @logger.warn("Rejecting sampling request with a malformed history: #{problem}")
+        return jsonrpc_error_result(-32_602, "Invalid params: #{problem}")
+      end
+
       model_preferences = normalize_model_preferences(params['modelPreferences'])
       system_prompt = params['systemPrompt']
       max_tokens = params['maxTokens']
@@ -1644,6 +1681,91 @@ module MCPClient
         # and stays in the local log rather than crossing to the server.
         jsonrpc_error_result(-32_603, 'Sampling error')
       end
+    end
+
+    # What is wrong with a sampling history, if anything, by the rules of
+    # MCP 2026-07-28 client/sampling: every message has a role of "user" or
+    # "assistant" and content; a user message containing tool results
+    # contains only tool results; every assistant message with tool uses is
+    # followed by a user message consisting entirely of the matching tool
+    # results before any other message.
+    # @param messages [Array<Hash>] the sampling messages
+    # @return [String, nil] the problem, nil when the history is well formed
+    def sampling_history_problem(messages)
+      return 'messages must be an array' unless messages.is_a?(Array)
+
+      pending = nil
+      messages.each_with_index do |message, index|
+        problem, pending = sampling_message_problem(message, index, pending)
+        return problem if problem
+      end
+      return "the last message leaves its tool uses (#{pending.join(', ')}) unanswered" if pending
+
+      nil
+    end
+
+    # @param message [Object] a sampling message
+    # @param index [Integer] its position
+    # @param pending [Array<String>, nil] the tool use ids the previous message left to answer
+    # @return [Array(String, nil), Array(nil, Array<String>)] the problem, or the tool uses now pending
+    def sampling_message_problem(message, index, pending)
+      blocks = sampling_message_blocks(message)
+      unless blocks
+        return ["message #{index} must be an object with a role of \"user\" or \"assistant\" and content", nil]
+      end
+
+      role = message['role'] || message[:role]
+      uses = blocks.select { |block| sampling_block_type(block) == 'tool_use' }
+      results = blocks.select { |block| sampling_block_type(block) == 'tool_result' }
+      return ["message #{index} carries tool uses in a #{role} message", nil] if uses.any? && role != 'assistant'
+
+      if pending
+        problem = sampling_tool_results_problem(index, role, blocks, results, pending)
+        return [problem, nil] if problem
+      elsif results.any? && results.size != blocks.size
+        # The spec forbids the mixing, not a results-only message on its own:
+        # a server may hand over the results without the history before them.
+        return ["message #{index} mixes tool results with other content", nil]
+      end
+      [nil, (uses.map { |block| (block['id'] || block[:id]).to_s } if uses.any?)]
+    end
+
+    # @param index [Integer] the position of the message answering the tool uses
+    # @param role [String] its role
+    # @param blocks [Array<Hash>] its content blocks
+    # @param results [Array<Hash>] the tool results among them
+    # @param pending [Array<String>] the tool use ids to answer
+    # @return [String, nil] the problem, nil when the message answers exactly those uses
+    def sampling_tool_results_problem(index, role, blocks, results, pending)
+      unless role == 'user' && results.size == blocks.size
+        return "message #{index} must consist only of the tool results answering message #{index - 1}"
+      end
+
+      ids = results.map { |block| (block['toolUseId'] || block[:toolUseId]).to_s }
+      return nil if ids.sort == pending.sort
+
+      "message #{index} tool results do not match the tool uses of message #{index - 1}"
+    end
+
+    # @param message [Object] a sampling message
+    # @return [Array<Hash>, nil] its content blocks, nil unless the message is well formed
+    def sampling_message_blocks(message)
+      return nil unless message.is_a?(Hash) && %w[user assistant].include?(message['role'] || message[:role])
+
+      blocks = message['content'] || message[:content]
+      blocks = [blocks] if blocks.is_a?(Hash)
+      return nil unless blocks.is_a?(Array) && !blocks.empty? && blocks.all? { |block| sampling_block_type(block) }
+
+      blocks
+    end
+
+    # @param block [Object] a content block
+    # @return [String, nil] its type, nil unless it is an object with a String type
+    def sampling_block_type(block)
+      return nil unless block.is_a?(Hash)
+
+      type = block['type'] || block[:type]
+      type.is_a?(String) ? type : nil
     end
 
     # Call sampling handler with appropriate arity

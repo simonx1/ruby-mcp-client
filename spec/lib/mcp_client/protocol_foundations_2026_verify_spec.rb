@@ -1705,6 +1705,10 @@ RSpec.describe 'Client#call_tool does not run output validation on an unfinished
       server: mock_server
     )
   end
+  # The built-in transports resolve a continuation themselves (the multi
+  # round-trip branch) and never hand one up; a transport of the host's own
+  # that does is what this pins, so the Client's output validation gate is
+  # exercised directly on the published InputRequests wire shape.
   let(:unfinished) do
     { 'resultType' => 'input_required', 'requestState' => 'continue-later',
       'inputRequests' => { 'city' => { 'method' => 'elicitation/create',

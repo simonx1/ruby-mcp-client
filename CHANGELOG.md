@@ -40,6 +40,29 @@ metadata). Each feature lands in its own PR; this section accumulates them.
   than in a tight loop. The plain HTTP transport now accepts the elicitation,
   roots and sampling handlers so `MCPClient::Client` can serve round trips on
   it too.
+- **The out-of-band wait is the host's to steer.** Clients SHOULD provide
+  manual controls that let the user retry or cancel a request waiting on an
+  out-of-band interaction (client/elicitation "URL Mode"). Before each paced
+  retry of an answer that carries only `requestState` the transport calls the
+  block registered with `on_input_required_wait` (on a transport or on
+  `MCPClient::Client`, for every server) with an `InputRequiredWait` — the
+  method, the round trip, the pause, the `requestState`, the result and the
+  seconds waited — and the block answers `:retry` (retry now), `:cancel`
+  (stop) or anything else (wait the pace). A wait never runs past the
+  request's own timeout either. Every `InputRequiredError` the round trip
+  raises — cancelled, timed out, unfulfillable, over the round-trip ceiling —
+  carries the continuation (`request_method`, `request_params`, `transport`,
+  `resumable?`), and `resume_input_required(error)` (transport or Client)
+  re-issues the original request with the `requestState` echoed and no
+  `inputResponses`, continuing the round trip from where it stopped.
+- **Sampling histories are validated before they reach the host.** Both
+  parties SHOULD validate sampling message content (client/sampling
+  "Security Considerations"): a message without a `"user"`/`"assistant"`
+  role or without content, a user message mixing tool results with other
+  content, and an assistant tool use not answered by the user message that
+  follows it are refused with
+  `-32602` on a 2025-11-25 session and fail the round trip locally on a
+  2026-07-28 one, and the host's sampler is never invoked for them.
 - **Limits and errors.** More than 10 consecutive `input_required` answers,
   an input request this client cannot honour (unknown method, no handler,
   handler error) or a malformed `inputRequests` raise

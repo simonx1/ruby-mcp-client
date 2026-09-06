@@ -5,11 +5,13 @@ require 'zlib'
 require 'stringio'
 require_relative 'header_params'
 require_relative 'json_rpc_common/error_bodies'
+require_relative 'json_rpc_common/input_waits'
 
 module MCPClient
   # Shared retry/backoff logic for JSON-RPC transports
   module JsonRpcCommon
     include ErrorBodies
+    include InputWaits
 
     # JSON-RPC methods with arbitrary side effects that MUST NOT be re-sent
     # automatically. Even a "transient" failure (5xx, dropped connection,
@@ -931,19 +933,25 @@ module MCPClient
     # with a new id — carrying inputResponses keyed like the requests and
     # the opaque requestState echoed verbatim (omitted when the server sent
     # none). A result without inputRequests asks for nothing this client can
-    # fulfil, so it is retried after a growing pause (INPUT_RETRY_DELAY).
+    # fulfil, so it is retried after a growing pause (INPUT_RETRY_DELAY) that
+    # the host steers through {#on_input_required_wait} and that never runs
+    # past the request timeout: the continuation is handed back instead, on
+    # an error {#resume_input_required} accepts.
     # @param method [String] the JSON-RPC method
     # @param params [Hash] the original params
-    # @param timeout [Numeric, nil] per-request timeout
+    # @param timeout [Numeric, nil] per-request timeout, also bounding the waits
     # @yieldparam params [Hash] params for one attempt (original, or with inputResponses)
     # @yieldreturn [Object] the attempt's result
     # @return [Object] the final (complete) result
     # @raise [MCPClient::Errors::InvalidResultError] input_required on an unsupported method
-    # @raise [MCPClient::Errors::InputRequiredError] when a round trip cannot be fulfilled or too many occur
-    def resolve_input_round_trips(method, params, _timeout = nil)
+    # @raise [MCPClient::Errors::InputRequiredError] when a round trip cannot be fulfilled, is
+    #   cancelled or times out, or too many occur — carrying the continuation
+    def resolve_input_round_trips(method, params, timeout = nil)
       result = yield(params)
       round_trips = 0
       delay = INPUT_RETRY_DELAY
+      started = input_wait_clock
+      deadline = timeout ? started + timeout : nil
       while MCPClient::JsonRpcCommon.result_type(result) == 'input_required'
         # Read on the wire spelling, whatever the transport's JSON middleware
         # did to the keys: a symbolized inputRequests/requestState would
@@ -967,33 +975,22 @@ module MCPClient
         @logger.debug("#{method} requires input (round trip #{round_trips}); fulfilling and retrying")
         retry_params = retry_params_for(params, result)
         unless retry_params.key?('inputResponses')
-          sleep(delay)
-          delay = [delay * 2, INPUT_RETRY_MAX_DELAY].min
+          now = input_wait_clock
+          wait = InputRequiredWait.new(rpc_method: method, round_trip: round_trips, delay: delay,
+                                       request_state: result['requestState'], result: result,
+                                       elapsed: now - started)
+          delay = pace_input_round_trip(wait, deadline, now)
         end
         result = yield(retry_params)
       end
       result
-    end
-
-    # The params for a multi round-trip retry: the original params plus the
-    # fulfilled inputResponses and the server's requestState. Both fields
-    # affect only this retry; the caller's params are not mutated.
-    # @param params [Hash] the original params
-    # @param result [Hash] the InputRequiredResult
-    # @return [Hash]
-    def retry_params_for(params, result)
-      retry_params = (params.is_a?(Hash) ? params.dup : {})
-      retry_params.delete('inputResponses')
-      retry_params.delete(:inputResponses)
-      retry_params.delete('requestState')
-      retry_params.delete(:requestState)
-
-      if result.key?('inputRequests')
-        retry_params['inputResponses'] = fulfil_input_requests(result['inputRequests'], result)
-      end
-      state = result['requestState']
-      retry_params['requestState'] = state unless state.nil?
-      retry_params
+    rescue MCPClient::Errors::InputRequiredError => e
+      # Every failure of the round trip hands the continuation back: the
+      # request it was driving, for #resume_input_required.
+      e.request_method ||= method
+      e.request_params ||= params
+      e.transport ||= self
+      raise
     end
 
     # Fulfil every input request through the handler registered for its

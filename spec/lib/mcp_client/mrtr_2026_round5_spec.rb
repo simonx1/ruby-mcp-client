@@ -9,7 +9,8 @@ require 'webmock/rspec'
 # way down, the continuation-level recoveries on the HTTP transports (version
 # renegotiation and an ordinary retry), two overlapping HTTP round trips each
 # spending their own HeaderMismatch refresh, and the sampling histories this
-# client hands to the host unvalidated on both eras.
+# client refuses before they reach the host on both eras (round 6 pins the
+# rules; these pin that a modern and a legacy request are refused alike).
 RSpec.describe 'MCP 2026-07-28 multi round-trip requests — round 5' do
   let(:url) { 'https://example.com/mcp' }
 
@@ -340,31 +341,37 @@ RSpec.describe 'MCP 2026-07-28 multi round-trip requests — round 5' do
        { 'role' => 'user', 'content' => { 'type' => 'text', 'text' => 'never mind' } }]
     end
 
-    it 'hands a mixed or dangling tool history to the modern round-trip sampler unchanged' do
-      stdio = modern_stdio
-      seen = []
-      handler = lambda do |messages, _prefs, _system, _max, params|
-        seen << [messages, params['tools']]
-        { 'content' => 'ok' }
+    # Both parties SHOULD validate message content (client/sampling
+    # "Security Considerations"); a user message mixing tool results with
+    # text, or an assistant tool use no user message answers, is refused
+    # before the host's sampler sees it — locally on the round-trip path,
+    # where inputResponses has no per-request error channel.
+    it 'refuses a mixed or dangling tool history on the modern round-trip path before the sampler runs' do
+      [mixed_history, dangling_history].each do |history|
+        stdio = modern_stdio
+        seen = []
+        handler = lambda do |messages, _prefs, _system, _max, params|
+          seen << [messages, params['tools']]
+          { 'content' => 'ok' }
+        end
+        client = client_with(stdio, sampling_handler: handler, sampling_supports_tools: true)
+        sent = script_stdio(stdio, [{ 'result' => discover_result },
+                                    { 'result' => tool_list },
+                                    { 'result' => input_required({ 's' => sampling_request('tools' => tools,
+                                                                                           'messages' => history) },
+                                                                 state: 'one') },
+                                    { 'result' => { 'content' => [{ 'type' => 'text', 'text' => 'done' }] } }])
+
+        expect { client.call_tool('c', {}) }
+          .to raise_error(MCPClient::Errors::InputRequiredError, /sampling.*Invalid params/i) do |e|
+            expect(e.request_state).to eq('one')
+          end
+        expect(seen).to be_empty
+        expect(sent.count { |r| r['method'] == 'tools/call' }).to eq(1)
       end
-      client = client_with(stdio, sampling_handler: handler, sampling_supports_tools: true)
-      mixed = sampling_request('tools' => tools, 'messages' => mixed_history)
-      dangling = sampling_request('tools' => tools, 'messages' => dangling_history)
-      sent = script_stdio(stdio, [{ 'result' => discover_result },
-                                  { 'result' => tool_list },
-                                  { 'result' => input_required({ 's' => mixed }, state: 'one') },
-                                  { 'result' => input_required({ 's' => dangling }, state: 'two') },
-                                  { 'result' => { 'content' => [{ 'type' => 'text', 'text' => 'done' }] } }])
-
-      expect(client.call_tool('c', {})['content'].first['text']).to eq('done')
-
-      expect(seen).to eq([[mixed_history, tools], [dangling_history, tools]])
-      answers = sent.select { |r| r['method'] == 'tools/call' }.drop(1).map { |r| r['params']['inputResponses']['s'] }
-      expect(answers).to all(include('role' => 'assistant', 'stopReason' => 'endTurn',
-                                     'content' => { 'type' => 'text', 'text' => 'ok' }))
     end
 
-    it 'hands a mixed or dangling tool history to the legacy sampling handler unchanged' do
+    it 'refuses a mixed or dangling tool history on the legacy path with -32602 before the sampler runs' do
       seen = []
       handler = lambda do |messages, _prefs, _system, _max, params|
         seen << [messages, params['tools']]
@@ -377,9 +384,9 @@ RSpec.describe 'MCP 2026-07-28 multi round-trip requests — round 5' do
         client.send(:handle_sampling_request, 7, { 'messages' => history, 'tools' => tools, 'maxTokens' => 10 })
       end
 
-      expect(seen).to eq([[mixed_history, tools], [dangling_history, tools]])
-      expect(results).to all(include('role' => 'assistant', 'content' => { 'type' => 'text', 'text' => 'ok' }))
-      expect(results.map { |r| r.key?('error') }).to eq([false, false])
+      expect(seen).to be_empty
+      expect(results.map { |r| r.dig('error', 'code') }).to eq([-32_602, -32_602])
+      expect(results.map { |r| r.key?('result') }).to eq([false, false])
     end
   end
 end
