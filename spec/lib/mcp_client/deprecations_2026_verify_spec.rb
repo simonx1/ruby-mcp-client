@@ -335,7 +335,48 @@ RSpec.describe 'MCP 2026-07-28 deprecations (verification)' do
 
           expect(MCPClient::Deprecations.emitted?(:sampling)).to be(false)
           expect(MCPClient::Deprecations.emitted?(:include_context)).to be(false)
-          expect(posted.last['error']).to include('message' => 'Sampling not supported')
+          # sampling.mdx § Error Handling reserves -1 for "User rejected
+          # sampling request"; a capability the client never declared is an
+          # unsupported method, -32601, as Client#handle_sampling_request answers.
+          expect(posted.last['error']).to include('code' => -32_601, 'message' => 'Sampling not supported')
+        end
+
+        # SEP-1577: "The client MUST return an error if this field is provided
+        # but ClientCapabilities.sampling.tools is not declared" — on the 2025
+        # server-initiated path as on the round-trip one, and with the notices
+        # a served-or-refused sampling request owes going out first.
+        it 'refuses a tool-enabled request the host never declared sampling.tools for, notices first' do
+          served = []
+          server.on_sampling_request do |_id, params|
+            served << params
+            sampling_answer
+          end
+
+          route(server, { 'id' => 12, 'method' => 'sampling/createMessage',
+                          'params' => { 'messages' => [], 'maxTokens' => 5, 'includeContext' => 'thisServer',
+                                        'tools' => [{ 'name' => 'lookup', 'inputSchema' => {} }] } })
+
+          expect(served).to be_empty
+          expect(posted.last['error']).to include('code' => -32_602)
+          expect(posted.last['error']['message']).to match(/sampling\.tools/)
+          expect(posted.last).not_to have_key('result')
+          expect(MCPClient::Deprecations.emitted?(:sampling)).to be(true)
+          expect(output.string).to include('Received: includeContext thisServer')
+        end
+
+        it 'serves the same request once the host declared sampling.tools' do
+          served = []
+          server.on_sampling_request do |_id, params|
+            served << params
+            sampling_answer
+          end
+          server.declare_sampling_tools
+
+          route(server, { 'id' => 13, 'method' => 'sampling/createMessage',
+                          'params' => { 'messages' => [], 'maxTokens' => 5, 'toolChoice' => { 'mode' => 'auto' } } })
+
+          expect(served.last).to include('toolChoice' => { 'mode' => 'auto' })
+          expect(posted.last['result']).to eq(sampling_answer)
         end
 
         # Roots counts as used only once an answer carries a root, and an

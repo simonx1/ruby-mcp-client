@@ -266,6 +266,8 @@ metadata). Each feature lands in its own PR; this section accumulates them.
   enabled, a complete discovery -> input_required -> continuation exchange
   for a modern URL elicitation next to the legacy response envelope, and
   `notifications/elicitation/complete` ignored on either era.
+- A 2025-11-25 `sampling/createMessage` request reaching a transport with no sampling handler is answered with `-32601` (Method not found) by every transport, as `Client#handle_sampling_request` already did: sampling.mdx § Error Handling reserves `-1` for "User rejected sampling request", and a capability the client never declared is an unsupported method, not a rejection.
+- A 2025-11-25 `sampling/createMessage` carrying `tools`/`toolChoice` is refused by the transport itself with `-32602` when `sampling.tools` was never declared (SEP-1577: "The client MUST return an error if this field is provided but ClientCapabilities.sampling.tools is not declared") — on the server-initiated path as on the multi round-trip one, after the Sampling/includeContext notices a served-or-refused request owes. A host driving a transport directly no longer depends on its own callback for the check.
 
 ### JSON Schema handling
 

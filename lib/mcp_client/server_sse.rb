@@ -783,13 +783,18 @@ module MCPClient
       # If no callback is registered, return error
       unless @sampling_request_callback
         @logger.warn('Received sampling request but no callback registered, returning error')
-        send_error_response(request_id, -1, 'Sampling not supported')
+        # sampling.mdx § Error Handling reserves -1 for "User rejected sampling
+        # request"; a capability this client never declared is an unsupported
+        # method (-32601, Method not found), as Client#handle_sampling_request answers.
+        send_error_response(request_id, -32_601, 'Sampling not supported')
         return
       end
 
       # Sampling, and the includeContext values it may carry, are deprecated
       # (SEP-2577, SEP-2596) — with or without a Client.
       warn_sampling_deprecated(params)
+      return if refused_undeclared_sampling_tools?(request_id, params)
+
       # Call the registered callback
       result = @sampling_request_callback.call(request_id, params)
 

@@ -803,6 +803,25 @@ module MCPClient
       instance_variable_defined?(:@sampling_tools_supported) && @sampling_tools_supported
     end
 
+    # SEP-1577 (schema.ts CreateMessageRequestParams.tools/.toolChoice): "The
+    # client MUST return an error if this field is provided but
+    # ClientCapabilities.sampling.tools is not declared." The 2025-11-25
+    # server-initiated path refuses here, before any handler sees the request,
+    # with the Invalid params code sampling.mdx § Error Handling uses; the
+    # multi round-trip path refuses the same way in InputRoundTrips.
+    # @param request_id [String, Integer] the JSON-RPC request ID
+    # @param params [Hash] the sampling/createMessage params
+    # @return [Boolean] true when the request was refused (and answered)
+    def refused_undeclared_sampling_tools?(request_id, params)
+      return false unless undeclared_sampling_tool_use?('sampling/createMessage', params)
+
+      @logger.warn('Rejecting tool-enabled sampling request: sampling.tools capability not declared')
+      send_error_response(request_id, -32_602,
+                          'Invalid params: tools/toolChoice provided but the sampling.tools ' \
+                          'capability was not declared')
+      true
+    end
+
     # Result types defined by the core protocol (basic/index.mdx "ResultType").
     # Extensions add more (e.g. "task"); the accepted set widens with the
     # declared extensions this client implements (#accepted_result_types).
