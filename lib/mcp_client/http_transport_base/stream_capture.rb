@@ -36,6 +36,53 @@ module MCPClient
         [budget ? [budget, remaining].min : remaining, deadline]
       end
 
+      # Run one HTTP exchange under its deadline, whatever the socket does.
+      #
+      # Faraday's socket timeout bounds the gap between reads, and every read
+      # restarts it: a server that sends an event late in the budget, or head
+      # bytes forever, outlives the bound the caller asked for — the second
+      # never even reaches the body callback that checks the deadline. MCP
+      # 2026-07-28 cancellation/timeouts asks for a maximum timeout "regardless
+      # of progress", so a watchdog ends the exchange at the deadline whatever
+      # the socket is doing.
+      #
+      # Raising into the requesting thread is the only way to break its
+      # blocking read from outside. The watchdog fires at most once, never
+      # after the request settled, and is always torn down; if it loses the
+      # race by the microseconds between the answer arriving and the request
+      # being marked settled, the answer stands rather than the timeout.
+      # @param deadline [Float, nil] monotonic instant the exchange must finish by
+      # @return [Object] whatever the block returns
+      # @raise [Faraday::TimeoutError] when the deadline passes first
+      def with_request_watchdog(deadline)
+        return yield unless deadline
+
+        target = Thread.current
+        lock = Mutex.new
+        settled = false
+        watchdog = Thread.new do
+          remaining = deadline - monotonic_now
+          sleep(remaining) if remaining.positive?
+          lock.synchronize do
+            target.raise(Faraday::TimeoutError, 'Request exceeded its deadline') unless settled
+          end
+        end
+
+        begin
+          answered = yield
+          lock.synchronize { settled = true }
+          answered
+        rescue Faraday::TimeoutError
+          raise if answered.nil?
+
+          lock.synchronize { settled = true }
+          answered
+        ensure
+          lock.synchronize { settled = true }
+          watchdog.kill
+        end
+      end
+
       # A callback handed every complete SSE event of the response stream as
       # it arrives, or nil to read the stream only once it has ended. The base
       # transport parses completed bodies; ServerHTTP overrides this.

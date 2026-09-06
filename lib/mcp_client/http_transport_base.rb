@@ -91,12 +91,17 @@ module MCPClient
         # modern error only under the status it came with.
         state[:mcp_env] = env
         env.request.on_data = lambda do |chunk, _size, _env|
+          # Before the chunk is kept, never after: bytes that arrive past the
+          # deadline are not part of an answer this request may settle on, and
+          # buffering them first would let the salvage hand back an answer the
+          # caller had already stopped waiting for.
+          deadline = state[:mcp_deadline]
+          raise Faraday::TimeoutError, 'Request exceeded its deadline' if deadline && monotonic_now > deadline
+
           buffer << chunk.to_s
           # Only a streamed body can be measured against its Content-Length
           # here; a response the adapter hands over whole never reaches this.
           state[:mcp_streamed] = true
-          deadline = state[:mcp_deadline]
-          raise Faraday::TimeoutError, 'Request exceeded its deadline' if deadline && monotonic_now > deadline
 
           next unless scanner
 
@@ -623,8 +628,10 @@ module MCPClient
                   mcp_stream_listener: response_stream_listener(request), mcp_inflate_limit: inflate_limit }
 
       begin
-        response = conn.post(@endpoint) do |req|
-          prepare_http_request(req, request, sent_session_id, timeout, capture)
+        response = with_request_watchdog(deadline) do
+          conn.post(@endpoint) do |req|
+            prepare_http_request(req, request, sent_session_id, timeout, capture)
+          end
         end
 
         return restart_session_and_resend(request, sent_session_id) if expired_session?(response, sent_session_id)

@@ -754,6 +754,16 @@ class MidStreamCloseServer
   # complete SSE event under HTTP `code`, then close without the terminating
   # chunk. The answer arrived; the framing after it did not.
   STATUS_THEN_CLOSE = :status_then_close
+  # Reply token pair [HEADER_DRIP, interval]: the status line, then a fresh
+  # response header line every `interval` seconds and never the blank line
+  # that ends the head. Every read succeeds, so a socket timeout alone never
+  # fires and no body callback ever runs — only a bound on the whole exchange
+  # can end it.
+  HEADER_DRIP = :header_drip
+  # Reply token quadruple [HEADER_DRIP_THEN, seconds, interval, reply]: drip
+  # header lines for `seconds`, then answer with `reply`. The answer is real
+  # but arrives after any deadline shorter than `seconds`.
+  HEADER_DRIP_THEN = :header_drip_then
   # Reply token pair [SHORT_BODY, prefix]: a Content-Length that promises more
   # than `prefix`, then `prefix` and a close. Net::HTTP hands such a body back
   # normally, so nothing raises and only the length says it stopped short.
@@ -934,6 +944,8 @@ class MidStreamCloseServer
       sleep payload
       return write_reply(client, extra)
     when STALL then sleep
+    when HEADER_DRIP, HEADER_DRIP_THEN
+      return write_header_drip_reply(client, reply)
     when DELIVER_THEN_STALL, EVENT_THEN_STALL
       write_sse_chunk(client, sse_events_for(payload))
       client.flush
@@ -1029,6 +1041,35 @@ class MidStreamCloseServer
     client.write("HTTP/1.1 #{status} Bad Request\r\nContent-Type: application/json\r\n" \
                  "Transfer-Encoding: chunked\r\nConnection: close\r\n\r\n")
     client.write(format("%<size>x\r\n%<chunk>s\r\n", size: chunk.bytesize, chunk: chunk))
+  end
+
+  # The two tokens that hold the response head open, and what follows.
+  # @return [void]
+  def write_header_drip_reply(client, reply)
+    token, payload, extra = reply.is_a?(Array) ? reply : [reply, nil, nil]
+    return drip_headers(client, payload || 0.02) if token == HEADER_DRIP
+
+    drip_headers(client, extra || 0.02, seconds: payload)
+    write_reply(client, reply[3])
+  end
+
+  # Response header lines, forever or for `seconds`, and never the blank line
+  # that would end the head.
+  def drip_headers(client, interval, seconds: nil)
+    client.write("HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\n")
+    stop = seconds && (Process.clock_gettime(Process::CLOCK_MONOTONIC) + seconds)
+    pad = 0
+    loop do
+      break if stop && Process.clock_gettime(Process::CLOCK_MONOTONIC) >= stop
+
+      pad += 1
+      client.write("X-Pad-#{pad}: keep-the-head-open\r\n")
+      client.flush
+      sleep interval
+    end
+  rescue StandardError
+    @mutex.synchronize { @aborted = true }
+    raise
   end
 
   def drip(client, interval)
@@ -1464,6 +1505,77 @@ RSpec.describe 'MCP 2026-07-28 Streamable HTTP — a response stream that really
           # A replacement on a fresh 1.0 s socket timeout would take ~1.7 s.
           expect(elapsed_since(started)).to be < 1.45
           expect(probes).to eq(2)
+        end
+
+        # MCP 2026-07-28 cancellation/timeouts: "SHOULD always enforce a
+        # maximum timeout regardless of progress". A socket timeout bounds the
+        # gap between reads, so a server that reads back the clock — an event
+        # late in the budget, or head bytes forever — outlives it.
+        it 'ends a request whose stream falls silent late in its budget, not a timeout later' do
+          start_server do |message|
+            if message['method'] == 'server/discover'
+              jsonrpc(message, discovery)
+            else
+              [MidStreamCloseServer::DELAY, 0.6,
+               [MidStreamCloseServer::EVENT_THEN_STALL,
+                { 'jsonrpc' => '2.0', 'method' => 'notifications/progress', 'params' => {} }]]
+            end
+          end
+          server = transport(klass, read_timeout: 30)
+          server.connect
+
+          started = Process.clock_gettime(Process::CLOCK_MONOTONIC)
+          Timeout.timeout(15) do
+            expect { server.rpc_request('tools/call', { 'name' => 't', 'arguments' => {} }, timeout: 1.0) }
+              .to raise_error(MCPClient::Errors::RequestTimeoutError)
+          end
+          # Bounded by the request's own timeout. Restarting the socket clock
+          # on the 0.6 s event would end it at ~1.6 s instead.
+          expect(elapsed_since(started)).to be < 1.35
+        end
+
+        it 'ends a request whose head never finishes, which no socket timeout would' do
+          start_server do |message|
+            if message['method'] == 'server/discover'
+              jsonrpc(message, discovery)
+            else
+              [MidStreamCloseServer::HEADER_DRIP, 0.02]
+            end
+          end
+          server = transport(klass, read_timeout: 30)
+          server.connect
+
+          started = Process.clock_gettime(Process::CLOCK_MONOTONIC)
+          Timeout.timeout(15) do
+            expect { server.rpc_request('tools/call', { 'name' => 't', 'arguments' => {} }, timeout: 1.0) }
+              .to raise_error(MCPClient::Errors::RequestTimeoutError)
+          end
+          # Every read succeeds, so the socket timeout never fires at all.
+          expect(elapsed_since(started)).to be < 1.35
+        end
+
+        it 'refuses an answer that arrives after the deadline instead of settling on it' do
+          start_server do |message|
+            if message['method'] == 'server/discover'
+              jsonrpc(message, discovery)
+            else
+              [MidStreamCloseServer::HEADER_DRIP_THEN, 1.4, 0.02,
+               [MidStreamCloseServer::DELIVER_THEN_STALL, jsonrpc(message, { 'content' => [] })]]
+            end
+          end
+          server = transport(klass, read_timeout: 30)
+          server.connect
+
+          started = Process.clock_gettime(Process::CLOCK_MONOTONIC)
+          Timeout.timeout(15) do
+            expect { server.rpc_request('tools/call', { 'name' => 't', 'arguments' => {} }, timeout: 1.0) }
+              .to raise_error(MCPClient::Errors::RequestTimeoutError)
+          end
+          # Ended at the deadline, so the answer the server sent at 1.4 s was
+          # never read — a request cannot settle on an answer it waited past
+          # its own bound to receive.
+          expect(elapsed_since(started)).to be < 1.35
+          expect(@fixture.received.count { |r| r['method'] == 'tools/call' }).to eq(1)
         end
 
         # The re-issue rule is about a request that was *lost*. A server that
