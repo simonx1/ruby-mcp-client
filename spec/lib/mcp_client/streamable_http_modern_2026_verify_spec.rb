@@ -1728,6 +1728,47 @@ RSpec.describe 'MCP 2026-07-28 Streamable HTTP — a response stream that really
       # Dispatched exactly once: not again when the completed body is parsed.
       expect(seen.size).to eq(1)
     end
+
+    # A listener that fails while the stream is still open must not cancel
+    # the request it was interleaved with (closing the stream is the
+    # cancellation signal): the body is read to its end, the response the
+    # server then sends is received, and the listener's failure is what the
+    # caller gets — once, with no re-issue.
+    it 'holds a live listener failure until the response stream ends' do
+      seen = Queue.new
+      start_server do |message|
+        case message['method']
+        when 'server/discover' then jsonrpc(message, discovery)
+        when 'tools/list' then jsonrpc(message, { 'tools' => [] })
+        else
+          waiter = -> { settled_within?(3) { !seen.empty? } }
+          [MidStreamCloseServer::EVENT_THEN_WAIT,
+           { 'jsonrpc' => '2.0', 'method' => 'notifications/progress',
+             'params' => { 'progressToken' => 'p', 'progress' => 1 } },
+           waiter, jsonrpc(message, { 'content' => [] })]
+        end
+      end
+      server = transport(MCPClient::ServerHTTP, read_timeout: 5)
+      server.on_notification do |method, _params|
+        seen << method
+        raise 'listener failed'
+      end
+
+      error = nil
+      Timeout.timeout(15) do
+        server.rpc_request('tools/call', { 'name' => 't', 'arguments' => {} })
+      rescue MCPClient::Errors::ToolCallError => e
+        error = e
+      end
+
+      expect(error&.message).to include('listener failed')
+      expect(error.cause).to be_a(RuntimeError)
+      expect(error.cause).to be_a(MCPClient::HttpTransportBase::RequestRecovery::NestedExchange)
+      # The stream was read to its end: the server got to send the response
+      # (its waiter saw the listener run), and the call was sent exactly once.
+      expect(methods_received.count('tools/call')).to eq(1)
+      expect(seen.size).to eq(1)
+    end
   end
 
   describe 'deadlines bound connection setup' do

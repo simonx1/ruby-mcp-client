@@ -43,7 +43,7 @@ RSpec.describe 'MCP 2026-07-28 x-mcp-header custom headers' do
       end
 
       it 'rejects values that are not HTTP field-name tokens' do
-        ['Reg ion', 'Region:', "Reg\nion", "Reg\rion", 'Région', 'a/b', '(x)'].each do |bad|
+        ['Reg ion', 'Region:', "Reg\nion", "Reg\rion", "Region\t1", 'Région', 'a/b', '(x)', 'a,b'].each do |bad|
           errors = described_class.validate_schema(schema('a' => { 'type' => 'string', 'x-mcp-header' => bad }))
           expect(errors).not_to be_empty, "expected #{bad.inspect} to be rejected"
         end
