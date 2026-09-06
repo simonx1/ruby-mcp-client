@@ -513,6 +513,31 @@ module MCPClient
     # @param request [Hash] the JSON-RPC request
     # @return [Faraday::Response] the HTTP response
     # @raise [MCPClient::Errors::ConnectionError] if connection fails
+    # What an answered POST means: the session it was sent under may have
+    # expired, its body may have been cut short, it may carry an error, or it
+    # settles the request.
+    # @param response [Faraday::Response] the answer as it arrived
+    # @param request [Hash] the JSON-RPC message that was sent
+    # @param sent_session_id [String, nil] the session id the request carried
+    # @param capture [Hash] the capture state of this exchange
+    # @return [Faraday::Response] the response the caller settles on
+    def settle_http_response(response, request, sent_session_id, capture)
+      # MCP 2026-07-28 caching: the result is bound to the Authorization
+      # the request went out with, middleware included.
+      note_sent_authorization(response)
+
+      return restart_session_and_resend(request, sent_session_id) if expired_session?(response, sent_session_id)
+      # A body that stopped short of its Content-Length was cut on the way,
+      # exactly like a socket that died mid-body — it just did not raise.
+      return truncated_body_outcome(request, capture) if capture[:mcp_short_body]
+
+      handle_http_error_response(response) unless response.success?
+      handle_successful_response(response, request)
+
+      log_response(response)
+      response
+    end
+
     def send_http_request(request, timeout: nil, deadline: nil, extra_headers: {})
       conn = http_connection
       # The session id this request goes out with: a later 404 is attributed
@@ -531,20 +556,7 @@ module MCPClient
             prepare_http_request(req, request, sent_session_id, timeout, capture, extra_headers)
           end
         end
-        # MCP 2026-07-28 caching: the result is bound to the Authorization
-        # the request went out with, middleware included.
-        note_sent_authorization(response)
-
-        return restart_session_and_resend(request, sent_session_id) if expired_session?(response, sent_session_id)
-        # A body that stopped short of its Content-Length was cut on the way,
-        # exactly like a socket that died mid-body — it just did not raise.
-        return truncated_body_outcome(request, capture) if capture[:mcp_short_body]
-
-        handle_http_error_response(response) unless response.success?
-        handle_successful_response(response, request)
-
-        log_response(response)
-        response
+        settle_http_response(response, request, sent_session_id, capture)
       rescue Faraday::UnauthorizedError, Faraday::ForbiddenError => e
         handle_auth_error(e)
       rescue Faraday::ResourceNotFound => e
