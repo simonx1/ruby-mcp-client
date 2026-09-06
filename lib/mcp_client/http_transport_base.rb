@@ -604,16 +604,6 @@ module MCPClient
       end
     end
 
-    # Whether a 404 answer means the session this request went out under has
-    # expired (MCP 2025-11-25) rather than being a modern server's well-formed
-    # -32601 answer to THIS request, which restarting would only re-send.
-    # @param response [#status] the normalized 404 response
-    # @param sent_session_id [String, nil] the session id the request carried
-    # @return [Boolean]
-    def session_expired?(response, sent_session_id)
-      response.status == 404 && session_restart_applicable?(sent_session_id) && !method_not_found_answer?(response)
-    end
-
     # Send an HTTP request to the server
     # @param request [Hash] the JSON-RPC request
     # @return [Faraday::Response] the HTTP response

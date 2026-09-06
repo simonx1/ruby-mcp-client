@@ -29,7 +29,9 @@ module MCPClient
         # single JSON object or an SSE stream scoped to the request; the
         # client MUST support both.
         data = if content_type.include?('text/event-stream')
-                 response_from_sse(body.to_s.strip, request && request['id'], live_event_count(response))
+                 # Not stripped: the blank line that terminates the final
+                 # event is what makes it a delivered event at all.
+                 response_from_sse(body.to_s, request && request['id'], live_event_count(response))
                elsif body.is_a?(String)
                  JSON.parse(body.strip)
                else
