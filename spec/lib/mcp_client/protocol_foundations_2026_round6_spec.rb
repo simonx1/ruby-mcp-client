@@ -114,9 +114,18 @@ RSpec.describe 'a 404 answering a well-formed -32601 is method-not-found off a n
     server
   end
 
+  # The registry is process-wide, so a request another example made — a GET
+  # carrying no body among them — can be listed here too. Only JSON-RPC
+  # bodies name a method; anything else is not this example's traffic.
   def posted_methods
-    WebMock::RequestRegistry.instance.requested_signatures.hash.keys
-                            .map { |signature| JSON.parse(signature.body)['method'] }
+    WebMock::RequestRegistry.instance.requested_signatures.hash.keys.filter_map do |signature|
+      body = signature.body
+      next unless body.is_a?(String) && !body.empty?
+
+      JSON.parse(body)['method']
+    rescue JSON::ParserError
+      nil
+    end
   end
 
   [MCPClient::ServerHTTP, MCPClient::ServerStreamableHTTP].each do |klass|
