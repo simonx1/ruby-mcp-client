@@ -249,12 +249,20 @@ RSpec.describe 'MCP 2026-07-28 deprecations (round 11)' do
       expect(output.string).to include('SEP-2577')
     end
 
+    # The notice is spent once, but the level it names is carried by every
+    # request that asked for it: a per-call value overrides the host default
+    # rather than disappearing with the warning that announced it.
     it 'warns when a per-call _meta carries it, and only once' do
-      2.times do
+      transport.request_meta = { 'io.modelcontextprotocol/logLevel' => 'error' }
+      MCPClient::Deprecations.reset!
+      output.truncate(output.rewind)
+
+      carried = Array.new(2) do
         transport.with_request_meta({ '_meta' => { 'io.modelcontextprotocol/logLevel' => 'warning' } })
       end
 
       expect(output.string.scan('Logging is deprecated').size).to eq(1)
+      expect(carried.map { |params| params['_meta']['io.modelcontextprotocol/logLevel'] }).to eq(%w[warning warning])
     end
 
     # A host that writes the key as a Symbol — the natural Ruby spelling for
@@ -299,8 +307,10 @@ RSpec.describe 'MCP 2026-07-28 deprecations (round 11)' do
     it 'warns for a notification that carries it, on the same wire path' do
       transport.request_meta = -> { { 'io.modelcontextprotocol/logLevel' => 'error' } }
 
-      transport.build_jsonrpc_notification('notifications/progress', {})
+      notification = transport.build_jsonrpc_notification('notifications/progress', {})
 
+      # The notice is about a level the notification really carries.
+      expect(notification['params']['_meta']['io.modelcontextprotocol/logLevel']).to eq('error')
       expect(output.string).to include('Logging is deprecated')
     end
 

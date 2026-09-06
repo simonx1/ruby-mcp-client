@@ -109,8 +109,11 @@ RSpec.describe 'MCP 2026-07-28 deprecations (round 7)' do
         expect(MCPClient::Deprecations.emitted?(:roots)).to be(true)
       end
 
-      # Emptying the list is not use of Roots, and the server that asks next
-      # is answered with the list the host actually left it.
+      # Reaching for `roots=` at all is use of Roots — the README says the
+      # notice fires when the host configures `roots:`, calls `Client#roots=`
+      # or serves an answer carrying a root — so clearing the list raises it
+      # like any other assignment, and the server that asks next is answered
+      # with the list the host actually left it.
       it 'answers roots/list with the emptied list after the last root is cleared' do
         client = MCPClient::Client.new(mcp_server_configs: [client_config], logger: logger,
                                        roots: [{ uri: 'file:///workspace' }])
@@ -118,11 +121,16 @@ RSpec.describe 'MCP 2026-07-28 deprecations (round 7)' do
         allow(server).to receive(:rpc_notify)
         sent = []
         allow(server).to receive(:send_message) { |message| sent << message }
+        # The constructor's own notice is not what the assignment must raise.
+        MCPClient::Deprecations.reset!
+        output.truncate(output.rewind)
 
         client.roots = []
         server.send(:handle_server_request, { 'id' => 1, 'method' => 'roots/list', 'params' => {} })
 
         expect(sent.last['result']).to eq({ 'roots' => [] })
+        expect(MCPClient::Deprecations.emitted?(:roots)).to be(true)
+        expect(output.string).to match(/Roots .*deprecated/)
       end
     end
 

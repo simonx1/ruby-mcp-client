@@ -390,4 +390,39 @@ RSpec.describe 'MCP 2026-07-28 deprecations' do
     expect(output.string.length).to be < 1000
     expect(output.string).to include('...')
   end
+
+  # The bound is an implementation contract, not a wire rule, so pin the
+  # limit the code documents: a detail exactly that long is quoted whole and
+  # one character longer is cut at the limit. The notice's own wording
+  # contains an ellipsis, so read the quoted detail rather than the line.
+  def quoted_detail = output.string[/Received: (.*)\n/, 1]
+
+  it 'quotes a detail up to the limit whole and cuts anything past it' do
+    # The number is spelled out, not read from the constant: an example that
+    # reads MAX_DETAIL_LENGTH agrees with whatever the constant says and
+    # pins nothing.
+    limit = 200
+    expect(MCPClient::Deprecations::MAX_DETAIL_LENGTH).to eq(limit)
+
+    MCPClient::Deprecations.warn(:include_context, logger, detail: 'x' * limit)
+    at_limit = quoted_detail
+    MCPClient::Deprecations.reset!
+    output.truncate(output.rewind)
+    MCPClient::Deprecations.warn(:include_context, logger, detail: 'x' * (limit + 1))
+
+    expect(at_limit).to eq('x' * limit)
+    expect(quoted_detail).to eq("#{'x' * limit}...")
+  end
+
+  # The limit counts the ESCAPED text — the form the notice actually carries
+  # — so a control character near the limit is what pushes the quote over it,
+  # and the cut lands inside the escape sequence rather than past it.
+  it 'measures the bound in escaped characters' do
+    limit = 200
+
+    MCPClient::Deprecations.warn(:include_context, logger, detail: "#{'x' * (limit - 1)}\n")
+
+    expect(quoted_detail).to eq("#{'x' * (limit - 1)}\\...")
+    expect(output.string.lines.size).to eq(1)
+  end
 end
