@@ -716,6 +716,10 @@ class MidStreamCloseServer
   # complete SSE event under HTTP `code`, then close without the terminating
   # chunk. The answer arrived; the framing after it did not.
   STATUS_THEN_CLOSE = :status_then_close
+  # Reply token pair [SHORT_BODY, prefix]: a Content-Length that promises more
+  # than `prefix`, then `prefix` and a close. Net::HTTP hands such a body back
+  # normally, so nothing raises and only the length says it stopped short.
+  SHORT_BODY = :short_body
 
   # A self-signed certificate for 127.0.0.1, built once for the whole file
   # because key generation is the expensive part.
@@ -879,11 +883,9 @@ class MidStreamCloseServer
   def write_reply(client, reply)
     token, payload, extra = reply.is_a?(Array) ? reply : [reply, nil, nil]
 
+    return client.flush if write_body_reply?(client, token, payload, extra)
+
     case token
-    when CLOSE_MID_STREAM then write_sse_chunk(client, ": keep-alive\n\n")
-    when DELIVER_THEN_CLOSE then write_sse_chunk(client, sse_events_for(payload))
-    when STATUS_THEN_CLOSE then write_json_chunk(client, JSON.generate(extra), status: payload)
-    when GZIP_THEN_CLOSE then write_gzip_chunk(client, sse_events_for(payload))
     when GZIP_EVENTS_THEN_STALL
       write_gzip_events_open(client, sse_events_for(payload))
       sleep
@@ -902,6 +904,20 @@ class MidStreamCloseServer
     else write_plain(client, 200, JSON.generate(token))
     end
     client.flush
+  end
+
+  # The tokens that write a body and are done with the socket.
+  # @return [Boolean] whether this token was one of them
+  def write_body_reply?(client, token, payload, extra)
+    case token
+    when CLOSE_MID_STREAM then write_sse_chunk(client, ": keep-alive\n\n")
+    when DELIVER_THEN_CLOSE then write_sse_chunk(client, sse_events_for(payload))
+    when STATUS_THEN_CLOSE then write_json_chunk(client, JSON.generate(extra), status: payload)
+    when SHORT_BODY then write_short_body(client, payload)
+    when GZIP_THEN_CLOSE then write_gzip_chunk(client, sse_events_for(payload))
+    else return false
+    end
+    true
   end
 
   # One complete event now, the reply only once `waiter` says the client has
@@ -960,6 +976,13 @@ class MidStreamCloseServer
   def write_sse_chunk(client, chunk, status: 200)
     write_sse_head(client, status: status)
     client.write(format("%<size>x\r\n%<chunk>s\r\n", size: chunk.bytesize, chunk: chunk))
+  end
+
+  # A Content-Length that promises more than what follows, then a close.
+  def write_short_body(client, prefix)
+    client.write("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n" \
+                 "Content-Length: #{prefix.bytesize + 128}\r\nConnection: close\r\n\r\n")
+    client.write(prefix)
   end
 
   # A JSON body under `status`, chunked, with no terminating zero chunk: the
@@ -1738,6 +1761,36 @@ RSpec.describe 'MCP 2026-07-28 Streamable HTTP — a response stream that really
       expect(server.protocol_era).to eq(:modern)
     end
 
+    # A Content-Length body that stops short is a lost response like any
+    # other, but nothing raises: Net::HTTP hands the short body back as if it
+    # were whole, and only the length it promised says otherwise. Read as a
+    # parse failure it would surface as a plain transport error and the
+    # request the stream took with it would never be re-issued.
+    it 'reissues a request whose Content-Length body stopped short' do
+      calls = 0
+      start_server do |message|
+        case message['method']
+        when 'server/discover' then jsonrpc(message, discovery)
+        when 'tools/call'
+          calls += 1
+          if calls == 1
+            [MidStreamCloseServer::SHORT_BODY,
+             %({"jsonrpc":"2.0","id":"#{message['id']}","result":{"content":)]
+          else
+            jsonrpc(message, { 'content' => [] })
+          end
+        else jsonrpc(message, { 'tools' => [] })
+        end
+      end
+      server = transport(MCPClient::ServerStreamableHTTP)
+
+      Timeout.timeout(15) { expect(server.call_tool('charge', {})).to eq({ 'content' => [] }) }
+
+      calls = @fixture.received.select { |r| r['method'] == 'tools/call' }
+      expect(calls.size).to eq(2)
+      expect(calls.map { |r| r['id'] }.uniq.size).to eq(2)
+    end
+
     # An answer this client refuses to expand is not an answer that was lost.
     # The re-issue rule is for an in-flight request the broken stream took
     # with it; here the server ran the tool and sent its result, and only the
@@ -1844,6 +1897,37 @@ RSpec.describe 'MCP 2026-07-28 Streamable HTTP — a response stream that really
       end
       expect(seen.size).to eq(1)
       expect(seen.pop).to eq('notifications/progress')
+    end
+
+    # The bound belongs to the transport, not only to the reader that takes
+    # one: a live stream must be given the configured ceiling, or a peer can
+    # make this client allocate without limit while the body is still open.
+    it 'reads a live compressed stream under the configured expansion bound' do
+      bomb = { 'jsonrpc' => '2.0', 'method' => 'notifications/progress',
+               'params' => { 'progressToken' => 'p', 'progress' => 1, 'padding' => 'a' * (4 * 1024 * 1024) } }
+      start_server do |message|
+        case message['method']
+        when 'server/discover' then jsonrpc(message, discovery)
+        when 'tools/call' then [MidStreamCloseServer::GZIP_EVENTS_THEN_STALL, bomb]
+        else jsonrpc(message, { 'tools' => [] })
+        end
+      end
+      inflated = 0
+      allow_any_instance_of(Zlib::Inflate).to receive(:inflate).and_wrap_original do |original, bytes, &block|
+        if block
+          original.call(bytes) { |piece| inflated += piece.bytesize and block.call(piece) }
+        else
+          original.call(bytes).tap { |text| inflated += text.bytesize }
+        end
+      end
+      server = transport(MCPClient::ServerStreamableHTTP, read_timeout: 0.5, max_decompressed_body_bytes: 1024)
+
+      Timeout.timeout(15) do
+        expect { server.rpc_request('tools/call', { 'name' => 't', 'arguments' => {} }) }
+          .to raise_error(MCPClient::Errors::MCPError)
+      end
+
+      expect(inflated).to be <= 1024 + (64 * 1024)
     end
   end
 end

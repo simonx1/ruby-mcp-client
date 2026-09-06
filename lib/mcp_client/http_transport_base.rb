@@ -92,6 +92,9 @@ module MCPClient
         state[:mcp_env] = env
         env.request.on_data = lambda do |chunk, _size, _env|
           buffer << chunk.to_s
+          # Only a streamed body can be measured against its Content-Length
+          # here; a response the adapter hands over whole never reaches this.
+          state[:mcp_streamed] = true
           deadline = state[:mcp_deadline]
           raise Faraday::TimeoutError, 'Request exceeded its deadline' if deadline && monotonic_now > deadline
 
@@ -113,9 +116,31 @@ module MCPClient
         state = env.request&.context
         buffer = state && state[:mcp_body_buffer]
         env.body = buffer.dup if buffer && env.body.to_s.empty?
+        state[:mcp_short_body] = short_body?(env, state, buffer) if state
       end
 
       private
+
+      # Whether a streamed body stopped short of the length it promised.
+      #
+      # A Content-Length body that ends early does not raise: Net::HTTP hands
+      # back what arrived as if it were whole, and only the promised length
+      # says the exchange was cut. Read as a malformed body it would look like
+      # a server that speaks bad JSON, and the request the stream took with it
+      # would never be re-issued.
+      # @param env [Faraday::Env] the completed request environment
+      # @param state [Hash] the capture state
+      # @param buffer [String, nil] the bytes this exchange streamed
+      # @return [Boolean]
+      def short_body?(env, state, buffer)
+        return false unless buffer && state[:mcp_streamed]
+
+        declared = env.response_headers && (env.response_headers['content-length'] ||
+                                            env.response_headers['Content-Length'])
+        return false if declared.nil? || !declared.to_s.match?(/\A\d+\z/)
+
+        buffer.bytesize < declared.to_i
+      end
 
       # @return [Float] a monotonic clock reading in seconds
       def monotonic_now
@@ -471,10 +496,11 @@ module MCPClient
 
       apply_discover_result(result)
     rescue MCPClient::Errors::InvalidResultError => e
-      # The result named a resultType this client does not recognize, which
-      # only a modern server writes: modern, and unusable.
-      raise invalid_discover_answer({ 'resultType' => nil },
-                                    "answered without a DiscoverResult (#{e.message})")
+      # The error carries the result it refused. One that named a resultType
+      # this client does not recognize could only have been written by a
+      # modern server; one that is not an object at all (a permissive legacy
+      # endpoint answering any method) says nothing modern.
+      raise invalid_discover_answer(e.data, "answered without a DiscoverResult (#{e.message})")
     end
 
     # What an unusable probe answer says about the server's era.
@@ -604,6 +630,9 @@ module MCPClient
         end
 
         return restart_session_and_resend(request, sent_session_id) if expired_session?(response, sent_session_id)
+        # A body that stopped short of its Content-Length was cut on the way,
+        # exactly like a socket that died mid-body — it just did not raise.
+        return truncated_body_outcome(request, capture) if capture[:mcp_short_body]
 
         handle_http_error_response(response) unless response.success?
         handle_successful_response(response, request)
@@ -787,6 +816,22 @@ module MCPClient
     # @return [Integer]
     def delivered_status(capture)
       (capture.is_a?(Hash) && capture[:mcp_env]&.status) || 200
+    end
+
+    # What a body that stopped short of its Content-Length settles: the
+    # answer if it is all there anyway (the bytes that arrived carry this
+    # request's response, and the rest was framing), otherwise the loss the
+    # re-issue rule is written for.
+    # @param request [Hash] the JSON-RPC message that was being sent
+    # @param capture [Hash] the capture state of the exchange
+    # @return [NormalizedResponse] the delivered answer
+    # @raise [MCPClient::Errors::MCPError] when the response was lost
+    def truncated_body_outcome(request, capture)
+      error = Faraday::ConnectionFailed.new(EOFError.new('response body stopped short of its Content-Length'))
+      salvaged = salvaged_response(capture[:mcp_body_buffer], request, error, capture)
+      return settled_salvage(salvaged) if salvaged
+
+      raise connection_failure_error(error, request)
     end
 
     # A salvaged answer read the way the unbroken path reads one: an error

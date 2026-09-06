@@ -1798,9 +1798,13 @@ RSpec.describe 'an unfinished result survives the HTTP transports off the wire' 
       server.instance_variable_set(:@protocol_version, '2025-11-25')
       respond_with('result' => unfinished)
 
+      # The refused result travels with the error: nothing the server sent is
+      # lost, and the discovery probe reads it to tell a modern server's
+      # unusable answer from a legacy endpoint's (see the Streamable HTTP
+      # branch's probe).
       expect { server.call_tool('t', {}) }
         .to raise_error(MCPClient::Errors::InvalidResultError, /unrecognized resultType/) do |e|
-          expect(e.data).to be_nil
+          expect(e.data).to eq(unfinished)
         end
     end
   end

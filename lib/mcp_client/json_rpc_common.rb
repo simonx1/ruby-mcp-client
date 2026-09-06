@@ -985,8 +985,13 @@ module MCPClient
       return if type.is_a?(String) && accepted_result_types.include?(type)
 
       shown = type.is_a?(String) ? type[0, 64].inspect : type.class.name
-      raise MCPClient::Errors::InvalidResultError,
-            "Invalid result: unrecognized resultType #{shown} (accepted: #{accepted_result_types.join(', ')})"
+      # The refused result travels with the error: only a modern server names
+      # a resultType at all, which is how the discovery probe tells a modern
+      # server's unusable answer from a legacy endpoint's.
+      raise MCPClient::Errors::InvalidResultError.new(
+        "Invalid result: unrecognized resultType #{shown} (accepted: #{accepted_result_types.join(', ')})",
+        data: result
+      )
     end
   end
 end
