@@ -175,8 +175,18 @@ module MCPClient
       def queue_task_update(state, input_responses)
         return if input_responses.nil? || input_responses.empty?
 
-        remember_answered_keys_in(state, input_responses.keys.map(&:to_s))
-        keep_pending_update(state, input_responses)
+        # Marked and kept in one step: a rejection of an older answer to one
+        # of these keys decides what it still owns by the pending payload
+        # (see #rejected_keys_of), and between a mark and a keep done apart
+        # it would still find the older payload there — and unmark a key
+        # this newer answer has just claimed, which nothing marks again once
+        # this answer is acknowledged.
+        keys = input_responses.keys.map(&:to_s)
+        answered_keys_mutex.synchronize do
+          state[:answered].merge(keys)
+          state[:submitted].merge(keys)
+          state[:pending_update] = (state[:pending_update] || {}).merge(input_responses)
+        end
       end
 
       # Whether the answers may still go out: the session they were produced

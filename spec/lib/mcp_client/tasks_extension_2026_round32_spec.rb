@@ -89,7 +89,11 @@ RSpec.describe 'MCP 2026-07-28 tasks extension — round 32' do
       expect(sent).to be_empty
     end
 
-    it 'keeps polling after a lost poll rather than surfacing the session change' do
+    # The session does not move here (the epoch is the same before and
+    # after): what is pinned is that a poll the transport refused as a
+    # SessionChangedError is a lost poll, polled again — the wait ending on
+    # a session that did move is pinned by the epoch-changing examples.
+    it 'polls again after a poll the transport refused, when the session did not move' do
       client = client_for(stdio)
       negotiated(stdio)
       polls = 0

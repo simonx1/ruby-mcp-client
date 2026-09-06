@@ -191,6 +191,7 @@ RSpec.describe 'MCP 2026-07-28 tasks extension — round 9' do
     client = MCPClient.connect(%w[echo test], extensions: [TASKS_EXT])
 
     expect(client).to be_tasks_extension
+    expect(stdio.declared_extensions).to include(TASKS_EXT)
   end
 
   it 'loads the client file on its own' do

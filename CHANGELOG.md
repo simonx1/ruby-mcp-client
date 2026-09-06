@@ -475,7 +475,9 @@ metadata). Each feature lands in its own PR; this section accumulates them.
 
 - **Opt-in extension.** `MCPClient::Client.new(extensions:
   ['io.modelcontextprotocol/tasks'])` (or a `identifier => settings` Hash)
-  declares extensions in every request's `clientCapabilities`;
+  declares extensions in every modern request's `clientCapabilities` (the
+  2025-11-25 `initialize` handshake, which has no extension negotiation,
+  does not advertise them);
   `Client#tasks_extension?` reports it. Transports accept `resultType
   "task"` only once the extension is declared, only from a 2026-07-28
   server, and only for `tools/call` — anywhere else it is an

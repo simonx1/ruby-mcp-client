@@ -95,6 +95,12 @@ module MCPClient
       # handlers (each inputRequests key is answered once), and give up when
       # the task's TTL backstop or the caller's timeout elapses.
       #
+      # Input requests are answered here (and by {Client#call_tool}) and
+      # nowhere else: a notifications/tasks that carries inputRequests is
+      # delivered to the notification listeners as it arrived, and a host
+      # that follows a task through notifications hands it to this method
+      # (or answers with {Client#update_task}) when it wants them answered.
+      #
       # Giving up ends the wait and nothing else: the task keeps running,
       # since only the host knows whether its result is still wanted. The
       # handle stays usable — wait again, read it with {Client#get_task}, or
@@ -120,10 +126,14 @@ module MCPClient
         # discovery) counts against it too.
         # The wait carries the definition the creating call went out under, so
         # every handle it hands back names the tool the task is running (see
-        # #validated_task_result); a bare task id names no request, and so no
-        # tool.
+        # #validated_task_result) — and the lifetime that call started, so
+        # none of them can later reach a task the server names with the same
+        # id (see #handle_task_generation). A bare task id names no request,
+        # and so no tool and no lifetime; neither does a handle of another
+        # server, whose task and tool are its own.
         wait = { task_id: task_id, srv: srv, deadline: timeout && (monotonic_time + timeout), ttl_deadline: nil,
-                 answered: nil, state: nil, epoch: nil, last: nil, called_tool: called_tool_of(task) }
+                 answered: nil, state: nil, epoch: nil, last: nil, called_tool: called_tool_for(task, srv),
+                 generation: handle_task_generation(task, srv) }
         probe_task_capability!(wait)
         unless modern_server?(srv)
           raise MCPClient::Errors::TaskError, 'wait_for_task requires an MCP 2026-07-28 server (tasks extension)'
@@ -233,9 +243,12 @@ module MCPClient
         return nil unless current
 
         validate_terminal_task!(current) if current.terminal?
-        # A poll asks by task id, which names no tool: the observation is the
-        # same task the wait was handed, so it keeps that handle's definition.
-        current.with_called_tool(wait[:called_tool])
+        # A poll asks by task id, which names no tool and no lifetime: the
+        # observation is the same task the wait was handed, so it keeps that
+        # handle's definition and names that handle's lifetime — a handle the
+        # wait hands back must refuse to reach a task that reused the id
+        # exactly as the handle the wait was given does.
+        current.with_called_tool(wait[:called_tool]).with_task_generation(wait[:generation])
       end
 
       # Answer this poll's outstanding input requests, bounding how many
@@ -671,10 +684,11 @@ module MCPClient
       # @param task [Object] what the caller named the task with
       # @param result [Object] the result the task delivered
       # @return [Object] the result
-      def validated_task_result(task, result)
-        return result unless task.is_a?(MCPClient::Task) && task.called_tool
+      def validated_task_result(task, result, srv = nil)
+        tool = srv ? called_tool_for(task, srv) : called_tool_of(task)
+        return result unless tool
 
-        validate_structured_content!(task.called_tool, result)
+        validate_structured_content!(tool, result)
       end
 
       # The definition a handle carries, if the caller named the task with a
@@ -686,6 +700,20 @@ module MCPClient
       # @return [MCPClient::Tool, nil]
       def called_tool_of(task)
         task.is_a?(MCPClient::Task) ? task.called_tool : nil
+      end
+
+      # The definition a request addressed to `srv` validates against: the
+      # handle's, when the handle is this server's. A `server:` override that
+      # names another server asks that server about its own task, which the
+      # handle's tool says nothing about — its output schema belongs to the
+      # tool the handle's server ran, not to whatever the named server
+      # delivers under the same id.
+      # @param task [Object] what the caller named the task with
+      # @return [MCPClient::Tool, nil]
+      def called_tool_for(task, srv)
+        return nil unless task.is_a?(MCPClient::Task) && task.server.equal?(srv)
+
+        task.called_tool
       end
 
       # The handle for a CreateTaskResult, which MUST carry a taskId.

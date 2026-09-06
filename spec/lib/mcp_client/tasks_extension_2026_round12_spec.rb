@@ -112,7 +112,9 @@ RSpec.describe 'MCP 2026-07-28 tasks extension — round 12' do
       def server.capabilities
         { 'tools' => {}, 'extensions' => { MCPClient::JsonRpcCommon::TASKS_EXTENSION => {} } }
       end
-      def server.rpc_request(_method, _params, timeout: nil)
+      def server.rpc_request(method, params, timeout: nil)
+        exit(4) unless method == 'tasks/get' && params[:taskId] == 'task-1'
+
         now = Time.now.utc.iso8601(3)
         { 'resultType' => 'complete', 'taskId' => 'task-1', 'status' => 'completed', 'createdAt' => now,
           'lastUpdatedAt' => now, 'ttlMs' => nil, 'result' => { 'content' => [], 'isError' => false } }

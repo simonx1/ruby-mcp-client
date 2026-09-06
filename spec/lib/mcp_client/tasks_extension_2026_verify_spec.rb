@@ -99,14 +99,15 @@ RSpec.describe 'MCP 2026-07-28 tasks extension — verification round' do
       handle = creation(client)
       (1..cap).each { |i| creation(client, "other-#{i}") }
       sent = []
-      allow(stdio).to receive(:rpc_request) do |method, _params|
-        sent << method
+      allow(stdio).to receive(:rpc_request) do |method, params|
+        sent << [method, params]
         {}
       end
 
       expect(client.update_task(handle, { 'k1' => accept })).to be(true)
       expect(client.cancel_task(handle).task_id).to eq('task-1')
-      expect(sent).to eq(['tasks/update', 'tasks/cancel'])
+      expect(sent).to eq([['tasks/update', { taskId: 'task-1', inputResponses: { 'k1' => accept } }],
+                          ['tasks/cancel', { taskId: 'task-1' }]])
     end
 
     it 'keeps a handle the legacy creation API produced usable too' do

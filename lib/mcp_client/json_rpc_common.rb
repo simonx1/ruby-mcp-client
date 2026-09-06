@@ -681,9 +681,16 @@ module MCPClient
     # Generate initialization parameters for MCP protocol
     # @return [Hash] the initialization parameters
     def initialization_params
+      # Extension negotiation is a 2026-07-28 mechanism (basic/versioning
+      # "Extension Negotiation", carried in every modern request's _meta):
+      # the 2025-11-25 handshake has no such capability, and an extension
+      # defined for 2026-07-28 (the tasks extension, say) is not advertised
+      # to a server that negotiates the legacy protocol.
+      capabilities = client_capabilities
+      capabilities.delete('extensions')
       {
         'protocolVersion' => MCPClient::PROTOCOL_VERSION,
-        'capabilities' => client_capabilities,
+        'capabilities' => capabilities,
         'clientInfo' => client_info_payload
       }
     end

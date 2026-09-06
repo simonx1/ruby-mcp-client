@@ -608,6 +608,22 @@ client.on_notification do |server, method, params|
 end
 ```
 
+Notifications announce; they do not drive. A `notifications/tasks` (2026-07-28,
+on a `listen` stream) that carries `inputRequests` reaches the listeners exactly
+as it arrived — the client answers input requests only inside `wait_for_task`
+(and `call_tool`), or when the host sends the answers itself with
+`update_task`. A host that follows a task through notifications hands it to
+`wait_for_task` when it wants the requests answered.
+
+Handles outlive a process only as far as the host keeps them: `task.to_h`
+serializes a handle, and `MCPClient::Task.from_json(hash, server: server)` (or
+the bare `taskId` with `server:`) names the same task in another client, which
+can `get_task`, `wait_for_task` or `cancel_task` it. Every handle a creation, a
+`get_task` refresh, a `wait_for_task` or a cancellation hands back within one
+client also names the *lifetime* of its task: once the server has handed the
+same id to a new task, that handle raises `TaskReplacedError` instead of
+reaching the replacement.
+
 ### Elicitation (Server-initiated user interactions)
 
 ```ruby

@@ -178,7 +178,7 @@ RSpec.describe 'MCP 2026-07-28 tasks extension' do
                                             'serverInfo' => { 'name' => 's', 'version' => '1' } } },
                             { 'result' => task_result }])
 
-      expect { legacy.call_tool('slow', {}) }.to raise_error(MCPClient::Errors::InvalidResultError)
+      expect { legacy.call_tool('slow', {}) }.to raise_error(MCPClient::Errors::InvalidResultError, /resultType/)
     end
 
     it 'rejects a tasks/get answer whose resultType is not complete' do
@@ -186,7 +186,7 @@ RSpec.describe 'MCP 2026-07-28 tasks extension' do
       script_stdio(server, [{ 'result' => discover_result }, { 'result' => task_result }])
 
       expect { server.rpc_request('tasks/get', { 'taskId' => 'task-1' }) }
-        .to raise_error(MCPClient::Errors::InvalidResultError)
+        .to raise_error(MCPClient::Errors::InvalidResultError, /resultType/)
     end
   end
 

@@ -129,7 +129,8 @@ module MCPClient
           # task is running too: what the task delivers is validated against
           # the definition its creating call went out under (see
           # #get_task_result), whichever handle of that task the caller kept.
-          task = task.with_called_tool(called_tool_of(handle))
+          # A handle of another server names none of this server's tools.
+          task = task.with_called_tool(called_tool_for(handle, srv))
           # The answer must be about the task that was asked for: its state
           # drives result delivery and tasks/update.
           if modern_server?(srv) && task.task_id != task_id.to_s
@@ -197,8 +198,13 @@ module MCPClient
         # to be known: an initialization failure surfaces here.
         ensure_task_capability!(srv, 'result', strict: true)
         # MCP 2026-07-28 removed tasks/result: the result is delivered inline
-        # by tasks/get once the task is terminal.
-        return validated_task_result(task_id, task_outcome(wait_for_task(task_id, server: srv))) if modern_server?(srv)
+        # by tasks/get once the task is terminal. The wait's handle carries
+        # the definition of the task on the server the wait polled (a handle
+        # of another server names none of its tools).
+        if modern_server?(srv)
+          final = wait_for_task(task_id, server: srv)
+          return validated_task_result(final, task_outcome(final))
+        end
 
         # The result of the task the handle names, in the session it was seen
         # in: the request is pinned to that session and refused once it has
@@ -217,7 +223,7 @@ module MCPClient
           # task the server names with the same id, and nothing keeps it on
           # the books either.
           forget_task_keys(srv, task_id, epoch: epoch, pin: pin)
-          validated_task_result(handle, result)
+          validated_task_result(handle, result, srv)
         rescue MCPClient::Errors::ServerError => e
           raise if e.protocol_error?
 
@@ -301,7 +307,11 @@ module MCPClient
           verify_task_lifetime!(pin)
           return cancelled_task_handle(task, task_id, srv, epoch) if modern_server?(srv)
 
-          cancelled = MCPClient::Task.from_json(result, server: srv, session_epoch: epoch)
+          # The handle names the lifetime the cancelled handle named (see
+          # #handle_task_generation): a task the server names with the same
+          # id later is not this one, and the handle must not reach it.
+          cancelled = MCPClient::Task.from_json(result, server: srv, session_epoch: epoch,
+                                                        task_generation: handle_task_generation(task, srv))
           # A legacy cancellation that answers with a terminal task ended it:
           # its bookkeeping goes with it, exactly as a terminal poll's does.
           # An acknowledgement that still reports the task working leaves it
