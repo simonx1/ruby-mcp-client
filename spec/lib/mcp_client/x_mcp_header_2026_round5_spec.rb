@@ -251,7 +251,10 @@ RSpec.describe 'MCP 2026-07-28 x-mcp-header — round 5' do
           if lists == failing_list
             { status: 503, body: '' }
           else
-            json_response(body['id'], { 'tools' => [annotated_tool(calls.positive? ? 'Zone' : 'Region')] })
+            # Hinted, so the list read ahead of each call is served from the
+            # cache: this branch re-reads a hint-less modern list every time.
+            json_response(body['id'], { 'tools' => [annotated_tool(calls.positive? ? 'Zone' : 'Region')],
+                                        'ttlMs' => 60_000 })
           end
         when 'tools/call'
           calls += 1
@@ -315,9 +318,12 @@ RSpec.describe 'MCP 2026-07-28 x-mcp-header — round 5' do
         end
         case method
         when 'server/discover' then json_response(body['id'], full_discover)
-        when 'prompts/list' then json_response(body['id'], { 'prompts' => [{ 'name' => "p#{n}" }] })
+        # Hinted lists: a hint-less modern list is re-read on every call on
+        # this branch, and the point here is which fetched list is kept.
+        when 'prompts/list' then json_response(body['id'], { 'prompts' => [{ 'name' => "p#{n}" }], 'ttlMs' => 60_000 })
         when 'resources/list'
-          json_response(body['id'], { 'resources' => [{ 'uri' => "file:///r#{n}", 'name' => "r#{n}" }] })
+          json_response(body['id'], { 'resources' => [{ 'uri' => "file:///r#{n}", 'name' => "r#{n}" }],
+                                      'ttlMs' => 60_000 })
         end
       end
     end
