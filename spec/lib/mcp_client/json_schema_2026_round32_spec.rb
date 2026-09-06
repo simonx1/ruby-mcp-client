@@ -132,11 +132,12 @@ RSpec.describe 'MCP 2026-07-28 JSON Schema handling — round 32' do
         m.call(*args)
       end
       now = Process.clock_gettime(Process::CLOCK_MONOTONIC)
-      clock = [now, now, now + 10] # the first pattern is compiled before the clock jumps past the deadline
-      allow(Process).to receive(:clock_gettime).with(Process::CLOCK_MONOTONIC) { clock.length > 1 ? clock.shift : clock.first }
+      # The clock stands still until a pattern has been compiled, then jumps
+      # past the deadline: compilation demonstrably started, and stopped.
+      allow(Process).to receive(:clock_gettime).with(Process::CLOCK_MONOTONIC) { compiled.zero? ? now : now + 10 }
       problems = validator.check_schema(many_patterns(400), deadline: now + 1)
       expect(problems).to contain_exactly(a_string_matching(/time budget exhausted/))
-      expect(compiled).to be < 10
+      expect(compiled).to be_between(1, 9)
     end
 
     it 'gives check_schema its own budget when the caller names none' do

@@ -116,9 +116,13 @@ RSpec.describe 'MCP 2026-07-28 JSON Schema handling — round 5' do
     expect(validator.check_schema(external)).to contain_exactly(a_string_matching(/external \$recursiveRef/))
     expect(validator.validate(1, external)).not_to be_empty
 
+    # A root whose $recursiveAnchor is true is the outermost dynamic scope
+    # there is: the reference is bound to it and evaluated — here onto the
+    # same instance again, which is the cycle it is reported as.
     local = { '$schema' => draft2019, '$recursiveAnchor' => true, '$recursiveRef' => '#' }
     expect(validator.check_schema(local)).to be_empty
-    expect(validator.unsupported_keywords(local)).to eq(['$recursiveRef'])
+    expect(validator.unsupported_keywords(local)).to eq([])
+    expect(validator.validate(1, local)).to contain_exactly(a_string_matching(/cycle/))
     # Without a `$recursiveAnchor: true` at its target it is a plain `#`.
     plain = { '$schema' => draft2019, '$recursiveRef' => '#' }
     expect(validator.check_schema(plain)).to be_empty

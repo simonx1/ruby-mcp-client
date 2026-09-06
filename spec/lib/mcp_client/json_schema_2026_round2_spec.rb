@@ -145,14 +145,21 @@ RSpec.describe 'MCP 2026-07-28 JSON Schema handling — round 2' do
 
     it 'reports draft-specific keywords it does not evaluate under the dialect that defines them' do
       draft7 = 'http://json-schema.org/draft-07/schema#'
-      # The draft-specific applicators are evaluated; only what needs a
-      # dynamic scope is reported — a `$recursiveRef` whose target carries
-      # `$recursiveAnchor: true`, never the plain reference one without is.
+      # The draft-specific applicators are evaluated; only what needs the
+      # evaluation path to choose a binding is reported — a `$recursiveRef`
+      # several non-root resources could bind, never a root-anchored one nor
+      # the plain reference one without a `$recursiveAnchor: true` is.
       expect(validator.unsupported_keywords({ '$schema' => draft7, 'items' => [], 'additionalItems' => false }))
         .to eq([])
       expect(validator.unsupported_keywords({ '$schema' => draft7, 'dependencies' => {} })).to eq([])
       expect(validator.unsupported_keywords({ '$schema' => validator::DRAFT_2019_09, '$recursiveAnchor' => true,
-                                              '$recursiveRef' => '#' })).to eq(['$recursiveRef'])
+                                              '$recursiveRef' => '#' })).to eq([])
+      two = { 'a' => { '$id' => 'https://example.com/ra', '$recursiveAnchor' => true, 'type' => 'object',
+                       'properties' => { 'v' => { '$recursiveRef' => '#' } } },
+              'b' => { '$id' => 'https://example.com/rb', '$recursiveAnchor' => true, 'type' => 'string' } }
+      expect(validator.unsupported_keywords({ '$schema' => validator::DRAFT_2019_09,
+                                              '$ref' => 'https://example.com/ra', '$defs' => two }))
+        .to eq(['$recursiveRef'])
       expect(validator.unsupported_keywords({ '$schema' => validator::DRAFT_2019_09, '$recursiveRef' => '#' }))
         .to eq([])
       expect(validator.unsupported_keywords({ '$schema' => validator::DRAFT_2019_09, 'allOf' => [true],

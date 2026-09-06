@@ -510,13 +510,19 @@ RSpec.describe 'MCP 2026-07-28 JSON Schema handling — round 28' do
 
   describe 'the dynamic references this validator does not evaluate' do
     it 'reports them and never lets one decide a non-monotonic composition' do
-      schema = { '$dynamicRef' => '#node', '$defs' => { 'n' => { '$dynamicAnchor' => 'node', 'type' => 'string' } } }
+      # Several non-root resources declare the anchor: only the evaluation
+      # path could choose the binding, which this validator does not track.
+      schema = { '$ref' => 'https://example.com/a',
+                 '$defs' => { 'a' => { '$id' => 'https://example.com/a', '$dynamicAnchor' => 'node',
+                                       'type' => 'object', 'properties' => { 'v' => { '$dynamicRef' => '#node' } } },
+                              'b' => { '$id' => 'https://example.com/b', '$dynamicAnchor' => 'node',
+                                       'type' => 'string' } } }
       expect(validator.check_schema(schema)).to be_empty
       expect(validator.unsupported_keywords(schema)).to contain_exactly('$dynamicRef')
       # Not applied, so it decides nothing — and a `not` around it cannot
       # read the pass as a match.
-      expect(validator.validate(1, schema)).to be_empty
-      expect(validator.validate(1, { 'not' => schema })).to be_empty
+      expect(validator.validate({ 'v' => 1 }, schema)).to be_empty
+      expect(validator.validate({ 'v' => 1 }, { 'not' => schema })).to be_empty
     end
 
     it 'refuses a dynamic reference that is not a string' do
@@ -537,7 +543,10 @@ RSpec.describe 'MCP 2026-07-28 JSON Schema handling — round 28' do
                     'dependentRequired' => {}, 'dependentSchemas' => {},
                     'allOf' => [true], 'unevaluatedProperties' => false, 'unevaluatedItems' => false }
       expect(validator.unsupported_keywords(supported)).to be_empty
-      partial = { 'format' => 'email', '$dynamicRef' => '#a', '$dynamicAnchor' => 'a' }
+      partial = { 'format' => 'email', '$ref' => 'https://example.com/a',
+                  '$defs' => { 'a' => { '$id' => 'https://example.com/a', '$dynamicAnchor' => 'node',
+                                        'properties' => { 'v' => { '$dynamicRef' => '#node' } } },
+                               'b' => { '$id' => 'https://example.com/b', '$dynamicAnchor' => 'node' } } }
       expect(validator.unsupported_keywords(partial)).to contain_exactly('$dynamicRef', 'format')
     end
   end

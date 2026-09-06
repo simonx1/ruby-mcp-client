@@ -70,10 +70,15 @@ RSpec.describe 'MCP 2026-07-28 JSON Schema handling — round 8' do
   end
 
   describe 'an if without branches' do
-    it 'is not evaluated' do
+    # The condition is evaluated all the same (its annotations are what an
+    # `unevaluated*` beside it reads, 2020-12 Section 10.2.2.1), it just
+    # asserts nothing; one that applies the schema to the same instance
+    # again is the cycle it is reported as.
+    it 'is evaluated but asserts nothing' do
       expect(validator.check_schema({ 'if' => { '$ref' => '#' } })).to be_empty
-      expect(validator.validate(1, { 'if' => { '$ref' => '#' } })).to be_empty
+      expect(validator.validate(1, { 'if' => { '$ref' => '#' } })).to contain_exactly(a_string_matching(/cycle/))
       expect(validator.validate(1, { 'if' => { 'type' => 'string' } })).to be_empty
+      expect(validator.validate(1, { 'if' => { 'type' => 'integer' } })).to be_empty
     end
 
     it 'still selects a branch when one exists' do
