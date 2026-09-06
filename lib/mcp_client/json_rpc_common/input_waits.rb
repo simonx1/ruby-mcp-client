@@ -28,6 +28,28 @@ module MCPClient
       # to wait the pace and retry.
       # @param block [Proc] callback that receives an InputRequiredWait
       # @return [void]
+      # An InputRequiredResult is defined only for tools/call, resources/read
+      # and prompts/get (MCP 2026-07-28 basic/patterns/mrtr "Supported
+      # Requests"). server/discover is not one of them, so an input_required
+      # discover answer is invalid and MUST NOT be applied or cached: the probe
+      # would otherwise adopt a protocol version out of an unfinished result
+      # and hand that result back as the first heartbeat. The rejection is a
+      # ModernServerError, not an InvalidResultError, because a server
+      # answering server/discover with a 2026-07-28-only discriminator is
+      # modern: the era is settled, so it must never be retried with the
+      # initialize handshake, and MCPClient.connect must not send it on to the
+      # legacy SSE and HTTP+POST transports either.
+      # @param result [Hash] the server/discover result
+      # @return [void]
+      # @raise [MCPClient::Errors::ModernServerError] if the result is an InputRequiredResult
+      def reject_input_required_discover!(result)
+        return unless MCPClient::JsonRpcCommon.result_type(result) == 'input_required'
+
+        raise MCPClient::Errors::ModernServerError,
+              'Server answered server/discover with an input_required result; multi round-trip requests are ' \
+              "only valid for #{MRTR_METHODS.join(', ')}"
+      end
+
       def on_input_required_wait(&block)
         @input_required_wait_callback = block
       end
