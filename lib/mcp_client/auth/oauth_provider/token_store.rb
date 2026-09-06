@@ -305,6 +305,19 @@ module MCPClient
           !current.nil? && current == token.issuer
         end
 
+        # A 2025-11-25 record that names no issuer is bound to the authorization
+        # server in use the first time it is read ({TokenStore#bind_token_issuer});
+        # what it says was granted counts before that read happens too, as long
+        # as there is a server in use to bind it to and it was not retired.
+        # @param token [Token] the stored token
+        # @return [Boolean]
+        def bindable_to_current_issuer?(token)
+          return false unless token.respond_to?(:issuer) && token.issuer.nil?
+          return false if retired_token?(token)
+
+          !current_issuer_for_tokens.nil?
+        end
+
         # The authorization server tokens are judged against: a validated
         # challenge received since the metadata was cached is authoritative
         # (discovery treats it so), else the cached metadata's issuer.

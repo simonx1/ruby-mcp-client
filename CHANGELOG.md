@@ -552,6 +552,24 @@ metadata). Each feature lands in its own PR; this section accumulates them.
   delete on a backend whose delete answers with nothing — the storage
   interface never required it to answer with the removed record.
 
+- **Forty-first review round.** Pre-registered credentials that name no
+  authorization server are never presented on a refresh, expired or not: the
+  binding is judged on the record before the secret's lifetime is, so an
+  expired issuer-less record no longer falls through to whichever server the
+  refresh goes to. A validated change of authorization server (a 401 challenge
+  whose protected-resource metadata names another server) now ends the
+  authorization request still pending with the previous server for every
+  provider sharing the storage: the pending record is marked ended rather than
+  deleted, and a code exchange answered afterwards is refused as an
+  authorization-server change instead of storing that server's token. A 403
+  `insufficient_scope` challenge is a step-up whatever its resource metadata is
+  worth: a document that is fetched and refused, one naming no authorization
+  server, or an unacceptable metadata URL leaves the known server and the
+  still-valid token in place and records the challenged scope, so the step-up
+  requests the union of what was granted and what was challenged, and a scope
+  a 2025-11-25 token that names no issuer says was granted counts in that
+  union before the record is bound on first read.
+  
 ### Tasks extension (`io.modelcontextprotocol/tasks`)
 
 - **An observation only retires the answers it could have seen (round 44).** A

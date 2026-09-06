@@ -297,8 +297,21 @@ RSpec.describe 'MCP 2026-07-28 authorization — round 37' do
     it 'still completes when only the optional per-authorization-server copy cannot be written' do
       provider = provider_for(refusing_storage)
       refusing_storage.refuse_key = provider.client_registration_key(issuer_a)
+      stub_request(:post, "#{issuer_a}/token")
+        .with(body: hash_including('client_id' => 'dyn-a'))
+        .to_return(status: 200, headers: json,
+                   body: { 'access_token' => 'fresh', 'token_type' => 'Bearer', 'expires_in' => 3600 }.to_json)
 
-      expect(provider.start_authorization_flow).to include('client_id=dyn-a')
+      url = provider.start_authorization_flow
+      expect(url).to include('client_id=dyn-a')
+      state = URI.decode_www_form(URI.parse(url).query).to_h['state']
+
+      expect(provider.complete_authorization_flow('code', state).access_token).to eq('fresh')
+      expect(refusing_storage.get_token(server_url).access_token).to eq('fresh')
+      request = Faraday::Request.new
+      request.headers = {}
+      provider.apply_authorization(request)
+      expect(request.headers['Authorization']).to eq('Bearer fresh')
     end
   end
 

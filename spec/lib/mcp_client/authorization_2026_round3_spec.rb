@@ -142,6 +142,37 @@ RSpec.describe 'MCP 2026-07-28 authorization — round 3' do
       .to raise_error(MCPClient::Errors::ConnectionError, /iss/)
   end
 
+  # The inverse: the request was made when the server advertised no iss, the
+  # cache says it does now (another server, or a rotated document), and the
+  # callback carries none — the request's own record rules, so both the
+  # error and the success callback are accepted.
+  it 'applies a recorded "not advertised" over a cache that now says advertised, on the error callback' do
+    storage.set_client_info(server_url, client_info(registration_type: 'cimd'))
+    provider = provider_for
+    stub_discovery(provider, as_meta(authorization_response_iss_parameter_supported: false))
+    provider.start_authorization_flow
+    state = storage.get_state(server_url)
+    expect(storage.get_pkce(server_url).iss_parameter_supported).to be(false)
+    storage.set_server_metadata(server_url, as_meta(authorization_response_iss_parameter_supported: true))
+
+    expect(provider.authorization_error_message('error' => 'access_denied', 'state' => state))
+      .to include('access_denied')
+  end
+
+  it 'applies a recorded "not advertised" over a cache that now says advertised, on the success callback' do
+    storage.set_client_info(server_url, client_info(registration_type: 'cimd'))
+    provider = provider_for
+    stub_discovery(provider, as_meta(authorization_response_iss_parameter_supported: false))
+    provider.start_authorization_flow
+    state = storage.get_state(server_url)
+    storage.set_server_metadata(server_url, as_meta(authorization_response_iss_parameter_supported: true))
+    stub_request(:post, 'https://auth.example.com/token')
+      .to_return(status: 200, headers: { 'Content-Type' => 'application/json' },
+                 body: { access_token: 'fresh', token_type: 'Bearer', expires_in: 3600 }.to_json)
+
+    expect(provider.complete_authorization_flow('code', state).access_token).to eq('fresh')
+  end
+
   it 'compares metadata issuers byte for byte' do
     storage.set_client_info(server_url, client_info)
     provider = provider_for

@@ -44,40 +44,45 @@ module MCPClient
           # including resetting a previously challenged scope when the current
           # challenge carries none.
           url = extract_resource_metadata_url(www_authenticate)
-
-          # The challenge header is peer-controlled input: validate the
-          # advertised URL BEFORE storing, fetching, or recording any challenge
-          # state, so a malicious challenge cannot pivot this host into requests
-          # against internal services (SSRF) and cannot leave the provider
-          # holding half of a rejected challenge.
-          validate_peer_advertised_url!(url, 'resource metadata URL (from WWW-Authenticate challenge)') if url
-
-          @challenge_scope = bearer_params && extract_challenge_param(bearer_params, 'scope')
-          return nil unless url
-
-          # Remember the advertised URL even if the fetch below fails, so a
-          # later discovery retries it instead of probing well-known URIs the
-          # challenge already superseded. The current header is the one to
-          # honour: an earlier document, and an earlier refusal, are forgotten
-          # before the fetch so a failed fetch leaves the flow waiting on this
-          # URL rather than completing against stale state.
+          scope = bearer_params && extract_challenge_param(bearer_params, 'scope')
+          # A step-up challenge (403 insufficient_scope) says this operation
+          # needs more scopes, not that the authorization server moved: the
+          # token in hand stays valid (MCP 2026-07-28 step-up authorization).
+          # So whatever its resource metadata is worth — unfetchable, fetched
+          # and refused, or named by an unacceptable URL — the known server
+          # stays in place rather than becoming unknown (which would withhold
+          # that token from every other operation), and the challenged scope
+          # is recorded as the authoritative one. A challenge reporting an
+          # invalid token is judged in full, and a refused document stands.
+          step_up = step_up_challenge?(bearer_params)
           previous = [@challenge_metadata_url, @challenge_resource_metadata, @challenge_error]
-          @challenge_metadata_url = url
-          @challenge_resource_metadata = nil
-          @challenge_error = nil
 
           begin
+            # The challenge header is peer-controlled input: validate the
+            # advertised URL BEFORE storing, fetching, or recording any challenge
+            # state, so a malicious challenge cannot pivot this host into requests
+            # against internal services (SSRF) and cannot leave the provider
+            # holding half of a rejected challenge.
+            validate_peer_advertised_url!(url, 'resource metadata URL (from WWW-Authenticate challenge)') if url
+
+            @challenge_scope = scope
+            return nil unless url
+
+            # Remember the advertised URL even if the fetch below fails, so a
+            # later discovery retries it instead of probing well-known URIs the
+            # challenge already superseded. The current header is the one to
+            # honour: an earlier document, and an earlier refusal, are forgotten
+            # before the fetch so a failed fetch leaves the flow waiting on this
+            # URL rather than completing against stale state.
+            @challenge_metadata_url = url
+            @challenge_resource_metadata = nil
+            @challenge_error = nil
             adopt_challenge_metadata(url)
           rescue MCPClient::Errors::ConnectionError
-            # A step-up challenge (403 insufficient_scope) says this operation
-            # needs more scopes, not that the authorization server moved: the
-            # token in hand stays valid (MCP 2026-07-28 step-up authorization).
-            # Metadata that could not be fetched therefore leaves the known
-            # server in place instead of making it unknown, which would
-            # withhold that token from every other operation. A document that
-            # was fetched and REFUSED is a different matter and stands.
-            @challenge_metadata_url, @challenge_resource_metadata, @challenge_error = previous \
-              if step_up_challenge?(bearer_params) && @challenge_error.nil?
+            raise unless step_up
+
+            @challenge_metadata_url, @challenge_resource_metadata, @challenge_error = previous
+            @challenge_scope = scope
             raise
           end
         end
@@ -133,6 +138,11 @@ module MCPClient
           return unless advertised && known && advertised != known
 
           @authorization_server_switched = true
+          # The requests still pending with the server this resource left can
+          # never complete as this resource's: ended now, before anything is
+          # fetched from the advertised server, so a late answer to them is
+          # refused by every provider sharing the storage.
+          end_pending_requests_of(known)
           # A token another provider sharing the storage already bound to the
           # advertised server is exactly the token to keep.
           return if record_bound_to?(stored_token_or_nil, advertised)

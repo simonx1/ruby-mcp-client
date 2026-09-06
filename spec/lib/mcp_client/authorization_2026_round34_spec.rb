@@ -359,6 +359,22 @@ RSpec.describe 'MCP 2026-07-28 authorization — round 34' do
       expect { provider.complete_authorization_flow('code', state) }
         .to raise_error(MCPClient::Errors::ConnectionError, /iss/)
     end
+
+    # ... and the metadata can answer "not advertised" as well as "advertised":
+    # a malformed recorded value read as "advertised" would refuse this
+    # callback, which carries no iss because the server sends none.
+    it 'completes without iss when the metadata says the server does not advertise it' do
+      pkce = MCPClient::Auth::PKCE.from_h('code_verifier' => 'v' * 64, 'code_challenge' => 'challenge',
+                                          'issuer' => issuer, 'iss_parameter_supported' => 'true',
+                                          'client_id' => 'client-1', 'redirect_uri' => redirect_uri)
+      store_pending_flow(metadata: server_metadata(issuer, iss_supported: false), pkce: pkce)
+      stub_request(:post, token_endpoint)
+        .to_return(status: 200, headers: json,
+                   body: { 'access_token' => 'fresh', 'token_type' => 'Bearer' }.to_json)
+      provider = provider_for
+
+      expect(provider.complete_authorization_flow('code', state).access_token).to eq('fresh')
+    end
   end
 
   describe 'peer bytes in an exception message' do

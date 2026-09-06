@@ -554,6 +554,14 @@ module MCPClient
       attr_reader :code_verifier, :code_challenge, :code_challenge_method, :issuer, :iss_parameter_supported,
                   :client_id, :redirect_uri, :state, :resource, :scope
 
+      # Issuer value marking an authorization request that can no longer
+      # complete as this resource's: the resource left the authorization
+      # server the request was made with (see
+      # {OAuthProvider::PendingRequests}). The record stays in the pending
+      # slot, so a late callback is refused for that reason rather than
+      # mistaken for a stranger's, on every storage backend alike.
+      ENDED_ISSUER = 'urn:mcp:ended-request'
+
       # Generate PKCE parameters
       # @param code_verifier [String, nil] Existing code verifier (for deserialization)
       # @param code_challenge [String, nil] Existing code challenge (for deserialization)

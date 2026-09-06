@@ -9,6 +9,7 @@ require_relative '../auth'
 require_relative 'peer_text'
 require_relative 'oauth_provider/challenge_handling'
 require_relative 'oauth_provider/client_authentication'
+require_relative 'oauth_provider/pending_requests'
 require_relative 'oauth_provider/registration_store'
 require_relative 'oauth_provider/response_validation'
 require_relative 'oauth_provider/token_store'
@@ -40,6 +41,7 @@ module MCPClient
       include ChallengeHandling
       include ClientAuthentication
       include PeerText
+      include PendingRequests
       include RegistrationStore
       include ResponseValidation
       include TokenStore
@@ -339,6 +341,12 @@ module MCPClient
         # audiences: a token bought for the resource the request named is
         # never stored as another resource's, however alike their issuers.
         raise_resource_changed!(pkce.resource) unless request_resource_current?(pkce)
+        # A validated change of authorization server ends the requests still
+        # pending with the previous one (see {#end_pending_requests_of}),
+        # whichever provider sharing the storage made them: a request whose
+        # record is gone was answered by a server that is no longer this
+        # resource's, however current that server still looks from here.
+        raise_authorization_server_changed!(pkce.issuer) unless request_still_pending?(pkce)
 
         store_token(token)
 
@@ -810,7 +818,7 @@ module MCPClient
       def granted_scopes
         token = stored_token_or_nil
         return [] unless token.respond_to?(:scope) && token.scope.is_a?(String)
-        return [] unless token_for_current_issuer?(token)
+        return [] unless token_for_current_issuer?(token) || bindable_to_current_issuer?(token)
 
         token.scope.split
       end
@@ -2055,12 +2063,15 @@ module MCPClient
       # @return [ClientInfo, nil]
       def refresh_client_info(issuer)
         in_use = stored_client_info
-        usable = in_use.nil? || in_use.client_secret_expired? ? nil : in_use
         # Credentials the host pre-registered without saying which
         # authorization server issued them are not presented to the one the
         # refresh goes to, exactly as an authorization request does not
-        # present them: nothing says that server issued them.
-        return registration_for_issuer(issuer) if unbound_static?(usable)
+        # present them: nothing says that server issued them. Expiry changes
+        # nothing about whom they belong to, so it is judged on the record
+        # itself, before the secret's lifetime is.
+        return registration_for_issuer(issuer) if unbound_static?(in_use)
+
+        usable = in_use.nil? || in_use.client_secret_expired? ? nil : in_use
         return usable if usable && answers_for_issuer?(usable, issuer)
 
         registration_for_issuer(issuer) || in_use
