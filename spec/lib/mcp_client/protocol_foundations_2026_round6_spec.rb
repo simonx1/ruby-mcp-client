@@ -268,6 +268,15 @@ RSpec.describe 'ServerSSE direct JSON responses obey the same rules as the strea
       end
   end
 
+  it 'raises a well-formed -32022 as the typed error naming the supported versions' do
+    data = { 'supported' => ['2026-07-28'], 'requested' => '2025-11-25' }
+    expect { direct('error' => { 'code' => -32_022, 'message' => 'Unsupported protocol version', 'data' => data }) }
+      .to raise_error(MCPClient::Errors::UnsupportedProtocolVersionError) do |e|
+        expect(e.supported).to eq(['2026-07-28'])
+        expect(e.modern_protocol_error?).to be(true)
+      end
+  end
+
   it 'rejects an unrecognized resultType on a modern session' do
     server.instance_variable_set(:@protocol_version, '2026-07-28')
 

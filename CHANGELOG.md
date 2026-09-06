@@ -67,7 +67,10 @@ metadata). Each feature lands in its own PR; this section accumulates them.
   `"complete"` (earlier-protocol servers, and modern ones that omit it), and
   any unrecognized value raises `MCPClient::Errors::InvalidResultError` (a
   `ServerError`, so it is answered rather than re-sent), as the spec
-  requires. `"input_required"` passes through for the multi round-trip
+  requires — in every era: `resultType` is a name 2026-07-28 coined, so a
+  server that sends one is 2026-aware whatever version the session
+  negotiated, and a value this client cannot interpret is never silently
+  read as `"complete"`. `"input_required"` passes through for the multi round-trip
   handling that follows, but only on a modern session: the pattern exists
   only in 2026-07-28, so a handshake-era server claiming an unfinished result
   is malformed. No operation that projects a field out of the result
