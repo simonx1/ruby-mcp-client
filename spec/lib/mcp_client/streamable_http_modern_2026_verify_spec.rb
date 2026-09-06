@@ -1636,10 +1636,12 @@ RSpec.describe 'MCP 2026-07-28 Streamable HTTP — a response stream that really
         # request instead of a replacement request running it again.
         it 'keeps a delivered result when the stream stalls after the final SSE event until the timeout' do
           start_server do |message|
-            if message['method'] == 'server/discover'
-              jsonrpc(message, discovery)
-            else
-              [MidStreamCloseServer::DELIVER_THEN_STALL, jsonrpc(message, { 'content' => [] })]
+            case message['method']
+            when 'server/discover' then jsonrpc(message, discovery)
+            # A modern call reads tools/list first (to derive its headers);
+            # the stall this example is about belongs to the call's own stream.
+            when 'tools/list' then jsonrpc(message, { 'tools' => [] })
+            else [MidStreamCloseServer::DELIVER_THEN_STALL, jsonrpc(message, { 'content' => [] })]
             end
           end
           server = transport(klass, read_timeout: 0.3)

@@ -448,7 +448,8 @@ RSpec.describe 'MCP 2026-07-28 Streamable HTTP modern mode' do
         # too, and a modern server never asked for one.
         answers = requests.select { |r| r[:body]['id'] == 'srv-1' }
         expect(answers).to be_empty
-        expect(requests.map { |r| r[:body]['method'] }).to eq(%w[server/discover tools/call])
+        # A modern call reads tools/list first (to derive its headers).
+        expect(requests.map { |r| r[:body]['method'] }).to eq(%w[server/discover tools/list tools/call])
       end
 
       it 'ignores SSE comment keep-alive lines' do
