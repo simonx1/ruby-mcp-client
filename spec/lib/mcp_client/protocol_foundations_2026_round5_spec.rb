@@ -73,11 +73,11 @@ end
 
 # --- requiredCapabilities is ClientCapabilities all the way down -----------
 #
-# ClientCapabilities types its members: `elicitation` and `sampling` are
-# objects OF objects (form/url, context/tools), `experimental` and
-# `extensions` are maps to objects, and `roots.listChanged` is a boolean.
-# Checking only the first level let {"elicitation": {"form": []}} claim the
-# modern-server signal.
+# ClientCapabilities types its members: `elicitation` and `sampling` hold
+# objects under the names the schema gives them (form/url, context/tools),
+# and `experimental` and `extensions` map names to objects. Checking only
+# the first level let {"elicitation": {"form": []}} claim the modern-server
+# signal. (Round 6 pins the other direction: nothing beyond that is checked.)
 RSpec.describe 'a -32021 is well formed only when its capability members follow the schema' do
   def build(caps)
     MCPClient::Errors::ServerError.from_jsonrpc(
@@ -90,8 +90,7 @@ RSpec.describe 'a -32021 is well formed only when its capability members follow 
     'an elicitation mode that is an array' => { 'elicitation' => { 'form' => [] } },
     'a sampling feature that is a boolean' => { 'sampling' => { 'tools' => false } },
     'an extension entry that is an array' => { 'extensions' => { 'io.example/test' => [] } },
-    'an experimental entry that is a number' => { 'experimental' => { 'x' => 1 } },
-    'a roots.listChanged that is not a boolean' => { 'roots' => { 'listChanged' => 'yes' } }
+    'an experimental entry that is a number' => { 'experimental' => { 'x' => 1 } }
   }.each do |description, caps|
     it "rejects #{description}" do
       error = build(caps)
@@ -108,7 +107,7 @@ RSpec.describe 'a -32021 is well formed only when its capability members follow 
                                      'sampling' => { 'context' => {}, 'tools' => {} } },
     'extension and experimental objects' => { 'extensions' => { 'io.example/test' => { 'v' => 1 } },
                                               'experimental' => { 'x' => {} } },
-    'a boolean roots.listChanged' => { 'roots' => { 'listChanged' => true } },
+    'a roots object, whose members the schema leaves open' => { 'roots' => { 'listChanged' => 'yes' } },
     'an unknown capability with whatever members it likes' => { 'io.example/custom' => { 'anything' => 1 } }
   }.each do |description, caps|
     it "accepts #{description}" do
@@ -239,10 +238,13 @@ end
 # InputRequests wire shape: a map from identifier to request.
 RSpec.describe 'an unfinished tool or prompt result survives stdio and SSE off the wire' do
   let(:city_schema) { { 'type' => 'object', 'properties' => { 'city' => { 'type' => 'string' } } } }
+  # The published InputRequests wire shape: a map from server-assigned key to
+  # a request object (here an ElicitRequest).
   let(:unfinished) do
     { 'resultType' => 'input_required', 'requestState' => 'continue-later',
-      'inputRequests' => { 'city' => { 'type' => 'elicitation', 'mode' => 'form', 'message' => 'which city?',
-                                       'requestedSchema' => city_schema } } }
+      'inputRequests' => { 'city' => { 'method' => 'elicitation/create',
+                                       'params' => { 'mode' => 'form', 'message' => 'which city?',
+                                                     'requestedSchema' => city_schema } } } }
   end
 
   shared_examples 'accepts and preserves a continuation' do
@@ -262,7 +264,16 @@ RSpec.describe 'an unfinished tool or prompt result survives stdio and SSE off t
       answer_with('result' => unfinished)
 
       expect(server.call_tool('t', {})['inputRequests'].keys).to eq(['city'])
-      expect(server.call_tool('t', {}).dig('inputRequests', 'city', 'type')).to eq('elicitation')
+      expect(server.call_tool('t', {}).dig('inputRequests', 'city', 'method')).to eq('elicitation/create')
+    end
+
+    # "At least one of inputRequests or requestState MUST be present": a
+    # continuation may carry the requests alone.
+    it 'keeps a continuation that carries inputRequests without requestState' do
+      stateless = unfinished.except('requestState')
+      answer_with('result' => stateless)
+
+      expect(server.call_tool('t', {})).to eq(stateless)
     end
 
     it 'surfaces it from read_resource with the continuation on the error data' do

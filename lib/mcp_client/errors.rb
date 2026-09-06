@@ -286,25 +286,32 @@ module MCPClient
       end
 
       # The schema types this error's data as `requiredCapabilities:
-      # ClientCapabilities`, an object whose members (experimental, roots,
-      # sampling, elicitation, and any extension) are themselves objects, and
-      # it types those objects too: `elicitation` and `sampling` hold
-      # objects (form/url, context/tools), `experimental` and `extensions`
-      # map names to objects, and `roots.listChanged` is a boolean. A body
-      # that breaks any of that is not ClientCapabilities, and must not
-      # claim the signal that separates a well-formed modern rejection from
-      # a legacy peer or an intermediary emitting a bare -32021. Unknown
-      # member NAMES are deliberately accepted: the capability set is
-      # extensible, and an unknown-but-object one still comes from a peer
-      # that speaks the schema.
+      # ClientCapabilities` — an open object whose KNOWN members are typed:
+      # `elicitation` and `sampling` are objects holding objects under the
+      # names the schema gives them (form/url, context/tools) and nothing is
+      # said about their other members; `experimental` and `extensions` map
+      # names to objects; `roots` is an object with no typed member at all;
+      # and a capability the schema does not name may be anything. A body
+      # that breaks any of THAT is not ClientCapabilities, and must not claim
+      # the signal that separates a well-formed modern rejection from a legacy
+      # peer or an intermediary emitting a bare -32021 — but reading more
+      # into the schema than it says turns schema-valid rejections into
+      # "legacy" ones and strips their typed interface on the way to the
+      # caller, so exactly the schema's constraints are checked, no more.
       # @return [Boolean] whether data.requiredCapabilities is ClientCapabilities-shaped
       def well_formed?
         caps = data_member('requiredCapabilities')
         caps.is_a?(Hash) && caps.all? { |name, value| capability_well_formed?(name, value) }
       end
 
-      # Capabilities whose members the schema types as objects.
-      OBJECT_MEMBER_CAPABILITIES = %w[elicitation sampling experimental extensions].freeze
+      # Capabilities whose named members the schema types as objects.
+      TYPED_CAPABILITY_MEMBERS = { 'elicitation' => %w[form url], 'sampling' => %w[context tools] }.freeze
+
+      # Capabilities the schema types as maps from name to object.
+      OBJECT_MAP_CAPABILITIES = %w[experimental extensions].freeze
+
+      # Capabilities the schema types as objects with no typed member.
+      OPEN_OBJECT_CAPABILITIES = %w[roots].freeze
 
       private
 
@@ -312,21 +319,22 @@ module MCPClient
       # @param value [Object] its declared value
       # @return [Boolean] whether the value has the shape the schema gives that capability
       def capability_well_formed?(name, value)
+        key = name.to_s
+        members = TYPED_CAPABILITY_MEMBERS[key]
+        return true unless members || OBJECT_MAP_CAPABILITIES.include?(key) || OPEN_OBJECT_CAPABILITIES.include?(key)
         return false unless value.is_a?(Hash)
+        return value.each_value.all?(Hash) if OBJECT_MAP_CAPABILITIES.include?(key)
 
-        case name.to_s
-        when *OBJECT_MEMBER_CAPABILITIES then value.each_value.all?(Hash)
-        when 'roots' then roots_well_formed?(value)
-        else true
-        end
+        (members || []).all? { |member| typed_member_ok?(value, member) }
       end
 
-      # @param roots [Hash] the declared roots capability
-      # @return [Boolean] whether listChanged, when present, is a boolean
-      def roots_well_formed?(roots)
-        return true unless roots.key?('listChanged') || roots.key?(:listChanged)
+      # @param value [Hash] a capability object
+      # @param member [String] a member the schema types as an object
+      # @return [Boolean] whether the member, when present, is an object
+      def typed_member_ok?(value, member)
+        return true unless value.key?(member) || value.key?(member.to_sym)
 
-        [true, false].include?(roots.key?('listChanged') ? roots['listChanged'] : roots[:listChanged])
+        (value.key?(member) ? value[member] : value[member.to_sym]).is_a?(Hash)
       end
     end
 

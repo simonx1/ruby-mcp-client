@@ -1722,10 +1722,15 @@ end
 RSpec.describe 'an unfinished result survives the HTTP transports off the wire' do
   let(:base_url) { 'https://example.com' }
   let(:endpoint) { '/rpc' }
-  # The schema's InputRequests wire shape: a map from identifier to request.
+  # The schema's InputRequests wire shape: a map from server-assigned key to
+  # a request object (here an ElicitRequest).
+  let(:city_request) do
+    { 'method' => 'elicitation/create',
+      'params' => { 'mode' => 'form', 'message' => 'which city?', 'requestedSchema' => { 'type' => 'object' } } }
+  end
   let(:unfinished) do
     { 'resultType' => 'input_required', 'requestState' => 'continue-later',
-      'inputRequests' => { 'city' => { 'type' => 'elicitation', 'mode' => 'form', 'message' => 'which city?' } } }
+      'inputRequests' => { 'city' => city_request } }
   end
 
   shared_examples 'accepts and preserves a continuation' do
@@ -1755,9 +1760,15 @@ RSpec.describe 'an unfinished result survives the HTTP transports off the wire' 
           # Not the "unrecognized resultType" rejection: the transport
           # accepted the discriminator and the WRAPPER declined to flatten it.
           expect(e.data).to eq(unfinished)
-          expect(e.data['inputRequests'])
-            .to eq({ 'city' => { 'type' => 'elicitation', 'mode' => 'form', 'message' => 'which city?' } })
+          expect(e.data['inputRequests']).to eq({ 'city' => city_request })
         end
+    end
+
+    it 'keeps a continuation that carries inputRequests without requestState' do
+      stateless = unfinished.except('requestState')
+      respond_with('result' => stateless)
+
+      expect(server.call_tool('t', {})).to eq(stateless)
     end
 
     it 'rejects it on a session that negotiated a handshake revision' do

@@ -267,7 +267,11 @@ module MCPClient
         # MCP 2025-11-25 session management: HTTP 404 for a request carrying
         # Mcp-Session-Id means the session expired — the client MUST start a
         # new session with a fresh InitializeRequest (without a session ID).
-        if response.status == 404 && session_restart_applicable?(sent_session_id)
+        # Unless the 404 carries a well-formed -32601: that is MCP 2026-07-28's
+        # answer to THIS request (unknown method), not a session expiry, and
+        # restarting on it would re-send the same unknown method.
+        if response.status == 404 && session_restart_applicable?(sent_session_id) &&
+           !method_not_found_answer?(response)
           return restart_session_and_resend(request, sent_session_id)
         end
 
@@ -281,7 +285,10 @@ module MCPClient
       rescue Faraday::ResourceNotFound => e
         # User-configured raise_error middleware surfaces 404 as an exception;
         # apply the same session-expiry recovery as the response path.
-        return restart_session_and_resend(request, sent_session_id) if session_restart_applicable?(sent_session_id)
+        if session_restart_applicable?(sent_session_id) &&
+           !method_not_found_answer?(normalize_error_response(e.response))
+          return restart_session_and_resend(request, sent_session_id)
+        end
 
         raise client_error_from_exception(e, 404)
       rescue Faraday::ClientError => e
@@ -324,6 +331,23 @@ module MCPClient
       ensure
         @restarting_session = false
       end
+    end
+
+    # Whether a 404 body is a well-formed JSON-RPC -32601 — MCP 2026-07-28's
+    # "unknown method" answer to the request itself — rather than a
+    # 2025-11-25 session expiry, which answers nothing.
+    # @param response [#body, nil] the 404 response, if its body is readable
+    # @return [Boolean]
+    def method_not_found_answer?(response)
+      body = response.respond_to?(:body) ? response.body : nil
+      data = body.is_a?(Hash) ? body : JSON.parse(body.to_s)
+      error = data.is_a?(Hash) ? (data['error'] || data[:error]) : nil
+      return false unless error.is_a?(Hash)
+
+      (error['code'] || error[:code]) == MCPClient::Errors::Codes::METHOD_NOT_FOUND &&
+        (error['message'] || error[:message]).is_a?(String)
+    rescue JSON::ParserError, TypeError
+      false
     end
 
     # Whether a 404 should trigger a session restart: only when the 404'd

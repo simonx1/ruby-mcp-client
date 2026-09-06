@@ -38,16 +38,24 @@ metadata). Each feature lands in its own PR; this section accumulates them.
   as `ClientCapabilities`, so its members must be objects too — a body
   claiming `{"elicitation": []}` is malformed and does not identify a modern
   server — and so is one whose nested members break the schema's types
-  (`elicitation`/`sampling` hold objects, `experimental`/`extensions` map
-  names to objects, `roots.listChanged` is a boolean); unknown capability
-  names are accepted. `#modern_http_protocol_error?` is the
+  (`elicitation.form`/`.url` and `sampling.context`/`.tools` are objects,
+  `experimental`/`extensions` map names to objects). Exactly the schema's
+  constraints, and no more: ClientCapabilities is an open object, so a
+  vendor member beside `form`, anything inside `roots`, or an unknown
+  capability of any shape is still well-formed, and such a rejection reaches
+  the caller as the typed error with its `#required_capabilities` readable
+  instead of being flattened into a `ToolCallError`. `#modern_http_protocol_error?` is the
   Streamable-HTTP-specific predicate: it additionally recognizes an unknown
   method answered with HTTP 404 and a JSON-RPC -32601 body, which that
   transport's backward compatibility rules name as a modern-server signal.
   That -32601 is typed as `MCPClient::Errors::MethodNotFoundError` (a plain
   `ServerError` for every other purpose) and, like the reserved codes, only
   when its error object is well-formed: a 404 page dressed up as
-  `{"error": {"code": -32601}}` with no `message` identifies nobody. It is
+  `{"error": {"code": -32601}}` with no `message` identifies nobody. That
+  body is read before the 2025-11-25 session rule: a 404 answering a request
+  that carried an `Mcp-Session-Id` starts a fresh session only when it is NOT
+  a well-formed -32601 — that one is the answer to the request itself (an
+  unknown method), and restarting on it would re-send the same method. It is
   deliberately separate from `#modern_protocol_error?`, because on stdio a
   bare -32601 is exactly what a legacy peer answers a modern probe with and
   must keep the `initialize` fallback alive. When a modern-only server
