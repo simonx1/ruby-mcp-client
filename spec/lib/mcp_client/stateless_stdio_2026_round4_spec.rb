@@ -495,7 +495,10 @@ RSpec.describe 'MCP 2026-07-28 stateless protocol (stdio) — round 4' do
       expect(client.list_tools.map(&:name)).to eq(%w[echo echo])
 
       requests = bodies.reject { |body| body['method'].start_with?('notifications/') }
-      expect(requests.map { |body| body['method'] }.uniq).to contain_exactly('initialize', 'tools/list')
+      # The HTTP transports probe the era with server/discover before falling
+      # back to the handshake; the probe is a request like any other.
+      expect(requests.map { |body| body['method'] }.uniq)
+        .to contain_exactly('server/discover', 'initialize', 'tools/list')
       requests.each do |body|
         expect(body.dig('params', '_meta', 'traceparent')).to eq('00-http-trace-01'), body['method']
       end

@@ -377,6 +377,12 @@ module MCPClient
         list.is_a?(Array) ? list.grep(String) : []
       end
 
+      # The versions the server named, phrased for a message about the rejection.
+      # @return [String] " (server supports: ...)" or "" when it named none
+      def supported_suffix
+        supported.empty? ? '' : " (server supports: #{supported.join(', ')})"
+      end
+
       # @return [String, nil] the protocol version the request asked for (data.requested)
       def requested
         data_member('requested')

@@ -512,7 +512,9 @@ module MCPClient
     def modern_probe_failure(error)
       @protocol_version = nil
       @confirmed_era = :modern
-      MCPClient::Errors::ModernServerError.new("Server is modern but incompatible: #{error.message}")
+      # A version rejection names what the server would accept.
+      suffix = error.respond_to?(:supported_suffix) ? error.supported_suffix : ''
+      MCPClient::Errors::ModernServerError.new("Server is modern but incompatible: #{error.message}#{suffix}")
     end
 
     # A 404 with -32601 is how a modern server reports an unknown method;
