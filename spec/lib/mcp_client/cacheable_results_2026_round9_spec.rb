@@ -78,10 +78,9 @@ RSpec.describe 'MCP 2026-07-28 cacheable results — round 9' do
     server.send(:note_request_authorization, 'Bearer alice')
     server.send(:record_cache_hint, :tools, { 'ttlMs' => 0, 'cacheScope' => 'private' }, [:alice_secret])
     stale = server.send(:stale_list_entry, :tools)
-    served = nil
 
     expect do
-      served = server.send(:refetch_or_serve_stale, :tools, stale) do
+      server.send(:refetch_or_serve_stale, :tools, stale) do
         # A concurrent request under Bob's credentials installs Bob's entry,
         # then Alice's re-fetch (now carrying Bob's token) fails.
         server.send(:note_request_authorization, 'Bearer bob')
@@ -89,7 +88,6 @@ RSpec.describe 'MCP 2026-07-28 cacheable results — round 9' do
         raise MCPClient::Errors::TransientServerError, 'HTTP 503'
       end
     end.to raise_error(MCPClient::Errors::TransientServerError)
-    expect(served).to be_nil
   end
 
   it 'serves a stale copy to the context that produced it' do

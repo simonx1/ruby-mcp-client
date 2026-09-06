@@ -349,17 +349,22 @@ RSpec.describe 'MCP 2026-07-28 cacheable results' do
       client.cleanup
     end
 
-    it 'keeps serving the client cache while the server list is fresh' do
+    it 'keeps serving the client cache while the server list is fresh, without asking the transport' do
       counts = stub_client_server(ttl_ms: 60_000)
       client = MCPClient::Client.new(mcp_server_configs: [MCPClient.streamable_http_config(
         base_url: 'https://example.com', endpoint: '/mcp', retries: 0
       )])
+      # The transport's own cache would hide a client cache that re-asked it
+      # on every call: what is pinned is that the client does not ask.
+      transport = client.servers.first
+      allow(transport).to receive(:list_tools).and_call_original
 
       client.list_tools
       client.list_tools
       client.call_tool('t', {})
 
       expect(counts['tools/list']).to eq(1)
+      expect(transport).to have_received(:list_tools).once
       client.cleanup
     end
   end

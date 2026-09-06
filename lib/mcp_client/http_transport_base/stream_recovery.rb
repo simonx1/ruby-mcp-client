@@ -65,7 +65,10 @@ module MCPClient
             # while the response is still open (a server that waits for its
             # ping to be answered before sending the result would otherwise
             # deadlock against a client that answers only at EOF).
-            scanner.feed(chunk.to_s) { |event| deliver_live_event(state, listener, event) }
+            scanner.feed(chunk.to_s) do |event|
+              note_response_arrival(state, event)
+              deliver_live_event(state, listener, event)
+            end
             state[:mcp_live_events] = scanner.count
           end
         end
@@ -84,6 +87,34 @@ module MCPClient
           listener.call(event)
         rescue StandardError => e
           state[:mcp_stream_error] ||= e
+        end
+
+        # Flag the event carrying the answer to this request, so whoever
+        # dates the response (CacheSupport's recorder) can date it from the
+        # chunk that completed the result rather than from whatever opened
+        # the stream: a keep-alive or a progress notification is not the
+        # result, and a TTL that ran from it would expire results that took
+        # a while to compute (MCP 2026-07-28 caching, "Freshness Calculation").
+        # @param state [Hash] the exchange's capture state
+        # @param event [String] one complete SSE event
+        # @return [void]
+        def note_response_arrival(state, event)
+          return if state[:mcp_response_seen] || !state.key?(:mcp_response_id)
+
+          state[:mcp_response_seen] = true if response_event?(event, state[:mcp_response_id])
+        end
+
+        # @param event [String] one complete SSE event
+        # @param id [Integer, String] the id of the request awaiting its answer
+        # @return [Boolean] whether the event is the JSON-RPC response to it
+        def response_event?(event, id)
+          data = event.lines.filter_map { |line| line[5..].to_s.sub(/\A /, '').chomp if line.start_with?('data:') }
+          return false if data.empty?
+
+          message = JSON.parse(data.join("\n"))
+          message.is_a?(Hash) && !message.key?('method') && (message['id'] == id || message['id'].to_s == id.to_s)
+        rescue JSON::ParserError
+          false
         end
 
         # @param env [Faraday::Env] the completed request environment

@@ -94,7 +94,7 @@ module MCPClient
           env[SENT_AUTHORIZATION_KEY] = @transport.send(:recorded_request_authorization)
           # Each attempt the retry middleware makes is received on its own.
           env[RESPONSE_RECEIVED_AT_KEY] = nil
-          stamp_first_chunk(env)
+          stamp_response_chunk(env)
         end
 
         # The bytes are in hand and nothing of the host's has run on them
@@ -107,21 +107,37 @@ module MCPClient
 
         private
 
-        # A response read as a stream is in hand from its first chunk, and
-        # what that chunk carries -- a notification, a server request -- is
-        # handled while the stream is still open. The TTL runs from receipt,
-        # not from whatever the host made of the stream on the way: the stamp
-        # goes on ahead of the transport's own on_data handler.
+        # A response read as a stream is dated from the chunk that completed
+        # the result -- not from the keep-alive or progress notification that
+        # opened the stream, which is not the result and would expire a slow
+        # one before it arrived, and not from whatever the host made of the
+        # stream on the way: the chunk's arrival is taken before the
+        # transport's own on_data handler dispatches what it carries, and the
+        # stamp goes on once that handler flagged the answer as in hand (see
+        # StreamRecovery::ResponseBodyCapture#note_response_arrival). A body
+        # that is not a stream of events is dated on completion.
         # @param env [Faraday::Env] the outgoing request environment
         # @return [void]
-        def stamp_first_chunk(env)
+        def stamp_response_chunk(env)
           inner = env.request.on_data
-          return unless inner
+          state = env.request.context
+          return unless inner && state.is_a?(Hash)
 
+          state[:mcp_response_id] = request_id_of(env.body)
           env.request.on_data = lambda do |chunk, size, data_env|
-            env[RESPONSE_RECEIVED_AT_KEY] ||= @transport.send(:monotonic_now)
+            arrived = @transport.send(:monotonic_now)
             inner.call(chunk, size, data_env)
+            env[RESPONSE_RECEIVED_AT_KEY] ||= arrived if state[:mcp_response_seen]
           end
+        end
+
+        # @param body [String, nil] the serialized JSON-RPC request
+        # @return [Integer, String, nil] the request's id
+        def request_id_of(body)
+          message = JSON.parse(body.to_s)
+          message['id'] if message.is_a?(Hash)
+        rescue JSON::ParserError
+          nil
         end
       end
 
