@@ -58,12 +58,23 @@ module MCPClient
       # every request, so a delivered answer is usually a delivered
       # *compressed* answer; treating those bytes as a lost stream would
       # re-issue a tools/call the server already ran.
+      # An expansion the bound refuses is not a lost answer either: the
+      # server ran the request and sent its result, and only this client's
+      # ceiling stands in the way. Re-issuing there would run the request a
+      # second time, so the caller is told the response was too large — the
+      # same answer the ordinary (unbroken) path gives.
       # @param body [String] the captured bytes
-      # @return [String, nil] the expanded body; nil when it cannot be inflated
-      #   (truncated inside the deflate stream, or over the bound)
+      # @return [String, nil] the expanded body; nil when the deflate stream
+      #   itself stopped short of what it needs to be read
+      # @raise [MCPClient::Errors::ResponseTooLargeError] when the body expands
+      #   past the configured bound
       def inflate_delivered_gzip(body)
         inflater = Zlib::Inflate.new(Zlib::MAX_WBITS + 32)
-        BoundedInflate.inflate(inflater, body, inflate_limit)
+        text = BoundedInflate.inflate(inflater, body, inflate_limit)
+        return text unless text.nil?
+
+        raise MCPClient::Errors::ResponseTooLargeError,
+              "Gzip response expanded beyond #{inflate_limit} bytes"
       rescue Zlib::Error
         nil
       ensure

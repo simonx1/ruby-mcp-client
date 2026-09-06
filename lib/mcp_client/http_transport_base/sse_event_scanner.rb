@@ -107,9 +107,17 @@ module MCPClient
       end
 
       # Whether the body is an event stream worth scanning, settled from its
-      # first few bytes after any leading blank lines: one that does not
-      # start like an event stream (JSON, anything else) is never scanned and
-      # never buffered here.
+      # first line after any leading blank lines: one that does not start like
+      # an event stream (JSON, anything else) is never scanned and never
+      # buffered here.
+      #
+      # The verdict waits for that first line to be decidable. A field name is
+      # what says "event stream", and a name split across chunks ("x-igno" +
+      # "re: 1\n") is not one yet: settling on its first bytes would answer
+      # "not an event stream" for a stream that is one, and nothing on it —
+      # a server's request awaiting its answer, a progress notification —
+      # would ever be delivered. A JSON body is refused on its first byte,
+      # since no field name may open with one.
       # @return [Boolean] false while too little has arrived to tell
       def scanning?
         return @sse unless @sse.nil?
@@ -117,11 +125,20 @@ module MCPClient
         # The UTF-8 decode step of the SSE algorithm drops one leading BOM.
         @normalized.delete_prefix!(BOM) if @scanned.zero?
         content = @normalized.sub(/\A\n+/, '')
-        return false unless content.bytesize >= 6 || content.include?("\n")
+        return settle(false) if content.match?(/\A[{\[]/n)
+        # A colon ends a field name; so does the line itself, since a line
+        # with no colon is a field whose value is empty.
+        return false unless content.match?(/[:\n]/n)
 
-        @sse = content.match?(SSE_START)
-        @normalized.clear unless @sse
-        @sse
+        settle(content.match?(SSE_START) || !content.match?(/\A[^\n]*:/n))
+      end
+
+      # @param verdict [Boolean] whether this body is an event stream
+      # @return [Boolean] the verdict
+      def settle(verdict)
+        @sse = verdict
+        @normalized.clear unless verdict
+        verdict
       end
     end
   end

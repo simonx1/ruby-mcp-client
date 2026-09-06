@@ -72,6 +72,31 @@ RSpec.describe MCPClient::HttpTransportBase::SseEventScanner do
     expect(events).to eq(["x-ignore: 1\ndata: a"])
   end
 
+  # The field name is what says "event stream", and it is not complete until
+  # its colon or its line terminator arrives. Settling on the first few bytes
+  # of a name split across chunks would decide "not an event stream" for a
+  # stream that is one, and nothing on it would ever be delivered.
+  it 'waits for the end of a field name split across chunks before deciding' do
+    events, = events_from('x-igno', "re: 1\ndata: a\n\n")
+
+    expect(events).to eq(["x-ignore: 1\ndata: a"])
+  end
+
+  # SSE "Parsing an event stream": a line with no colon is a field whose
+  # value is the empty string, so a stream may legitimately open with one.
+  it 'scans a stream whose first field has no colon at all' do
+    events, = events_from("x-ignore\ndata: a\n\n")
+
+    expect(events).to eq(["x-ignore\ndata: a"])
+  end
+
+  it 'settles on a JSON body as soon as its first byte arrives' do
+    events, count = events_from('{', '"jsonrpc":"2.0","id":1,"result":{}}')
+
+    expect(events).to be_empty
+    expect(count).to eq(0)
+  end
+
   it 'skips a leading byte-order mark' do
     events, = events_from("\xEF\xBB\xBF".b, "data: a\n\n")
 

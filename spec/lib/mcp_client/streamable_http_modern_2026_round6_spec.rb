@@ -183,12 +183,29 @@ RSpec.describe 'MCP 2026-07-28 Streamable HTTP — round 6' do
 
     # A small compressed body the peer breaks off afterwards would otherwise
     # be inflated whole by the salvage, past the bound the completed-body
-    # decoder enforces.
+    # decoder enforces. The bound is reported as such (round 7): an answer
+    # this client refuses to expand is not one the stream lost, and treating
+    # it as lost would re-issue a request the server already ran.
     it 'never inflates a salvaged answer past the bound' do
       inflated = inflated_pieces
 
-      expect(server.send(:inflate_delivered_gzip, bomb)).to be_nil
+      expect { server.send(:inflate_delivered_gzip, bomb) }
+        .to raise_error(MCPClient::Errors::ResponseTooLargeError, /1024 bytes/)
       expect(inflated.call).to be <= 1024 + (64 * 1024)
+    end
+
+    # A deflate stream that stopped short hands back only the bytes it did
+    # expand — never the bound's refusal. The salvage then finds no answer in
+    # them and the caller re-issues, which is the right outcome for a stream
+    # that really did lose the response.
+    it 'hands back what a deflate stream that stopped short did expand' do
+      answer = sse_event('jsonrpc' => '2.0', 'id' => 1, 'result' => {})
+      truncated = gzip(answer)[0, 12]
+
+      salvaged = server.send(:inflate_delivered_gzip, truncated)
+
+      expect(salvaged).not_to include('"result"')
+      expect(server.send(:body_carries_response?, salvaged.to_s, false, 1)).to be(false)
     end
 
     it 'still inflates a salvaged answer within the bound' do

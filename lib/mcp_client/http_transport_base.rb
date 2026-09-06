@@ -85,6 +85,11 @@ module MCPClient
         listener = state[:mcp_stream_listener]
         scanner = listener && SseEventScanner.new(max_inflated_bytes: state[:mcp_inflate_limit])
         state[:mcp_live_events] = 0
+        # The adapter fills this same env in as it reads: its status is set
+        # from the status line, so a salvaged answer can be rebuilt under the
+        # status it really arrived with. The era rule reads a recognized
+        # modern error only under the status it came with.
+        state[:mcp_env] = env
         env.request.on_data = lambda do |chunk, _size, _env|
           buffer << chunk.to_s
           deadline = state[:mcp_deadline]
@@ -460,14 +465,34 @@ module MCPClient
       end
       # A 2xx that is not a DiscoverResult (e.g. a permissive legacy endpoint
       # answering any method) is not a modern answer: let the probe treat it
-      # as legacy rather than fail on a malformed modern result.
-      unless discover_result?(result)
-        raise MCPClient::Errors::ServerError, 'server/discover was answered without a DiscoverResult'
-      end
+      # as legacy rather than fail on a malformed modern result. A result
+      # carrying a resultType is the exception — see #invalid_discover_answer.
+      raise invalid_discover_answer(result, 'answered without a DiscoverResult') unless discover_result?(result)
 
       apply_discover_result(result)
     rescue MCPClient::Errors::InvalidResultError => e
-      raise MCPClient::Errors::ServerError, "server/discover was answered without a DiscoverResult (#{e.message})"
+      # The result named a resultType this client does not recognize, which
+      # only a modern server writes: modern, and unusable.
+      raise invalid_discover_answer({ 'resultType' => nil },
+                                    "answered without a DiscoverResult (#{e.message})")
+    end
+
+    # What an unusable probe answer says about the server's era.
+    #
+    # `resultType` was introduced in MCP 2026-07-28, so a result carrying one
+    # could only have been written by a modern server, however little else of
+    # it this client can use: falling back would open the handshake that
+    # revision removed, on a server that has already answered as modern. The
+    # ModernServerError settles the era for good (see #probe_modern_server);
+    # anything else stays a plain ServerError the probe may read as legacy.
+    # @param result [Object] the probe's result
+    # @param message [String] what was wrong with it
+    # @return [MCPClient::Errors::MCPError] the failure to raise
+    def invalid_discover_answer(result, message)
+      modern = result.is_a?(Hash) && (result.key?('resultType') || result.key?(:resultType))
+      return MCPClient::Errors::ServerError.new("server/discover was #{message}") unless modern
+
+      MCPClient::Errors::ModernServerError.new("Server is modern but incompatible: server/discover was #{message}")
     end
 
     # One server/discover exchange with its own JSON-RPC id.
@@ -606,14 +631,14 @@ module MCPClient
         # The body may have been fully delivered before the socket died; if it
         # was, that response settles the request and must not be replaced.
         salvaged = salvaged_response(capture[:mcp_body_buffer], request, e, capture)
-        return salvaged if salvaged
+        return settled_salvage(salvaged) if salvaged
 
         raise connection_failure_error(e, request)
       rescue Faraday::TimeoutError => e
         # A stream that stalled after delivering the whole final event has
         # answered the request; the timeout only tears the idle socket down.
         salvaged = salvaged_response(capture[:mcp_body_buffer], request, e, capture)
-        return salvaged if salvaged
+        return settled_salvage(salvaged) if salvaged
 
         raise MCPClient::Errors::RequestTimeoutError, "Request timed out: #{e.message}"
       rescue Faraday::ServerError => e
@@ -747,8 +772,33 @@ module MCPClient
 
       @logger.warn("Response stream ended after the response arrived (#{error.message}); " \
                    "keeping the delivered #{request['method']} response instead of re-issuing it")
-      NormalizedResponse.new(200, { 'content-type' => sse ? 'text/event-stream' : 'application/json' }, body,
+      NormalizedResponse.new(delivered_status(capture),
+                             { 'content-type' => sse ? 'text/event-stream' : 'application/json' }, body,
                              capture)
+    end
+
+    # The status a salvaged answer arrived under. A well-formed -32022 in a
+    # 400 body identifies a modern server and is retried with an advertised
+    # version, while the same body under 200 is a permissive legacy echo:
+    # rebuilding every salvaged answer as 200 would turn the first into the
+    # second. The adapter fills the captured env in as it reads, so its status
+    # is the status line this response really carried.
+    # @param capture [Hash, nil] the capture state of the failed exchange
+    # @return [Integer]
+    def delivered_status(capture)
+      (capture.is_a?(Hash) && capture[:mcp_env]&.status) || 200
+    end
+
+    # A salvaged answer read the way the unbroken path reads one: an error
+    # status it arrived under still becomes the typed JSON-RPC error, so a
+    # recognized modern error keeps the status the era rule needs. Returning
+    # it unread would settle a 400 rejection as if it were a 200 result.
+    # @param salvaged [NormalizedResponse] the response the salvage rebuilt
+    # @return [NormalizedResponse] the same response, once it is an answer
+    # @raise [MCPClient::Errors::MCPError] whatever its status and body say
+    def settled_salvage(salvaged)
+      handle_http_error_response(salvaged) unless (200..299).cover?(salvaged.status.to_i)
+      salvaged
     end
 
     # Per the SSE specification a line is terminated by CRLF, CR or LF alone;

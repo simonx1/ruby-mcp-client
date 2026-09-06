@@ -217,6 +217,42 @@ RSpec.describe 'MCP 2026-07-28 Streamable HTTP modern mode — verification' do
         expect(methods_sent(requests).first(2)).to eq(%w[server/discover initialize])
       end
 
+      # `resultType` did not exist before 2026-07-28, so a result carrying one
+      # could only have been written by a modern server — however unusable the
+      # rest of it is. Falling back would open a handshake that revision
+      # removed, on a server that has already answered as modern. The stdio
+      # probe settles this the same way.
+      it 'never falls back when a 2xx probe answer carries a resultType' do
+        requests = stub_posts(
+          'server/discover' => { 'resultType' => 'complete', 'capabilities' => { 'tools' => {} } },
+          'initialize' => lambda do |body, _reqs|
+            json_response(body['id'], { 'protocolVersion' => '2025-11-25', 'capabilities' => {},
+                                        'serverInfo' => { 'name' => 'legacy', 'version' => '1' } })
+          end
+        )
+        stub_request(:get, url).to_return(status: 405, body: '')
+
+        expect { server.connect }.to raise_error(MCPClient::Errors::ModernServerError, /modern/)
+
+        expect(methods_sent(requests)).to eq(%w[server/discover])
+        expect(server.protocol_era).not_to eq(:legacy)
+      end
+
+      it 'never falls back when a 2xx probe answer carries an unrecognized resultType' do
+        requests = stub_posts(
+          'server/discover' => { 'resultType' => 'something_new', 'supportedVersions' => ['2026-07-28'] },
+          'initialize' => lambda do |body, _reqs|
+            json_response(body['id'], { 'protocolVersion' => '2025-11-25', 'capabilities' => {},
+                                        'serverInfo' => { 'name' => 'legacy', 'version' => '1' } })
+          end
+        )
+        stub_request(:get, url).to_return(status: 405, body: '')
+
+        expect { server.connect }.to raise_error(MCPClient::Errors::ModernServerError, /modern/)
+
+        expect(methods_sent(requests)).to eq(%w[server/discover])
+      end
+
       # Configuration reaches the wire as both a socket timeout and an
       # overall deadline (the capture middleware's `mcp_deadline`): the probe
       # gets discover_timeout, every other request the transport's timeout.
@@ -676,6 +712,10 @@ class MidStreamCloseServer
   # open without the deflate stream ever ending. Only a reader that inflates
   # the body as it arrives can see those events.
   GZIP_EVENTS_THEN_STALL = :gzip_events_then_stall
+  # Reply token triple [STATUS_THEN_CLOSE, code, reply]: `reply` as one
+  # complete SSE event under HTTP `code`, then close without the terminating
+  # chunk. The answer arrived; the framing after it did not.
+  STATUS_THEN_CLOSE = :status_then_close
 
   # A self-signed certificate for 127.0.0.1, built once for the whole file
   # because key generation is the expensive part.
@@ -842,6 +882,7 @@ class MidStreamCloseServer
     case token
     when CLOSE_MID_STREAM then write_sse_chunk(client, ": keep-alive\n\n")
     when DELIVER_THEN_CLOSE then write_sse_chunk(client, sse_events_for(payload))
+    when STATUS_THEN_CLOSE then write_json_chunk(client, JSON.generate(extra), status: payload)
     when GZIP_THEN_CLOSE then write_gzip_chunk(client, sse_events_for(payload))
     when GZIP_EVENTS_THEN_STALL
       write_gzip_events_open(client, sse_events_for(payload))
@@ -910,14 +951,22 @@ class MidStreamCloseServer
     client.flush
   end
 
-  def write_sse_head(client)
-    client.write("HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\n" \
+  def write_sse_head(client, status: 200)
+    client.write("HTTP/1.1 #{status} OK\r\nContent-Type: text/event-stream\r\n" \
                  "Transfer-Encoding: chunked\r\nConnection: close\r\n\r\n")
   end
 
   # One chunk and no terminating zero chunk: the body stops mid-stream.
-  def write_sse_chunk(client, chunk)
-    write_sse_head(client)
+  def write_sse_chunk(client, chunk, status: 200)
+    write_sse_head(client, status: status)
+    client.write(format("%<size>x\r\n%<chunk>s\r\n", size: chunk.bytesize, chunk: chunk))
+  end
+
+  # A JSON body under `status`, chunked, with no terminating zero chunk: the
+  # answer arrived whole, the framing after it did not.
+  def write_json_chunk(client, chunk, status: 200)
+    client.write("HTTP/1.1 #{status} Bad Request\r\nContent-Type: application/json\r\n" \
+                 "Transfer-Encoding: chunked\r\nConnection: close\r\n\r\n")
     client.write(format("%<size>x\r\n%<chunk>s\r\n", size: chunk.bytesize, chunk: chunk))
   end
 
@@ -1657,6 +1706,57 @@ RSpec.describe 'MCP 2026-07-28 Streamable HTTP — a response stream that really
 
       expect(transport(MCPClient::ServerStreamableHTTP).call_tool('charge',
                                                                   { 'amount' => 10 })).to eq({ 'content' => [] })
+      expect(@fixture.received.count { |r| r['method'] == 'tools/call' }).to eq(1)
+    end
+
+    # The era rule keys on the status a recognized modern error came under:
+    # 400 + a well-formed -32022 identifies a modern server and is retried
+    # with an advertised version, while the same body under 200 is a
+    # permissive legacy echo. A salvage that rebuilt every delivered answer as
+    # 200 turned the first into the second, and the client fell back to a
+    # handshake against a server that had just answered as modern.
+    it 'keeps the status a delivered error arrived under' do
+      start_server do |message|
+        case message['method']
+        when 'server/discover'
+          if @fixture.received.count { |m| m['method'] == 'server/discover' } > 1
+            jsonrpc(message, discovery)
+          else
+            [MidStreamCloseServer::STATUS_THEN_CLOSE, 400,
+             { 'jsonrpc' => '2.0', 'id' => message['id'],
+               'error' => { 'code' => -32_022, 'message' => 'Unsupported protocol version',
+                            'data' => { 'supported' => ['2026-07-28'], 'requested' => '2026-07-28' } } }]
+          end
+        else jsonrpc(message, { 'tools' => [] })
+        end
+      end
+      server = transport(MCPClient::ServerStreamableHTTP)
+
+      Timeout.timeout(15) { expect(server.list_tools).to eq([]) }
+
+      expect(methods_received).not_to include('initialize')
+      expect(server.protocol_era).to eq(:modern)
+    end
+
+    # An answer this client refuses to expand is not an answer that was lost.
+    # The re-issue rule is for an in-flight request the broken stream took
+    # with it; here the server ran the tool and sent its result, and only the
+    # local expansion bound stands in the way. Re-issuing would charge twice,
+    # so the caller is told the response was too large instead.
+    it 'refuses an oversized delivered gzip answer rather than running the tool again' do
+      start_server do |message|
+        case message['method']
+        when 'server/discover' then jsonrpc(message, discovery)
+        when 'tools/call'
+          [MidStreamCloseServer::GZIP_THEN_CLOSE,
+           jsonrpc(message, { 'content' => [{ 'type' => 'text', 'text' => 'x' * 4096 }] })]
+        else jsonrpc(message, { 'tools' => [] })
+        end
+      end
+      server = transport(MCPClient::ServerStreamableHTTP, max_decompressed_body_bytes: 1024)
+
+      expect { server.call_tool('charge', { 'amount' => 10 }) }
+        .to raise_error(MCPClient::Errors::ResponseTooLargeError)
       expect(@fixture.received.count { |r| r['method'] == 'tools/call' }).to eq(1)
     end
   end
