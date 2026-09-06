@@ -68,8 +68,10 @@ module MCPClient
 
         # Determine response format based on Content-Type header per MCP 2025 spec
         data = if content_type.include?('text/event-stream')
-                 # Parse SSE-formatted response for streaming
-                 parse_sse_response(body, request && request['id'])
+                 # Parse SSE-formatted response for streaming. The body is
+                 # not stripped: its final blank line is the last event's
+                 # terminator, and without it that event was never dispatched.
+                 parse_sse_response(body.to_s, request && request['id'])
                elsif body.is_a?(String)
                  # Parse regular JSON response (default for Streamable HTTP)
                  JSON.parse(body.strip)
@@ -90,11 +92,25 @@ module MCPClient
         # Streamable HTTP always offers gzip, so a stream that stops before the
         # gzip footer arrives here rather than as a socket failure. No response
         # was delivered, which on a modern server means the in-flight request
-        # is lost and MUST be re-issued with a new id.
-        raise MCPClient::Errors::TransportError, "Invalid gzip response from server: #{e.message}" unless modern?
+        # is lost and MUST be re-issued with a new id. A body that is complete
+        # but corrupt (bad CRC, bad deflate data) was not cut short: the
+        # server answered, badly, and running the request again would not
+        # make it answer better.
+        unless modern? && truncated_gzip?(e)
+          raise MCPClient::Errors::TransportError, "Invalid gzip response from server: #{e.message}"
+        end
 
         raise MCPClient::Errors::ResponseStreamClosedError,
               "Response stream closed before delivering the response: #{e.message}"
+      end
+
+      # Whether a gzip failure means the body stopped before its end rather
+      # than carrying bad data.
+      # @param error [Zlib::Error] the decompression failure
+      # @return [Boolean]
+      def truncated_gzip?(error)
+        error.is_a?(Zlib::GzipFile::NoFooter) || error.is_a?(Zlib::BufError) ||
+          error.message.to_s.match?(/unexpected end|footer/i)
       end
 
       # Incrementally decompress a gzip response body, aborting once the
@@ -243,8 +259,18 @@ module MCPClient
           end
         end
 
-        # Handle last event if no trailing empty line
-        events << current_event if sse_event_present?(current_event)
+        # An event is dispatched at its terminating blank line, so a body that
+        # ends inside an event delivered nothing for it. On a modern server
+        # the event is dropped — and a missing response re-issued — exactly
+        # as when the socket cut it; a legacy server keeps the benefit of the
+        # doubt this transport always gave it.
+        if sse_event_present?(current_event)
+          if modern?
+            @logger.warn('Dropping an SSE event the response stream ended without terminating')
+          else
+            events << current_event
+          end
+        end
         [events, retry_ms]
       end
 

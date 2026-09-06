@@ -9,16 +9,23 @@ metadata). Each feature lands in its own PR; this section accumulates them.
 
 - **Era detection over HTTP** (Streamable HTTP "Backward Compatibility").
   Both HTTP transports POST `server/discover` first. A `DiscoverResult`, or a
-  recognized modern JSON-RPC error in a 400 body (`UnsupportedProtocolVersion`
+  recognized modern JSON-RPC error in a **400** body (`UnsupportedProtocolVersion`
   is retried with an advertised version; `HeaderMismatch` and
   `MissingRequiredClientCapability` are surfaced), marks the server modern. A
   404 carrying -32601 is a modern server without discovery support
   (tolerated, capabilities unknown, on every connection rather than only the
   first). Any other 4xx — or a 2xx that is not a
   `DiscoverResult` — is a legacy server: the `initialize` handshake runs as
-  before. **Both verdicts are cached** for the transport, so a server once
-  found modern never gets `initialize` on a later connection, however a later
-  probe fails. `protocol:` and `discover_timeout:` are accepted by
+  before. The status is part of the rule: a reserved code under 200 (a
+  permissive legacy endpoint echoing an error object) or under 405 says
+  nothing modern and falls back like any other legacy answer, while an
+  ordinary request after the era is settled still raises the typed error
+  whatever the status. **Both verdicts are cached** for the transport, so a
+  server once found modern never gets `initialize` on a later connection,
+  however a later probe fails — and a reconnect probe that fails
+  inconclusively (timeout, 5xx, broken stream) is reported as that failure,
+  not as "modern but incompatible". `protocol:` and `discover_timeout:` are
+  accepted by
   `http_config`, `streamable_http_config`, the factory and `MCPClient.connect`.
 - **Only a genuine rejection settles the era.** A probe whose exchange never
   completed says nothing about the server: 401/403, 5xx (including a 5xx
@@ -89,23 +96,40 @@ metadata). Each feature lands in its own PR; this section accumulates them.
   Faraday raises: if they carry this request's complete answer, that answer is
   returned (or its JSON-RPC error raised) instead of a replacement request
   going out. A final event whose terminating blank line never arrived was
-  never dispatched and does not count as delivered.
+  never dispatched and does not count as delivered — on a response Faraday
+  completed normally exactly as on a broken socket, so a modern server that
+  ends the body inside an event gets the request re-issued (a legacy server
+  keeps the lenient parse it always had). The same salvage applies when the
+  stream *stalls* after the final event until the request times out: the
+  delivered answer settles the request and the timeout only tears the idle
+  socket down. A completed gzip body that is corrupt rather than truncated
+  is a bad response (`TransportError`), not a broken stream to re-issue.
 - **SSE framing follows the specification's line terminators.** Both HTTP
   parsers now treat CRLF, CR and LF alike, so a server that frames its events
   with bare CR is read rather than mistaken for a stream that delivered
   nothing (and, on a modern server, re-issued).
-- **`discover_timeout` bounds the whole probe** (2026-07-28
+- **Every request is bounded regardless of progress** (2026-07-28
   cancellation/timeouts: implementations "SHOULD always enforce a maximum
-  timeout regardless of progress"). It used to set only Faraday's socket
-  timeout, which measures the gap between reads: a probe answered with an
-  endless drip of SSE keep-alives never timed out and blocked every caller
-  waiting on the connection. One deadline now covers the probe and its
-  re-issue.
+  timeout regardless of progress"). The timeouts used to set only Faraday's
+  socket timeout, which measures the gap between reads: a request answered
+  with an endless drip of SSE keep-alives never timed out — a probe blocked
+  every caller waiting on the connection, and a `tools/call` with a
+  per-request `timeout:` never closed its stream. Now the probe gets one
+  deadline (`discover_timeout`) that also covers its re-issue, whose socket
+  timeout is the time *left* on it rather than a fresh allowance, and every
+  other request gets a deadline from its own `timeout:` or the transport's
+  `read_timeout`, enforced while the body arrives.
 - **Plain HTTP + SSE response streams.** `ServerHTTP` now advertises and
-  parses `text/event-stream` responses. On a **legacy** stream the server may
-  still send requests, so a `ping` is answered with an empty result and any
-  other server-initiated method with JSON-RPC `-32601` rather than dropped in
-  silence; on a **modern** stream they are dropped, as 2026-07-28 requires. A
+  parses `text/event-stream` responses, and reads them **as they arrive**:
+  each complete event is acted on while the response is still open, so a
+  progress or log notification reaches the callback before the server has
+  finished, and on a **legacy** stream — where the server may still send
+  requests, and a receiver "MUST respond promptly" to `ping` — a `ping` is
+  answered with an empty result and any other server-initiated method with
+  JSON-RPC `-32601` on its own POST while the stream is open, rather than
+  only once it has ended (a server that waits for its ping to be answered
+  before sending the result would otherwise deadlock against the client).
+  On a **modern** stream server requests are dropped, as 2026-07-28 requires. A
   stream that carries only a response to a *different* request is treated as
   a lost stream on a modern server (both HTTP transports) instead of
   completing the call with someone else's result; the lenient
@@ -115,6 +139,10 @@ metadata). Each feature lands in its own PR; this section accumulates them.
   cleanup/reconnect that follows, so a caller that observed a dead connection
   can no longer tear down the connection another caller established in the
   meantime (which terminated its session and re-ran the era probe).
+- **`MCP-Protocol-Version` is taken from the request body.** The header is
+  built from the `_meta` the body was built with, not from the transport's
+  current version, so a concurrent version switch between building the body
+  and attaching its headers can no longer make the two disagree.
 
 ### Stateless protocol on stdio (server/discover, per-request `_meta`)
 

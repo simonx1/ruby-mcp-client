@@ -860,7 +860,12 @@ module MCPClient
     # @param request [Hash] the JSON-RPC request (String keys)
     # @return [Hash{String => String}] header name => value
     def modern_request_headers(request)
-      headers = { 'MCP-Protocol-Version' => protocol_version, 'Mcp-Method' => request['method'].to_s }
+      # The version the body was built with, not the transport's current one:
+      # a concurrent request may have switched versions in between, and the
+      # header MUST match the body's _meta.
+      meta = request['params'].is_a?(Hash) ? request['params']['_meta'] : nil
+      version = (meta.is_a?(Hash) && meta[META_PROTOCOL_VERSION]) || protocol_version
+      headers = { 'MCP-Protocol-Version' => version, 'Mcp-Method' => request['method'].to_s }
       name = mcp_name_header_value(request)
       headers['Mcp-Name'] = name if name
       headers

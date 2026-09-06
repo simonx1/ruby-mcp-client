@@ -5,16 +5,22 @@ require 'openssl'
 require 'zlib'
 require_relative 'json_rpc_common'
 require_relative 'auth/oauth_provider'
+require_relative 'http_transport_base/sse_event_scanner'
+require_relative 'http_transport_base/stream_capture'
 
 module MCPClient
   # Base module for HTTP-based JSON-RPC transports
   # Contains common functionality shared between HTTP and Streamable HTTP transports
   module HttpTransportBase
     include JsonRpcCommon
+    include StreamCapture
 
     # Lightweight response wrapper for Faraday exception payloads (Hashes),
     # so the exception path and the default path share one challenge pipeline.
-    NormalizedResponse = Struct.new(:status, :headers, :body)
+    # `context` carries the per-request capture state (see ResponseBodyCapture)
+    # for a response assembled from a captured body, so the parser can tell
+    # which events were already dispatched while the body was arriving.
+    NormalizedResponse = Struct.new(:status, :headers, :body, :context)
 
     # One auth-param (name = token / quoted-string) as it appears in a
     # WWW-Authenticate challenge (RFC 7235 §2.1, optional whitespace around '=').
@@ -70,12 +76,27 @@ module MCPClient
         return unless buffer
 
         # The retry middleware sits above this one and replays the whole inner
-        # stack, so each attempt must start from an empty buffer.
+        # stack, so each attempt must start from an empty buffer (and from an
+        # empty event scanner: the count of events dispatched while the body
+        # arrived belongs to the attempt whose body is finally parsed).
         buffer.clear
+        listener = state[:mcp_stream_listener]
+        scanner = listener && SseEventScanner.new
+        state[:mcp_live_events] = 0
         env.request.on_data = lambda do |chunk, _size, _env|
           buffer << chunk.to_s
           deadline = state[:mcp_deadline]
           raise Faraday::TimeoutError, 'Request exceeded its deadline' if deadline && monotonic_now > deadline
+
+          next unless scanner
+
+          # Every complete event is handed over as it arrives, so a server
+          # request or a progress notification on the stream is acted on
+          # while the response is still open (a server that waits for its
+          # ping to be answered before sending the result would otherwise
+          # deadlock against a client that answers only at EOF).
+          scanner.feed(chunk.to_s) { |event| listener.call(event) }
+          state[:mcp_live_events] = scanner.count
         end
       end
 
@@ -363,7 +384,8 @@ module MCPClient
     # HeaderMismatch / MissingRequiredClientCapability are surfaced); a 404
     # carrying -32601 is a modern server that violates the "MUST implement
     # server/discover" rule, tolerated with unknown capabilities; any other
-    # 4xx (or a 2xx carrying a non-modern JSON-RPC error) is a legacy server.
+    # 4xx, or a 2xx carrying a JSON-RPC error (reserved code or not), is a
+    # legacy server.
     # Only a genuine rejection settles the era: authorization failures, 5xx,
     # timeouts and a broken response stream propagate untouched, because an
     # exchange that never completed says nothing about the era. Both verdicts
@@ -380,9 +402,10 @@ module MCPClient
       begin
         perform_discover
       rescue MCPClient::Errors::UnsupportedProtocolVersionError => e
-        # Only a well-formed rejection (data.supported present) is a
-        # recognized modern error; a bare -32022 is a legacy answer.
-        raise unless e.modern_protocol_error?
+        # Only a well-formed rejection (data.supported present) in a 400
+        # body is a recognized modern error; a bare -32022, or the same body
+        # under any other status, is a legacy answer.
+        raise unless modern_probe_rejection?(e)
 
         # A well-formed rejection settles the era: whatever the retried probe
         # does next, this server is modern and never gets initialize.
@@ -412,7 +435,7 @@ module MCPClient
     # @return [Boolean] true when the server is modern despite the failure
     # @raise [MCPClient::Errors::MCPError] when the failure settles nothing or the server is modern
     def modern_despite_probe_failure?(error, modern_confirmed)
-      raise modern_probe_failure(error) if error.modern_protocol_error_for_probe?
+      raise modern_probe_failure(error) if modern_probe_rejection?(error)
 
       # A 404 with -32601 is a complete answer rather than a failed exchange:
       # the server is modern and simply has no discovery support. It answers
@@ -424,18 +447,32 @@ module MCPClient
         return true
       end
 
-      raise modern_probe_failure(error) if modern_confirmed
-
       if error.era_inconclusive?
         # The exchange never completed (broken response stream, timeout, 5xx):
-        # nothing was learned, so no verdict is recorded and the caller sees
-        # the transport failure. Only a genuine rejection means legacy.
+        # nothing was learned, so no verdict is recorded — a cached modern
+        # verdict stays, and still rules initialize out — and the caller sees
+        # the transport failure as itself. Only a genuine rejection means
+        # legacy, or "modern but incompatible" once the server is known modern.
         @protocol_version = nil
         raise error
       end
 
+      raise modern_probe_failure(error) if modern_confirmed
+
       treat_probe_failure_as_legacy(error)
       false
+    end
+
+    # Whether a probe failure is a modern server's rejection of the probe.
+    # Streamable HTTP "Backward Compatibility" recognizes the reserved
+    # errors in a **400** response; the same JSON-RPC error under 200 (a
+    # permissive legacy endpoint echoing an error object) or any other 4xx
+    # says nothing modern. The typed error is still raised for ordinary
+    # requests whatever the status — only the era verdict is status-gated.
+    # @param error [MCPClient::Errors::MCPError] the probe failure
+    # @return [Boolean]
+    def modern_probe_rejection?(error)
+      error.respond_to?(:http_status) && error.http_status == 400 && error.modern_protocol_error_for_probe?
     end
 
     # A modern server reports an unknown method as HTTP 404 with -32601;
@@ -628,9 +665,11 @@ module MCPClient
       # holds by 404-handling time (another caller may have completed a
       # restart in between, and its fresh session must not be re-initialized).
       sent_session_id = @mutex.synchronize { @session_id }
+      timeout, deadline = request_bounds(timeout, deadline)
       # ResponseBodyCapture fills this in as the body arrives, so the bytes
       # that made it are still here when Faraday raises instead of returning.
-      capture = { mcp_body_buffer: +'', mcp_deadline: deadline }
+      capture = { mcp_body_buffer: +'', mcp_deadline: deadline,
+                  mcp_stream_listener: response_stream_listener(request) }
 
       begin
         response = conn.post(@endpoint) do |req|
@@ -669,6 +708,11 @@ module MCPClient
 
         raise connection_failure_error(e, request)
       rescue Faraday::TimeoutError => e
+        # A stream that stalled after delivering the whole final event has
+        # answered the request; the timeout only tears the idle socket down.
+        salvaged = salvaged_response(capture[:mcp_body_buffer], request, e, capture)
+        return salvaged if salvaged
+
         raise MCPClient::Errors::RequestTimeoutError, "Request timed out: #{e.message}"
       rescue Faraday::ServerError => e
         # 5xx raised by user-configured raise_error middleware. It must reach
@@ -769,13 +813,17 @@ module MCPClient
     # server already executed a second time. MCP 2026-07-28's re-issue rule is
     # about an in-flight request that was *lost*; a delivered response settles
     # its request, however the socket ends afterwards.
+    # A socket that stalls after the final event until the timeout is the
+    # same case from the other direction: the answer arrived, the framing
+    # after it did not.
     # @param partial_body [String, nil] the bytes captured before the failure
     # @param request [Hash] the JSON-RPC message that was being sent
-    # @param error [Faraday::Error] the socket failure
+    # @param error [Faraday::Error] the socket failure or timeout
+    # @param capture [Hash, nil] the capture state of the failed exchange
     # @return [NormalizedResponse, nil] a response carrying the delivered answer
-    def salvaged_response(partial_body, request, error)
+    def salvaged_response(partial_body, request, error, capture = nil)
       return nil unless modern? && request.is_a?(Hash) && request.key?('id')
-      return nil unless interrupted_exchange?(error)
+      return nil unless error.is_a?(Faraday::TimeoutError) || interrupted_exchange?(error)
 
       body = partial_body.to_s
       return nil if body.empty?
@@ -787,9 +835,10 @@ module MCPClient
       body = complete_sse_events(body) if sse
       return nil if body.empty? || !body_carries_response?(body, sse, request['id'])
 
-      @logger.warn("Response stream closed after the response arrived (#{error.message}); " \
+      @logger.warn("Response stream ended after the response arrived (#{error.message}); " \
                    "keeping the delivered #{request['method']} response instead of re-issuing it")
-      NormalizedResponse.new(200, { 'content-type' => sse ? 'text/event-stream' : 'application/json' }, body)
+      NormalizedResponse.new(200, { 'content-type' => sse ? 'text/event-stream' : 'application/json' }, body,
+                             capture)
     end
 
     # Per the SSE specification a line is terminated by CRLF, CR or LF alone;

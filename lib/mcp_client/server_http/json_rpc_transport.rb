@@ -29,7 +29,7 @@ module MCPClient
         # single JSON object or an SSE stream scoped to the request; the
         # client MUST support both.
         data = if content_type.include?('text/event-stream')
-                 response_from_sse(body.to_s.strip, request && request['id'])
+                 response_from_sse(body.to_s.strip, request && request['id'], live_event_count(response))
                elsif body.is_a?(String)
                  JSON.parse(body.strip)
                else
@@ -40,18 +40,54 @@ module MCPClient
         raise MCPClient::Errors::TransportError, "Invalid JSON response from server: #{describe_parse_error(e)}"
       end
 
+      # Every complete event of a response stream is handed over while the
+      # body is still arriving, so a legacy server's request on the stream
+      # is answered — and a progress notification delivered — before the
+      # server has to end the response. A notification has no response
+      # stream worth reading incrementally.
+      # @param request [Hash] the JSON-RPC message being sent
+      # @return [Proc, nil]
+      def response_stream_listener(request)
+        return nil unless request.is_a?(Hash) && request.key?('id')
+
+        ->(event) { dispatch_live_sse_event(event) }
+      end
+
+      # Act on one event as it arrives: requests and notifications are
+      # routed now, responses wait for the completed body. A failing
+      # callback is logged rather than allowed to abort the read of the
+      # response it was interleaved with.
+      # @param event [String] one complete, LF-normalized SSE event
+      # @return [void]
+      def dispatch_live_sse_event(event)
+        message = sse_event_message(event)
+        dispatch_sse_message(message) if message && message['method']
+      rescue StandardError => e
+        @logger.error("Error handling a message on the response stream: #{e.message}")
+      end
+
       # Pick the JSON-RPC response to the request out of an SSE-framed body,
       # forwarding request-scoped notifications (progress, log messages) to
-      # the notification callback. Server-initiated requests are not
-      # permitted on a 2026-07-28 response stream and are dropped.
+      # the notification callback — except the `live` leading events, which
+      # were already routed as they arrived. Server-initiated requests are
+      # not permitted on a 2026-07-28 response stream and are dropped.
       # @param sse_body [String] the text/event-stream body
       # @param request_id [Integer, String, nil] id of the originating request
+      # @param live [Integer] events already dispatched while the body arrived
       # @return [Hash] the JSON-RPC response
       # @raise [MCPClient::Errors::TransportError] when the stream carries no response
-      def response_from_sse(sse_body, request_id)
-        messages = sse_messages(sse_body)
-        messages.select { |m| m['method'] }.each { |m| dispatch_sse_message(m) }
-        responses = messages.reject { |m| m['method'] }
+      def response_from_sse(sse_body, request_id, live = 0)
+        responses = []
+        sse_events(sse_body).each_with_index do |event, index|
+          message = sse_event_message(event)
+          next unless message
+
+          if message['method']
+            dispatch_sse_message(message) if index >= live
+          else
+            responses << message
+          end
+        end
         matched = responses.find { |m| request_id.nil? || m['id'] == request_id || m['id'].to_s == request_id.to_s }
         matched ||= tolerated_id_mismatch(responses, request_id)
         return matched if matched
@@ -65,17 +101,31 @@ module MCPClient
         raise MCPClient::Errors::TransportError, 'No JSON-RPC response found in SSE response'
       end
 
+      # Split a response stream into events, in the order and count the
+      # stream listener saw them.
+      #
+      # SSE line terminators are CRLF, CR or LF; a server framing its events
+      # with bare CR still delimits them, so normalize before splitting. An
+      # event is dispatched at its terminating blank line, so a body that
+      # ends inside an event delivered nothing for it: on a modern server
+      # that event is dropped (and a missing response re-issued). A legacy
+      # server keeps the benefit of the doubt this transport always gave it.
       # @param sse_body [String] the text/event-stream body
-      # @return [Array<Hash>] the JSON-RPC messages carried by its data lines
-      def sse_messages(sse_body)
-        # SSE line terminators are CRLF, CR or LF; a server framing its events
-        # with bare CR still delimits them, so normalize before splitting.
-        normalize_sse_newlines(sse_body).split("\n\n").filter_map do |event|
-          data_lines = event.lines.map(&:chomp).select { |l| l.start_with?('data:') }
-          next if data_lines.empty?
+      # @return [Array<String>] the events, without their terminators
+      def sse_events(sse_body)
+        normalized = modern? ? complete_sse_events(sse_body) : normalize_sse_newlines(sse_body)
+        events = normalized.split("\n\n", -1)
+        events.pop if events.last.to_s.empty?
+        events
+      end
 
-          parse_sse_message(data_lines.map { |l| l.sub(/\Adata:\s*/, '') }.join("\n"))
-        end
+      # @param event [String] one LF-normalized SSE event
+      # @return [Hash, nil] the JSON-RPC message its data lines carry, if any
+      def sse_event_message(event)
+        data_lines = event.lines.map(&:chomp).select { |l| l.start_with?('data:') }
+        return nil if data_lines.empty?
+
+        parse_sse_message(data_lines.map { |l| l.sub(/\Adata:\s*/, '') }.join("\n"))
       end
 
       # The only response on a stream, when its id is not the one asked for.

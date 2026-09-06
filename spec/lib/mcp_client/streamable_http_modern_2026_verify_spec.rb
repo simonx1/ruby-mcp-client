@@ -215,21 +215,35 @@ RSpec.describe 'MCP 2026-07-28 Streamable HTTP modern mode — verification' do
         expect(methods_sent(requests).first(2)).to eq(%w[server/discover initialize])
       end
 
-      it 'bounds the probe with discover_timeout and leaves other requests on the default timeout' do
-        timeouts = []
+      # Configuration reaches the wire as both a socket timeout and an
+      # overall deadline (the capture middleware's `mcp_deadline`): the probe
+      # gets discover_timeout, every other request the transport's timeout.
+      # The live-socket examples at the end of this file show the deadline
+      # being enforced; this one shows which request gets which bound.
+      it 'bounds the probe with discover_timeout and other requests with the transport timeout' do
+        bounds = []
         recorder = Class.new(Faraday::Middleware) do
-          define_method(:on_request) { |env| timeouts << env.request.timeout }
+          define_method(:on_request) do |env|
+            bounds << [env.request.timeout, env.request.context && env.request.context[:mcp_deadline]]
+          end
         end
         server = klass.new(base_url: 'https://example.com', endpoint: '/mcp', retries: 0,
                            read_timeout: 30, discover_timeout: 3,
                            faraday_config: ->(conn) { conn.builder.insert(0, recorder) })
         stub_posts('server/discover' => discover_result, 'tools/list' => { 'tools' => [] })
         stub_request(:get, url).to_return(status: 405, body: '')
+        started = Process.clock_gettime(Process::CLOCK_MONOTONIC)
 
         server.list_tools
 
-        expect(timeouts.first).to eq(3)
-        expect(timeouts.last).to eq(30)
+        probe_timeout, probe_deadline = bounds.first
+        list_timeout, list_deadline = bounds.last
+        # The probe's socket timeout is the time left on its deadline, so it
+        # is a hair under discover_timeout by the time the request is built.
+        expect(probe_timeout).to be_within(0.1).of(3)
+        expect(probe_deadline - started).to be_within(0.5).of(3)
+        expect(list_timeout).to eq(30)
+        expect(list_deadline - started).to be_within(0.5).of(30)
         server.cleanup
       end
 
@@ -312,7 +326,7 @@ RSpec.describe 'MCP 2026-07-28 Streamable HTTP modern mode — verification' do
       # the HTTP wire so dropping either from required_request_meta cannot pass
       # here, and that the header keeps matching the body.
       it 'carries clientCapabilities and clientInfo in _meta on every modern POST' do
-        requests = stub_posts('server/discover' => discover_result, 'tools/call' => { 'content' => [] })
+        requests = []
         headers = []
         stub_request(:post, url).to_return do |request|
           headers << request.headers
@@ -340,13 +354,24 @@ RSpec.describe 'MCP 2026-07-28 Streamable HTTP modern mode — verification' do
         broken = {}
         requests = []
         mutex = Mutex.new
+        # Both first attempts are held until the other has arrived, so the
+        # two broken exchanges — and the two recoveries — genuinely overlap
+        # instead of running one after the other by scheduling luck.
+        both_broken = ConditionVariable.new
         stub_request(:post, url).to_return do |request|
           body = JSON.parse(request.body)
           mutex.synchronize { requests << body }
           next json_response(body['id'], discover_result) if body['method'] == 'server/discover'
 
           name = body.dig('params', 'name')
-          first = mutex.synchronize { broken[name] ? false : (broken[name] = true) }
+          first = mutex.synchronize do
+            next false if broken[name]
+
+            broken[name] = true
+            both_broken.broadcast if broken.size == 2
+            both_broken.wait(mutex, 2) while broken.size < 2
+            true
+          end
           first ? keep_alive_only : json_response(body['id'], { 'content' => [{ 'text' => name }] })
         end
         server.connect
@@ -357,10 +382,13 @@ RSpec.describe 'MCP 2026-07-28 Streamable HTTP modern mode — verification' do
 
         expect(results).to eq('alpha' => { 'content' => [{ 'text' => 'alpha' }] },
                               'beta' => { 'content' => [{ 'text' => 'beta' }] })
+        expect(broken.size).to eq(2)
+        calls = requests.select { |r| r['method'] == 'tools/call' }
+        expect(calls.size).to eq(4)
+        expect(calls.map { |r| r['id'] }.uniq.size).to eq(4)
         %w[alpha beta].each do |name|
-          sent = requests.select { |r| r.dig('params', 'name') == name }
+          sent = calls.select { |r| r.dig('params', 'name') == name }
           expect(sent.size).to eq(2)
-          expect(sent[1]['id']).not_to eq(sent[0]['id'])
           expect(sent.map { |r| r.dig('params', 'arguments') }).to all(eq({ 'arg' => name }))
         end
       end
@@ -484,7 +512,7 @@ RSpec.describe 'MCP 2026-07-28 Streamable HTTP modern mode — verification' do
     end
 
     it 'still opens the events stream for a legacy server' do
-      stub_request(:get, url).to_return(status: 405, body: '')
+      get_stub = stub_request(:get, url).to_return(status: 405, body: '')
       stub_posts(
         'server/discover' => ->(_body, _reqs) { { status: 400, body: 'Bad Request' } },
         'initialize' => lambda do |body, _reqs|
@@ -497,7 +525,16 @@ RSpec.describe 'MCP 2026-07-28 Streamable HTTP modern mode — verification' do
       server.connect
 
       expect(server.protocol_era).to eq(:legacy)
-      expect(server.instance_variable_get(:@events_thread)).not_to be_nil
+      # A non-nil thread proves nothing about the GET; wait for the request
+      # itself, which the thread issues asynchronously.
+      deadline = Process.clock_gettime(Process::CLOCK_MONOTONIC) + 2
+      registry = WebMock::RequestRegistry.instance
+      until registry.times_executed(get_stub.request_pattern).positive?
+        break if Process.clock_gettime(Process::CLOCK_MONOTONIC) > deadline
+
+        sleep 0.01
+      end
+      expect(get_stub).to have_been_requested
     end
   end
 
@@ -609,6 +646,19 @@ class MidStreamCloseServer
   DRIP_FOREVER = :drip_forever
   # Reply token triple [HTTP_STATUS, code, body]: a complete, plain response.
   HTTP_STATUS = :http_status
+  # Reply token triple [DELAY, seconds, reply]: wait, then serve `reply`.
+  DELAY = :delay
+  # Reply token: send nothing at all and hold the socket open — the server
+  # never answers.
+  STALL = :stall
+  # Reply token pair [DELIVER_THEN_STALL, reply]: send the complete final SSE
+  # event, then hold the socket open without ever ending the response.
+  DELIVER_THEN_STALL = :deliver_then_stall
+  # Reply token quadruple [EVENT_THEN_WAIT, message, waiter, reply]: send
+  # `message` as one complete SSE event, call `waiter` and, only if it
+  # returns true, send `reply` as the final event and end the response
+  # properly. A waiter that gives up ends the response without the reply.
+  EVENT_THEN_WAIT = :event_then_wait
 
   # A self-signed certificate for 127.0.0.1, built once for the whole file
   # because key generation is the expensive part.
@@ -646,6 +696,7 @@ class MidStreamCloseServer
     @mutex = Mutex.new
     @listener = TCPServer.new('127.0.0.1', 0)
     @port = @listener.addr[1]
+    @workers = []
     @thread = Thread.new { accept_loop }
   end
 
@@ -682,6 +733,7 @@ class MidStreamCloseServer
   # @return [void]
   def stop
     @thread&.kill
+    @mutex.synchronize { @workers.each(&:kill) }
     @listener.close unless @listener.closed?
   rescue IOError
     nil
@@ -689,22 +741,29 @@ class MidStreamCloseServer
 
   private
 
+  # Each connection is served on its own thread: a reply that waits for the
+  # client's answer on a *second* connection (EVENT_THEN_WAIT) must not block
+  # the accept loop that has to take that connection.
   def accept_loop
     loop do
       socket = @listener.accept
-      @mutex.synchronize { @connections += 1 }
-      client = nil
-      begin
-        client = wrap(socket)
-        serve(client)
-      rescue StandardError
-        nil
-      ensure
-        close_client(client || socket)
+      @mutex.synchronize do
+        @connections += 1
+        @workers << Thread.new { handle(socket) }
       end
     end
   rescue StandardError
     nil
+  end
+
+  def handle(socket)
+    client = nil
+    client = wrap(socket)
+    serve(client)
+  rescue StandardError
+    nil
+  ensure
+    close_client(client || socket)
   end
 
   def wrap(socket)
@@ -759,9 +818,31 @@ class MidStreamCloseServer
     when DELIVER_UNTERMINATED then write_sse_chunk(client, "event: message\ndata: #{JSON.generate(payload)}\n")
     when DRIP_FOREVER then drip(client, payload || 0.02)
     when HTTP_STATUS then write_plain(client, payload, extra.to_s)
+    when DELAY
+      sleep payload
+      return write_reply(client, extra)
+    when STALL then sleep
+    when DELIVER_THEN_STALL
+      write_sse_chunk(client, "event: message\ndata: #{JSON.generate(payload)}\n\n")
+      client.flush
+      sleep
+    when EVENT_THEN_WAIT then event_then_wait(client, *reply[1..])
     else write_plain(client, 200, JSON.generate(token))
     end
     client.flush
+  end
+
+  # One complete event now, the reply only once `waiter` says the client has
+  # done its part (answered a server request, observed a notification), and
+  # a properly terminated response either way.
+  def event_then_wait(client, message, waiter, reply)
+    write_sse_chunk(client, "event: message\ndata: #{JSON.generate(message)}\n\n")
+    client.flush
+    if waiter.call
+      chunk = "event: message\ndata: #{JSON.generate(reply)}\n\n"
+      client.write(format("%<size>x\r\n%<chunk>s\r\n", size: chunk.bytesize, chunk: chunk))
+    end
+    client.write("0\r\n\r\n")
   end
 
   def write_sse_head(client)
@@ -834,6 +915,26 @@ RSpec.describe 'MCP 2026-07-28 Streamable HTTP — a response stream that really
 
   def methods_received
     @fixture.received.map { |r| r['method'] }
+  end
+
+  def legacy_init
+    { 'protocolVersion' => '2025-11-25', 'capabilities' => { 'tools' => {} },
+      'serverInfo' => { 'name' => 'legacy', 'version' => '1' } }
+  end
+
+  # Poll for a condition; false once `limit` seconds passed without it.
+  def settled_within?(limit = 5)
+    deadline = Process.clock_gettime(Process::CLOCK_MONOTONIC) + limit
+    until yield
+      return false if Process.clock_gettime(Process::CLOCK_MONOTONIC) > deadline
+
+      sleep 0.01
+    end
+    true
+  end
+
+  def elapsed_since(started)
+    Process.clock_gettime(Process::CLOCK_MONOTONIC) - started
   end
 
   HTTP_TRANSPORTS.each do |klass|
@@ -1126,6 +1227,165 @@ RSpec.describe 'MCP 2026-07-28 Streamable HTTP — a response stream that really
       ensure
         server&.cleanup
       end
+
+      # --- Round 4: every request is bounded, the probe's replacement shares
+      # its deadline, and a delivered answer survives a stall.
+      describe 'deadlines' do
+        # MCP 2026-07-28 cancellation/timeouts: implementations SHOULD enforce a
+        # maximum timeout regardless of progress — for every request, not only
+        # the probe. Keep-alives faster than the socket timeout never let the
+        # socket go idle, so only an overall deadline can end the call.
+        it 'bounds an ordinary request with its own timeout while the server keeps the stream alive' do
+          start_server do |message|
+            message['method'] == 'server/discover' ? jsonrpc(message, discovery) : MidStreamCloseServer::DRIP_FOREVER
+          end
+          server = transport(klass, read_timeout: 30)
+          server.connect
+
+          started = Process.clock_gettime(Process::CLOCK_MONOTONIC)
+          Timeout.timeout(15) do
+            expect { server.rpc_request('tools/call', { 'name' => 't', 'arguments' => {} }, timeout: 0.2) }
+              .to raise_error(MCPClient::Errors::RequestTimeoutError)
+          end
+          expect(elapsed_since(started)).to be < 2
+          settled_within? { @fixture.stream_aborted? }
+          expect(@fixture.stream_aborted?).to be(true)
+        end
+
+        it 'bounds a later heartbeat with the transport timeout while the server keeps the stream alive' do
+          probes = 0
+          start_server do |message|
+            probes += 1
+            probes == 1 ? jsonrpc(message, discovery) : MidStreamCloseServer::DRIP_FOREVER
+          end
+          server = transport(klass, read_timeout: 0.2)
+          server.connect
+
+          started = Process.clock_gettime(Process::CLOCK_MONOTONIC)
+          Timeout.timeout(15) do
+            expect { server.rpc_request('ping', {}) }.to raise_error(MCPClient::Errors::RequestTimeoutError)
+          end
+          expect(elapsed_since(started)).to be < 2
+        end
+
+        # One deadline covers the probe and its re-issue: the replacement gets
+        # what is left of discover_timeout, not a fresh socket timeout.
+        it 'gives the re-issued probe only the time left on the discovery deadline' do
+          probes = 0
+          start_server do |_message|
+            probes += 1
+            if probes == 1
+              [MidStreamCloseServer::DELAY, 0.7, MidStreamCloseServer::CLOSE_MID_STREAM]
+            else
+              MidStreamCloseServer::STALL
+            end
+          end
+          server = transport(klass, discover_timeout: 1.0, read_timeout: 30)
+
+          started = Process.clock_gettime(Process::CLOCK_MONOTONIC)
+          Timeout.timeout(15) do
+            expect { server.connect }.to raise_error(MCPClient::Errors::MCPError, /timed out/)
+          end
+          # A replacement on a fresh 1.0 s socket timeout would take ~1.7 s.
+          expect(elapsed_since(started)).to be < 1.45
+          expect(probes).to eq(2)
+        end
+
+        # The re-issue rule is about a request that was *lost*. A server that
+        # delivered the whole final event and then stalled has answered; the
+        # timeout tears the stream down but the delivered answer settles the
+        # request instead of a replacement request running it again.
+        it 'keeps a delivered result when the stream stalls after the final SSE event until the timeout' do
+          start_server do |message|
+            if message['method'] == 'server/discover'
+              jsonrpc(message, discovery)
+            else
+              [MidStreamCloseServer::DELIVER_THEN_STALL, jsonrpc(message, { 'content' => [] })]
+            end
+          end
+          server = transport(klass, read_timeout: 0.3)
+          server.connect
+
+          Timeout.timeout(15) do
+            expect(server.rpc_request('tools/call', { 'name' => 't', 'arguments' => {} })).to eq({ 'content' => [] })
+          end
+          expect(@fixture.received.count { |r| r['method'] == 'tools/call' }).to eq(1)
+        end
+      end
+    end
+  end
+
+  describe "#{MCPClient::ServerHTTP} response streams read as they arrive" do
+    # A 2025-11-25 server may send a request on the POST response stream and
+    # wait for the answer before finishing the response — a receiver "MUST
+    # respond promptly" to ping. Answering only once the stream has ended
+    # would deadlock both sides; the WebMock examples in the main spec hand
+    # the ping and the result over together and cannot show that.
+    it 'answers a legacy server ping while the response stream is still open' do
+      start_server do |message|
+        case message['method']
+        when 'server/discover' then [MidStreamCloseServer::HTTP_STATUS, 400, 'Bad Request']
+        when 'initialize' then jsonrpc(message, legacy_init)
+        when 'tools/list'
+          waiter = -> { settled_within?(3) { @fixture.received.any? { |m| m['id'] == 'ping-1' } } }
+          [MidStreamCloseServer::EVENT_THEN_WAIT, { 'jsonrpc' => '2.0', 'id' => 'ping-1', 'method' => 'ping' },
+           waiter, jsonrpc(message, { 'tools' => [] })]
+        else [MidStreamCloseServer::HTTP_STATUS, 202, '']
+        end
+      end
+      server = transport(MCPClient::ServerHTTP, read_timeout: 5)
+
+      Timeout.timeout(15) { expect(server.list_tools).to eq([]) }
+
+      pong = @fixture.received.find { |m| m['id'] == 'ping-1' }
+      expect(pong).to include('jsonrpc' => '2.0', 'result' => {})
+    end
+
+    it 'answers an unsupported legacy server request with method not found while the stream is open' do
+      start_server do |message|
+        case message['method']
+        when 'server/discover' then [MidStreamCloseServer::HTTP_STATUS, 400, 'Bad Request']
+        when 'initialize' then jsonrpc(message, legacy_init)
+        when 'tools/list'
+          waiter = -> { settled_within?(3) { @fixture.received.any? { |m| m['id'] == 'req-1' } } }
+          [MidStreamCloseServer::EVENT_THEN_WAIT,
+           { 'jsonrpc' => '2.0', 'id' => 'req-1', 'method' => 'sampling/createMessage', 'params' => {} },
+           waiter, jsonrpc(message, { 'tools' => [] })]
+        else [MidStreamCloseServer::HTTP_STATUS, 202, '']
+        end
+      end
+      server = transport(MCPClient::ServerHTTP, read_timeout: 5)
+
+      Timeout.timeout(15) { expect(server.list_tools).to eq([]) }
+
+      answer = @fixture.received.find { |m| m['id'] == 'req-1' }
+      expect(answer.dig('error', 'code')).to eq(-32_601)
+    end
+
+    # Progress and log notifications are only useful while the request is
+    # running: a server that reports progress and then finishes the work
+    # must see the callback fire before it sends the result.
+    it 'delivers a request-scoped notification before the modern response stream ends' do
+      seen = Queue.new
+      start_server do |message|
+        if message['method'] == 'server/discover'
+          jsonrpc(message, discovery)
+        else
+          waiter = -> { settled_within?(3) { !seen.empty? } }
+          [MidStreamCloseServer::EVENT_THEN_WAIT,
+           { 'jsonrpc' => '2.0', 'method' => 'notifications/progress',
+             'params' => { 'progressToken' => 'p', 'progress' => 1 } },
+           waiter, jsonrpc(message, { 'content' => [] })]
+        end
+      end
+      server = transport(MCPClient::ServerHTTP, read_timeout: 5)
+      server.on_notification { |method, _params| seen << method }
+
+      Timeout.timeout(15) do
+        expect(server.rpc_request('tools/call', { 'name' => 't', 'arguments' => {} })).to eq({ 'content' => [] })
+      end
+      # Dispatched exactly once: not again when the completed body is parsed.
+      expect(seen.size).to eq(1)
     end
   end
 end
