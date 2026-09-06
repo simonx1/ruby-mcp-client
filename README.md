@@ -382,7 +382,13 @@ data = result['structuredContent']  # Type-safe structured data
 # annotate (format, contentSchema). When a schema uses one of those, call_tool
 # logs a "validation is partial" warning naming them (in both modes), since
 # data may pass this check that a full validator would reject; an unevaluated
-# keyword is never read as a match for not/oneOf/if either. By default a
+# keyword is never read as a match for not/oneOf/if either. In strict mode a
+# schema using one of the unevaluated ASSERTIONS (the dynamic references, or
+# unevaluatedItems/unevaluatedProperties beside a composition) refuses the
+# result with a ValidationError, since it cannot be shown to conform; the two
+# annotation-only keywords do not. A pattern is bounded to 10,000 characters
+# and must be an ECMA-262 expression (Ruby-only syntax such as inline flags
+# or possessive quantifiers makes the schema unusable). By default a
 # violation (mismatch, or missing structuredContent on a successful result)
 # logs a warning; opt in to strict mode to raise instead:
 client = MCPClient::Client.new(

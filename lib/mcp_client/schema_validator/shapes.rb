@@ -205,6 +205,10 @@ module MCPClient
       # @return [String, nil] why an `$id` is malformed
       def id_shape_problem(id, dialect)
         return '$id must be a non-empty string' unless id.is_a?(String) && !id.empty?
+        # JSON Schema 2020-12 Core Section 8.2.1: the value is a URI
+        # reference. One that is not (a space in it, say) names no resource,
+        # and a reference written to it would resolve elsewhere or nowhere.
+        return "$id #{clip(id.inspect)} must be a URI reference" unless uri_reference?(id)
         # draft-07 Core Section 8.2.3: an $id that is exactly a fragment
         # declares a plain name rather than a base URI.
         return nil if dialect == DRAFT_07 && id.start_with?('#')
@@ -213,6 +217,64 @@ module MCPClient
         return nil if fragment.nil? || fragment.empty?
 
         "$id #{clip(id.inspect)} must not contain a non-empty fragment"
+      end
+
+      # @return [Boolean] whether a string parses as an RFC 3986 URI reference
+      def uri_reference?(value)
+        URI::RFC3986_PARSER.parse(value)
+        true
+      rescue URI::InvalidURIError
+        false
+      end
+
+      # The core keywords with a fixed shape beyond the identifiers:
+      # `$vocabulary` is an object mapping vocabulary URIs to booleans (Core
+      # Section 8.1.2) and 2019-09's `$recursiveAnchor` is a boolean (2019-09
+      # Core Section 8.2.4.2.2). A keyword the dialect does not define is
+      # unknown there, never malformed.
+      # @return [void]
+      def check_core_keyword_shapes(schema, dialect, problems)
+        if schema.key?('$vocabulary') && keyword_known?('$vocabulary',
+                                                        dialect) && !vocabulary_map?(schema['$vocabulary'])
+          problems << '$vocabulary must be an object of booleans keyed by URI'
+        end
+        return unless schema.key?('$recursiveAnchor') && keyword_known?('$recursiveAnchor', dialect)
+
+        problems << '$recursiveAnchor must be a boolean' unless boolean_value?(schema['$recursiveAnchor'])
+      end
+
+      # @return [Boolean]
+      def vocabulary_map?(value)
+        value.is_a?(Hash) && value.all? { |uri, required| uri_reference?(uri.to_s) && boolean_value?(required) }
+      end
+
+      # A `pattern`, and every `patternProperties` key, must be an ECMA-262
+      # regular expression the validator can read (JSON Schema 2020-12 Core
+      # Section 4.3) within the length bound. One that is not is a malformed
+      # keyword: the schema is unusable, not a schema without the pattern
+      # (which admitted every string).
+      # @return [void]
+      def check_pattern_shapes(schema, dialect, problems)
+        pattern = schema['pattern']
+        problem = pattern_shape_problem('pattern', pattern) if pattern.is_a?(String)
+        problems << problem if problem
+        patterns = schema['patternProperties'] if keyword_known?('patternProperties', dialect)
+        return unless patterns.is_a?(Hash)
+
+        patterns.each_key do |key|
+          problem = pattern_shape_problem('patternProperties pattern', key.to_s)
+          problems << problem if problem
+        end
+      end
+
+      # @return [String, nil] why a pattern cannot be used
+      def pattern_shape_problem(keyword, pattern)
+        return "#{keyword} is longer than #{MAX_PATTERN_LENGTH} characters" if pattern.length > MAX_PATTERN_LENGTH
+
+        ecma_regexp(pattern, PATTERN_MATCH_TIMEOUT)
+        nil
+      rescue RegexpError => e
+        "#{keyword} #{clip(pattern.inspect)} is not an ECMA-262 regular expression (#{clip(e.message)})"
       end
 
       # exclusiveMinimum / exclusiveMaximum are numbers in every supported

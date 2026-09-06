@@ -47,6 +47,10 @@ module MCPClient
 
         name = (params['name'] || params[:name]).to_s
         tool = known_tools_for_headers.find { |t| t.name.to_s == name }
+        # The definition checked here is the one the retry goes out under
+        # ({#mcp_param_headers} takes it): a second lookup could bring
+        # another, unchecked one.
+        pin_retry_definition(name, tool)
         dialect = tool && MCPClient::SchemaValidator.unsupported_dialect(tool.schema)
         return unless dialect
 
@@ -70,7 +74,8 @@ module MCPClient
         return {} unless params.is_a?(Hash)
 
         name = (params['name'] || params[:name]).to_s
-        tool = known_tools_for_headers.find { |t| t.name.to_s == name }
+        pinned = take_pinned_retry_definition(name)
+        tool = pinned ? pinned.first : known_tools_for_headers.find { |t| t.name.to_s == name }
         # The list the headers come from is the list this request goes out
         # under: a host re-resolving the tool after the call reads that
         # definition back instead of asking for a possibly newer one.

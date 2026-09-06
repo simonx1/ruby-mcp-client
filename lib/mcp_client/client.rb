@@ -1079,8 +1079,9 @@ module MCPClient
       end
     end
 
-    # Validate parameters against tool JSON schema (checks required properties).
-    # A schema declaring a dialect this client does not implement is refused
+    # Validate parameters against tool JSON schema (checks required
+    # properties, through the root's `$ref` chain and `allOf` members). A
+    # schema declaring a dialect this client does not implement is refused
     # outright, so the call is never sent under a schema nothing could read.
     # @param tool [MCPClient::Tool] tool definition with schema
     # @param parameters [Hash] parameters to validate
@@ -1095,18 +1096,20 @@ module MCPClient
       return if state[:unusable]
       return unless schema.is_a?(Hash)
 
-      required = schema['required'] || schema[:required]
-      return unless required.is_a?(Array)
+      # What the schema requires through every applicator that applies
+      # unconditionally: the root, its `$ref` chain, its `allOf` members (the
+      # tools spec: clients SHOULD follow `$ref` resolution when validating
+      # tool inputs). A conditional branch is the server's to judge.
+      required, properties = MCPClient::SchemaValidator.input_requirements(schema)
+      return if required.empty?
 
-      properties = schema['properties'] || schema[:properties] || {}
-
-      missing = required.map(&:to_s) - parameters.keys.map(&:to_s)
+      missing = required - parameters.keys.map(&:to_s)
 
       # Exclude required params that have a default value in the schema,
       # since the server will apply the default.
       missing = missing.reject do |param|
-        prop = properties[param] || properties[param.to_sym]
-        prop.is_a?(Hash) && (prop.key?('default') || prop.key?(:default))
+        prop = properties[param]
+        prop.is_a?(Hash) && prop.key?('default')
       end
 
       return unless missing.any?
@@ -1142,8 +1145,9 @@ module MCPClient
       # the continuation away with it.
       return result unless MCPClient::JsonRpcCommon.result_type(result) == 'complete'
 
-      warn_partial_schema_coverage(tool)
+      unsupported = warn_partial_schema_coverage(tool)
       reject_unsupported_dialect!(tool, output_schema_state(tool), 'output')
+      reject_partial_schema_coverage!(tool, unsupported)
 
       # MCP 2026-07-28: structuredContent "can be any JSON value (object,
       # array, string, number, boolean, or null)", so presence is decided by
@@ -1297,15 +1301,16 @@ module MCPClient
     # coverage is never silent. The schema is scanned once per definition
     # (keyed like {#warn_unusable_input_schema}), not on every result.
     # @param tool [MCPClient::Tool] the tool whose output schema is being used
-    # @return [void]
+    # @return [Array<String>] the unsupported keywords the schema uses
     def warn_partial_schema_coverage(tool)
       @output_schema_coverage ||= {}
       key = [tool.server&.object_id, tool.name]
-      return if @output_schema_coverage[key].equal?(tool_definition_identity(tool))
+      known = @output_schema_coverage[key]
+      return known[:unsupported] if known && known[:identity].equal?(tool_definition_identity(tool))
 
       unsupported = MCPClient::SchemaValidator.unsupported_keywords(tool.output_schema)
-      @output_schema_coverage[key] = tool_definition_identity(tool)
-      return if unsupported.empty?
+      @output_schema_coverage[key] = { identity: tool_definition_identity(tool), unsupported: unsupported }
+      return unsupported if unsupported.empty?
 
       @logger.warn(
         "Structured content check for tool '#{sanitize_peer_log_text(tool.name.to_s)}': validation is partial: " \
@@ -1313,6 +1318,30 @@ module MCPClient
         "keywords: #{unsupported.join(', ')} (full JSON Schema 2020-12 evaluation is not implemented, so " \
         'conforming-looking data may still violate the schema)'
       )
+      unsupported
+    end
+
+    # :strict is a gate. A schema using an assertion this validator does not
+    # evaluate (the dynamic references, `unevaluatedItems` /
+    # `unevaluatedProperties` where a composition produces the annotations
+    # they read) cannot be shown to accept the result, and a result not shown
+    # to conform is refused there — a warning beside a returned value was a
+    # silent pass in everything but the log. A keyword that only annotates
+    # (`format`, `contentSchema`) decides nothing and does not refuse.
+    # @param tool [MCPClient::Tool] the tool whose output schema is being used
+    # @param unsupported [Array<String>] what {#warn_partial_schema_coverage} found
+    # @return [void]
+    # @raise [MCPClient::Errors::ValidationError] in :strict mode
+    def reject_partial_schema_coverage!(tool, unsupported)
+      return unless @validate_structured_content == :strict
+
+      assertions = unsupported - MCPClient::SchemaValidator::ANNOTATION_KEYWORDS
+      return if assertions.empty?
+
+      raise MCPClient::Errors::ValidationError,
+            "Structured content for tool '#{sanitize_peer_log_text(tool.name.to_s)}' cannot be checked against " \
+            'its output schema: the schema uses keywords this validator does not evaluate ' \
+            "(#{assertions.join(', ')}), so the result is not shown to conform"
     end
 
     # Log a structured-content conformance violation and, in :strict mode,

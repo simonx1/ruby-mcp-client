@@ -470,10 +470,15 @@ RSpec.describe MCPClient::Client do
         expect(log_output.string).to include('format').and include('unevaluatedProperties')
       end
 
-      it 'warns that validation is partial in :strict mode instead of silently passing' do
+      # Round 30: an assertion this validator does not evaluate leaves the
+      # result unshown to conform, and :strict is a gate — a warning beside a
+      # returned result was a silent pass in everything but the log.
+      it 'refuses the result in :strict mode, since the schema cannot be shown to accept it' do
         client = build_client(validate_structured_content: :strict)
 
-        expect(client.call_tool('get_weather', {})).to eq(result)
+        expect { client.call_tool('get_weather', {}) }
+          .to raise_error(MCPClient::Errors::ValidationError,
+                          /get_weather.*cannot be checked.*does not evaluate.*unevaluatedProperties/m)
         expect(log_output.string).to match(/get_weather.*validation is partial: schema uses unsupported keywords/)
         expect(log_output.string).to include('format').and include('unevaluatedProperties')
       end

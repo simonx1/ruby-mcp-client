@@ -10,6 +10,8 @@ require_relative 'schema_validator/keyword_scan'
 require_relative 'schema_validator/composition'
 require_relative 'schema_validator/evaluation'
 require_relative 'schema_validator/scalars'
+require_relative 'schema_validator/ecma_patterns'
+require_relative 'schema_validator/input_requirements'
 require_relative 'schema_validator/instances'
 
 module MCPClient
@@ -89,6 +91,8 @@ module MCPClient
     extend Composition
     extend Evaluation
     extend Scalars
+    extend EcmaPatterns
+    extend InputRequirements
     extend Instances
 
     # Raised inside a validation to abandon it (time budget, resource bound).
@@ -203,6 +207,12 @@ module MCPClient
     # still makes progress rather than failing every remaining pattern.
     MIN_PATTERN_MATCH_TIMEOUT = 0.01
 
+    # The longest `pattern` (or `patternProperties` key) a schema may carry.
+    # A pattern is translated and compiled before it is matched, and both
+    # cost what the peer's text costs; the depth and subschema bounds say
+    # nothing about one string, so its length is bounded on its own.
+    MAX_PATTERN_LENGTH = 10_000
+
     # Keywords whose value is a single subschema to walk (or, for `items`,
     # an array of positional subschemas in draft-07 / 2019-09).
     SUBSCHEMA_KEYWORDS = %w[
@@ -230,6 +240,7 @@ module MCPClient
       '$dynamicAnchor' => [DEFAULT_DIALECT],
       '$recursiveRef' => [DRAFT_2019_09],
       '$recursiveAnchor' => [DRAFT_2019_09],
+      '$vocabulary' => [DEFAULT_DIALECT, DRAFT_2019_09],
       'additionalItems' => [DRAFT_2019_09, DRAFT_07],
       'dependencies' => [DRAFT_07],
       'dependentSchemas' => [DEFAULT_DIALECT, DRAFT_2019_09],
@@ -476,6 +487,8 @@ module MCPClient
       check_assertion_shapes(schema, dialect, problems)
       check_exclusive_bounds(schema, dialect, problems)
       check_identifier_shapes(schema, dialect, problems)
+      check_core_keyword_shapes(schema, dialect, problems)
+      check_pattern_shapes(schema, dialect, problems)
     end
 
     # Account for a schema (object or boolean) about to be walked: once per

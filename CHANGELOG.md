@@ -7,6 +7,53 @@ metadata). Each feature lands in its own PR; this section accumulates them.
 
 ### JSON Schema handling
 
+- **A bounded pattern translation, the rest of ECMA-262, malformed core
+  keywords, a strict gate over what is not evaluated, and the retry's own
+  definition (fourth verification round).**
+
+  - *Pattern translation runs under the budget.* The ECMA-262 rewrite walked
+    the pattern by index — quadratic on a multibyte pattern — and never
+    consulted the deadline, so a 100,000-character `pattern` held the
+    calling thread for seconds past the one-second budget and, under `not`,
+    reported a pass. The translation is one linear pass that checks the
+    deadline as it goes, and a `pattern` (or `patternProperties` key) longer
+    than 10,000 characters makes the schema unusable at preflight.
+  - *The rest of ECMA-262.* A back-reference to a group that did not
+    participate matches the empty string in ECMA-262 and failed in Ruby
+    (`^(a)?\1$` rejected `""`); a numeric escape past the group count is
+    the legacy octal escape; a surrogate-pair escape (`\uD83D\uDE00`) is
+    the character it encodes and a lone surrogate matches nothing (Ruby
+    could not compile either, and the pattern was dropped — every string
+    passed it); Ruby-only syntax ECMA-262 refuses — inline flags (`(?i)`),
+    possessive quantifiers (`a++`), atomic groups, comments, `(?'n')`
+    groups — now makes the schema unusable instead of being read as Ruby.
+    An unreadable pattern is a malformed keyword, never an absent one.
+  - *Malformed core keywords.* An `$id` that is no URI reference, a
+    `$vocabulary` that is not an object of booleans keyed by URI and a
+    2019-09 `$recursiveAnchor` that is not a boolean were read as usable
+    schemas; each is refused at preflight.
+  - *`:strict` refuses what cannot be shown to conform.* A schema using an
+    assertion this validator does not evaluate (the dynamic references,
+    `unevaluatedItems` / `unevaluatedProperties` beside a composition)
+    logged "validation is partial" and returned the result: `:strict`
+    accepted `{"id": "1", "secret": "leak"}` against the canonical closed
+    composition `{"$ref": ..., "unevaluatedProperties": false}`. In
+    `:strict` such a result is refused with a `ValidationError` naming the
+    keywords, on every call; the annotation-only keywords still pass, and
+    `:warn` keeps its once-per-definition warning. The full dynamic-scope
+    and annotation-collecting evaluation stays deferred and documented.
+  - *The HeaderMismatch retry goes out under the definition it was checked
+    against.* The dialect check before the retry and the retry's header
+    derivation each looked the tool up, and on a list bounded with
+    `ttlMs: 0` each lookup fetched: the check read one definition and the
+    call went out under the next, whose dialect nothing here could read.
+    The checked definition is pinned for the send.
+  - *Required arguments through the applicators.* The local check of a
+    call's required arguments read the root only; it now follows the root's
+    `$ref` chain and `allOf` members (the tools spec: clients SHOULD follow
+    `$ref` resolution when validating tool inputs), leaving conditional
+    branches to the server.
+
 - **JSON equality, ECMA-262 patterns, the annotation-driven keywords, and a
   budget the instance cannot outrun (third verification round).** The
   assertions the previous round started applying reached some wrong verdicts,

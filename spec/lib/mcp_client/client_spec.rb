@@ -767,9 +767,11 @@ RSpec.describe MCPClient::Client do
       it 'streams from the specified server by name' do
         enum = multi_client.call_tool_streaming('test_tool', {}, server: 'server2')
         expect(mock_server2).to have_received(:call_tool_streaming).with('test_tool', {})
-        # The client wraps the transport's stream (every chunk is checked
-        # against the tool's outputSchema), so the chunks are what identify
-        # the server that was streamed from, not the enumerator object.
+        # The client wraps the transport's stream (a complete result chunk
+        # is checked against the tool's outputSchema — see the JSON Schema
+        # round 29 examples; this tool declares none and streams scalars),
+        # so the chunks are what identify the server that was streamed from,
+        # not the enumerator object.
         expect(enum.to_a).to eq([4, 5, 6])
       end
     end

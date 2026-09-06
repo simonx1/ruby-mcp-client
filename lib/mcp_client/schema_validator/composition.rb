@@ -174,7 +174,7 @@ module MCPClient
         remaining = pattern_budget_remaining(deadline)
         raise Aborted, "validation time budget exhausted before pattern #{clip(pattern.inspect)}" if remaining.zero?
 
-        ecma_regexp(pattern, remaining).match?(name)
+        ecma_regexp(pattern, remaining, deadline).match?(name)
       rescue Regexp::TimeoutError
         raise Aborted, "pattern #{clip(pattern.inspect)} exceeded the #{PATTERN_MATCH_TIMEOUT}s matching budget"
       rescue RegexpError, TypeError

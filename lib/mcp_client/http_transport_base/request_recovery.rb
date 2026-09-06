@@ -97,6 +97,10 @@ module MCPClient
             retry
           end
         end
+      ensure
+        # A pin the retry never consumed (it raised before sending) must not
+        # outlive the request it was for.
+        clear_pinned_retry_definition
       end
 
       # Send the request, renegotiating the protocol version once if the server

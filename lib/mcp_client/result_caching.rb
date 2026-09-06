@@ -375,7 +375,7 @@ module MCPClient
     def transport_thread_local_keys
       %i[served_entries_key recorded_entries_key response_received_key
          request_params_key round_trip_marker_key request_authorization_key
-         exchange_records_key called_tool_definition_key]
+         exchange_records_key called_tool_definition_key pinned_retry_definition_key]
         .select { |name| respond_to?(name, true) }
         .map { |name| send(name) }
     end
