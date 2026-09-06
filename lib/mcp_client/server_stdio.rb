@@ -374,6 +374,18 @@ module MCPClient
       # (no caller is waiting on it).
       return if handle_subscription_response(msg)
 
+      record_response(id, msg, arrived)
+    rescue JSON::ParserError, EncodingError
+      # Skip non-JSONRPC or undecodable lines in the output stream so a single
+      # bad line cannot kill the reader thread
+    end
+
+    # Queue a response for the caller waiting on it.
+    # @param id [Integer, String] the response's request id
+    # @param msg [Hash] the decoded response
+    # @param arrived [Float, nil] when its line arrived (monotonic seconds)
+    # @return [void]
+    def record_response(id, msg, arrived)
       @mutex.synchronize do
         # Only retain a response that corresponds to an outstanding request.
         # Late responses (arriving after the caller timed out) and unsolicited
@@ -402,9 +414,6 @@ module MCPClient
           @logger.debug("Discarding response for unknown or expired request id=#{id}")
         end
       end
-    rescue JSON::ParserError, EncodingError
-      # Skip non-JSONRPC or undecodable lines in the output stream so a single
-      # bad line cannot kill the reader thread
     end
 
     # Whether a server-initiated request is prohibited traffic.

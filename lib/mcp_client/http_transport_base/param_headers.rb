@@ -30,9 +30,6 @@ module MCPClient
         end
         param_headers.each { |k, v| req.headers[k] = v }
       end
-      rescue StandardError => e
-        e.extend(RequestRecovery::NestedExchange) unless e.frozen?
-        raise
     end
   end
 end

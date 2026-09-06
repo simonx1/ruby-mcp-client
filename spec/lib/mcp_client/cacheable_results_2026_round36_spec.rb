@@ -209,7 +209,9 @@ RSpec.describe 'MCP 2026-07-28 cacheable results — round 36' do
           # then the exchange it is nested in fails.
           token.value = 'bob'
           state[:server].read_resource('file:///public')
-          raise Faraday::TimeoutError, 'execution expired'
+          # A failure the transport cannot salvage a delivered body from (a
+          # stall after the response arrived would be the response).
+          raise Faraday::SSLError, 'SSL_connect returned=1 errno=0 state=error: certificate verify failed'
         end
       end
 
@@ -231,7 +233,7 @@ RSpec.describe 'MCP 2026-07-28 cacheable results — round 36' do
       expect(server.list_tools.map(&:name)).to eq(['bob-tool'])
 
       token.value = 'alice'
-      expect { server.list_tools }.to raise_error(MCPClient::Errors::RequestTimeoutError)
+      expect { server.list_tools }.to raise_error(MCPClient::Errors::ConnectionError)
       expect(state[:nested]).to be(true)
     ensure
       server&.cleanup

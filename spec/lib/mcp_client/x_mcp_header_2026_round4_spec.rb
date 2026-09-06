@@ -40,6 +40,12 @@ RSpec.shared_context 'with x-mcp-header round-4 helpers' do
       body: JSON.generate('jsonrpc' => '2.0', 'id' => id, 'error' => { 'code' => -32_020, 'message' => message }) }
   end
 
+  # A tools/list result with a freshness hint: on the cacheable-results
+  # branch a modern list without one is read again by the next call.
+  def fresh_tools(tools, **extra)
+    { 'tools' => tools, 'ttlMs' => 60_000 }.merge(extra)
+  end
+
   def annotated_tool(header = 'Region')
     { 'name' => 'execute_sql',
       'inputSchema' => { 'type' => 'object',
@@ -69,7 +75,7 @@ RSpec.shared_context 'with x-mcp-header round-4 helpers' do
       if method == 'server/discover' then json_response(body['id'], modern_discover)
       elsif answer == :mismatch then header_mismatch(body['id'], 'Mcp-Param-Zone missing')
       elsif answer then answer.call(body)
-      elsif method == 'tools/list' then json_response(body['id'], { 'tools' => [annotated_tool] })
+      elsif method == 'tools/list' then json_response(body['id'], fresh_tools([annotated_tool]))
       else json_response(body['id'], { 'content' => [] })
       end
     end
@@ -182,7 +188,7 @@ RSpec.describe 'MCP 2026-07-28 x-mcp-header — value encoding edges' do
       tool = { 'name' => 'n', 'inputSchema' => { 'type' => 'object',
                                                  'properties' => { 'n' => { 'type' => 'integer',
                                                                             'x-mcp-header' => 'N' } } } }
-      requests = stub_sequence(lists: [->(body) { json_response(body['id'], { 'tools' => [tool] }) }])
+      requests = stub_sequence(lists: [->(body) { json_response(body['id'], fresh_tools([tool])) }])
       server.call_tool('n', { 'n' => -7 })
 
       expect(param_headers(calls_in(requests).first[:headers])).to eq({ 'Mcp-Param-N' => '-7' })
@@ -263,7 +269,7 @@ RSpec.describe 'MCP 2026-07-28 x-mcp-header — HeaderMismatch recovery edges' d
           requests << { headers: request.headers.to_h, body: body }
           case body['method']
           when 'server/discover' then json_response(body['id'], modern_discover)
-          when 'tools/list' then json_response(body['id'], { 'tools' => [annotated_tool(header)] })
+          when 'tools/list' then json_response(body['id'], fresh_tools([annotated_tool(header)]))
           when 'tools/call'
             if request.headers['Mcp-Param-Zone']
               json_response(body['id'], { 'content' => [] })
@@ -289,7 +295,7 @@ RSpec.describe 'MCP 2026-07-28 x-mcp-header — HeaderMismatch recovery edges' d
       it 'retries without mirrored headers when the refreshed definition is invalid' do
         refreshed = false
         requests = stub_sequence(
-          lists: [nil, ->(body) { json_response(body['id'], { 'tools' => [invalid_tool] }) }],
+          lists: [nil, ->(body) { json_response(body['id'], fresh_tools([invalid_tool])) }],
           calls: [lambda { |body|
             refreshed = true
             header_mismatch(body['id'], 'Mcp-Param-Region is not expected')
@@ -318,12 +324,12 @@ RSpec.describe 'MCP 2026-07-28 x-mcp-header — HeaderMismatch recovery edges' d
           when 'server/discover' then json_response(body['id'], modern_discover)
           when 'tools/list'
             if !refreshing
-              json_response(body['id'], { 'tools' => [annotated_tool] })
+              json_response(body['id'], fresh_tools([annotated_tool]))
             elsif body['params']['cursor']
               pages += 1
               { status: 503, body: '' }
             else
-              json_response(body['id'], { 'tools' => [annotated_tool('Zone')], 'nextCursor' => 'page2' })
+              json_response(body['id'], fresh_tools([annotated_tool('Zone')], 'nextCursor' => 'page2'))
             end
           when 'tools/call'
             refreshing = true
@@ -346,7 +352,7 @@ RSpec.describe 'MCP 2026-07-28 x-mcp-header — HeaderMismatch recovery edges' d
       end
 
       it 'returns the result when the refreshed list lacks the tool and the server answers the retry' do
-        requests = stub_sequence(lists: [nil, ->(body) { json_response(body['id'], { 'tools' => [] }) }],
+        requests = stub_sequence(lists: [nil, ->(body) { json_response(body['id'], fresh_tools([])) }],
                                  calls: [:mismatch])
 
         expect(server.call_tool('execute_sql', { 'region' => 'eu' })).to eq({ 'content' => [] })
@@ -374,10 +380,10 @@ RSpec.describe 'MCP 2026-07-28 x-mcp-header — HeaderMismatch recovery edges' d
           when 'server/discover' then json_response(body['id'], modern_discover)
           when 'tools/list'
             if body['params']['cursor']
-              json_response(body['id'], { 'tools' => [invalid_tool, annotated_tool('Zone').merge('name' => 'ok')] })
+              json_response(body['id'], fresh_tools([invalid_tool, annotated_tool('Zone').merge('name' => 'ok')]))
             else
-              json_response(body['id'], { 'tools' => [{ 'name' => 'first', 'inputSchema' => { 'type' => 'object' } }],
-                                          'nextCursor' => 'page2' })
+              json_response(body['id'], fresh_tools([{ 'name' => 'first', 'inputSchema' => { 'type' => 'object' } }],
+                                                    'nextCursor' => 'page2'))
             end
           end
         end
@@ -414,7 +420,7 @@ RSpec.describe 'MCP 2026-07-28 x-mcp-header — the definition a modern call wen
       body = JSON.parse(request.body)
       case body['method']
       when 'server/discover' then json_response(body['id'], modern_discover)
-      when 'tools/list' then json_response(body['id'], { 'tools' => [listed.call] })
+      when 'tools/list' then json_response(body['id'], fresh_tools([listed.call]))
       when 'tools/call'
         sse_response([list_changed,
                       { 'jsonrpc' => '2.0', 'id' => body['id'],

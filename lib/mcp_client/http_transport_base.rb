@@ -16,7 +16,6 @@ require_relative 'http_transport_base/tool_listing'
 require_relative 'http_transport_base/param_headers'
 require_relative 'http_transport_base/stream_recovery'
 require_relative 'http_transport_base/request_recovery'
-require_relative 'http_transport_base/list_caches'
 
 module MCPClient
   # Base module for HTTP-based JSON-RPC transports
@@ -29,7 +28,6 @@ module MCPClient
     include ParamHeaders
     include StreamRecovery
     include RequestRecovery
-    include ListCaches
     include ListenStream
     include CacheSupport
     include ToolListing
