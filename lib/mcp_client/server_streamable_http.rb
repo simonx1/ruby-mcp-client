@@ -1166,11 +1166,13 @@ module MCPClient
     # interleaved on a POST SSE response stream.
     # @param message [Hash] the parsed JSON-RPC message
     def dispatch_server_message(message)
-      if modern? && message['method'] && message.key?('id')
+      if protocol_era == :modern && message['method'] && message.key?('id')
         # MCP 2026-07-28: "The server MUST NOT send independent JSON-RPC
         # requests on this stream" — server-to-client interactions are
         # embedded in InputRequiredResult. There is no response channel
         # either (clients MUST NOT POST responses), so the request is dropped.
+        # Judged by the ESTABLISHED era: while the probe is in flight a legacy
+        # server may be waiting for its ping on the probe's own stream.
         @logger.warn("Ignoring server-initiated request #{message['method']} on a response stream: " \
                      'not permitted by MCP 2026-07-28')
         return

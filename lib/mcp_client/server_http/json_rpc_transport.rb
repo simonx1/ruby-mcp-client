@@ -159,8 +159,10 @@ module MCPClient
 
         # MCP 2026-07-28: "The server MUST NOT send independent JSON-RPC
         # requests on this stream" and clients MUST NOT POST responses to it,
-        # so there is nothing to answer with.
-        if modern?
+        # so there is nothing to answer with. Judged by the ESTABLISHED era:
+        # while the probe is in flight the version is only a proposal, and a
+        # legacy server may be waiting for its ping on the probe's stream.
+        if protocol_era == :modern
           @logger.warn("Ignoring server-initiated request #{message['method']} on a response stream")
           return
         end

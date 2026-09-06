@@ -155,6 +155,33 @@ metadata). Each feature lands in its own PR; this section accumulates them.
   that arrived before its stream broke inflates a gzip-encoded capture before
   looking for the answer, so a `tools/call` whose compressed result was
   fully delivered is settled rather than re-issued and run again.
+  The same holds when it is the gzip decoder rather than the socket that
+  reports the loss: a body cut after its deflate data — footer only — still
+  delivered its final event in full, and the Streamable HTTP parser now
+  keeps that answer instead of treating the missing footer as a lost
+  request. A body whose deflate data itself stops short is still re-issued,
+  and a complete body with a bad footer CRC is still a bad response.
+- **Gzip is inflated under its bound as it happens.** The live event scanner
+  and the salvage of a compressed answer inflated a body whole and measured
+  it afterwards, so a small compressed body could expand far past
+  `max_decompressed_body_bytes` before the check. Both now inflate through
+  zlib's piecewise form under that bound and stop at the first piece that
+  would cross it.
+- **The live reader follows the SSE parsing rules for the start of a
+  stream.** A stream that opens with a field the client does not know
+  (`x-anything: …`) or with a UTF-8 byte-order mark is read — unknown fields
+  are ignored, not a reason to stop reading — so a ping sent behind one is
+  still answered while the stream is open, and a progress notification
+  behind one is not delayed until the body ends.
+- **The era is unknown while the probe is in flight.** `server/discover`
+  proposes 2026-07-28 but has not established it, and a 2025-11-25 server
+  may send a request on the probe's own response stream and wait for the
+  answer before rejecting the probe. A server-initiated request on a
+  response stream is now dropped only once the era is *established* modern;
+  during the probe a `ping` is answered (and any other method gets
+  `-32601`) as on any legacy stream, so such a server is negotiated down to
+  `initialize` instead of timing out. A modern server never sends one, so
+  answering costs nothing.
 - **A malformed `-32601` identifies no modern server.** The backward
   compatibility rule ("HTTP 404 with a JSON-RPC `-32601` body is a modern
   server") now requires a well-formed error object, exactly like the reserved

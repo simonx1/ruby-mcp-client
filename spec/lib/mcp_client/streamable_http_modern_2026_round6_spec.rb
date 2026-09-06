@@ -139,6 +139,30 @@ RSpec.describe 'MCP 2026-07-28 Streamable HTTP — round 6' do
     end
   end
 
+  # 2026-07-28 removed SSE resumability: an event id on a modern response
+  # stream is not a cursor, is never retained and never sent back.
+  describe 'event ids on a modern response stream' do
+    it 'neither retains nor echoes them' do
+      headers = []
+      stub_request(:post, url).to_return do |request|
+        headers << request.headers
+        body = JSON.parse(request.body)
+        if body['method'] == 'server/discover'
+          json_response(body['id'], discover_result)
+        else
+          event = "id: evt-1\nevent: message\ndata: #{JSON.generate('jsonrpc' => '2.0', 'id' => body['id'],
+                                                                    'result' => { 'content' => [] })}\n\n"
+          { status: 200, body: event, headers: { 'Content-Type' => 'text/event-stream' } }
+        end
+      end
+
+      expect(server.call_tool('t', {})).to eq({ 'content' => [] })
+      expect(server.instance_variable_get(:@last_event_id)).to be_nil
+      expect(server.call_tool('t', {})).to eq({ 'content' => [] })
+      expect(headers).to all(satisfy { |h| !h.key?('Last-Event-Id') && !h.key?('Last-Event-ID') })
+    end
+  end
+
   describe 'the expansion bound on compressed bodies' do
     let(:bomb) { gzip("#{'a' * (8 * 1024 * 1024)}\n\n#{sse_event('jsonrpc' => '2.0', 'id' => 1, 'result' => {})}") }
 

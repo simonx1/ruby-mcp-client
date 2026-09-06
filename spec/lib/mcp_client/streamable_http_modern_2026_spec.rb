@@ -1109,7 +1109,11 @@ RSpec.describe 'MCP 2026-07-28 modern mode — a server that offers a session an
       delete_stub = stub_request(:delete, url).to_return(status: 200, body: '')
 
       server.list_tools
+      # Never retained — checked while the connection is up, not only after
+      # cleanup has cleared whatever was held.
+      expect(server.instance_variable_get(:@session_id)).to be_nil
       server.call_tool('t', {})
+      expect(server.instance_variable_get(:@session_id)).to be_nil
       server.cleanup
 
       # 2026-07-28 removed the session layer: an assigned id must be ignored,

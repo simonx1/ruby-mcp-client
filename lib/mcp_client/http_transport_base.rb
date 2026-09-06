@@ -397,6 +397,11 @@ module MCPClient
     #   probe failed, or legacy while protocol: :modern is configured
     def probe_modern_server
       @protocol_version = MCPClient::LATEST_PROTOCOL_VERSION
+      # The version is a proposal until the server answers: a 2025-11-25
+      # server may send a request on the probe's own response stream and wait
+      # for the answer, and it gets one while the era is unknown (a modern
+      # server never sends one, so answering costs nothing).
+      begin_era_probe
       # A server already found to be modern never gets the initialize
       # fallback again, however a later probe fails — the mirror image of the
       # cached legacy verdict.
@@ -428,6 +433,8 @@ module MCPClient
       raise
     rescue MCPClient::Errors::ServerError, MCPClient::Errors::TransportError => e
       modern_despite_probe_failure?(e, modern_confirmed)
+    ensure
+      settle_era_probe
     end
 
     # Send server/discover and apply the DiscoverResult.

@@ -671,6 +671,11 @@ class MidStreamCloseServer
   # gzip-encoded as the client's Accept-Encoding allows, then close without
   # the terminating chunk. The response *did* arrive, compressed.
   GZIP_THEN_CLOSE = :gzip_then_close
+  # Reply token pair [GZIP_EVENTS_THEN_STALL, message]: `message` as complete
+  # SSE events, gzip-encoded and flushed onto the wire, then the socket held
+  # open without the deflate stream ever ending. Only a reader that inflates
+  # the body as it arrives can see those events.
+  GZIP_EVENTS_THEN_STALL = :gzip_events_then_stall
 
   # A self-signed certificate for 127.0.0.1, built once for the whole file
   # because key generation is the expensive part.
@@ -838,6 +843,9 @@ class MidStreamCloseServer
     when CLOSE_MID_STREAM then write_sse_chunk(client, ": keep-alive\n\n")
     when DELIVER_THEN_CLOSE then write_sse_chunk(client, sse_events_for(payload))
     when GZIP_THEN_CLOSE then write_gzip_chunk(client, sse_events_for(payload))
+    when GZIP_EVENTS_THEN_STALL
+      write_gzip_events_open(client, sse_events_for(payload))
+      sleep
     when DELIVER_UNTERMINATED then write_sse_chunk(client, "event: message\ndata: #{JSON.generate(payload)}\n")
     when DRIP_FOREVER then drip(client, payload || 0.02)
     when HTTP_STATUS then write_plain(client, payload, extra.to_s)
@@ -886,6 +894,20 @@ class MidStreamCloseServer
     client.write("HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Encoding: gzip\r\n" \
                  "Transfer-Encoding: chunked\r\nConnection: close\r\n\r\n")
     client.write(format("%<size>x\r\n%<chunk>s\r\n", size: compressed.bytesize, chunk: compressed))
+  end
+
+  # The events gzip-encoded and sync-flushed as one chunk, with the deflate
+  # stream left open (no footer, no terminating zero chunk).
+  def write_gzip_events_open(client, chunk)
+    io = StringIO.new
+    gz = Zlib::GzipWriter.new(io)
+    gz.write(chunk)
+    gz.flush(Zlib::SYNC_FLUSH)
+    compressed = io.string.dup
+    client.write("HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Encoding: gzip\r\n" \
+                 "Transfer-Encoding: chunked\r\nConnection: close\r\n\r\n")
+    client.write(format("%<size>x\r\n%<chunk>s\r\n", size: compressed.bytesize, chunk: compressed))
+    client.flush
   end
 
   def write_sse_head(client)
@@ -1636,6 +1658,92 @@ RSpec.describe 'MCP 2026-07-28 Streamable HTTP — a response stream that really
       expect(transport(MCPClient::ServerStreamableHTTP).call_tool('charge',
                                                                   { 'amount' => 10 })).to eq({ 'content' => [] })
       expect(@fixture.received.count { |r| r['method'] == 'tools/call' }).to eq(1)
+    end
+  end
+
+  # --- Round 6: the era is unknown while the probe is in flight; unknown SSE
+  # fields; compressed events read live.
+
+  HTTP_TRANSPORTS.each do |klass|
+    describe "#{klass} while the era is still unknown" do
+      # A 2025-11-25 server may send a request on the POST stream of ANY
+      # request it answers — the probe included — and wait for the answer.
+      # The probe proposes 2026-07-28 but has not established it, so a ping
+      # on that stream is answered as on any legacy stream; a modern server
+      # never sends one, so nothing is lost by answering.
+      it 'answers a legacy server ping on the probe stream before the era is known' do
+        start_server do |message|
+          case message['method']
+          when 'server/discover'
+            waiter = -> { settled_within?(3) { @fixture.received.any? { |m| m['id'] == 'ping-0' } } }
+            [MidStreamCloseServer::EVENT_THEN_WAIT, { 'jsonrpc' => '2.0', 'id' => 'ping-0', 'method' => 'ping' },
+             waiter, { 'jsonrpc' => '2.0', 'id' => message['id'],
+                       'error' => { 'code' => -32_601, 'message' => 'Method not found' } }]
+          when 'initialize' then jsonrpc(message, legacy_init)
+          when 'tools/list' then jsonrpc(message, { 'tools' => [] })
+          else [MidStreamCloseServer::HTTP_STATUS, 202, '']
+          end
+        end
+        server = transport(klass, read_timeout: 5)
+
+        Timeout.timeout(15) { expect(server.list_tools).to eq([]) }
+
+        expect(@fixture.received.find { |m| m['id'] == 'ping-0' }).to include('jsonrpc' => '2.0', 'result' => {})
+        expect(methods_received).to include('initialize')
+      end
+    end
+
+    describe "#{klass} streams that open with an unknown SSE field" do
+      # SSE "Parsing an event stream": a field the client does not know is
+      # ignored, not a reason to stop reading; the ping behind it is still
+      # answered while the stream is open.
+      it 'answers a legacy server ping sent behind a field it does not know' do
+        start_server do |message|
+          case message['method']
+          when 'server/discover' then [MidStreamCloseServer::HTTP_STATUS, 400, 'Bad Request']
+          when 'initialize' then jsonrpc(message, legacy_init)
+          when 'tools/list'
+            waiter = -> { settled_within?(3) { @fixture.received.any? { |m| m['id'] == 'ping-1' } } }
+            ping = JSON.generate('jsonrpc' => '2.0', 'id' => 'ping-1', 'method' => 'ping')
+            [MidStreamCloseServer::EVENT_THEN_WAIT, "x-ignore: 1\ndata: #{ping}\n\n", waiter,
+             jsonrpc(message, { 'tools' => [] })]
+          else [MidStreamCloseServer::HTTP_STATUS, 202, '']
+          end
+        end
+        server = transport(klass, read_timeout: 5)
+
+        Timeout.timeout(15) { expect(server.list_tools).to eq([]) }
+
+        expect(@fixture.received.find { |m| m['id'] == 'ping-1' }).to include('jsonrpc' => '2.0', 'result' => {})
+      end
+    end
+  end
+
+  describe "#{MCPClient::ServerStreamableHTTP} compressed response streams read as they arrive" do
+    # Streamable HTTP offers gzip on every request, so a live stream is a
+    # compressed stream: a progress notification inside a deflate stream
+    # that never ends must still reach the host before the request's
+    # deadline tears the stream down.
+    it 'delivers a compressed progress notification before the stream is torn down' do
+      progress = { 'jsonrpc' => '2.0', 'method' => 'notifications/progress',
+                   'params' => { 'progressToken' => 'p', 'progress' => 1 } }
+      start_server do |message|
+        case message['method']
+        when 'server/discover' then jsonrpc(message, discovery)
+        when 'tools/call' then [MidStreamCloseServer::GZIP_EVENTS_THEN_STALL, progress]
+        else jsonrpc(message, { 'tools' => [] })
+        end
+      end
+      seen = Queue.new
+      server = transport(MCPClient::ServerStreamableHTTP, read_timeout: 0.5)
+      server.on_notification { |method, _params| seen << method }
+
+      Timeout.timeout(15) do
+        expect { server.rpc_request('tools/call', { 'name' => 't', 'arguments' => {} }) }
+          .to raise_error(MCPClient::Errors::RequestTimeoutError)
+      end
+      expect(seen.size).to eq(1)
+      expect(seen.pop).to eq('notifications/progress')
     end
   end
 end
