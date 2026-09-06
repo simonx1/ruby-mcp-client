@@ -214,4 +214,39 @@ RSpec.describe 'MCP 2026-07-28 Streamable HTTP — round 6' do
       expect(server.send(:inflate_delivered_gzip, compressed)).to include('"result"')
     end
   end
+  # A terminated event carrying invalid JSON is not a lost stream: the server
+  # processed the request and answered, however badly. Re-issuing there runs
+  # a tools/call the server already ran.
+  describe 'a complete SSE event whose data is not JSON' do
+    it 'fails the call without re-issuing it, on Streamable HTTP' do
+      requests = stub_posts(
+        'server/discover' => discover_result,
+        'tools/call' => lambda { |_body|
+          { status: 200, body: "event: message\ndata: not-json\n\n",
+            headers: { 'Content-Type' => 'text/event-stream' } }
+        }
+      )
+
+      expect { server.rpc_request('tools/call', { 'name' => 't', 'arguments' => {} }) }
+        .to raise_error(MCPClient::Errors::TransportError, /JSON/i)
+      expect(requests.count { |r| r['method'] == 'tools/call' }).to eq(1)
+    end
+
+    it 'fails the call without re-issuing it, on plain HTTP' do
+      plain = MCPClient::ServerHTTP.new(base_url: 'https://example.com', endpoint: '/mcp', retries: 0)
+      requests = stub_posts(
+        'server/discover' => discover_result,
+        'tools/call' => lambda { |_body|
+          { status: 200, body: "event: message\ndata: not-json\n\n",
+            headers: { 'Content-Type' => 'text/event-stream' } }
+        }
+      )
+
+      expect { plain.rpc_request('tools/call', { 'name' => 't', 'arguments' => {} }) }
+        .to raise_error(MCPClient::Errors::TransportError, /JSON/i)
+      expect(requests.count { |r| r['method'] == 'tools/call' }).to eq(1)
+    ensure
+      plain&.cleanup
+    end
+  end
 end

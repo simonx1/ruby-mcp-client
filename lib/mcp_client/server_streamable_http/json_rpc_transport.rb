@@ -245,15 +245,18 @@ module MCPClient
         matched = select_sse_response(responses, request_id)
         return matched if matched
 
-        if saw_invalid_json && !modern?
+        # Every event that reaches here is terminated: an unterminated final
+        # event is dropped before parsing. So invalid JSON is not a break that
+        # landed inside an event — the server processed the request and
+        # answered, however badly, and re-issuing would run it a second time.
+        if saw_invalid_json
           raise MCPClient::Errors::TransportError,
                 'Invalid JSON response from server: SSE stream contained no valid JSON-RPC response'
         end
 
-        # On a modern server a disconnection that lands inside an event's JSON
-        # is the same loss as one that lands between events, so both take the
-        # re-issue path (2026-07-28 changelog, major change 9). Recovery must
-        # not depend on where the break fell.
+        # A stream that ended between events carries no answer at all: the
+        # in-flight request was lost and takes the re-issue path (2026-07-28
+        # changelog, major change 9).
         resume_or_fail(events, request_id, retry_ms)
       end
 

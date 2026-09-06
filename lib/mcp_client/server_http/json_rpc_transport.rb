@@ -80,8 +80,10 @@ module MCPClient
       # @raise [MCPClient::Errors::TransportError] when the stream carries no response
       def response_from_sse(sse_body, request_id, live = 0)
         responses = []
+        saw_invalid_json = false
         sse_events(sse_body).each_with_index do |event, index|
           message = sse_event_message(event)
+          saw_invalid_json = true if message.nil? && event.lines.any? { |l| l.start_with?('data:') }
           next unless message
 
           if message['method']
@@ -93,6 +95,15 @@ module MCPClient
         matched = responses.find { |m| request_id.nil? || m['id'] == request_id || m['id'].to_s == request_id.to_s }
         matched ||= tolerated_id_mismatch(responses, request_id)
         return matched if matched
+
+        # Every event that reaches here is terminated, so a data line that did
+        # not parse is a delivered (malformed) answer rather than a break
+        # inside one: the server ran the request, and re-issuing would run it
+        # again.
+        if saw_invalid_json
+          raise MCPClient::Errors::TransportError,
+                'Invalid JSON response from server: SSE event carried no valid JSON-RPC message'
+        end
 
         # The stream closed without the response: on a modern server the
         # request is lost and must be re-issued (see rpc_request).
