@@ -7,6 +7,49 @@ metadata). Each feature lands in its own PR; this section accumulates them.
 
 ### JSON Schema handling
 
+- **Dynamic references bind to the outermost scope, a branchless `if` keeps
+  its annotations, and the checks around a result close their last gaps
+  (sixth verification round).**
+
+  - *`$dynamicRef` and `$recursiveRef` are evaluated.* The dynamic scope a
+    reference is met in always starts at the root resource of the schema
+    being applied, so a `$dynamicRef` whose anchor the root declares binds to
+    the root wherever it is met (JSON Schema 2020-12 Core Section 8.2.3.2:
+    the recursive-node shape `{"$dynamicAnchor": "node", "properties":
+    {"child": {"$dynamicRef": "#node"}}}` now rejects `{"child": 1}`, and the
+    strict tree re-binds the open tree's items to the closed root), a
+    `$recursiveRef` to a root whose `$recursiveAnchor` is true likewise
+    (2019-09 Core Section 8.2.4.2.2), and where exactly one resource declares
+    the anchor it is the target the reference named. Only a document in which
+    several non-root resources declare the same dynamic anchor would need the
+    evaluation path to choose: that one reference stays unevaluated,
+    reported, and refused in `:strict`; the previous round refused every
+    dynamic-anchor reference in `:strict` and let an invalid instance through
+    in `:warn`.
+  - *A branchless `if` still annotates.* An `if` without `then` or `else`
+    was skipped, so `{"if": {"properties": {"foo": true}},
+    "unevaluatedProperties": false}` rejected the conforming `{"foo": 1}`
+    (and, under `not`, accepted the non-conforming one). The condition is
+    evaluated whether or not a branch follows, and the annotations of one
+    that passed are what the `unevaluated*` beside it reads (Section
+    10.2.2.1).
+  - *Generated capture-group names cannot collide.* An unnamed group beside
+    a named one is written as a named group, and a pattern naming its own
+    group `__mcp_g1` made `^(a)(?<__mcp_g1>b)\1$` accept `"abb"`. The
+    generated prefix is now one none of the pattern's names begins with.
+  - *The HeaderMismatch retry is refused under an unreadable output dialect
+    too.* The refreshed definition was checked for its input dialect only,
+    so a tool whose refreshed `outputSchema` declared a dialect this client
+    cannot read was run and its result refused afterwards; both schemas are
+    checked before the retry goes out (the unsupported-dialect MUST binds
+    before the call, as on the first send).
+  - *The structuredContent an error result carries is checked.* An error
+    result may omit `structuredContent`; one that carries it is bound by the
+    output schema like any other (the tools specification exempts nothing
+    about error results), so `:warn` logs and `:strict` refuses a
+    non-conforming one instead of skipping it. An `outputSchema` of `false`
+    refuses every structured result in `:strict`.
+
 - **The annotation-driven keywords are evaluated, the dynamic references
   narrowed to the dynamic ones, and the checks that ran outside the rules
   brought under them (fifth verification round).**

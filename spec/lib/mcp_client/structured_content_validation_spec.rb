@@ -375,12 +375,12 @@ RSpec.describe MCPClient::Client do
         expect(log_output.string).not_to include('structuredContent')
       end
 
-      it 'skips validation for error results (isError: true)' do
+      it 'still checks the structuredContent an error result carries' do
         result = { 'isError' => true, 'content' => [], 'structuredContent' => { 'temperature' => 'hot' } }
         allow(mock_server).to receive(:call_tool).and_return(result)
 
         expect(build_client.call_tool('get_weather', {})).to eq(result)
-        expect(log_output.string).not_to include('output schema')
+        expect(log_output.string).to include('does not match its output schema')
       end
 
       it 'does not require structuredContent on error results' do

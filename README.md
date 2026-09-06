@@ -379,10 +379,12 @@ data = result['structuredContent']  # Type-safe structured data
 # themselves evaluated, collected through every $ref/allOf/anyOf/oneOf/
 # if-then-else/dependentSchemas that passed — never from a cousin). A
 # $dynamicRef or $recursiveRef that names no dynamic anchor is the plain
-# reference it resolves to and is applied as one. What is NOT evaluated is a
-# dynamic reference the dynamic scope could re-bind (a $dynamicRef to a
-# $dynamicAnchor, a $recursiveRef to a $recursiveAnchor: true), which needs a
-# scope this client does not track, and the two keywords that only annotate
+# reference it resolves to and is applied as one; one that does binds to the
+# outermost dynamic scope declaring the anchor — the root resource where it
+# declares it (the recursive-tree shape), else the one resource that does.
+# What is NOT evaluated is a dynamic reference several non-root resources
+# could bind (only the evaluation path could choose, which this client does
+# not track), and the two keywords that only annotate
 # (format, contentSchema). When a schema uses one of those, call_tool logs a
 # "validation is partial" warning naming them (in both modes), since data may
 # pass this check that a full validator would reject; an unevaluated keyword

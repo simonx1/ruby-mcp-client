@@ -236,10 +236,21 @@ RSpec.describe 'MCP 2026-07-28 JSON Schema unevaluated keywords (round 31)' do
       expect_verdicts(schema, valid: [3], invalid: [0, 6])
     end
 
-    it 'keeps a $dynamicRef that a dynamic anchor could re-bind out of reach, and says so' do
+    it 'binds a $dynamicRef to the dynamic anchor its root resource declares' do
       dynamic = { '$dynamicRef' => '#node', '$defs' => { 'n' => { '$dynamicAnchor' => 'node', 'type' => 'integer' } } }
+      expect(validator.unsupported_keywords(dynamic)).to be_empty
+      expect_verdicts(dynamic, valid: [1], invalid: ['bad'])
+    end
+
+    it 'keeps a $dynamicRef that several non-root resources could bind out of reach, and says so' do
+      dynamic = { '$ref' => 'https://example.com/a',
+                  '$defs' => { 'a' => { '$id' => 'https://example.com/a', '$dynamicAnchor' => 'node',
+                                        'type' => 'object',
+                                        'properties' => { 'child' => { '$dynamicRef' => '#node' } } },
+                               'b' => { '$id' => 'https://example.com/b', '$dynamicAnchor' => 'node',
+                                        'type' => 'string' } } }
       expect(validator.unsupported_keywords(dynamic)).to contain_exactly('$dynamicRef')
-      expect(validator.validate('bad', { 'not' => dynamic })).to be_empty
+      expect(validator.validate({ 'child' => 1 }, { 'not' => dynamic })).to be_empty
     end
 
     it 'applies a 2019-09 $recursiveRef whose target has no true $recursiveAnchor as a $ref' do
@@ -250,7 +261,9 @@ RSpec.describe 'MCP 2026-07-28 JSON Schema unevaluated keywords (round 31)' do
 
       dynamic = { '$schema' => draft2019, '$recursiveAnchor' => true, 'type' => 'object',
                   'properties' => { 'child' => { '$recursiveRef' => '#' } } }
-      expect(validator.unsupported_keywords(dynamic)).to contain_exactly('$recursiveRef')
+      # The root's own $recursiveAnchor is the outermost one there is.
+      expect(validator.unsupported_keywords(dynamic)).to be_empty
+      expect_verdicts(dynamic, valid: [{ 'child' => {} }], invalid: [{ 'child' => 1 }])
     end
   end
 
@@ -316,7 +329,11 @@ RSpec.describe 'MCP 2026-07-28 JSON Schema unevaluated keywords (round 31)' do
     end
 
     it 'still refuses, in :strict mode, a schema whose dynamic reference it cannot follow' do
-      dynamic = { '$dynamicRef' => '#node', '$defs' => { 'n' => { '$dynamicAnchor' => 'node', 'type' => 'object' } } }
+      dynamic = { '$ref' => 'https://example.com/a', 'type' => 'object',
+                  '$defs' => { 'a' => { '$id' => 'https://example.com/a', '$dynamicAnchor' => 'node',
+                                        'type' => 'object', 'properties' => { 'id' => { '$dynamicRef' => '#node' } } },
+                               'b' => { '$id' => 'https://example.com/b', '$dynamicAnchor' => 'node',
+                                        'type' => 'string' } } }
       client = client_over(stub_server(dynamic, conforming), :strict)
 
       expect { client.call_tool('t', {}) }

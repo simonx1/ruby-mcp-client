@@ -155,6 +155,11 @@ module MCPClient
 
         target = resolve_reference(ctx.root, ref, ctx.dialect, ctx, from: app.schema)
         return ref_problem(app, "unresolvable local #{keyword} #{clip(ref.inspect)}") if target.equal?(UNRESOLVED)
+
+        if keyword != '$ref'
+          kind, bound = dynamic_binding(app.schema, keyword, ctx.root, ctx.dialect, ctx)
+          target = bound if kind == :bound
+        end
         unless schema_value?(target)
           return ref_problem(app, "#{keyword} #{clip(ref.inspect)} does not point at a schema")
         end
@@ -392,16 +397,18 @@ module MCPClient
         end
       end
 
-      # if / then / else. An `if` without `then` or `else` asserts nothing
-      # (JSON Schema 2020-12 Section 10.2.2.1) and is not evaluated; an
-      # undecided condition applies neither branch, but may still be settled
-      # by the branches agreeing ({#unconditional_conditional}). A condition
-      # that passed evaluated the value, and so does the branch applied.
+      # if / then / else. An `if` asserts nothing by itself, but it is
+      # evaluated even without `then` or `else`: the annotations of a
+      # condition that passed are what an `unevaluated*` beside it reads
+      # (JSON Schema 2020-12 Section 10.2.2.1). An undecided condition
+      # applies neither branch, but may still be settled by the branches
+      # agreeing ({#unconditional_conditional}). A condition that passed
+      # evaluated the value, and so does the branch applied.
       # @param app [Application]
       # @return [Array] a step
       def compose_conditional(app, &cont)
         schema = app.schema
-        return cont.call unless schema.key?('if') && (schema.key?('then') || schema.key?('else'))
+        return cont.call unless schema.key?('if')
 
         branch_verdict(app, schema['if']) do |verdict, evaluated|
           branch = { pass: 'then', fail: 'else' }[verdict]

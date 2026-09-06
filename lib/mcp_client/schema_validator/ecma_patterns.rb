@@ -105,6 +105,7 @@ module MCPClient
         scan[:order] = count_capture_groups(chars)
         scan[:groups] = scan[:order].length
         scan[:names] = scan[:order].compact
+        scan[:generated] = generated_name_prefix(scan[:names])
         while scan[:index] < chars.length
           note_translation_progress(scan)
           chars[scan[:index]] == '[' ? copy_character_class(scan) : copy_ecma_token(scan)
@@ -157,7 +158,18 @@ module MCPClient
       # @param number [Integer] the group's number, from 1
       # @return [String]
       def group_name_for(scan, number)
-        scan[:order][number - 1] || "__mcp_g#{number}"
+        scan[:order][number - 1] || "#{scan[:generated]}#{number}"
+      end
+
+      # A prefix for the generated names that none of the pattern's own
+      # names begins with, so a written `(?<__mcp_g1>` can never be the
+      # group a numeric back-reference is rewritten to name.
+      # @param names [Array<String>] the names the pattern wrote
+      # @return [String]
+      def generated_name_prefix(names)
+        prefix = +'__mcp_g'
+        prefix << '_' while names.any? { |name| name.start_with?(prefix) }
+        prefix
       end
 
       # The name of a `(?<name>` group opening at the index of its `<`.

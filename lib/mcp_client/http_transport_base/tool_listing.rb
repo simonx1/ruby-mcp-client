@@ -41,7 +41,7 @@ module MCPClient
       # @param params [Hash] the tools/call params being re-sent
       # @return [void]
       # @raise [MCPClient::Errors::ValidationError] when the refreshed input
-      #   schema declares a dialect this client does not implement
+      #   or output schema declares a dialect this client does not implement
       def reject_unreadable_refreshed_schema!(params)
         return unless params.is_a?(Hash)
 
@@ -51,13 +51,19 @@ module MCPClient
         # ({#mcp_param_headers} takes it): a second lookup could bring
         # another, unchecked one.
         pin_retry_definition(name, tool)
-        dialect = tool && MCPClient::SchemaValidator.unsupported_dialect(tool.schema)
-        return unless dialect
+        return unless tool
 
-        raise MCPClient::Errors::ValidationError,
-              "Tool #{sanitize_log_text(name.inspect)} input schema declares the JSON Schema dialect " \
-              "#{sanitize_log_text(dialect.inspect)[0, 128]}: that dialect is not supported " \
-              "(supported: #{MCPClient::SchemaValidator::SUPPORTED_DIALECTS.join(', ')})"
+        # Both schemas: a tool run under an output dialect nothing here can
+        # read would only be refused after it ran.
+        { 'input' => tool.schema, 'output' => tool.output_schema }.each do |side, schema|
+          dialect = schema.is_a?(Hash) && MCPClient::SchemaValidator.unsupported_dialect(schema)
+          next unless dialect
+
+          raise MCPClient::Errors::ValidationError,
+                "Tool #{sanitize_log_text(name.inspect)} #{side} schema declares the JSON Schema dialect " \
+                "#{sanitize_log_text(dialect.inspect)[0, 128]}: that dialect is not supported " \
+                "(supported: #{MCPClient::SchemaValidator::SUPPORTED_DIALECTS.join(', ')})"
+        end
       end
 
       # The Mcp-Param-* headers for a tools/call request (MCP 2026-07-28

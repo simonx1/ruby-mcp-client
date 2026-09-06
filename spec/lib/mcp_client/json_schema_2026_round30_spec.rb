@@ -301,8 +301,16 @@ RSpec.describe 'MCP 2026-07-28 JSON Schema handling — round 30' do
       end
 
       it 'refuses the dynamic references it does not evaluate the same way, and only those' do
-        [{ '$dynamicRef' => '#node', '$defs' => { 'n' => { '$dynamicAnchor' => 'node', 'type' => 'object' } } },
-         { '$schema' => draft2019, '$recursiveAnchor' => true, 'type' => 'object', '$recursiveRef' => '#' }]
+        # Several non-root resources declare the anchor: only the evaluation
+        # path could choose the binding, which is the one case left unevaluated.
+        two = { 'a' => { '$id' => 'https://example.com/a', '$dynamicAnchor' => 'node', 'type' => 'object',
+                         'properties' => { 'id' => { '$dynamicRef' => '#node' } } },
+                'b' => { '$id' => 'https://example.com/b', '$dynamicAnchor' => 'node', 'type' => 'string' } }
+        recursive = { 'a' => { '$id' => 'https://example.com/ra', '$recursiveAnchor' => true, 'type' => 'object',
+                               'properties' => { 'id' => { '$recursiveRef' => '#' } } },
+                      'b' => { '$id' => 'https://example.com/rb', '$recursiveAnchor' => true, 'type' => 'string' } }
+        [{ '$ref' => 'https://example.com/a', 'type' => 'object', '$defs' => two },
+         { '$schema' => draft2019, '$ref' => 'https://example.com/ra', 'type' => 'object', '$defs' => recursive }]
           .each do |schema|
           client = client_over(stub_server(schema, leak), :strict)
           expect { client.call_tool('t', {}) }

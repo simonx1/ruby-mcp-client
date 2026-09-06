@@ -1129,6 +1129,12 @@ module MCPClient
       raise MCPClient::Errors::ValidationError, "Missing required parameters: #{missing.join(', ')}"
     end
 
+    # @param result [Hash] a tool result
+    # @return [Symbol, String, nil] the key its structuredContent sits under
+    def structured_content_key(result)
+      [:structuredContent, 'structuredContent'].find { |k| result.key?(k) }
+    end
+
     # Validate a tools/call result's structuredContent against the tool's
     # declared outputSchema (MCP 2025-11-25 server/tools spec: "Clients SHOULD
     # validate structured results against this schema"; a tool declaring an
@@ -1153,7 +1159,10 @@ module MCPClient
       # A dialect this client cannot read is an error for every result, an
       # error result included (the MUST is not limited to successful ones).
       reject_unsupported_dialect!(tool, output_schema_state(tool), 'output')
-      return result if result['isError'] || result[:isError]
+      # An error result may carry no structuredContent at all; one that does
+      # is bound by the output schema like any other (the tools specification
+      # exempts nothing about error results), so what is there is checked.
+      return result if (result['isError'] || result[:isError]) && !structured_content_key(result)
       # An unfinished result (MCP 2026-07-28 resultType "input_required") is
       # not a successful one either: it carries the continuation instead of
       # the tool's output. Checking it for structuredContent would fail the
@@ -1171,7 +1180,7 @@ module MCPClient
       # array, a string, a number, a boolean — is what it was there: no
       # structured content at all. The widening is a 2026-07-28 rule and does
       # not reach back over a legacy session.
-      key = [:structuredContent, 'structuredContent'].find { |k| result.key?(k) }
+      key = structured_content_key(result)
       key = nil if key && !result[key].is_a?(Hash) && legacy_server?(tool.server)
       unless key
         handle_structured_content_violation(
@@ -1337,7 +1346,7 @@ module MCPClient
     end
 
     # :strict is a gate. A schema using an assertion this validator does not
-    # evaluate (a dynamic reference the dynamic scope could re-bind) cannot
+    # evaluate (a dynamic reference only the evaluation path could bind) cannot
     # be shown to accept the result, and a result not shown to conform is
     # refused there — a warning beside a returned value was a silent pass in
     # everything but the log. A keyword that only annotates (`format`,
