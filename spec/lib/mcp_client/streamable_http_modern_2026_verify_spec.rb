@@ -610,7 +610,10 @@ RSpec.describe 'MCP 2026-07-28 Streamable HTTP modern mode — verification' do
 
         sleep 0.01
       end
-      expect(get_stub).to have_been_requested
+      # At least once: what this pins is that a legacy session opens the
+      # stream at all. The thread re-opens it when the server refuses the
+      # GET, so an exact count would only be pinning the scheduler.
+      expect(get_stub).to have_been_requested.at_least_once
     end
   end
 
