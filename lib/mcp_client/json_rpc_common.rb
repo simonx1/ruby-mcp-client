@@ -585,25 +585,22 @@ module MCPClient
     # @param result [Hash] the DiscoverResult
     # @return [void]
     def record_discovery_freshness(result)
-      @discovery_expires_at = discovery_clock + discovery_ttl_seconds(result['ttlMs'])
+      # One reading of ttlMs for every cached result, on one clock, so
+      # cache_info(:discover) and this decision never disagree: a JSON number
+      # of milliseconds; zero is immediately stale, and a negative, absent or
+      # malformed hint is treated as zero (a DiscoverResult without a hint is
+      # re-read on the next access that needs it).
+      @discovery_expires_at = discovery_clock + (MCPClient::CachedResult.normalize_ttl(result['ttlMs']) / 1000.0)
       scope = result['cacheScope']
       @discovery_cache_scope = scope.is_a?(String) ? scope : nil
     end
 
-    # The freshness a ttlMs hint grants, by the caching rules: a JSON number
-    # (an Integer or a Float on the wire) of milliseconds; zero is
-    # immediately stale, and a negative, absent or malformed hint SHOULD be
-    # treated as zero.
-    # @param ttl [Object] the ttlMs member
-    # @return [Float] seconds of freshness
-    def discovery_ttl_seconds(ttl)
-      return 0.0 unless ttl.is_a?(Numeric) && ttl.finite? && ttl.positive?
-
-      ttl / 1000.0
-    end
-
-    # @return [Float] the monotonic clock, in seconds, discovery freshness is judged by
+    # @return [Float] the monotonic clock, in seconds, discovery freshness is
+    #   judged by: the transport's own when it has one (the one its cache
+    #   entries are dated by), the process clock otherwise
     def discovery_clock
+      return monotonic_now if respond_to?(:monotonic_now, true)
+
       Process.clock_gettime(Process::CLOCK_MONOTONIC)
     end
 

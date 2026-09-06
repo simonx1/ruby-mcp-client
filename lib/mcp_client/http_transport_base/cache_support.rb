@@ -123,21 +123,11 @@ module MCPClient
           state = env.request.context
           return unless inner && state.is_a?(Hash)
 
-          state[:mcp_response_id] = request_id_of(env.body)
           env.request.on_data = lambda do |chunk, size, data_env|
             arrived = @transport.send(:monotonic_now)
             inner.call(chunk, size, data_env)
             env[RESPONSE_RECEIVED_AT_KEY] ||= arrived if state[:mcp_response_seen]
           end
-        end
-
-        # @param body [String, nil] the serialized JSON-RPC request
-        # @return [Integer, String, nil] the request's id
-        def request_id_of(body)
-          message = JSON.parse(body.to_s)
-          message['id'] if message.is_a?(Hash)
-        rescue JSON::ParserError
-          nil
         end
       end
 

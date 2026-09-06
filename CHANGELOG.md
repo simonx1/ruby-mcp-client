@@ -7,6 +7,22 @@ metadata). Each feature lands in its own PR; this section accumulates them.
 
 ### Cacheable results (`ttlMs` / `cacheScope`)
 
+- **A streamed result is dated from the chunk that completed it, a stale
+  `server/discover` is refreshed on every transport, and an empty unhinted list
+  is asked for again on HTTP (round 39).** A response read as a stream was
+  dated from its first chunk, which may be a keep-alive or a progress
+  notification rather than the result, so a slow read with a short `ttlMs`
+  could be stale before its result arrived; the receipt is now the arrival of
+  the chunk that completed the answer. The capability gate re-fetches a
+  `server/discover` result whose `ttlMs` has elapsed before refusing a
+  capability on the HTTP transports as it already did on stdio, and both judge
+  freshness by the one rule every cached result uses (a negative or malformed
+  hint is stale at once; a missing one keeps the negotiated result in force
+  until the next probe) on the transport's own clock, so `cache_info(:discover)`
+  never disagrees with the decision. An empty list an older server put no hint
+  on is asked for again on the HTTP transports, as the client's own cache and
+  the stdio transport already did, instead of being kept for the life of the
+  connection. The stale-list fallback is documented as the HTTP transports'.
 - **A read is keyed by the URI its request went out with, whatever the host
   does to the string it passed (round 38).** The cache key was taken from the
   caller's string on entry while the request carrying it was serialized later,

@@ -522,7 +522,8 @@ module MCPClient
       # ResponseBodyCapture fills this in as the body arrives, so the bytes
       # that made it are still here when Faraday raises instead of returning.
       capture = { mcp_body_buffer: +'', mcp_deadline: deadline,
-                  mcp_stream_listener: response_stream_listener(request), mcp_inflate_limit: inflate_limit }
+                  mcp_stream_listener: response_stream_listener(request), mcp_inflate_limit: inflate_limit,
+                  mcp_response_id: (request['id'] if request.is_a?(Hash)) }
 
       begin
         response = with_request_watchdog(deadline) do

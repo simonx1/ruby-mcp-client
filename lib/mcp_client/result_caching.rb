@@ -198,8 +198,11 @@ module MCPClient
     # 2026-07-28 server, and the entry remembers the authorization context
     # of the request that produced it (transports that know it).
     # @return [MCPClient::CachedResult]
-    def cache_entry_for(result, value, now:)
-      entry = MCPClient::CachedResult.from_result(result, value, now: now, assume_zero: assume_zero_ttl?)
+    # @param assume_zero [Boolean] treat an absent ttlMs as 0; not for a
+    #   DiscoverResult, which is the session's negotiated state and stays in
+    #   force until the next probe when it carries no hint
+    def cache_entry_for(result, value, now:, assume_zero: assume_zero_ttl?)
+      entry = MCPClient::CachedResult.from_result(result, value, now: now, assume_zero: assume_zero)
       bind_authorization_context(entry)
     end
 
@@ -478,7 +481,12 @@ module MCPClient
       entry = private_entry_for_current_context(kind)
       if entry.nil?
         note_legacy_served(kind)
-        return block_given? ? yield : nil
+        # The transport's own copy stands in for a list an older server put
+        # no hint on -- unless it is empty: an empty unhinted list is asked
+        # for again, the way the client's own cache treats it, rather than
+        # kept for the life of the connection.
+        copy = block_given? ? yield : nil
+        return empty_list_copy?(copy) ? nil : copy
       end
       # An invalidation (a list_changed notification, a cleanup) that lands
       # after the lookup — the authorization probe makes that a wide window —
@@ -487,6 +495,10 @@ module MCPClient
       # holds and still fresh.
       copy = cache_entries_mutex.synchronize do
         next nil unless cache_entries[kind].equal?(entry) && entry.value && entry.fresh?(now: monotonic_now)
+        # An empty list an older server put no hint on (an entry kept until
+        # a change notification) is asked for again, the way the client's
+        # own cache treats it, rather than kept for the life of the connection.
+        next nil if entry.ttl_ms.nil? && empty_list_copy?(entry.value)
 
         MCPClient::DeepCopy.copy(entry.value)
       end
@@ -495,6 +507,17 @@ module MCPClient
       release_serving_request_meta
       note_served_entry(kind, entry)
       copy
+    end
+
+    # @param copy [Object, nil] a transport's own copy of a list
+    # @return [Boolean] whether it lists nothing (an Array, or a page Hash
+    #   whose list member is empty)
+    def empty_list_copy?(copy)
+      case copy
+      when Array then copy.empty?
+      when Hash then copy.values.any?(Array) && copy.values.grep(Array).all?(&:empty?)
+      else false
+      end
     end
 
     # The list recorded for a kind whatever its freshness: the candidate for

@@ -57,6 +57,10 @@ RSpec.describe 'MCP 2026-07-28 cacheable results — round 39' do
     "event: message\ndata: #{JSON.generate(message)}\n\n"
   end
 
+  def tool(name)
+    { 'name' => name, 'inputSchema' => { 'type' => 'object' } }
+  end
+
   describe 'a response read as a stream, chunk by chunk' do
     def replies_for(reads)
       lambda do |request|
@@ -241,6 +245,157 @@ RSpec.describe 'MCP 2026-07-28 cacheable results — round 39' do
 
       expect(reads[:count]).to eq(1)
       expect(server.cache_info(:read, 'file:///empty')).to include(ttl_ms: 60_000, fresh: true)
+    ensure
+      server&.cleanup
+    end
+  end
+
+  describe 'a stale server/discover result' do
+    # The probe answers without completions and a short TTL; every later
+    # discover declares completions.
+    def stub_discover(ttl_ms:, later_capabilities:)
+      counts = Hash.new(0)
+      stub_request(:post, url).to_return do |request|
+        body = JSON.parse(request.body)
+        counts[body['method']] += 1
+        case body['method']
+        when 'server/discover'
+          capabilities = counts['server/discover'] == 1 ? { 'tools' => {} } : later_capabilities
+          json_response(body['id'], { 'resultType' => 'complete', 'supportedVersions' => ['2026-07-28'],
+                                      'capabilities' => capabilities, 'ttlMs' => ttl_ms, 'cacheScope' => 'public' })
+        when 'completion/complete'
+          json_response(body['id'], { 'completion' => { 'values' => ['x'] } })
+        else json_response(body['id'], {})
+        end
+      end
+      counts
+    end
+
+    it 'is refreshed once its ttlMs has elapsed before a capability it lacked is refused, on Streamable HTTP' do
+      clock = { now: 10.0 }
+      counts = stub_discover(ttl_ms: 500, later_capabilities: { 'tools' => {}, 'completions' => {} })
+      server = streamable
+      allow(server).to receive(:monotonic_now) { clock[:now] }
+      server.connect
+      expect(server.cache_info(:discover)).to include(ttl_ms: 500, fresh: true)
+
+      # Still fresh: the capability the stale-to-be result lacks is refused
+      # without another probe.
+      expect do
+        server.complete(ref: { 'type' => 'ref/prompt', 'name' => 'p' }, argument: { 'name' => 'a', 'value' => '' })
+      end
+        .to raise_error(MCPClient::Errors::CapabilityError)
+      expect(counts['server/discover']).to eq(1)
+
+      clock[:now] += 1.0
+      expect(server.cache_info(:discover)[:fresh]).to be(false)
+      values = server.complete(ref: { 'type' => 'ref/prompt', 'name' => 'p' },
+                               argument: { 'name' => 'a', 'value' => '' })
+      expect(values['values']).to eq(['x'])
+      expect(counts['server/discover']).to eq(2)
+      expect(counts['completion/complete']).to eq(1)
+    ensure
+      server&.cleanup
+    end
+
+    it 'is refreshed once, and the refusal stands when the fresh result lacks the capability too' do
+      clock = { now: 10.0 }
+      counts = stub_discover(ttl_ms: 500, later_capabilities: { 'tools' => {} })
+      server = plain_http
+      allow(server).to receive(:monotonic_now) { clock[:now] }
+      server.connect
+      clock[:now] += 1.0
+
+      expect do
+        server.complete(ref: { 'type' => 'ref/prompt', 'name' => 'p' }, argument: { 'name' => 'a', 'value' => '' })
+      end
+        .to raise_error(MCPClient::Errors::CapabilityError)
+      expect(counts['server/discover']).to eq(2)
+      expect(counts['completion/complete']).to eq(0)
+    ensure
+      server&.cleanup
+    end
+
+    # One rule for every reading of the hint, on one clock, so the freshness
+    # the capability gate acts on is the one cache_info(:discover) reports.
+    it 'is judged by the same rule and clock as cache_info(:discover), on stdio' do
+      clock = { now: 50.0 }
+      server = MCPClient::ServerStdio.new(command: 'echo test')
+      allow(server).to receive(:monotonic_now) { clock[:now] }
+      discover = { 'resultType' => 'complete', 'supportedVersions' => ['2026-07-28'], 'capabilities' => {} }
+
+      server.send(:apply_discover_result, discover.merge('ttlMs' => -1))
+      expect(server.cache_info(:discover)[:fresh]).to be(false)
+      expect(server.send(:discovery_fresh?)).to be(false)
+
+      server.send(:apply_discover_result, discover.merge('ttlMs' => 1500.5))
+      expect(server.cache_info(:discover)).to include(ttl_ms: 1500.5, fresh: true)
+      expect(server.send(:discovery_fresh?)).to be(true)
+      clock[:now] += 1.6
+      expect(server.cache_info(:discover)[:fresh]).to be(false)
+      expect(server.send(:discovery_fresh?)).to be(false)
+
+      # No hint: the negotiated result is in force until the next probe.
+      server.send(:apply_discover_result, discover)
+      expect(server.cache_info(:discover)).to include(ttl_ms: nil, fresh: true)
+      expect(server.send(:discovery_fresh?)).to be(true)
+      clock[:now] += 1_000_000
+      expect(server.cache_info(:discover)[:fresh]).to be(true)
+      expect(server.send(:discovery_fresh?)).to be(true)
+    end
+  end
+
+  describe 'an expired list whose re-fetch fails on the SSE transport' do
+    it 'raises rather than serving the stale copy, which is the HTTP transports\' fallback' do
+      clock = { now: 0.0 }
+      server = MCPClient::ServerSSE.new(base_url: 'https://example.com/sse', retries: 0)
+      allow(server).to receive(:monotonic_now) { clock[:now] }
+      allow(server).to receive(:ensure_initialized)
+      server.instance_variable_set(:@protocol_version, '2025-11-25')
+      lists = 0
+      allow(server).to receive(:rpc_request).with('tools/list', anything) do
+        lists += 1
+        raise MCPClient::Errors::TransientServerError, 'HTTP 503' if lists > 1
+
+        { 'tools' => [{ 'name' => 'old', 'inputSchema' => { 'type' => 'object' } }], 'ttlMs' => 1_000 }
+      end
+
+      expect(server.list_tools.map(&:name)).to eq(['old'])
+      clock[:now] += 2
+      expect { server.list_tools }.to raise_error(MCPClient::Errors::MCPError)
+      expect(lists).to eq(2)
+    end
+  end
+
+  describe 'an empty list an older server put no hint on' do
+    def stub_legacy_lists(tools_by_call)
+      lists = { count: 0 }
+      stub_request(:post, url).to_return do |request|
+        body = JSON.parse(request.body)
+        case body['method']
+        when 'server/discover' then { status: 404, body: '' }
+        when 'initialize'
+          json_response(body['id'], { 'protocolVersion' => '2025-11-25', 'capabilities' => { 'tools' => {} },
+                                      'serverInfo' => { 'name' => 'legacy', 'version' => '1' } })
+        when 'tools/list'
+          lists[:count] += 1
+          json_response(body['id'], { 'tools' => tools_by_call.call(lists[:count]) })
+        else { status: 202, body: '' }
+        end
+      end
+      lists
+    end
+
+    it 'is asked for again on the next call, while a non-empty one is kept until a change notification' do
+      lists = stub_legacy_lists(->(n) { n < 3 ? [] : [tool('late')] })
+      server = streamable
+
+      expect(server.list_tools).to eq([])
+      expect(server.list_tools).to eq([])
+      expect(lists[:count]).to eq(2)
+      expect(server.list_tools.map(&:name)).to eq(['late'])
+      expect(server.list_tools.map(&:name)).to eq(['late'])
+      expect(lists[:count]).to eq(3)
     ensure
       server&.cleanup
     end

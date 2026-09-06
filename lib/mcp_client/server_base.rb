@@ -147,6 +147,16 @@ module MCPClient
     # @param method [String] the JSON-RPC method the caller wants to send
     # @raise [MCPClient::Errors::CapabilityError]
     def require_capability!(*path, method:)
+      # A DiscoverResult whose ttlMs has elapsed is re-fetched on the next
+      # use of what it declared (MCP 2026-07-28 caching: a stale result is
+      # re-fetched on access) BEFORE the capability is judged at all: the
+      # server may have enabled a capability the stale result lacked, or
+      # withdrawn one it still lists. A result that carried no hint, or a
+      # zero, negative or malformed one, is stale at once.
+      if respond_to?(:modern?, true) && modern? && respond_to?(:discovery_fresh?, true) && !discovery_fresh?
+        @logger&.debug("The server/discover result is stale; refreshing it before #{method}")
+        rpc_request('server/discover')
+      end
       return if capability?(*path)
 
       raise MCPClient::Errors::CapabilityError,

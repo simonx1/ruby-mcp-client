@@ -969,9 +969,14 @@ Two rules follow the protocol rather than the cache:
   or `list_resource_templates(cursor:)` raises — after the first page cached
   under the dead cursor has been discarded, so the next call really re-fetches.
 
-A re-fetch that fails for a transient reason may serve the stale copy ("Clients
-MAY serve stale responses if errors occur during re-fetching"); an
-authorization failure never does, so it reaches your auth flow instead.
+A re-fetch of a list that fails for a transient reason may serve the stale copy
+on the HTTP transports ("Clients MAY serve stale responses if errors occur
+during re-fetching"); the SSE and stdio transports raise instead, and an
+authorization failure never serves a stale copy, so it reaches your auth flow.
+
+A `server/discover` result is the session's negotiated state: with a `ttlMs`
+it is re-fetched once that has elapsed and a capability it lacked is asked
+for, on every transport; without one it stays in force until the next probe.
 
 ## Server Notifications
 

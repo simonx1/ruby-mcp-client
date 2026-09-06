@@ -954,23 +954,6 @@ module MCPClient
       # @raise [MCPClient::Errors::ServerError] if server returns an error
       # @raise [MCPClient::Errors::TransportError] on transport errors
       # @raise [MCPClient::Errors::ToolCallError] on tool call errors
-      # Like {ServerBase#require_capability!}, except that a modern server's
-      # capabilities come from a DiscoverResult with a freshness hint: one
-      # whose ttlMs has elapsed (a zero ttlMs is "immediately stale") is
-      # refreshed on the next access before the capability is judged at all
-      # (server/utilities/caching) — the server may have enabled the
-      # capability since, or withdrawn one the stale result still lists.
-      # @param path [Array<String, Symbol>] capability key path
-      # @param method [String] the JSON-RPC method the caller wants to send
-      # @raise [MCPClient::Errors::CapabilityError]
-      def require_capability!(*path, method:)
-        if modern? && !discovery_fresh?
-          @logger.debug("The server/discover result is stale; refreshing it before #{method}")
-          rpc_request('server/discover')
-        end
-        super
-      end
-
       def rpc_request(method, params = {}, timeout: nil)
         freshly_probed = !@initialized || transport_retired?
         ensure_initialized

@@ -59,6 +59,17 @@ RSpec.describe 'MCP 2026-07-28 cacheable results' do
       expect(combined.fresh?(now: 0.9)).to be(true)
       expect(combined.fresh?(now: 1.1)).to be(false)
     end
+
+    it 'combines pages by what remains of each TTL, not by the hints as written' do
+      # The first page arrived 1.5 s before the last: 500 ms of its 2 s are
+      # left, less than the second page's whole minute.
+      first = described_class.from_result({ 'ttlMs' => 2_000, 'cacheScope' => 'public' }, nil, now: 0.0)
+      second = described_class.from_result({ 'ttlMs' => 60_000, 'cacheScope' => 'public' }, nil, now: 1.5)
+      combined = described_class.combine([first, second], :all, now: 1.5)
+      expect(combined.ttl_ms).to eq(500)
+      expect(combined.fresh?(now: 1.9)).to be(true)
+      expect(combined.fresh?(now: 2.1)).to be(false)
+    end
   end
 
   describe 'on Streamable HTTP' do
@@ -284,6 +295,8 @@ RSpec.describe 'MCP 2026-07-28 cacheable results' do
       fresh.cleanup
     end
 
+    # A list with something in it: an empty unhinted list is asked for again
+    # (round 39), the way the client's own cache treats it.
     it 'keeps caching until a notification for a legacy server (no ttlMs hint)' do
       counts = Hash.new(0)
       stub_request(:post, url).to_return do |request|
@@ -295,7 +308,8 @@ RSpec.describe 'MCP 2026-07-28 cacheable results' do
           json_response(body['id'], { 'protocolVersion' => '2025-11-25', 'capabilities' => { 'tools' => {} },
                                       'serverInfo' => { 'name' => 'l', 'version' => '1' } })
         when 'notifications/initialized' then { status: 202, body: '' }
-        when 'tools/list' then json_response(body['id'], { 'tools' => [] })
+        when 'tools/list'
+          json_response(body['id'], { 'tools' => [{ 'name' => 't', 'inputSchema' => { 'type' => 'object' } }] })
         end
       end
       stub_request(:get, url).to_return(status: 405, body: '')
