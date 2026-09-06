@@ -380,20 +380,20 @@ data = result['structuredContent']  # Type-safe structured data
 # if-then-else/dependentSchemas that passed — never from a cousin). A
 # $dynamicRef or $recursiveRef that names no dynamic anchor is the plain
 # reference it resolves to and is applied as one; one that does binds to the
-# outermost dynamic scope declaring the anchor — the root resource where it
-# declares it (the recursive-tree shape), else the one resource that does.
-# What is NOT evaluated is a dynamic reference several non-root resources
-# could bind (only the evaluation path could choose, which this client does
-# not track), and the two keywords that only annotate
+# outermost resource of the DYNAMIC SCOPE declaring that anchor — the
+# resources the evaluation actually entered, tracked as it enters them, so a
+# duplicate anchor in a resource the instance never enters decides nothing.
+# What is NOT evaluated is the two keywords that only annotate
 # (format, contentSchema). When a schema uses one of those, call_tool logs a
 # "validation is partial" warning naming them (in both modes), since data may
 # pass this check that a full validator would reject; an unevaluated keyword
-# is never read as a match for not/oneOf/if either. In strict mode a schema
-# using such a dynamic reference refuses the result with a ValidationError,
-# since it cannot be shown to conform; the two annotation-only keywords do
-# not. A pattern is bounded to 10,000 characters
-# and must be an ECMA-262 expression (Ruby-only syntax such as inline flags
-# or possessive quantifiers makes the schema unusable). By default a
+# is never read as a match for not/oneOf/if either. A pattern is bounded to
+# 10,000 characters and must be an ECMA-262 expression (Ruby-only syntax such
+# as inline flags or possessive quantifiers makes the schema unusable). Two
+# ECMA-262 constructs Ruby's engine cannot reproduce — a back-reference to a
+# group a quantifier repeats (ECMA-262 clears it at each iteration, Ruby
+# keeps it) and a variable-length lookbehind — make the schema unusable too,
+# rather than being answered under the other engine's rules. By default a
 # violation (mismatch, or missing structuredContent on a successful result)
 # logs a warning; opt in to strict mode to raise instead:
 client = MCPClient::Client.new(

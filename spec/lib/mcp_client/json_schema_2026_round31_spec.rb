@@ -242,14 +242,15 @@ RSpec.describe 'MCP 2026-07-28 JSON Schema unevaluated keywords (round 31)' do
       expect_verdicts(dynamic, valid: [1], invalid: ['bad'])
     end
 
-    it 'keeps a $dynamicRef that several non-root resources could bind out of reach, and says so' do
+    it 'binds a $dynamicRef by the resources the instance entered, not by the ones it did not' do
       dynamic = { '$ref' => 'https://example.com/a',
                   '$defs' => { 'a' => { '$id' => 'https://example.com/a', '$dynamicAnchor' => 'node',
                                         'type' => 'object',
                                         'properties' => { 'child' => { '$dynamicRef' => '#node' } } },
                                'b' => { '$id' => 'https://example.com/b', '$dynamicAnchor' => 'node',
                                         'type' => 'string' } } }
-      expect(validator.unsupported_keywords(dynamic)).to contain_exactly('$dynamicRef')
+      expect(validator.unsupported_keywords(dynamic)).to be_empty
+      expect_verdicts(dynamic, valid: [{ 'child' => {} }], invalid: [{ 'child' => 1 }])
       expect(validator.validate({ 'child' => 1 }, { 'not' => dynamic })).to be_empty
     end
 
@@ -328,16 +329,24 @@ RSpec.describe 'MCP 2026-07-28 JSON Schema unevaluated keywords (round 31)' do
         .to raise_error(MCPClient::Errors::ValidationError, /item 1 is not allowed \(unevaluatedItems/)
     end
 
-    it 'still refuses, in :strict mode, a schema whose dynamic reference it cannot follow' do
+    # The reference is evaluated now, so :strict gates on the verdict rather
+    # than refusing the schema: a conforming result passes, and one the
+    # binding rejects is refused for what is wrong with it.
+    it 'checks, in :strict mode, a result against the schema its dynamic reference binds to' do
       dynamic = { '$ref' => 'https://example.com/a', 'type' => 'object',
                   '$defs' => { 'a' => { '$id' => 'https://example.com/a', '$dynamicAnchor' => 'node',
                                         'type' => 'object', 'properties' => { 'id' => { '$dynamicRef' => '#node' } } },
                                'b' => { '$id' => 'https://example.com/b', '$dynamicAnchor' => 'node',
                                         'type' => 'string' } } }
-      client = client_over(stub_server(dynamic, conforming), :strict)
 
-      expect { client.call_tool('t', {}) }
-        .to raise_error(MCPClient::Errors::ValidationError, /does not evaluate.*\$dynamicRef/)
+      # `id` binds to the resource the evaluation entered, whose `type` is
+      # object: a nested object passes and the string `conforming` carries is
+      # refused for the type it is.
+      nested = { 'resultType' => 'complete', 'content' => [], 'structuredContent' => { 'id' => {} } }
+      expect(client_over(stub_server(dynamic, nested), :strict).call_tool('t', {})).to eq(nested)
+
+      expect { client_over(stub_server(dynamic, conforming), :strict).call_tool('t', {}) }
+        .to raise_error(MCPClient::Errors::ValidationError, /expected type object/)
     end
   end
 end

@@ -145,10 +145,9 @@ RSpec.describe 'MCP 2026-07-28 JSON Schema handling — round 2' do
 
     it 'reports draft-specific keywords it does not evaluate under the dialect that defines them' do
       draft7 = 'http://json-schema.org/draft-07/schema#'
-      # The draft-specific applicators are evaluated; only what needs the
-      # evaluation path to choose a binding is reported — a `$recursiveRef`
-      # several non-root resources could bind, never a root-anchored one nor
-      # the plain reference one without a `$recursiveAnchor: true` is.
+      # The draft-specific applicators are evaluated, the recursive reference
+      # among them: it binds against the dynamic scope, so nothing here is
+      # reported as beyond this validator.
       expect(validator.unsupported_keywords({ '$schema' => draft7, 'items' => [], 'additionalItems' => false }))
         .to eq([])
       expect(validator.unsupported_keywords({ '$schema' => draft7, 'dependencies' => {} })).to eq([])
@@ -159,7 +158,7 @@ RSpec.describe 'MCP 2026-07-28 JSON Schema handling — round 2' do
               'b' => { '$id' => 'https://example.com/rb', '$recursiveAnchor' => true, 'type' => 'string' } }
       expect(validator.unsupported_keywords({ '$schema' => validator::DRAFT_2019_09,
                                               '$ref' => 'https://example.com/ra', '$defs' => two }))
-        .to eq(['$recursiveRef'])
+        .to eq([])
       expect(validator.unsupported_keywords({ '$schema' => validator::DRAFT_2019_09, '$recursiveRef' => '#' }))
         .to eq([])
       expect(validator.unsupported_keywords({ '$schema' => validator::DRAFT_2019_09, 'allOf' => [true],

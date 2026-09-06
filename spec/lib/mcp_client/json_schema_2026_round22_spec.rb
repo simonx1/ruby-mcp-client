@@ -117,9 +117,11 @@ RSpec.describe 'MCP 2026-07-28 JSON Schema handling — round 22' do
   end
 
   describe 'a node whose own type already rejected the value' do
-    # Backtracking Ruby's regexp cache cannot flatten: matching it would
-    # burn the whole validation budget.
-    let(:evil_pattern) { '^(a*)*\1$' }
+    # Backtracking Ruby's regexp cache cannot flatten: matching it would burn
+    # the whole validation budget. The back-reference is to a group `?`
+    # quantifies, which repeats at most once, so it stays a pattern this
+    # validator translates.
+    let(:evil_pattern) { '^(x?)(a*)*\1$' }
     let(:evil_name) { "#{'a' * 17}!" }
 
     it 'spends nothing more on the keywords for the type it does not have' do

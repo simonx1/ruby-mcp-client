@@ -70,16 +70,11 @@ module MCPClient
           return queue_scan(scan, schema, depth, dialect, referenced, :each_definition)
         end
 
-        # A dynamic reference that names no dynamic anchor is the plain
-        # reference it resolves to: applied, and scanned like one.
-        dynamic, plain = DYNAMIC_REFERENCE_KEYWORDS.select { |k| schema.key?(k) && keyword_known?(k, dialect) }
-                                                   .partition do |k|
-          dynamic_reference?(schema, k, root, scan[:dialect], scan)
-        end
-        found.concat((schema.keys & UNSUPPORTED_KEYWORDS).select do |k|
-          keyword_known?(k, dialect) && (!DYNAMIC_REFERENCE_KEYWORDS.include?(k) || dynamic.include?(k))
-        end)
-        referenced = (['$ref'] + plain).filter_map { |k| referenced_position(schema, root, depth, scan, dialect, k) }
+        # A dynamic reference is applied like a `$ref` — where it binds is
+        # decided during evaluation — so it is scanned like one.
+        dynamic = DYNAMIC_REFERENCE_KEYWORDS.select { |k| schema.key?(k) && keyword_known?(k, dialect) }
+        found.concat((schema.keys & UNSUPPORTED_KEYWORDS).select { |k| keyword_known?(k, dialect) })
+        referenced = (['$ref'] + dynamic).filter_map { |k| referenced_position(schema, root, depth, scan, dialect, k) }
         queue_scan(scan, schema, depth, dialect, referenced, :each_subschema)
       end
 

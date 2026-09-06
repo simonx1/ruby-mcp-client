@@ -14,7 +14,10 @@ RSpec.describe 'MCP 2026-07-28 JSON Schema handling — round 21' do
   # Backtracking Ruby's regexp cache cannot flatten (the backreference
   # disables the memoization): a server-controlled expression like this one
   # must not be able to hold the calling thread past the deadline.
-  let(:evil_pattern) { '^(a*)*\1$' }
+  # The back-reference is to a group `?` quantifies, which repeats at most
+  # once, so it is a pattern this validator translates — and one Ruby's
+  # optimizer cannot flatten, so matching it burns the whole budget.
+  let(:evil_pattern) { '^(x?)(a*)*\1$' }
   let(:evil_name) { "#{'a' * 17}!" }
 
   def timed

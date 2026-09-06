@@ -300,22 +300,28 @@ RSpec.describe 'MCP 2026-07-28 JSON Schema handling — round 30' do
         expect(log_output.string).not_to include('validation is partial')
       end
 
-      it 'refuses the dynamic references it does not evaluate the same way, and only those' do
-        # Several non-root resources declare the anchor: only the evaluation
-        # path could choose the binding, which is the one case left unevaluated.
+      it 'checks a result against the schema each dynamic reference binds to' do
+        # The dynamic scope decides the binding, and `b` is never entered: the
+        # result is checked against `a`, which the leak violates.
         two = { 'a' => { '$id' => 'https://example.com/a', '$dynamicAnchor' => 'node', 'type' => 'object',
                          'properties' => { 'id' => { '$dynamicRef' => '#node' } } },
                 'b' => { '$id' => 'https://example.com/b', '$dynamicAnchor' => 'node', 'type' => 'string' } }
         recursive = { 'a' => { '$id' => 'https://example.com/ra', '$recursiveAnchor' => true, 'type' => 'object',
                                'properties' => { 'id' => { '$recursiveRef' => '#' } } },
                       'b' => { '$id' => 'https://example.com/rb', '$recursiveAnchor' => true, 'type' => 'string' } }
+        # `id` binds to `a` (an object), so the string the result carries is
+        # refused for what is wrong with it rather than for a keyword nothing
+        # evaluated.
         [{ '$ref' => 'https://example.com/a', 'type' => 'object', '$defs' => two },
          { '$schema' => draft2019, '$ref' => 'https://example.com/ra', 'type' => 'object', '$defs' => recursive }]
           .each do |schema|
-          client = client_over(stub_server(schema, leak), :strict)
-          expect { client.call_tool('t', {}) }
-            .to raise_error(MCPClient::Errors::ValidationError, /does not evaluate/), schema.inspect
+          expect { client_over(stub_server(schema, leak), :strict).call_tool('t', {}) }
+            .to raise_error(MCPClient::Errors::ValidationError, /expected type object/), schema.inspect
         end
+        # The same shape accepts what the binding admits.
+        nested = { 'resultType' => 'complete', 'content' => [], 'structuredContent' => { 'id' => {} } }
+        expect(client_over(stub_server({ '$ref' => 'https://example.com/a', 'type' => 'object', '$defs' => two },
+                                       nested), :strict).call_tool('t', {})).to eq(nested)
         # A pointer-form `$dynamicRef` and a `$recursiveRef` to a root without
         # `$recursiveAnchor` are the plain references they resolve to.
         [{ '$dynamicRef' => '#/$defs/n', '$defs' => { 'n' => { 'type' => 'object' } } },

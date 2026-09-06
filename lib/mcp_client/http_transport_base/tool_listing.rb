@@ -51,10 +51,21 @@ module MCPClient
         # ({#mcp_param_headers} takes it): a second lookup could bring
         # another, unchecked one.
         pin_retry_definition(name, tool)
+        reject_unreadable_tool_schema!(name, tool)
+      end
+
+      # Refuse a tool definition whose input or output schema declares a JSON
+      # Schema dialect this client cannot read, before the request it governs
+      # goes out: a tool run under an output dialect nothing here can read
+      # would only be refused after it ran, and the host would have paid for
+      # whatever it did.
+      # @param name [String] the tool name
+      # @param tool [MCPClient::Tool, nil] the definition the request goes out under
+      # @return [void]
+      # @raise [MCPClient::Errors::ValidationError]
+      def reject_unreadable_tool_schema!(name, tool)
         return unless tool
 
-        # Both schemas: a tool run under an output dialect nothing here can
-        # read would only be refused after it ran.
         { 'input' => tool.schema, 'output' => tool.output_schema }.each do |side, schema|
           dialect = schema.is_a?(Hash) && MCPClient::SchemaValidator.unsupported_dialect(schema)
           next unless dialect
@@ -84,8 +95,12 @@ module MCPClient
         tool = pinned ? pinned.first : known_tools_for_headers.find { |t| t.name.to_s == name }
         # The list the headers come from is the list this request goes out
         # under: a host re-resolving the tool after the call reads that
-        # definition back instead of asking for a possibly newer one.
+        # definition back instead of asking for a possibly newer one. It is
+        # also the definition the dialect guard has to read — this lookup may
+        # bring a newer one than the caller preflighted, and a pinned one has
+        # been checked already by the refresh that pinned it.
         note_called_tool_definition(name, tool)
+        reject_unreadable_tool_schema!(name, tool) unless pinned
         return {} unless tool
 
         MCPClient::HeaderParams.headers_for(tool.schema, params['arguments'] || params[:arguments])

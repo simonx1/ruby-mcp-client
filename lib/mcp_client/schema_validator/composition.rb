@@ -28,19 +28,15 @@ module MCPClient
       # 2020-12, `contentSchema`) decide nothing and leave the verdict whole;
       # draft-07 `format` asserts (Validation Section 7.2), and the validator
       # does not evaluate formats, so a string branch carrying one is
-      # undecided there.
+      # undecided there. Dynamic references are evaluated, against the
+      # dynamic scope, and leave no verdict partial.
       # @param schema [Hash] the schema object
       # @param dialect [String, nil] the dialect in force at it
       # @param data [Object] the instance
-      # @param ctx [Context] the validation context
+      # @param _ctx [Context] the validation context
       # @return [Boolean]
-      def partial_keywords?(schema, dialect, data, ctx)
-        return true if dialect == DRAFT_07 && data.is_a?(String) && schema.key?('format')
-
-        DYNAMIC_REFERENCE_KEYWORDS.any? do |keyword|
-          schema.key?(keyword) && keyword_known?(keyword, dialect) &&
-            dynamic_reference?(schema, keyword, ctx.root, ctx.dialect, ctx)
-        end
+      def partial_keywords?(schema, dialect, data, _ctx)
+        dialect == DRAFT_07 && data.is_a?(String) && schema.key?('format')
       end
 
       # The number of matching items `contains` requires: its companion

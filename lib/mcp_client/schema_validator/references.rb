@@ -366,83 +366,79 @@ module MCPClient
         resource_start?(schema)
       end
 
-      # Whether a dynamic reference is one this validator leaves unevaluated:
-      # one the dynamic scope would have to choose a binding for.
-      # @return [Boolean]
-      def dynamic_reference?(schema, keyword, root, dialect, resolver)
-        dynamic_binding(schema, keyword, root, dialect, resolver).first == :ambiguous
-      end
-
       # How a dynamic reference binds (JSON Schema 2020-12 Core Section
       # 8.2.3.2; 2019-09 Section 8.2.4.2.2). A reference whose initial
       # target declares no matching dynamic anchor is the plain reference it
-      # resolves to (`:plain`). One that does re-binds to the OUTERMOST
-      # dynamic scope declaring that anchor: the dynamic scope always starts
-      # at the root resource of the schema being applied, so where the root
-      # declares the anchor the binding is the root's, wherever the
-      # reference is met; and where exactly one resource declares it, that
-      # resource is the target the reference named (`:bound`, with the
-      # target). Only several non-root resources declaring the same dynamic
-      # anchor would need the evaluation path to choose (`:ambiguous`) — the
-      # one case left unevaluated, and reported as such.
+      # resolves to (`:plain`). One that does re-binds to the declaration in
+      # the OUTERMOST resource of the dynamic scope — the resources the
+      # evaluation entered on its way here, which {SchemaValidator.enter_scope}
+      # records as they are entered (`:bound`, with the target). What the
+      # document holds elsewhere decides nothing: a resource the instance
+      # never entered is not in the scope, so a duplicate anchor there is
+      # neither ambiguity nor a reason to leave the reference unevaluated.
+      # Outside a validation there is no scope to read, and every reference
+      # is the plain one it resolves to — which is what the preflight, whose
+      # job is that the reference resolves at all, needs.
       # @param schema [Hash] the schema object holding the reference
       # @param keyword [String] "$dynamicRef" or "$recursiveRef"
       # @param root [Hash] the root schema
       # @param dialect [String, nil] the canonical root dialect
-      # @param resolver [Hash, Context] holder of the memoized anchor index
-      # @return [Array] [:plain], [:bound, target] or [:ambiguous]
+      # @param resolver [Hash, Context] holder of the memoized anchor index,
+      #   and — during a validation — of the dynamic scope
+      # @return [Array] [:plain] or [:bound, target]
       def dynamic_binding(schema, keyword, root, dialect, resolver)
         ref = schema[keyword]
-        return [:ambiguous] unless ref.is_a?(String) && !external_ref?(ref, root, dialect, resolver, from: schema)
+        return [:plain] unless ref.is_a?(String) && !external_ref?(ref, root, dialect, resolver, from: schema)
 
         target = resolve_reference(root, ref, dialect, resolver, from: schema)
-        return [:ambiguous] if target.equal?(UNRESOLVED)
+        return [:plain] if target.equal?(UNRESOLVED)
         return [:plain] unless target.is_a?(Hash)
 
         index = resolver[:anchors]
-        candidates = if keyword == '$recursiveRef'
-                       return [:plain] unless target['$recursiveAnchor'] == true
+        scope = resolver[:scope]
+        bound = if keyword == '$recursiveRef'
+                  return [:plain] unless target['$recursiveAnchor'] == true
 
-                       recursive_anchor_resources(index, root, dialect)
-                     else
-                       fragment = ref.include?('#') ? decoded_fragment(ref[ref.index('#')..]) : nil
-                       return [:plain] if fragment.nil? || fragment.empty? || fragment.start_with?('/')
-                       return [:plain] unless target['$dynamicAnchor'] == fragment
+                  outermost_recursive_anchor(index, scope, dialect)
+                else
+                  fragment = ref.include?('#') ? decoded_fragment(ref[ref.index('#')..]) : nil
+                  return [:plain] if fragment.nil? || fragment.empty? || fragment.start_with?('/')
+                  return [:plain] unless target['$dynamicAnchor'] == fragment
 
-                       dynamic_anchor_declarations(index, fragment)
-                     end
-        bind_outermost(candidates, root)
+                  outermost_dynamic_anchor(index, scope, fragment)
+                end
+        bound ? [:bound, bound] : [:plain]
       end
 
-      # The resource roots whose `$recursiveAnchor` is true, as
-      # [resource, target] pairs (the target of a `$recursiveRef` is the
-      # resource root itself).
-      # @return [Array<Array(Hash, Hash)>]
-      def recursive_anchor_resources(index, root, dialect)
-        roots = ([root] + index[:by_base].values).uniq(&:object_id)
-        roots.select { |resource| resource.is_a?(Hash) && resource['$recursiveAnchor'] == true }
-             .reject { |resource| (index[:dialects][resource] || dialect) == DRAFT_07 }
-             .map { |resource| [resource, resource] }
-      end
-
-      # The resources declaring `$dynamicAnchor: name`, as [resource,
-      # declaring schema] pairs, in index order.
-      # @return [Array<Array(Hash, Hash)>]
-      def dynamic_anchor_declarations(index, name)
-        index[:anchors].filter_map do |resource, names|
-          declaring = names[name]
-          [resource, declaring] if declaring.is_a?(Hash) && declaring['$dynamicAnchor'] == name
+      # The schema declaring `$dynamicAnchor: name` in the outermost resource
+      # of the dynamic scope that declares it — the scope being the resources
+      # the evaluation actually entered, outermost first. A resource the
+      # instance never entered declares nothing for this reference, however
+      # many of them the document holds; and where no entered resource
+      # declares the name, the caller keeps the target the reference resolved
+      # to on its own, which is what the specification's "otherwise behave as
+      # $ref" says.
+      # @param index [Hash] the anchor index
+      # @param scope [Array<Hash>, nil] the dynamic scope, outermost first
+      # @param name [String] the anchor name
+      # @return [Hash, nil]
+      def outermost_dynamic_anchor(index, scope, name)
+        Array(scope).each do |resource|
+          declaring = index[:anchors][resource]&.[](name)
+          return declaring if declaring.is_a?(Hash) && declaring['$dynamicAnchor'] == name
         end
+        nil
       end
 
-      # @param candidates [Array<Array(Hash, Hash)>] [resource, target] pairs
-      # @return [Array] [:bound, target] or [:ambiguous]
-      def bind_outermost(candidates, root)
-        at_root = candidates.find { |resource, _| resource.equal?(root) }
-        return [:bound, at_root.last] if at_root
-        return [:bound, candidates.first.last] if candidates.size == 1
-
-        [:ambiguous]
+      # The outermost resource of the dynamic scope whose `$recursiveAnchor`
+      # is true (2019-09 Core Section 8.2.4.2.2); the target of a
+      # `$recursiveRef` is the resource root itself.
+      # @return [Hash, nil]
+      def outermost_recursive_anchor(index, scope, dialect)
+        Array(scope).find do |resource|
+          resource.is_a?(Hash) && resource['$recursiveAnchor'] == true &&
+            (index[:dialects][resource] || dialect) != DRAFT_07
+        end
       end
 
       # @return [Array<String>] the plain names a schema object declares

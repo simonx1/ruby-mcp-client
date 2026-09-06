@@ -22,6 +22,23 @@ module MCPClient
       # so every caller that rescues an unreadable expression sees it.
       class SyntaxError < RegexpError; end
 
+      # A pattern that IS an ECMA-262 expression but whose meaning Ruby's
+      # engine cannot be made to reproduce, so translating it would answer
+      # some instances wrongly. The two engines differ in two ways no
+      # rewriting bridges:
+      #
+      # - ECMA-262 clears the captures inside a quantified group at the start
+      #   of every iteration (a back-reference to a group the last iteration
+      #   did not enter matches the empty string); Ruby keeps whatever the
+      #   last iteration that entered it captured. `^(a|(b))*\2$` accepts
+      #   "aba" and refuses "abab" there, and exactly the opposite here.
+      # - ECMA-262 lookbehind is variable-length (ES2018); Ruby's is not.
+      #
+      # Refusing the schema is the only honest answer left: a verdict from
+      # the other engine's rules would accept structured content the schema
+      # forbids as readily as it would refuse conforming content.
+      class Untranslatable < RegexpError; end
+
       # What each ECMA-262 anchor means in Ruby: the ends of the subject,
       # never a line boundary.
       ECMA_ANCHORS = { '^' => '\\A', '$' => '\\z' }.freeze
@@ -81,9 +98,18 @@ module MCPClient
       # @param deadline [Float, nil] monotonic deadline the translation runs under
       # @return [Regexp]
       # @raise [RegexpError] when the pattern is not a usable expression
+      # @raise [Untranslatable] when it is one Ruby cannot reproduce
       # @raise [Aborted] when the deadline passes during the translation
       def ecma_regexp(pattern, timeout, deadline = nil)
         Regexp.new(ecma_source(pattern, deadline), timeout: timeout)
+      rescue RegexpError => e
+        # ECMA-262 lookbehind has been variable-length since ES2018 and
+        # Ruby's never has been: the pattern is a good expression this
+        # engine cannot be given, not a bad one.
+        raise Untranslatable, "variable-length lookbehind cannot be evaluated faithfully (#{e.message})" if
+          e.message.include?('look-behind')
+
+        raise
       end
 
       # Rewrite an ECMA-262 pattern as Ruby regexp source. Everything
@@ -105,6 +131,7 @@ module MCPClient
         scan[:order] = count_capture_groups(chars)
         scan[:groups] = scan[:order].length
         scan[:names] = scan[:order].compact
+        scan[:repeated] = repeated_capture_groups(chars)
         scan[:generated] = generated_name_prefix(scan[:names])
         while scan[:index] < chars.length
           note_translation_progress(scan)
@@ -341,6 +368,7 @@ module MCPClient
         (digits << chars[scan[:index]]) && scan[:index] += 1 while chars[scan[:index]].to_s.match?(/\d/)
         number = digits.to_i
         if number.positive? && number <= scan[:groups] && !in_class
+          reject_repeated_reference(scan, number)
           return emit(scan, "(?(#{number})\\#{number}|)", :atom) if scan[:names].empty?
 
           name = group_name_for(scan, number)
@@ -402,7 +430,91 @@ module MCPClient
         end
 
         scan[:index] += name.length + 2
+        reject_repeated_reference(scan, scan[:order].index(name) + 1)
         emit(scan, "(?(<#{name}>)\\k<#{name}>|)", :atom)
+      end
+
+      # A back-reference to a group a quantifier may repeat reads one way in
+      # ECMA-262 (cleared at each iteration) and another in Ruby (kept), and
+      # the difference decides instances either way round, so the pattern is
+      # refused rather than answered.
+      # @param number [Integer] the group the reference names
+      # @return [void]
+      # @raise [Untranslatable]
+      def reject_repeated_reference(scan, number)
+        return unless scan[:repeated].include?(number)
+
+        raise Untranslatable,
+              "a back-reference to group #{number}, which a quantifier repeats, cannot be evaluated faithfully " \
+              "(ECMA-262 clears the group's capture at each repetition and Ruby keeps it)"
+      end
+
+      # The capturing groups a quantifier may repeat: those inside (or being)
+      # a group followed by a quantifier that allows a second iteration.
+      # `?` and `{0,1}` allow only one, so nothing is ever cleared between
+      # iterations there and the existing "did the group participate"
+      # conditional already reads the way ECMA-262 does. Read in one pass,
+      # skipping escapes and character classes, so a `(` written as a
+      # literal opens nothing.
+      # @param chars [Array<String>] the pattern
+      # @return [Array<Integer>] the group numbers
+      def repeated_capture_groups(chars)
+        state = { open: [], repeated: [], number: 0, index: 0, in_class: false }
+        while state[:index] < chars.length
+          char = chars[state[:index]]
+          state[:index] += 1
+          next state[:index] += 1 if char == '\\'
+          next state[:in_class] = true if char == '[' && !state[:in_class]
+          next state[:in_class] = false if char == ']' && state[:in_class]
+          next if state[:in_class]
+
+          open_repeat_group(state, chars) if char == '('
+          close_repeat_group(state, chars) if char == ')'
+        end
+        state[:repeated]
+      end
+
+      # @return [void]
+      def open_repeat_group(state, chars)
+        capturing = chars[state[:index]] != '?' || group_name_at(chars, state[:index] + 1).to_s != ''
+        number = capturing ? (state[:number] += 1) : nil
+        state[:open] << { number: number, inner: [] }
+      end
+
+      # @return [void]
+      def close_repeat_group(state, chars)
+        group = state[:open].pop
+        return unless group
+
+        members = group[:inner] + [group[:number]].compact
+        state[:repeated].concat(members) if quantifier_at?(chars, state[:index])
+        parent = state[:open].last
+        parent ? parent[:inner].concat(members) : nil
+      end
+
+      # @return [Boolean] whether the quantifier at an index admits a second
+      #   iteration, which is when ECMA-262's per-iteration clearing of the
+      #   captures inside it can be seen at all
+      def quantifier_at?(chars, index)
+        char = chars[index]
+        return true if ['*', '+'].include?(char)
+        return false unless char == '{'
+
+        bounds = chars[index..].join[/\A\{(\d+)(,(\d*))?\}/, 0]
+        return false unless bounds
+
+        repeated_bounds?(Regexp.last_match(1).to_i, Regexp.last_match(2), Regexp.last_match(3))
+      end
+
+      # @param least [Integer] the `{n` of the quantifier
+      # @param comma [String, nil] its `,`, when it has one
+      # @param most [String, nil] its `m`, when it has one
+      # @return [Boolean] whether it admits two iterations
+      def repeated_bounds?(least, comma, most)
+        return least >= 2 if comma.nil?
+        return true if most.nil? || most.empty?
+
+        most.to_i >= 2
       end
 
       # Copy a character class, which ECMA-262 and Ruby read differently: an

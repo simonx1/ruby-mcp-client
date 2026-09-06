@@ -315,39 +315,46 @@ RSpec.describe 'MCP 2026-07-28 JSON Schema handling — verification round' do
   end
 
   describe 'a condition the validator cannot decide' do
-    # A `$dynamicRef` resolves through the dynamic scope a validation was
-    # entered through, which this validator does not track, so a condition
-    # carrying one is genuinely undecidable — unlike the standard
-    # assertions, which are evaluated and decide their condition outright,
-    # and unlike an `unevaluatedItems` whose annotations its own node
-    # produces, which is now evaluated too.
-    let(:undecidable) { { '$dynamicRef' => '#node' } }
+    # draft-07 `format` asserts (Validation Section 7.2) and this validator
+    # does not evaluate formats, so a string branch carrying one is
+    # genuinely undecidable — unlike the standard assertions, which are
+    # evaluated and decide their condition outright, unlike an
+    # `unevaluatedItems` whose annotations its own node produces, and unlike
+    # a dynamic reference, which binds against the dynamic scope.
+    let(:draft7) { MCPClient::SchemaValidator::DRAFT_07 }
+    let(:undecidable) { { 'format' => 'email' } }
+
+    def under_draft7(schema)
+      { '$schema' => draft7 }.merge(schema)
+    end
 
     it 'reports a failure both branches agree on' do
-      schema = { 'if' => undecidable, 'then' => false, 'else' => false }
-      expect(validator.validate([1], schema)).to contain_exactly(a_string_matching(/if/))
-      expect(validator.validate([1, 2], schema)).to contain_exactly(a_string_matching(/if/))
+      schema = under_draft7({ 'if' => undecidable, 'then' => false, 'else' => false })
+      expect(validator.validate('x', schema)).to contain_exactly(a_string_matching(/if/))
+      expect(validator.validate('yy', schema)).to contain_exactly(a_string_matching(/if/))
     end
 
     it 'reports it when both branches assert the same rejected type' do
-      schema = { 'if' => undecidable, 'then' => { 'type' => 'string' }, 'else' => { 'type' => 'string' } }
-      expect(validator.validate([1], schema)).to contain_exactly(a_string_matching(/expected type string/))
-      expect(validator.validate('x', schema)).to be_empty
+      schema = under_draft7({ 'if' => undecidable, 'then' => { 'type' => 'integer' },
+                              'else' => { 'type' => 'integer' } })
+      expect(validator.validate('x', schema)).to contain_exactly(a_string_matching(/expected type integer/))
+      expect(validator.validate(1, schema)).to be_empty
     end
 
     it 'stays silent when the branches genuinely disagree' do
-      schema = { 'if' => undecidable, 'then' => { 'type' => 'string' }, 'else' => { 'type' => 'array' } }
-      expect(validator.validate([1], schema)).to be_empty
+      schema = under_draft7({ 'if' => undecidable, 'then' => { 'type' => 'integer' },
+                              'else' => { 'type' => 'string' } })
+      expect(validator.validate('x', schema)).to be_empty
     end
 
     it 'stays silent when only one branch is written' do
-      expect(validator.validate([1], { 'if' => undecidable, 'then' => false })).to be_empty
-      expect(validator.validate([1], { 'if' => undecidable, 'else' => false })).to be_empty
+      expect(validator.validate('x', under_draft7({ 'if' => undecidable, 'then' => false }))).to be_empty
+      expect(validator.validate('x', under_draft7({ 'if' => undecidable, 'else' => false }))).to be_empty
     end
 
     it 'does not treat an unconditional failure as a match for not' do
-      schema = { 'not' => { 'if' => undecidable, 'then' => false, 'else' => false } }
-      expect(validator.validate([1], schema)).to be_empty
+      schema = under_draft7({ 'not' => { 'if' => undecidable, 'then' => false, 'else' => false } })
+      expect(validator.validate('x', schema)).to be_empty
     end
 
     it 'applies the branch a condition the validator does evaluate selects' do

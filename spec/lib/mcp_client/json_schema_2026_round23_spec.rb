@@ -103,8 +103,9 @@ RSpec.describe 'MCP 2026-07-28 JSON Schema handling — round 23' do
     it 'leaves a contains whose items it cannot decide undecided' do
       # An item the validator cannot decide is neither a match nor a
       # non-match, so the count never settles and `not` must not fail here.
-      undecidable = { 'contains' => { '$dynamicRef' => '#x' } }
-      expect(validator.validate([1], { 'not' => undecidable })).to be_empty
+      undecidable = { 'contains' => { 'format' => 'email' } }
+      expect(validator.validate(['x'], { '$schema' => MCPClient::SchemaValidator::DRAFT_07,
+                                         'not' => undecidable })).to be_empty
       # A contains schema it can evaluate decides the branch outright.
       expect(validator.validate([1], { 'not' => { 'contains' => { 'type' => 'integer' } } }))
         .to contain_exactly(a_string_matching(/value satisfies the schema in not/))

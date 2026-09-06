@@ -508,20 +508,18 @@ RSpec.describe 'MCP 2026-07-28 JSON Schema handling — round 28' do
     end
   end
 
-  describe 'the dynamic references this validator does not evaluate' do
-    it 'reports them and never lets one decide a non-monotonic composition' do
-      # Several non-root resources declare the anchor: only the evaluation
-      # path could choose the binding, which this validator does not track.
+  describe 'the dynamic references' do
+    it 'evaluates them, so one decides a non-monotonic composition like any other' do
+      # The binding is the outermost resource of the dynamic scope declaring
+      # the anchor; a resource the instance never entered is not in it.
       schema = { '$ref' => 'https://example.com/a',
                  '$defs' => { 'a' => { '$id' => 'https://example.com/a', '$dynamicAnchor' => 'node',
                                        'type' => 'object', 'properties' => { 'v' => { '$dynamicRef' => '#node' } } },
                               'b' => { '$id' => 'https://example.com/b', '$dynamicAnchor' => 'node',
                                        'type' => 'string' } } }
       expect(validator.check_schema(schema)).to be_empty
-      expect(validator.unsupported_keywords(schema)).to contain_exactly('$dynamicRef')
-      # Not applied, so it decides nothing — and a `not` around it cannot
-      # read the pass as a match.
-      expect(validator.validate({ 'v' => 1 }, schema)).to be_empty
+      expect(validator.unsupported_keywords(schema)).to be_empty
+      expect(validator.validate({ 'v' => 1 }, schema)).not_to be_empty
       expect(validator.validate({ 'v' => 1 }, { 'not' => schema })).to be_empty
     end
 
@@ -543,11 +541,15 @@ RSpec.describe 'MCP 2026-07-28 JSON Schema handling — round 28' do
                     'dependentRequired' => {}, 'dependentSchemas' => {},
                     'allOf' => [true], 'unevaluatedProperties' => false, 'unevaluatedItems' => false }
       expect(validator.unsupported_keywords(supported)).to be_empty
-      partial = { 'format' => 'email', '$ref' => 'https://example.com/a',
+      # A dynamic reference is evaluated and reports nothing; `format` and
+      # `contentSchema`, which this validator only ever annotates with, are
+      # what is left.
+      partial = { 'format' => 'email', 'contentSchema' => { 'type' => 'object' },
+                  '$ref' => 'https://example.com/a',
                   '$defs' => { 'a' => { '$id' => 'https://example.com/a', '$dynamicAnchor' => 'node',
                                         'properties' => { 'v' => { '$dynamicRef' => '#node' } } },
                                'b' => { '$id' => 'https://example.com/b', '$dynamicAnchor' => 'node' } } }
-      expect(validator.unsupported_keywords(partial)).to contain_exactly('$dynamicRef', 'format')
+      expect(validator.unsupported_keywords(partial)).to contain_exactly('contentSchema', 'format')
     end
   end
 end

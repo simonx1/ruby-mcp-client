@@ -178,14 +178,18 @@ RSpec.describe MCPClient::SchemaValidator do
     end
 
     it 'detects every keyword in the unsupported list' do
-      keywords = %w[$dynamicRef $recursiveRef contentSchema format]
+      # What is left unevaluated is the two keywords that only annotate; the
+      # dynamic references bind against the dynamic scope and are evaluated.
+      keywords = %w[contentSchema format]
       expect(described_class::UNSUPPORTED_KEYWORDS).to match_array(keywords)
       keywords.each do |keyword|
-        # Under a dialect that defines the keyword. A dynamic reference that
-        # is no string resolves to nothing, and is reported as dynamic.
         dialect = described_class::DIALECT_KEYWORDS.fetch(keyword, [described_class::DEFAULT_DIALECT]).first
         schema = { '$schema' => dialect, keyword => {} }
         expect(described_class.unsupported_keywords(schema)).to eq([keyword])
+      end
+      %w[$dynamicRef $recursiveRef].each do |keyword|
+        dialect = described_class::DIALECT_KEYWORDS.fetch(keyword, [described_class::DEFAULT_DIALECT]).first
+        expect(described_class.unsupported_keywords({ '$schema' => dialect, keyword => '#x' })).to be_empty
       end
     end
 
@@ -218,11 +222,11 @@ RSpec.describe MCPClient::SchemaValidator do
       schema = {
         'type' => 'object',
         'properties' => {
-          'a' => { '$dynamicRef' => '#x' },
+          'a' => { 'contentSchema' => { 'type' => 'object' } },
           'b' => { 'type' => 'array', 'items' => { 'format' => 'email' } }
         }
       }
-      expect(described_class.unsupported_keywords(schema)).to contain_exactly('$dynamicRef', 'format')
+      expect(described_class.unsupported_keywords(schema)).to contain_exactly('contentSchema', 'format')
     end
 
     it 'detects unsupported keywords nested inside applicator schemas' do

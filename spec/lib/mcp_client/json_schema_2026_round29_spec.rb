@@ -291,19 +291,19 @@ RSpec.describe 'MCP 2026-07-28 JSON Schema handling — round 29' do
         .to contain_exactly(a_string_matching(/unevaluatedProperties/))
     end
 
-    it 'keeps the dynamic reference only the evaluation path could bind deferred, and says so' do
-      # A `$dynamicRef` binds to the outermost dynamic scope declaring its
-      # anchor; where several non-root resources declare it, only the path a
-      # validation was entered through could choose, which this validator
-      # does not track. That one stays unevaluated, is reported, and never
-      # decides a non-monotonic composition.
+    it 'binds the dynamic reference by the path the evaluation took' do
+      # A `$dynamicRef` binds to the outermost resource of the dynamic scope
+      # declaring its anchor — the resources the evaluation entered. A
+      # resource it never entered declares nothing for it, so the reference
+      # is evaluated and decides its composition like any other.
       schema = { '$ref' => 'https://example.com/a',
                  '$defs' => { 'a' => { '$id' => 'https://example.com/a', '$dynamicAnchor' => 'node',
                                        'type' => 'object', 'properties' => { 'v' => { '$dynamicRef' => '#node' } } },
                               'b' => { '$id' => 'https://example.com/b', '$dynamicAnchor' => 'node',
                                        'type' => 'string' } } }
-      expect(validator.unsupported_keywords(schema)).to contain_exactly('$dynamicRef')
-      expect(validator.validate({ 'v' => 1 }, schema)).to be_empty
+      expect(validator.unsupported_keywords(schema)).to be_empty
+      expect(validator.validate({ 'v' => 1 }, schema)).not_to be_empty
+      expect(validator.validate({ 'v' => {} }, schema)).to be_empty
       expect(validator.validate({ 'v' => 1 }, { 'not' => schema })).to be_empty
     end
   end

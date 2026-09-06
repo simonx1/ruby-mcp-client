@@ -287,6 +287,8 @@ module MCPClient
 
         ecma_regexp(pattern, PATTERN_MATCH_TIMEOUT, deadline)
         nil
+      rescue EcmaPatterns::Untranslatable => e
+        "#{keyword} #{clip(pattern.inspect)} cannot be evaluated faithfully (#{clip(e.message)})"
       rescue RegexpError => e
         "#{keyword} #{clip(pattern.inspect)} is not an ECMA-262 regular expression (#{clip(e.message)})"
       rescue Aborted => e

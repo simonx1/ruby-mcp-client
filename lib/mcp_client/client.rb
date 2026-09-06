@@ -1182,6 +1182,12 @@ module MCPClient
       # not reach back over a legacy session.
       key = structured_content_key(result)
       key = nil if key && !result[key].is_a?(Hash) && legacy_server?(tool.server)
+      # Dropping the non-object leaves an error result what it was: one
+      # carrying no structured content, which it is allowed to be. Reporting
+      # it as a successful result missing its output would refuse — in
+      # :strict, raise on — a result the tools specification permits.
+      return result if key.nil? && (result['isError'] || result[:isError])
+
       unless key
         handle_structured_content_violation(
           "Tool '#{sanitize_peer_log_text(tool.name.to_s)}' declares an output schema but its successful result " \

@@ -400,12 +400,27 @@ module MCPClient
           return ["#{path}: contains requires between #{min} and #{max} matching items, which no count satisfies"]
         end
 
-        hits, unsure = count_contains_matches(data, schema['contains'], path, ctx, evaluated)
+        # 2020-12 Core Section 10.3.1.3 gives `contains` the item annotation
+        # `unevaluatedItems` reads; 2019-09 does not (its Section 9.3.1.3
+        # gives `unevaluatedItems` the annotations of `items` and
+        # `additionalItems` alone), so there a matched item stays unevaluated
+        # and the keyword still has to answer for it.
+        annotating = evaluated if contains_annotates?(dialect)
+        hits, unsure = count_contains_matches(data, schema['contains'], path, ctx, annotating)
         errors = []
         errors << "#{path}: expected at least #{min} items matching contains, got #{hits}" if hits + unsure < min
         errors << "#{path}: expected at most #{max} items matching contains, got #{hits}" if max && hits > max
         ctx.undecided += 1 if errors.empty? && unsure.positive? && (hits < min || (max && hits + unsure > max))
         errors
+      end
+
+      # Whether the dialect gives `contains` the item annotation that
+      # `unevaluatedItems` consumes: 2020-12 does, 2019-09 does not, and
+      # draft-07 has neither keyword.
+      # @param dialect [String, nil] the dialect in force
+      # @return [Boolean]
+      def contains_annotates?(dialect)
+        dialect != DRAFT_2019_09 && dialect != DRAFT_07
       end
 
       # Match a `contains` schema against every item. The matches are a

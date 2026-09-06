@@ -159,11 +159,9 @@ module MCPClient
     # left unevaluated, validation is partial: data may pass here that a full
     # validator would reject.
     #
-    # A dynamic reference is only *sometimes* in this position: one naming
-    # a pointer or a plain anchor is the `$ref` it resolves to, and is
-    # applied as one ({Evaluation#applied_references});
-    # {References#dynamic_reference?} tells the two apart, and the scan
-    # reports only the dynamic ones.
+    # A dynamic reference is not in this position: it is evaluated, against
+    # the dynamic scope the validation records as it enters each resource
+    # ({References#dynamic_binding}).
     #
     # Every other standard keyword is evaluated — `unevaluatedItems` and
     # `unevaluatedProperties` from the annotations {Evaluation} collects
@@ -172,7 +170,7 @@ module MCPClient
     # branch undecided, and an undecided branch is accepted wherever the
     # composition is monotonic (`allOf`, `anyOf`), so the instance passes a
     # schema that rejects it.
-    UNSUPPORTED_KEYWORDS = %w[$dynamicRef $recursiveRef contentSchema format].freeze
+    UNSUPPORTED_KEYWORDS = %w[contentSchema format].freeze
 
     # Unsupported keywords that are annotations, not assertions (`format`
     # is annotation-only in the default 2020-12 vocabulary, `contentSchema`
@@ -272,9 +270,12 @@ module MCPClient
       dialect.nil? || !DIALECT_KEYWORDS.key?(keyword) || DIALECT_KEYWORDS[keyword].include?(dialect)
     end
 
-    # Per-validation state.
+    # Per-validation state. `scope` is the dynamic scope: the schema
+    # resources the evaluation has entered, outermost first, which is what a
+    # dynamic reference binds against (JSON Schema 2020-12 Core Section
+    # 8.2.3.2).
     Context = Struct.new(:root, :deadline, :dialect, :visits, :errors, :speculative, :anchors, :undecided, :depth,
-                         keyword_init: true)
+                         :scope, keyword_init: true)
 
     # Per-preflight state: the document, the counter the walk accounts to,
     # the problems it found, and the positions it has still to read (a
@@ -656,8 +657,6 @@ module MCPClient
           walk.problems << "external #{keyword} #{clip(ref.inspect)} is not dereferenced"
           next []
         end
-        next [] if dynamic_reference?(schema, keyword, walk.root, walk.counter[:dialect], walk.counter)
-
         check_ref(walk, schema, depth, dialect, keyword)
       end
     end
@@ -740,7 +739,7 @@ module MCPClient
       # reference resolves to depend on the order this instance applies them.
       ctx = Context.new(root: root, deadline: deadline, dialect: canonical_dialect(dialect(root)),
                         visits: 0, errors: 0, speculative: 0, anchors: preflight[:anchors], undecided: 0,
-                        depth: 0)
+                        depth: 0, scope: [])
       validate_node(data, root, path, ctx, 0)
     rescue TooLarge => e
       ["#{path}: #{e.message}"]
@@ -781,6 +780,11 @@ module MCPClient
     # @raise [Aborted] when a bound is hit
     def self.validate_node(data, schema, path, ctx, ref_depth)
       pending = []
+      # The dynamic scope grows and shrinks with these applications, exactly
+      # as it does with the Ruby frames a recursive validator would spend:
+      # entering a schema of another resource enters that resource, and the
+      # application that entered it is the one that leaves it.
+      entered = [entered_scope?(ctx, schema)]
       step = start_node(data, schema, path, ctx, ref_depth)
       loop do
         if step[0] == :apply
@@ -788,11 +792,13 @@ module MCPClient
           # A speculative application's errors are a verdict, not output, and
           # do not count toward MAX_ERRORS while it runs.
           ctx.speculative += 1 if step[3]
+          entered << entered_scope?(ctx, step[1])
           step = start_node(data, step[1], path, ctx, step[2], collecting: step[5])
           next
         end
 
         errors = step[1]
+        leave_scope(ctx, entered.pop)
         return errors if pending.empty?
 
         resumed = pending.pop
@@ -801,6 +807,33 @@ module MCPClient
         # evaluated of the value, for the applicator that applied it.
         step = resumed[4].call(errors, step[2])
       end
+    ensure
+      entered&.each { |was_entered| leave_scope(ctx, was_entered) }
+    end
+
+    # Enter the schema resource a subschema belongs to, when applying it
+    # leaves the resource in force. A schema of the resource already
+    # innermost adds nothing a dynamic reference could read, so it is not
+    # pushed and its application has nothing to pop.
+    # @param ctx [Context] the validation context
+    # @param schema [Object] the subschema about to be applied
+    # @return [Boolean] whether the scope was pushed
+    def self.entered_scope?(ctx, schema)
+      return false unless schema.is_a?(Hash) && ctx.scope
+
+      ctx.anchors ||= anchor_index(ctx.root, ctx.dialect)
+      resource = ctx.anchors[:resources][schema] || ctx.root
+      return false if ctx.scope.last.equal?(resource)
+
+      ctx.scope.push(resource)
+      true
+    end
+
+    # @param ctx [Context] the validation context
+    # @param entered [Boolean] what {.entered_scope?} answered
+    # @return [void]
+    def self.leave_scope(ctx, entered)
+      ctx.scope.pop if entered && ctx.scope
     end
 
     # Validate a child of the value being validated — an array item or a

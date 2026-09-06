@@ -70,16 +70,20 @@ RSpec.describe 'MCP 2026-07-28 JSON Schema dynamic references, branchless if, ca
   end
 
   describe 'a dynamic anchor several non-root resources declare' do
-    let(:ambiguous) do
+    let(:elsewhere) do
       { '$ref' => 'https://example.com/a',
         '$defs' => { 'a' => { '$id' => 'https://example.com/a', '$dynamicAnchor' => 'node', 'type' => 'object',
                               'properties' => { 'child' => { '$dynamicRef' => '#node' } } },
                      'b' => { '$id' => 'https://example.com/b', '$dynamicAnchor' => 'node', 'type' => 'string' } } }
     end
 
-    it 'is the one dynamic reference still reported as not evaluated' do
-      expect(validator.unsupported_keywords(ambiguous)).to contain_exactly('$dynamicRef')
-      expect(validator.validate({ 'child' => 1 }, { 'not' => ambiguous })).to be_empty
+    # The dynamic scope holds the resources the evaluation entered, and `b`
+    # is not one of them: it declares nothing for this reference, so the
+    # binding is decided and the verdict is whole (see round 34).
+    it 'is evaluated against the resources the instance entered' do
+      expect(validator.unsupported_keywords(elsewhere)).to be_empty
+      expect(validator.validate({ 'child' => 1 }, elsewhere)).not_to be_empty
+      expect(validator.validate({ 'child' => 1 }, { 'not' => elsewhere })).to be_empty
     end
   end
 
@@ -179,11 +183,11 @@ RSpec.describe 'MCP 2026-07-28 JSON Schema dynamic references, branchless if, ca
       { status: 200, body: JSON.generate('jsonrpc' => '2.0', 'id' => id, 'result' => result), headers: json }
     end
 
-    def listing(header, output_dialect: nil)
+    def listing(header, output_dialect: nil, ttl: 0)
       input = { 'type' => 'object', 'properties' => { 'region' => { 'type' => 'string', 'x-mcp-header' => header } } }
       output = { 'type' => 'object' }
       output = { '$schema' => output_dialect }.merge(output) if output_dialect
-      { 'tools' => [{ 'name' => 'wipe', 'inputSchema' => input, 'outputSchema' => output }], 'ttlMs' => 0 }
+      { 'tools' => [{ 'name' => 'wipe', 'inputSchema' => input, 'outputSchema' => output }], 'ttlMs' => ttl }
     end
 
     # The refreshed definition is checked before the retry goes out, on both
@@ -267,13 +271,18 @@ RSpec.describe 'MCP 2026-07-28 JSON Schema dynamic references, branchless if, ca
       client.cleanup
     end
 
-    # Two calls of one tool recovering at once each retry under the
-    # definition their own refresh read: a pin shared between them would
-    # send both retries under one of the two.
-    it 'pins each overlapping retry to the definition its own refresh read' do
+    # Two calls of one tool recovering at once: both first attempts really are
+    # rejected and both really are re-sent, each under the header its own
+    # refresh read. NOTE: `take_pinned_retry_definition` answers nil on this
+    # path, so what keeps the two apart here is the per-call definition
+    # lookup, not the retry pin — the pin itself is still unpinned by any
+    # example, which is worth closing.
+    it 'sends each overlapping retry under the definition its own refresh read' do
       retries = Queue.new
       rejections = Queue.new
+      refreshed = Queue.new
       refreshes = 0
+      calls = []
       lock = Mutex.new
       stub_request(:post, url).to_return do |request|
         body = JSON.parse(request.body)
@@ -282,10 +291,27 @@ RSpec.describe 'MCP 2026-07-28 JSON Schema dynamic references, branchless if, ca
           json_response(body['id'], { 'resultType' => 'complete', 'supportedVersions' => ['2026-07-28'],
                                       'capabilities' => { 'tools' => {} } })
         when 'tools/list'
+          # Every list before both calls have been rejected still annotates
+          # `region` with Region, so both first attempts really do go out
+          # under it and really are rejected; each refresh that follows
+          # brings a header of its own, which is what the two retries must
+          # not share.
           n = lock.synchronize { refreshes += 1 }
-          json_response(body['id'], listing(n == 1 ? 'Region' : "H#{n}"))
+          next json_response(body['id'], listing('Region')) if rejections.size < 2
+
+          # Neither refreshed list is handed back until both have been
+          # produced, so the list the transport caches is the later one for
+          # both callers: only the definition each retry pinned for itself
+          # can still tell the two apart.
+          refreshed << n
+          deadline = Process.clock_gettime(Process::CLOCK_MONOTONIC) + 1
+          sleep 0.01 while refreshed.size < 2 && Process.clock_gettime(Process::CLOCK_MONOTONIC) < deadline
+          # Cacheable, so the retry that reads the transport's list rather
+          # than the definition it pinned for itself finds the other's.
+          json_response(body['id'], listing("H#{n}", ttl: 60_000))
         when 'tools/call'
           mirrored = request.headers.select { |k, _| k.start_with?('Mcp-Param-') }
+          lock.synchronize { calls << body['id'] }
           if mirrored.key?('Mcp-Param-Region')
             rejections << body['id']
             deadline = Process.clock_gettime(Process::CLOCK_MONOTONIC) + 1
@@ -310,6 +336,11 @@ RSpec.describe 'MCP 2026-07-28 JSON Schema dynamic references, branchless if, ca
       sent = Array.new(2) { retries.pop }
       expect(sent.map(&:keys).flatten.uniq.size).to eq(2)
       expect(sent.map(&:values).flatten).to contain_exactly('a', 'b')
+      # Both calls were rejected once and re-sent once, each under a request
+      # id of its own: four requests, no id reused.
+      expect(rejections.size).to eq(2)
+      expect(calls.size).to eq(4)
+      expect(calls.uniq.size).to eq(4)
       client.cleanup
     end
   end

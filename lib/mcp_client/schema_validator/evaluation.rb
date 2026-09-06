@@ -55,11 +55,10 @@ module MCPClient
                              compose_dependent_schemas].freeze
 
       # The keywords that apply another schema to the same instance before
-      # the node's own keywords: `$ref`, and the dynamic references where
-      # they name no dynamic anchor and so are the plain references the
-      # specification says they are (2020-12 Core Section 8.2.3.2, 2019-09
-      # Core Section 8.2.4.2.1). Applied in this order, each alongside the
-      # others (draft-07's `$ref` alone replaces its siblings).
+      # the node's own keywords: `$ref` and the dynamic references (2020-12
+      # Core Section 8.2.3.2, 2019-09 Core Section 8.2.4.2.1). Applied in
+      # this order, each alongside the others (draft-07's `$ref` alone
+      # replaces its siblings).
       REFERENCE_KEYWORDS = %w[$ref $dynamicRef $recursiveRef].freeze
 
       # Begin applying one (sub)schema to the value, under the bound on the
@@ -97,17 +96,14 @@ module MCPClient
         end
       end
 
-      # The reference keywords a node applies as plain references: `$ref`
-      # and each dynamic reference that names no dynamic anchor (one that
-      # does is left unevaluated, see {Composition#partial_keywords?}).
+      # The reference keywords a node applies: `$ref` and the dynamic
+      # references the dialect defines. Where a dynamic reference binds is
+      # {References#dynamic_binding}'s business, and {#ref_target} asks it
+      # once the plain target has resolved.
       # @param app [Application]
       # @return [Array<String>]
       def applied_references(app)
-        REFERENCE_KEYWORDS.select do |keyword|
-          next false unless app.schema.key?(keyword) && keyword_known?(keyword, app.dialect)
-
-          keyword == '$ref' || !dynamic_reference?(app.schema, keyword, app.ctx.root, app.ctx.dialect, app.ctx)
-        end
+        REFERENCE_KEYWORDS.select { |keyword| app.schema.key?(keyword) && keyword_known?(keyword, app.dialect) }
       end
 
       # Apply the references a schema object carries, one after the other,

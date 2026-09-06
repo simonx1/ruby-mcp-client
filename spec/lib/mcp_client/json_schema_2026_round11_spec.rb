@@ -38,21 +38,24 @@ RSpec.describe 'MCP 2026-07-28 JSON Schema handling — round 11' do
     it 'skips a conditional whose if it cannot decide, unless the branches agree' do
       # Neither branch can be selected, but both reject the value, so the
       # instance is rejected whichever way the condition goes.
-      # A `$dynamicRef` needs the dynamic scope a validation was entered
-      # through, which this validator does not track: a condition carrying
-      # one is genuinely undecidable.
-      condition = { '$dynamicRef' => '#node' }
-      agreed = { 'if' => condition, 'then' => { 'type' => 'string' }, 'else' => { 'type' => 'string' } }
-      expect(validator.validate([1], agreed)).to contain_exactly(a_string_matching(/expected type string/))
-      schema = { 'if' => condition, 'then' => { 'type' => 'string' }, 'else' => { 'type' => 'array' } }
-      expect(validator.validate([1], schema)).to be_empty
+      # draft-07 `format` asserts and formats are not evaluated: a string
+      # branch carrying one is genuinely undecidable.
+      draft7 = MCPClient::SchemaValidator::DRAFT_07
+      condition = { 'format' => 'email' }
+      agreed = { '$schema' => draft7, 'if' => condition, 'then' => { 'type' => 'integer' },
+                 'else' => { 'type' => 'integer' } }
+      expect(validator.validate('x', agreed)).to contain_exactly(a_string_matching(/expected type integer/))
+      schema = { '$schema' => draft7, 'if' => condition, 'then' => { 'type' => 'integer' },
+                 'else' => { 'type' => 'string' } }
+      expect(validator.validate('x', schema)).to be_empty
       decided = { 'if' => { 'type' => 'integer' }, 'then' => { 'type' => 'string' } }
       expect(validator.validate(3, decided)).to contain_exactly(a_string_matching(/expected type string/))
     end
 
     it 'keeps treating a partial pass as a pass where that is the permissive direction' do
-      expect(validator.validate([1], { 'anyOf' => [{ '$dynamicRef' => '#node' }] })).to be_empty
-      expect(validator.validate([1], { 'allOf' => [{ '$dynamicRef' => '#node' }] })).to be_empty
+      draft7 = MCPClient::SchemaValidator::DRAFT_07
+      expect(validator.validate('x', { '$schema' => draft7, 'anyOf' => [{ 'format' => 'email' }] })).to be_empty
+      expect(validator.validate('x', { '$schema' => draft7, 'allOf' => [{ 'format' => 'email' }] })).to be_empty
       # An assertion this validator does evaluate decides those compositions
       # rather than passing them: an unevaluated one is not a licence to
       # accept what the schema rejects.

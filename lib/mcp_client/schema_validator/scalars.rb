@@ -53,6 +53,8 @@ module MCPClient
         ["#{path}: string does not match pattern #{clip(pattern.inspect)}"]
       rescue Regexp::TimeoutError
         raise Aborted, "pattern #{clip(pattern.inspect)} exceeded the #{PATTERN_MATCH_TIMEOUT}s matching budget"
+      rescue EcmaPatterns::Untranslatable => e
+        ["#{path}: pattern #{clip(pattern.inspect)} cannot be evaluated faithfully (#{clip(e.message)})"]
       rescue RegexpError => e
         ["#{path}: pattern #{clip(pattern.inspect)} is not an ECMA-262 regular expression (#{clip(e.message)})"]
       end

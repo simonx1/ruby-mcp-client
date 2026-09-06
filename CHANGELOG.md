@@ -7,6 +7,50 @@ metadata). Each feature lands in its own PR; this section accumulates them.
 
 ### JSON Schema handling
 
+- **Dynamic references bind against the evaluation path, `contains`
+  annotations follow their dialect, and a pattern Ruby cannot reproduce is
+  refused rather than answered (seventh verification round).**
+
+  - *The dynamic scope is tracked.* A `$dynamicRef` binds to the outermost
+    resource of the dynamic scope — the schema resources the evaluation
+    entered on its way to the reference — declaring its anchor (JSON Schema
+    2020-12 Core Section 8.2.3.2), and a `$recursiveRef` likewise (2019-09
+    Core Section 8.2.4.2.2). A resource the instance never enters is not in
+    that scope and declares nothing for the reference, so a document holding
+    a second, unvisited declaration of the anchor no longer leaves the
+    reference unevaluated: `{"$ref": "https://example.com/a", "$defs": {"a":
+    {"$id": "...a", "$dynamicAnchor": "node", "type": "object", "properties":
+    {"child": {"$dynamicRef": "#node"}}}, "b": {"$id": "...b",
+    "$dynamicAnchor": "node", "type": "string"}}}` now rejects
+    `{"child": 1}`. Nothing about the dynamic references is deferred any
+    more: they are gone from the partial-coverage report, and `:strict` gates
+    on the verdict instead of refusing the schema.
+  - *`contains` annotates in 2020-12, not in 2019-09.* `unevaluatedItems`
+    reads the annotations of `items`/`additionalItems` alone in 2019-09
+    (Core Section 9.3.1.3), so `{"$schema": ".../2019-09/schema", "contains":
+    {"type": "integer"}, "unevaluatedItems": false}` now rejects `[1]`, which
+    it accepted while the 2020-12 rule (Section 10.3.1.3) was applied to
+    every dialect.
+  - *A pattern whose ECMA-262 meaning Ruby cannot reproduce is refused.* A
+    back-reference to a group a quantifier repeats reads one way in ECMA-262
+    (the capture is cleared at each iteration) and the other in Ruby (it is
+    kept), and Ruby's lookbehind is fixed-length where ECMA-262's has been
+    variable-length since ES2018. Both used to produce verdicts under the
+    wrong rules — `^(a|(b))*\2$` accepted "abab", which ECMA-262 rejects, and
+    refused "aba", which it accepts — and both are now reported as patterns
+    that cannot be evaluated faithfully. A variable-length lookbehind is no
+    longer reported as "not an ECMA-262 regular expression", which it is.
+  - *The initial send is held to the dialect guard the retry already was.*
+    The header extraction that decides what a `tools/call` carries may read a
+    newer definition than the caller preflighted; that definition is now
+    checked before the request goes out, so a tool whose refreshed schema
+    declares an unreadable dialect is refused instead of running first.
+  - *An error result carrying a non-object `structuredContent` on a
+    2025-11-25 session stays an error result.* The value is dropped there (the
+    revision types the field as an object), and the result was then reported
+    as a successful one missing its structured content — raising in `:strict`
+    on a result the tools specification permits.
+
 - **Dynamic references bind to the outermost scope, a branchless `if` keeps
   its annotations, and the checks around a result close their last gaps
   (sixth verification round).**
