@@ -811,13 +811,13 @@ module MCPClient
     # @return [Object] the result field from the response
     # @raise [MCPClient::Errors::ServerError] if the response contains an error
     # @raise [MCPClient::Errors::InvalidResultError] if the result's resultType is unrecognized
-    def process_jsonrpc_response(response)
+    def process_jsonrpc_response(response, method: nil)
       error = envelope_member(response, 'error')
       raise MCPClient::Errors::ServerError.from_jsonrpc(error) if error
 
       result = envelope_member(response, 'result')
       validate_result_type!(result)
-      record_server_info(result)
+      record_server_info(result, method: method)
       reject_unfulfillable_input_required!(result)
       result
     end
@@ -871,13 +871,18 @@ module MCPClient
     # (`io.modelcontextprotocol/serverInfo`, MCP 2026-07-28); keep the latest
     # self-reported identity for display and logging.
     # @param result [Object] a JSON-RPC result
+    # @param method [String, nil] the method the result answers, when known
     # @return [void]
-    def record_server_info(result)
+    def record_server_info(result, method: nil)
       return unless result.is_a?(Hash)
       # A DiscoverResult's identity is recorded by apply_discover_result, once
-      # the whole result has validated: a refresh that fails must change
-      # nothing, not even the identity it carried.
-      return if result.key?('supportedVersions')
+      # the WHOLE result has validated: a refresh that fails must change
+      # nothing, not even the identity it carried. Judged by the method the
+      # result answers rather than by the result's own shape — an answer that
+      # is missing supportedVersions is exactly the one apply_discover_result
+      # rejects, and reading the shape recorded its identity first. The shape
+      # still stands in for the method where the caller cannot name it.
+      return if method == 'server/discover' || result.key?('supportedVersions')
 
       info = result['_meta'].is_a?(Hash) ? result['_meta'][META_SERVER_INFO] : nil
       @server_info = info if info.is_a?(Hash)

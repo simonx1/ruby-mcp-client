@@ -246,7 +246,10 @@ module MCPClient
       # @raise [MCPClient::Errors::ServerError] when a legacy server answered
       def interpret_discover_answer(res)
         modern_answer = modern_discover_answer?(res)
-        result = process_jsonrpc_response(res)
+        # Named so the identity of an answer that fails to validate below is
+        # not recorded: apply_discover_result records it once the whole
+        # result has validated.
+        result = process_jsonrpc_response(res, method: 'server/discover')
         unless discover_result?(result)
           raise invalid_discover_answer(modern_answer, 'answered without a DiscoverResult')
         end
@@ -395,7 +398,14 @@ module MCPClient
         return req unless send_request(req, generation) == :replaced
 
         @logger.debug("The transport was replaced before #{req['method']} was sent; re-issuing it")
-        @mutex.synchronize { @awaiting.delete(req['id']) }
+        # Nothing was written, so nobody will ever wait on this id: drop it
+        # from the teardown's record as well as from the awaiting table. The
+        # waiter is what normally consumes that record, and an id no request
+        # carries has no waiter — it would accumulate for the process's life.
+        @mutex.synchronize do
+          @awaiting.delete(req['id'])
+          dropped_requests.delete(req['id'])
+        end
         nil
       end
 
@@ -562,7 +572,7 @@ module MCPClient
           send_cancellation_notification(req_id) if cancellable_request?(method, params)
           raise
         end
-        process_jsonrpc_response(res)
+        process_jsonrpc_response(res, method: method)
       end
 
       # Register, build and write a request on the transport that is current

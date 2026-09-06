@@ -24,6 +24,14 @@
 #                     anything and refuse to process further input until the
 #                     response arrives (a legacy server MAY ping at startup;
 #                     the receiver MUST respond promptly)
+#   legacy-ping-immediate like legacy-ping-first, but the ping goes out at
+#                     startup, before the first client message is read, so the
+#                     ordering between the client's reader starting and its
+#                     probe proposing a version is exercised
+#   modern-then-ping  the first process is modern and exits after one
+#                     tools/list; its replacement is a 2025-11-25 server that
+#                     pings immediately, so a client that judged the
+#                     replacement by the dead process's era is observable
 #   silent-probe      never answer server/discover; run the handshake instead
 #   late-discover     answer server/discover only after a delay longer than
 #                     the client's discover timeout, then behave like
@@ -137,7 +145,12 @@ end
 # @param msg [Hash] the request
 # @return [Boolean]
 def modern_request?(msg)
-  msg['method'] == 'server/discover' || %w[modern modern-one-shot modern-exit-on-call future-only].include?(MODE)
+  return true if msg['method'] == 'server/discover'
+  # modern-then-ping speaks 2026-07-28 until it exits; its replacement is a
+  # 2025-11-25 server, and the same mode name covers both.
+  return !REPLACEMENT if MODE == 'modern-then-ping'
+
+  %w[modern modern-one-shot modern-exit-on-call future-only].include?(MODE)
 end
 
 # @param msg [Hash] the request
@@ -192,6 +205,7 @@ def answered_by_mode?(msg)
   case MODE
   when 'modern', 'modern-one-shot', 'modern-exit-on-call', 'future-only' then answered_by_modern_mode?(msg)
   when 'legacy-one-shot', 'legacy-broken-init', 'late-discover' then answered_by_legacy_mode?(msg)
+  when 'modern-then-ping' then answered_by_modern_then_ping?(msg)
   else false
   end
 end
@@ -219,6 +233,24 @@ def answered_by_modern_mode?(msg)
     exit 0 if msg['method'] == 'tools/call'
   end
   false
+end
+
+# modern-then-ping: modern until it has served one tools/list, then gone.
+# The replacement answers as a 2025-11-25 server (its startup ping is emitted
+# before it reads anything, see the REPLACEMENT branch below).
+# @param msg [Hash] the request
+# @return [Boolean] whether the mode answered the request itself
+def answered_by_modern_then_ping?(msg)
+  return false if REPLACEMENT
+
+  if msg['method'] == 'server/discover'
+    respond(msg['id'], discover_result(['2026-07-28']))
+    return true
+  end
+  return false unless msg['method'] == 'tools/list'
+
+  respond(msg['id'], { 'tools' => tools })
+  exit 0
 end
 
 # @param msg [Hash] the request
@@ -285,6 +317,9 @@ end
 # @return [Boolean] whether the pong arrived
 def ping_answered?(buffered)
   emit({ 'jsonrpc' => '2.0', 'id' => 'srv-ping', 'method' => 'ping' })
+  # Recorded so a test can hold the client's negotiation until the ping is
+  # really on the wire, instead of racing it.
+  record('ping-sent')
   while (line = $stdin.gets)
     msg = parse(line)
     next unless msg
@@ -297,10 +332,21 @@ def ping_answered?(buffered)
   false
 end
 
+# Whether an earlier process of this fixture already ran, read before this
+# one announces itself: modern-then-ping is the first process's mode and its
+# replacement's mode at once, and only the transcript tells them apart.
+REPLACEMENT = !TRANSCRIPT.nil? && File.exist?(TRANSCRIPT) &&
+              File.read(TRANSCRIPT).lines.any? { |line| line.start_with?('pid ') }
+
 record("pid #{Process.pid}")
 
 pending = []
-if MODE == 'legacy-ping-first'
+# The ping goes out before a single byte is read: the client's reader is
+# started before its probe proposes a version, and nothing it negotiated with
+# a previous process may answer for this one.
+if MODE == 'legacy-ping-immediate' || (MODE == 'modern-then-ping' && REPLACEMENT)
+  exit 0 unless ping_answered?(pending)
+elsif MODE == 'legacy-ping-first'
   first = $stdin.gets
   exit 0 if first.nil?
 

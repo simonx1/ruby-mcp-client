@@ -131,8 +131,15 @@ module MCPClient
         @stdin, @stdout, @stderr, @wait_thread = handles
         @transport_generation += 1
         # A fresh process has said nothing yet: what the previous one wrote
-        # identifies nothing about this one.
+        # identifies nothing about this one, and what was negotiated WITH it
+        # binds nothing here. The era is per process (stdio "Backward
+        # Compatibility"), and the replacement's reader starts before the
+        # probe proposes anything: a 2025-11-25 replacement that pings at
+        # startup would otherwise be judged by the dead process's era, its
+        # ping dropped, and both the probe and the handshake left waiting on
+        # a server that answers nothing until its pong arrives.
         @modern_answer_received = false
+        @protocol_version = nil
       end
       pin_pipe_encodings
       true
