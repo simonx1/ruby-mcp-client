@@ -69,7 +69,7 @@ module MCPClient
       # @return [Integer] the lifetime this creation started
       def start_task_lifetime(srv, task_id, epoch)
         answered_keys_mutex.synchronize do
-          lookup = [srv.object_id, epoch, task_id]
+          lookup = [srv.object_id, registry_epoch(srv, epoch), task_id]
           @task_states ||= {}
           drop_ended_session_state(lookup)
           lifetimes = (@task_lifetimes ||= {})
@@ -194,7 +194,7 @@ module MCPClient
       # @raise [MCPClient::Errors::TaskReplacedError] if the handle's task was replaced
       def task_lifetime_pin(task, task_id, srv, epoch, operation)
         named = handle_task_generation(task, srv)
-        pin = { lookup: [srv.object_id, epoch, task_id], generation: named, named: !named.nil?,
+        pin = { lookup: [srv.object_id, registry_epoch(srv, epoch), task_id], generation: named, named: !named.nil?,
                 task_id: task_id, operation: operation }
         answered_keys_mutex.synchronize do
           pin[:generation] = task_lifetime(pin[:lookup]) unless pin[:named]

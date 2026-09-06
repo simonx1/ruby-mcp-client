@@ -208,7 +208,7 @@ module MCPClient
           # that came back late (transport retries) ends the wait here.
           bound_wait_by_ttl(current, wait)
           raise_if_past_deadline!(wait)
-          retransmit_pending_update(wait)
+          retransmit_pending_update(current, wait)
           # No new handler round once the wait is over, whatever the
           # retransmission took.
           raise_if_past_deadline!(wait)
@@ -268,10 +268,27 @@ module MCPClient
       # new input is answered (the server ignores keys it already has). Only
       # what is still pending once the task's update lock is held is sent: a
       # snapshot taken before the lock could resend an answer a concurrent,
-      # confirmed update has just superseded.
+      # confirmed update has just superseded. And only what the task still
+      # asks for: the keys of a tasks/update MUST name outstanding input
+      # requests, so an answer the observation in hand no longer lists was
+      # consumed (the acknowledgement, not the update, was lost) and is not
+      # sent again — the key stays answered, so the host is not asked twice.
+      # @param current [MCPClient::Task] the observation this poll made
       # @return [void]
-      def retransmit_pending_update(wait)
-        deliver_task_update(wait[:srv], wait[:task_id], nil, wait, pending_only: true)
+      def retransmit_pending_update(current, wait)
+        deliver_task_update(wait[:srv], wait[:task_id], nil, wait, pending_only: true,
+                                                                   outstanding: outstanding_task_keys(current))
+      end
+
+      # The input request keys a task observation still lists: none for a
+      # task that is not asking, nil when it is asking but the observation
+      # does not say for what (a summary without inputRequests).
+      # @return [Set<String>, nil]
+      def outstanding_task_keys(task)
+        return Set.new unless task.input_required?
+
+        requests = task.input_requests
+        requests.is_a?(Hash) ? Set.new(requests.keys.map(&:to_s)) : nil
       end
 
       # Whether the task lists an input request that has not been answered.
@@ -403,7 +420,7 @@ module MCPClient
       def task_state_of_lifetime(srv, task_id, epoch, pin)
         answered_keys_mutex.synchronize do
           check_task_lifetime_locked!(pin) if pin
-          task_state_locked(srv, task_id, epoch)
+          task_state_locked(srv, task_id, registry_epoch(srv, epoch))
         end
       end
 

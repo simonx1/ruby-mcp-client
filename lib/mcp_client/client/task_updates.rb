@@ -96,7 +96,7 @@ module MCPClient
       # of the wait: the payload stays pending and goes out again with the
       # next poll, like a lost tasks/get. A definite rejection surfaces.
       # @return [void]
-      def deliver_task_update(srv, task_id, responses, wait, pending_only: false)
+      def deliver_task_update(srv, task_id, responses, wait, pending_only: false, outstanding: nil)
         # The bookkeeping this delivery is bound to is captured here, before
         # anything is sent: a session that restarts meanwhile must not make
         # the send record its keys, drop its pending payload or release them
@@ -110,6 +110,7 @@ module MCPClient
         bounded_by_wait(wait, deadline: wait[:deadline],
                               on_abandon: ->(_runner) { abandon_task_update(state) }) do
           send_task_update(srv, task_id, responses, epoch: wait[:epoch], pending_only: pending_only, state: state,
+                                                    outstanding: outstanding,
                                                     timeout: request_timeout(wait_deadline(wait), srv))
         end
       rescue MCPClient::Errors::TaskError => e
@@ -136,10 +137,13 @@ module MCPClient
       #   dropped when the server's session moved on since (nil: no expectation, e.g. #update_task)
       # @param state [Hash, nil] the bookkeeping the answers were built from; every mutation
       #   (answered keys, pending payload) lands there and nowhere else
+      # @param outstanding [Set<String>, nil] for a retransmission, the input request keys the task
+      #   still lists: a pending answer to any other key was consumed and is dropped, not resent
+      #   (nil: not known, everything pending is sent)
       # @return [true]
       # @raise [MCPClient::Errors::TaskError, MCPClient::Errors::ServerError]
       def send_task_update(srv, task_id, input_responses, timeout: nil, pending_only: false, epoch: nil, state: nil,
-                           strict_session: false)
+                           strict_session: false, outstanding: nil)
         shown = shown_task_id(task_id)
         state ||= task_state(srv, task_id)
         # The answers are pending — and their keys answered — from the moment
@@ -156,6 +160,7 @@ module MCPClient
         lock = state[:update_mutex]
         lock.synchronize do
           payload = answered_keys_mutex.synchronize { state[:pending_update] }
+          payload = still_outstanding(state, payload, outstanding, shown) if pending_only && outstanding && payload
           # An explicit answer goes out even when it adds nothing to send
           # (#update_task with no responses is the caller's request, not a
           # retransmission).
@@ -166,6 +171,24 @@ module MCPClient
                                                       timeout: timeout, epoch: epoch,
                                                       strict_session: strict_session)
         end
+      end
+
+      # What a retransmission may carry: the pending answers the task still
+      # asks for. The rest was consumed (its acknowledgement was lost, not
+      # the update) and is dropped from the payload for good — the keys stay
+      # answered — so the update names only outstanding requests, as the
+      # extension requires, and a server rejecting a stale key cannot fail
+      # a task that is progressing normally.
+      # @return [Hash, nil] the payload left to send (callers hold the update lock)
+      def still_outstanding(state, payload, outstanding, shown)
+        consumed = payload.keys.reject { |key| outstanding.include?(key.to_s) }
+        return payload if consumed.empty?
+
+        logger.debug("Task #{shown}: the server consumed the answers to #{consumed.map(&:to_s).join(', ')} " \
+                     'before acknowledging them; they are not sent again')
+        answered_keys_mutex.synchronize { drop_pending_keys(state, consumed.map(&:to_s)) }
+        remaining = payload.reject { |key, _| consumed.include?(key) }
+        remaining.empty? ? nil : remaining
       end
 
       # Record a delivery's answers before it queues for the task's update

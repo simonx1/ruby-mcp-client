@@ -161,6 +161,17 @@ module MCPClient
         answered_keys_mutex.synchronize { current_session_epoch(srv) }
       end
 
+      # The epoch a request's bookkeeping is keyed by: the session it was
+      # pinned to, or — for a request that carries no pin, e.g. on a
+      # transport that reports no session — the one live now. A transport
+      # without a session epoch reports 0 from every lookup path, so a nil
+      # pin must resolve to that same key and never to a key of its own.
+      # @param epoch [Integer, nil] the session the request is pinned to
+      # @return [Integer]
+      def registry_epoch(srv, epoch)
+        epoch.nil? ? current_session_epoch(srv) : epoch
+      end
+
       # @return [Array] where a task id's live bookkeeping is found in the
       #   session live at this call (callers hold answered_keys_mutex)
       def task_state_lookup(srv, task_id)
