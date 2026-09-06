@@ -492,6 +492,79 @@ module MCPClient
       @mutex.synchronize { @id == id }
     end
 
+    # Undo the listen attempt that failed — or find that it is no longer this
+    # attempt's to undo — in one step.
+    #
+    # {#open_as?} used to answer the first half of that question on its own,
+    # and a restart could re-open the subscription under a newer id *and*
+    # have it acknowledged between the answer and the transition it guarded:
+    # the older attempt then finished the very stream the fresh process was
+    # serving, with nothing left to cancel it. Asking and acting under one
+    # hold of the lock is what makes the answer good for the transition it
+    # decides.
+    #
+    # The three answers are the three things a failed attempt can be:
+    # superseded by a newer attempt, which owns the subscription now; a
+    # hand-over to a new session that could not be written
+    # ({#reestablishing?}), which goes back to waiting for the next one; or
+    # the caller's own request, which ends with the error.
+    # @param id [Integer, String, nil] the listen id the attempt sent under;
+    #   nil for an attempt that failed before it took one (the request could
+    #   not be built), which no newer attempt can have superseded
+    # @param error [MCPClient::Errors::MCPError] why it failed
+    # @return [Symbol] :superseded, :deferred (it is :reconnecting again) or
+    #   :failed (ended with the error — or already closed)
+    # @api private
+    def fail_attempt(id, error)
+      @mutex.synchronize do
+        return :superseded if id && @id != id
+        return :failed if @state == :closed
+
+        if @reestablishing
+          @state = :reconnecting
+          return :deferred
+        end
+
+        close_locked(error: error)
+        :failed
+      end
+    end
+
+    # End the request a deadline was set on, if the subscription is still on
+    # that request and the server has still not answered it — in one step.
+    #
+    # The watchdog that waits out the deadline cannot decide this for itself:
+    # by the time its wait returns, a restart may have replaced the request
+    # with a newer one (a new id, with a deadline of its own, which the older
+    # request's timer must not spend), and an acknowledgment may have landed
+    # in the instant between the wait and the verdict, which is the server's
+    # answer and is kept.
+    # Anyone waiting for the subscription to settle is woken only once the
+    # block — the cancellation the transport sends for the expired request —
+    # has run: a host that sees the handle settle on a timeout sees a server
+    # that has already been told, rather than one the watchdog is still
+    # writing to. The block runs outside the lock, since telling the server
+    # takes the ids recorded on this subscription.
+    # @param id [Integer, String] the listen id the deadline was set on
+    # @param error [MCPClient::Errors::RequestTimeoutError] the deadline missed
+    # @yield after the subscription has been ended, before the waiters wake
+    # @return [Symbol, nil] :expired when the subscription was ended here;
+    #   nil when the request was no longer this one's to expire
+    # @api private
+    def expire_unanswered(id, error)
+      @mutex.synchronize do
+        return nil if @id != id || @answered || SETTLED_STATES.include?(@state)
+
+        close_locked(by_client: true, error: error, announce: false)
+      end
+      begin
+        yield if block_given?
+      ensure
+        @mutex.synchronize { @settled.broadcast }
+      end
+      :expired
+    end
+
     # Record what the server agreed to honour.
     #
     # The filter is copied and frozen through and through, arrays and strings
@@ -573,18 +646,7 @@ module MCPClient
 
     # @api private
     def finish(gracefully: false, by_client: false, error: nil, reason: nil)
-      @mutex.synchronize do
-        return if @state == :closed
-
-        @state = :closed
-        @closed_gracefully = gracefully
-        @closed_by_client = by_client
-        @error = error
-        @close_reason = reason
-        @settled.broadcast
-        # Deliveries already queued still run; the dispatcher ends after them.
-        @dispatcher&.stop
-      end
+      @mutex.synchronize { close_locked(gracefully: gracefully, by_client: by_client, error: error, reason: reason) }
     end
 
     # @return [Boolean] whether the subscription should be re-established after a reconnect
@@ -598,6 +660,24 @@ module MCPClient
     end
 
     private
+
+    # The closing transition, for the callers that decide it under the lock
+    # they already hold. A closed subscription stays as it was closed.
+    # @param announce [Boolean] whether to wake the waiters now; a caller
+    #   that passes false owes them a broadcast of its own
+    # @return [void]
+    def close_locked(gracefully: false, by_client: false, error: nil, reason: nil, announce: true)
+      return if @state == :closed
+
+      @state = :closed
+      @closed_gracefully = gracefully
+      @closed_by_client = by_client
+      @error = error
+      @close_reason = reason
+      @settled.broadcast if announce
+      # Deliveries already queued still run; the dispatcher ends after them.
+      @dispatcher&.stop
+    end
 
     # Wait for the condition the caller is asking about to hold, then read the
     # acknowledgment on record for this URI. The block is evaluated with the

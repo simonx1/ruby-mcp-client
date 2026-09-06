@@ -90,6 +90,11 @@ module MCPClient
         # once the teardown has closed that pipe it fails into the error paths
         # below instead.
         stdin = @stdin
+        # Whether the subscription has taken this attempt's id yet. A failure
+        # before that — the request could not be built — is nobody's to have
+        # superseded, and was filed as exactly that while the id it never
+        # took was compared with the one it had (see {#fail_open_attempt}).
+        taken = false
         id = next_id
         # No caller waits on this id: the response, if any, is the server's
         # graceful closure and is routed to the subscription itself.
@@ -101,6 +106,7 @@ module MCPClient
         # lock (so a close that wins stops the re-open outright), and a close
         # that cancelled this id while the request was still going out is
         # named again below, once the server has seen the listen.
+        taken = true
         return unless subscription.with_open_id(id) { register_subscription(subscription) }
 
         # Recorded before the write, and whatever the write does: from here on
@@ -127,7 +133,7 @@ module MCPClient
           cancel_outstanding_listens(subscription, io: stdin) if subscription.closed_by_client?
         end
       rescue StandardError => e
-        fail_open_attempt(subscription, id, e)
+        fail_open_attempt(subscription, taken ? id : nil, e)
       end
 
       # Undo the listen attempt that just failed — but only when the
@@ -154,21 +160,40 @@ module MCPClient
       #   taking the new listen id has already moved it from :reconnecting to
       #   :pending by the time the write raises, so the state says "being
       #   opened" for the very hand-over that is failing.
+      #
+      # Which of those it is, and the transition that follows, are decided in
+      # one step on the subscription ({MCPClient::Subscription#fail_attempt}).
+      # Asked first and acted on afterwards, the answer went stale in
+      # between: a restart re-opened the subscription under a newer id and
+      # had it acknowledged after the ownership check had passed, and this
+      # attempt then finished the healthy replacement. Only the registration
+      # comes first — it is scoped to this attempt's id, so a newer one is
+      # never touched by it.
+      #
+      # An attempt that failed before the subscription took its id at all
+      # (the request could not be built) arrives with no id: nothing was
+      # registered for it, and no newer attempt can have superseded it, so
+      # the failure is the caller's — or the next session's — to hear about.
       # @param subscription [MCPClient::Subscription]
-      # @param id [Integer, String] the listen id this attempt sent under
+      # @param id [Integer, String, nil] the listen id this attempt sent
+      #   under; nil when it failed before taking one
       # @param error [StandardError] why it failed
       # @return [void]
       # @raise [StandardError] the failure, when it was still this attempt's
       def fail_open_attempt(subscription, id, error)
-        return fail_superseded_attempt(subscription, id, error) unless subscription.open_as?(id)
+        unregister_subscription_id(subscription, id) if id
+        failure = subscription_failure(error)
+        case subscription.fail_attempt(id, failure)
+        when :superseded then fail_superseded_attempt(subscription, id, error)
+        when :deferred then defer_reestablished_attempt(subscription, id, error)
+        else raise failure
+        end
+      end
 
-        unregister_subscription_id(subscription, id)
-        return defer_reestablished_attempt(subscription, id, error) if subscription.reestablishing?
-
-        subscription.finish(
-          error: error.is_a?(MCPClient::Errors::MCPError) ? error : MCPClient::Errors::TransportError.new(error.message)
-        )
-        raise error
+      # @param error [StandardError] a failure
+      # @return [MCPClient::Errors::MCPError] the error a subscription ends with
+      def subscription_failure(error)
+        error.is_a?(MCPClient::Errors::MCPError) ? error : MCPClient::Errors::TransportError.new(error.message)
       end
 
       # Put a subscription whose hand-over could not be written back on the
@@ -181,15 +206,19 @@ module MCPClient
       # process that could not be written to is on its way out — its reader
       # reaches EOF and restarts, and the crash-loop bound then decides
       # whether another one is worth spawning.
+      # The subscription is :reconnecting again already — that transition
+      # was decided with the verdict, under the one lock
+      # ({MCPClient::Subscription#fail_attempt}).
       # @param subscription [MCPClient::Subscription]
-      # @param id [Integer, String] the listen id this attempt sent under
+      # @param id [Integer, String, nil] the listen id this attempt sent
+      #   under; nil when it failed before taking one
       # @param error [StandardError] why it failed
       # @return [void]
       def defer_reestablished_attempt(subscription, id, error)
-        subscription.mark_reconnecting
         enqueue_reconnecting_subscriptions([subscription])
-        @logger.debug("subscriptions/listen #{id} failed while the subscription was being handed to a new " \
-                      "process (#{error.message}); it will be re-sent to the next one")
+        @logger.debug("#{id ? "subscriptions/listen #{id}" : 'a subscriptions/listen request'} failed while the " \
+                      "subscription was being handed to a new process (#{error.message}); it will be re-sent to " \
+                      'the next one')
       end
 
       # A failure the subscription has already moved on from: harmless while
@@ -473,7 +502,7 @@ module MCPClient
       # @param error [StandardError] why they ended
       # @return [void]
       def fail_subscriptions(pending, error)
-        failure = error.is_a?(MCPClient::Errors::MCPError) ? error : MCPClient::Errors::TransportError.new(error.message)
+        failure = subscription_failure(error)
         pending.each { |subscription| subscription.finish(gracefully: false, error: failure) }
       end
 
