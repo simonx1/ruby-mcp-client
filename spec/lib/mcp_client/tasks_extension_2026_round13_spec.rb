@@ -113,7 +113,10 @@ RSpec.describe 'MCP 2026-07-28 tasks extension — round 13' do
     expect(state[:answered]).to include('k1', 'k2')
   end
 
-  it 'forgets task bookkeeping when the server session ends' do
+  # A stateless 2026-07-28 peer holds no session a cleanup could end (round
+  # 43): the task outlives the connection, and so does what the host already
+  # answered for it. A 2025-11-25 handshake's session does end — see round 43.
+  it 'keeps task bookkeeping across a cleanup: a stateless peer has no session to end' do
     client = client_for(stdio)
     script_stdio(stdio, [{ 'result' => discover_result }, tool_list, { 'result' => task_result }, { 'result' => {} }])
     task = client.call_tool_as_task('slow', {})
@@ -122,7 +125,8 @@ RSpec.describe 'MCP 2026-07-28 tasks extension — round 13' do
 
     stdio.cleanup
 
-    expect(client.send(:answered_task_keys, stdio, 'task-1')).to be_empty
+    expect(stdio.session_epoch).to eq(0)
+    expect(client.send(:answered_task_keys, stdio, 'task-1')).to include('k1')
   end
 
   it 'forgets task bookkeeping once the task is gone or its TTL elapsed' do

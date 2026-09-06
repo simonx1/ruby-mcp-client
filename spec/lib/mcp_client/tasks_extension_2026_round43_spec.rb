@@ -95,6 +95,17 @@ RSpec.describe 'MCP 2026-07-28 tasks extension — round 43' do
       expect(stdio.session_epoch).to be > epoch
     end
 
+    it 'forgets the task bookkeeping of the session a 2025-11-25 handshake opened' do
+      client = client_for(stdio)
+      connected(stdio, version: '2025-11-25')
+      client.send(:remember_answered_keys, stdio, 'task-1', ['k1'])
+
+      stdio.cleanup
+
+      expect(stdio.session_epoch).to eq(1)
+      expect(client.send(:answered_task_keys, stdio, 'task-1')).to be_empty
+    end
+
     it 'ends no session on a process that never completed a handshake' do
       connected(stdio, version: nil, initialized: false)
       epoch = stdio.session_epoch

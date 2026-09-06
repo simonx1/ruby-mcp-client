@@ -564,8 +564,9 @@ metadata). Each feature lands in its own PR; this section accumulates them.
   concurrent update that read an empty pending slot can never confirm and
   wipe an answer another delivery had just left pending. Task bookkeeping
   (answered keys, pending answers, input rounds) is keyed by the
-  transport's `session_epoch` (bumped by every `cleanup`, including a
-  restarted stdio process) and dropped once the task is gone
+  transport's `session_epoch` (bumped when a `cleanup` ends a session — the
+  one a 2025-11-25 handshake opened; a stateless 2026-07-28 peer, over HTTP
+  or stdio, holds none, see round 43) and dropped once the task is gone
   (`TaskNotFound`) or past its TTL, so a reused task id never inherits
   it. A poll that times out before the server ever said a pace waits the
   default interval, not the busy-loop floor.
@@ -583,6 +584,22 @@ metadata). Each feature lands in its own PR; this section accumulates them.
   represent, or that is merely enormous, is bounded to
   `MAX_TASK_POLL_INTERVAL` (one hour) rather than handed to `sleep`, and
   still clamped to what is left of the caller's timeout and the TTL.
+- **Durable stdio tasks, outstanding-only retransmission (round 43).** A
+  replaced stdio process ends a session only when a 2025-11-25 handshake
+  opened one: a stateless 2026-07-28 peer holds none, so a task it created
+  outlives the connection exactly as over sessionless HTTP, and the
+  replacement process is asked about it rather than the handle being refused
+  for a session that never existed. A retransmitted `tasks/update` carries
+  only the pending answers the task still lists as outstanding: an answer
+  the observation no longer asks for was consumed (its acknowledgement was
+  lost, not the update), so it is dropped while its key stays answered. A
+  transport that reports no session keys its bookkeeping like every other
+  lookup, so one explicit update after another no longer crashes the
+  registry. A persisted `DetailedTask` hash (a completed handle's `to_h`) is
+  read back as one, so `get_task_result` hands back its result without
+  asking a server that may have purged the task; a 2026-07-28 URL-mode
+  elicitation hands the host no `elicitationId` key (a 2025-11-25 field)
+  when the request carries none.
 
 ### Cacheable results (`ttlMs` / `cacheScope`)
 

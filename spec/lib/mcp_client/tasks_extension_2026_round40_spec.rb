@@ -381,15 +381,19 @@ RSpec.describe 'MCP 2026-07-28 tasks extension — round 40' do
       expect(client.send(:task_state, http, task.task_id)[:pending_update]).to have_key('k1')
     end
 
-    it 'forgets the bookkeeping of a session the cleanup ended' do
+    # A stateless 2026-07-28 stdio peer holds no session either (round 43):
+    # its cleanup ends none, and the bookkeeping stays exactly as it does over
+    # sessionless HTTP above. The session a 2025-11-25 handshake opened is
+    # forgotten with its cleanup — pinned in round 43.
+    it 'keeps the bookkeeping of a stateless stdio peer across a cleanup' do
       client = client_for
       script_stdio(stdio, [{ 'result' => discover_result }])
       client.send(:remember_answered_keys, stdio, 'task-1', ['k1'])
 
       client.cleanup
 
-      expect(stdio.session_epoch).to eq(1)
-      expect(client.instance_variable_get(:@task_states)).to be_nil
+      expect(stdio.session_epoch).to eq(0)
+      expect(client.send(:answered_task_keys, stdio, 'task-1')).to include('k1')
     end
   end
 
