@@ -149,6 +149,9 @@ module MCPClient
       @transport_lock.synchronize do
         @stdin, @stdout, @stderr, @wait_thread = handles
         @transport_generation += 1
+        # A fresh process is not the one that exited: a restart made for the
+        # open subscriptions must not be torn down again by the next request.
+        @transport_retired = false
         # A fresh process has said nothing yet: what the previous one wrote
         # identifies nothing about this one, and what was negotiated WITH it
         # binds nothing here. The era is per process (stdio "Backward
@@ -983,6 +986,10 @@ module MCPClient
       # Stamped before the teardown, on the record the teardown retires: this
       # is the one path that knows the process was not asked to go.
       session&.exited_unexpectedly
+      # Retired before the teardown bumps the generation past this reader's,
+      # so the exit stays observable the way any other unexpected exit is:
+      # the next request releases the dead handles and negotiates again.
+      retire_transport(@transport_generation)
       cleanup
       restart_for_open_subscriptions
     end
