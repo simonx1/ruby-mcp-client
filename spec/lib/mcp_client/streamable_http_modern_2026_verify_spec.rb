@@ -1860,10 +1860,12 @@ RSpec.describe 'MCP 2026-07-28 Streamable HTTP — a response stream that really
       it 'delivers a notification exactly once when the socket dies after the final SSE event' do
         seen = Queue.new
         start_server do |message|
-          if message['method'] == 'server/discover'
-            jsonrpc(message, discovery)
-          else
-            [MidStreamCloseServer::DELIVER_THEN_CLOSE, [progress, jsonrpc(message, { 'content' => [] })]]
+          case message['method']
+          when 'server/discover' then jsonrpc(message, discovery)
+          # The call's own prerequisite list on this branch: answered plainly,
+          # so the only notification on the wire rides the call's stream.
+          when 'tools/list' then jsonrpc(message, { 'tools' => [] })
+          else [MidStreamCloseServer::DELIVER_THEN_CLOSE, [progress, jsonrpc(message, { 'content' => [] })]]
           end
         end
         server = transport(klass, read_timeout: 5)
@@ -1877,10 +1879,12 @@ RSpec.describe 'MCP 2026-07-28 Streamable HTTP — a response stream that really
       it 'delivers a notification exactly once when the stream stalls after the final SSE event' do
         seen = Queue.new
         start_server do |message|
-          if message['method'] == 'server/discover'
-            jsonrpc(message, discovery)
-          else
-            [MidStreamCloseServer::DELIVER_THEN_STALL, [progress, jsonrpc(message, { 'content' => [] })]]
+          case message['method']
+          when 'server/discover' then jsonrpc(message, discovery)
+          # The call's own prerequisite list on this branch: answered plainly,
+          # so the only notification on the wire rides the call's stream.
+          when 'tools/list' then jsonrpc(message, { 'tools' => [] })
+          else [MidStreamCloseServer::DELIVER_THEN_STALL, [progress, jsonrpc(message, { 'content' => [] })]]
           end
         end
         server = transport(klass, read_timeout: 0.3)
@@ -1898,8 +1902,10 @@ RSpec.describe 'MCP 2026-07-28 Streamable HTTP — a response stream that really
     it 'delivers a request-scoped notification before the modern response stream ends' do
       seen = Queue.new
       start_server do |message|
-        if message['method'] == 'server/discover'
-          jsonrpc(message, discovery)
+        case message['method']
+        when 'server/discover' then jsonrpc(message, discovery)
+        # The call's own prerequisite list on this branch, answered plainly.
+        when 'tools/list' then jsonrpc(message, { 'tools' => [] })
         else
           waiter = -> { settled_within?(3) { !seen.empty? } }
           [MidStreamCloseServer::EVENT_THEN_WAIT,

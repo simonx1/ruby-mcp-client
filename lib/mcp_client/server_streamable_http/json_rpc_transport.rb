@@ -60,6 +60,13 @@ module MCPClient
       # @raise [MCPClient::Errors::TransportError] if parsing fails
       # @raise [MCPClient::Errors::ServerError] if the response contains an error
       def parse_response(response, request = nil)
+        # Host code a stream listener reached raised while the body was still
+        # arriving: that is this exchange's failure (already marked as a
+        # nested exchange's, so no recovery acts on it), raised in place of
+        # the response it was interleaved with.
+        failure = stream_listener_error(response)
+        raise failure if failure
+
         body = response.body
         content_type = response.headers['content-type'] || response.headers['Content-Type'] || ''
         content_encoding = response.headers['content-encoding'] || response.headers['Content-Encoding'] || ''
@@ -159,8 +166,6 @@ module MCPClient
           message = sse_event_json_rpc_message(parsed)
           dispatch_server_message(message) if message.is_a?(Hash) && message['method']
         end
-      rescue StandardError => e
-        @logger.error("Error handling a message on the response stream: #{e.message}")
       end
 
       # How many of the events the completed body splits into were handed to
