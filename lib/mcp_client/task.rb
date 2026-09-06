@@ -122,7 +122,11 @@ module MCPClient
         result: extract_field(data, 'result'),
         error: extract_field(data, 'error'),
         modern: modern,
-        detailed: detailed,
+        # A hash carrying what only a DetailedTask carries (a result, an
+        # error, the input requests) is one, however it was handed back: a
+        # host that persisted a completed handle's #to_h reads its result
+        # from it instead of asking a server that may have purged the task.
+        detailed: detailed || detail_carried?(data),
         server: server,
         session_epoch: session_epoch,
         task_generation: task_generation
@@ -180,6 +184,14 @@ module MCPClient
       data.key?(str_key) || data.key?(str_key.to_sym) || (!sym_key.nil? && data.key?(sym_key))
     end
     private_class_method :field_present?
+
+    # @return [Boolean] whether the hash carries a DetailedTask's payload
+    def self.detail_carried?(data)
+      %w[result error inputRequests].any? do |key|
+        field_present?(data, key, key == 'inputRequests' ? :input_requests : nil)
+      end
+    end
+    private_class_method :detail_carried?
 
     # Convert to a spec-shaped, JSON-serializable hash
     # @return [Hash]

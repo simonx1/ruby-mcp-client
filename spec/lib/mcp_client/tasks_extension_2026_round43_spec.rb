@@ -49,7 +49,8 @@ RSpec.describe 'MCP 2026-07-28 tasks extension — round 43' do
     allow(server).to receive(:start_reader)
     allow(server).to receive(:start_stderr_reader)
     server.instance_variable_set(:@stdin, double('stdin', puts: nil, flush: nil, closed?: true, close: nil))
-    allow(server).to receive(:send_request) { |req, *_rest, **_opts| sent << req }
+    # The wire shape: what send_request would serialize.
+    allow(server).to receive(:send_request) { |req, *_rest, **_opts| sent << JSON.parse(JSON.generate(req)) }
     allow(server).to receive(:wait_response) do |id, **_opts|
       method = sent.last['method']
       queue = script.fetch(method) { raise "no script for #{method}" }
@@ -266,6 +267,269 @@ RSpec.describe 'MCP 2026-07-28 tasks extension — round 43' do
       expect(client.wait_for_task('task-1', timeout: 5)).to be_completed
       expect(update_keys(calls)).to eq([['k1'], ['k2']])
       expect(calls.map { |req| req['method'] }).to eq(%w[server/discover tasks/update tasks/update tasks/get])
+    end
+  end
+
+  describe 'a completed handle a host persisted' do
+    let(:stdio) { MCPClient::ServerStdio.new(command: 'echo test', read_timeout: 1) }
+
+    it 'hands back its serialized result without asking a server that may have purged the task' do
+      client = client_for(stdio)
+      sent = scripted(stdio, 'tasks/get' => [detailed_task(status: 'completed', 'result' => call_result('kept'))])
+      finished = client.wait_for_task('task-1', timeout: 5)
+
+      # What the README shows: the handle's hash, persisted and read back.
+      restored = MCPClient::Task.from_json(JSON.parse(JSON.generate(finished.to_h)), server: stdio)
+
+      expect(restored).to be_detailed
+      expect(client.get_task_result(restored)).to eq(call_result('kept'))
+      expect(sent.count { |req| req['method'] == 'tasks/get' }).to eq(1)
+    end
+
+    it 'still treats a persisted CreateTaskResult as the seed it is' do
+      created = MCPClient::Task.from_create_result(
+        { 'resultType' => 'task', 'taskId' => 'task-1', 'status' => 'working', 'ttlMs' => 1000 }, server: stdio
+      )
+
+      expect(MCPClient::Task.from_json(created.to_h, server: stdio)).not_to be_detailed
+    end
+  end
+
+  describe 'the input a 2026-07-28 task asks for' do
+    let(:stdio) { MCPClient::ServerStdio.new(command: 'echo test', read_timeout: 1) }
+    let(:done) { detailed_task(status: 'completed', 'result' => call_result) }
+
+    def url_request
+      { 'method' => 'elicitation/create',
+        'params' => { 'mode' => 'url', 'message' => 'Sign in', 'url' => 'https://consent.example.com/session/1' } }
+    end
+
+    it 'runs a URL-mode elicitation through tasks/update, handing the host no 2025 field' do
+      seen = []
+      client = client_for(stdio, elicitation_handler: lambda { |message, details|
+        seen << [message, details]
+        { action: 'accept' }
+      })
+      asks = detailed_task(status: 'input_required', 'inputRequests' => { 'consent' => url_request })
+      sent = scripted(stdio, 'tasks/get' => [asks, done], 'tasks/update' => [{}])
+
+      expect(client.wait_for_task('task-1', timeout: 5)).to be_completed
+
+      expect(seen).to eq([['Sign in', { 'mode' => 'url', 'url' => 'https://consent.example.com/session/1' }]])
+      update = sent.find { |req| req['method'] == 'tasks/update' }
+      expect(update['params']['inputResponses']).to eq({ 'consent' => { 'action' => 'accept' } })
+    end
+
+    it 'still hands a 2025-11-25 elicitationId to the host when the request carries one' do
+      seen = []
+      client = client_for(stdio, elicitation_handler: lambda { |_message, details|
+        seen << details
+        { action: 'accept' }
+      })
+      request = url_request.merge('params' => url_request['params'].merge('elicitationId' => 'e-1'))
+      asks = detailed_task(status: 'input_required', 'inputRequests' => { 'consent' => request })
+      scripted(stdio, 'tasks/get' => [asks, done], 'tasks/update' => [{}])
+
+      client.wait_for_task('task-1', timeout: 5)
+
+      expect(seen.first).to include('elicitationId' => 'e-1')
+    end
+
+    def sampling_request(tools: true)
+      params = { 'messages' => [{ 'role' => 'user', 'content' => { 'type' => 'text', 'text' => 'hi' } }],
+                 'maxTokens' => 10 }
+      if tools
+        params.merge!('tools' => [{ 'name' => 'lookup', 'inputSchema' => { 'type' => 'object' } }],
+                      'toolChoice' => { 'mode' => 'auto' })
+      end
+      { 'method' => 'sampling/createMessage', 'params' => params }
+    end
+
+    it 'refuses a tool-enabled sampling request when sampling.tools was not declared, before any sampler runs' do
+      sampled = []
+      client = client_for(stdio, sampling_handler: lambda { |params|
+        sampled << params
+        raise 'not reached'
+      })
+      asks = detailed_task(status: 'input_required', 'inputRequests' => { 'k1' => sampling_request })
+      sent = scripted(stdio, 'tasks/get' => [asks])
+
+      expect { client.wait_for_task('task-1', timeout: 5) }
+        .to raise_error(MCPClient::Errors::InputRequiredError, /sampling\.tools/)
+      expect(sampled).to be_empty
+      expect(sent.map { |req| req['method'] }).not_to include('tasks/update')
+    end
+
+    it 'hands a declared sampler the tools and tool choice whole and sends its answer whole' do
+      sampled = []
+      answer = { 'role' => 'assistant', 'content' => { 'type' => 'text', 'text' => 'call lookup' },
+                 'model' => 'm-1', 'stopReason' => 'toolUse' }
+      client = client_for(stdio, sampling_supports_tools: true,
+                                 sampling_handler: lambda { |_messages, _prefs, _system, _max, params|
+                                   sampled << params
+                                   answer
+                                 })
+      asks = detailed_task(status: 'input_required', 'inputRequests' => { 'k1' => sampling_request })
+      sent = scripted(stdio, 'tasks/get' => [asks, done], 'tasks/update' => [{}])
+
+      expect(client.wait_for_task('task-1', timeout: 5)).to be_completed
+
+      expect(sampled.first).to include('tools' => sampling_request['params']['tools'],
+                                       'toolChoice' => { 'mode' => 'auto' }, 'maxTokens' => 10)
+      update = sent.find { |req| req['method'] == 'tasks/update' }
+      expect(update['params']['inputResponses']).to eq({ 'k1' => answer })
+    end
+  end
+
+  describe 'a task created after a real HeaderMismatch recovery over Streamable HTTP' do
+    let(:url) { 'http://tasks.example/mcp' }
+
+    def charge_tool(required)
+      { 'name' => 'charge',
+        'inputSchema' => { 'type' => 'object',
+                           'properties' => { 'region' => { 'type' => 'string', 'x-mcp-header' => 'Region' } } },
+        'outputSchema' => { 'type' => 'object', 'properties' => { 'a' => { 'type' => 'integer' },
+                                                                  'b' => { 'type' => 'integer' } },
+                            'required' => required } }
+    end
+
+    def json_answer(id, result)
+      { status: 200, headers: { 'Content-Type' => 'application/json' },
+        body: { jsonrpc: '2.0', id: id, result: result }.to_json }
+    end
+
+    # The first call is rejected with HeaderMismatch; the list the client
+    # refreshes in response carries a stricter outputSchema, and the retried
+    # call is accepted as a task.
+    def serving
+      sent = []
+      lists = 0
+      calls = 0
+      stub_request(:post, url).to_return do |request|
+        body = JSON.parse(request.body)
+        sent << [body['method'], request.headers['Mcp-Param-Region']]
+        case body['method']
+        when 'server/discover' then json_answer(body['id'], discover_result)
+        when 'tools/list'
+          lists += 1
+          json_answer(body['id'], { 'resultType' => 'complete', 'ttlMs' => 60_000,
+                                    'tools' => [charge_tool(lists == 1 ? ['a'] : %w[a b])] })
+        when 'tools/call'
+          calls += 1
+          if calls == 1
+            { status: 400, headers: { 'Content-Type' => 'application/json' },
+              body: { jsonrpc: '2.0', id: body['id'],
+                      error: { code: -32_020, message: 'Header mismatch' } }.to_json }
+          else
+            now = Time.now.utc.iso8601
+            json_answer(body['id'], { 'resultType' => 'task', 'taskId' => 'task-1', 'status' => 'working',
+                                      'createdAt' => now, 'lastUpdatedAt' => now, 'ttlMs' => 60_000,
+                                      'pollIntervalMs' => 1 })
+          end
+        when 'tasks/get'
+          json_answer(body['id'], detailed_task(status: 'completed',
+                                                'result' => { 'content' => [], 'structuredContent' => { 'a' => 1 },
+                                                              'isError' => false }))
+        else raise "unexpected #{body['method']}"
+        end
+      end
+      sent
+    end
+
+    it 'validates what the task delivers against the definition the recovery refreshed' do
+      sent = serving
+      http = MCPClient::ServerStreamableHTTP.new(base_url: url)
+      allow(MCPClient::ServerFactory).to receive(:create).and_return(http)
+      client = MCPClient::Client.new(mcp_server_configs: [{ type: 'streamable_http', url: url }],
+                                     extensions: [TASKS_EXT], validate_structured_content: :strict)
+      allow(client).to receive(:sleep)
+
+      handle = client.call_tool_as_task('charge', { 'region' => 'eu' })
+
+      expect(handle).to be_working
+      expect(sent.map(&:first)).to eq(%w[server/discover tools/list tools/call tools/list tools/call
+                                         tasks/get].first(5))
+      expect(sent.filter_map { |method, region| region if method == 'tools/call' }).to eq(%w[eu eu])
+      expect { client.get_task_result(handle) }.to raise_error(MCPClient::Errors::ValidationError, /\bb\b/)
+      expect(sent.map(&:first).last).to eq('tasks/get')
+    end
+  end
+
+  describe 'a legacy task whose result stream carries a related-task elicitation' do
+    let(:server) { MCPClient::ServerSSE.new(base_url: 'https://example.com/sse', read_timeout: 5, retries: 0) }
+    let(:related_key) { MCPClient::ServerBase::RELATED_TASK_META_KEY }
+
+    def legacy_task(status: 'working')
+      now = Time.now.utc.iso8601
+      { 'taskId' => 'task-1', 'status' => status, 'createdAt' => now, 'lastUpdatedAt' => now, 'ttl' => 60_000,
+        'pollInterval' => 1 }
+    end
+
+    def event(message)
+      "event: message\ndata: #{JSON.generate(message)}\n\n"
+    end
+
+    def elicitation_from_server
+      { 'jsonrpc' => '2.0', 'id' => 'srv-7', 'method' => 'elicitation/create',
+        'params' => { 'message' => 'Name?', 'mode' => 'form',
+                      'requestedSchema' => { 'type' => 'object', 'properties' => { 'n' => { 'type' => 'string' } } },
+                      '_meta' => { related_key => { 'taskId' => 'task-1' } } } }
+    end
+
+    # The SSE transport at the wire: every POST is recorded, and the answer
+    # (or, for tasks/result, first the server's own request and then the
+    # answer) arrives on the event stream, as it does over this transport.
+    def on_the_stream(answers)
+      sent = []
+      written = []
+      server.instance_variable_set(:@connection_established, true)
+      server.instance_variable_set(:@sse_connected, true)
+      server.instance_variable_set(:@rpc_endpoint, 'https://example.com/messages')
+      allow(server).to receive(:post_json_rpc_request) do |request|
+        wire = JSON.parse(JSON.generate(request))
+        sent << wire
+        next nil if wire['method'].start_with?('notifications/')
+
+        answers.fetch(wire['method']) { raise "no answer for #{wire['method']}" }.call(wire).each do |message|
+          server.send(:parse_and_handle_sse_event, event(message.merge('jsonrpc' => '2.0')))
+        end
+        nil
+      end
+      allow(server).to receive(:post_jsonrpc_response) { |response| written << JSON.parse(JSON.generate(response)) }
+      [sent, written]
+    end
+
+    it 'answers the elicitation on the stream before the result is released, related to the task' do
+      allow(MCPClient::ServerFactory).to receive(:create).and_return(server)
+      client = MCPClient::Client.new(mcp_server_configs: [{ type: 'sse', base_url: 'https://example.com/sse' }],
+                                     elicitation_handler: lambda { |_message, _schema|
+                                       { action: 'accept', content: { 'n' => 'x' } }
+                                     })
+      allow(client).to receive(:sleep)
+      answer = ->(wire, result) { [{ 'id' => wire['id'], 'result' => result }] }
+      sent, written = on_the_stream(
+        'initialize' => lambda { |wire|
+          tasks = { 'get' => true, 'result' => true, 'requests' => { 'tools' => { 'call' => {} } } }
+          answer.call(wire, { 'protocolVersion' => '2025-11-25',
+                              'capabilities' => { 'tools' => {}, 'tasks' => tasks },
+                              'serverInfo' => { 'name' => 's', 'version' => '1' } })
+        },
+        'tools/list' => lambda { |wire|
+          answer.call(wire, { 'tools' => [{ 'name' => 'slow', 'inputSchema' => { 'type' => 'object' },
+                                            'execution' => { 'taskSupport' => 'optional' } }] })
+        },
+        'tools/call' => ->(wire) { answer.call(wire, { 'task' => legacy_task }) },
+        'tasks/result' => ->(wire) { [elicitation_from_server] + answer.call(wire, call_result('legacy')) }
+      )
+
+      handle = client.call_tool_as_task('slow', {})
+      expect(client.get_task_result(handle)).to eq(call_result('legacy'))
+
+      expect(sent.map { |request| request['method'] }.reject { |method| method.start_with?('notifications/') })
+        .to eq(%w[initialize tools/list tools/call tasks/result])
+      reply = written.find { |message| message['id'] == 'srv-7' }
+      expect(reply['result']).to include('action' => 'accept', 'content' => { 'n' => 'x' })
+      expect(reply.dig('result', '_meta', related_key)).to eq({ 'taskId' => 'task-1' })
     end
   end
 end

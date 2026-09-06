@@ -1377,8 +1377,10 @@ module MCPClient
     # @param message [String] the human-readable message
     # @return [Object] handler result
     def handle_url_elicitation(params, message)
-      url = params['url']
-      elicitation_id = params['elicitationId']
+      # elicitationId is a 2025-11-25 field: MCP 2026-07-28 dropped it, and a
+      # request without one hands the handler no such key rather than a nil.
+      details = { 'mode' => 'url', 'url' => params['url'] }
+      details['elicitationId'] = params['elicitationId'] if params.key?('elicitationId')
 
       # Call handler with URL-mode specific params
       case @elicitation_handler.arity
@@ -1387,10 +1389,9 @@ module MCPClient
       when 1
         @elicitation_handler.call(message)
       when 2, -1
-        @elicitation_handler.call(message, { 'mode' => 'url', 'url' => url, 'elicitationId' => elicitation_id })
+        @elicitation_handler.call(message, details)
       else
-        @elicitation_handler.call(message, { 'mode' => 'url', 'url' => url, 'elicitationId' => elicitation_id },
-                                  params['metadata'])
+        @elicitation_handler.call(message, details, params['metadata'])
       end
     end
 

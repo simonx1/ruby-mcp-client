@@ -184,10 +184,10 @@ module MCPClient
         consumed = payload.keys.reject { |key| outstanding.include?(key.to_s) }
         return payload if consumed.empty?
 
-        logger.debug("Task #{shown}: the server consumed the answers to #{consumed.map(&:to_s).join(', ')} " \
+        logger.debug("Task #{shown}: the server consumed the answers to #{consumed.join(', ')} " \
                      'before acknowledging them; they are not sent again')
         answered_keys_mutex.synchronize { drop_pending_keys(state, consumed.map(&:to_s)) }
-        remaining = payload.reject { |key, _| consumed.include?(key) }
+        remaining = payload.except(*consumed)
         remaining.empty? ? nil : remaining
       end
 
