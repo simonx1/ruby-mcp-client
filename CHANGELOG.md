@@ -495,6 +495,18 @@ metadata). Each feature lands in its own PR; this section accumulates them.
   `tasks/get`, since only a DetailedTask carries the result, error or
   input requests. The `createdAt + ttlMs` backstop ends the wait with a
   `TaskError`.
+- **Restored handles, hung transports and Symbol keys.** A task handle a
+  host rebuilt (`Task.from_json`) into a transport nothing was sent through
+  yet is not refused as belonging to an ended session: a first connect ends
+  none, and a sessionless 2026-07-28 server never has one. A transport that
+  takes no per-request timeout is polled through a bounded set of workers —
+  a request still hanging is joined again on the next poll rather than
+  started again beside it, its late answer is taken by that poll, and at
+  most `MAX_PENDING_TASK_REQUESTS` distinct requests may hang on one
+  transport (a `TransportError` beyond that) — so a transport that never
+  answers cannot pile up live threads. Task payloads a transport hands up
+  with Symbol keys (a JSON middleware, a host's own transport) are validated
+  and bookkept as the wire spelled them.
 - **Task lifecycle API.** `call_tool_as_task` returns the `MCPClient::Task`
   handle (a locally completed task when the server answered
   synchronously); `get_task` returns the DetailedTask (`input_requests`,

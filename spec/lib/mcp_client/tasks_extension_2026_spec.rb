@@ -407,7 +407,7 @@ RSpec.describe 'MCP 2026-07-28 tasks extension' do
       client = client_for(stdio, logger: Logger.new(output))
       client.logger.level = Logger::INFO
       received = []
-      client.on_notification { |_srv, method, params| received << [method, params['status']] }
+      client.on_notification { |_srv, method, params| received << [method, params['status'], params['result']] }
 
       # Routed the way the transport routes it: the client's own processing
       # (which logs the status) and the host's listeners hang off two
@@ -415,7 +415,7 @@ RSpec.describe 'MCP 2026-07-28 tasks extension' do
       stdio.send(:route_notification, 'notifications/tasks',
                  detailed_task(status: 'completed', 'result' => call_result).tap { |t| t.delete('resultType') })
 
-      expect(received).to eq([['notifications/tasks', 'completed']])
+      expect(received).to eq([['notifications/tasks', 'completed', call_result]])
       expect(output.string).to include('Task task-1 status: completed')
     end
   end

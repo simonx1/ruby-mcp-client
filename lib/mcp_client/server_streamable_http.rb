@@ -628,9 +628,10 @@ module MCPClient
     # Clean up the server connection
     # Properly closes HTTP connections, stops threads, and clears cached state
     def cleanup
-      # Only a session ends a task's namespace; a sessionless (MCP 2026-07-28)
-      # connection is merely closed — see #session_bearing_connection?.
-      bump_session_epoch if session_bearing_connection?
+      # Only an established session ends a task's namespace; a sessionless
+      # (MCP 2026-07-28) connection is merely closed, and a connection that
+      # never came up has nothing to end — see #ending_session?.
+      bump_session_epoch if ending_session?
       @mutex.synchronize do
         return unless @connection_established || @initialized
 

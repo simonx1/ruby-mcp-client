@@ -1,5 +1,6 @@
 # frozen_string_literal: true
 
+require_relative 'task_workers'
 require_relative '../task'
 require_relative '../errors'
 require_relative '../json_rpc_common'
@@ -15,6 +16,8 @@ module MCPClient
     # answer tools/call with a task that the client then polls (tasks/get),
     # feeds (tasks/update) and cancels (tasks/cancel).
     module TaskSupport
+      include TaskWorkers
+
       # The per-task bookkeeping (answered keys, in-flight keys, the session
       # epochs everything is keyed by) lives in its own module.
       include TaskRegistry
@@ -321,37 +324,54 @@ module MCPClient
       # {#bounded_by_wait} around the whole call.
       # @return [Object] the JSON-RPC result
       def task_rpc(srv, method, params, timeout: nil, epoch: nil, lifetime: nil)
-        return capped_task_rpc(srv, method, params, timeout, epoch, lifetime) if timeout && !accepts_timeout?(srv)
-
-        pinned_to_lifetime(srv, lifetime) do
-          pinned_to_session(srv, epoch) do
-            if timeout.nil?
-              srv.rpc_request(method, params)
-            else
-              srv.rpc_request(method, params, timeout: timeout)
-            end
-          end
-        end
+        answer = if timeout && !accepts_timeout?(srv)
+                   capped_task_rpc(srv, method, params, timeout, epoch, lifetime)
+                 else
+                   pinned_to_lifetime(srv, lifetime) do
+                     pinned_to_session(srv, epoch) do
+                       if timeout.nil?
+                         srv.rpc_request(method,
+                                         params)
+                       else
+                         srv.rpc_request(method, params, timeout: timeout)
+                       end
+                     end
+                   end
+                 end
+        wire_keyed(answer)
       end
 
       # One task request through a transport that takes no timeout, bounded
       # on the wall clock: without it the computed bound (MAX_TASK_REQUEST_TIMEOUT,
       # or what is left of the task's TTL) would simply be dropped and a hung
       # tasks/get would block a wait that has no caller deadline for good.
-      # The request runs on its own thread and is abandoned when the bound
-      # runs out — a transport that never comes back cannot be interrupted —
-      # and the caller is told it timed out, exactly as a transport enforcing
-      # the timeout itself would report it. The session pin is applied inside
-      # that thread: pins are thread-local, so the request would otherwise
-      # lose the guard that keeps it out of the session which replaced its own.
+      # The request runs on its own thread — a transport that never comes
+      # back cannot be interrupted — and when the bound runs out the caller
+      # is told it timed out, exactly as a transport enforcing the timeout
+      # itself would report it. The worker is not abandoned: the next poll
+      # for the same request joins it again instead of starting another one
+      # beside it (and takes its answer if it came back meanwhile), and the
+      # number of distinct requests left hanging on a transport is capped,
+      # so a transport that never answers cannot pile up live threads for as
+      # long as a wait keeps polling. The session pin is applied inside the
+      # worker: pins are thread-local, so the request would otherwise lose
+      # the guard that keeps it out of the session which replaced its own.
       # @return [Object] the JSON-RPC result
       # @raise [MCPClient::Errors::RequestTimeoutError] when the bound ran out
+      # @raise [MCPClient::Errors::TransportError] when the transport already
+      #   has MAX_PENDING_TASK_REQUESTS requests hanging
       def capped_task_rpc(srv, method, params, timeout, epoch, lifetime = nil)
-        runner = Thread.new do
-          Thread.current.report_on_exception = false
-          pinned_to_lifetime(srv, lifetime) { pinned_to_session(srv, epoch) { srv.rpc_request(method, params) } }
+        key = [method, params, epoch, lifetime]
+        runner = pending_task_request(srv, key) do
+          Thread.new do
+            Thread.current.report_on_exception = false
+            pinned_to_lifetime(srv, lifetime) { pinned_to_session(srv, epoch) { srv.rpc_request(method, params) } }
+          end
         end
-        return runner.value if runner.join(timeout)
+        if runner.join(timeout)
+          pending_task_requests_mutex.synchronize { pending_task_requests(srv).delete(key) }
+          return runner.value
+        end
 
         raise MCPClient::Errors::RequestTimeoutError,
               "Request #{method} timed out after #{timeout} seconds"
@@ -722,6 +742,7 @@ module MCPClient
       # @return [MCPClient::Task]
       # @raise [MCPClient::Errors::InvalidResultError]
       def created_task(result, srv, epoch = nil)
+        result = wire_keyed(result)
         # A CreateTaskResult is a Task: a defaulted status or a missing TTL
         # would drive the wait on made-up state (and lose the backstop).
         unless result.is_a?(Hash) && result['taskId'].is_a?(String)

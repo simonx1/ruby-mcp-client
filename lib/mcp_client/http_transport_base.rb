@@ -306,6 +306,18 @@ module MCPClient
       !modern? || !@session_id.nil?
     end
 
+    # Whether #cleanup ends a session. A transport nothing was ever sent
+    # through has none to end: a first connect failing on its way, or a
+    # transport a host restored a task handle into before anything was sent
+    # — and until the era is known the connection counts as session-bearing,
+    # so without this the epoch would move on that first connect and the
+    # restored handle be refused for a session that never existed (and, on a
+    # sessionless 2026-07-28 server, never will).
+    # @return [Boolean]
+    def ending_session?
+      session_bearing_connection? && (@connection_established || @initialized)
+    end
+
     # Store the session id a handshake established. A handshake that lands a
     # different id on a live session replaced it — the 404 recovery is only
     # one way there, and none of them goes through #cleanup — so the epoch

@@ -434,6 +434,9 @@ RSpec.describe 'MCP 2026-07-28 tasks extension — round 40' do
 
       expect(client.cancel_task('task-1').task_id).to eq('task-1')
       expect(methods_of(sent)).to include('tasks/cancel')
+      # Neither as a request nor as a notification written past the request
+      # path.
+      expect(methods_of(sent)).not_to include('notifications/cancelled')
       expect(methods_of(written)).not_to include('notifications/cancelled')
     end
 
@@ -646,7 +649,7 @@ RSpec.describe 'MCP 2026-07-28 tasks extension — round 40' do
       acknowledge_on_listen(stdio)
 
       subscription = client.listen(notifications: { task_ids: ['task-1'] }) do |method, params|
-        received << [method, params['status']]
+        received << [method, params['status'], params['result']]
       end
 
       request = sent.find { |message| message['method'] == 'subscriptions/listen' }
@@ -658,7 +661,7 @@ RSpec.describe 'MCP 2026-07-28 tasks extension — round 40' do
       stdio.handle_line(task_notification(subscription))
       wait_for { received.any? }
 
-      expect(received).to eq([['notifications/tasks', 'completed']])
+      expect(received).to eq([['notifications/tasks', 'completed', call_result]])
     end
   end
 
