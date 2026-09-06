@@ -1741,10 +1741,13 @@ RSpec.describe 'MCP 2026-07-28 Streamable HTTP — a response stream that really
 
     # A listener that fails while the stream is still open must not cancel
     # the request it was interleaved with (closing the stream is the
-    # cancellation signal): the body is read to its end, the response the
-    # server then sends is received, and the listener's failure is what the
-    # caller gets — once, with no re-issue.
-    it 'holds a live listener failure until the response stream ends' do
+    # cancellation signal): the body is read to its end and the response the
+    # server then sends is what the caller gets. The listener's own failure
+    # is the notification routing's to contain (a listener that raises must
+    # not fail the request whose response carried the notification — see
+    # SubscriptionSupport#notify_host): it is logged once, and nothing is
+    # re-issued.
+    it 'isolates a live listener failure from the request its notification rode on' do
       seen = Queue.new
       progress = lambda do |n|
         { 'jsonrpc' => '2.0', 'method' => 'notifications/progress',
@@ -1770,23 +1773,19 @@ RSpec.describe 'MCP 2026-07-28 Streamable HTTP — a response stream that really
         raise "listener failed #{failures}"
       end
 
-      error = nil
-      result = nil
-      Timeout.timeout(15) do
-        result = server.rpc_request('tools/call', { 'name' => 't', 'arguments' => {} })
-      rescue MCPClient::Errors::ToolCallError => e
-        error = e
-      end
+      logger = server.instance_variable_get(:@logger)
+      allow(logger).to receive(:warn).and_call_original
 
-      expect(result).to be_nil
-      # The FIRST failure is the one held; the reader carried on past it, so
-      # the second event was dispatched too and the server's waiter saw both
-      # before it sent the response.
-      expect(error&.message).to include('listener failed 1')
-      expect(error.message).not_to include('listener failed 2')
+      result = Timeout.timeout(15) { server.rpc_request('tools/call', { 'name' => 't', 'arguments' => {} }) }
+
+      # From the subscriptions branch on, the notification routing contains a
+      # listener's own failure, so the call returns the server's result. What
+      # the x-mcp-header branch pins here still holds and is asserted: the
+      # reader carried on past the first failure, so the second event was
+      # dispatched too and the server's waiter saw both.
+      expect(result).to eq({ 'content' => [] })
       expect(seen.size).to eq(2)
-      expect(error.cause).to be_a(RuntimeError)
-      expect(error.cause).to be_a(MCPClient::HttpTransportBase::RequestRecovery::NestedExchange)
+      expect(logger).to have_received(:warn).with(/listener failed/).at_least(:once)
       # The stream was read to its end: the server got to send the response
       # (its waiter saw the listeners run), and the call was sent exactly once.
       expect(methods_received.count('tools/call')).to eq(1)
