@@ -221,6 +221,9 @@ module MCPClient
       # Of those, the ones whose write has not finished yet. They are not
       # cancellable: see {#take_outstanding_listens}.
       @unwritten_listens = []
+      # The transport generation this subscription's listen went out on: see
+      # {#with_open_id}.
+      @open_generation = nil
     end
 
     # @return [Integer] notifications queued for this subscription's listeners
@@ -430,7 +433,7 @@ module MCPClient
     # @yield runs while the id cannot change underneath it
     # @return [Boolean] false when the host had already closed it
     # @api private
-    def with_open_id(id)
+    def with_open_id(id, generation = nil)
       @mutex.synchronize do
         return false if @state == :closed
 
@@ -440,9 +443,24 @@ module MCPClient
         # about the last, it has not answered this.
         @answered = false
         @state = :pending
+        # Stamped in the same step as the registration, so every registered
+        # subscription names the process its listen went out on: a teardown
+        # parks the ones belonging to the process it claimed and leaves the
+        # replacement's alone (see {MCPClient::ServerStdio#park_open_subscriptions}).
+        # A transport with no such notion (the HTTP ones, whose streams are
+        # per-connection) passes none and is never asked.
+        @open_generation = generation
         yield
         true
       end
+    end
+
+    # The transport generation the listen this subscription is on went out
+    # under, or nil on a transport that does not number its processes.
+    # @return [Integer, nil]
+    # @api private
+    def open_generation
+      @mutex.synchronize { @open_generation }
     end
 
     # Record a listen request the transport has written for this subscription

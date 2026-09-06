@@ -947,7 +947,7 @@ module MCPClient
       return unless claimed
 
       begin
-        park_open_subscriptions
+        park_open_subscriptions(claimed)
         terminate_server_process(claimed.wait_thread)
         claimed.stdout.close unless claimed.stdout.nil? || claimed.stdout.closed?
         claimed.stderr.close unless claimed.stderr.nil? || claimed.stderr.closed?
@@ -1001,20 +1001,45 @@ module MCPClient
     # the pending list outside the registry lock, since a subscription being
     # opened holds its own lock while taking that one.
     #
+    # Only the claimed process's, the way the pipe teardown is. Draining the
+    # registry took whatever it held at that moment, and a teardown that got
+    # here after a host request had established the replacement parked the
+    # streams that replacement was already serving: their outstanding listen
+    # ids were discarded with the dead process's, so `close` had nothing left
+    # to cancel and the server went on serving a stream this client could no
+    # longer name. A subscription carries the generation its listen went out
+    # on ({MCPClient::Subscription#with_open_id}), which is the same question
+    # the pipe asks, asked of the registry.
+    #
     # Enqueued through the one lock a deferred hand-over writes under too,
     # since a listen write failing on the process being torn down lands in
     # the window between the snapshot and the write
     # (JsonRpcTransport#queue_subscriptions_of_ended_process, which also
     # forgets the listen ids this process was holding).
+    # @param claimed [TornDownTransport] what this teardown claimed
     # @return [void]
-    def park_open_subscriptions
+    def park_open_subscriptions(claimed)
       open_subscriptions = subscriptions_mutex.synchronize do
-        live = subscriptions.values
-        subscriptions.clear
-        live
+        mine, theirs = subscriptions.values.partition { |subscription| claimed_subscription?(subscription, claimed) }
+        subscriptions.keep_if { |_, subscription| theirs.include?(subscription) }
+        mine
       end
       open_subscriptions.each(&:mark_reconnecting)
       queue_subscriptions_of_ended_process(open_subscriptions.select(&:reconnectable?))
+    end
+
+    # Whether a registered subscription belongs to the process a teardown
+    # claimed. The claim's generation is the one the transport moved *to*, so
+    # the process it took is everything below it; a subscription opened on the
+    # replacement carries a higher one. One that never recorded a generation
+    # is treated as the claim's, which is what a registry entry was before
+    # the stamp existed.
+    # @param subscription [MCPClient::Subscription]
+    # @param claimed [TornDownTransport] what this teardown claimed
+    # @return [Boolean]
+    def claimed_subscription?(subscription, claimed)
+      generation = subscription.open_generation
+      generation.nil? || generation < claimed.generation
     end
 
     # The last word of a teardown, whatever else went wrong: the record of the
@@ -1039,24 +1064,33 @@ module MCPClient
       # Its record outlives it: it is what the next session's re-send of the
       # open subscriptions asks about (JsonRpcTransport#reopen_subscriptions).
       claimed.session&.ended
-      # Either signal says a process has been established since the claim:
-      # `connect` moves the generation on, and the handshake that follows
-      # records a new session.
-      return if @transport_lock.synchronize { @transport_generation != claimed.generation }
-      return unless @session.equal?(claimed.session)
+      # Asked and acted on in one step, under the lock a replacement is
+      # established through. Asking first and writing afterwards let the
+      # answer go stale in between: a host request that established the
+      # replacement in that window did so *after* both checks passed, and
+      # this teardown then marked its outstanding requests dropped and left
+      # it uninitialized with no session — a live process the transport could
+      # no longer name.
+      @transport_lock.synchronize do
+        # Either signal says a process has been established since the claim:
+        # `connect` moves the generation on, and the handshake that follows
+        # records a new session.
+        next if @transport_generation != claimed.generation
+        next unless @session.equal?(claimed.session)
 
-      @mutex.synchronize do
-        # The ids still outstanding are recorded as dropped: their waiters
-        # fail on that record, whenever they next run, rather than wait out
-        # their timeouts because the restart cleared the retirement first.
-        dropped_requests.merge(@awaiting.keys)
-        @awaiting.clear
-        @cond.broadcast
+        @mutex.synchronize do
+          # The ids still outstanding are recorded as dropped: their waiters
+          # fail on that record, whenever they next run, rather than wait out
+          # their timeouts because the restart cleared the retirement first.
+          dropped_requests.merge(@awaiting.keys)
+          @awaiting.clear
+          @cond.broadcast
+        end
+        @session = nil
+        # The next request re-establishes the process and, on a modern
+        # server, re-sends the subscriptions the host still holds.
+        @initialized = false
       end
-      @session = nil
-      # The next request re-establishes the process and, on a modern
-      # server, re-sends the subscriptions the host still holds.
-      @initialized = false
     end
 
     # The server process ended on its own (its stdout reached EOF). MCP

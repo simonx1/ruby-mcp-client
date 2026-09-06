@@ -89,7 +89,11 @@ module MCPClient
         # write that lands late goes to the pipe it was recorded against, and
         # once the teardown has closed that pipe it fails into the error paths
         # below instead.
-        stdin = @stdin
+        # Read with the generation it belongs to, so the two agree: the pipe
+        # is what this attempt writes to, and the generation is what a
+        # teardown compares its claim against when it decides whose
+        # subscriptions to park.
+        stdin, generation = @transport_lock.synchronize { [@stdin, @transport_generation] }
         # Whether the subscription has taken this attempt's id yet. A failure
         # before that — the request could not be built — is nobody's to have
         # superseded, and was filed as exactly that while the id it never
@@ -107,7 +111,7 @@ module MCPClient
         # that cancelled this id while the request was still going out is
         # named again below, once the server has seen the listen.
         taken = true
-        return unless subscription.with_open_id(id) { register_subscription(subscription) }
+        return unless subscription.with_open_id(id, generation) { register_subscription(subscription) }
 
         # Recorded before the write, and whatever the write does: from here on
         # the server may be serving this listen, and {#cancel_subscription}
