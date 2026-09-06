@@ -521,25 +521,6 @@ module MCPClient
       defined?(@discovery_cache_scope) ? @discovery_cache_scope : nil
     end
 
-    # Check a server/discover answer before anything is read out of it.
-    #
-    # The input_required rejection has to come first: an InputRequiredResult
-    # need only carry `requestState` ("At least one of inputRequests or
-    # requestState MUST be present"), so an unfinished discover answer does
-    # not have to look like a DiscoverResult at all. Testing the shape first
-    # would classify that answer as a permissive legacy endpoint answering an
-    # unknown method — and send initialize to a modern server.
-    # @param result [Object] the server/discover result
-    # @return [void]
-    # @raise [MCPClient::Errors::ModernServerError] on an input_required answer
-    # @raise [MCPClient::Errors::ServerError] when the answer is not a DiscoverResult
-    def require_discover_result!(result)
-      reject_input_required_discover!(result)
-      return if discover_result?(result)
-
-      raise MCPClient::Errors::ServerError, 'server/discover was answered without a DiscoverResult'
-    end
-
     # Validate a log level name (logging utility levels).
     # @param level [String, Symbol] the level
     # @return [String] the normalized level
@@ -858,7 +839,6 @@ module MCPClient
       result = envelope_member(response, 'result')
       validate_result_type!(result)
       record_server_info(result, method: method)
-      reject_unfulfillable_input_required!(result)
       result
     end
 
