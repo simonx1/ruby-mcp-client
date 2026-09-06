@@ -52,7 +52,7 @@ module MCPClient
       return [] unless schema.is_a?(Hash)
 
       errors = []
-      walk(schema, [], root: true, reachable: false, errors: errors, seen: {}, found: [])
+      walk(schema, [], root: true, reachable: false, document: schema, errors: errors, seen: {}, found: [])
       errors
     end
 
@@ -63,7 +63,7 @@ module MCPClient
       return [] unless schema.is_a?(Hash)
 
       found = []
-      walk(schema, [], root: true, reachable: false, errors: [], seen: {}, found: found)
+      walk(schema, [], root: true, reachable: false, document: schema, errors: [], seen: {}, found: found)
       found
     end
 
@@ -177,11 +177,11 @@ module MCPClient
     # composition and conditional keywords, $defs, $ref targets, the root
     # itself) invalidate the tool.
     # @api private
-    def walk(node, path, root:, reachable:, errors:, seen:, found:)
+    def walk(node, path, root:, reachable:, document:, errors:, seen:, found:)
       return unless node.is_a?(Hash)
 
-      ctx = { errors: errors, seen: seen, found: found }
-      check_annotation(node, path, reachable, errors, seen, found) if annotated?(node)
+      ctx = { document: document, errors: errors, seen: seen, found: found }
+      check_annotation(node, path, reachable, document, errors, seen, found) if annotated?(node)
       node.each do |key, value|
         key_name = key.to_s
         if key_name == 'properties' && value.is_a?(Hash)
@@ -215,11 +215,68 @@ module MCPClient
     # while a null *value* has its own rule -- the header is omitted -- so
     # dropping the whole tool over `["string", "null"]` would reject a schema
     # the transport can mirror perfectly well.
+    #
+    # A property that states its type through a reference states it all the
+    # same: JSON Schema 2020-12 evaluates `$ref` beside its siblings (Core
+    # 8.2.3.1), so `{"$ref": "#/$defs/r", "x-mcp-header": "Region"}` is a
+    # primitive property whenever the target is one. That is separate from
+    # the reachability rule, which is about where the ANNOTATION sits and
+    # still never passes through a reference.
     # @api private
-    def primitive_type?(node)
+    def primitive_type?(node, document = nil)
+      node = typed_node(node, document)
+      return false unless node.is_a?(Hash)
+
       type = node.key?('type') ? node['type'] : node[:type]
       declared = Array(type) - ['null']
       declared.size == 1 && declared.first.is_a?(String) && PRIMITIVE_TYPES.include?(declared.first)
+    end
+
+    # How many references the type lookup will follow before giving up.
+    MAX_REF_HOPS = 8
+
+    # The schema object that states this property's type: the node itself, or
+    # what its local `$ref` chain leads to. A reference this client cannot
+    # resolve on its own -- an external URI, a pointer into nothing, a cycle,
+    # or a name whose pointer escapes are percent-encoded -- resolves to
+    # nothing, and the property is treated as one whose type is unstated: the
+    # tool is excluded rather than mirrored on a guess.
+    # @api private
+    def typed_node(node, document)
+      hops = 0
+      seen = []
+      while node.is_a?(Hash) && !node.key?('type') && !node.key?(:type)
+        ref = node.key?('$ref') ? node['$ref'] : node[:$ref]
+        return nil unless ref.is_a?(String) && !seen.include?(ref) && (hops += 1) <= MAX_REF_HOPS
+
+        seen << ref
+        node = resolve_local_pointer(document, ref)
+      end
+      node
+    end
+
+    # Resolve a same-document JSON pointer (RFC 6901) given as a URI fragment.
+    # @api private
+    def resolve_local_pointer(document, ref)
+      return nil unless document.is_a?(Hash) && ref.start_with?('#')
+
+      pointer = ref[1..]
+      return document if pointer.empty?
+      return nil unless pointer.start_with?('/')
+
+      pointer.split('/', -1).drop(1).reduce(document) do |node, token|
+        return nil if token.include?('%')
+
+        pointer_step(node, token.gsub('~1', '/').gsub('~0', '~'))
+      end
+    end
+
+    # @api private
+    def pointer_step(node, token)
+      case node
+      when Hash then node.key?(token) ? node[token] : node[token.to_sym]
+      when Array then token.match?(/\A(?:0|[1-9][0-9]*)\z/) ? node[token.to_i] : nil
+      end
     end
 
     # @api private
@@ -228,7 +285,7 @@ module MCPClient
     end
 
     # @api private
-    def check_annotation(node, path, reachable, errors, seen, found)
+    def check_annotation(node, path, reachable, document, errors, seen, found)
       value = node.key?(ANNOTATION) ? node[ANNOTATION] : node[ANNOTATION.to_sym]
       # Property names are peer-controlled: inspect escapes control characters.
       where = path.empty? ? 'the schema root' : path.join('.').inspect
@@ -245,7 +302,7 @@ module MCPClient
         errors << "#{ANNOTATION} at #{where} is not statically reachable via properties keys from the schema root"
       end
 
-      unless primitive_type?(node)
+      unless primitive_type?(node, document)
         errors << "#{ANNOTATION} at #{where} must be on a primitive property (integer, string or boolean)"
       end
 

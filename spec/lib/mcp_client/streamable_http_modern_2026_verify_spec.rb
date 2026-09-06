@@ -1736,38 +1736,50 @@ RSpec.describe 'MCP 2026-07-28 Streamable HTTP — a response stream that really
     # caller gets — once, with no re-issue.
     it 'holds a live listener failure until the response stream ends' do
       seen = Queue.new
+      progress = lambda do |n|
+        { 'jsonrpc' => '2.0', 'method' => 'notifications/progress',
+          'params' => { 'progressToken' => 'p', 'progress' => n } }
+      end
       start_server do |message|
         case message['method']
         when 'server/discover' then jsonrpc(message, discovery)
         when 'tools/list' then jsonrpc(message, { 'tools' => [] })
         else
-          waiter = -> { settled_within?(3) { !seen.empty? } }
-          [MidStreamCloseServer::EVENT_THEN_WAIT,
-           { 'jsonrpc' => '2.0', 'method' => 'notifications/progress',
-             'params' => { 'progressToken' => 'p', 'progress' => 1 } },
+          # Two events, each on its own chunk: a reader that let the first
+          # listener failure abort it never gets to the second.
+          waiter = -> { settled_within?(3) { seen.size == 2 } }
+          [MidStreamCloseServer::EVENT_THEN_WAIT, [progress.call(1), progress.call(2)],
            waiter, jsonrpc(message, { 'content' => [] })]
         end
       end
       server = transport(MCPClient::ServerHTTP, read_timeout: 5)
+      failures = 0
       server.on_notification do |method, _params|
         seen << method
-        raise 'listener failed'
+        failures += 1
+        raise "listener failed #{failures}"
       end
 
       error = nil
+      result = nil
       Timeout.timeout(15) do
-        server.rpc_request('tools/call', { 'name' => 't', 'arguments' => {} })
+        result = server.rpc_request('tools/call', { 'name' => 't', 'arguments' => {} })
       rescue MCPClient::Errors::ToolCallError => e
         error = e
       end
 
-      expect(error&.message).to include('listener failed')
+      expect(result).to be_nil
+      # The FIRST failure is the one held; the reader carried on past it, so
+      # the second event was dispatched too and the server's waiter saw both
+      # before it sent the response.
+      expect(error&.message).to include('listener failed 1')
+      expect(error.message).not_to include('listener failed 2')
+      expect(seen.size).to eq(2)
       expect(error.cause).to be_a(RuntimeError)
       expect(error.cause).to be_a(MCPClient::HttpTransportBase::RequestRecovery::NestedExchange)
       # The stream was read to its end: the server got to send the response
-      # (its waiter saw the listener run), and the call was sent exactly once.
+      # (its waiter saw the listeners run), and the call was sent exactly once.
       expect(methods_received.count('tools/call')).to eq(1)
-      expect(seen.size).to eq(1)
     end
   end
 

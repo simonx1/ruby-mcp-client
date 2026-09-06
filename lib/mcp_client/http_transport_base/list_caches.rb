@@ -19,7 +19,23 @@ module MCPClient
       def refresh_tools_cache
         invalidate_tools_cache
         list_tools
+      ensure
+        announce_tools_list_changed
+      end
+
+      # Tell the host its own copy is gone. This runs whether or not the
+      # re-fetch that followed the invalidation succeeded: the transport's
+      # list is already dropped by then, so a host that kept its copy would
+      # go on calling with definitions this client has thrown away, and it
+      # would never learn otherwise -- the server sends no notification for a
+      # refresh the client started. A listener that raises is the host's
+      # problem, not the caller's: the rejection that started the refresh is
+      # what the caller must see.
+      # @return [void]
+      def announce_tools_list_changed
         @notification_callback&.call('notifications/tools/list_changed', {})
+      rescue StandardError => e
+        @logger.warn("Tool list invalidation listener failed: #{sanitize_log_text("#{e.class}: #{e.message}")}")
       end
 
       # Forget the cached tool list. The generation counter lets a list fetch

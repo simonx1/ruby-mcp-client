@@ -457,17 +457,25 @@ RSpec.describe 'MCP 2026-07-28 x-mcp-header — the definition a modern call wen
 end
 
 RSpec.describe 'MCP 2026-07-28 x-mcp-header — annotations beside a $ref' do
-  # The reachability chain MUST NOT pass through $ref, and the type check is
-  # made on the property schema as written: a property whose type lives only
-  # behind a $ref is not a primitive property this client can vouch for, so
-  # the tool is excluded. Pinned so a later $ref resolver cannot change list
-  # membership silently.
-  it 'excludes a tool whose annotated property declares its type only behind a $ref' do
+  # The reachability chain MUST NOT pass through $ref: an annotation that
+  # sits in a $ref target is not a property of the tool, however the property
+  # pointing at it is written. Reaching THIS annotation traverses `properties`
+  # alone -- the reference only says what the property's type is, which
+  # JSON Schema 2020-12 evaluates beside its siblings -- so the tool stays in
+  # the list. See round 6 for the type resolution itself.
+  it 'keeps a tool whose annotated property declares its type behind a local $ref' do
     input = { 'type' => 'object',
               '$defs' => { 'r' => { 'type' => 'string' } },
               'properties' => { 'region' => { '$ref' => '#/$defs/r', 'x-mcp-header' => 'Region' } } }
-    errors = MCPClient::HeaderParams.validate_schema(input)
-    expect(errors).to include(match(/primitive/))
+    expect(MCPClient::HeaderParams.validate_schema(input)).to eq([])
+    expect(MCPClient::HeaderParams.annotations(input)).to eq([[['region'], 'Region']])
+  end
+
+  it 'excludes a tool whose annotation itself sits behind a $ref' do
+    input = { 'type' => 'object',
+              '$defs' => { 'r' => { 'type' => 'string', 'x-mcp-header' => 'Region' } },
+              'properties' => { 'region' => { '$ref' => '#/$defs/r' } } }
+    expect(MCPClient::HeaderParams.validate_schema(input)).to include(match(/statically reachable/))
     expect(MCPClient::HeaderParams.annotations(input)).to eq([])
   end
 end
@@ -526,8 +534,12 @@ RSpec.describe 'MCP 2026-07-28 x-mcp-header — stale prompt and resource fetche
         expect(in_flight.pop(timeout: 5)).not_to be_nil
         notify(server, dispatcher, 'notifications/prompts/list_changed')
         release << true
-        stale.join(5)
 
+        # The caller that was already waiting is answered with the list its
+        # own fetch obtained -- returned, but never put back into the cache
+        # the notification emptied.
+        expect(stale.join(5)).not_to be_nil
+        expect(stale.value.map(&:name)).to eq(['p1'])
         expect(server.list_prompts.map(&:name)).to eq(['p2'])
       end
 
@@ -541,8 +553,9 @@ RSpec.describe 'MCP 2026-07-28 x-mcp-header — stale prompt and resource fetche
         expect(in_flight.pop(timeout: 5)).not_to be_nil
         notify(server, dispatcher, 'notifications/resources/list_changed')
         release << true
-        stale.join(5)
 
+        expect(stale.join(5)).not_to be_nil
+        expect(stale.value['resources'].map(&:name)).to eq(['r1'])
         expect(server.list_resources['resources'].map(&:name)).to eq(['r2'])
       end
     end

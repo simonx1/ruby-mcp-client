@@ -345,8 +345,10 @@ RSpec.describe 'MCP 2026-07-28 x-mcp-header — round 5' do
           notify(server, dispatcher, 'notifications/prompts/list_changed')
           expect(server.list_prompts.map(&:name)).to eq(['p2'])
           release << true
-          stale.join(5)
 
+          # The held caller is answered with what its own fetch returned.
+          expect(stale.join(5)).not_to be_nil
+          expect(stale.value.map(&:name)).to eq(['p1'])
           expect(server.list_prompts.map(&:name)).to eq(['p2'])
           expect(counts['prompts/list']).to eq(2)
         end
@@ -363,8 +365,9 @@ RSpec.describe 'MCP 2026-07-28 x-mcp-header — round 5' do
           notify(server, dispatcher, 'notifications/resources/list_changed')
           expect(server.list_resources['resources'].map(&:name)).to eq(['r2'])
           release << true
-          stale.join(5)
 
+          expect(stale.join(5)).not_to be_nil
+          expect(stale.value['resources'].map(&:name)).to eq(['r1'])
           expect(server.list_resources['resources'].map(&:name)).to eq(['r2'])
           expect(counts['resources/list']).to eq(2)
         end
