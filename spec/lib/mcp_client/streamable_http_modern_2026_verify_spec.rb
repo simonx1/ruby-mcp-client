@@ -1565,8 +1565,11 @@ RSpec.describe 'MCP 2026-07-28 Streamable HTTP — a response stream that really
         # late in the budget, or head bytes forever — outlives it.
         it 'ends a request whose stream falls silent late in its budget, not a timeout later' do
           start_server do |message|
-            if message['method'] == 'server/discover'
-              jsonrpc(message, discovery)
+            case message['method']
+            when 'server/discover' then jsonrpc(message, discovery)
+            # A modern call reads tools/list first to derive its headers;
+            # the stall this example is about belongs to the call's own stream.
+            when 'tools/list' then jsonrpc(message, { 'tools' => [] })
             else
               [MidStreamCloseServer::DELAY, 0.6,
                [MidStreamCloseServer::EVENT_THEN_STALL,
@@ -1588,10 +1591,12 @@ RSpec.describe 'MCP 2026-07-28 Streamable HTTP — a response stream that really
 
         it 'ends a request whose head never finishes, which no socket timeout would' do
           start_server do |message|
-            if message['method'] == 'server/discover'
-              jsonrpc(message, discovery)
-            else
-              [MidStreamCloseServer::HEADER_DRIP, 0.02]
+            case message['method']
+            when 'server/discover' then jsonrpc(message, discovery)
+            # A modern call reads tools/list first to derive its headers;
+            # the stall this example is about belongs to the call's own stream.
+            when 'tools/list' then jsonrpc(message, { 'tools' => [] })
+            else [MidStreamCloseServer::HEADER_DRIP, 0.02]
             end
           end
           server = transport(klass, read_timeout: 30)
@@ -1608,8 +1613,11 @@ RSpec.describe 'MCP 2026-07-28 Streamable HTTP — a response stream that really
 
         it 'refuses an answer that arrives after the deadline instead of settling on it' do
           start_server do |message|
-            if message['method'] == 'server/discover'
-              jsonrpc(message, discovery)
+            case message['method']
+            when 'server/discover' then jsonrpc(message, discovery)
+            # A modern call reads tools/list first to derive its headers;
+            # the stall this example is about belongs to the call's own stream.
+            when 'tools/list' then jsonrpc(message, { 'tools' => [] })
             else
               [MidStreamCloseServer::HEADER_DRIP_THEN, 1.4, 0.02,
                [MidStreamCloseServer::DELIVER_THEN_STALL, jsonrpc(message, { 'content' => [] })]]
