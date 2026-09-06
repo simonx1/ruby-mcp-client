@@ -100,7 +100,9 @@ RSpec.describe 'Completion (MCP 2025-06-18 / 2025-11-25 context)' do
         result = server.complete(ref: ref, argument: argument)
 
         expect(server).to have_received(:send_request).with(
-          hash_including('method' => 'completion/complete')
+          hash_including('method' => 'completion/complete'),
+          # the transport generation the request was registered on
+          anything
         )
         expect(result['values']).to eq(%w[python pytho])
       end
@@ -132,7 +134,9 @@ RSpec.describe 'Completion (MCP 2025-06-18 / 2025-11-25 context)' do
           hash_including(
             'method' => 'completion/complete',
             'params' => { 'ref' => ref, 'argument' => argument, 'context' => context }
-          )
+          ),
+          # the transport generation the request was registered on
+          anything
         )
       end
 
@@ -142,7 +146,9 @@ RSpec.describe 'Completion (MCP 2025-06-18 / 2025-11-25 context)' do
         expect(server).to have_received(:send_request).with(
           hash_including(
             'params' => { 'ref' => ref, 'argument' => argument }
-          )
+          ),
+          # the transport generation the request was registered on
+          anything
         )
       end
     end

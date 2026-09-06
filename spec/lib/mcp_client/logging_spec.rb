@@ -209,7 +209,9 @@ RSpec.describe 'Logging (MCP 2025-06-18)' do
         server.log_level = 'debug'
 
         expect(server).to have_received(:send_request).with(
-          hash_including('method' => 'logging/setLevel', 'params' => { 'level' => 'debug' })
+          hash_including('method' => 'logging/setLevel', 'params' => { 'level' => 'debug' }),
+          # the transport generation the request was registered on
+          anything
         )
       end
 

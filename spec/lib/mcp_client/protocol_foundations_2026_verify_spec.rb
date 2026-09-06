@@ -723,11 +723,17 @@ RSpec.describe 'input_required is a modern-era result type' do
     transport.process_jsonrpc_response({ 'jsonrpc' => '2.0', 'id' => 1, 'result' => result })
   end
 
-  it 'accepts it once a modern revision is established' do
+  it 'recognizes it once a modern revision is established' do
     transport.protocol_version = '2026-07-28'
     result = { 'resultType' => 'input_required', 'requestState' => 'continue-later' }
 
-    expect(process(result)).to eq(result)
+    # Recognized, not accepted: this client cannot fulfil the round trip, so
+    # the result surfaces as the InputRequired condition with the whole
+    # answer on `data` — never as an invalid result, and never flattened.
+    expect { process(result) }.to raise_error(MCPClient::Errors::InputRequiredError) do |e|
+      expect(e.data).to eq(result)
+      expect(e.request_state).to eq('continue-later')
+    end
     expect(transport.accepted_result_types).to include('input_required')
   end
 
@@ -765,13 +771,13 @@ RSpec.describe 'read_resource never presents an unfinished read as an empty one'
       stub_read_result(incomplete)
 
       expect { server.read_resource('file:///x.txt') }
-        .to raise_error(MCPClient::Errors::InvalidResultError, /input_required/) do |e|
+        .to raise_error(MCPClient::Errors::InputRequiredError, /input_required/) do |e|
           expect(e).not_to be_a(MCPClient::Errors::ResourceReadError)
           expect(e.protocol_error?).to be(true)
           # The continuation is preserved, not discarded: a host can drive
           # the round trip itself from the opaque requestState.
           expect(e.data).to eq(incomplete)
-          expect(e.data['requestState']).to eq('continue-later')
+          expect(e.request_state).to eq('continue-later')
         end
     end
 
@@ -1563,6 +1569,9 @@ end
 # resources/read. read_resource was pinned in round 3; every other wrapper
 # that projects a field out of the result still turned an unfinished answer
 # into a successful empty one -- an empty tool list, a dropped second page,
+# The condition is reported as InputRequired wherever it is caught: the
+# response parser refuses a round trip this client cannot drive, and the
+# projector guard below it reports the same answer the same way.
 # or an empty completion -- discarding the requestState with it.
 RSpec.describe 'no list or completion wrapper flattens an unfinished result' do
   let(:incomplete) { { 'resultType' => 'input_required', 'requestState' => 'continue-later' } }
@@ -1571,7 +1580,7 @@ RSpec.describe 'no list or completion wrapper flattens an unfinished result' do
     it 'raises instead of returning an empty tool list' do
       answer_with(incomplete)
 
-      expect { server.list_tools }.to raise_error(MCPClient::Errors::InvalidResultError, /input_required/) do |e|
+      expect { server.list_tools }.to raise_error(MCPClient::Errors::InputRequiredError, /input_required/) do |e|
         expect(e.data).to eq(incomplete)
         expect(e).not_to be_a(MCPClient::Errors::ToolCallError)
       end
@@ -1580,7 +1589,7 @@ RSpec.describe 'no list or completion wrapper flattens an unfinished result' do
     it 'raises instead of returning an empty prompt list' do
       answer_with(incomplete)
 
-      expect { server.list_prompts }.to raise_error(MCPClient::Errors::InvalidResultError, /input_required/) do |e|
+      expect { server.list_prompts }.to raise_error(MCPClient::Errors::InputRequiredError, /input_required/) do |e|
         expect(e.data).to eq(incomplete)
         expect(e).not_to be_a(MCPClient::Errors::PromptGetError)
       end
@@ -1589,14 +1598,14 @@ RSpec.describe 'no list or completion wrapper flattens an unfinished result' do
     it 'raises instead of returning an empty resource list' do
       answer_with(incomplete)
 
-      expect { server.list_resources }.to raise_error(MCPClient::Errors::InvalidResultError, /input_required/)
+      expect { server.list_resources }.to raise_error(MCPClient::Errors::InputRequiredError, /input_required/)
     end
 
     it 'raises instead of returning an empty resource template list' do
       answer_with(incomplete)
 
       expect { server.list_resource_templates }
-        .to raise_error(MCPClient::Errors::InvalidResultError, /input_required/)
+        .to raise_error(MCPClient::Errors::InputRequiredError, /input_required/)
     end
 
     it 'raises instead of returning an empty completion' do
@@ -1605,7 +1614,7 @@ RSpec.describe 'no list or completion wrapper flattens an unfinished result' do
         server.complete(ref: { 'type' => 'ref/prompt', 'name' => 'p' }, argument: { 'name' => 'a', 'value' => '' })
       end
 
-      expect(&request).to raise_error(MCPClient::Errors::InvalidResultError, /input_required/) do |e|
+      expect(&request).to raise_error(MCPClient::Errors::InputRequiredError, /input_required/) do |e|
         expect(e.data).to eq(incomplete)
       end
     end
@@ -1657,7 +1666,7 @@ RSpec.describe 'no list or completion wrapper flattens an unfinished result' do
           headers: { 'Content-Type' => 'application/json' } }
       end
 
-      expect { server.list_tools }.to raise_error(MCPClient::Errors::InvalidResultError, /input_required/)
+      expect { server.list_tools }.to raise_error(MCPClient::Errors::InputRequiredError, /input_required/)
     end
   end
 end
@@ -1684,7 +1693,9 @@ RSpec.describe 'Client#call_tool does not run output validation on an unfinished
   end
   let(:unfinished) do
     { 'resultType' => 'input_required', 'requestState' => 'continue-later',
-      'inputRequests' => { 'city' => { 'type' => 'elicitation', 'mode' => 'form', 'message' => 'which city?' } } }
+      'inputRequests' => { 'city' => { 'method' => 'elicitation/create',
+                                       'params' => { 'mode' => 'form', 'message' => 'which city?',
+                                                     'requestedSchema' => { 'type' => 'object' } } } } }
   end
 
   before do
@@ -1743,35 +1754,44 @@ RSpec.describe 'an unfinished result survives the HTTP transports off the wire' 
       server.instance_variable_set(:@protocol_version, '2026-07-28')
     end
 
-    it 'returns the whole continuation from call_tool' do
-      respond_with('result' => unfinished)
+    # The discriminator is recognized -- this is not the "unrecognized
+    # resultType" rejection -- and the whole answer, inputRequests included,
+    # rides on the error so a host can drive the round trip itself. Driving
+    # it is what the multi round-trip resolver above adds.
+    %w[call_tool get_prompt].each do |operation|
+      it "surfaces the continuation from #{operation}" do
+        respond_with('result' => unfinished)
 
-      expect(server.call_tool('t', {})).to eq(unfinished)
-    end
-
-    it 'returns the whole continuation from get_prompt' do
-      respond_with('result' => unfinished)
-
-      expect(server.get_prompt('p', {})).to eq(unfinished)
+        expect { server.public_send(operation, 'x', {}) }
+          .to raise_error(MCPClient::Errors::InputRequiredError, /input_required/) do |e|
+            expect(e.data).to eq(unfinished)
+            expect(e.request_state).to eq('continue-later')
+            expect(e.input_requests).to eq({ 'city' => city_request })
+          end
+      end
     end
 
     it 'surfaces it from read_resource with the continuation on the error data' do
       respond_with('result' => unfinished)
 
       expect { server.read_resource('file:///x') }
-        .to raise_error(MCPClient::Errors::InvalidResultError, /input_required/) do |e|
-          # Not the "unrecognized resultType" rejection: the transport
-          # accepted the discriminator and the WRAPPER declined to flatten it.
+        .to raise_error(MCPClient::Errors::InputRequiredError, /input_required/) do |e|
           expect(e.data).to eq(unfinished)
-          expect(e.data['inputRequests']).to eq({ 'city' => city_request })
+          expect(e.input_requests).to eq({ 'city' => city_request })
         end
     end
 
+    # A client that drives multi round-trip requests surfaces a continuation
+    # it cannot fulfil as the typed error; the requests-only shape is kept whole.
     it 'keeps a continuation that carries inputRequests without requestState' do
       stateless = unfinished.except('requestState')
       respond_with('result' => stateless)
 
-      expect(server.call_tool('t', {})).to eq(stateless)
+      expect { server.call_tool('t', {}) }.to raise_error(MCPClient::Errors::InputRequiredError) do |e|
+        expect(e.data).to eq(stateless)
+        expect(e.input_requests).to eq({ 'city' => city_request })
+        expect(e.request_state).to be_nil
+      end
     end
 
     it 'rejects it on a session that negotiated a handshake revision' do
@@ -1883,7 +1903,7 @@ RSpec.describe 'ServerSSE resource errors and unfinished reads off the stream' d
     answer_with('result' => unfinished)
 
     expect { server.read_resource('file:///x') }
-      .to raise_error(MCPClient::Errors::InvalidResultError, /input_required/) do |e|
+      .to raise_error(MCPClient::Errors::InputRequiredError, /input_required/) do |e|
         expect(e.data).to eq(unfinished)
       end
   end

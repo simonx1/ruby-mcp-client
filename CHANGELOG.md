@@ -5,6 +5,139 @@
 Groundwork for the 2026-07-28 protocol revision (stateless, per-request
 metadata). Each feature lands in its own PR; this section accumulates them.
 
+### Stateless protocol on stdio (server/discover, per-request `_meta`)
+
+- **No handshake for modern servers.** On stdio the client now probes with
+  `server/discover` first (basic/transports/stdio "Backward Compatibility").
+  A `DiscoverResult` makes the server *modern*: the client picks the newest
+  mutually supported version from `supportedVersions`, records the server's
+  capabilities, instructions and `_meta` `serverInfo`, and never sends
+  `initialize`. An `UnsupportedProtocolVersionError` also identifies a modern
+  server — the probe is retried with an advertised version and the client
+  never falls back. Any other *error*, or a timeout, means a *legacy* server
+  and the `initialize` handshake runs as before; a *result* never does. A
+  result carrying `resultType` could only have come from a 2026-07-28 server
+  (the field does not exist before it), so one that is not a usable
+  `DiscoverResult` fails the negotiation instead of downgrading the process
+  to the legacy handshake. A result with no 2026-07-28 marker at all is still
+  a legacy answer — a permissive server answering an unknown method. If the
+  fallback handshake is then refused with a well-formed
+  `UnsupportedProtocolVersionError` naming a version this client speaks — a
+  modern server that was simply too slow to answer the probe — the client
+  goes back to `server/discover` rather than ending the session; a host that
+  configured `protocol: :legacy` gets the error instead. The era is cached
+  for the life of the process. The probe *declares* a protocol version without
+  establishing one: until it is answered `protocol_era` stays `nil`, and a
+  server-initiated request (a legacy server MAY `ping` during initialization,
+  and may answer nothing until the response arrives) is still handled. The
+  exception is `protocol: :modern`, which has already ruled out the legacy
+  fallback that accommodation exists for: it never runs a host callback for a
+  server request and never writes a JSON-RPC response, probe in flight or not.
+- **A failed negotiation releases the transport.** If discovery or the
+  handshake fails, the subprocess is shut down and its pipes and reader
+  threads are closed before the error is raised, so a retry cannot strand the
+  previous process behind overwritten handles.
+- **An unexpected exit is recoverable.** If the subprocess behind a completed
+  handshake exits, the reader thread retires the transport instead of leaving
+  the session writing to a dead process's pipes: the next request closes the
+  stale handles and negotiates again against a fresh subprocess
+  (basic/transports/stdio "Unexpected Termination": clients SHOULD restart a
+  server that terminated unexpectedly). The request that was in flight still
+  fails — the server may already have executed it, so it is never replayed —
+  but an answer that had already arrived and was waiting to be handed to its
+  caller survives the restart rather than being discarded into a timeout.
+- **Per-request metadata.** Every request to a modern server carries
+  `io.modelcontextprotocol/protocolVersion`, `clientInfo` and
+  `clientCapabilities` in `_meta` (with `extensions` once declared via
+  `declare_extension`, whose identifiers follow the `_meta` key grammar with
+  a mandatory prefix — the name after the slash may be empty, so
+  `com.example/` is valid). Host-supplied `_meta` keys (`progressToken`,
+  OpenTelemetry `traceparent`/`tracestate`/`baggage`, vendor keys) are
+  preserved. The reserved protocol keys are transport-owned and are stripped
+  from both `request_meta` and per-call `_meta`, so
+  `server.send_client_info = false` really suppresses the client identity:
+  a caller cannot reinstate it by passing its own
+  `io.modelcontextprotocol/clientInfo`. That holds in either era: a dual-era
+  server reads a request carrying modern per-request `_meta` *as* a modern
+  request, so those keys are dropped from a 2025-11-25 request too rather
+  than serving one call statelessly under a session that negotiated the
+  handshake. Legacy traffic is otherwise byte-for-byte unchanged.
+  `Client.new(request_meta:)` (a Hash or a callable evaluated per
+  request) merges default metadata into every request on every transport.
+- **Inline version retry.** A modern server answering any request with
+  `UnsupportedProtocolVersionError` makes the client switch to a mutually
+  supported version from `data.supported` and re-send once (new id).
+- **Removed methods mapped.** Against a modern server `ping` maps to
+  `server/discover` (answered from the probe on a fresh connection),
+  `log_level=` stores the level and sends it as
+  `_meta["io.modelcontextprotocol/logLevel"]` on subsequent requests instead
+  of calling `logging/setLevel`, and `notifications/roots/list_changed` is
+  no longer sent (the modern `roots` capability has no `listChanged`).
+- **Configuration.** `MCPClient.stdio_config(protocol:, discover_timeout:)`
+  and `ServerStdio.new(protocol:, discover_timeout:)`: `:auto` (default,
+  dual-era), `:modern` (fail instead of falling back), `:legacy` (skip the
+  probe; the probe waits the full `read_timeout` by default so a slow-starting
+  modern server is not misclassified). New readers: `protocol_version` (the
+  version outgoing requests declare, which during the probe is only a
+  proposal), `protocol_era` (`:modern`, `:legacy`, or `nil` while the era is
+  unknown), `modern?`, `supported_versions`. Initialization is serialized, so
+  concurrent first requests run the probe once.
+- **Multi round-trip requests are not driven yet.** Modern requests declare
+  no `roots`, `sampling` or `elicitation` capability until the multi
+  round-trip pattern lands, so a compliant server has no input it may ask
+  this client for (basic/patterns/mrtr: a server MUST NOT send an
+  `inputRequests` the client has not declared support for). It may still
+  answer `prompts/get`, `resources/read` or `tools/call` with an
+  `input_required` result carrying only the opaque `requestState`, which a
+  client MAY retry immediately. Either shape raises
+  `MCPClient::Errors::InputRequiredError` (exposing `input_requests` and
+  `request_state`) instead of being mistaken for the operation's result;
+  echoing the state back on a retry is left to the multi round-trip PR.
+
+- **Fifth review round.** A request that had passed the transport-generation
+  check could still be written *after* another thread restarted the exited
+  subprocess: it reached the replacement process unregistered, was executed
+  there, and its answer was discarded as unsolicited. Judging whether a
+  request's transport is current and writing it are now one step under a
+  transport lock that every restart also takes, so such a request is
+  re-issued registered instead. A modern-shaped answer to a probe that had
+  already timed out — and been cancelled — no longer identifies the peer as
+  modern: only an outstanding request's answer says anything, so the
+  2025-11-25 handshake the session fell back to still answers the server's
+  startup `ping` instead of hanging on it. A request in flight when the
+  subprocess exits now fails as soon as the exit is noticed (a
+  `TransportError` naming the exit) rather than waiting out its timeout; it
+  is not replayed, and the next request restarts the server. A caller's
+  `_meta` supplied under both the String and the Symbol key is merged into
+  one member (the String one winning) before the reserved fields are
+  stripped, so nothing stripped from one copy reaches the wire through the
+  other. A `DiscoverResult`'s `ttlMs`/`cacheScope` are honoured by the
+  caching rules: `ttlMs` is a JSON number of milliseconds, zero is
+  immediately stale, a negative, absent or malformed hint counts as zero,
+  and a stale discovery is refreshed on the next capability-gated request
+  before the capability is judged at all — a capability the stale result
+  still lists is not reused (`discovery_fresh?`, `discovery_cache_scope`).
+  A discovery refresh that fails to validate — `supportedVersions`,
+  `capabilities` or `_meta` malformed — changes nothing, not even the
+  identity it carried. `declare_extension` refuses settings that are not an
+  object, and refuses an extension that adds a result type this client does
+  not implement (`io.modelcontextprotocol/tasks` adds `task`; a transport
+  that implements such an extension registers it through
+  `implemented_extension_result_types`, which widens `accepted_result_types`
+  once the extension is declared). Sixth round: an ordinary request is
+  never written to a replacement subprocess whose negotiation has not
+  completed (a restart clears the retirement before it negotiates, so the
+  generation alone judged the half-restarted transport current); an answer
+  on an established 2025-11-25 session identifies nothing, however modern
+  its shape, so the server's own ping, roots, sampling and elicitation
+  requests stay answered; a caller whose request the exited process never
+  answered fails at once even when another caller restarted first (its
+  marker, cleared by the restart, is the durable sign); an explicit
+  `connect` followed by a request negotiates that process instead of
+  spawning a second one; and the public client's `log_level=` no longer
+  gates a 2026-07-28 server on a `logging` capability the per-request field
+  does not need.
+
 ### Protocol foundations
 
 - **Version constants.** `MCPClient::LATEST_PROTOCOL_VERSION` (`2026-07-28`),

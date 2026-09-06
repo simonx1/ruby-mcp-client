@@ -12,14 +12,281 @@ module MCPClient
       # @return [void]
       # @raise [MCPClient::Errors::ConnectionError] if initialization fails
       def ensure_initialized
-        return if @initialized
+        # Read the retirement flag FIRST. A restart clears @initialized and
+        # then the flag; a thread reading them the other way round could see
+        # a stale handshake next to a cleared flag and skip the lock, then
+        # register a request against a transport that is being replaced.
+        return if !transport_retired? && @initialized
 
-        connect
-        start_reader
-        start_stderr_reader
+        @init_lock.synchronize do
+          # The subprocess behind a completed handshake exited under it:
+          # release its pipes and reader threads before connect overwrites
+          # the handles, then negotiate again against the fresh process.
+          release_retired_transport if transport_retired?
+          return if @initialized
+
+          begin
+            # Ordinary requests are refused while the replacement is being
+            # negotiated (see #send_request): the restart clears the
+            # retirement before it negotiates, so the generation alone would
+            # judge a half-restarted transport current.
+            @transport_lock.synchronize { @negotiating = true }
+            # A process the host connected explicitly is negotiated, not
+            # replaced: spawning again would orphan it.
+            connect unless live_process?
+            start_reader unless @reader_thread&.alive?
+            start_stderr_reader unless @stderr_thread&.alive?
+            negotiate_protocol
+          rescue StandardError
+            # A failed negotiation must not leave the subprocess, its pipes
+            # and its reader threads behind. @initialized stays false, so the
+            # next request runs connect again and overwrites @stdin/@stdout/
+            # @wait_thread — putting the first process permanently out of
+            # cleanup's reach.
+            release_transport
+            raise
+          ensure
+            @transport_lock.synchronize { @negotiating = false }
+          end
+
+          @initialized = true
+        end
+      end
+
+      # @return [Boolean] whether a subprocess is connected and still running
+      def live_process?
+        return false unless @stdin.respond_to?(:closed?) && !@stdin.closed?
+
+        @wait_thread.respond_to?(:alive?) && @wait_thread.alive?
+      end
+
+      # Ids of requests a teardown found outstanding: recorded under @mutex
+      # by cleanup, consumed by their waiters (see #wait_response).
+      # @return [Set<Integer>]
+      def dropped_requests
+        @dropped_requests ||= Set.new
+      end
+
+      # @return [Boolean] whether the subprocess behind the handshake exited
+      def transport_retired?
+        @transport_retired
+      end
+
+      # Discard a transport whose subprocess exited after a successful
+      # handshake, so the next negotiation starts from a clean slate rather
+      # than on top of the dead process's handles.
+      # @return [void]
+      def release_retired_transport
+        @logger.info('The MCP server subprocess exited; restarting it for this request')
+        @initialized = false
+        @transport_retired = false
+        release_transport
+      end
+
+      # Tear down a transport that is not going to be used again — a
+      # handshake that never completed, or a subprocess that exited under a
+      # completed one. Failures are swallowed: the transport being unusable
+      # is often the reason it is being released, and the original error is
+      # the one worth raising.
+      # @return [void]
+      def release_transport
+        cleanup
+      rescue StandardError => e
+        @logger.debug("Releasing the stdio transport did not complete cleanly: #{e.message}")
+      end
+
+      # Establish the server's protocol era (MCP 2026-07-28
+      # basic/transports/stdio "Backward Compatibility"): probe with
+      # server/discover unless configured legacy-only, and fall back to the
+      # initialize handshake when the probe shows a legacy server.
+      # @return [void]
+      # @raise [MCPClient::Errors::ConnectionError] if no era can be established
+      def negotiate_protocol
+        return perform_initialize if @protocol_mode == :legacy
+        return if probe_modern_server
+
         perform_initialize
+      rescue StandardError
+        # Nothing was negotiated. The probe only PROPOSES its version, and a
+        # failure that never reached one of the classified outcomes — the
+        # host's request_meta provider raising, say, so no probe was even
+        # sent — would otherwise leave that proposal behind as a settled
+        # modern era. The next attempt would then take a legacy server's
+        # startup request for prohibited modern traffic and drop it, and a
+        # server waiting for that response answers nothing: the recovery
+        # deadlocks until it times out.
+        @protocol_version = nil
+        settle_era_probe
+        raise
+      end
 
-        @initialized = true
+      # Send the server/discover probe with this client's preferred modern
+      # version. Three outcomes, per the stdio backward-compatibility rules:
+      # a DiscoverResult (modern: select a version from supportedVersions), a
+      # recognized modern error such as UnsupportedProtocolVersionError
+      # (modern: retry with an advertised version, never fall back), or any
+      # other error / a timeout (legacy: fall back to initialize). The
+      # fallback is deliberately not keyed to one error code — legacy servers
+      # answer pre-initialize requests with implementation-defined errors.
+      # @return [Boolean] true when the server is modern and a version was selected
+      # @raise [MCPClient::Errors::ConnectionError] if the server is modern but no
+      #   version is mutually supported, or legacy while protocol: :modern is configured
+      def probe_modern_server
+        # The probe DECLARES this version; it does not establish it. Until the
+        # answer arrives the era stays unknown, so an incoming server request
+        # is still handled — a legacy server MAY ping during initialization and
+        # the receiver MUST respond promptly, and a server waiting for that
+        # response answers nothing until it arrives.
+        @protocol_version = MCPClient::LATEST_PROTOCOL_VERSION
+        begin_era_probe
+        modern_confirmed = false
+        begin
+          perform_discover
+        rescue MCPClient::Errors::UnsupportedProtocolVersionError => e
+          raise unless e.modern_protocol_error?
+
+          # A well-formed rejection settles the era: whatever the retried
+          # probe does next, this server is modern and never gets initialize.
+          modern_confirmed = true
+          settle_era_probe
+          retry_discover_with_advertised_version(e)
+        end
+        true
+      rescue MCPClient::Errors::ConnectionError
+        # A DiscoverResult (or advertised list) with no mutual version: the
+        # server is modern but incompatible. Nothing was negotiated.
+        @protocol_version = nil
+        raise
+      rescue MCPClient::Errors::ServerError, MCPClient::Errors::TransportError => e
+        # A recognized modern error (-32020/-32021, or -32022 with no usable
+        # version) identifies a modern server: surface it, never fall back.
+        # Anything else — including a 2xx-style result that is not a
+        # DiscoverResult — is a legacy server, unless the era was already
+        # settled by a well-formed rejection.
+        if modern_confirmed || e.modern_protocol_error_for_probe?
+          @protocol_version = nil
+          raise MCPClient::Errors::ConnectionError, "Server is modern but incompatible: #{e.message}"
+        end
+
+        legacy_after_probe(e)
+        false
+      ensure
+        # However the probe ended, it is no longer proposing anything.
+        settle_era_probe
+      end
+
+      # Not a recognized modern error: a legacy server (or one that never
+      # answered).
+      # @param error [StandardError] the probe failure
+      # @return [void]
+      # @raise [MCPClient::Errors::ConnectionError] when protocol: :modern is configured
+      def legacy_after_probe(error)
+        e = error
+        @protocol_version = nil
+        if @protocol_mode == :modern
+          raise MCPClient::Errors::ConnectionError,
+                "Server did not answer server/discover as a modern MCP server (#{e.message}); it is most likely " \
+                'a legacy server expecting the initialize handshake. Use protocol: :auto or :legacy to allow that.'
+        end
+
+        @logger.debug("server/discover probe failed (#{e.class}); treating the server as legacy")
+      end
+
+      # After UnsupportedProtocolVersionError, pick a mutually supported
+      # version from the error's advertised list and re-issue the probe.
+      # @param error [MCPClient::Errors::UnsupportedProtocolVersionError]
+      # @return [void]
+      def retry_discover_with_advertised_version(error)
+        version = select_protocol_version(error.supported)
+        unless version
+          raise MCPClient::Errors::ConnectionError,
+                "Server rejected protocol version #{@protocol_version} and supports only " \
+                "#{error.supported.join(', ')}, none of which this client speaks " \
+                "(modern versions supported: #{MCPClient::MODERN_PROTOCOL_VERSIONS.join(', ')})"
+        end
+
+        @logger.info("Server does not support #{@protocol_version}; retrying server/discover with #{version}")
+        @protocol_version = version
+        perform_discover
+      end
+
+      # Send server/discover and apply the DiscoverResult. Bounded by
+      # discover_timeout rather than the general read timeout so a silent
+      # legacy server delays the fallback only briefly.
+      # @return [Hash] the DiscoverResult
+      def perform_discover
+        req_id = next_id
+        req = build_registered_request('server/discover', {}, req_id)
+        send_request(req)
+        begin
+          res = wait_response(req_id, timeout: @discover_timeout)
+        rescue MCPClient::Errors::RequestTimeoutError
+          send_cancellation_notification(req_id)
+          raise
+        end
+        interpret_discover_answer(res)
+      end
+
+      # Turn the probe's answer into a DiscoverResult, or into the failure
+      # that says what kind of server sent it.
+      #
+      # The stdio fallback rule is keyed to the probe being answered with an
+      # error, or not answered at all — never to a result. `resultType` does
+      # not exist before 2026-07-28, so a result carrying it came from a
+      # modern server even when the rest of it is unusable: treating that as
+      # a legacy answer would pin a dual-era server to the 2025-11-25
+      # handshake for the life of the process, and would make a modern-only
+      # server fail to connect after it had already answered the probe. Such
+      # an answer therefore fails the negotiation instead of falling back.
+      # A result with no 2026-07-28 marker at all is still a legacy answer: a
+      # permissive server answering an unknown method with some object.
+      # @param res [Hash] the JSON-RPC response to the probe
+      # @return [Hash] the applied DiscoverResult
+      # @raise [MCPClient::Errors::ConnectionError] when a modern server answered unusably
+      # @raise [MCPClient::Errors::ServerError] when a legacy server answered
+      def interpret_discover_answer(res)
+        modern_answer = modern_discover_answer?(res)
+        # Named so the identity of an answer that fails to validate below is
+        # not recorded: apply_discover_result records it once the whole
+        # result has validated.
+        result = process_jsonrpc_response(res, method: 'server/discover')
+        unless discover_result?(result)
+          raise invalid_discover_answer(modern_answer, 'answered without a DiscoverResult')
+        end
+
+        apply_discover_result(result)
+      rescue MCPClient::Errors::InvalidResultError, MCPClient::Errors::InputRequiredError => e
+        raise invalid_discover_answer(modern_answer, "answered without a DiscoverResult (#{e.message})")
+      end
+
+      # @param res [Hash] the JSON-RPC response to the probe
+      # @return [Boolean] whether its result could only have come from a 2026-07-28 server
+      def modern_discover_answer?(res)
+        result = res.is_a?(Hash) ? res['result'] : nil
+        return false unless result.is_a?(Hash)
+
+        result.key?('resultType') || result.key?(:resultType) || discover_result?(result)
+      end
+
+      # Whether a response, as it comes off the wire, could only have been
+      # written by a modern server: a result carrying a 2026-07-28 marker, or
+      # one of the spec-defined modern errors in its mandated shape.
+      # @param msg [Hash] a JSON-RPC response
+      # @return [Boolean]
+      def identifies_modern_server?(msg)
+        return true if modern_discover_answer?(msg)
+        return false unless msg.key?('error')
+
+        MCPClient::Errors::ServerError.from_jsonrpc(msg['error']).modern_protocol_error?
+      end
+
+      # @param modern_answer [Boolean] whether the answer identified a modern server
+      # @param message [String] what was wrong with it
+      # @return [StandardError] the failure the probe should propagate
+      def invalid_discover_answer(modern_answer, message)
+        return MCPClient::Errors::ServerError.new("server/discover was #{message}") unless modern_answer
+
+        MCPClient::Errors::ConnectionError.new("Server is modern but incompatible: server/discover was #{message}")
       end
 
       # Handshake: send initialize request and initialized notification
@@ -28,15 +295,20 @@ module MCPClient
       def perform_initialize
         # Initialize request
         init_id = next_id
-        init_req = build_jsonrpc_request('initialize', initialization_params, init_id)
+        init_req = build_registered_request('initialize', initialization_params, init_id)
         send_request(init_req)
         res = wait_response(init_id)
         begin
           result = process_jsonrpc_response(res) || {}
         rescue MCPClient::Errors::UnsupportedProtocolVersionError => e
           # A modern-only server SHOULD name the versions it supports when
-          # rejecting initialize (basic/versioning): surface them, since a
-          # legacy-only configuration has no fall-forward path.
+          # rejecting initialize (basic/versioning). When one of them is
+          # mutual the era is settled after all — the fallback ran only
+          # because the probe was too slow — so go back to server/discover
+          # instead of ending the session. A legacy-only configuration has
+          # opted out of the modern era and gets the error.
+          return fall_forward_to_modern(e) if fall_forward_to_modern?(e)
+
           raise MCPClient::Errors::ConnectionError,
                 "Initialize failed: #{e.message} (server supports: #{e.supported.join(', ')})"
         rescue MCPClient::Errors::ServerError => e
@@ -55,6 +327,34 @@ module MCPClient
         @stdin.puts(notif.to_json)
       end
 
+      # Whether a rejected initialize handshake should send this connection
+      # back to the modern path. Only a well-formed rejection counts — a bare
+      # -32022 from a legacy endpoint identifies nothing — and only one that
+      # names a version this client speaks, since the retry has to declare
+      # one. A host that configured protocol: :legacy asked for the 2025-11-25
+      # handshake and gets the error instead.
+      # @param error [MCPClient::Errors::UnsupportedProtocolVersionError]
+      # @return [Boolean]
+      def fall_forward_to_modern?(error)
+        return false if @protocol_mode == :legacy
+
+        error.modern_protocol_error? && !select_protocol_version(error.supported).nil?
+      end
+
+      # Resume the modern path after a fallback handshake was refused by a
+      # modern server: the rejection settles the era, so server/discover is
+      # re-issued with a version the server named and initialize is never
+      # sent again.
+      # @param error [MCPClient::Errors::UnsupportedProtocolVersionError]
+      # @return [Hash] the DiscoverResult
+      def fall_forward_to_modern(error)
+        version = select_protocol_version(error.supported)
+        @logger.info('The server refused the initialize handshake and supports ' \
+                     "#{error.supported.join(', ')}; it is a modern server — retrying server/discover with #{version}")
+        @protocol_version = version
+        perform_discover
+      end
+
       # Generate a new unique request ID and mark it as awaiting a response.
       # Registering the id before the request is sent lets the reader thread
       # distinguish expected responses from late/unsolicited ones.
@@ -68,13 +368,68 @@ module MCPClient
         end
       end
 
-      # Send a JSON-RPC request and return nothing
+      # Build a JSON-RPC request under an id {#next_id} has already registered
+      # as outstanding. Building can fail — the host's request_meta provider
+      # is evaluated here and may raise — and a request that was never built
+      # is never sent and never answered, so its marker has to go with it;
+      # otherwise every such failure leaks an entry into @awaiting.
+      # @param method [String] JSON-RPC method
+      # @param params [Hash, nil] parameters for the request
+      # @param req_id [Integer] the registered request id
+      # @return [Hash] the JSON-RPC request
+      def build_registered_request(method, params, req_id)
+        build_jsonrpc_request(method, params, req_id)
+      rescue StandardError
+        @mutex.synchronize { @awaiting.delete(req_id) }
+        raise
+      end
+
+      # Write a registered request, unless the transport it was registered on
+      # has been replaced since. Replacement is judged by the transport
+      # generation, which every teardown and every spawn bumps: a restart in
+      # between has dropped the id from @awaiting, and the process the
+      # request was built for is gone.
       # @param req [Hash] the JSON-RPC request
-      # @return [void]
+      # @param generation [Integer] the transport generation the id was registered on
+      # @return [Hash, nil] the request once written, or nil when the
+      #   transport was replaced under it before it was written (it was not sent)
       # @raise [MCPClient::Errors::TransportError] on write errors
-      def send_request(req)
+      def send_if_current(req, generation)
+        return req unless send_request(req, generation) == :replaced
+
+        @logger.debug("The transport was replaced before #{req['method']} was sent; re-issuing it")
+        # Nothing was written, so nobody will ever wait on this id: drop it
+        # from the teardown's record as well as from the awaiting table. The
+        # waiter is what normally consumes that record, and an id no request
+        # carries has no waiter — it would accumulate for the process's life.
+        @mutex.synchronize do
+          @awaiting.delete(req['id'])
+          dropped_requests.delete(req['id'])
+        end
+        nil
+      end
+
+      # Send a JSON-RPC request. With a generation, the request is written
+      # only if that is still the transport's generation, and the check and
+      # the write are one step under the transport lock: a restart replaces
+      # the handles and bumps the generation under the same lock, so a
+      # request judged current cannot be written to the replacement process
+      # — where it would be executed unregistered and its answer discarded.
+      # @param req [Hash] the JSON-RPC request
+      # @param generation [Integer, nil] the transport generation the request was registered on
+      # @return [Symbol] :sent, or :replaced when the transport was replaced and nothing was written
+      # @raise [MCPClient::Errors::TransportError] on write errors
+      def send_request(req, generation = nil)
         @logger.debug("Sending JSONRPC request: #{describe_jsonrpc_message(req)}")
-        @stdin.puts(req.to_json)
+        @transport_lock.synchronize do
+          # A replacement whose negotiation has not completed is not current
+          # either, whatever its generation says: an ordinary request written
+          # to it would reach the process before its handshake.
+          return :replaced if generation && (generation != @transport_generation || @negotiating)
+
+          @stdin.puts(req.to_json)
+        end
+        :sent
       rescue StandardError => e
         # A request that failed to send will never receive a response, so drop
         # its awaiting marker; otherwise a broken transport (e.g. the server
@@ -91,6 +446,13 @@ module MCPClient
         deadline = Time.now + (timeout || @read_timeout)
         @mutex.synchronize do
           until @pending.key?(id)
+            # The subprocess exited: no answer is coming, however long the
+            # timeout. (An answer that arrived before it exited is above.)
+            # A restart another caller completed meanwhile has cleared the
+            # retirement again, but it recorded this request as dropped —
+            # the durable sign that the transport it went out on is gone.
+            break if @transport_retired || dropped_requests.include?(id)
+
             remaining = deadline - Time.now
             break if remaining <= 0
 
@@ -99,10 +461,16 @@ module MCPClient
           # Remove the response and the awaiting marker on both success and
           # timeout so neither @pending nor @awaiting accumulates entries.
           msg = @pending.delete(id)
+          transport_gone = @transport_retired || !dropped_requests.delete?(id).nil?
           @awaiting.delete(id)
-          raise MCPClient::Errors::RequestTimeoutError, "Timeout waiting for JSONRPC response id=#{id}" unless msg
+          return msg if msg
 
-          msg
+          if transport_gone
+            raise MCPClient::Errors::TransportError,
+                  "The MCP server subprocess exited before answering JSONRPC request id=#{id}"
+          end
+
+          raise MCPClient::Errors::RequestTimeoutError, "Timeout waiting for JSONRPC response id=#{id}"
         end
       end
 
@@ -123,22 +491,128 @@ module MCPClient
       # @raise [MCPClient::Errors::ServerError] if server returns an error
       # @raise [MCPClient::Errors::TransportError] on transport errors
       # @raise [MCPClient::Errors::ToolCallError] on tool call errors
-      def rpc_request(method, params = {}, timeout: nil)
-        ensure_initialized
-        with_retry(method) do
-          req_id = next_id
-          req = build_jsonrpc_request(method, params, req_id)
-          send_request(req)
-          begin
-            res = wait_response(req_id, timeout: timeout)
-          rescue MCPClient::Errors::RequestTimeoutError
-            # MCP lifecycle: on timeout the sender SHOULD issue a cancellation
-            # notification for the abandoned request and stop waiting.
-            send_cancellation_notification(req_id) if cancellable_request?(method, params)
-            raise
-          end
-          process_jsonrpc_response(res)
+      # Like {ServerBase#require_capability!}, except that a modern server's
+      # capabilities come from a DiscoverResult with a freshness hint: one
+      # whose ttlMs has elapsed (a zero ttlMs is "immediately stale") is
+      # refreshed on the next access before the capability is judged at all
+      # (server/utilities/caching) — the server may have enabled the
+      # capability since, or withdrawn one the stale result still lists.
+      # @param path [Array<String, Symbol>] capability key path
+      # @param method [String] the JSON-RPC method the caller wants to send
+      # @raise [MCPClient::Errors::CapabilityError]
+      def require_capability!(*path, method:)
+        if modern? && !discovery_fresh?
+          @logger.debug("The server/discover result is stale; refreshing it before #{method}")
+          rpc_request('server/discover')
         end
+        super
+      end
+
+      def rpc_request(method, params = {}, timeout: nil)
+        freshly_probed = !@initialized || transport_retired?
+        ensure_initialized
+        if method == 'ping' && modern?
+          # `ping` was removed in MCP 2026-07-28; the mandatory server/discover
+          # request is the modern heartbeat. The probe that just established
+          # the connection IS such a round trip, so answer from it rather than
+          # paying for a second one.
+          return @last_discover_result if freshly_probed && @last_discover_result
+
+          method = 'server/discover'
+        end
+
+        result = with_retry(method) do
+          sent_version = nil
+          begin
+            send_request_and_wait(method, params, timeout) { |version| sent_version = version }
+          rescue MCPClient::Errors::UnsupportedProtocolVersionError => e
+            # MCP 2026-07-28 basic/versioning: "The client SHOULD select a
+            # mutually supported version from the supported list and retry
+            # the request". The server rejected the request before
+            # processing it, so re-sending cannot duplicate a side effect.
+            # Compared against the version THIS request declared, read back
+            # from the request itself: a concurrent request may have moved
+            # the transport on while this one was being built.
+            version = select_protocol_version(e.supported)
+            raise unless modern? && version && version != sent_version
+
+            @logger.info("Server does not support protocol version #{sent_version}; " \
+                         "retrying #{method} with #{version}")
+            @protocol_version = version
+            send_request_and_wait(method, params, timeout)
+          end
+        end
+        # Every server/discover answer is validated and applied: a later
+        # heartbeat may advertise new versions or capabilities.
+        result = apply_discover_result(result) if method == 'server/discover'
+        result
+      end
+
+      # @param result [Object] a JSON-RPC result
+      # @return [Boolean] whether it has the DiscoverResult shape
+      def discover_result?(result)
+        result.is_a?(Hash) && result['supportedVersions'].is_a?(Array)
+      end
+
+      # One request/response exchange with its own JSON-RPC id.
+      # @param method [String] JSON-RPC method
+      # @param params [Hash] parameters for the request
+      # @param timeout [Numeric, nil] per-request timeout override
+      # @yieldparam version [String, nil] the protocol version the request declares
+      # @return [Object] result from the JSON-RPC response
+      def send_request_and_wait(method, params, timeout)
+        req_id, = send_on_current_transport(method, params) do |built|
+          yield declared_protocol_version(built) if block_given?
+        end
+        begin
+          res = wait_response(req_id, timeout: timeout)
+        rescue MCPClient::Errors::RequestTimeoutError
+          # MCP lifecycle: on timeout the sender SHOULD issue a cancellation
+          # notification for the abandoned request and stop waiting.
+          send_cancellation_notification(req_id) if cancellable_request?(method, params)
+          raise
+        end
+        process_jsonrpc_response(res, method: method)
+      end
+
+      # Register, build and write a request on the transport that is current
+      # when it is written. Between registering the id and writing, the
+      # host's request_meta provider runs, and in that window the subprocess
+      # may exit and another thread restart it: the restart drops every
+      # outstanding id, so a request written afterwards would go out
+      # unregistered and its answer be discarded as unsolicited. Nothing has
+      # been sent when that is detected, so the request is simply rebuilt —
+      # after waiting for the restart to complete — and sent registered.
+      # @param method [String] JSON-RPC method
+      # @param params [Hash] parameters for the request
+      # @yieldparam req [Hash] the request as built, before it is written
+      # @return [Array(Integer, Hash)] the registered id and the request
+      def send_on_current_transport(method, params)
+        loop do
+          # A subprocess that exited under the handshake is restarted here
+          # (MCP 2026-07-28 stdio "Unexpected Termination": the client
+          # SHOULD restart it) rather than written to.
+          ensure_initialized if transport_retired?
+          generation = @transport_generation
+          req_id = next_id
+          req = build_registered_request(method, params, req_id)
+          yield req if block_given?
+          return [req_id, req] if send_if_current(req, generation)
+
+          ensure_initialized
+        end
+      end
+
+      # The protocol version a built request declares in its `_meta`. Read
+      # back from the request rather than from the transport: building it
+      # evaluates the host's metadata provider, during which a concurrent
+      # request may settle the transport on a different version.
+      # @param req [Hash] a JSON-RPC request
+      # @return [String, nil] the declared version, nil for a legacy request
+      def declared_protocol_version(req)
+        params = req['params']
+        meta = params.is_a?(Hash) ? params['_meta'] : nil
+        meta.is_a?(Hash) ? meta[JsonRpcCommon::META_PROTOCOL_VERSION] : nil
       end
 
       # Best-effort notifications/cancelled for a request the client stopped
@@ -160,8 +634,21 @@ module MCPClient
       # @return [void]
       def rpc_notify(method, params = {})
         ensure_initialized
+        if suppressed_modern_notification?(method)
+          @logger.debug("Not sending #{method}: removed in MCP #{protocol_version}")
+          return
+        end
+
         notif = build_jsonrpc_notification(method, params)
-        @stdin.puts(notif.to_json)
+        begin
+          @stdin.puts(notif.to_json)
+        rescue StandardError => e
+          # The same failure a request write reports, reported the same way:
+          # a notification writes on its own, outside the request path's
+          # check-and-write, and a dead pipe there reached the host as a raw
+          # IOError.
+          raise MCPClient::Errors::TransportError, "Failed to send JSONRPC notification: #{e.message}"
+        end
       end
     end
   end

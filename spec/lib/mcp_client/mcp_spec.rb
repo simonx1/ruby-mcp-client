@@ -19,7 +19,9 @@ RSpec.describe MCPClient do
         command: cmd,
         name: nil,
         logger: nil,
-        env: {}
+        env: {},
+        protocol: :auto,
+        discover_timeout: nil
       )
     end
   end

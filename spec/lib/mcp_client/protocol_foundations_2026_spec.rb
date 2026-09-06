@@ -191,14 +191,15 @@ RSpec.describe 'MCP 2026-07-28 protocol foundations' do
       expect(MCPClient::JsonRpcCommon.result_type(result)).to eq('complete')
     end
 
-    it 'passes through an "input_required" result for the caller to handle' do
+    it 'recognizes an "input_required" result and surfaces it as InputRequiredError' do
       # Only a modern session has the multi round-trip pattern; a legacy one
       # answering with it is malformed (see the era examples in the
       # verification spec).
       transport.instance_variable_set(:@protocol_version, '2026-07-28')
       result = { 'resultType' => 'input_required', 'requestState' => 'blob' }
-      expect(transport.process_jsonrpc_response({ 'id' => 1, 'result' => result })).to eq(result)
       expect(MCPClient::JsonRpcCommon.result_type(result)).to eq('input_required')
+      expect { transport.process_jsonrpc_response({ 'id' => 1, 'result' => result }) }
+        .to raise_error(MCPClient::Errors::InputRequiredError) { |e| expect(e.request_state).to eq('blob') }
     end
 
     it 'rejects an unrecognized resultType as an invalid response' do
@@ -597,8 +598,11 @@ RSpec.describe 'initialize handshake against the modern era' do
       .to raise_error(MCPClient::Errors::ConnectionError, /2026-07-28/)
   end
 
+  # A legacy-only configuration has no fall-forward path — a dual-era one
+  # goes back to server/discover instead, which the stdio suite pins — so the
+  # advertised versions are all this host can be given to act on.
   it 'names the versions a modern-only server advertises when it rejects initialize' do
-    server = MCPClient::ServerStdio.new(command: 'echo test')
+    server = MCPClient::ServerStdio.new(command: 'echo test', protocol: :legacy)
     allow(server).to receive(:next_id).and_return(1)
     allow(server).to receive(:send_request)
     allow(server).to receive(:wait_response).and_return(

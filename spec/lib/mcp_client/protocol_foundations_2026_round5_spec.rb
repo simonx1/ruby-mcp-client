@@ -132,7 +132,7 @@ RSpec.describe 'ServerSSE and ServerStreamableHTTP surface an unfinished list or
     it 'raises instead of returning an empty tool list' do
       answer_with([incomplete])
 
-      expect { server.list_tools }.to raise_error(MCPClient::Errors::InvalidResultError, /input_required/) do |e|
+      expect { server.list_tools }.to raise_error(MCPClient::Errors::InputRequiredError, /input_required/) do |e|
         expect(e.data).to eq(incomplete)
         expect(e).not_to be_a(MCPClient::Errors::ToolCallError)
       end
@@ -141,7 +141,7 @@ RSpec.describe 'ServerSSE and ServerStreamableHTTP surface an unfinished list or
     it 'raises instead of returning an empty prompt list' do
       answer_with([incomplete])
 
-      expect { server.list_prompts }.to raise_error(MCPClient::Errors::InvalidResultError, /input_required/) do |e|
+      expect { server.list_prompts }.to raise_error(MCPClient::Errors::InputRequiredError, /input_required/) do |e|
         expect(e.data).to eq(incomplete)
       end
     end
@@ -149,7 +149,7 @@ RSpec.describe 'ServerSSE and ServerStreamableHTTP surface an unfinished list or
     it 'raises instead of returning an empty resource list' do
       answer_with([incomplete])
 
-      expect { server.list_resources }.to raise_error(MCPClient::Errors::InvalidResultError, /input_required/) do |e|
+      expect { server.list_resources }.to raise_error(MCPClient::Errors::InputRequiredError, /input_required/) do |e|
         expect(e.data).to eq(incomplete)
       end
     end
@@ -158,7 +158,7 @@ RSpec.describe 'ServerSSE and ServerStreamableHTTP surface an unfinished list or
       answer_with([incomplete])
 
       expect { server.list_resource_templates }
-        .to raise_error(MCPClient::Errors::InvalidResultError, /input_required/) do |e|
+        .to raise_error(MCPClient::Errors::InputRequiredError, /input_required/) do |e|
         expect(e.data).to eq(incomplete)
       end
     end
@@ -169,7 +169,7 @@ RSpec.describe 'ServerSSE and ServerStreamableHTTP surface an unfinished list or
         server.complete(ref: { 'type' => 'ref/prompt', 'name' => 'p' }, argument: { 'name' => 'a', 'value' => '' })
       end
 
-      expect(&request).to raise_error(MCPClient::Errors::InvalidResultError, /input_required/) do |e|
+      expect(&request).to raise_error(MCPClient::Errors::InputRequiredError, /input_required/) do |e|
         expect(e.data).to eq(incomplete)
       end
     end
@@ -177,7 +177,7 @@ RSpec.describe 'ServerSSE and ServerStreamableHTTP surface an unfinished list or
     it 'raises instead of silently dropping an unfinished second page' do
       answer_with([{ 'resultType' => 'complete', 'tools' => [tool], 'nextCursor' => 'p2' }, incomplete])
 
-      expect { server.list_tools }.to raise_error(MCPClient::Errors::InvalidResultError, /input_required/) do |e|
+      expect { server.list_tools }.to raise_error(MCPClient::Errors::InputRequiredError, /input_required/) do |e|
         expect(e.data).to eq(incomplete)
       end
     end
@@ -248,23 +248,45 @@ RSpec.describe 'an unfinished tool or prompt result survives stdio and SSE off t
   end
 
   shared_examples 'accepts and preserves a continuation' do
-    it 'returns the whole continuation from call_tool' do
-      answer_with('result' => unfinished)
-
-      expect(server.call_tool('t', {})).to eq(unfinished)
+    # Whatever a transport does with a continuation it cannot fulfil —
+    # surface it as the typed error (a transport that drives multi round-trip
+    # requests) or hand it back whole (one that does not yet) — nothing of it
+    # may be lost on the way. Each context says which of the two it pins.
+    def continuation_of
+      yield
+    rescue MCPClient::Errors::InputRequiredError => e
+      expect(continuation_raises).to be(true), 'the continuation was raised where a raw result was pinned'
+      e.data
+    else
+      expect(continuation_raises).to be(false), 'the continuation was returned where the typed error was pinned'
+      # `else` cannot reach the block's value, so the caller re-runs it below.
+      nil
     end
 
-    it 'returns the whole continuation from get_prompt' do
+    def continuation_from(&request)
+      result = continuation_of(&request)
+      result.nil? ? request.call : result
+    end
+
+    it 'surfaces the whole continuation from call_tool' do
       answer_with('result' => unfinished)
 
-      expect(server.get_prompt('p', {})).to eq(unfinished)
+      expect(continuation_from { server.call_tool('t', {}) }).to eq(unfinished)
+    end
+
+    it 'surfaces the whole continuation from get_prompt' do
+      answer_with('result' => unfinished)
+
+      expect(continuation_from { server.get_prompt('p', {}) }).to eq(unfinished)
     end
 
     it 'keeps the InputRequests map intact' do
       answer_with('result' => unfinished)
 
-      expect(server.call_tool('t', {})['inputRequests'].keys).to eq(['city'])
-      expect(server.call_tool('t', {}).dig('inputRequests', 'city', 'method')).to eq('elicitation/create')
+      continuation = continuation_from { server.call_tool('t', {}) }
+      expect(continuation['inputRequests'].keys).to eq(['city'])
+      expect(continuation.dig('inputRequests', 'city', 'method')).to eq('elicitation/create')
+      expect(continuation['requestState']).to eq('continue-later')
     end
 
     # "At least one of inputRequests or requestState MUST be present": a
@@ -273,14 +295,14 @@ RSpec.describe 'an unfinished tool or prompt result survives stdio and SSE off t
       stateless = unfinished.except('requestState')
       answer_with('result' => stateless)
 
-      expect(server.call_tool('t', {})).to eq(stateless)
+      expect(continuation_from { server.call_tool('t', {}) }).to eq(stateless)
     end
 
     it 'surfaces it from read_resource with the continuation on the error data' do
       answer_with('result' => unfinished)
 
       expect { server.read_resource('file:///x') }
-        .to raise_error(MCPClient::Errors::InvalidResultError, /input_required/) do |e|
+        .to raise_error(MCPClient::Errors::InputRequiredError, /input_required/) do |e|
           expect(e.data).to eq(unfinished)
         end
     end
@@ -296,6 +318,9 @@ RSpec.describe 'an unfinished tool or prompt result survives stdio and SSE off t
 
   context 'with ServerStdio (line -> reader dispatch -> waiter)' do
     let(:server) { MCPClient::ServerStdio.new(command: 'echo test', read_timeout: 5) }
+    # The stateless stdio transport drives multi round-trip requests: with
+    # nothing to fulfil this one it raises the typed error.
+    let(:continuation_raises) { true }
 
     before do
       server.instance_variable_set(:@initialized, true)
@@ -314,6 +339,9 @@ RSpec.describe 'an unfinished tool or prompt result survives stdio and SSE off t
 
   context 'with ServerSSE (POST -> SSE event -> result store -> waiter)' do
     let(:server) { MCPClient::ServerSSE.new(base_url: 'https://example.com/sse', read_timeout: 5, retries: 0) }
+    # The SSE transport hands the continuation back whole until the HTTP
+    # branches teach it the round trip.
+    let(:continuation_raises) { false }
 
     before do
       server.instance_variable_set(:@connection_established, true)

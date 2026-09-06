@@ -23,6 +23,8 @@ RSpec.describe MCPClient::ServerStdio::JsonRpcTransport do
         @retry_backoff = 0.1
         @read_timeout = 0.1
         @initialized = false
+        @transport_lock = Mutex.new
+        @transport_generation = 0
       end
 
       def connect; end
