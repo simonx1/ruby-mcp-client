@@ -96,6 +96,11 @@ module MCPClient
       # Bumped whenever a subprocess is spawned or torn down, so a reader
       # thread only ever speaks for the transport it was started for.
       @transport_generation = 0
+      # Guards the pair (subprocess handles, generation) so that judging
+      # whether a request's transport is still current and writing it are
+      # one step: a restart cannot slip in between (see
+      # JsonRpcTransport#send_request).
+      @transport_lock = Mutex.new
       @transport_retired = false
       @modern_answer_received = false
     end
@@ -118,25 +123,33 @@ module MCPClient
     # @return [Boolean] true if connection was successful
     # @raise [MCPClient::Errors::ConnectionError] if connection fails
     def connect
-      if @command_array
-        if @env.any?
-          @stdin, @stdout, @stderr, @wait_thread = Open3.popen3(@env, *@command_array)
-        else
-          @stdin, @stdout, @stderr, @wait_thread = Open3.popen3(*@command_array)
-        end
-      elsif @env.any?
-        @stdin, @stdout, @stderr, @wait_thread = Open3.popen3(@env, @command)
-      else
-        @stdin, @stdout, @stderr, @wait_thread = Open3.popen3(@command)
+      handles = spawn_server_process
+      # The handles and the generation change together: a request judged
+      # current against the old generation must not find the new stdin.
+      @transport_lock.synchronize do
+        @stdin, @stdout, @stderr, @wait_thread = handles
+        @transport_generation += 1
+        # A fresh process has said nothing yet: what the previous one wrote
+        # identifies nothing about this one.
+        @modern_answer_received = false
       end
-      @transport_generation += 1
-      # A fresh process has said nothing yet: what the previous one wrote
-      # identifies nothing about this one.
-      @modern_answer_received = false
       pin_pipe_encodings
       true
     rescue StandardError => e
       raise MCPClient::Errors::ConnectionError, "Failed to connect to MCP server: #{e.message}"
+    end
+
+    # @return [Array] the stdin, stdout, stderr and wait thread of the spawned process
+    def spawn_server_process
+      if @command_array
+        return Open3.popen3(@env, *@command_array) if @env.any?
+
+        Open3.popen3(*@command_array)
+      elsif @env.any?
+        Open3.popen3(@env, @command)
+      else
+        Open3.popen3(@command)
+      end
     end
 
     # Pin the subprocess pipe encodings to UTF-8 instead of inheriting the
@@ -185,7 +198,12 @@ module MCPClient
     def retire_transport(generation)
       return unless generation == @transport_generation
 
-      @transport_retired = true
+      # Waiters are woken: a request in flight on this transport will never
+      # be answered, and should fail now rather than wait out its timeout.
+      @mutex.synchronize do
+        @transport_retired = true
+        @cond.broadcast
+      end
       @logger.debug('Server stdout closed; the transport will be re-established on the next request')
     end
 
@@ -258,18 +276,22 @@ module MCPClient
       id = msg['id']
       return unless id
 
-      # The answer is recorded as identifying the peer BEFORE it is queued
-      # and before the next line is read: the thread waiting for it may not
-      # run until after the server has written its next line, and if that
-      # line is a request a modern server MUST NOT have written, it must
-      # already be known as prohibited traffic — a legacy accommodation is
-      # only owed while the probe is unanswered.
-      @modern_answer_received = true if identifies_modern_server?(msg)
       @mutex.synchronize do
         # Only retain a response that corresponds to an outstanding request.
         # Late responses (arriving after the caller timed out) and unsolicited
         # responses are dropped so @pending cannot grow without bound.
         if @awaiting.key?(id)
+          # The answer is recorded as identifying the peer BEFORE it is
+          # queued and before the next line is read: the thread waiting for
+          # it may not run until after the server has written its next line,
+          # and if that line is a request a modern server MUST NOT have
+          # written, it must already be known as prohibited traffic — a
+          # legacy accommodation is only owed while the probe is unanswered.
+          # Only an OUTSTANDING request's answer says anything, though: the
+          # response to a probe that timed out (and was cancelled) SHOULD be
+          # ignored, and the session it fell back to is a 2025-11-25 one
+          # whose server requests are still owed their responses.
+          @modern_answer_received = true if identifies_modern_server?(msg)
           @pending[id] = msg
           @cond.broadcast
         else
@@ -785,9 +807,12 @@ module MCPClient
 
       # Past this point the reader threads speak for a transport that is
       # being dismantled on purpose: their EOF must not retire whatever
-      # replaces it.
-      @transport_generation += 1
-      @stdin.close unless @stdin.closed?
+      # replaces it. Bumped under the transport lock, so a request that was
+      # judged current is written before this, or not at all.
+      @transport_lock.synchronize do
+        @transport_generation += 1
+        @stdin.close unless @stdin.closed?
+      end
       terminate_server_process
       @stdout.close unless @stdout.closed?
       @stderr.close unless @stderr.closed?

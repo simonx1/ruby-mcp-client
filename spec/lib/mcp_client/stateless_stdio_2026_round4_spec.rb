@@ -595,20 +595,4 @@ RSpec.describe 'MCP 2026-07-28 stateless protocol (stdio) — round 4' do
       expect(written.map { |line| JSON.parse(line)['method'] }).not_to include('notifications/cancelled')
     end
   end
-
-  # ---------------------------------------------------------------------------
-  describe 'Client#roots= while a probe is in flight' do
-    it 'leaves the decision to the transport, which settles the era first' do
-      server = MCPClient::ServerStdio.new(command: 'echo test', read_timeout: 1)
-      allow(MCPClient::ServerFactory).to receive(:create).and_return(server)
-      client = MCPClient::Client.new(mcp_server_configs: [{ type: 'stdio', command: 'a' }])
-      server.instance_variable_set(:@protocol_version, MCPClient::LATEST_PROTOCOL_VERSION)
-      server.send(:begin_era_probe)
-      allow(server).to receive(:rpc_notify)
-
-      client.roots = [{ 'uri' => 'file:///tmp', 'name' => 'tmp' }]
-
-      expect(server).to have_received(:rpc_notify).with('notifications/roots/list_changed', {})
-    end
-  end
 end

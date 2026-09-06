@@ -94,6 +94,31 @@ metadata). Each feature lands in its own PR; this section accumulates them.
   `request_state`) instead of being mistaken for the operation's result;
   echoing the state back on a retry is left to the multi round-trip PR.
 
+- **Fifth review round.** A request that had passed the transport-generation
+  check could still be written *after* another thread restarted the exited
+  subprocess: it reached the replacement process unregistered, was executed
+  there, and its answer was discarded as unsolicited. Judging whether a
+  request's transport is current and writing it are now one step under a
+  transport lock that every restart also takes, so such a request is
+  re-issued registered instead. A modern-shaped answer to a probe that had
+  already timed out — and been cancelled — no longer identifies the peer as
+  modern: only an outstanding request's answer says anything, so the
+  2025-11-25 handshake the session fell back to still answers the server's
+  startup `ping` instead of hanging on it. A request in flight when the
+  subprocess exits now fails as soon as the exit is noticed (a
+  `TransportError` naming the exit) rather than waiting out its timeout; it
+  is not replayed, and the next request restarts the server. A caller's
+  `_meta` supplied under both the String and the Symbol key is merged into
+  one member (the String one winning) before the reserved fields are
+  stripped, so nothing stripped from one copy reaches the wire through the
+  other. A `DiscoverResult`'s `ttlMs`/`cacheScope` are honoured: a zero
+  `ttlMs` is immediately stale, and a stale discovery is refreshed before a
+  capability it did not declare is refused (`discovery_fresh?`,
+  `discovery_cache_scope`). A discovery refresh that fails to validate —
+  `supportedVersions`, `capabilities` or `_meta` malformed — changes
+  nothing, not even the identity it carried. `declare_extension` refuses
+  settings that are not an object.
+
 ### Protocol foundations
 
 - **Version constants.** `MCPClient::LATEST_PROTOCOL_VERSION` (`2026-07-28`),

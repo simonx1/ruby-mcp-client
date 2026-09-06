@@ -25,6 +25,14 @@
 #                     response arrives (a legacy server MAY ping at startup;
 #                     the receiver MUST respond promptly)
 #   silent-probe      never answer server/discover; run the handshake instead
+#   late-discover     answer server/discover only after a delay longer than
+#                     the client's discover timeout, then behave like
+#                     legacy-ping-first for the handshake the client fell
+#                     back to (a late answer to a cancelled probe identifies
+#                     nothing; the 2025-11-25 ping is still owed a response)
+#   modern-exit-on-call like modern, but exit as soon as a tools/call arrives,
+#                     without answering it, so a call in flight when the
+#                     server terminates is observable
 #   future-only       advertise a protocol version no client speaks, and keep
 #                     running after stdin closes so a leaked process is visible
 #
@@ -53,6 +61,9 @@ TRANSCRIPT = ARGV[1]
 # How long future-only lingers after stdin closes; the client is expected to
 # terminate it long before this elapses.
 LINGER_SECONDS = 10
+# How long late-discover holds the probe's answer; longer than any discover
+# timeout the examples configure.
+LATE_DISCOVER_DELAY = 0.6
 
 $stdout.sync = true
 
@@ -87,7 +98,7 @@ end
 # @return [Hash] a DiscoverResult
 def discover_result(versions)
   { 'resultType' => 'complete', 'supportedVersions' => versions,
-    'capabilities' => { 'tools' => {} },
+    'capabilities' => { 'tools' => {} }, 'ttlMs' => 60_000, 'cacheScope' => 'public',
     '_meta' => { 'io.modelcontextprotocol/serverInfo' => { 'name' => 'era-fixture', 'version' => '1.0' } } }
 end
 
@@ -120,7 +131,7 @@ end
 # @param msg [Hash] the request
 # @return [Boolean]
 def modern_request?(msg)
-  msg['method'] == 'server/discover' || %w[modern modern-one-shot future-only].include?(MODE)
+  msg['method'] == 'server/discover' || %w[modern modern-one-shot modern-exit-on-call future-only].include?(MODE)
 end
 
 # @param msg [Hash] the request
@@ -162,31 +173,92 @@ def handle_request(msg)
     return respond_error(msg['id'], violation, -32_602)
   end
 
-  case MODE
-  when 'modern'
-    return respond(msg['id'], discover_result(['2026-07-28'])) if msg['method'] == 'server/discover'
-  when 'legacy-one-shot'
-    if msg['method'] == 'tools/list'
-      respond(msg['id'], { 'tools' => tools })
-      exit 0
-    end
-  when 'legacy-broken-init'
-    return respond_error(msg['id'], 'initialize refused', -32_602) if msg['method'] == 'initialize'
-  when 'modern-one-shot'
-    return respond(msg['id'], discover_result(['2026-07-28'])) if msg['method'] == 'server/discover'
+  handle_common(msg) unless answered_by_mode?(msg)
+end
 
-    if msg['method'] == 'tools/list'
-      respond(msg['id'], { 'tools' => tools })
-      # Terminate unexpectedly, with the pipes still open on the client side:
-      # the client is expected to notice and restart the server rather than
-      # keep writing to a dead process.
-      exit 0
-    end
-  when 'future-only'
-    return respond(msg['id'], discover_result(['2099-01-01'])) if msg['method'] == 'server/discover'
+# The answers a mode gives that differ from the common ones.
+# @param msg [Hash] the request
+# @return [Boolean] whether the mode answered the request itself
+def answered_by_mode?(msg)
+  case MODE
+  when 'modern', 'modern-one-shot', 'modern-exit-on-call', 'future-only' then answered_by_modern_mode?(msg)
+  when 'legacy-one-shot', 'legacy-broken-init', 'late-discover' then answered_by_legacy_mode?(msg)
+  else false
+  end
+end
+
+# @param msg [Hash] the request
+# @return [Boolean] whether the mode answered the request itself
+def answered_by_modern_mode?(msg)
+  if msg['method'] == 'server/discover'
+    respond(msg['id'], discover_result([MODE == 'future-only' ? '2099-01-01' : '2026-07-28']))
+    return true
   end
 
-  handle_common(msg)
+  case MODE
+  when 'modern-one-shot'
+    return false unless msg['method'] == 'tools/list'
+
+    respond(msg['id'], { 'tools' => tools })
+    # Terminate unexpectedly, with the pipes still open on the client side:
+    # the client is expected to notice and restart the server rather than
+    # keep writing to a dead process.
+    exit 0
+  when 'modern-exit-on-call'
+    # Terminate with the call unanswered: the client must fail it promptly
+    # and not replay it on the replacement process.
+    exit 0 if msg['method'] == 'tools/call'
+  end
+  false
+end
+
+# @param msg [Hash] the request
+# @return [Boolean] whether the mode answered the request itself
+def answered_by_legacy_mode?(msg)
+  case MODE
+  when 'legacy-one-shot'
+    return false unless msg['method'] == 'tools/list'
+
+    respond(msg['id'], { 'tools' => tools })
+    exit 0
+  when 'legacy-broken-init'
+    return false unless msg['method'] == 'initialize'
+
+    respond_error(msg['id'], 'initialize refused', -32_602)
+  when 'late-discover'
+    return answered_late_discover?(msg)
+  end
+  true
+end
+
+# late-discover: the probe is answered after the client gave up on it, and
+# the handshake it fell back to is pinged first.
+# @param msg [Hash] the request
+# @return [Boolean] whether the request was answered here
+def answered_late_discover?(msg)
+  case msg['method']
+  when 'server/discover'
+    sleep LATE_DISCOVER_DELAY
+    respond(msg['id'], discover_result(['2026-07-28']))
+  when 'initialize'
+    answer_initialize_after_ping(msg)
+  else
+    return false
+  end
+  true
+end
+
+# Ping before answering initialize and wait for the pong (a 2025-11-25
+# server MAY ping at startup; the receiver MUST respond promptly), then
+# answer the handshake and whatever arrived while waiting.
+# @param msg [Hash] the initialize request
+# @return [void]
+def answer_initialize_after_ping(msg)
+  buffered = []
+  exit 0 unless ping_answered?(buffered)
+
+  respond(msg['id'], initialize_result)
+  buffered.each { |queued| handle_request(queued) if queued['id'] }
 end
 
 # @param line [String] a raw stdin line

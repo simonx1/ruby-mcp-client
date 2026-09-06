@@ -287,8 +287,13 @@ module MCPClient
                              '(e.g. io.modelcontextprotocol/tasks)'
       end
 
+      settings = {} if settings.nil?
+      unless settings.is_a?(Hash)
+        raise ArgumentError, "Extension settings for #{identifier} must be an object (Hash), got #{settings.class}"
+      end
+
       @declared_extensions ||= {}
-      @declared_extensions[identifier] = settings || {}
+      @declared_extensions[identifier] = settings
     end
 
     # @return [Hash] declared extension id => settings
@@ -304,13 +309,12 @@ module MCPClient
     # @param params [Hash, nil] request params (String or Symbol keys)
     # @return [Hash, nil] params with `_meta` merged under the String key
     def with_request_meta(params)
+      params = merge_meta_spellings(params)
       defaults = host_request_meta
       return params if defaults.empty? && !modern? && !reserved_meta_supplied?(params)
 
       params = params.is_a?(Hash) ? params.dup : {}
       supplied = params.delete('_meta')
-      symbol_meta = params.delete(:_meta)
-      supplied = symbol_meta if supplied.nil?
       supplied = supplied.is_a?(Hash) ? supplied.transform_keys(&:to_s) : {}
       # The reserved protocol fields are transport-owned in per-call `_meta`
       # exactly as they are in request_meta. Merging the transport's own
@@ -326,6 +330,25 @@ module MCPClient
         meta.merge!(required_request_meta)
       end
       params['_meta'] = meta
+      params
+    end
+
+    # A caller's `_meta` supplied under the Symbol key, or under both
+    # spellings, becomes one String-keyed `_meta` (the String one winning on
+    # a clash). Two spellings would otherwise serialize as two `_meta`
+    # members — and whatever was stripped from one copy would reach the wire
+    # through the other, since only one is inspected.
+    # @param params [Hash, nil] request params
+    # @return [Hash, nil] params with at most one `_meta` member, under the String key
+    def merge_meta_spellings(params)
+      return params unless params.is_a?(Hash) && params.key?(:_meta)
+
+      params = params.dup
+      symbol_meta = params.delete(:_meta)
+      string_meta = params['_meta']
+      symbol_meta = symbol_meta.is_a?(Hash) ? symbol_meta.transform_keys(&:to_s) : {}
+      string_meta = string_meta.is_a?(Hash) ? string_meta.transform_keys(&:to_s) : {}
+      params['_meta'] = symbol_meta.merge(string_meta)
       params
     end
 
@@ -392,15 +415,56 @@ module MCPClient
               "Server supports protocol versions #{versions.join(', ')}, none of which this client speaks " \
               "(modern versions supported: #{MCPClient::MODERN_PROTOCOL_VERSIONS.join(', ')})"
       end
+      # Everything is checked before anything is recorded: a refresh that
+      # fails to validate changes nothing, not even the identity it carried.
+      capabilities = result['capabilities']
+      unless capabilities.nil? || capabilities.is_a?(Hash)
+        raise MCPClient::Errors::ConnectionError, 'server/discover result capabilities is not an object'
+      end
+
+      meta = result['_meta']
+      unless meta.nil? || meta.is_a?(Hash)
+        raise MCPClient::Errors::ConnectionError, 'server/discover result _meta is not an object'
+      end
 
       @protocol_version = version
       @supported_versions = versions
       @last_discover_result = result
-      @capabilities = result['capabilities'].is_a?(Hash) ? result['capabilities'] : {}
+      @capabilities = capabilities || {}
       @instructions = result['instructions']
-      info = result.dig('_meta', META_SERVER_INFO)
+      info = meta && meta[META_SERVER_INFO]
       @server_info = info if info.is_a?(Hash)
+      record_discovery_freshness(result)
       result
+    end
+
+    # Record a DiscoverResult's cache hints (CacheableResult: ttlMs,
+    # cacheScope). A ttlMs of zero means the result is immediately stale.
+    # @param result [Hash] the DiscoverResult
+    # @return [void]
+    def record_discovery_freshness(result)
+      ttl = result['ttlMs']
+      @discovery_expires_at = ttl.is_a?(Integer) && ttl >= 0 ? discovery_clock + (ttl / 1000.0) : nil
+      scope = result['cacheScope']
+      @discovery_cache_scope = scope.is_a?(String) ? scope : nil
+    end
+
+    # @return [Float] the monotonic clock, in seconds, discovery freshness is judged by
+    def discovery_clock
+      Process.clock_gettime(Process::CLOCK_MONOTONIC)
+    end
+
+    # Whether the last DiscoverResult is still fresh by its own ttlMs. A
+    # result that gave no hint is treated as fresh for the process lifetime.
+    # @return [Boolean]
+    def discovery_fresh?
+      deadline = defined?(@discovery_expires_at) ? @discovery_expires_at : nil
+      deadline.nil? || discovery_clock < deadline
+    end
+
+    # @return [String, nil] the cacheScope the last DiscoverResult declared
+    def discovery_cache_scope
+      defined?(@discovery_cache_scope) ? @discovery_cache_scope : nil
     end
 
     # Validate a log level name (logging utility levels).
@@ -770,6 +834,10 @@ module MCPClient
     # @return [void]
     def record_server_info(result)
       return unless result.is_a?(Hash)
+      # A DiscoverResult's identity is recorded by apply_discover_result, once
+      # the whole result has validated: a refresh that fails must change
+      # nothing, not even the identity it carried.
+      return if result.key?('supportedVersions')
 
       info = result['_meta'].is_a?(Hash) ? result['_meta'][META_SERVER_INFO] : nil
       @server_info = info if info.is_a?(Hash)

@@ -369,23 +369,31 @@ module MCPClient
       #   transport was replaced under it before it was written (it was not sent)
       # @raise [MCPClient::Errors::TransportError] on write errors
       def send_if_current(req, generation)
-        unless generation == @transport_generation
-          @logger.debug("The transport was replaced before #{req['method']} was sent; re-issuing it")
-          @mutex.synchronize { @awaiting.delete(req['id']) }
-          return nil
-        end
+        return req unless send_request(req, generation) == :replaced
 
-        send_request(req)
-        req
+        @logger.debug("The transport was replaced before #{req['method']} was sent; re-issuing it")
+        @mutex.synchronize { @awaiting.delete(req['id']) }
+        nil
       end
 
-      # Send a JSON-RPC request and return nothing
+      # Send a JSON-RPC request. With a generation, the request is written
+      # only if that is still the transport's generation, and the check and
+      # the write are one step under the transport lock: a restart replaces
+      # the handles and bumps the generation under the same lock, so a
+      # request judged current cannot be written to the replacement process
+      # — where it would be executed unregistered and its answer discarded.
       # @param req [Hash] the JSON-RPC request
-      # @return [void]
+      # @param generation [Integer, nil] the transport generation the request was registered on
+      # @return [Symbol] :sent, or :replaced when the transport was replaced and nothing was written
       # @raise [MCPClient::Errors::TransportError] on write errors
-      def send_request(req)
+      def send_request(req, generation = nil)
         @logger.debug("Sending JSONRPC request: #{describe_jsonrpc_message(req)}")
-        @stdin.puts(req.to_json)
+        @transport_lock.synchronize do
+          return :replaced if generation && generation != @transport_generation
+
+          @stdin.puts(req.to_json)
+        end
+        :sent
       rescue StandardError => e
         # A request that failed to send will never receive a response, so drop
         # its awaiting marker; otherwise a broken transport (e.g. the server
@@ -402,6 +410,10 @@ module MCPClient
         deadline = Time.now + (timeout || @read_timeout)
         @mutex.synchronize do
           until @pending.key?(id)
+            # The subprocess exited: no answer is coming, however long the
+            # timeout. (An answer that arrived before it exited is above.)
+            break if @transport_retired
+
             remaining = deadline - Time.now
             break if remaining <= 0
 
@@ -411,9 +423,14 @@ module MCPClient
           # timeout so neither @pending nor @awaiting accumulates entries.
           msg = @pending.delete(id)
           @awaiting.delete(id)
-          raise MCPClient::Errors::RequestTimeoutError, "Timeout waiting for JSONRPC response id=#{id}" unless msg
+          return msg if msg
 
-          msg
+          if @transport_retired
+            raise MCPClient::Errors::TransportError,
+                  "The MCP server subprocess exited before answering JSONRPC request id=#{id}"
+          end
+
+          raise MCPClient::Errors::RequestTimeoutError, "Timeout waiting for JSONRPC response id=#{id}"
         end
       end
 
@@ -434,6 +451,24 @@ module MCPClient
       # @raise [MCPClient::Errors::ServerError] if server returns an error
       # @raise [MCPClient::Errors::TransportError] on transport errors
       # @raise [MCPClient::Errors::ToolCallError] on tool call errors
+      # Like {ServerBase#require_capability!}, except that a modern server's
+      # capabilities come from a DiscoverResult with a freshness hint: one
+      # whose ttlMs has elapsed (a zero ttlMs is "immediately stale") is
+      # refreshed before a capability it did not declare is refused — the
+      # server may have enabled it since.
+      # @param path [Array<String, Symbol>] capability key path
+      # @param method [String] the JSON-RPC method the caller wants to send
+      # @raise [MCPClient::Errors::CapabilityError]
+      def require_capability!(*path, method:)
+        super
+      rescue MCPClient::Errors::CapabilityError
+        raise unless modern? && !discovery_fresh?
+
+        @logger.debug("The server/discover result is stale; refreshing it before refusing #{method}")
+        rpc_request('server/discover')
+        super
+      end
+
       def rpc_request(method, params = {}, timeout: nil)
         freshly_probed = !@initialized || transport_retired?
         ensure_initialized
@@ -515,6 +550,10 @@ module MCPClient
       # @return [Array(Integer, Hash)] the registered id and the request
       def send_on_current_transport(method, params)
         loop do
+          # A subprocess that exited under the handshake is restarted here
+          # (MCP 2026-07-28 stdio "Unexpected Termination": the client
+          # SHOULD restart it) rather than written to.
+          ensure_initialized if transport_retired?
           generation = @transport_generation
           req_id = next_id
           req = build_registered_request(method, params, req_id)
