@@ -26,6 +26,13 @@ require_relative 'mcp_client/server_factory'
 require_relative 'mcp_client/client/task_support'
 require_relative 'mcp_client/client/task_api'
 require_relative 'mcp_client/client'
+
+# The tasks extension's SubscriptionFilter field (extensions/tasks
+# "Subscriptions"): `taskIds`, beyond the four published core fields. Known
+# to the filter from the start so a host can spell it before declaring the
+# extension; MCPClient::Client#listen still refuses it on a client that has
+# not declared the extension.
+MCPClient::Subscription.register_filter_field('taskIds', :string_array, alias_name: 'task_ids')
 require_relative 'mcp_client/version'
 require_relative 'mcp_client/config_parser'
 require_relative 'mcp_client/auth'

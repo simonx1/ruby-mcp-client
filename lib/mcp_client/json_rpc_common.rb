@@ -874,18 +874,6 @@ module MCPClient
       extra.empty? ? CORE_RESULT_TYPES : (CORE_RESULT_TYPES + extra).uniq.freeze
     end
 
-    # The result types of the extensions this client implements, by
-    # extension identifier: what a declared extension may widen the accepted
-    # result types with. This client implements the tasks extension:
-    # declaring it makes a CreateTaskResult (resultType "task") an accepted
-    # answer on the requests it allows ("A server MUST NOT return
-    # CreateTaskResult to a client that did not include the extension
-    # capability on its request").
-    # @return [Hash{String => Array<String>}]
-    def implemented_extension_result_types
-      { TASKS_EXTENSION => ['task'] }
-    end
-
     # Which request field mirrors into the Mcp-Name header (MCP 2026-07-28
     # Streamable HTTP "Standard Request Headers"; the tasks extension adds
     # taskId routing for its methods).
