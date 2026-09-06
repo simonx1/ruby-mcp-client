@@ -1465,6 +1465,7 @@ module MCPClient
         end
       end
     end
+
     # Generate a cache key for server-specific items
     # @param server [MCPClient::ServerBase] the server
     # @param item_id [String] the item identifier (name or URI)
