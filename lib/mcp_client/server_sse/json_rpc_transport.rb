@@ -97,7 +97,15 @@ module MCPClient
         request_id = @mutex.synchronize { @request_id += 1 }
         json_rpc_request = build_jsonrpc_request('initialize', initialization_params, request_id)
         @logger.debug("Performing initialize RPC: #{json_rpc_request}")
-        result = send_jsonrpc_request(json_rpc_request)
+        begin
+          result = send_jsonrpc_request(json_rpc_request)
+        rescue MCPClient::Errors::UnsupportedProtocolVersionError => e
+          # As on the HTTP transports: the versions a modern-only server
+          # names in `data` are the diagnostic a legacy configuration needs,
+          # so they are spelled out rather than dropped by connect's wrap.
+          raise MCPClient::Errors::ConnectionError,
+                "Initialize failed: #{e.message} (server supports: #{e.supported.join(', ')})"
+        end
         unless result.is_a?(Hash)
           # A non-object initialize result means the handshake did not succeed.
           # Continuing would enter the Operation phase without ever sending the

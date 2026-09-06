@@ -257,7 +257,10 @@ RSpec.describe 'modern protocol error recognition matches the schema wire shape'
     end
   end
 
-  describe 'the legacy fallback a malformed error must not suppress' do
+  # The predicate alone: the transport that consults it to decide between a
+  # modern verdict and the legacy handshake is the Streamable HTTP branch's,
+  # and its examples drive the wire sequence.
+  describe 'the modern-server signal a malformed error must not raise' do
     it 'leaves a malformed -32022 out of the modern-server signal' do
       malformed = unsupported({ 'supported' => [42] })
       well_formed = unsupported({ 'supported' => ['2026-07-28'], 'requested' => 'x' })

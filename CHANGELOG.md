@@ -55,7 +55,12 @@ metadata). Each feature lands in its own PR; this section accumulates them.
   body is read before the 2025-11-25 session rule: a 404 answering a request
   that carried an `Mcp-Session-Id` starts a fresh session only when it is NOT
   a well-formed -32601 — that one is the answer to the request itself (an
-  unknown method), and restarting on it would re-send the same method. It is
+  unknown method), and restarting on it would re-send the same method. The
+  404 body is read the way every other HTTP error body is: a JSON-RPC 2.0
+  envelope, size-bounded, gunzipped when the response says so — an "error"
+  member outside an envelope, an oversized or undecodable body is no answer
+  and leaves the 404 a session expiry, and a compressed well-formed -32601
+  is the typed error without a restart. It is
   deliberately separate from `#modern_protocol_error?`, because on stdio a
   bare -32601 is exactly what a legacy peer answers a modern probe with and
   must keep the `initialize` fallback alive. When a modern-only server

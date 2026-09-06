@@ -237,9 +237,14 @@ RSpec.describe 'concurrent SSE waiters settle independently' do
     expect(ids.keys).to contain_exactly('one', 'two')
 
     deliver(ids['one'], { 'resultType' => 'bogus' })
-    deliver(ids['two'], { 'resultType' => 'complete', 'ok' => true })
 
+    # The invalid caller finishes on its own answer while its sibling is
+    # still waiting: nothing about the bad result touches the other slot.
     expect(invalid.value).to be_a(MCPClient::Errors::InvalidResultError)
+    expect(valid).to be_alive
+    expect(valid.join(0.2)).to be_nil
+
+    deliver(ids['two'], { 'resultType' => 'complete', 'ok' => true })
     expect(valid.value).to eq({ 'resultType' => 'complete', 'ok' => true })
     expect(server.instance_variable_get(:@sse_results)).to be_empty
     expect(server.instance_variable_get(:@pending_request_ids)).to be_empty

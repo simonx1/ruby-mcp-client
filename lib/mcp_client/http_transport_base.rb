@@ -336,18 +336,22 @@ module MCPClient
     # Whether a 404 body is a well-formed JSON-RPC -32601 — MCP 2026-07-28's
     # "unknown method" answer to the request itself — rather than a
     # 2025-11-25 session expiry, which answers nothing.
+    #
+    # Read the way every other HTTP error body is (jsonrpc_error_in_body): a
+    # JSON-RPC 2.0 envelope, size-bounded, gunzipped when the response says
+    # so. Anything else — an "error" member outside an envelope, an oversized
+    # or undecodable body — is not an answer to this request and leaves the
+    # 404 meaning what 2025-11-25 says it means.
     # @param response [#body, nil] the 404 response, if its body is readable
     # @return [Boolean]
     def method_not_found_answer?(response)
-      body = response.respond_to?(:body) ? response.body : nil
-      data = body.is_a?(Hash) ? body : JSON.parse(body.to_s)
-      error = data.is_a?(Hash) ? (data['error'] || data[:error]) : nil
+      return false unless response
+
+      error = jsonrpc_error_in_body(response)
       return false unless error.is_a?(Hash)
 
       (error['code'] || error[:code]) == MCPClient::Errors::Codes::METHOD_NOT_FOUND &&
         (error['message'] || error[:message]).is_a?(String)
-    rescue JSON::ParserError, TypeError
-      false
     end
 
     # Whether a 404 should trigger a session restart: only when the 404'd
