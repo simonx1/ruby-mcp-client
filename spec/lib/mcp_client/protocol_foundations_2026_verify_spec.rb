@@ -1760,9 +1760,7 @@ RSpec.describe 'an unfinished result survives the HTTP transports off the wire' 
     # inputRequests is a MAP of server-assigned key => request object, not a
     # list: the resolver keys its inputResponses by the same names.
     { 'resultType' => 'input_required', 'requestState' => 'continue-later',
-      'inputRequests' => { 'city' => { 'method' => 'elicitation/create',
-                                       'params' => { 'mode' => 'form', 'message' => 'which city?',
-                                                     'requestedSchema' => { 'type' => 'object' } } } } }
+      'inputRequests' => { 'city' => city_request } }
   end
 
   # Anything the operation under test needs on the way (a modern call_tool
@@ -1931,11 +1929,15 @@ RSpec.describe 'ServerSSE resource errors and unfinished reads off the stream' d
 
   it 'surfaces an unfinished read with the continuation on the error data' do
     server.instance_variable_set(:@protocol_version, '2026-07-28')
-    unfinished = { 'resultType' => 'input_required', 'requestState' => 'continue-later' }
+    unfinished = { 'resultType' => 'input_required', 'requestState' => 'continue-later',
+                   'inputRequests' => { 'city' => { 'method' => 'elicitation/create',
+                                                    'params' => { 'mode' => 'form', 'message' => 'which city?' } } } }
     answer_with('result' => unfinished)
 
+    # The transport drives the round trip; with no handler for the request
+    # it raises the typed error carrying the whole continuation.
     expect { server.read_resource('file:///x') }
-      .to raise_error(MCPClient::Errors::InputRequiredError, /input_required/) do |e|
+      .to raise_error(MCPClient::Errors::InputRequiredError, /no handler is registered/) do |e|
         expect(e.data).to eq(unfinished)
       end
   end
