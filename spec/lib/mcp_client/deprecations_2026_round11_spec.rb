@@ -273,12 +273,17 @@ RSpec.describe 'MCP 2026-07-28 deprecations (round 11)' do
       expect(output.string).to include('Logging is deprecated')
     end
 
+    # A `_meta` written under the Symbol key is folded into the one
+    # String-keyed member in every era (the stateless stdio branch: mixed
+    # spellings must not slip past the reserved-field protection), so the
+    # notice reads the merged member and the request carries exactly one.
     it 'warns when a legacy _meta is itself keyed by symbol' do
       legacy = transport_class.new(logger, '2025-06-18')
 
       params = legacy.with_request_meta({ _meta: { 'io.modelcontextprotocol/logLevel': 'warning' } })
 
-      expect(params[:_meta]).to eq({ 'io.modelcontextprotocol/logLevel': 'warning' })
+      expect(params['_meta']).to eq({ 'io.modelcontextprotocol/logLevel' => 'warning' })
+      expect(params).not_to have_key(:_meta)
       expect(output.string).to include('Logging is deprecated')
     end
 
