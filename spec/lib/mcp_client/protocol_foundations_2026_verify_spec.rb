@@ -1779,11 +1779,17 @@ RSpec.describe 'an unfinished result survives the HTTP transports off the wire' 
         end
     end
 
+    # A client that drives multi round-trip requests surfaces a continuation
+    # it cannot fulfil as the typed error; the requests-only shape is kept whole.
     it 'keeps a continuation that carries inputRequests without requestState' do
       stateless = unfinished.except('requestState')
       respond_with('result' => stateless)
 
-      expect(server.call_tool('t', {})).to eq(stateless)
+      expect { server.call_tool('t', {}) }.to raise_error(MCPClient::Errors::InputRequiredError) do |e|
+        expect(e.data).to eq(stateless)
+        expect(e.input_requests).to eq({ 'city' => city_request })
+        expect(e.request_state).to be_nil
+      end
     end
 
     it 'rejects it on a session that negotiated a handshake revision' do
