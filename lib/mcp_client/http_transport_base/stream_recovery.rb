@@ -65,9 +65,25 @@ module MCPClient
             # while the response is still open (a server that waits for its
             # ping to be answered before sending the result would otherwise
             # deadlock against a client that answers only at EOF).
-            scanner.feed(chunk.to_s) { |event| listener.call(event) }
+            scanner.feed(chunk.to_s) { |event| deliver_live_event(state, listener, event) }
             state[:mcp_live_events] = scanner.count
           end
+        end
+
+        # Hand one event to the stream listener. A failure there is the
+        # exchange's failure, but raising it here would abort the read — and
+        # on MCP 2026-07-28 a client closing the response stream is the
+        # cancellation signal — so the first failure is held for the
+        # transport to raise once the body has been read
+        # (StreamCapture#stream_listener_error).
+        # @param state [Hash] the exchange's capture state
+        # @param listener [Proc] the stream listener
+        # @param event [String] one complete SSE event
+        # @return [void]
+        def deliver_live_event(state, listener, event)
+          listener.call(event)
+        rescue StandardError => e
+          state[:mcp_stream_error] ||= e
         end
 
         # @param env [Faraday::Env] the completed request environment

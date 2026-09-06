@@ -438,6 +438,8 @@ RSpec.describe 'MCP 2026-07-28 Streamable HTTP modern mode — verification' do
           body = JSON.parse(request.body)
           mutex.synchronize { requests << body }
           next json_response(body['id'], discover_result) if body['method'] == 'server/discover'
+          # A modern call reads tools/list first (to derive its headers).
+          next json_response(body['id'], { 'tools' => [] }) if body['method'] == 'tools/list'
 
           name = body.dig('params', 'name')
           first = mutex.synchronize do
@@ -1497,7 +1499,13 @@ RSpec.describe 'MCP 2026-07-28 Streamable HTTP — a response stream that really
         # socket go idle, so only an overall deadline can end the call.
         it 'bounds an ordinary request with its own timeout while the server keeps the stream alive' do
           start_server do |message|
-            message['method'] == 'server/discover' ? jsonrpc(message, discovery) : MidStreamCloseServer::DRIP_FOREVER
+            case message['method']
+            when 'server/discover' then jsonrpc(message, discovery)
+            # The tools/list a modern call reads first is answered at once:
+            # it is the call itself that must be bounded.
+            when 'tools/list' then jsonrpc(message, { 'tools' => [] })
+            else MidStreamCloseServer::DRIP_FOREVER
+            end
           end
           server = transport(klass, read_timeout: 30)
           server.connect
@@ -1699,8 +1707,10 @@ RSpec.describe 'MCP 2026-07-28 Streamable HTTP — a response stream that really
     it 'delivers a request-scoped notification before the modern response stream ends' do
       seen = Queue.new
       start_server do |message|
-        if message['method'] == 'server/discover'
-          jsonrpc(message, discovery)
+        case message['method']
+        when 'server/discover' then jsonrpc(message, discovery)
+        # The tools/list a modern call reads first carries no notification.
+        when 'tools/list' then jsonrpc(message, { 'tools' => [] })
         else
           waiter = -> { settled_within?(3) { !seen.empty? } }
           [MidStreamCloseServer::EVENT_THEN_WAIT,

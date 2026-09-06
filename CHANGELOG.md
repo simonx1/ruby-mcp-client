@@ -52,7 +52,10 @@ metadata). Each feature lands in its own PR; this section accumulates them.
   escaped host code the transport called back into while parsing a response —
   a notification listener's own rejected `tools/call` is that request's
   failure, and the request whose response reached the listener has already
-  been executed. The same holds for the `tools/list` a call reads first to
+  been executed (on plain HTTP, where the response stream is read as it
+  arrives, that failure is held until the body is in — closing the stream
+  would be the cancellation signal — and raised then, in place of the
+  response). The same holds for the `tools/list` a call reads first to
   derive its headers: that list has a re-issue of its own, and its failure
   surfaces as its own instead of spending the call's re-issue or refresh on
   a request that never went out. Transport tool, prompt and resource caches
