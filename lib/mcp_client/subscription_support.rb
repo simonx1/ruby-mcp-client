@@ -162,7 +162,12 @@ module MCPClient
 
     # The subscriptions this transport has opened, keyed by the String form
     # of their listen request id.
-    # @return [Hash{String => MCPClient::Subscription}]
+    # Keyed by the JSON-RPC id the listen went out with, exactly as it was
+    # sent. A JSON-RPC id of another type is another request's id — the
+    # cancellation path has always compared them exactly, and the
+    # acknowledgment and delivery paths do too — so a peer that tags a
+    # message with "9" does not reach the subscription listening on 9.
+    # @return [Hash{Integer, String => MCPClient::Subscription}]
     def subscriptions
       @subscriptions ||= {}
     end
@@ -177,19 +182,19 @@ module MCPClient
     def subscription_by_id(id)
       return nil if id.nil?
 
-      subscriptions_mutex.synchronize { subscriptions[id.to_s] }
+      subscriptions_mutex.synchronize { subscriptions[id] }
     end
 
     # @param subscription [MCPClient::Subscription]
     # @return [void]
     def register_subscription(subscription)
-      subscriptions_mutex.synchronize { subscriptions[subscription.id.to_s] = subscription }
+      subscriptions_mutex.synchronize { subscriptions[subscription.id] = subscription }
     end
 
     # @param subscription [MCPClient::Subscription]
     # @return [void]
     def unregister_subscription(subscription)
-      subscriptions_mutex.synchronize { subscriptions.delete(subscription.id.to_s) }
+      subscriptions_mutex.synchronize { subscriptions.delete(subscription.id) }
     end
 
     # Drop the registration a particular listen id made, and only that one: a
@@ -201,7 +206,7 @@ module MCPClient
     # @return [void]
     def unregister_subscription_id(subscription, id)
       subscriptions_mutex.synchronize do
-        subscriptions.delete(id.to_s) if subscriptions[id.to_s].equal?(subscription)
+        subscriptions.delete(id) if subscriptions[id].equal?(subscription)
       end
     end
 

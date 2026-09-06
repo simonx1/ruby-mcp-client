@@ -210,19 +210,28 @@ RSpec.describe 'MCP 2026-07-28 subscriptions/listen, verification pass 2' do
 
     after { server.cleanup }
 
-    # The handle and its error only. That the expiry also *closes the response
-    # stream* — the cancellation signal on this transport, which no
-    # `notifications/cancelled` stands in for — needs a peer holding one open
-    # to be visible, and is pinned in verify3.
-    it 'ends the handle on the deadline' do
+    # A stream that ends the moment it opens is a drop, not a silent server:
+    # the request it carried is over and the transport is waiting to send the
+    # next one. Round 14 (grok): the deadline bounds the listen that is in
+    # flight, so it does not fire during that wait — expiring there closed the
+    # handle `by_client`, which is also unreconnectable, and a server
+    # answering 503 for longer than the backoff unsubscribed the host without
+    # ever having refused anything.
+    #
+    # The deadline doing its job on a request that really is outstanding — and
+    # closing the response stream, the cancellation signal on this transport —
+    # needs a peer holding one open to be visible, and is pinned in verify3.
+    it 'does not end the handle while it is waiting to re-open the stream' do
       stub_request(:post, 'https://example.com/mcp')
         .to_return(status: 200, headers: { 'Content-Type' => 'text/event-stream' }, body: ": keep-alive\n\n")
       stub_const('MCPClient::HttpTransportBase::ListenStream::LISTEN_RECONNECT_DELAY', 5)
 
       subscription = server.listen(notifications: { tools_list_changed: true }, ack_timeout: 0.1)
 
-      expect(subscription.wait_until_settled(5)).to eq(:closed)
-      expect(subscription.error).to be_a(MCPClient::Errors::RequestTimeoutError)
+      expect(subscription.wait_until_settled(0.5)).to be_nil
+      expect(subscription).not_to be_closed
+      expect(subscription).to be_reconnectable
+      expect(subscription.error).to be_nil
     end
   end
 

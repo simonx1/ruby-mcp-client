@@ -620,6 +620,14 @@ module MCPClient
     def expire_unanswered(id, error)
       @mutex.synchronize do
         return nil if @id != id || @answered || SETTLED_STATES.include?(@state)
+        # A deadline bounds the request that is out, not the subscription: a
+        # transport waiting to send the next listen (an HTTP reconnect inside
+        # its backoff, a stdio restart still spawning) has nothing in flight
+        # for this deadline to expire, and ending the handle here would also
+        # mark it closed by the client — unreconnectable, so the re-send that
+        # basic/patterns/subscriptions requires after a reconnect never
+        # happens. The next attempt arms a deadline of its own with its id.
+        return nil if @state == :reconnecting
 
         close_locked(by_client: true, error: error, announce: false)
       end

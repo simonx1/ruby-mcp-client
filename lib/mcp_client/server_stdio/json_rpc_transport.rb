@@ -498,9 +498,35 @@ module MCPClient
 
         @logger.info("Re-establishing the server process for #{pending.size} open subscription(s)")
         ensure_initialized
+        hand_over_to_established_process
       rescue StandardError => e
         @logger.warn("Could not re-establish the server process: #{e.message}")
         fail_reconnecting_subscriptions(e)
+      end
+
+      # Hand the queue to a process that is already established.
+      #
+      # {#ensure_initialized} re-sends the queue itself, but only when it
+      # negotiated the process: a host request that observed the exit while
+      # this teardown was still parking its subscriptions established the
+      # replacement, found the queue empty and returned, and the restart
+      # above then took the initialized fast path — leaving the subscriptions
+      # parked on a queue nothing was going to read. Whichever of the two
+      # finishes last drains what it finds here, so the re-send MCP
+      # 2026-07-28 basic/patterns/subscriptions requires after a stdio
+      # reconnect happens however the two threads interleave.
+      #
+      # Under the initialization lock, like every other hand-over: the
+      # process must not be replaced underneath the writes, and a queue taken
+      # while a negotiation is in flight would be re-sent to the process that
+      # negotiation is replacing.
+      # @return [void]
+      def hand_over_to_established_process
+        @init_lock.synchronize do
+          next unless @initialized
+
+          reopen_subscriptions
+        end
       end
 
       # End the subscriptions waiting for a process that is not coming back.

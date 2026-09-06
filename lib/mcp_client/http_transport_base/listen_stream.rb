@@ -611,6 +611,7 @@ module MCPClient
 
       def consume_listen_events(buffer, subscription, state = { scanned: 0 })
         finished = nil
+        strip_listen_bom(buffer, state)
         discard_comment_lines(buffer, state)
         while (separator = match_event_terminator(buffer, [state[:scanned].to_i - 3, 0].max))
           # A complete event over the cap is refused before it is parsed: it
@@ -631,6 +632,33 @@ module MCPClient
         # like the offset String#match takes.
         state[:scanned] = buffer.length
         finished
+      end
+
+      # Drop one byte order mark from the head of the stream.
+      #
+      # The UTF-8 decode step of the SSE processing model drops it, and the
+      # field it precedes must still be recognized: without this the first
+      # event's `data:` lines are not data lines at all, so an acknowledgment
+      # opening the stream was discarded and its subscription cancelled by
+      # the watchdog. Only the head of the stream is examined, and only until
+      # the question is settled — a mark arriving split across chunks is
+      # neither stripped as a partial nor mistaken for data, and the bytes
+      # are never sought again once real content has started.
+      # @param buffer [String] mutable stream buffer
+      # @param state [Hash] the stream's parsing state
+      # @return [void]
+      def strip_listen_bom(buffer, state)
+        return if state[:bom_settled] || buffer.empty?
+
+        bom = buffer.encoding == Encoding::BINARY ? SseEventScanner::BOM : "\uFEFF".encode(buffer.encoding)
+        if buffer.start_with?(bom)
+          buffer.slice!(0, bom.length)
+        elsif bom.start_with?(buffer)
+          return # the mark itself is still arriving
+        end
+        state[:bom_settled] = true
+      rescue EncodingError
+        state[:bom_settled] = true
       end
 
       # Drop the complete comment lines the buffer holds, wherever they sit.
@@ -665,7 +693,7 @@ module MCPClient
         elsif message.key?('id')
           # A listen stream is scoped to its own request: a response for any
           # other id on it is not this subscription's business.
-          unless message['id'].to_s == subscription.id.to_s
+          unless message['id'] == subscription.id
             @logger.warn("Ignoring a response for request #{sanitize_log_text(message['id'].to_s)} " \
                          "on the stream of subscription #{subscription.id}")
             return nil

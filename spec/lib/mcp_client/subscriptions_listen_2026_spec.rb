@@ -351,6 +351,16 @@ RSpec.describe 'MCP 2026-07-28 subscriptions/listen' do
         .to raise_error(MCPClient::Errors::CapabilityError, /2026-07-28/)
       server.subscribe_resource('file:///a')
       expect(sent.last['method']).to eq('resources/subscribe')
+      expect(sent.last['params']).to eq({ 'uri' => 'file:///a' })
+      # codex round 14: the unsubscribe half was pinned nowhere — the only
+      # example that reached it stubbed the send and asserted the return
+      # value, so sending `resources/subscribe` for an unsubscribe would have
+      # passed. Both halves of the 2025-11-25 pair are on the wire here.
+      server.unsubscribe_resource('file:///a')
+      expect(sent.last['method']).to eq('resources/unsubscribe')
+      expect(sent.last['params']).to eq({ 'uri' => 'file:///a' })
+      expect(sent.map { |m| m['method'] }).to eq(%w[resources/subscribe resources/unsubscribe])
+      expect(sent.last['jsonrpc']).to eq('2.0')
     end
   end
 

@@ -374,6 +374,39 @@ metadata). Each feature lands in its own PR; this section accumulates them.
   Opening and closing the stream for one URI is serialized, so concurrent
   subscribers share a single stream that `unsubscribe_resource` really
   closes.
+- **A subscription reaches the process that replaced the one it was open
+  on, whichever thread gets there first.** The reader of a process that
+  exited parks its open subscriptions for the replacement; a host request
+  that observed the exit establishes that replacement and re-sends whatever
+  is parked. Those two ran in either order, and in one of them the host got
+  there first, found nothing parked yet and returned, while the reader's own
+  restart then took the already-initialized fast path and sent nothing — the
+  replacement never received the listen and the subscription stayed
+  reconnecting for good. Whichever of the two finishes last now hands the
+  queue it finds to the live process, so the re-send after a stdio reconnect
+  happens however they interleave.
+- **The acknowledgment deadline bounds the listen that is in flight, not the
+  subscription.** A transport waiting to send the next listen — an HTTP
+  reconnect inside its backoff, a stdio restart still spawning — has nothing
+  outstanding for the deadline to expire, and ending the handle there also
+  marked it closed by the client, which is unreconnectable. With the default
+  acknowledgment timeout and the maximum backoff both being the read timeout,
+  a run of 503 answers unsubscribed the host from a server that had never
+  refused anything, and a spawn slower than the remaining deadline skipped
+  the re-send a reconnect requires. Each attempt is bounded by a deadline of
+  its own, armed with its own listen id.
+- **A stream that opens with a byte order mark is read.** The SSE decoding
+  step drops one leading mark; the listen parser did not, so every `data:`
+  line of the first event went unrecognized — an acknowledgment opening the
+  stream was discarded and its subscription cancelled by the watchdog. The
+  mark is stripped once, at the head of the stream, whether it arrives whole
+  or split across chunks.
+- **A JSON-RPC id of another type is another request's id.** The
+  subscription registry was keyed by the id stringified, so a peer tagging an
+  acknowledgment, a notification or a closing response with `"9"` reached the
+  subscription whose listen went out with `9`. The acknowledgment and
+  delivery paths now compare ids exactly, as the cancellation path already
+  did.
 
 ### Multi round-trip requests (InputRequiredResult)
 
