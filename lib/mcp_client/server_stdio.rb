@@ -981,6 +981,16 @@ module MCPClient
                                         stderr_thread: @stderr_thread, session: @session)
         @stdin.close unless @stdin.closed?
         @stdin = @stdout = @stderr = @wait_thread = @reader_thread = @stderr_thread = nil
+        # The ids still outstanding went out on the process just claimed and
+        # will never be answered. They are recorded as dropped here, at the
+        # claim, so their waiters fail on that record — promptly, woken here —
+        # even when a replacement is established before this teardown
+        # finishes and {#forget_torn_down_transport} therefore leaves the
+        # replacement's bookkeeping alone.
+        @mutex.synchronize do
+          dropped_requests.merge(@awaiting.keys)
+          @cond.broadcast
+        end
         claimed
       end
     end
