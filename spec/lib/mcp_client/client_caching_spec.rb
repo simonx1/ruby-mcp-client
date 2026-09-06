@@ -72,9 +72,12 @@ RSpec.describe MCPClient::Client, 'caching' do
 
       # Both tools should be in the cache with different keys
       expect(client.tool_cache.size).to eq(3)
-      # The cache keeps its own copies (MCP 2026-07-28 caching).
+      # The cache keeps its own copies (MCP 2026-07-28 caching): the same
+      # attributes, not the same objects.
       expect(client.tool_cache['123456:duplicate_tool'])
         .to have_attributes(name: tool1_from_server1.name, description: tool1_from_server1.description)
+      expect(client.tool_cache['123456:duplicate_tool']).not_to equal(tool1_from_server1)
+      expect(client.tool_cache['789012:duplicate_tool']).not_to equal(tool2_from_server2)
       expect(client.tool_cache['789012:duplicate_tool'])
         .to have_attributes(name: tool2_from_server2.name, description: tool2_from_server2.description)
       expect(client.tool_cache['123456:unique_tool'])

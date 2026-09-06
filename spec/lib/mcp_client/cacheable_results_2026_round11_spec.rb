@@ -44,7 +44,12 @@ RSpec.describe 'MCP 2026-07-28 cacheable results — round 11' do
       end
     end
 
-    it 'sees the endpoint and body a real request carries' do
+    # The middleware below has a request phase of its own, which the probe
+    # never runs: the context is unknown, and a private entry is never
+    # matched to an unknown context. What this pins is that rotation under
+    # such middleware is never served the previous principal's list -- not
+    # that the probe saw the endpoint (nothing it can run looks at one).
+    it 'never serves a private list across a rotation made by middleware the probe cannot run' do
       stub_private_tools
       holder = { value: 'alice' }
       # Path-aware middleware: only requests to the endpoint get the token.

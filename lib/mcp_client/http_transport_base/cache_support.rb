@@ -166,19 +166,43 @@ module MCPClient
         stale
       end
 
-      # A request that failed before returning a response: Faraday errors
-      # raised by its middleware keep the request headers, which name the
-      # Authorization actually sent; otherwise the context stays unknown.
+      # A request that failed: the context it is judged by is the one its
+      # request went out with.
+      #
+      # With the recorder on the connection that is what it filed against
+      # this exchange, before the adapter sent the request -- and it stands
+      # again here over anything a request the host's response phase nested
+      # inside this one left on the thread. The error's own copy of the
+      # request headers is not read: a host `on_complete` that redacts
+      # Authorization runs before `raise_error` builds its exception, and an
+      # authenticated failure would read as anonymous -- serving the
+      # anonymous context's private stale copy to whoever holds the
+      # credentials now (MCP 2026-07-28 caching: private results "MUST NOT
+      # be shared across authorization contexts").
+      #
+      # Without the recorder, Faraday errors raised by the middleware keep
+      # the request headers, which name what was sent as far as anything
+      # can tell; otherwise the context stays unknown.
       # @param error [Exception]
       # @return [void]
       def note_failed_request_authorization(error)
         return unless @faraday_config
+        return restore_own_exchange_authorization if @authorization_recorder_installed
 
         response = error.respond_to?(:response) ? error.response : nil
         headers = response.is_a?(Hash) ? response.dig(:request, :headers) : nil
         return unless headers.respond_to?(:[])
 
         note_request_authorization(authorization_header_value(headers))
+      end
+
+      # Put back what this exchange's own request was recorded with, straight
+      # into the slot: written through {#file_request_authorization} it would
+      # become the enclosing exchange's record too.
+      # @return [void]
+      def restore_own_exchange_authorization
+        record = Thread.current[exchange_records_key]&.last&.first
+        Thread.current[request_authorization_key] = record unless record.nil?
       end
 
       # @param kind [Symbol, String, nil] the cache kind whose next request is modelled
@@ -541,10 +565,11 @@ module MCPClient
       # @return [Object] the parsed result
       def perform_jsonrpc_exchange(request, timeout: nil, deadline: nil, extra_headers: {})
         clear_response_received_at if respond_to?(:clear_response_received_at, true)
+        sent_at = monotonic_now if respond_to?(:monotonic_now, true)
         response = send_http_request(request, timeout: timeout, deadline: deadline, extra_headers: extra_headers)
         # When the innermost middleware had the response, not when the host's
         # response phase was finished with it.
-        received_at = response_receipt_time(response)
+        received_at = response_receipt_time(response, sent_at)
         # The credentials this exchange's own request went out with, as the
         # recorder filed them against it: a request the response phase nested
         # inside this one left its own on this thread.
@@ -577,14 +602,22 @@ module MCPClient
       # The moment the response was received: what the {AuthorizationRecorder}
       # stamped on the way back in, before a host `on_complete` — which may
       # log, convert, retry or send a request of its own — had the response.
-      # A connection carrying no recorder falls back to now.
+      #
+      # A connection carrying no recorder (a host that locked its own stack)
+      # has nothing stamped, and by the time the transport has the response
+      # the host's response phase has run for as long as it took: the TTL
+      # then runs from the moment the request was sent, the latest moment
+      # known not to be after receipt, so that a result is never held fresh
+      # past "t_received + ttlMs" (MCP 2026-07-28 caching, "Freshness
+      # Calculation").
       # @param response [Faraday::Response, nil]
+      # @param sent_at [Float, nil] when the request was sent
       # @return [Float, nil]
-      def response_receipt_time(response)
+      def response_receipt_time(response, sent_at = nil)
         stamped = response_env(response)&.[](RESPONSE_RECEIVED_AT_KEY)
         return stamped if stamped.is_a?(Numeric)
 
-        monotonic_now if respond_to?(:monotonic_now, true)
+        sent_at || (monotonic_now if respond_to?(:monotonic_now, true))
       end
 
       # Put back what this exchange's own request was recorded with, over

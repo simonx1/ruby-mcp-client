@@ -54,8 +54,43 @@ RSpec.describe 'MCP 2026-07-28 cacheable results — round 12' do
     end
   end
 
+  # A minimal OAuth provider writing whatever bearer it currently holds: the
+  # probe asks it, so the context is knowable and a same-context hit is real.
+  def provider_holding(token)
+    Class.new do
+      def initialize(token)
+        @token = token
+      end
+
+      def apply_authorization(request)
+        request.headers['Authorization'] = "Bearer #{@token.value}" if @token.value
+      end
+    end.new(token)
+  end
+
   describe 'the freshness probe' do
-    it 'models the operation whose cache is checked, not the last request sent' do
+    # Nothing the probe may run chooses a credential by method, so the
+    # request it models is pinned directly: it is the operation whose cache
+    # is being checked, not whatever was sent last.
+    it 'models the very operation whose cache is checked' do
+      server = streamable
+      server.instance_variable_set(:@probe_method, 'resources/read')
+
+      expect(server.send(:probe_request_for, :tools)).to eq(['tools/list', {}])
+      expect(server.send(:probe_request_for, :prompts)).to eq(['prompts/list', {}])
+      expect(server.send(:probe_request_for, :resources)).to eq(['resources/list', {}])
+      expect(server.send(:probe_request_for, :templates)).to eq(['resources/templates/list', {}])
+      expect(server.send(:probe_request_for, :discover)).to eq(['server/discover', {}])
+      expect(server.send(:probe_request_for, 'read:file:///a')).to eq(['resources/read', { 'uri' => 'file:///a' }])
+      expect(server.send(:probe_request_for, nil)).to eq(['resources/read', {}])
+    ensure
+      server&.cleanup
+    end
+
+    # Middleware with a request phase of its own is never run by the probe:
+    # the context is unknown, so a private list is fetched again -- whatever
+    # principal the middleware would pick, and whatever was sent last.
+    it 'refetches a private list under middleware that picks the principal by method' do
       tools_requests = []
       stub_request(:post, url).to_return do |request|
         body = JSON.parse(request.body)
@@ -100,8 +135,10 @@ RSpec.describe 'MCP 2026-07-28 cacheable results — round 12' do
         else json_response(body['id'], discover_result)
         end
       end
-      holder = { other: 'alice' }
-      server = streamable(faraday_config: ->(f) { f.use method_aware_middleware, holder })
+      token = Struct.new(:value).new('alice')
+      # No host middleware: the probe can tell the context, so a hit is
+      # possible and the rotation below proves something.
+      server = streamable(oauth_provider: provider_holding(token))
       nested = 0
       server.on_notification do |method, _params|
         next unless method == 'notifications/progress' && nested.zero?
@@ -109,14 +146,22 @@ RSpec.describe 'MCP 2026-07-28 cacheable results — round 12' do
         # The callback switches principal and sends a request of its own on
         # this very thread while the outer tools/list is still being handled.
         nested += 1
-        holder[:other] = 'bob'
+        token.value = 'bob'
         server.ping
       end
 
       expect(server.list_tools.map(&:name)).to eq(['alice-tool'])
       expect(nested).to eq(1)
 
-      # Bob must not be served Alice's private list.
+      # The list is Alice's, not the nested ping's: back under her
+      # credentials it answers without a request. Without this hit the
+      # re-fetch below would prove nothing about the binding.
+      token.value = 'alice'
+      expect(server.list_tools.map(&:name)).to eq(['alice-tool'])
+      expect(tools_requests).to eq(%w[alice])
+
+      # Bob holds the credentials now, and must not be served it.
+      token.value = 'bob'
       expect(server.list_tools.map(&:name)).to eq(['bob-tool'])
       expect(tools_requests).to eq(%w[alice bob])
     ensure

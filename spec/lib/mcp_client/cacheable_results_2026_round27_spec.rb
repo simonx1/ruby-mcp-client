@@ -159,7 +159,7 @@ RSpec.describe 'MCP 2026-07-28 cacheable results — round 27' do
       end
     end
 
-    it 'models the request with the metadata held for it, spending no extra evaluation' do
+    it 'spends no evaluation of the host request_meta on a probe that sends nothing' do
       sent = []
       stub_request(:post, url).to_return do |request|
         body = JSON.parse(request.body)
