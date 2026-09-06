@@ -153,6 +153,10 @@ RSpec.describe 'MCP 2026-07-28 stateless protocol (stdio) — round 5' do
       writing, restarted = paused_at_the_write(server)
       caller = Thread.new { server.send(:send_request_and_wait, 'tools/call', { 'name' => 'echo' }, 1) }
       writing.pop
+      # The id the abandoned request was registered under, read while it is
+      # still the only one outstanding: what must never reach the
+      # replacement is THIS id, not merely some other id.
+      original = server.instance_variable_get(:@awaiting).keys.first
       server.cleanup
       server.instance_variable_set(:@stdin, replacement)
       server.instance_variable_set(:@initialized, true)
@@ -163,8 +167,14 @@ RSpec.describe 'MCP 2026-07-28 stateless protocol (stdio) — round 5' do
 
       wait_for('the request to reach the replacement transport') { !replacement.string.empty? }
       request = JSON.parse(replacement.string.lines.first)
+      expect(original).not_to be_nil
+      expect(request['id']).not_to eq(original)
       expect(request['id']).not_to eq(taken)
-      expect(server.instance_variable_get(:@awaiting).keys).to include(taken, request['id'])
+      # The abandoned registration is gone from both books: nothing was
+      # written under it, so no waiter will ever consume it (round 7).
+      expect(server.instance_variable_get(:@awaiting)).not_to have_key(original)
+      expect(server.send(:dropped_requests)).not_to include(original)
+      expect(server.instance_variable_get(:@awaiting).keys).to include(request['id'])
       server.handle_line(JSON.generate('jsonrpc' => '2.0', 'id' => request['id'], 'result' => {}))
       expect(caller.value).to eq({})
     end

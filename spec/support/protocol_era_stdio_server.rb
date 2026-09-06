@@ -28,6 +28,9 @@
 #                     startup, before the first client message is read, so the
 #                     ordering between the client's reader starting and its
 #                     probe proposing a version is exercised
+#   modern-mute-list  answer server/discover, then never answer tools/list, so
+#                     a post-handshake timeout against a live process (and the
+#                     cancellation it owes) is observable
 #   modern-then-ping  the first process is modern and exits after one
 #                     tools/list; its replacement is a 2025-11-25 server that
 #                     pings immediately, so a client that judged the
@@ -146,6 +149,7 @@ end
 # @return [Boolean]
 def modern_request?(msg)
   return true if msg['method'] == 'server/discover'
+  return true if MODE == 'modern-mute-list'
   # modern-then-ping speaks 2026-07-28 until it exits; its replacement is a
   # 2025-11-25 server, and the same mode name covers both.
   return !REPLACEMENT if MODE == 'modern-then-ping'
@@ -204,6 +208,7 @@ end
 def answered_by_mode?(msg)
   case MODE
   when 'modern', 'modern-one-shot', 'modern-exit-on-call', 'future-only' then answered_by_modern_mode?(msg)
+  when 'modern-mute-list' then answered_by_modern_mute_list?(msg)
   when 'legacy-one-shot', 'legacy-broken-init', 'late-discover' then answered_by_legacy_mode?(msg)
   when 'modern-then-ping' then answered_by_modern_then_ping?(msg)
   else false
@@ -233,6 +238,19 @@ def answered_by_modern_mode?(msg)
     exit 0 if msg['method'] == 'tools/call'
   end
   false
+end
+
+# modern-mute-list: a live, negotiated modern server that simply never answers
+# tools/list, so the client's own request timeout is what ends the wait.
+# @param msg [Hash] the request
+# @return [Boolean] whether the mode answered the request itself
+def answered_by_modern_mute_list?(msg)
+  if msg['method'] == 'server/discover'
+    respond(msg['id'], discover_result(['2026-07-28']))
+    return true
+  end
+
+  msg['method'] == 'tools/list'
 end
 
 # modern-then-ping: modern until it has served one tools/list, then gone.
@@ -317,9 +335,10 @@ end
 # @return [Boolean] whether the pong arrived
 def ping_answered?(buffered)
   emit({ 'jsonrpc' => '2.0', 'id' => 'srv-ping', 'method' => 'ping' })
-  # Recorded so a test can hold the client's negotiation until the ping is
-  # really on the wire, instead of racing it.
-  record('ping-sent')
+  # Noted beside the transcript — not in it, which is the record of messages
+  # RECEIVED — so a test can hold the client's negotiation until the ping is
+  # really on the wire instead of racing it.
+  File.write("#{TRANSCRIPT}.events", "ping-sent\n", mode: 'a') if TRANSCRIPT
   while (line = $stdin.gets)
     msg = parse(line)
     next unless msg

@@ -534,7 +534,11 @@ RSpec.describe 'MCP 2026-07-28 stateless protocol (stdio)' do
       expect(sent.map { |r| r['method'] }).to eq(['initialize'])
     end
 
-    it 'waits at most discover_timeout for the probe' do
+    # What this pins is the forwarding: the probe asks its wait for
+    # discover_timeout rather than the transport's read timeout. That the
+    # real wait honours the value it is given is pinned against a process
+    # that never answers, by the silent-probe example below.
+    it 'gives the probe discover_timeout rather than the read timeout' do
       server = MCPClient::ServerStdio.new(command: 'echo test', read_timeout: 30, discover_timeout: 2)
       timeouts = []
       allow(server).to receive(:connect).and_return(true)
@@ -771,6 +775,10 @@ RSpec.describe 'MCP 2026-07-28 stateless protocol (stdio)' do
 
       cancelled = stdin_lines.map { |l| JSON.parse(l) }.find { |m| m['method'] == 'notifications/cancelled' }
       expect(cancelled['params']['requestId']).to eq(sent.last['id'])
+      # A notification carries no id: with one it would be a request, which
+      # stdio MUST NOT send for a cancellation, and the server would owe it
+      # a response nobody is waiting for.
+      expect(cancelled).not_to have_key('id')
     end
   end
 

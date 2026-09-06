@@ -297,11 +297,13 @@ RSpec.describe 'MCP 2026-07-28 stateless protocol (stdio) — round 4' do
       expect(server.modern_peer?).to be(true)
       allow(server).to receive(:connect).and_call_original
       allow(Open3).to receive(:popen3).and_return([StringIO.new, StringIO.new, StringIO.new, nil])
-      server.instance_variable_set(:@protocol_version, nil)
 
+      # Nothing is repaired by hand: spawning the replacement is what has to
+      # forget the previous process, the era it negotiated included (round 7).
       server.connect
 
       expect(server.modern_peer?).to be(false)
+      expect(server.protocol_era).to be_nil
     end
   end
 

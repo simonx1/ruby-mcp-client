@@ -89,7 +89,7 @@ RSpec.describe 'MCP 2026-07-28 stateless protocol (stdio) — round 7' do
       # under whatever era the replacement inherited — not raced against the
       # probe that would have cleared it.
       allow(server).to receive(:negotiate_protocol).and_wrap_original do |original, *args|
-        wait_for('the replacement to ping') { transcript_lines(transcript).include?('ping-sent') }
+        wait_for('the replacement to ping') { transcript_lines("#{transcript}.events").include?('ping-sent') }
         sleep 0.2
         original.call(*args)
       end
@@ -220,6 +220,160 @@ RSpec.describe 'MCP 2026-07-28 stateless protocol (stdio) — round 7' do
       # The rebuilt request's own registration is consumed by its waiter,
       # which is stubbed here; only the abandoned id is this example's.
       expect(server.instance_variable_get(:@awaiting)).not_to have_key(abandoned)
+    end
+  end
+  # ---------------------------------------------------------------------------
+  # Coverage the reviewers asked for beyond the three defects.
+  describe 'the fallback handshake of a client with host callbacks' do
+    let(:server) { MCPClient::ServerStdio.new(command: 'echo test', read_timeout: 1) }
+
+    # The capability builder is unit-tested elsewhere; what was missing is that
+    # negotiation RESTORES those declarations after the modern probe, and that
+    # the server request they authorize is actually served.
+    it 'declares the registered callbacks and then serves the request they authorize' do
+      server.on_roots_list_request { |_id, _params| { 'roots' => [{ 'uri' => 'file:///w', 'name' => 'w' }] } }
+      server.on_sampling_request { |_p| { 'role' => 'assistant', 'content' => { 'type' => 'text', 'text' => 'hi' } } }
+      server.on_elicitation_request { |_m, _d| { action: 'accept' } }
+      written = []
+      allow(server).to receive(:connect).and_return(true)
+      allow(server).to receive(:start_reader)
+      allow(server).to receive(:start_stderr_reader)
+      stdin = double('stdin', flush: nil, closed?: false, close: nil)
+      allow(stdin).to receive(:puts) { |line| written << line }
+      server.instance_variable_set(:@stdin, stdin)
+      allow(server).to receive(:wait_response) do |id, **_opts|
+        case JSON.parse(written.last)['method']
+        when 'server/discover'
+          { 'jsonrpc' => '2.0', 'id' => id, 'error' => { 'code' => -32_601, 'message' => 'Method not found' } }
+        when 'initialize'
+          { 'jsonrpc' => '2.0', 'id' => id,
+            'result' => { 'protocolVersion' => '2025-11-25', 'capabilities' => { 'tools' => {} },
+                          'serverInfo' => { 'name' => 'legacy', 'version' => '1' } } }
+        else
+          { 'jsonrpc' => '2.0', 'id' => id, 'result' => { 'resultType' => 'complete', 'tools' => [] } }
+        end
+      end
+
+      server.list_tools
+
+      initialize_request = written.map { |line| JSON.parse(line) }.find { |m| m['method'] == 'initialize' }
+      expect(initialize_request['params']['capabilities'])
+        .to eq({ 'elicitation' => { 'form' => {}, 'url' => {} }, 'roots' => { 'listChanged' => true },
+                 'sampling' => {} })
+
+      # And the declaration is honoured: the server asks, the host answers.
+      written.clear
+      server.handle_line(JSON.generate('jsonrpc' => '2.0', 'id' => 'srv-1', 'method' => 'roots/list'))
+      response = written.map { |line| JSON.parse(line) }.find { |m| m['id'] == 'srv-1' }
+      expect(response['result']).to eq({ 'roots' => [{ 'uri' => 'file:///w', 'name' => 'w' }] })
+    end
+  end
+
+  describe 'a DiscoverResult that omits what it may omit' do
+    let(:server) { MCPClient::ServerStdio.new(command: 'echo test', read_timeout: 1) }
+
+    it 'is applied with no capabilities and no identity of its own' do
+      server.send(:apply_discover_result,
+                  { 'resultType' => 'complete', 'supportedVersions' => ['2026-07-28'] })
+
+      expect(server.capabilities).to eq({})
+      expect(server.server_info).to be_nil
+      expect(server.protocol_version).to eq('2026-07-28')
+    end
+
+    it 'keeps the identity of an earlier result when a later one carries none' do
+      server.send(:apply_discover_result,
+                  discover_result(extra: { '_meta' => { MCPClient::JsonRpcCommon::META_SERVER_INFO =>
+                                                          { 'name' => 'named', 'version' => '1' } } }))
+
+      server.send(:apply_discover_result, discover_result)
+
+      expect(server.server_info).to eq({ 'name' => 'named', 'version' => '1' })
+    end
+  end
+
+  describe 'a host request_meta provider that does not return a Hash' do
+    let(:server) { MCPClient::ServerStdio.new(command: 'echo test', read_timeout: 1) }
+
+    it 'is ignored rather than written to the wire' do
+      server.request_meta = -> { 'not a hash' }
+      server.instance_variable_set(:@protocol_version, '2026-07-28')
+
+      params = server.send(:with_request_meta, { 'name' => 'echo' })
+
+      expect(params['_meta']).to be_a(Hash)
+      expect(params['_meta'].values).not_to include('not a hash')
+    end
+  end
+
+  describe 'a notification written while the transport is replaced' do
+    let(:server) { MCPClient::ServerStdio.new(command: 'echo test', read_timeout: 1) }
+
+    # The request path takes the transport lock for its check-and-write;
+    # rpc_notify writes on its own and must not reach a dead pipe unnoticed.
+    it 'fails on the pipe it was given rather than reaching the replacement' do
+      server.instance_variable_set(:@initialized, true)
+      server.instance_variable_set(:@protocol_version, '2025-11-25')
+      broken = StringIO.new
+      broken.close_write
+      server.instance_variable_set(:@stdin, broken)
+
+      expect { server.rpc_notify('notifications/roots/list_changed') }
+        .to raise_error(MCPClient::Errors::TransportError)
+    end
+  end
+
+  describe 'a discovery whose ttlMs has elapsed' do
+    let(:server) { MCPClient::ServerStdio.new(command: 'echo test', read_timeout: 1) }
+
+    # Characterisation: capability? reads the last DiscoverResult without
+    # re-fetching. The request paths that DEPEND on a capability refresh it
+    # first (require_capability!), which is what the caching rule binds.
+    it 'still reports the capabilities of the last result, while a gated call refreshes first' do
+      allow(server).to receive(:connect).and_return(true)
+      allow(server).to receive(:start_reader)
+      allow(server).to receive(:start_stderr_reader)
+      server.send(:apply_discover_result,
+                  { 'resultType' => 'complete', 'supportedVersions' => ['2026-07-28'],
+                    'capabilities' => { 'completions' => {} }, 'ttlMs' => 0 })
+      server.instance_variable_set(:@initialized, true)
+
+      expect(server.discovery_fresh?).to be(false)
+      expect(server.capability?('completions')).to be(true)
+
+      refreshed = []
+      allow(server).to receive(:rpc_request).and_wrap_original do |_original, method, *_rest|
+        refreshed << method
+        { 'resultType' => 'complete', 'supportedVersions' => ['2026-07-28'],
+          'capabilities' => { 'completions' => {} }, 'ttlMs' => 60_000 }
+      end
+      server.send(:require_capability!, 'completions', method: 'completion/complete')
+
+      expect(refreshed).to eq(['server/discover'])
+    end
+  end
+
+  describe 'a live modern process that never answers' do
+    let(:transcript) { File.join(@dir, 'transcript') }
+
+    around do |example|
+      Dir.mktmpdir { |dir| @dir = dir and example.run }
+    end
+
+    # The probe hang is pinned elsewhere; this is a request that times out on
+    # a session that HAS negotiated, and the cancellation it owes the server.
+    it 'times out the request and cancels it on the wire' do
+      server = MCPClient::ServerStdio.new(command: fixture_command('modern-mute-list', transcript),
+                                          read_timeout: 1, discover_timeout: 3)
+
+      expect { server.list_tools }.to raise_error(MCPClient::Errors::ToolCallError, /[Tt]imeout/)
+
+      wait_for('the cancellation to be recorded') do
+        transcript_lines(transcript).include?('notifications/cancelled')
+      end
+      expect(transcript_lines(transcript)).to include('server/discover', 'tools/list', 'notifications/cancelled')
+    ensure
+      server&.cleanup
     end
   end
 end

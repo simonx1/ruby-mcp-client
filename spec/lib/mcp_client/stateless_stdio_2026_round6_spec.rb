@@ -503,9 +503,20 @@ RSpec.describe 'MCP 2026-07-28 stateless protocol (stdio) — round 6' do
       Process.kill('TERM', transcript_pids(transcript).first)
       wait_for('the transport to retire') { server.transport_retired? }
 
-      # The restart runs connect for real: nothing is repaired by hand.
+      # The restart runs connect for real: nothing is repaired by hand. The
+      # era of the replacement is observed while it is still being
+      # established — retaining the dead process's would satisfy the final
+      # state just as well, and it is what round 7 found dropping a legacy
+      # replacement's startup ping.
+      era_at_negotiation = :unset
+      allow(server).to receive(:negotiate_protocol).and_wrap_original do |original, *args|
+        era_at_negotiation = server.protocol_era
+        original.call(*args)
+      end
+
       expect(server.list_tools.map(&:name)).to eq(['echo'])
 
+      expect(era_at_negotiation).to be_nil
       expect(transcript_pids(transcript).size).to eq(2)
       expect(server.protocol_era).to eq(:modern)
     ensure

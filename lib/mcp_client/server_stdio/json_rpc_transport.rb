@@ -640,7 +640,15 @@ module MCPClient
         end
 
         notif = build_jsonrpc_notification(method, params)
-        @stdin.puts(notif.to_json)
+        begin
+          @stdin.puts(notif.to_json)
+        rescue StandardError => e
+          # The same failure a request write reports, reported the same way:
+          # a notification writes on its own, outside the request path's
+          # check-and-write, and a dead pipe there reached the host as a raw
+          # IOError.
+          raise MCPClient::Errors::TransportError, "Failed to send JSONRPC notification: #{e.message}"
+        end
       end
     end
   end
