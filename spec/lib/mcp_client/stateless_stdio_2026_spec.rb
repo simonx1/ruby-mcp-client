@@ -185,11 +185,20 @@ RSpec.describe 'MCP 2026-07-28 stateless protocol (stdio)' do
 
     it 'declares negotiated extensions under clientCapabilities.extensions' do
       transport.protocol_version = '2026-07-28'
-      transport.declare_extension('io.modelcontextprotocol/tasks')
+      transport.declare_extension('com.example/audit')
       transport.declare_extension('com.example/ui', { 'mimeTypes' => ['text/html'] })
       caps = transport.build_jsonrpc_request('tools/list', {}, 1)['params']['_meta'][META_CLIENT_CAPS]
-      expect(caps['extensions']).to eq({ 'io.modelcontextprotocol/tasks' => {},
+      expect(caps['extensions']).to eq({ 'com.example/audit' => {},
                                          'com.example/ui' => { 'mimeTypes' => ['text/html'] } })
+    end
+
+    # The tasks extension adds the "task" result type; a client that does
+    # not implement it must not tell the server it is negotiated (the tasks
+    # extension branch registers itself as an implementation).
+    it 'refuses to advertise a result-type-adding extension this client does not implement' do
+      transport.protocol_version = '2026-07-28'
+      expect { transport.declare_extension('io.modelcontextprotocol/tasks') }
+        .to raise_error(ArgumentError, /"task".*not implement/)
     end
 
     it 'rejects extension identifiers without the mandatory prefix' do

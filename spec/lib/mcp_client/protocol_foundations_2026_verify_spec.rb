@@ -1693,7 +1693,9 @@ RSpec.describe 'Client#call_tool does not run output validation on an unfinished
   end
   let(:unfinished) do
     { 'resultType' => 'input_required', 'requestState' => 'continue-later',
-      'inputRequests' => { 'city' => { 'type' => 'elicitation', 'mode' => 'form', 'message' => 'which city?' } } }
+      'inputRequests' => { 'city' => { 'method' => 'elicitation/create',
+                                       'params' => { 'mode' => 'form', 'message' => 'which city?',
+                                                     'requestedSchema' => { 'type' => 'object' } } } } }
   end
 
   before do

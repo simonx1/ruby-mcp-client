@@ -292,6 +292,16 @@ module MCPClient
         raise ArgumentError, "Extension settings for #{identifier} must be an object (Hash), got #{settings.class}"
       end
 
+      # An extension that adds a result type is advertised only by a client
+      # that can accept that result type: a server told the extension is
+      # negotiated may answer with it, and an unrecognized resultType is an
+      # invalid response — the usable answer would be lost.
+      added = RESULT_TYPE_EXTENSIONS[identifier]
+      if added && !implemented_extension_result_types.key?(identifier)
+        raise ArgumentError,
+              "Extension #{identifier} adds the result type #{added.inspect}, which this client does not implement"
+      end
+
       @declared_extensions ||= {}
       @declared_extensions[identifier] = settings
     end
@@ -443,10 +453,21 @@ module MCPClient
     # @param result [Hash] the DiscoverResult
     # @return [void]
     def record_discovery_freshness(result)
-      ttl = result['ttlMs']
-      @discovery_expires_at = ttl.is_a?(Integer) && ttl >= 0 ? discovery_clock + (ttl / 1000.0) : nil
+      @discovery_expires_at = discovery_clock + discovery_ttl_seconds(result['ttlMs'])
       scope = result['cacheScope']
       @discovery_cache_scope = scope.is_a?(String) ? scope : nil
+    end
+
+    # The freshness a ttlMs hint grants, by the caching rules: a JSON number
+    # (an Integer or a Float on the wire) of milliseconds; zero is
+    # immediately stale, and a negative, absent or malformed hint SHOULD be
+    # treated as zero.
+    # @param ttl [Object] the ttlMs member
+    # @return [Float] seconds of freshness
+    def discovery_ttl_seconds(ttl)
+      return 0.0 unless ttl.is_a?(Numeric) && ttl.finite? && ttl.positive?
+
+      ttl / 1000.0
     end
 
     # @return [Float] the monotonic clock, in seconds, discovery freshness is judged by
@@ -455,7 +476,8 @@ module MCPClient
     end
 
     # Whether the last DiscoverResult is still fresh by its own ttlMs. A
-    # result that gave no hint is treated as fresh for the process lifetime.
+    # session that recorded no discovery at all (a 2025-11-25 one) has
+    # nothing to refresh.
     # @return [Boolean]
     def discovery_fresh?
       deadline = defined?(@discovery_expires_at) ? @discovery_expires_at : nil
@@ -607,9 +629,14 @@ module MCPClient
     end
 
     # Result types defined by the core protocol (basic/index.mdx "ResultType").
-    # Extensions add more (e.g. "task"); transports widen the accepted set
-    # via #accepted_result_types once such an extension is negotiated.
+    # Extensions add more (e.g. "task"); the accepted set widens with the
+    # declared extensions this client implements (#accepted_result_types).
     CORE_RESULT_TYPES = %w[complete input_required].freeze
+
+    # The result type each known result-type-adding extension introduces. A
+    # client advertises one of these only when it implements it (see
+    # #implemented_extension_result_types).
+    RESULT_TYPE_EXTENSIONS = { 'io.modelcontextprotocol/tasks' => 'task' }.freeze
 
     # The only result type a handshake-era (legacy) server can validly send:
     # the others were introduced with the discriminator itself.
@@ -638,7 +665,20 @@ module MCPClient
       # in modern revisions: a handshake-era server answering with it is
       # malformed, and treating it as valid would let a wrapper flatten an
       # unfinished result into an empty successful one.
-      modern? ? CORE_RESULT_TYPES : LEGACY_RESULT_TYPES
+      return LEGACY_RESULT_TYPES unless modern?
+
+      extra = implemented_extension_result_types.select { |id, _| declared_extensions.key?(id) }.values.flatten
+      extra.empty? ? CORE_RESULT_TYPES : (CORE_RESULT_TYPES + extra).uniq.freeze
+    end
+
+    # The result types of the extensions this client implements, by
+    # extension identifier: what a declared extension may widen the accepted
+    # result types with. The core client implements none; a transport that
+    # implements a result-type-adding extension (the tasks extension, say)
+    # overrides this.
+    # @return [Hash{String => Array<String>}]
+    def implemented_extension_result_types
+      {}
     end
 
     # Project a payload out of a result that has to be finished. This client

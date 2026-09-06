@@ -55,6 +55,12 @@ REQUIRED_MODERN_META = %w[
 
 # Reserved prefix: none of these keys belong on a 2025-11-25 request.
 MODERN_META_PREFIX = 'io.modelcontextprotocol/'
+# The per-request fields that select the 2026-07-28 era: a 2025-11-25
+# request carrying one of these would be read as a modern request.
+LEGACY_PROHIBITED_META = %w[
+  io.modelcontextprotocol/protocolVersion io.modelcontextprotocol/clientCapabilities
+  io.modelcontextprotocol/clientInfo io.modelcontextprotocol/logLevel
+].freeze
 
 MODE = ARGV[0] || 'modern'
 TRANSCRIPT = ARGV[1]
@@ -155,7 +161,10 @@ def meta_violation(msg)
       return 'modern request _meta clientCapabilities is not an object'
     end
   else
-    leaked = meta.keys.select { |key| key.to_s.start_with?(MODERN_META_PREFIX) }
+    # Only the era-selecting fields are prohibited: a 2025-11-25 request may
+    # legitimately carry other io.modelcontextprotocol/ metadata (the tasks
+    # extension's related-task, for one).
+    leaked = meta.keys.select { |key| LEGACY_PROHIBITED_META.include?(key.to_s) }
     return "2025-11-25 request carried modern _meta: #{leaked.join(', ')}" if leaked.any?
   end
 

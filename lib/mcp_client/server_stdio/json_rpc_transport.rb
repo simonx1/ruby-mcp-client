@@ -26,9 +26,16 @@ module MCPClient
           return if @initialized
 
           begin
-            connect
-            start_reader
-            start_stderr_reader
+            # Ordinary requests are refused while the replacement is being
+            # negotiated (see #send_request): the restart clears the
+            # retirement before it negotiates, so the generation alone would
+            # judge a half-restarted transport current.
+            @transport_lock.synchronize { @negotiating = true }
+            # A process the host connected explicitly is negotiated, not
+            # replaced: spawning again would orphan it.
+            connect unless live_process?
+            start_reader unless @reader_thread&.alive?
+            start_stderr_reader unless @stderr_thread&.alive?
             negotiate_protocol
           rescue StandardError
             # A failed negotiation must not leave the subprocess, its pipes
@@ -38,10 +45,26 @@ module MCPClient
             # cleanup's reach.
             release_transport
             raise
+          ensure
+            @transport_lock.synchronize { @negotiating = false }
           end
 
           @initialized = true
         end
+      end
+
+      # @return [Boolean] whether a subprocess is connected and still running
+      def live_process?
+        return false unless @stdin.respond_to?(:closed?) && !@stdin.closed?
+
+        @wait_thread.respond_to?(:alive?) && @wait_thread.alive?
+      end
+
+      # Ids of requests a teardown found outstanding: recorded under @mutex
+      # by cleanup, consumed by their waiters (see #wait_response).
+      # @return [Set<Integer>]
+      def dropped_requests
+        @dropped_requests ||= Set.new
       end
 
       # @return [Boolean] whether the subprocess behind the handshake exited
@@ -389,7 +412,10 @@ module MCPClient
       def send_request(req, generation = nil)
         @logger.debug("Sending JSONRPC request: #{describe_jsonrpc_message(req)}")
         @transport_lock.synchronize do
-          return :replaced if generation && generation != @transport_generation
+          # A replacement whose negotiation has not completed is not current
+          # either, whatever its generation says: an ordinary request written
+          # to it would reach the process before its handshake.
+          return :replaced if generation && (generation != @transport_generation || @negotiating)
 
           @stdin.puts(req.to_json)
         end
@@ -412,7 +438,10 @@ module MCPClient
           until @pending.key?(id)
             # The subprocess exited: no answer is coming, however long the
             # timeout. (An answer that arrived before it exited is above.)
-            break if @transport_retired
+            # A restart another caller completed meanwhile has cleared the
+            # retirement again, but it recorded this request as dropped —
+            # the durable sign that the transport it went out on is gone.
+            break if @transport_retired || dropped_requests.include?(id)
 
             remaining = deadline - Time.now
             break if remaining <= 0
@@ -422,10 +451,11 @@ module MCPClient
           # Remove the response and the awaiting marker on both success and
           # timeout so neither @pending nor @awaiting accumulates entries.
           msg = @pending.delete(id)
+          transport_gone = @transport_retired || !dropped_requests.delete?(id).nil?
           @awaiting.delete(id)
           return msg if msg
 
-          if @transport_retired
+          if transport_gone
             raise MCPClient::Errors::TransportError,
                   "The MCP server subprocess exited before answering JSONRPC request id=#{id}"
           end
@@ -454,18 +484,17 @@ module MCPClient
       # Like {ServerBase#require_capability!}, except that a modern server's
       # capabilities come from a DiscoverResult with a freshness hint: one
       # whose ttlMs has elapsed (a zero ttlMs is "immediately stale") is
-      # refreshed before a capability it did not declare is refused — the
-      # server may have enabled it since.
+      # refreshed on the next access before the capability is judged at all
+      # (server/utilities/caching) — the server may have enabled the
+      # capability since, or withdrawn one the stale result still lists.
       # @param path [Array<String, Symbol>] capability key path
       # @param method [String] the JSON-RPC method the caller wants to send
       # @raise [MCPClient::Errors::CapabilityError]
       def require_capability!(*path, method:)
-        super
-      rescue MCPClient::Errors::CapabilityError
-        raise unless modern? && !discovery_fresh?
-
-        @logger.debug("The server/discover result is stale; refreshing it before refusing #{method}")
-        rpc_request('server/discover')
+        if modern? && !discovery_fresh?
+          @logger.debug("The server/discover result is stale; refreshing it before #{method}")
+          rpc_request('server/discover')
+        end
         super
       end
 

@@ -111,13 +111,32 @@ metadata). Each feature lands in its own PR; this section accumulates them.
   `_meta` supplied under both the String and the Symbol key is merged into
   one member (the String one winning) before the reserved fields are
   stripped, so nothing stripped from one copy reaches the wire through the
-  other. A `DiscoverResult`'s `ttlMs`/`cacheScope` are honoured: a zero
-  `ttlMs` is immediately stale, and a stale discovery is refreshed before a
-  capability it did not declare is refused (`discovery_fresh?`,
-  `discovery_cache_scope`). A discovery refresh that fails to validate —
-  `supportedVersions`, `capabilities` or `_meta` malformed — changes
-  nothing, not even the identity it carried. `declare_extension` refuses
-  settings that are not an object.
+  other. A `DiscoverResult`'s `ttlMs`/`cacheScope` are honoured by the
+  caching rules: `ttlMs` is a JSON number of milliseconds, zero is
+  immediately stale, a negative, absent or malformed hint counts as zero,
+  and a stale discovery is refreshed on the next capability-gated request
+  before the capability is judged at all — a capability the stale result
+  still lists is not reused (`discovery_fresh?`, `discovery_cache_scope`).
+  A discovery refresh that fails to validate — `supportedVersions`,
+  `capabilities` or `_meta` malformed — changes nothing, not even the
+  identity it carried. `declare_extension` refuses settings that are not an
+  object, and refuses an extension that adds a result type this client does
+  not implement (`io.modelcontextprotocol/tasks` adds `task`; a transport
+  that implements such an extension registers it through
+  `implemented_extension_result_types`, which widens `accepted_result_types`
+  once the extension is declared). Sixth round: an ordinary request is
+  never written to a replacement subprocess whose negotiation has not
+  completed (a restart clears the retirement before it negotiates, so the
+  generation alone judged the half-restarted transport current); an answer
+  on an established 2025-11-25 session identifies nothing, however modern
+  its shape, so the server's own ping, roots, sampling and elicitation
+  requests stay answered; a caller whose request the exited process never
+  answered fails at once even when another caller restarted first (its
+  marker, cleared by the restart, is the durable sign); an explicit
+  `connect` followed by a request negotiates that process instead of
+  spawning a second one; and the public client's `log_level=` no longer
+  gates a 2026-07-28 server on a `logging` capability the per-request field
+  does not need.
 
 ### Protocol foundations
 

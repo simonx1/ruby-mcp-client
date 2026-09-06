@@ -101,6 +101,7 @@ module MCPClient
       # one step: a restart cannot slip in between (see
       # JsonRpcTransport#send_request).
       @transport_lock = Mutex.new
+      @negotiating = false
       @transport_retired = false
       @modern_answer_received = false
     end
@@ -290,8 +291,12 @@ module MCPClient
           # Only an OUTSTANDING request's answer says anything, though: the
           # response to a probe that timed out (and was cancelled) SHOULD be
           # ignored, and the session it fell back to is a 2025-11-25 one
-          # whose server requests are still owed their responses.
-          @modern_answer_received = true if identifies_modern_server?(msg)
+          # whose server requests are still owed their responses. And only
+          # while the era is being negotiated: an answer on an established
+          # 2025-11-25 session renegotiates nothing, however modern its
+          # shape, and that session's ping, roots, sampling and elicitation
+          # requests stay owed their responses.
+          @modern_answer_received = true if era_probe_in_flight? && identifies_modern_server?(msg)
           @pending[id] = msg
           @cond.broadcast
         else
@@ -831,6 +836,10 @@ module MCPClient
       # will never be answered re-checks its deadline rather than blocking on
       # a reader thread that has been killed.
       @mutex.synchronize do
+        # The ids still outstanding are recorded as dropped: their waiters
+        # fail on that record, whenever they next run, rather than wait out
+        # their timeouts because the restart cleared the retirement first.
+        dropped_requests.merge(@awaiting.keys)
         @awaiting.clear
         @cond.broadcast
       end

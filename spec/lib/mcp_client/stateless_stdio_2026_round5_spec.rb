@@ -29,8 +29,11 @@ R5_META = MCPClient::JsonRpcCommon
 R5_FIXTURE = File.expand_path('../../support/protocol_era_stdio_server.rb', __dir__)
 
 RSpec.describe 'MCP 2026-07-28 stateless protocol (stdio) — round 5' do
+  # A DiscoverResult fresh for a minute unless the example says otherwise
+  # (a hint-less one is immediately stale by the caching rules).
   def discover_result(versions: ['2026-07-28'], capabilities: { 'tools' => {} }, extra: {})
-    { 'resultType' => 'complete', 'supportedVersions' => versions, 'capabilities' => capabilities }.merge(extra)
+    { 'resultType' => 'complete', 'supportedVersions' => versions, 'capabilities' => capabilities,
+      'ttlMs' => 60_000 }.merge(extra)
   end
 
   def legacy_init_result
@@ -372,17 +375,33 @@ RSpec.describe 'MCP 2026-07-28 stateless protocol (stdio) — round 5' do
       end).to eq(%w[server/discover server/discover completion/complete])
     end
 
-    it 'never re-discovers on its own when the server gave no freshness hint' do
-      written = wire_stdio(server, [{ 'result' => discover_result(capabilities: {}) }])
+    # Caching: an absent ttlMs SHOULD be treated as zero, so a hint-less
+    # discovery is immediately stale and re-fetched on every access.
+    it 're-discovers on every access when the server gave no freshness hint' do
+      hintless = { 'result' => discover_result(capabilities: {}).except('ttlMs') }
+      written = wire_stdio(server, [hintless, hintless, hintless])
 
       expect { server.complete(ref: prompt_ref, argument: argument) }.to raise_error(MCPClient::Errors::CapabilityError)
       expect { server.complete(ref: prompt_ref, argument: argument) }.to raise_error(MCPClient::Errors::CapabilityError)
-      expect(requests_in(written).map { |r| r['method'] }).to eq(%w[server/discover])
+      expect(requests_in(written).map { |r| r['method'] }).to eq(%w[server/discover server/discover server/discover])
     end
 
-    it 'does not re-discover for a capability the fresh discovery already declares' do
+    # Caching: a stale result is re-fetched on the next access, hit or miss
+    # — the server may have withdrawn a capability the stale result lists.
+    it 're-discovers a zero-TTL discovery even for a capability it already declares' do
       written = wire_stdio(server, [{ 'result' => discover_result(capabilities: { 'completions' => {} },
                                                                   extra: { 'ttlMs' => 0 }) },
+                                    { 'result' => discover_result(capabilities: { 'completions' => {} }) },
+                                    { 'result' => completion }])
+
+      expect(server.complete(ref: prompt_ref, argument: argument)['values']).to eq(['ada'])
+      expect(requests_in(written).map do |r|
+        r['method']
+      end).to eq(%w[server/discover server/discover completion/complete])
+    end
+
+    it 'does not re-discover for a capability a fresh discovery declares' do
+      written = wire_stdio(server, [{ 'result' => discover_result(capabilities: { 'completions' => {} }) },
                                     { 'result' => completion }])
 
       expect(server.complete(ref: prompt_ref, argument: argument)['values']).to eq(['ada'])
@@ -406,7 +425,7 @@ RSpec.describe 'MCP 2026-07-28 stateless protocol (stdio) — round 5' do
     let(:second_identity) { { 'name' => 'srv', 'version' => '2' } }
 
     def discovered_server(bad_refresh)
-      first = discover_result(extra: { 'instructions' => 'first',
+      first = discover_result(extra: { 'instructions' => 'first', 'cacheScope' => 'private',
                                        '_meta' => { R5_META::META_SERVER_INFO => first_identity } })
       wire_stdio(server, [{ 'result' => first }, { 'result' => bad_refresh }])
       server.ping
@@ -418,6 +437,11 @@ RSpec.describe 'MCP 2026-07-28 stateless protocol (stdio) — round 5' do
       expect(server.capabilities).to eq({ 'tools' => {} })
       expect(server.instructions).to eq('first')
       expect(server.supported_versions).to eq(['2026-07-28'])
+      # The freshness deadline, the cache scope and the cached result are
+      # the first answer's too.
+      expect(server.discovery_fresh?).to be(true)
+      expect(server.discovery_cache_scope).to eq('private')
+      expect(server.instance_variable_get(:@last_discover_result)['instructions']).to eq('first')
     end
 
     it 'changes nothing, not even the identity the invalid answer carried' do

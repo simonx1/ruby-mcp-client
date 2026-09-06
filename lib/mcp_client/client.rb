@@ -693,8 +693,10 @@ module MCPClient
         # MCP lifecycle: only use capabilities that were successfully
         # negotiated — skip servers whose NEGOTIATED set lacks logging.
         # Unconnected servers proceed: the transport-level gate re-checks
-        # after its handshake establishes the capability set.
-        unless !capabilities_known?(srv) || srv.capability?('logging')
+        # after its handshake establishes the capability set. A 2026-07-28
+        # server needs no capability at all: the level is a per-request
+        # field of every request's _meta, not a logging/setLevel call.
+        unless !capabilities_known?(srv) || srv.capability?('logging') || modern_server?(srv)
           @logger.debug("Skipping logging/setLevel for #{srv.name || srv.class.name}: " \
                         'logging capability not negotiated')
           next
@@ -723,6 +725,12 @@ module MCPClient
     # @return [Boolean]
     def capabilities_known?(srv)
       srv.respond_to?(:capabilities) && !srv.capabilities.nil?
+    end
+
+    # @param srv [MCPClient::ServerBase] the transport
+    # @return [Boolean] whether it established a 2026-07-28 session
+    def modern_server?(srv)
+      srv.class.method_defined?(:modern?) && srv.modern?
     end
 
     # Enforce the tasks.<operation> capability gate for a server (MCP

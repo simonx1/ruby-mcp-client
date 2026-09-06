@@ -722,9 +722,10 @@ RSpec.describe 'MCP 2026-07-28 stateless protocol (stdio) — verification round
 
       expect(server.send(:wait_response, answered)).to include('result' => tool_list_result)
       # The one that was never answered still fails, as it would on any other
-      # broken transport: nothing is replayed.
-      expect { server.send(:wait_response, unanswered, timeout: 0.05) }
-        .to raise_error(MCPClient::Errors::RequestTimeoutError)
+      # broken transport: nothing is replayed — and it fails at once, not at
+      # its deadline, even though the restart has cleared the retirement.
+      expect { server.send(:wait_response, unanswered, timeout: 5) }
+        .to raise_error(MCPClient::Errors::TransportError, /exited before answering/)
     end
 
     it 'stops treating the dead transport ids as outstanding' do
