@@ -548,6 +548,7 @@ module MCPClient
       end
 
       reject_input_required_discover!(result)
+      reject_task_result_discover!(result)
       versions = result['supportedVersions']
       unless versions.is_a?(Array) && versions.all?(String)
         raise MCPClient::Errors::ConnectionError, 'server/discover result has no supportedVersions list'
@@ -1042,6 +1043,30 @@ module MCPClient
 
       raise MCPClient::Errors::InvalidResultError,
             "Invalid result: resultType \"task\" is only valid for #{TASK_METHODS.join(', ')}, not #{method}"
+    end
+
+    # server/discover is not one of the request types the tasks extension
+    # covers, so a CreateTaskResult there is invalid and MUST NOT be applied:
+    # the probe would otherwise adopt a protocol version and install
+    # capabilities out of a task creation, and the discovery-shaped members a
+    # non-conforming server bolted onto it would override the discriminator.
+    # The ordinary rejection ({#reject_task_result_on_unsupported_method!})
+    # runs in the round-trip resolver, which discovery does not go through.
+    #
+    # Like the input_required sibling this is a ModernServerError, not an
+    # InvalidResultError: resultType is a 2026-07-28 field, so a server that
+    # answered with one is modern and the era is settled — it must never be
+    # retried with the initialize handshake, nor sent on to the legacy
+    # transports by MCPClient.connect.
+    # @param result [Object] the server/discover result
+    # @return [void]
+    # @raise [MCPClient::Errors::ModernServerError] if the result is a CreateTaskResult
+    def reject_task_result_discover!(result)
+      return unless MCPClient::JsonRpcCommon.result_type(result) == 'task'
+
+      raise MCPClient::Errors::ModernServerError,
+            'Server answered server/discover with a task result; resultType "task" is ' \
+            "only valid for #{TASK_METHODS.join(', ')}"
     end
 
     # Notifications the 2026-07-28 revision removed; never written to a

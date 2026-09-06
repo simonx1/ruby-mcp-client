@@ -41,7 +41,7 @@ with a revision it cannot speak (supported: `2025-11-25`, `2025-06-18`,
 - **Sampling**: Server-requested LLM completions with modelPreferences
 - **Completion**: Autocomplete for prompts/resources with context
 - **Logging**: Server log messages with level filtering
-- **Tasks**: Task-augmented `tools/call` — create with a `ttl`, poll `tasks/get`, retrieve via `tasks/result`, plus `tasks/list` and `tasks/cancel`
+- **Tasks**: Task-augmented `tools/call` — declare the `io.modelcontextprotocol/tasks` extension, poll `tasks/get`, answer `inputRequests` with `tasks/update`, and `tasks/cancel`. On 2025-11-25 servers the earlier surface (a requested `ttl`, `tasks/result`, `tasks/list`) is still spoken
 - **Audio**: Audio content type support
 - **Progress & Cancellation**: `progressToken` plumbing with per-call callbacks; automatic `notifications/cancelled` for abandoned requests
 - **Metadata**: `icons`, `title` and `_meta` parsed on tools, prompts and resources
@@ -572,27 +572,42 @@ Try it locally: `python3 examples/echo_server_streamable.py &` then
 `./examples/tasks_example.rb` runs the full lifecycle against a task-capable
 demo server.
 
+On MCP 2026-07-28 the client must declare the extension for the server to be
+allowed to answer with a task at all:
+
 ```ruby
+client = MCPClient.create_client(mcp_server_configs: [...],
+                                 extensions: ['io.modelcontextprotocol/tasks'])
+
 tool = client.find_tool('long_job')
 tool.supports_task?   # execution.taskSupport is optional/required?
 
-# Create the task (returns immediately); ttl is the requested lifetime in ms
-task = client.call_tool_as_task('long_job', { input: 'data' }, ttl: 60_000)
+# Create the task (returns immediately). The server sets the lifetime it
+# grants (ttlMs) and the pace it wants to be polled at (pollIntervalMs).
+task = client.call_tool_as_task('long_job', { input: 'data' })
 
-# Poll until the task reaches a terminal (or input-required) status,
-# honoring the server's suggested poll interval
+# Drive the whole lifecycle: polls tasks/get at the server's pace, answers
+# any inputRequests through your elicitation/sampling handlers with
+# tasks/update, and returns the finished task.
+finished = client.wait_for_task(task)
+result = finished.result               # the CallToolResult the task produced
+
+# Or step it yourself
 until task.terminal? || task.input_required?
   sleep((task.poll_interval || 1000) / 1000.0)
   task = client.get_task(task)          # tasks/get, routed to the task's own server
 end
+result = client.get_task_result(task)   # read from tasks/get on 2026-07-28
 
-# Retrieve the underlying result (e.g. a CallToolResult) via tasks/result
-result = client.get_task_result(task)
-
-# List and cancel tasks
-page = client.list_tasks               # { tasks: [...], next_cursor: ... }
-client.cancel_task(task)               # tasks/cancel
+client.cancel_task(task)                # tasks/cancel
 ```
+
+On a 2026-07-28 server `tasks/result` and `tasks/list` are gone: the outcome
+is read from `tasks/get`, `client.list_tasks` raises, and a `ttl:` passed to
+`call_tool_as_task` is ignored (the server grants `ttlMs`). Against a
+2025-11-25 server the earlier surface still applies — `ttl:` is sent,
+`get_task_result` uses `tasks/result`, and `client.list_tasks` pages
+`tasks/list`.
 
 Task IDs are only unique within the server that issued them, so pass the `Task`
 returned by `call_tool_as_task` — it carries its own server. A bare task ID also

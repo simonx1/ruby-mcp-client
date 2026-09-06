@@ -160,7 +160,11 @@ RSpec.describe 'MCP 2026-07-28 tasks extension — round 43' do
                 result = { 'resultType' => 'complete', 'taskId' => 'task-1', 'status' => task['status'],
                            'servedBy' => generation }.merge(stamp)
                 if task['status'] == 'completed'
-                  result['result'] = { 'content' => [{ 'type' => 'text', 'text' => 'done' }], 'isError' => false }
+                  # The generation travels in the payload the client hands
+                  # back, so the example can name the process that served the
+                  # task without depending on a field Task#to_h drops.
+                  result['result'] = { 'content' => [{ 'type' => 'text', 'text' => "done by \#{generation}" }],
+                                       'isError' => false }
                 end
                 answer.call(id, result)
               end
@@ -198,9 +202,10 @@ RSpec.describe 'MCP 2026-07-28 tasks extension — round 43' do
         # asked about there, not refused as belonging to an ended session.
         finished = client.wait_for_task(handle, timeout: 10)
         expect(finished).to be_completed
-        expect(finished.result).to eq(call_result)
+        # The replacement process served it: its generation is in the payload
+        # the client handed back, asserted unconditionally.
+        expect(finished.result).to eq(call_result('done by 2'))
         expect(File.read("#{store}.gen").to_i).to eq(2)
-        expect(client.get_task(handle).to_h['servedBy']).to eq(2) if finished.to_h.key?('servedBy')
       end
     end
   end

@@ -704,6 +704,7 @@ module MCPClient
         # result has validated.
         result = process_jsonrpc_response(res, method: 'server/discover')
         reject_input_required_discover!(result)
+        reject_task_result_discover!(result)
         unless discover_result?(result)
           raise invalid_discover_answer(modern_answer, 'answered without a DiscoverResult')
         end

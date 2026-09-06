@@ -55,7 +55,8 @@ module MCPClient
       def new_task_state(lookup)
         generation = task_lifetime(lookup)
         { key: [*lookup, generation], lookup: lookup, generation: generation, answered: Set.new,
-          submitted: Set.new, rounds: 0, pending_update: nil, update_mutex: Mutex.new }
+          submitted: Set.new, rounds: 0, pending_update: nil, update_mutex: Mutex.new,
+          answer_seq: 0, pending_at: {} }
       end
 
       # A previous session of this server is over: its state (answered keys,

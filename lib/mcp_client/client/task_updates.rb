@@ -96,7 +96,7 @@ module MCPClient
       # of the wait: the payload stays pending and goes out again with the
       # next poll, like a lost tasks/get. A definite rejection surfaces.
       # @return [void]
-      def deliver_task_update(srv, task_id, responses, wait, pending_only: false, outstanding: nil)
+      def deliver_task_update(srv, task_id, responses, wait, pending_only: false, outstanding: nil, observed_at: nil)
         # The bookkeeping this delivery is bound to is captured here, before
         # anything is sent: a session that restarts meanwhile must not make
         # the send record its keys, drop its pending payload or release them
@@ -110,7 +110,7 @@ module MCPClient
         bounded_by_wait(wait, deadline: wait[:deadline],
                               on_abandon: ->(_runner) { abandon_task_update(state) }) do
           send_task_update(srv, task_id, responses, epoch: wait[:epoch], pending_only: pending_only, state: state,
-                                                    outstanding: outstanding,
+                                                    outstanding: outstanding, observed_at: observed_at,
                                                     timeout: request_timeout(wait_deadline(wait), srv))
         end
       rescue MCPClient::Errors::TaskError => e
@@ -143,7 +143,7 @@ module MCPClient
       # @return [true]
       # @raise [MCPClient::Errors::TaskError, MCPClient::Errors::ServerError]
       def send_task_update(srv, task_id, input_responses, timeout: nil, pending_only: false, epoch: nil, state: nil,
-                           strict_session: false, outstanding: nil)
+                           strict_session: false, outstanding: nil, observed_at: nil)
         shown = shown_task_id(task_id)
         state ||= task_state(srv, task_id)
         # The answers are pending — and their keys answered — from the moment
@@ -160,7 +160,9 @@ module MCPClient
         lock = state[:update_mutex]
         lock.synchronize do
           payload = answered_keys_mutex.synchronize { state[:pending_update] }
-          payload = still_outstanding(state, payload, outstanding, shown) if pending_only && outstanding && payload
+          if pending_only && outstanding && payload
+            payload = still_outstanding(state, payload, outstanding, shown, observed_at)
+          end
           # An explicit answer goes out even when it adds nothing to send
           # (#update_task with no responses is the caller's request, not a
           # retransmission).
@@ -179,9 +181,14 @@ module MCPClient
       # answered — so the update names only outstanding requests, as the
       # extension requires, and a server rejecting a stale key cannot fail
       # a task that is progressing normally.
+      # @param observed_at [Integer, nil] the answer sequence this observation
+      #   was issued at: an answer queued after the poll went out is newer than
+      #   anything the poll can testify about (nil: not known, nothing is retired)
       # @return [Hash, nil] the payload left to send (callers hold the update lock)
-      def still_outstanding(state, payload, outstanding, shown)
-        consumed = payload.keys.reject { |key| outstanding.include?(key.to_s) }
+      def still_outstanding(state, payload, outstanding, shown, observed_at = nil)
+        consumed = payload.keys.reject do |key|
+          outstanding.include?(key.to_s) || newer_than_observation?(state, key, observed_at)
+        end
         return payload if consumed.empty?
 
         logger.debug("Task #{shown}: the server consumed the answers to #{consumed.join(', ')} " \
@@ -189,6 +196,24 @@ module MCPClient
         answered_keys_mutex.synchronize { drop_pending_keys(state, consumed.map(&:to_s)) }
         remaining = payload.except(*consumed)
         remaining.empty? ? nil : remaining
+      end
+
+      # Whether an answer is newer than the observation in hand: it was queued
+      # after that poll was issued, so the poll's snapshot was taken before the
+      # answer existed and cannot say the server consumed it. Retiring it on
+      # that evidence would drop the answer for good while its key stays
+      # answered — the host is never asked again and the update is never
+      # resent, and an input request the task keeps asking for strands it for
+      # its whole TTL. Concurrent waits make this ordinary: one wait's poll can
+      # be in flight while another answers the request it is about.
+      # @param key [Object] the pending key
+      # @param observed_at [Integer, nil] the answer sequence the poll was issued at
+      # @return [Boolean]
+      def newer_than_observation?(state, key, observed_at)
+        return false if observed_at.nil?
+
+        queued_at = answered_keys_mutex.synchronize { (state[:pending_at] || {})[key.to_s] }
+        !queued_at.nil? && queued_at > observed_at
       end
 
       # Record a delivery's answers before it queues for the task's update
@@ -209,6 +234,11 @@ module MCPClient
           state[:answered].merge(keys)
           state[:submitted].merge(keys)
           state[:pending_update] = (state[:pending_update] || {}).merge(input_responses)
+          # When each answer became pending, so an observation can say whether
+          # it is old enough to testify about it (see #still_outstanding).
+          seq = (state[:answer_seq] = state[:answer_seq].to_i + 1)
+          pending_at = (state[:pending_at] ||= {})
+          keys.each { |key| pending_at[key] = seq }
         end
       end
 
@@ -384,6 +414,11 @@ module MCPClient
       # @param keys [Array<String>] the keys to drop from the pending payload
       # @return [void] (callers hold answered_keys_mutex)
       def drop_pending_keys(state, keys)
+        # The order stamps go with the answers they date: a key queued again
+        # later is stamped again, and nothing is ordered against an answer
+        # that is no longer pending.
+        stamps = state[:pending_at]
+        keys.each { |key| stamps.delete(key.to_s) } if stamps
         pending = state[:pending_update]
         return if pending.nil?
 

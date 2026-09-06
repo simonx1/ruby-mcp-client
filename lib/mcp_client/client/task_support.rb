@@ -242,6 +242,11 @@ module MCPClient
       # @raise [MCPClient::Errors::TaskError] once the deadline has passed
       def observe_task(wait)
         raise_if_past_deadline!(wait)
+        # What was already answered when this poll went out. Whatever it comes
+        # back with was decided by the server no earlier than this, so an
+        # answer queued after it is newer than the observation and must not be
+        # retired by it (see #still_outstanding).
+        wait[:observed_at] = answers_queued_so_far(wait)
         current = poll_task(wait)
         return nil unless current
 
@@ -277,7 +282,17 @@ module MCPClient
       # @return [void]
       def retransmit_pending_update(current, wait)
         deliver_task_update(wait[:srv], wait[:task_id], nil, wait, pending_only: true,
-                                                                   outstanding: outstanding_task_keys(current))
+                                                                   outstanding: outstanding_task_keys(current),
+                                                                   observed_at: wait[:observed_at])
+      end
+
+      # The task's answer sequence as it stands now: how many answers had been
+      # queued for it when the caller read it. Stamped on a poll before it goes
+      # out so what comes back can be ordered against the answers themselves.
+      # @return [Integer]
+      def answers_queued_so_far(wait)
+        state = wait[:state] || task_state(wait[:srv], wait[:task_id])
+        answered_keys_mutex.synchronize { state[:answer_seq].to_i }
       end
 
       # The input request keys a task observation still lists: none for a

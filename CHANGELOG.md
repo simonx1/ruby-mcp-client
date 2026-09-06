@@ -7,6 +7,35 @@ metadata). Each feature lands in its own PR; this section accumulates them.
 
 ### Tasks extension (`io.modelcontextprotocol/tasks`)
 
+- **An observation only retires the answers it could have seen (round 44).** A
+  retransmission drops a pending answer the task no longer lists, on the
+  grounds that the server consumed it and only the acknowledgement was lost.
+  That reading was applied to every poll, including one issued *before* the
+  answer existed: with two waits on one task, one wait's `tasks/get` can be in
+  flight while the other answers the request it is about, and the older
+  snapshot then retired an answer it had never seen — dropping it for good
+  while its key stayed marked answered, so nothing was resent and the host was
+  never asked again. An input request the task kept asking for stranded the
+  task for its whole TTL. Each answer is now stamped when it is queued and each
+  poll when it is issued, and an answer newer than the observation in hand
+  stays pending for the next poll to send.
+- **A 2025-11-25 session ends only where the server assigned one (round 44).**
+  Assigning an `Mcp-Session-Id` is optional, and a legacy HTTP server that
+  never sent the header kept no session state for this client. `#cleanup`
+  nevertheless treated every legacy connection as session-bearing and advanced
+  the session epoch, so a retained handle to a task that was still alive on
+  such a server was refused ("the task is gone") without asking it — while the
+  same task remained reachable by its bare id. What decides is now the session
+  id itself; the era only decides while it is still unknown.
+- **A `CreateTaskResult` is refused on `server/discover` too (round 44).** The
+  discriminator check runs in the round-trip resolver, which discovery does not
+  go through: with the extension declared, a server answering the probe with a
+  flat task creation that also carried `supportedVersions` and `capabilities`
+  had them installed as a successful discovery. `resultType: "task"` is only
+  valid for the request types the extension covers, so such an answer now fails
+  the negotiation (a `ModernServerError`, like the `input_required` sibling: the
+  discriminator settles the era, so the transport must not fall back to the
+  handshake).
 - **Every handle of a task carries the definition its creation went out under
   (round 40).** Round 39 gave the handle `call_tool_as_task` returns the tool
   definition its `tools/call` was answered under, so `get_task_result`

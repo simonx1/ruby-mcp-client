@@ -301,9 +301,18 @@ module MCPClient
     # and tasks/cancel for a session that never existed. A modern server that
     # does hand a task id out again is handled where it happens, by the task
     # registry's per-creation lifetime.
+    # A 2025-11-25 session is the one the server assigned with an
+    # Mcp-Session-Id, and assigning one is optional ("Session Management"): a
+    # legacy server that never sent the header kept no session state for this
+    # client, so there is nothing for a cleanup to end there either, and its
+    # durable tasks — and the handles naming them — outlive the connection
+    # exactly as a modern server's do. What decides is therefore the session
+    # id itself, not the era; the era only decides while it is still unknown,
+    # when a session may yet be assigned and the connection counts as
+    # session-bearing until the probe settles.
     # @return [Boolean]
     def session_bearing_connection?
-      !modern? || !@session_id.nil?
+      !@session_id.nil? || protocol_era.nil?
     end
 
     # Whether #cleanup ends a session. A transport nothing was ever sent
@@ -445,6 +454,7 @@ module MCPClient
       # — unless it carries a resultType, which only a modern server writes
       # (see #invalid_discover_answer).
       reject_input_required_discover!(result)
+      reject_task_result_discover!(result)
       raise invalid_discover_answer(result, 'answered without a DiscoverResult') unless discover_result?(result)
 
       apply_discover_result(result)

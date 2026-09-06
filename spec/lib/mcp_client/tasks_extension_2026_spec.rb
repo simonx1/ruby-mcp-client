@@ -1181,7 +1181,10 @@ RSpec.describe 'MCP 2026-07-28 tasks extension — round 6' do
     }
   end
 
-  it 'surfaces an initialization failure from get_task_result instead of sending tasks/result' do
+  # The handshake fails here, so nothing reaches the wire: what this pins is
+  # the failure surfacing, not the method the call would have used. That
+  # 2026-07-28 never sends tasks/result is pinned on the wire in round 44.
+  it 'surfaces an initialization failure from get_task_result' do
     client = client_for(stdio)
     allow(stdio).to receive(:ping).and_raise(MCPClient::Errors::ConnectionError, 'server down')
     allow(stdio).to receive(:rpc_request).and_raise('tasks/result must not be sent')
