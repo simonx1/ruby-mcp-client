@@ -36,7 +36,7 @@ module MCPClient
         # @param issuer [String] the authorization server the resource left
         # @return [void]
         def end_pending_requests_of(issuer)
-          with_pending_flow_lock do
+          with_authorization_state_lock do
             pending = stored_pkce
             return unless pending.respond_to?(:issuer) && pending.issuer == issuer
 

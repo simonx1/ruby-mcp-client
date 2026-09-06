@@ -247,14 +247,23 @@ RSpec.describe 'MCP 2026-07-28 authorization — round 38' do
         .to contain_exactly('files:read', 'files:write')
     end
 
-    it 'keeps the configured scope when a challenge names another one' do
+    # The step-up union preserves PREVIOUSLY REQUESTED permissions. A client
+    # that has asked for nothing and holds no grant has none: the challenge
+    # decides the first authorization alone, and the configured scope joins
+    # the union only from the request after it (see round 42).
+    it 'keeps the configured scope once it has actually been requested' do
       storage.set_server_metadata(server_url, server_metadata(issuer_a))
       storage.set_client_info(server_url, client_info('client-a', issuer_a))
       provider = provider_for(scope: 'files:read')
       provider.instance_variable_set(:@challenge_scope, 'files:write')
 
       expect(param_in(provider.start_authorization_flow, 'scope').split)
-        .to contain_exactly('files:read', 'files:write')
+        .to contain_exactly('files:write')
+
+      provider.instance_variable_set(:@challenge_scope, 'mail:send')
+
+      expect(param_in(provider.start_authorization_flow, 'scope').split)
+        .to contain_exactly('files:read', 'files:write', 'mail:send')
     end
 
     it 'does not carry one authorization server scopes into another server request' do

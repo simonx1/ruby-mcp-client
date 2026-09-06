@@ -135,7 +135,13 @@ RSpec.describe 'MCP 2026-07-28 authorization' do
       token = provider.complete_authorization_flow('code', state, iss: 'https://auth.example.com')
 
       expect(token.access_token).to eq('tok')
-      expect(token_request).to have_been_requested
+      # The exchange names the client it was made with and the resource the
+      # token is for (RFC 8707), so a token bought here is never a bearer
+      # token for some other audience.
+      expect(token_request.with do |request|
+        body = URI.decode_www_form(request.body).to_h
+        body['client_id'] == 'pre-registered' && body['resource'] == server_url
+      end).to have_been_requested
     end
 
     it 'rejects a response without iss when the server advertises the parameter' do

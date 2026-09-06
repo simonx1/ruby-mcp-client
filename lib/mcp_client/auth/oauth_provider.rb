@@ -12,6 +12,7 @@ require_relative 'oauth_provider/client_authentication'
 require_relative 'oauth_provider/pending_requests'
 require_relative 'oauth_provider/registration_store'
 require_relative 'oauth_provider/response_validation'
+require_relative 'oauth_provider/scope_selection'
 require_relative 'oauth_provider/token_store'
 
 module MCPClient
@@ -20,11 +21,13 @@ module MCPClient
     # Handles the complete OAuth flow including server discovery, client registration,
     # authorization, token exchange, and refresh
     class OAuthProvider
-      # One lock per storage backend and resource for the pending-flow records
-      # (see {#with_pending_flow_lock}); storage backends are weak keys.
-      PENDING_FLOW_LOCKS = ObjectSpace::WeakMap.new
-      PENDING_FLOW_LOCKS_GUARD = Mutex.new
-      private_constant :PENDING_FLOW_LOCKS, :PENDING_FLOW_LOCKS_GUARD
+      # One lock per storage backend and resource for this resource's
+      # authorization state — the pending-flow records and the token slot they
+      # end in (see {#with_authorization_state_lock}); storage backends are
+      # weak keys.
+      AUTHORIZATION_STATE_LOCKS = ObjectSpace::WeakMap.new
+      AUTHORIZATION_STATE_LOCKS_GUARD = Mutex.new
+      private_constant :AUTHORIZATION_STATE_LOCKS, :AUTHORIZATION_STATE_LOCKS_GUARD
 
       # One auth-param (name = token / quoted-string) as it appears in a
       # WWW-Authenticate challenge (RFC 7235 §2.1, optional whitespace around
@@ -44,6 +47,7 @@ module MCPClient
       include PendingRequests
       include RegistrationStore
       include ResponseValidation
+      include ScopeSelection
       include TokenStore
 
       # @!attribute [rw] redirect_uri
@@ -263,7 +267,7 @@ module MCPClient
                         state: state,
                         resource: server_url,
                         scope: @requested_scope)
-        with_pending_flow_lock do
+        with_authorization_state_lock do
           storage.set_pkce(server_url, pkce)
 
           # The separate slot is still written: it is the documented storage
@@ -336,23 +340,29 @@ module MCPClient
       # @return [Token]
       # @raise [MCPClient::Errors::ConnectionError] when the response is no longer this resource's to keep
       def accept_exchanged_token(token, pkce)
-        raise_authorization_server_changed!(pkce.issuer) unless exchange_target_current?(pkce.issuer)
-        # Two resources may share an authorization server and still be two
-        # audiences: a token bought for the resource the request named is
-        # never stored as another resource's, however alike their issuers.
-        raise_resource_changed!(pkce.resource) unless request_resource_current?(pkce)
-        # A validated change of authorization server ends the requests still
-        # pending with the previous one (see {#end_pending_requests_of}),
-        # whichever provider sharing the storage made them: a request whose
-        # record is gone was answered by a server that is no longer this
-        # resource's, however current that server still looks from here.
-        raise_authorization_server_changed!(pkce.issuer) unless request_still_pending?(pkce)
+        # Under the resource's authorization-state lock, so the answers these
+        # checks give are still the answers when the token is written: a
+        # switch of authorization server validated between the two would
+        # otherwise store its token first and have this one written over it.
+        with_authorization_state_lock do
+          raise_authorization_server_changed!(pkce.issuer) unless exchange_target_current?(pkce.issuer)
+          # Two resources may share an authorization server and still be two
+          # audiences: a token bought for the resource the request named is
+          # never stored as another resource's, however alike their issuers.
+          raise_resource_changed!(pkce.resource) unless request_resource_current?(pkce)
+          # A validated change of authorization server ends the requests still
+          # pending with the previous one (see {#end_pending_requests_of}),
+          # whichever provider sharing the storage made them: a request whose
+          # record is gone was answered by a server that is no longer this
+          # resource's, however current that server still looks from here.
+          raise_authorization_server_changed!(pkce.issuer) unless request_still_pending?(pkce)
 
-        store_token(token)
+          store_token(token)
 
-        # Clean up this request's temporary data — and only this request's: a
-        # flow started meanwhile keeps the records it is waiting on.
-        discard_pending_request(pkce)
+          # Clean up this request's temporary data — and only this request's: a
+          # flow started meanwhile keeps the records it is waiting on.
+          discard_pending_request(pkce)
+        end
 
         token
       end
@@ -400,7 +410,7 @@ module MCPClient
       # @param pkce [PKCE] the per-request record whose flow just ended
       # @return [void]
       def discard_pending_request(pkce)
-        with_pending_flow_lock do
+        with_authorization_state_lock do
           pending = stored_pkce
           discard_pending_pkce(pkce) if pending.nil? || same_request?(pending, pkce)
           recorded = pkce.state if pkce.respond_to?(:state)
@@ -409,19 +419,27 @@ module MCPClient
         end
       end
 
-      # The pending-flow records of one resource in one storage backend are
-      # written, and read-compared-deleted, under one in-process lock: a flow
-      # another provider (or thread) starts while a completed flow discards
-      # its records waits for the delete instead of losing its records to it.
-      # The storage interface has no conditional delete, and a backend need
-      # not answer a delete with the record it removed, so the window has to
-      # be closed on this side. The lock is re-entrant: a flow the SAME
-      # thread starts from inside a storage callback is not deadlocked, and
-      # falls back to the put-back a record-answering delete allows.
+      # The authorization state of one resource in one storage backend — the
+      # pending-flow records, and the token slot an accepted response is
+      # written to — is read, compared and written under one in-process lock.
+      # Two windows depend on it. A flow another provider (or thread) starts
+      # while a completed flow discards its records waits for the delete
+      # instead of losing its records to it; and the checks that accept a
+      # token (issuer, resource, pending request, token in use) stay true
+      # until that token is stored, so a change of authorization server
+      # validated meanwhile cannot have its token written over by a response
+      # that passed its checks just before it.
+      #
+      # The storage interface has no conditional write or delete, and a
+      # backend need not answer a delete with the record it removed, so both
+      # windows have to be closed on this side. The lock is re-entrant: a flow
+      # the SAME thread starts from inside a storage callback is not
+      # deadlocked, and falls back to the put-back a record-answering delete
+      # allows.
       # @return [Object] the block's value
-      def with_pending_flow_lock(&)
-        lock = PENDING_FLOW_LOCKS_GUARD.synchronize do
-          (PENDING_FLOW_LOCKS[storage] ||= {})[server_url] ||= Monitor.new
+      def with_authorization_state_lock(&)
+        lock = AUTHORIZATION_STATE_LOCKS_GUARD.synchronize do
+          (AUTHORIZATION_STATE_LOCKS[storage] ||= {})[server_url] ||= Monitor.new
         end
         lock.synchronize(&)
       end
@@ -431,7 +449,7 @@ module MCPClient
       # backend that answers the delete with the record it removed (the
       # in-memory one does, as does anything Hash-backed) says whose record
       # went, and a newer flow's is put back — and, held under
-      # {#with_pending_flow_lock}, the newer flow cannot start in between at
+      # {#with_authorization_state_lock}, the newer flow cannot start in between at
       # all within one process.
       # @param pkce [PKCE] the record whose flow just ended
       # @return [void]
@@ -730,112 +748,6 @@ module MCPClient
               "(recorded #{safe_error_text(recorded)}); restart the authorization"
       end
 
-      # Resolve the scope for authorization/registration requests: the MCP
-      # scope SELECTION strategy picks what this request needs (see
-      # {#selected_scope}), and the 2026-07-28 step-up rule adds back what has
-      # already been asked for (see {#accumulated_scope}).
-      # @return [String, nil]
-      def resolved_scope
-        accumulated_scope(selected_scope)
-      end
-
-      # What this request needs, by the MCP 2025-11-25 scope selection
-      # strategy: the challenge's scope parameter is authoritative; then an
-      # explicitly configured scope (:all resolves to the AS-advertised scope
-      # list); then the Protected Resource Metadata's scopes_supported;
-      # otherwise no scope at all.
-      # @return [String, nil]
-      def selected_scope
-        return @challenge_scope if @challenge_scope && !@challenge_scope.empty?
-
-        if scope == :all
-          all_scopes = supported_scopes
-          return all_scopes.join(' ') unless all_scopes.empty?
-        elsif scope
-          return scope
-        end
-
-        prm = @challenge_resource_metadata || @resource_metadata
-        prm_scopes = advertised_scopes(prm&.scopes_supported)
-        return prm_scopes.join(' ') unless prm_scopes.empty?
-
-        nil
-      end
-
-      # MCP 2026-07-28 "Step-Up Authorization Flow", step 2: "Determine
-      # required scopes by computing the union of the client's previously
-      # requested scope set and the scopes from the current challenge. This
-      # ensures previously granted permissions are preserved when servers
-      # emit per-operation scope challenges." A challenge is authoritative for
-      # what the CURRENT operation needs, not for what the client already had:
-      # re-authorizing with the challenge's scope alone trades the permissions
-      # every other operation depends on for the one being retried, and the
-      # next operation challenges again.
-      # @param selected [String, nil] the scope this request selects on its own
-      # @return [String, nil] the union, or nil when no scope is to be sent
-      def accumulated_scope(selected)
-        scopes = (previously_requested_scopes + selected.to_s.split).uniq
-        scopes.empty? ? nil : scopes.join(' ')
-      end
-
-      # "The client's previously requested scope set". Three things say what
-      # this client already asked for, and a step-up that consulted only the
-      # first would trade away permissions:
-      #
-      # * the last authorization request this provider made — in-process, and
-      #   gone the moment the process restarts or the host builds another
-      #   provider;
-      # * the scope the host configured, which is what this client asks for
-      #   whenever a challenge is not overriding it;
-      # * the scope of the token in hand, which is what the authorization
-      #   server actually granted (RFC 6749 Section 5.1) and is the only one
-      #   of the three that survives a restart.
-      #
-      # The granted set counts only while the token belongs to the
-      # authorization server in use: what one server granted is not a
-      # permission another one ever gave, and asking B for A's scopes is at
-      # best a rejected request. The in-process set is dropped for the same
-      # reason when the authorization server changes, and with the rest of
-      # the per-server state when the provider is retargeted.
-      # @return [Array<String>]
-      def previously_requested_scopes
-        (@requested_scope.to_s.split + configured_scopes + granted_scopes).uniq
-      end
-
-      # The scope the host configured, as a list.
-      # @return [Array<String>]
-      def configured_scopes
-        return supported_scopes if scope == :all
-        return [] unless scope.is_a?(String)
-
-        scope.split
-      end
-
-      # The scope the authorization server in use granted the token in hand.
-      # A token of another authorization server — or one this client
-      # retired — grants nothing here.
-      # @return [Array<String>]
-      def granted_scopes
-        token = stored_token_or_nil
-        return [] unless token.respond_to?(:scope) && token.scope.is_a?(String)
-        return [] unless token_for_current_issuer?(token) || bindable_to_current_issuer?(token)
-
-        token.scope.split
-      end
-
-      # A scopes_supported value as a scope list: RFC 8414 Section 2 and RFC
-      # 9728 Section 2 both make it an array of strings, and a document that
-      # breaks that is refused on the wire — but a record read back from a
-      # storage backend that persists plain hashes is not, and `"a b".join`
-      # is a NoMethodError out of the flow.
-      # @param scopes [Object, nil] the advertised value
-      # @return [Array<String>] the scopes, or none
-      def advertised_scopes(scopes)
-        return [] unless scopes.is_a?(Array)
-
-        scopes.grep(String)
-      end
-
       # Normalize server URL to canonical form
       # @param url [String] Server URL
       # @return [String] Normalized URL
@@ -953,6 +865,9 @@ module MCPClient
       # @return [ServerMetadata] Authorization server metadata
       # @raise [MCPClient::Errors::ConnectionError] if discovery fails
       def discover_authorization_server
+        # Another provider sharing the storage may have moved this resource to
+        # another authorization server since this one last resolved anything.
+        forget_foreign_server_switch
         # A CHALLENGE we refused is still authoritative: it says the cached
         # authorization server is no longer the right one. Falling back to
         # that cache (or to speculative well-known probing) would quietly
@@ -966,7 +881,7 @@ module MCPClient
         # whether the challenge-advertised PRM was already fetched or only its
         # URL is pending (e.g. the initial fetch failed and must be retried).
         challenge_pending = @challenge_resource_metadata || @challenge_metadata_url
-        cached = stored_server_metadata unless challenge_pending
+        cached = stored_server_metadata unless challenge_pending || @rediscover_after_switch
         if cached
           # Validate the cached entry before use so a persisted/older cache with
           # an HTTP endpoint or without S256 is still rejected.
@@ -976,12 +891,51 @@ module MCPClient
           # the parameter. Treating that silence as "not supported" would
           # accept an authorization response without `iss` from a server that
           # advertises it, so the answer is rediscovered rather than assumed.
-          return cached if cached.iss_parameter_recorded?
+          return note_state_issuer(cached) if cached.iss_parameter_recorded?
 
           logger.debug('Cached authorization server metadata predates the iss parameter record; rediscovering')
         end
 
-        discover_and_cache_authorization_server
+        note_state_issuer(discover_and_cache_authorization_server)
+      end
+
+      # Drop the issuer-dependent state this provider resolved against an
+      # authorization server that another provider sharing the storage has
+      # since replaced. The switch itself was made there — the token retired,
+      # the pending requests ended — but the scope state cached HERE
+      # (the resource metadata that advertised the previous server's scopes,
+      # the scopes it supported, the scope this provider last asked it for)
+      # would otherwise be carried into a request to the new server: asking B
+      # for A's scopes, which B may refuse outright or answer with permissions
+      # that do not cover the operation.
+      # @return [void]
+      def forget_foreign_server_switch
+        return unless @state_issuer
+
+        current = stored_server_metadata&.issuer
+        return if current.nil? || current == @state_issuer
+
+        logger.debug('The authorization server changed in shared storage; discarding the scopes of the previous one')
+        @state_issuer = nil
+        @supported_scopes = nil
+        @resource_metadata = nil
+        @requested_scope = nil
+        # What the new server advertises for this resource has never been read
+        # here: the cached entry another provider wrote says which server it
+        # is, not which scopes it offers. One rediscovery pass fetches the
+        # protected resource metadata again, so the next request asks for
+        # scopes this server actually advertises rather than for none.
+        @rediscover_after_switch = true
+      end
+
+      # Note the authorization server the state resolved here belongs to, so a
+      # change another provider makes in shared storage is recognised.
+      # @param metadata [ServerMetadata, nil] the metadata this resolution settled on
+      # @return [ServerMetadata, nil] the metadata, unchanged
+      def note_state_issuer(metadata)
+        @state_issuer = metadata.issuer if metadata.respond_to?(:issuer) && metadata.issuer
+        @rediscover_after_switch = nil
+        metadata
       end
 
       # Discover authorization server metadata, validate it, and cache it.
@@ -2005,28 +1959,36 @@ module MCPClient
       def accept_refreshed_token(new_token, issuer, resource, refreshed = nil)
         # A provider retargeted at another resource meanwhile — one that may
         # share the authorization server — is not handed the previous
-        # resource's token as its own.
+        # resource's token as its own. Judged before the lock: the lock of the
+        # resource this provider now serves says nothing about the one the
+        # refresh was made for.
         unless resource == server_url
           logger.warn('Discarding the refreshed token: the resource changed while the refresh was in flight')
           return nil
         end
-        unless refresh_target_current?(issuer)
-          logger.warn('Discarding the refreshed token: the authorization server changed while the refresh ' \
-                      'was in flight')
-          return nil
-        end
-        # What shared storage shows is what another provider did meanwhile: a
-        # challenge it validated retired the token being refreshed, or a flow
-        # it completed replaced it. This provider's own view of the
-        # authorization server says nothing about either, so the response is
-        # kept only while the token it refreshed is still the token in use.
-        unless refreshed_token_in_use?(refreshed)
-          logger.warn('Discarding the refreshed token: the token it refreshed is no longer the token in use')
-          return nil
-        end
 
-        store_token(new_token)
-        new_token
+        # The remaining checks and the write are one step, for the reason
+        # {#with_authorization_state_lock} gives: a switch validated between
+        # them would otherwise have its token written over by this response.
+        with_authorization_state_lock do
+          unless refresh_target_current?(issuer)
+            logger.warn('Discarding the refreshed token: the authorization server changed while the refresh ' \
+                        'was in flight')
+            next nil
+          end
+          # What shared storage shows is what another provider did meanwhile: a
+          # challenge it validated retired the token being refreshed, or a flow
+          # it completed replaced it. This provider's own view of the
+          # authorization server says nothing about either, so the response is
+          # kept only while the token it refreshed is still the token in use.
+          unless refreshed_token_in_use?(refreshed)
+            logger.warn('Discarding the refreshed token: the token it refreshed is no longer the token in use')
+            next nil
+          end
+
+          store_token(new_token)
+          new_token
+        end
       end
 
       # The scope an authorization request asked for, as recorded with it.

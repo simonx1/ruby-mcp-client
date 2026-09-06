@@ -191,10 +191,21 @@ RSpec.describe 'OAuth challenge handling (MCP 2025-11-25)' do
     describe 'scope resolution priority' do
       # The challenge decides what the CURRENT operation needs; MCP
       # 2026-07-28 step-up then asks for "the union of the client's
-      # previously requested scope set and the scopes from the current
-      # challenge", so the configured scope is not traded away for it.
-      it 'adds the challenge scope to what this client already asks for' do
+      # PREVIOUSLY REQUESTED scope set and the scopes from the current
+      # challenge", so the configured scope is not traded away for it — once
+      # it has actually been requested. A first authorization has no
+      # previously requested set, and the challenge decides it alone.
+      it 'asks for the challenge scope alone until something was requested' do
         provider.scope = 'configured:scope'
+        provider.instance_variable_set(:@challenge_scope, 'challenge:scope')
+
+        expect(provider.send(:resolved_scope).split).to contain_exactly('challenge:scope')
+        expect(provider.send(:selected_scope)).to eq('challenge:scope')
+      end
+
+      it 'adds the challenge scope to what this client already asked for' do
+        provider.scope = 'configured:scope'
+        provider.instance_variable_set(:@requested_scope, 'configured:scope')
         provider.instance_variable_set(:@challenge_scope, 'challenge:scope')
 
         expect(provider.send(:resolved_scope).split)

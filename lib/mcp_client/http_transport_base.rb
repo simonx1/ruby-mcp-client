@@ -928,20 +928,26 @@ module MCPClient
       @logger.debug("OAuth challenge processing failed: #{e.message}")
     end
 
-    # Raise the appropriate error for a 401/403: an insufficient_scope 403
+    # Raise the appropriate error for a 401/403: an insufficient_scope
     # challenge (SEP-835) raises InsufficientScopeError exposing the required
     # scopes so hosts can run a step-up authorization flow.
+    #
+    # The status the challenge arrives with does not change what it is. RFC
+    # 6750 Section 3.1 pairs insufficient_scope with 403, and authorization
+    # servers and resource servers do send it on 401 as well; a host that
+    # rescues the typed error to run the step-up flow would otherwise miss
+    # exactly those.
     # @param response [Faraday::Response] the 401/403 response
     # @raise [MCPClient::Errors::InsufficientScopeError, MCPClient::Errors::ConnectionError]
     def raise_authorization_error(response)
       challenge = bearer_challenge_segment(www_authenticate_header(response))
 
-      if response.status == 403 && insufficient_scope_challenge?(challenge)
+      if insufficient_scope_challenge?(challenge)
         scope = challenge[/(?:^|[\s,])scope\s*=\s*"([^"]*)"/i, 1] ||
                 challenge[/(?:^|[\s,])scope\s*=\s*([^,\s"]+)/i, 1]
         description = challenge[/(?:^|[\s,])error_description\s*=\s*"([^"]*)"/i, 1]
         raise MCPClient::Errors::InsufficientScopeError.new(
-          "Authorization failed: HTTP 403 insufficient_scope#{" (required scopes: #{scope})" if scope}",
+          "Authorization failed: HTTP #{response.status} insufficient_scope#{" (required scopes: #{scope})" if scope}",
           scope: scope, error_description: description
         )
       end

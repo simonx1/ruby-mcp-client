@@ -138,17 +138,24 @@ module MCPClient
           return unless advertised && known && advertised != known
 
           @authorization_server_switched = true
-          # The requests still pending with the server this resource left can
-          # never complete as this resource's: ended now, before anything is
-          # fetched from the advertised server, so a late answer to them is
-          # refused by every provider sharing the storage.
-          end_pending_requests_of(known)
-          # A token another provider sharing the storage already bound to the
-          # advertised server is exactly the token to keep.
-          return if record_bound_to?(stored_token_or_nil, advertised)
+          # Ending the pending requests and retiring the token are one step
+          # against the responses being accepted meanwhile: a code exchange or
+          # refresh that has passed its checks holds this lock until its token
+          # is written, so it is never this transition that lands in between
+          # (see {MCPClient::Auth::OAuthProvider#with_authorization_state_lock}).
+          with_authorization_state_lock do
+            # The requests still pending with the server this resource left can
+            # never complete as this resource's: ended now, before anything is
+            # fetched from the advertised server, so a late answer to them is
+            # refused by every provider sharing the storage.
+            end_pending_requests_of(known)
+            # A token another provider sharing the storage already bound to the
+            # advertised server is exactly the token to keep.
+            next if record_bound_to?(stored_token_or_nil, advertised)
 
-          logger.debug('The challenge names another authorization server; retiring the stored token')
-          delete_token(bind_to: Token::RETIRED_ISSUER)
+            logger.debug('The challenge names another authorization server; retiring the stored token')
+            delete_token(bind_to: Token::RETIRED_ISSUER)
+          end
         end
 
         # Apply the checks discovery applies to challenge-advertised resource
