@@ -87,7 +87,8 @@ RSpec.describe 'Request timeouts and cancellation (MCP 2025-11-25)' do
       allow(server).to receive(:http_connection).and_return(conn)
       calls = []
       allow(conn).to receive(:post) do |_endpoint, &blk|
-        req = Struct.new(:headers, :body, :options).new({}, nil, Struct.new(:timeout, :context).new(nil, nil))
+        req = Struct.new(:headers, :body, :options).new({}, nil,
+                                                        Struct.new(:timeout, :open_timeout, :context).new(nil, nil))
         blk&.call(req)
         body = req.body && JSON.parse(req.body)
         calls << body
@@ -111,7 +112,8 @@ RSpec.describe 'Request timeouts and cancellation (MCP 2025-11-25)' do
       conn = double('conn')
       allow(server).to receive(:http_connection).and_return(conn)
       allow(conn).to receive(:post) do |_endpoint, &blk|
-        req = Struct.new(:headers, :body, :options).new({}, nil, Struct.new(:timeout, :context).new(nil, nil))
+        req = Struct.new(:headers, :body, :options).new({}, nil,
+                                                        Struct.new(:timeout, :open_timeout, :context).new(nil, nil))
         blk&.call(req)
         captured_options = req.options
         Struct.new(:status, :headers, :body, :success?).new(
@@ -123,6 +125,9 @@ RSpec.describe 'Request timeouts and cancellation (MCP 2025-11-25)' do
       server.rpc_request('tools/list', {}, timeout: 42)
 
       expect(captured_options.timeout).to eq(42)
+      # The same bound covers connection setup (a stalled TLS handshake
+      # delivers no byte for the deadline check to see).
+      expect(captured_options.open_timeout).to eq(42)
     end
   end
 

@@ -81,7 +81,7 @@ module MCPClient
         # arrived belongs to the attempt whose body is finally parsed).
         buffer.clear
         listener = state[:mcp_stream_listener]
-        scanner = listener && SseEventScanner.new
+        scanner = listener && SseEventScanner.new(max_inflated_bytes: state[:mcp_inflate_limit])
         state[:mcp_live_events] = 0
         env.request.on_data = lambda do |chunk, _size, _env|
           buffer << chunk.to_s
@@ -480,8 +480,10 @@ module MCPClient
     # @param error [MCPClient::Errors::MCPError] the probe failure
     # @return [Boolean]
     def unknown_method_404?(error)
-      error.is_a?(MCPClient::Errors::ServerError) &&
-        error.code == MCPClient::Errors::Codes::METHOD_NOT_FOUND && error.http_status == 404
+      # Only a well-formed error object counts (from_jsonrpc types the -32601
+      # only when it carries a string message): a malformed one identifies
+      # nothing, and must not be cached as a modern verdict either.
+      error.is_a?(MCPClient::Errors::MethodNotFoundError) && error.modern_http_protocol_error?
     end
 
     # After UnsupportedProtocolVersionError, pick a mutually supported version
@@ -671,7 +673,7 @@ module MCPClient
       # ResponseBodyCapture fills this in as the body arrives, so the bytes
       # that made it are still here when Faraday raises instead of returning.
       capture = { mcp_body_buffer: +'', mcp_deadline: deadline,
-                  mcp_stream_listener: response_stream_listener(request) }
+                  mcp_stream_listener: response_stream_listener(request), mcp_inflate_limit: inflate_limit }
 
       begin
         response = conn.post(@endpoint) do |req|
@@ -705,7 +707,7 @@ module MCPClient
       rescue *INTERRUPTED_EXCHANGE_FARADAY_ERRORS => e
         # The body may have been fully delivered before the socket died; if it
         # was, that response settles the request and must not be replaced.
-        salvaged = salvaged_response(capture[:mcp_body_buffer], request, e)
+        salvaged = salvaged_response(capture[:mcp_body_buffer], request, e, capture)
         return salvaged if salvaged
 
         raise connection_failure_error(e, request)
@@ -738,10 +740,17 @@ module MCPClient
     # @return [void]
     def prepare_http_request(req, request, sent_session_id, timeout, capture)
       apply_request_headers(req, request)
-      req.options.context = (req.options.context || {}).merge(capture)
+      # The capture hash itself is the request context, not a merged copy:
+      # what the capture middleware records as the body arrives (the events
+      # already handed to the stream listener) must be on the hash a salvaged
+      # response carries, or those events would be delivered a second time.
+      req.options.context = capture.replace((req.options.context || {}).merge(capture))
       # Per-request timeout override (MCP lifecycle: timeouts SHOULD be
       # configurable on a per-request basis)
-      req.options.timeout = timeout if timeout
+      # The same bound covers connection setup: a server that accepts the
+      # socket and stalls the TLS handshake never delivers a byte for the
+      # deadline check to see.
+      req.options.timeout = req.options.open_timeout = timeout if timeout
       # The wire header must match the captured id exactly: a restart
       # completing between capture and header attachment would otherwise
       # attach a different (or fresh) session than the one attributed to
@@ -828,7 +837,8 @@ module MCPClient
       return nil unless error.is_a?(Faraday::TimeoutError) || interrupted_exchange?(error)
 
       body = partial_body.to_s
-      return nil if body.empty?
+      body = inflate_delivered_gzip(body) if body.b.start_with?(SseEventScanner::GZIP_MAGIC)
+      return nil if body.nil? || body.empty?
 
       sse = sse_framed_body?(body)
       # A truncated stream's last event has no terminating blank line, so it

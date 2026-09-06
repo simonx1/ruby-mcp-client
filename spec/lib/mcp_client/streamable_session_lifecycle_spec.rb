@@ -336,7 +336,8 @@ RSpec.describe 'Streamable HTTP session lifecycle (MCP 2025-11-25)' do
       allow(conn).to receive(:delete)
         .and_return(Struct.new(:status, :headers, :body, :success?).new(200, {}, '', true))
       allow(conn).to receive(:post) do |_endpoint, &blk|
-        req = Struct.new(:headers, :body, :options).new({}, nil, Struct.new(:timeout, :context).new(nil, nil))
+        req = Struct.new(:headers, :body, :options).new({}, nil,
+                                                        Struct.new(:timeout, :open_timeout, :context).new(nil, nil))
         # Simulate a concurrent restart completing between capture and header
         # application: the live session changes under the request.
         allow(server).to receive(:apply_request_headers) do |r, _request|

@@ -2,6 +2,8 @@
 
 require 'spec_helper'
 require 'webmock/rspec'
+require 'zlib'
+require 'stringio'
 
 # Verification follow-ups for MCP 2026-07-28 Streamable HTTP modern mode.
 #
@@ -658,7 +660,17 @@ class MidStreamCloseServer
   # `message` as one complete SSE event, call `waiter` and, only if it
   # returns true, send `reply` as the final event and end the response
   # properly. A waiter that gives up ends the response without the reply.
+  # `message` may also be the raw bytes of the event (a String), or several
+  # raw chunks (an Array of Strings) written one at a time.
   EVENT_THEN_WAIT = :event_then_wait
+  # Reply token pair [EVENT_THEN_STALL, message]: send `message` as one
+  # complete SSE event, then hold the socket open without ever ending the
+  # response.
+  EVENT_THEN_STALL = :event_then_stall
+  # Reply token pair [GZIP_THEN_CLOSE, reply]: the complete final SSE event,
+  # gzip-encoded as the client's Accept-Encoding allows, then close without
+  # the terminating chunk. The response *did* arrive, compressed.
+  GZIP_THEN_CLOSE = :gzip_then_close
 
   # A self-signed certificate for 127.0.0.1, built once for the whole file
   # because key generation is the expensive part.
@@ -684,11 +696,15 @@ class MidStreamCloseServer
   attr_reader :port
 
   # @param tls [Boolean] whether to serve HTTPS with the self-signed certificate
+  # @param stall_handshake_from [Integer, nil] the TCP connection (1-based)
+  #   from which on the TLS handshake is never completed: the server accepts
+  #   the socket and then does nothing with it
   # @yieldparam message [Hash] the JSON-RPC message the client POSTed
   # @yieldreturn [Hash, Symbol, Array] a JSON-RPC reply, or one of the reply tokens
-  def initialize(tls: false, &responder)
+  def initialize(tls: false, stall_handshake_from: nil, &responder)
     @responder = responder
     @tls = tls
+    @stall_handshake_from = stall_handshake_from
     @received = []
     @received_headers = []
     @connections = 0
@@ -758,6 +774,7 @@ class MidStreamCloseServer
 
   def handle(socket)
     client = nil
+    sleep if @stall_handshake_from && connections >= @stall_handshake_from
     client = wrap(socket)
     serve(client)
   rescue StandardError
@@ -786,9 +803,14 @@ class MidStreamCloseServer
   end
 
   def serve(client)
-    return unless client.gets # the request line
+    request_line = client.gets
+    return unless request_line
 
     headers = read_headers(client)
+    # A legacy Streamable HTTP client opens the GET events stream after its
+    # handshake; this fixture serves POST response streams only.
+    return write_plain(client, 405, '') if request_line.start_with?('GET')
+
     message = JSON.parse(client.read(headers['content-length'].to_i).to_s)
     @mutex.synchronize do
       @received << message
@@ -814,7 +836,8 @@ class MidStreamCloseServer
 
     case token
     when CLOSE_MID_STREAM then write_sse_chunk(client, ": keep-alive\n\n")
-    when DELIVER_THEN_CLOSE then write_sse_chunk(client, "event: message\ndata: #{JSON.generate(payload)}\n\n")
+    when DELIVER_THEN_CLOSE then write_sse_chunk(client, sse_events_for(payload))
+    when GZIP_THEN_CLOSE then write_gzip_chunk(client, sse_events_for(payload))
     when DELIVER_UNTERMINATED then write_sse_chunk(client, "event: message\ndata: #{JSON.generate(payload)}\n")
     when DRIP_FOREVER then drip(client, payload || 0.02)
     when HTTP_STATUS then write_plain(client, payload, extra.to_s)
@@ -822,8 +845,8 @@ class MidStreamCloseServer
       sleep payload
       return write_reply(client, extra)
     when STALL then sleep
-    when DELIVER_THEN_STALL
-      write_sse_chunk(client, "event: message\ndata: #{JSON.generate(payload)}\n\n")
+    when DELIVER_THEN_STALL, EVENT_THEN_STALL
+      write_sse_chunk(client, sse_events_for(payload))
       client.flush
       sleep
     when EVENT_THEN_WAIT then event_then_wait(client, *reply[1..])
@@ -836,13 +859,33 @@ class MidStreamCloseServer
   # done its part (answered a server request, observed a notification), and
   # a properly terminated response either way.
   def event_then_wait(client, message, waiter, reply)
-    write_sse_chunk(client, "event: message\ndata: #{JSON.generate(message)}\n\n")
-    client.flush
+    write_sse_head(client)
+    Array(message.is_a?(Array) ? message : [message]).each_with_index do |part, index|
+      sleep 0.05 if index.positive?
+      chunk = part.is_a?(String) ? part : sse_events_for(part)
+      client.write(format("%<size>x\r\n%<chunk>s\r\n", size: chunk.bytesize, chunk: chunk))
+      client.flush
+    end
     if waiter.call
       chunk = "event: message\ndata: #{JSON.generate(reply)}\n\n"
       client.write(format("%<size>x\r\n%<chunk>s\r\n", size: chunk.bytesize, chunk: chunk))
     end
     client.write("0\r\n\r\n")
+  end
+
+  # One or several complete, LF-framed SSE events.
+  # @param payload [Hash, Array<Hash>] the JSON-RPC message(s) to frame
+  # @return [String]
+  def sse_events_for(payload)
+    Array(payload.is_a?(Array) ? payload : [payload]).map { |m| "event: message\ndata: #{JSON.generate(m)}\n\n" }.join
+  end
+
+  # The chunk gzip-encoded, as one chunk and no terminating zero chunk.
+  def write_gzip_chunk(client, chunk)
+    compressed = StringIO.new.tap { |io| Zlib::GzipWriter.wrap(io) { |gz| gz.write(chunk) } }.string
+    client.write("HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Encoding: gzip\r\n" \
+                 "Transfer-Encoding: chunked\r\nConnection: close\r\n\r\n")
+    client.write(format("%<size>x\r\n%<chunk>s\r\n", size: compressed.bytesize, chunk: compressed))
   end
 
   def write_sse_head(client)
@@ -902,8 +945,8 @@ RSpec.describe 'MCP 2026-07-28 Streamable HTTP — a response stream that really
       'capabilities' => { 'tools' => {} } }
   end
 
-  def start_server(tls: false, &responder)
-    @fixture = MidStreamCloseServer.new(tls: tls, &responder)
+  def start_server(tls: false, **opts, &responder)
+    @fixture = MidStreamCloseServer.new(tls: tls, **opts, &responder)
   end
 
   def transport(klass, **opts)
@@ -1386,6 +1429,213 @@ RSpec.describe 'MCP 2026-07-28 Streamable HTTP — a response stream that really
       end
       # Dispatched exactly once: not again when the completed body is parsed.
       expect(seen.size).to eq(1)
+    end
+  end
+
+  describe 'deadlines bound connection setup' do
+    # A deadline that is only checked as body bytes arrive says nothing about
+    # a connection that never gets that far: a server that accepts the TCP
+    # connection and then stalls the TLS handshake would hold the request
+    # for the transport's whole open timeout. The clamped socket timeout has
+    # to bound the handshake too.
+    it 'gives up on a stalled TLS handshake at the discovery deadline' do
+      start_server(tls: true, stall_handshake_from: 1) { |message| jsonrpc(message, discovery) }
+      server = transport(MCPClient::ServerHTTP, read_timeout: 5, discover_timeout: 0.2)
+      started = Process.clock_gettime(Process::CLOCK_MONOTONIC)
+
+      expect { server.connect }.to raise_error(MCPClient::Errors::MCPError)
+
+      expect(Process.clock_gettime(Process::CLOCK_MONOTONIC) - started).to be < 2
+    end
+
+    [MCPClient::ServerStreamableHTTP, MCPClient::ServerHTTP].each do |klass|
+      it "gives up on a stalled TLS handshake at a request's own timeout on #{klass}" do
+        start_server(tls: true, stall_handshake_from: 2) { |message| jsonrpc(message, discovery) }
+        server = transport(klass, read_timeout: 5)
+        server.connect
+        started = Process.clock_gettime(Process::CLOCK_MONOTONIC)
+
+        expect { server.rpc_request('tools/list', {}, timeout: 0.2) }.to raise_error(MCPClient::Errors::MCPError)
+
+        expect(Process.clock_gettime(Process::CLOCK_MONOTONIC) - started).to be < 2
+      end
+    end
+  end
+
+  describe "#{MCPClient::ServerHTTP} legacy pings under every SSE framing" do
+    def legacy_ping_server(framing)
+      start_server do |message|
+        case message['method']
+        when 'server/discover' then [MidStreamCloseServer::HTTP_STATUS, 400, 'Bad Request']
+        when 'initialize' then jsonrpc(message, legacy_init)
+        when 'tools/list'
+          waiter = -> { settled_within?(3) { @fixture.received.any? { |m| m['id'] == 'ping-1' } } }
+          [MidStreamCloseServer::EVENT_THEN_WAIT, framing, waiter, jsonrpc(message, { 'tools' => [] })]
+        else [MidStreamCloseServer::HTTP_STATUS, 202, '']
+        end
+      end
+    end
+
+    let(:ping) { JSON.generate('jsonrpc' => '2.0', 'id' => 'ping-1', 'method' => 'ping') }
+
+    # SSE line terminators are CRLF, CR or LF. A bare CR that ends an event's
+    # blank line completes the event whatever byte follows it, so it must not
+    # be held back waiting for one — the server is waiting for the pong.
+    it 'answers a ping framed with bare CR while the stream is open' do
+      legacy_ping_server("data: #{ping}\r\r")
+      server = transport(MCPClient::ServerHTTP, read_timeout: 5)
+
+      Timeout.timeout(15) { expect(server.list_tools).to eq([]) }
+
+      expect(@fixture.received.find { |m| m['id'] == 'ping-1' }).to include('result' => {})
+    end
+
+    it 'answers a ping whose CRLF terminator is split across chunks, once' do
+      legacy_ping_server(["data: #{ping}\r\n\r", "\n"])
+      server = transport(MCPClient::ServerHTTP, read_timeout: 5)
+
+      Timeout.timeout(15) { expect(server.list_tools).to eq([]) }
+
+      expect(@fixture.received.count { |m| m['id'] == 'ping-1' }).to eq(1)
+    end
+
+    it 'still scans a stream whose first chunk is only a blank line' do
+      legacy_ping_server(["\n", "data: #{ping}\n\n"])
+      server = transport(MCPClient::ServerHTTP, read_timeout: 5)
+
+      Timeout.timeout(15) { expect(server.list_tools).to eq([]) }
+
+      expect(@fixture.received.find { |m| m['id'] == 'ping-1' }).to include('result' => {})
+    end
+  end
+
+  [MCPClient::ServerStreamableHTTP, MCPClient::ServerHTTP].each do |klass|
+    describe "#{klass} notifications on a stream that ends badly" do
+      let(:progress) do
+        { 'jsonrpc' => '2.0', 'method' => 'notifications/progress',
+          'params' => { 'progressToken' => 'p', 'progress' => 1 } }
+      end
+
+      # A notification handed over while the body arrived must not be handed
+      # over again when the delivered response is salvaged from the capture.
+      it 'delivers a notification exactly once when the socket dies after the final SSE event' do
+        seen = Queue.new
+        start_server do |message|
+          if message['method'] == 'server/discover'
+            jsonrpc(message, discovery)
+          else
+            [MidStreamCloseServer::DELIVER_THEN_CLOSE, [progress, jsonrpc(message, { 'content' => [] })]]
+          end
+        end
+        server = transport(klass, read_timeout: 5)
+        server.on_notification { |method, _params| seen << method }
+
+        expect(server.rpc_request('tools/call', { 'name' => 't', 'arguments' => {} })).to eq({ 'content' => [] })
+        expect(seen.size).to eq(1)
+        expect(@fixture.received.count { |r| r['method'] == 'tools/call' }).to eq(1)
+      end
+
+      it 'delivers a notification exactly once when the stream stalls after the final SSE event' do
+        seen = Queue.new
+        start_server do |message|
+          if message['method'] == 'server/discover'
+            jsonrpc(message, discovery)
+          else
+            [MidStreamCloseServer::DELIVER_THEN_STALL, [progress, jsonrpc(message, { 'content' => [] })]]
+          end
+        end
+        server = transport(klass, read_timeout: 0.3)
+        server.on_notification { |method, _params| seen << method }
+
+        Timeout.timeout(15) do
+          expect(server.rpc_request('tools/call', { 'name' => 't', 'arguments' => {} })).to eq({ 'content' => [] })
+        end
+        expect(seen.size).to eq(1)
+      end
+    end
+  end
+
+  describe "#{MCPClient::ServerStreamableHTTP} response streams read as they arrive" do
+    it 'delivers a request-scoped notification before the modern response stream ends' do
+      seen = Queue.new
+      start_server do |message|
+        if message['method'] == 'server/discover'
+          jsonrpc(message, discovery)
+        else
+          waiter = -> { settled_within?(3) { !seen.empty? } }
+          [MidStreamCloseServer::EVENT_THEN_WAIT,
+           { 'jsonrpc' => '2.0', 'method' => 'notifications/progress',
+             'params' => { 'progressToken' => 'p', 'progress' => 1 } },
+           waiter, jsonrpc(message, { 'content' => [] })]
+        end
+      end
+      server = transport(MCPClient::ServerStreamableHTTP, read_timeout: 5)
+      server.on_notification { |method, _params| seen << method }
+
+      Timeout.timeout(15) do
+        expect(server.rpc_request('tools/call', { 'name' => 't', 'arguments' => {} })).to eq({ 'content' => [] })
+      end
+      expect(seen.size).to eq(1)
+    end
+
+    # Progress that only reaches the host once the stream has ended is no
+    # progress at all when the stream ends in a timeout.
+    it 'delivers a notification before the request times out' do
+      seen = Queue.new
+      start_server do |message|
+        if message['method'] == 'server/discover'
+          jsonrpc(message, discovery)
+        else
+          [MidStreamCloseServer::EVENT_THEN_STALL,
+           { 'jsonrpc' => '2.0', 'method' => 'notifications/progress',
+             'params' => { 'progressToken' => 'p', 'progress' => 1 } }]
+        end
+      end
+      server = transport(MCPClient::ServerStreamableHTTP, read_timeout: 0.3)
+      server.on_notification { |method, _params| seen << method }
+
+      Timeout.timeout(15) do
+        expect { server.rpc_request('tools/call', { 'name' => 't', 'arguments' => {} }) }
+          .to raise_error(MCPClient::Errors::RequestTimeoutError)
+      end
+      expect(seen.size).to eq(1)
+    end
+
+    it 'answers a legacy server ping while the response stream is still open' do
+      start_server do |message|
+        case message['method']
+        when 'server/discover' then [MidStreamCloseServer::HTTP_STATUS, 400, 'Bad Request']
+        when 'initialize' then jsonrpc(message, legacy_init)
+        when 'tools/list'
+          waiter = -> { settled_within?(3) { @fixture.received.any? { |m| m['id'] == 'ping-1' } } }
+          [MidStreamCloseServer::EVENT_THEN_WAIT, { 'jsonrpc' => '2.0', 'id' => 'ping-1', 'method' => 'ping' },
+           waiter, jsonrpc(message, { 'tools' => [] })]
+        else [MidStreamCloseServer::HTTP_STATUS, 202, '']
+        end
+      end
+      server = transport(MCPClient::ServerStreamableHTTP, read_timeout: 5)
+
+      Timeout.timeout(15) { expect(server.list_tools).to eq([]) }
+
+      expect(@fixture.received.find { |m| m['id'] == 'ping-1' }).to include('jsonrpc' => '2.0', 'result' => {})
+    end
+
+    # Streamable HTTP offers gzip on every request, so a delivered answer is
+    # usually a delivered *compressed* answer: the salvage must inflate it
+    # before it can tell the response arrived, or a tools/call that did run
+    # is re-issued and runs again.
+    it 'keeps a delivered gzip result when the socket dies after the final SSE event' do
+      start_server do |message|
+        case message['method']
+        when 'server/discover' then jsonrpc(message, discovery)
+        when 'tools/call' then [MidStreamCloseServer::GZIP_THEN_CLOSE, jsonrpc(message, { 'content' => [] })]
+        else jsonrpc(message, { 'tools' => [] })
+        end
+      end
+
+      expect(transport(MCPClient::ServerStreamableHTTP).call_tool('charge',
+                                                                  { 'amount' => 10 })).to eq({ 'content' => [] })
+      expect(@fixture.received.count { |r| r['method'] == 'tools/call' }).to eq(1)
     end
   end
 end

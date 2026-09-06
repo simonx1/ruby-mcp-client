@@ -1,5 +1,7 @@
 # frozen_string_literal: true
 
+require 'zlib'
+
 module MCPClient
   module HttpTransportBase
     # How one HTTP exchange is bounded and read as it arrives: the socket
@@ -40,6 +42,33 @@ module MCPClient
       # @return [Proc, nil]
       def response_stream_listener(_request)
         nil
+      end
+
+      # The bound on a gzip body's expansion, for the stream scanner and the
+      # salvage of a delivered compressed answer (Streamable HTTP configures
+      # one; plain HTTP never asks for gzip).
+      # @return [Integer, nil]
+      def inflate_limit
+        respond_to?(:max_decompressed_body_bytes, true) ? max_decompressed_body_bytes : nil
+      end
+
+      # A response body that arrived gzip-encoded, inflated so the salvage
+      # can tell whether the answer is in it. Streamable HTTP offers gzip on
+      # every request, so a delivered answer is usually a delivered
+      # *compressed* answer; treating those bytes as a lost stream would
+      # re-issue a tools/call the server already ran.
+      # @param body [String] the captured bytes
+      # @return [String, nil] the expanded body; nil when it cannot be inflated
+      #   (truncated inside the deflate stream, or over the bound)
+      def inflate_delivered_gzip(body)
+        inflater = Zlib::Inflate.new(Zlib::MAX_WBITS + 32)
+        inflated = inflater.inflate(body)
+        limit = inflate_limit
+        limit && inflated.bytesize > limit ? nil : inflated
+      rescue Zlib::Error
+        nil
+      ensure
+        inflater&.close
       end
 
       # How many events of the response stream were already handed to the

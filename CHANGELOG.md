@@ -118,7 +118,11 @@ metadata). Each feature lands in its own PR; this section accumulates them.
   deadline (`discover_timeout`) that also covers its re-issue, whose socket
   timeout is the time *left* on it rather than a fresh allowance, and every
   other request gets a deadline from its own `timeout:` or the transport's
-  `read_timeout`, enforced while the body arrives.
+  `read_timeout`, enforced while the body arrives. The same bound covers
+  connection setup: a server that accepts the socket and then stalls the TLS
+  handshake delivers no byte for the deadline check to see, so the socket
+  timeout clamped to the time left is applied to opening the connection too,
+  not only to reading from it.
 - **Plain HTTP + SSE response streams.** `ServerHTTP` now advertises and
   parses `text/event-stream` responses, and reads them **as they arrive**:
   each complete event is acted on while the response is still open, so a
@@ -134,6 +138,29 @@ metadata). Each feature lands in its own PR; this section accumulates them.
   a lost stream on a modern server (both HTTP transports) instead of
   completing the call with someone else's result; the lenient
   single-response fallback remains for legacy servers, which echo ids loosely.
+  `ServerStreamableHTTP` reads its POST response streams the same way: a
+  progress notification reaches the callback while the tool is still running
+  (and before a timeout ends the stream, when it never finishes), and a
+  legacy server's `ping` on the stream is answered while it is open. A body
+  that arrives gzip-encoded, which Streamable HTTP asks for on every request,
+  is inflated as it arrives so its events are read live too. Events handed
+  over while the body arrived are not delivered a second time when the
+  completed body — or the answer salvaged from a stream that then broke or
+  stalled — is parsed. The live reader follows the specification's line
+  terminators as closely as the completed parse: a bare CR ending an event's
+  blank line dispatches it at once (the server may be waiting for the
+  answer), the LF of a CRLF that arrives in the next chunk is not a second
+  terminator, and a stream that opens with a blank line is still read.
+- **A delivered gzip answer is a delivered answer.** The salvage of a response
+  that arrived before its stream broke inflates a gzip-encoded capture before
+  looking for the answer, so a `tools/call` whose compressed result was
+  fully delivered is settled rather than re-issued and run again.
+- **A malformed `-32601` identifies no modern server.** The backward
+  compatibility rule ("HTTP 404 with a JSON-RPC `-32601` body is a modern
+  server") now requires a well-formed error object, exactly like the reserved
+  `-3202x` codes: a 404 whose error lacks a string `message` is a legacy
+  rejection, the client falls back to `initialize`, and no modern verdict is
+  cached from it.
 - **Reconnection is serialized.** `ensure_connected` now holds the transport
   monitor across its "is the connection up?" check and the
   cleanup/reconnect that follows, so a caller that observed a dead connection
