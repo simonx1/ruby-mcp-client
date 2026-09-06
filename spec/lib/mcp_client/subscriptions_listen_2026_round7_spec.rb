@@ -359,11 +359,11 @@ RSpec.describe 'MCP 2026-07-28 subscriptions/listen — round 7' do
     end
 
     it 'still reports a field the server left out as unsupported' do
-      subscription = subscription_for('taskIds' => ['task-1'], 'toolsListChanged' => true)
+      subscription = subscription_for('resourcesListChanged' => true, 'toolsListChanged' => true)
 
       subscription.acknowledge({ 'toolsListChanged' => true })
 
-      expect(subscription.unsupported).to eq(['taskIds'])
+      expect(subscription.unsupported).to eq(['resourcesListChanged'])
     end
   end
 end

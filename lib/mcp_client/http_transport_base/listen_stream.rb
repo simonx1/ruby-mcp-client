@@ -418,10 +418,7 @@ module MCPClient
             raise ListenStreamClosed if subscription.closed?
             next if state[:finished]
 
-            buffer << chunk
-            state[:framing] ||= listen_stream_framing(env, buffer)
-            state[:finished] = consume_listen_events(buffer, subscription, state) unless state[:framing] == :json
-            enforce_listen_buffer_cap!(buffer)
+            ingest_listen_chunk(buffer, chunk, subscription, state, env)
           end
         end
         return :closed if state[:finished]
@@ -591,10 +588,34 @@ module MCPClient
       # @param buffer [String] mutable stream buffer
       # @param subscription [MCPClient::Subscription]
       # @return [Symbol, nil] :closed once the subscription ended
+      # One chunk of a listen stream as it arrives: appended, framed on the
+      # first chunk, parsed for complete events, and measured. The cap is on
+      # the event — {#consume_listen_events} refuses one over it before it is
+      # parsed, and what is still waiting for its terminator afterwards is
+      # measured too — so the verdict on an oversized event does not depend on
+      # where the chunk boundaries fell.
+      # @param buffer [String] mutable stream buffer
+      # @param chunk [String] what arrived
+      # @param subscription [MCPClient::Subscription]
+      # @param state [Hash] the stream's parsing state
+      # @param env [Faraday::Env, nil] the response environment, for the framing
+      # @return [Symbol, nil] :closed once the subscription ended
+      # @raise [MCPClient::Errors::ConnectionError] on an event over LISTEN_MAX_BUFFER_BYTES
+      def ingest_listen_chunk(buffer, chunk, subscription, state, env = nil)
+        buffer << chunk
+        state[:framing] ||= listen_stream_framing(env, buffer)
+        state[:finished] = consume_listen_events(buffer, subscription, state) unless state[:framing] == :json
+        enforce_listen_buffer_cap!(buffer)
+        state[:finished]
+      end
+
       def consume_listen_events(buffer, subscription, state = { scanned: 0 })
         finished = nil
         discard_comment_lines(buffer, state)
         while (separator = match_event_terminator(buffer, [state[:scanned].to_i - 3, 0].max))
+          # A complete event over the cap is refused before it is parsed: it
+          # used to be consumed here and so never measured.
+          enforce_listen_buffer_cap!(buffer, separator.end(0))
           event = buffer.slice!(0, separator.end(0))
           state[:scanned] = 0
           data = event.split(LINE_TERMINATOR).select { |l| l.start_with?('data:') }.map { |l| l.sub(/\Adata:\s*/, '') }
@@ -667,10 +688,14 @@ module MCPClient
         nil
       end
 
-      # @param buffer [String] a partial-event buffer
+      # @param buffer [String] a partial-event buffer, or one holding a
+      #   complete event whose extent is given
+      # @param length [Integer, nil] the extent, in characters, of the event
+      #   to measure; the whole buffer when nil
       # @raise [MCPClient::Errors::ConnectionError] when it exceeds LISTEN_MAX_BUFFER_BYTES
-      def enforce_listen_buffer_cap!(buffer)
-        return if buffer.bytesize <= LISTEN_MAX_BUFFER_BYTES
+      def enforce_listen_buffer_cap!(buffer, length = nil)
+        bytes = length ? buffer[0, length].bytesize : buffer.bytesize
+        return if bytes <= LISTEN_MAX_BUFFER_BYTES
 
         raise MCPClient::Errors::ConnectionError,
               "Listen stream event exceeded the maximum buffered size (#{LISTEN_MAX_BUFFER_BYTES} bytes)"
@@ -678,23 +703,30 @@ module MCPClient
 
       # A streaming connection for listen requests (no retries: the loop above
       # decides about re-opening).
+      #
+      # The host's `faraday_config` is applied first and the stream's own
+      # settings last, since two of them are what make a listen cancellable at
+      # all: a retry middleware would re-issue a request whose stream was
+      # closed on purpose (re-opening is the loop's decision, on its own
+      # backoff), and the adapter block is where the cancellation signal is
+      # armed — a host replacing the adapter, or adding retries, used to undo
+      # both without noticing.
       # @param subscription [MCPClient::Subscription] the stream it serves
       # @return [Faraday::Connection]
       def listen_connection(subscription)
-        conn = Faraday.new(url: @base_url) do |f|
-          f.request :retry, max: 0
-          f.options.open_timeout = LISTEN_OPEN_TIMEOUT
-          f.options.timeout = LISTEN_STREAM_TIMEOUT
-          f.adapter :net_http do |http|
-            http.read_timeout = LISTEN_STREAM_TIMEOUT
-            http.open_timeout = LISTEN_OPEN_TIMEOUT
-            # Runs on the stream's own thread, just before the socket is
-            # opened: the last point at which a cancellation can still stop
-            # the request, and the first at which it can close it.
-            arm_listen_session(subscription, http)
-          end
-        end
+        conn = Faraday.new(url: @base_url)
         @faraday_config&.call(conn)
+        conn.builder.delete(Faraday::Retry::Middleware)
+        conn.options.open_timeout = LISTEN_OPEN_TIMEOUT
+        conn.options.timeout = LISTEN_STREAM_TIMEOUT
+        conn.adapter :net_http do |http|
+          http.read_timeout = LISTEN_STREAM_TIMEOUT
+          http.open_timeout = LISTEN_OPEN_TIMEOUT
+          # Runs on the stream's own thread, just before the socket is
+          # opened: the last point at which a cancellation can still stop
+          # the request, and the first at which it can close it.
+          arm_listen_session(subscription, http)
+        end
         conn
       end
     end

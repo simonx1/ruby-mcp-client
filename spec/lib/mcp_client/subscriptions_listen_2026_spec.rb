@@ -207,6 +207,15 @@ RSpec.describe 'MCP 2026-07-28 subscriptions/listen' do
       expect(subscription.state).to eq(:closed)
       server.handle_line(line('jsonrpc' => '2.0', 'method' => 'notifications/tools/list_changed',
                               'params' => { '_meta' => { SUB_ID_META => subscription.id } }))
+      # Delivery is asynchronous, so "nothing arrived yet" proves little on
+      # its own: a later notification on a live subscription is the barrier —
+      # routed after the one above, delivered in order, so anything the
+      # closed subscription was going to receive would be here by now.
+      later = []
+      live = server.listen(notifications: { tools_list_changed: true }) { |m, _p| later << m }
+      server.handle_line(line('jsonrpc' => '2.0', 'method' => 'notifications/tools/list_changed',
+                              'params' => { '_meta' => { SUB_ID_META => live.id } }))
+      wait_for { later.any? }
       expect(received).to be_empty
       expect(subscription.close).to be_nil
     end
@@ -499,7 +508,7 @@ RSpec.describe 'MCP 2026-07-28 subscriptions/listen' do
         end
       end
 
-      subscription = server.listen(notifications: { task_ids: ['t1'] })
+      subscription = server.listen(notifications: { resource_subscriptions: ['file:///t1'] })
       wait_until { subscription.state == :closed }
 
       expect(subscription.error).to be_a(MCPClient::Errors::MissingRequiredClientCapabilityError)
@@ -548,9 +557,12 @@ RSpec.describe 'MCP 2026-07-28 subscriptions/listen' do
   describe MCPClient::Subscription do
     it 'normalizes snake_case and camelCase filter keys and validates value types' do
       expect(described_class.normalize_filter({ tools_list_changed: true, 'promptsListChanged' => true,
-                                                resource_subscriptions: ['a'], task_ids: ['t'] }))
+                                                resource_subscriptions: ['a'], resources_list_changed: false }))
         .to eq({ 'toolsListChanged' => true, 'promptsListChanged' => true, 'resourceSubscriptions' => ['a'],
-                 'taskIds' => ['t'] })
+                 'resourcesListChanged' => false })
+      # The published SubscriptionFilter has four members; the tasks
+      # extension registers its own (see round 13).
+      expect { described_class.normalize_filter({ task_ids: ['t'] }) }.to raise_error(ArgumentError, /Unknown/)
       expect { described_class.normalize_filter({ tools_list_changed: 'yes' }) }.to raise_error(ArgumentError)
       expect { described_class.normalize_filter({ resource_subscriptions: 'a' }) }.to raise_error(ArgumentError)
       expect { described_class.normalize_filter(nil) }.to raise_error(ArgumentError)
@@ -559,7 +571,8 @@ RSpec.describe 'MCP 2026-07-28 subscriptions/listen' do
     it 'rejects an array with a non-string member, and keeps empty and false values as given' do
       expect { described_class.normalize_filter({ resource_subscriptions: ['file:///a', 1] }) }
         .to raise_error(ArgumentError, /array of strings/)
-      expect { described_class.normalize_filter({ task_ids: [nil] }) }.to raise_error(ArgumentError, /array of strings/)
+      expect { described_class.normalize_filter({ resource_subscriptions: [nil] }) }
+        .to raise_error(ArgumentError, /array of strings/)
       expect(described_class.normalize_filter({})).to eq({})
       expect(described_class.normalize_filter({ tools_list_changed: false })).to eq({ 'toolsListChanged' => false })
       expect(described_class.normalize_filter({ resource_subscriptions: [] })).to eq({ 'resourceSubscriptions' => [] })
@@ -660,7 +673,7 @@ RSpec.describe 'MCP 2026-07-28 subscriptions/listen — review follow-ups' do
         end
       end
 
-      subscription = server.listen(notifications: { task_ids: ['t'] })
+      subscription = server.listen(notifications: { resource_subscriptions: ['file:///t'] })
       wait_until { subscription.closed? }
 
       expect(subscription.error).to be_a(MCPClient::Errors::MissingRequiredClientCapabilityError)

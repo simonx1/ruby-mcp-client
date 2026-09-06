@@ -10,8 +10,12 @@ metadata). Each feature lands in its own PR; this section accumulates them.
 - **Long-lived notification streams.** `server.listen(notifications:)` and
   `Client#listen(notifications:, server:)` open a `subscriptions/listen`
   request with a `SubscriptionFilter` (`tools_list_changed`,
-  `prompts_list_changed`, `resources_list_changed`, `resource_subscriptions`,
-  `task_ids`; snake_case or camelCase) and return an `MCPClient::Subscription`.
+  `prompts_list_changed`, `resources_list_changed`, `resource_subscriptions`;
+  snake_case or camelCase) and return an `MCPClient::Subscription`. Those
+  four are the published filter's members; a field an extension defines
+  beyond them (the tasks extension's `taskIds`) is accepted once the
+  extension has registered it with `Subscription.register_filter_field`,
+  never offered as core 2026-07-28 functionality.
   The request itself is meant to outlive every other one the client sends — its
   response is the server's *closing* of the stream — so the deadline the
   lifecycle asks for is on the **acknowledgment** instead: a listen the server
@@ -111,6 +115,34 @@ metadata). Each feature lands in its own PR; this section accumulates them.
   listeners, and host code editing it in place used to rewrite the
   subscription's own record of the watch — adding a URI the acknowledgment had
   left out was enough to make a waiting `subscribe_resource` report success.
+- **A teardown dismantles only the process it claimed (review round 13).**
+  The reader of a process that exited retired the transport and entered
+  `cleanup`; a host request that observed the retirement ran its own cleanup
+  and re-initialization — killing the old reader without joining it — and
+  established the replacement; and the old reader's cleanup `ensure` then
+  cleared the *replacement's* session, handles, reader and handshake on its
+  way out, leaving a live, re-sent subscription registered on a transport
+  that had just forgotten its process. A teardown now claims the process of
+  one transport generation under the transport lock — the handles come off
+  the transport and the generation moves on together, so a second teardown
+  of the same process finds nothing to claim — and works on the claimed
+  handles alone; its last word (waking the requests that will never be
+  answered, forgetting the session and the handshake) is spoken only if no
+  process has been established since the claim. The reader's EOF handling is
+  keyed by the generation it was started for, so an EOF on a process the
+  host has already torn down or replaced is not an exit to handle.
+  The published `SubscriptionFilter` has four members; `taskIds` is the tasks
+  extension's and is accepted once that extension registers it with
+  `Subscription.register_filter_field` (with its `task_ids` spelling), never
+  offered as core functionality. A listen stream's size cap is enforced on
+  the *event*, before it is parsed — a complete oversized event whose
+  terminator arrived in the same chunk used to be consumed unmeasured. And a
+  host's `faraday_config` is applied to the listen connection first, the
+  stream's own settings last: a retry middleware it added would have
+  re-issued a stream that was closed on purpose, and an adapter it set would
+  have dropped the block that arms the cancellation signal. A transport with
+  no listen stream of its own (the deprecated SSE transport) refuses
+  `listen` with a `CapabilityError` whatever the session negotiated.
 - **Routing order: bookkeeping, cache invalidation, delivery, host callback.**
   A listener runs on the subscription's dispatcher thread, so queuing its
   delivery makes the notification visible at once: a listener reacting to

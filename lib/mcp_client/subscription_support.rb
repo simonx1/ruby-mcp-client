@@ -43,6 +43,15 @@ module MCPClient
     # @return [void]
     # @raise [MCPClient::Errors::CapabilityError] on a legacy session
     def ensure_modern_listen!
+      # A transport with no listen stream of its own (the deprecated SSE
+      # transport, a host adapter written against the older interface) cannot
+      # serve one however the session was negotiated.
+      unless respond_to?(:open_subscription, true)
+        raise MCPClient::Errors::CapabilityError,
+              "#{self.class.name} does not support subscriptions/listen (an MCP 2026-07-28 stdio or " \
+              'Streamable HTTP transport is required)'
+      end
+
       ensure_session_ready
       return if modern?
 

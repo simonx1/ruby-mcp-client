@@ -14,24 +14,80 @@ module MCPClient
   # when the server answers the listen request, otherwise on a transport
   # drop, a server `notifications/cancelled`, an error, or {#close}.
   class Subscription
-    # SubscriptionFilter fields and their value types (taskIds comes from the
-    # tasks extension).
+    # The published SubscriptionFilter's fields and their value types (MCP
+    # 2026-07-28 schema, SubscriptionFilter). Nothing beyond these four is a
+    # core filter field: an extension that defines one of its own — the tasks
+    # extension's `taskIds`, say — registers it with {.register_filter_field}.
     FILTER_FIELDS = {
       'toolsListChanged' => :boolean,
       'promptsListChanged' => :boolean,
       'resourcesListChanged' => :boolean,
-      'resourceSubscriptions' => :string_array,
-      'taskIds' => :string_array
+      'resourceSubscriptions' => :string_array
     }.freeze
 
-    # snake_case spellings accepted for the filter fields
+    # snake_case spellings accepted for the published filter fields
     FILTER_ALIASES = {
       'tools_list_changed' => 'toolsListChanged',
       'prompts_list_changed' => 'promptsListChanged',
       'resources_list_changed' => 'resourcesListChanged',
-      'resource_subscriptions' => 'resourceSubscriptions',
-      'task_ids' => 'taskIds'
+      'resource_subscriptions' => 'resourceSubscriptions'
     }.freeze
+
+    # The value types a filter field may have
+    FILTER_VALUE_TYPES = %i[boolean string_array].freeze
+
+    class << self
+      # Register a filter field an extension defines beyond the published
+      # SubscriptionFilter, so {.normalize_filter} accepts it (and its
+      # snake_case spelling) with the value type the extension gives it. A
+      # published field cannot be redefined; registering the same extension
+      # field twice with the same type is a no-op.
+      # @param name [String] the camelCase wire name of the field
+      # @param type [Symbol] :boolean or :string_array
+      # @param alias_name [String, nil] a snake_case spelling to accept for it
+      # @return [void]
+      # @raise [ArgumentError] on a published field, an unknown type, or a
+      #   name already registered with another type
+      def register_filter_field(name, type, alias_name: nil)
+        name = name.to_s
+        raise ArgumentError, "#{name} is a published SubscriptionFilter field" if FILTER_FIELDS.key?(name)
+        raise ArgumentError, 'a filter field is boolean or string_array' unless FILTER_VALUE_TYPES.include?(type)
+
+        extension_filter_fields_mutex.synchronize do
+          fields = @extension_filter_fields || { fields: {}, aliases: {} }
+          registered = fields[:fields][name]
+          raise ArgumentError, "#{name} is already registered as #{registered}" if registered && registered != type
+
+          fields[:fields][name] = type
+          fields[:aliases][alias_name.to_s] = name if alias_name
+          @extension_filter_fields = fields
+        end
+        nil
+      end
+
+      # @return [Hash{String => Symbol}] every accepted filter field — the
+      #   published four and the registered extension fields — with its type
+      def filter_fields
+        FILTER_FIELDS.merge(extension_filter_fields[:fields]).freeze
+      end
+
+      # @return [Hash{String => String}] every accepted snake_case spelling
+      def filter_aliases
+        FILTER_ALIASES.merge(extension_filter_fields[:aliases]).freeze
+      end
+
+      private
+
+      # @return [Hash] the registered extension fields and aliases
+      def extension_filter_fields
+        extension_filter_fields_mutex.synchronize { @extension_filter_fields || { fields: {}, aliases: {} } }
+      end
+
+      # @return [Mutex] guards the registry across extensions loading concurrently
+      def extension_filter_fields_mutex
+        @extension_filter_fields_mutex ||= Mutex.new
+      end
+    end
 
     STATES = %i[pending active reconnecting closed].freeze
 
@@ -105,10 +161,12 @@ module MCPClient
     def self.normalize_filter(filter)
       raise ArgumentError, 'notifications must be a Hash (SubscriptionFilter)' unless filter.is_a?(Hash)
 
+      fields = filter_fields
+      aliases = filter_aliases
       filter.to_h do |key, value|
         name = key.to_s
-        name = FILTER_ALIASES.fetch(name, name)
-        type = FILTER_FIELDS[name]
+        name = aliases.fetch(name, name)
+        type = fields[name]
         raise ArgumentError, "Unknown subscription filter field #{key.inspect}" unless type
 
         case type

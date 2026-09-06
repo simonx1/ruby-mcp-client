@@ -682,10 +682,16 @@ RSpec.describe 'MCP 2026-07-28 subscriptions/listen — round 11' do
   describe 'Client#listen' do
     include_context 'a scripted stdio session'
 
+    # codex round 13: with one server, always choosing the first would have
+    # satisfied this example; the selector is pinned against two.
     it 'forwards the server selector, the deadline and the listener' do
-      allow(MCPClient::ServerFactory).to receive(:create).and_return(server)
-      client = MCPClient::Client.new(mcp_server_configs: [{ type: 'stdio', command: 'echo test', name: 'one' }])
+      other = MCPClient::ServerStdio.new(command: 'echo other', read_timeout: 1)
+      allow(MCPClient::ServerFactory).to receive(:create).and_return(other, server)
+      client = MCPClient::Client.new(mcp_server_configs: [{ type: 'stdio', command: 'echo other', name: 'zero' },
+                                                          { type: 'stdio', command: 'echo test', name: 'one' }])
+      allow(other).to receive(:name).and_return('zero')
       allow(server).to receive(:name).and_return('one')
+      expect(other).not_to receive(:listen)
       listener = proc {}
       expect(server).to receive(:listen).with(notifications: { tools_list_changed: true }, ack_timeout: 0.5) do |&block|
         expect(block).to equal(listener)
@@ -694,6 +700,8 @@ RSpec.describe 'MCP 2026-07-28 subscriptions/listen — round 11' do
 
       expect(client.listen(notifications: { tools_list_changed: true }, server: 'one', ack_timeout: 0.5,
                            &listener)).to eq(:handle)
+      expect { client.listen(notifications: { tools_list_changed: true }, server: 'two') }
+        .to raise_error(MCPClient::Errors::ServerNotFound)
     end
   end
 
@@ -744,12 +752,15 @@ RSpec.describe 'MCP 2026-07-28 subscriptions/listen — round 11' do
   describe 'a stream whose re-open fails at the connection' do
     include_context 'a scripted HTTP session'
 
-    it 'backs off with growing delays and re-issues once the connection is back' do
+    # codex round 13: the maximum delay is pinned too — removing the clamp
+    # used to leave the first two delays, and this example, untouched.
+    it 'backs off with growing delays up to the maximum and re-issues once the connection is back' do
       stub_const('MCPClient::HttpTransportBase::ListenStream::LISTEN_RECONNECT_DELAY', 0.01)
+      stub_const('MCPClient::HttpTransportBase::ListenStream::LISTEN_MAX_RECONNECT_DELAY', 0.03)
       posts = 0
       stub_listen do |body|
         posts += 1
-        raise Errno::ECONNRESET, 'peer went away' if posts <= 2
+        raise Errno::ECONNRESET, 'peer went away' if posts <= 4
 
         sse_response(ack_message(body['id'], { 'toolsListChanged' => true }))
       end
@@ -762,8 +773,8 @@ RSpec.describe 'MCP 2026-07-28 subscriptions/listen — round 11' do
       subscription = server.listen(notifications: { tools_list_changed: true })
 
       expect(subscription.wait_until_settled(5)).to eq(:active)
-      expect(listen_requests.map { |request| request[:body]['id'] }.uniq.size).to eq(3)
-      expect(delays.first(2)).to eq([0.01, 0.02])
+      expect(listen_requests.map { |request| request[:body]['id'] }.uniq.size).to eq(5)
+      expect(delays.first(4)).to eq([0.01, 0.02, 0.03, 0.03])
     end
   end
 

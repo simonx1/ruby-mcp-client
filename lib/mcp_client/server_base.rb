@@ -189,7 +189,9 @@ module MCPClient
     # Open a long-lived notification stream (MCP 2026-07-28 subscriptions/listen).
     # @param notifications [Hash] the SubscriptionFilter (tools_list_changed,
     #   prompts_list_changed, resources_list_changed, resource_subscriptions,
-    #   task_ids — snake_case or camelCase)
+    #   snake_case or camelCase; an extension's own field, such as the tasks
+    #   extension's task_ids, once it has registered it — see
+    #   {MCPClient::Subscription.register_filter_field})
     # @param ack_timeout [Numeric, false, nil] seconds to wait for the
     #   server's acknowledgment before giving the listen up; nil takes the
     #   transport's own read timeout, false waits for ever

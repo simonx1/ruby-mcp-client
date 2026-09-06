@@ -37,6 +37,9 @@ RSpec.describe 'MCP 2026-07-28 subscriptions/listen — round 12' do
         case message['method']
         when 'server/discover'
           $stdout.puts(JSON.generate('jsonrpc' => '2.0', 'id' => message['id'], 'result' => discover))
+        when 'ping'
+          $stdout.puts(JSON.generate('jsonrpc' => '2.0', 'id' => message['id'],
+                                     'result' => { 'resultType' => 'complete', 'generation' => generation }))
         when 'subscriptions/listen'
           id = message['id']
           $stdout.puts(JSON.generate('jsonrpc' => '2.0', 'method' => 'notifications/subscriptions/acknowledged',
@@ -108,5 +111,48 @@ RSpec.describe 'MCP 2026-07-28 subscriptions/listen — round 12' do
 
     subscription.close
     expect(subscription).to be_closed_by_client
+  end
+
+  # codex round 13: the restart above is driven by the reader alone. A host
+  # request in flight while the process exits observes the retirement and
+  # re-establishes the process itself, racing the reader's own teardown — the
+  # interleaving that used to let the old reader's late `ensure` clear the
+  # replacement's handles (round 13, scripted). Here it is left to the
+  # operating system: the request completes or fails cleanly, and delivery
+  # resumes on the replacement either way.
+  it 'keeps serving the subscription when a host request races the exit and the restart' do
+    deliveries = Thread::Queue.new
+    subscription = server.listen(notifications: { tools_list_changed: true }) do |method, params|
+      deliveries << [method, params['generation'], params['listenId']]
+    end
+    first = deliveries.pop(timeout: 10)
+    expect(first&.at(1)).to eq(1)
+
+    outcomes = Thread::Queue.new
+    requesters = Array.new(3) do
+      Thread.new do
+        6.times do
+          outcomes << (server.ping.is_a?(Hash) ? :answered : :other)
+        rescue MCPClient::Errors::MCPError => e
+          outcomes << e.class
+        end
+      end
+    end
+
+    second = deliveries.pop(timeout: 10)
+    expect(second).not_to be_nil, 'no delivery from the replacement process'
+    expect(second[1]).to eq(2)
+    requesters.each { |thread| thread.join(15) }
+    wait_until { subscription.active? && subscription.id == second[2] }
+
+    expect(subscription).not_to be_closed
+    # The replacement answers requests as the transport's live process.
+    expect { server.ping }.not_to raise_error
+    expect(File.read(state_path).to_i).to eq(2)
+    results = Array.new(outcomes.size) { outcomes.pop }
+    expect(results.size).to eq(18)
+    failures = results.reject { |result| result == :answered }
+    expect(failures).to all(satisfy { |failure| failure.is_a?(Class) && failure <= MCPClient::Errors::MCPError })
+    subscription.close
   end
 end

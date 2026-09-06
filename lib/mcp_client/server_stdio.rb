@@ -202,11 +202,12 @@ module MCPClient
       # The record of the process this reader belongs to, so an EOF can be
       # told from the EOF of a process that has since been replaced.
       session = @session
+      stdout = @stdout
       @reader_thread = Thread.new do
-        @stdout.each_line do |line|
+        stdout.each_line do |line|
           handle_line(line)
         end
-        handle_reader_eof(session)
+        handle_reader_eof(session, generation)
       rescue StandardError
         # Reader thread aborted unexpectedly
       ensure
@@ -261,12 +262,26 @@ module MCPClient
     # still waiting for is already bounded by its own timeout.
     # @param session [MCPClient::ServerStdio::ChildSession, nil] the record of
     #   the process this reader was started for
+    # @param generation [Integer] the transport generation this reader was
+    #   started for; an EOF on a generation that has since been torn down —
+    #   by the host's `cleanup`, or by another exit — is not an exit to handle
     # @return [void]
-    def handle_reader_eof(session)
+    def handle_reader_eof(session, generation = @transport_generation)
       @init_lock.synchronize { nil } unless @initialized
-      return unless @stdin && !@shutting_down && current_session?(session)
+      return unless live_transport?(generation, session)
 
-      handle_server_exit(session)
+      handle_server_exit(session, generation)
+    end
+
+    # Whether the process a reader was started for is still the live one: its
+    # transport generation has not been claimed for teardown, and its record
+    # is the current session. Read under the transport lock, since a teardown
+    # claims the generation under it.
+    # @param generation [Integer] the transport generation to check
+    # @param session [MCPClient::ServerStdio::ChildSession, nil]
+    # @return [Boolean]
+    def live_transport?(generation, session)
+      @transport_lock.synchronize { !@stdin.nil? && generation == @transport_generation } && current_session?(session)
     end
 
     # Whether the process a reader was started for is still the live one. A
@@ -292,10 +307,11 @@ module MCPClient
     # STDERR_MAX_LINE_SIZE is flushed rather than retained.
     # @return [Thread] the stderr reader thread
     def start_stderr_reader
+      stderr = @stderr
       @stderr_thread = Thread.new do
         buffer = +''
         loop do
-          buffer << @stderr.readpartial(STDERR_READ_CHUNK_SIZE)
+          buffer << stderr.readpartial(STDERR_READ_CHUNK_SIZE)
           flush_stderr_lines(buffer)
           flush_stderr_overflow(buffer)
         end
@@ -891,62 +907,134 @@ module MCPClient
     # following the MCP 2025-11-25 stdio shutdown sequence (basic/lifecycle.mdx):
     # close stdin, wait for the server to exit, send SIGTERM if it does not exit
     # within a reasonable time, then SIGKILL if it still does not exit.
+    #
+    # Tears down the process the transport holds *now*: a `cleanup` that
+    # finds the process already claimed by another teardown — the reader of a
+    # process that exited, dismantling it while the host got here — has
+    # nothing to do, and never touches a replacement the host established in
+    # the meantime (see {#teardown_transport}).
     # @return [void]
     def cleanup
-      return unless @stdin
+      teardown_transport(@transport_lock.synchronize { @transport_generation })
+    end
 
-      # Past this point the reader threads speak for a transport that is
-      # being dismantled on purpose: their EOF must not retire whatever
-      # replaces it.
-      #
-      # The reader thread will see EOF once stdin closes; that is a shutdown,
-      # not an unexpected exit.
-      @shutting_down = true
-      #
-      # Subscriptions do not survive the process: keep the ones the host still
-      # wants so they are re-sent once the process is re-established
-      # (basic/patterns/subscriptions "Graceful Closure"). They are moved to
-      # the pending list outside the registry lock, since a subscription being
-      # opened holds its own lock while taking that one.
+    # What one teardown claimed: the handles of one process, and the
+    # generation the transport moved on to when it claimed them. Torn down
+    # from the record, not from the transport, so a teardown that finishes
+    # late — after a host request has already established the next process
+    # — dismantles only what it claimed.
+    TornDownTransport = Struct.new(:generation, :stdin, :stdout, :stderr, :wait_thread, :reader_thread,
+                                   :stderr_thread, :session, keyword_init: true)
+
+    # Tear down the process of one transport generation.
+    #
+    # The teardown claims the process under the transport lock — the handles
+    # come off the transport and the generation moves on, so a request judged
+    # current is written before this or not at all, and a second teardown of
+    # the same process (the host's `cleanup` racing the reader's own, or the
+    # reverse) finds nothing to claim. Everything after the claim works on the
+    # claimed handles alone: a `cleanup` that ran ahead of it may already have
+    # let the host establish a replacement, and a reader whose teardown
+    # finishes only now used to clear that replacement's session, handles,
+    # reader and handshake on its way out — leaving a live, re-sent
+    # subscription registered on a transport that had just forgotten its
+    # process.
+    # @param generation [Integer] the transport generation to tear down; a
+    #   generation that has moved on is not this teardown's to touch
+    # @return [void]
+    def teardown_transport(generation)
+      claimed = claim_transport(generation)
+      return unless claimed
+
+      begin
+        park_open_subscriptions
+        terminate_server_process(claimed.wait_thread)
+        claimed.stdout.close unless claimed.stdout.nil? || claimed.stdout.closed?
+        claimed.stderr.close unless claimed.stderr.nil? || claimed.stderr.closed?
+        # The reader calls this itself when the process exits on its own, and a
+        # thread that kills itself here would abandon the rest of the shutdown —
+        # including the restart that a live subscription depends on. It is at
+        # EOF by then and returns on its own.
+        claimed.reader_thread&.kill unless claimed.reader_thread.equal?(Thread.current)
+        claimed.stderr_thread&.kill
+      rescue StandardError
+        # Clean up resources during unexpected termination
+      ensure
+        forget_torn_down_transport(claimed)
+      end
+    end
+
+    # Take the process of a transport generation off the transport, for one
+    # teardown to dismantle. Under the transport lock: the handles and the
+    # generation change together, and closing stdin here is what makes a
+    # request judged current either already written or never written.
+    # @param generation [Integer] the transport generation to claim
+    # @return [TornDownTransport, nil] the claim, or nil when that generation
+    #   is not the live one (already claimed, or replaced)
+    def claim_transport(generation)
+      @transport_lock.synchronize do
+        return nil unless @stdin && generation == @transport_generation
+
+        @transport_generation += 1
+        claimed = TornDownTransport.new(generation: @transport_generation, stdin: @stdin, stdout: @stdout,
+                                        stderr: @stderr, wait_thread: @wait_thread, reader_thread: @reader_thread,
+                                        stderr_thread: @stderr_thread, session: @session)
+        @stdin.close unless @stdin.closed?
+        @stdin = @stdout = @stderr = @wait_thread = @reader_thread = @stderr_thread = nil
+        claimed
+      end
+    end
+
+    # Subscriptions do not survive the process: keep the ones the host still
+    # wants so they are re-sent once the process is re-established
+    # (basic/patterns/subscriptions "Graceful Closure"). They are moved to
+    # the pending list outside the registry lock, since a subscription being
+    # opened holds its own lock while taking that one.
+    #
+    # Enqueued through the one lock a deferred hand-over writes under too,
+    # since a listen write failing on the process being torn down lands in
+    # the window between the snapshot and the write
+    # (JsonRpcTransport#queue_subscriptions_of_ended_process, which also
+    # forgets the listen ids this process was holding).
+    # @return [void]
+    def park_open_subscriptions
       open_subscriptions = subscriptions_mutex.synchronize do
         live = subscriptions.values
         subscriptions.clear
         live
       end
       open_subscriptions.each(&:mark_reconnecting)
-      # Enqueued through the one lock a deferred hand-over writes under too,
-      # since a listen write failing on the process being torn down lands in
-      # the window between the snapshot above and this line
-      # (JsonRpcTransport#queue_subscriptions_of_ended_process, which also
-      # forgets the listen ids this process was holding).
       queue_subscriptions_of_ended_process(open_subscriptions.select(&:reconnectable?))
-      # Bumped under the transport lock, so a request that was judged current
-      # is written before this, or not at all.
-      @transport_lock.synchronize do
-        @transport_generation += 1
-        @stdin.close unless @stdin.closed?
-      end
-      terminate_server_process
-      @stdout.close unless @stdout.closed?
-      @stderr.close unless @stderr.closed?
-      # The reader calls this itself when the process exits on its own, and a
-      # thread that kills itself here would abandon the rest of the shutdown —
-      # including the restart that a live subscription depends on. It is at
-      # EOF by then and returns on its own.
-      @reader_thread&.kill unless @reader_thread.equal?(Thread.current)
-      @stderr_thread&.kill
-    rescue StandardError
-      # Clean up resources during unexpected termination
-    ensure
-      # No further response can arrive on a transport that is being
-      # dismantled, so nothing is outstanding any more. Responses that
-      # already arrived are kept: they are answers this client received and
-      # has not handed to their caller yet, and a restart happening in that
-      # window must not turn a completed request into a timeout. Each one
-      # belongs to a caller that is about to take it out of the map, so
-      # keeping them cannot accumulate. Waiters are woken so a request that
-      # will never be answered re-checks its deadline rather than blocking on
-      # a reader thread that has been killed.
+    end
+
+    # The last word of a teardown, whatever else went wrong: the record of the
+    # process it claimed is ended, and — only if no process has been
+    # established since the claim — the transport forgets its session and its
+    # handshake, and wakes the requests that will never be answered.
+    #
+    # No further response can arrive on a transport that is being dismantled,
+    # so nothing is outstanding any more. Responses that already arrived are
+    # kept: they are answers this client received and has not handed to their
+    # caller yet, and a restart happening in that window must not turn a
+    # completed request into a timeout. Each one belongs to a caller that is
+    # about to take it out of the map, so keeping them cannot accumulate.
+    # Waiters are woken so a request that will never be answered re-checks its
+    # deadline rather than blocking on a reader thread that has been killed.
+    # A replacement established meanwhile owns whatever is outstanding now,
+    # and its handshake and session are its own.
+    # @param claimed [TornDownTransport] what this teardown claimed
+    # @return [void]
+    def forget_torn_down_transport(claimed)
+      # The process this session was is gone, whatever else went wrong above.
+      # Its record outlives it: it is what the next session's re-send of the
+      # open subscriptions asks about (JsonRpcTransport#reopen_subscriptions).
+      claimed.session&.ended
+      # Either signal says a process has been established since the claim:
+      # `connect` moves the generation on, and the handshake that follows
+      # records a new session.
+      return if @transport_lock.synchronize { @transport_generation != claimed.generation }
+      return unless @session.equal?(claimed.session)
+
       @mutex.synchronize do
         # The ids still outstanding are recorded as dropped: their waiters
         # fail on that record, whenever they next run, rather than wait out
@@ -955,16 +1043,10 @@ module MCPClient
         @awaiting.clear
         @cond.broadcast
       end
-      # The process this session was is gone, whatever else went wrong above.
-      # Its record outlives it: it is what the next session's re-send of the
-      # open subscriptions asks about (JsonRpcTransport#reopen_subscriptions).
-      @session&.ended
       @session = nil
-      @stdin = @stdout = @stderr = @wait_thread = @reader_thread = @stderr_thread = nil
       # The next request re-establishes the process and, on a modern
       # server, re-sends the subscriptions the host still holds.
       @initialized = false
-      @shutting_down = false
     end
 
     # The server process ended on its own (its stdout reached EOF). MCP
@@ -978,9 +1060,12 @@ module MCPClient
     #   the process that exited; the crash-loop bound only counts an exit this
     #   path recorded, never a teardown the host asked for
     #   (see {JsonRpcTransport#crash_looping?})
+    # @param generation [Integer] the transport generation of the process
+    #   that exited; a generation the host has already torn down or replaced
+    #   is not this exit's to handle
     # @return [void]
-    def handle_server_exit(session = @session)
-      return if @shutting_down
+    def handle_server_exit(session = @session, generation = @transport_generation)
+      return unless live_transport?(generation, session)
 
       @logger.warn('MCP server process ended unexpectedly')
       # Stamped before the teardown, on the record the teardown retires: this
@@ -989,8 +1074,8 @@ module MCPClient
       # Retired before the teardown bumps the generation past this reader's,
       # so the exit stays observable the way any other unexpected exit is:
       # the next request releases the dead handles and negotiates again.
-      retire_transport(@transport_generation)
-      cleanup
+      retire_transport(generation)
+      teardown_transport(generation)
       restart_for_open_subscriptions
     end
 
@@ -999,15 +1084,18 @@ module MCPClient
     # so wait for the process to exit on its own; if it does not exit within
     # the grace period send SIGTERM, wait again, and finally send SIGKILL.
     # @return [void]
-    def terminate_server_process
-      return unless @wait_thread
-      return if @wait_thread.join(SHUTDOWN_GRACE_PERIOD)
+    # @param wait_thread [Process::Waiter, nil] the process to wait for; the
+    #   one a teardown claimed, since the transport may hold a replacement by now
+    # @return [void]
+    def terminate_server_process(wait_thread = @wait_thread)
+      return unless wait_thread
+      return if wait_thread.join(SHUTDOWN_GRACE_PERIOD)
 
-      signal_server_process('TERM')
-      return if @wait_thread.join(SHUTDOWN_GRACE_PERIOD)
+      signal_server_process('TERM', wait_thread)
+      return if wait_thread.join(SHUTDOWN_GRACE_PERIOD)
 
-      signal_server_process('KILL')
-      @wait_thread.join(SHUTDOWN_GRACE_PERIOD)
+      signal_server_process('KILL', wait_thread)
+      wait_thread.join(SHUTDOWN_GRACE_PERIOD)
     end
 
     # Cancel a subscription: on stdio there is no per-request stream to
@@ -1072,8 +1160,8 @@ module MCPClient
     # already exited or cannot be signalled.
     # @param signal [String] signal name, e.g. 'TERM' or 'KILL'
     # @return [void]
-    def signal_server_process(signal)
-      Process.kill(signal, @wait_thread.pid)
+    def signal_server_process(signal, wait_thread = @wait_thread)
+      Process.kill(signal, wait_thread.pid)
     rescue Errno::ESRCH, Errno::EPERM => e
       @logger.debug("Could not send SIG#{signal} to server process: #{e.class}")
     end
