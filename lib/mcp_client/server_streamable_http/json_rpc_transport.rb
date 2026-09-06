@@ -65,15 +65,22 @@ module MCPClient
         content_encoding = response.headers['content-encoding'] || response.headers['Content-Encoding'] || ''
 
         body = decompress_gzip(body) if content_encoding.include?('gzip')
-        body = body&.strip
 
         # Determine response format based on Content-Type header per MCP 2025 spec
         data = if content_type.include?('text/event-stream')
                  # Parse SSE-formatted response for streaming
                  parse_sse_response(body, request && request['id'])
-               else
+               elsif body.is_a?(String)
                  # Parse regular JSON response (default for Streamable HTTP)
-                 JSON.parse(body)
+                 JSON.parse(body.strip)
+               else
+                 # A host's `conn.response :json` middleware decodes the body
+                 # before it reaches here — the README offers that middleware
+                 # for the error path, and it applies to every response — so an
+                 # already-decoded object is taken as it is rather than parsed
+                 # a second time. An event-stream body is not JSON and reaches
+                 # the branch above as the text it was sent as.
+                 body
                end
 
         process_jsonrpc_response(data)

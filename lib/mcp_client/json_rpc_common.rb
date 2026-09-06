@@ -457,11 +457,31 @@ module MCPClient
     # @raise [MCPClient::Errors::ServerError] if the response contains an error
     # @raise [MCPClient::Errors::InvalidResultError] if the result's resultType is unrecognized
     def process_jsonrpc_response(response)
-      raise MCPClient::Errors::ServerError.from_jsonrpc(response['error']) if response['error']
+      error = envelope_member(response, 'error')
+      raise MCPClient::Errors::ServerError.from_jsonrpc(error) if error
 
-      result = response['result']
+      result = envelope_member(response, 'result')
       validate_result_type!(result)
       result
+    end
+
+    # Read a member of a decoded JSON-RPC envelope.
+    #
+    # The README offers Faraday's JSON middleware for reading a server's error
+    # bodies, and that middleware decodes every response — under
+    # `symbolize_names` the envelope arrives keyed by Symbol. The members are
+    # the peer's, not the host's, so both spellings name the same thing: read
+    # the wire spelling first and fall back to the Symbol one. Anything that
+    # is no Hash is indexed as before, so a malformed envelope fails where it
+    # always did.
+    # @param response [Object] the decoded JSON-RPC envelope
+    # @param name [String] the member's name in its wire spelling
+    # @return [Object, nil] the member, or nil when the envelope carries none
+    def envelope_member(response, name)
+      return response[name] unless response.is_a?(Hash)
+      return response[name] if response.key?(name)
+
+      response[name.to_sym]
     end
 
     # "A resultType of any value unrecognized by the client MUST be
