@@ -451,8 +451,12 @@ RSpec.describe 'MCP 2026-07-28 cacheable results — round 36' do
       end
 
       server = streamable
-      threads_before = Thread.list.size
       expect(server.list_tools.map(&:name)).to eq(['t1'])
+      # Sampled after the fetch: whatever a request needs while it runs (the
+      # modern HTTP branch gives each one a deadline watchdog) is already
+      # accounted for. What this pins is that the idle expiry that follows
+      # starts nothing of its own.
+      idle_threads = Thread.list.size
 
       # Real time, so that anything scheduled to run at expiry would have
       # run: the TTL is long gone, nothing was fetched and nothing was
@@ -460,7 +464,7 @@ RSpec.describe 'MCP 2026-07-28 cacheable results — round 36' do
       # interval"); the entry is simply stale when it is next read.
       sleep 0.2
       expect(lists).to eq(1)
-      expect(Thread.list.size).to eq(threads_before)
+      expect(Thread.list.size).to be <= idle_threads
       expect(server.cache_info(:tools)[:fresh]).to be(false)
 
       expect(server.list_tools.map(&:name)).to eq(['t2'])
