@@ -4,12 +4,14 @@ require 'json'
 require 'zlib'
 require 'stringio'
 require_relative 'header_params'
+require_relative 'json_rpc_common/envelopes'
 require_relative 'json_rpc_common/error_bodies'
 require_relative 'json_rpc_common/input_waits'
 
 module MCPClient
   # Shared retry/backoff logic for JSON-RPC transports
   module JsonRpcCommon
+    include Envelopes
     include ErrorBodies
     include InputWaits
 
@@ -840,25 +842,6 @@ module MCPClient
       validate_result_type!(result)
       record_server_info(result, method: method)
       result
-    end
-
-    # Read a member of a decoded JSON-RPC envelope.
-    #
-    # The README offers Faraday's JSON middleware for reading a server's error
-    # bodies, and that middleware decodes every response — under
-    # `symbolize_names` the envelope arrives keyed by Symbol. The members are
-    # the peer's, not the host's, so both spellings name the same thing: read
-    # the wire spelling first and fall back to the Symbol one. Anything that
-    # is no Hash is indexed as before, so a malformed envelope fails where it
-    # always did.
-    # @param response [Object] the decoded JSON-RPC envelope
-    # @param name [String] the member's name in its wire spelling
-    # @return [Object, nil] the member, or nil when the envelope carries none
-    def envelope_member(response, name)
-      return response[name] unless response.is_a?(Hash)
-      return response[name] if response.key?(name)
-
-      response[name.to_sym]
     end
 
     # Client requests a server MAY answer with an InputRequiredResult (MCP
