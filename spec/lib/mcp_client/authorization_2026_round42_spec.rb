@@ -23,13 +23,24 @@ RSpec.describe 'MCP 2026-07-28 authorization — round 42' do
   # can be shown to wait for it rather than interleave with it.
   def hooked_storage
     Class.new(MCPClient::Auth::OAuthProvider::MemoryStorage) do
-      attr_accessor :before_set_token, :before_delete_pkce
+      attr_accessor :before_set_token, :before_delete_pkce, :before_get_token, :after_get_token
 
       def set_token(url, token)
         hook = @before_set_token
         @before_set_token = nil
         hook&.call
         super
+      end
+
+      # Left armed until the hook itself disarms: a read of another key must
+      # not spend the pause meant for one particular key. The `after` hook
+      # runs once the value is in hand, which is what makes a stale read
+      # reproducible.
+      def get_token(url)
+        @before_get_token&.call(url)
+        value = super
+        @after_get_token&.call(url)
+        value
       end
 
       def delete_pkce(url)
@@ -162,6 +173,135 @@ RSpec.describe 'MCP 2026-07-28 authorization — round 42' do
 
       expect(race[:interleaved]).to be(false)
       expect(storage.get_token(server_url)&.access_token).to eq('token-b')
+    end
+  end
+
+  # ------------------------------------------------------------- codex P1 (round 8)
+  # Adoption reads the authorization server in use and the token kept for it,
+  # then makes that token the one in use. The read is not the state the write
+  # may trust: a switch of authorization server another provider validated in
+  # between made ITS token the one in use, and this one stale. The
+  # re-validation and the write are one step, under the lock the switch takes.
+  describe 'a saved token adopted while another provider completes a switch' do
+    before do
+      storage.set_server_metadata(server_url, server_metadata(issuer_a))
+      storage.set_client_info(server_url, client_info('client-a', issuer_a))
+    end
+
+    # Pauses the adopting provider on its read of the token kept for A, runs
+    # the switch to B to completion, and only then lets the adoption go on.
+    def adopting_across_a_switch(provider, kept_key)
+      at_read = Queue.new
+      resume = Queue.new
+      storage.before_get_token = lambda { |url|
+        next unless url == kept_key
+
+        storage.before_get_token = nil
+        at_read << true
+        resume.pop
+      }
+      adopting = Thread.new { provider.access_token }
+      at_read.pop
+      switcher = provider_for
+      challenge_to_b(switcher)
+      storage.set_server_metadata(server_url, server_metadata(issuer_b))
+      storage.set_token(server_url, token_for(issuer_b, 'token-b'))
+      resume << true
+      adopting.join(5)
+      adopting.value
+    end
+
+    it 'leaves the switch its token and never presents the previous issuer' do
+      provider = provider_for
+      kept_key = provider.client_registration_key(issuer_a)
+      storage.set_token(kept_key, token_for(issuer_a, 'token-a'))
+
+      adopted = adopting_across_a_switch(provider, kept_key)
+
+      # The slot the switch wrote is untouched, and the caller that was
+      # adopting is never handed the token of the server that is gone.
+      expect(storage.get_token(server_url)&.access_token).to eq('token-b')
+      expect(adopted&.access_token).not_to eq('token-a')
+      expect(authorization_header_for(provider_for)).to eq('Bearer token-b')
+      # The token kept for A stays kept: returning to A must still find it.
+      expect(storage.get_token(kept_key)&.access_token).to eq('token-a')
+    end
+
+    it 'still adopts the token kept for the server that is still in use' do
+      provider = provider_for
+      kept_key = provider.client_registration_key(issuer_a)
+      storage.set_token(kept_key, token_for(issuer_a, 'token-a'))
+
+      expect(provider.access_token&.access_token).to eq('token-a')
+      expect(storage.get_token(server_url)&.access_token).to eq('token-a')
+    end
+  end
+
+  # ------------------------------------------------------------- codex coverage
+  # Returning to an authorization server whose saved token has expired: the
+  # refresh token kept with it is what makes the return usable at all, so the
+  # saved grant is refreshed at that server and the rotation persisted.
+  describe 'a return to an authorization server whose saved token expired' do
+    before do
+      storage.set_server_metadata(server_url, server_metadata(issuer_a))
+      storage.set_client_info(server_url, client_info('client-a', issuer_a))
+    end
+
+    it 'refreshes the saved grant at that server and persists the rotated refresh token' do
+      provider = provider_for
+      kept_key = provider.client_registration_key(issuer_a)
+      storage.set_token(kept_key, token_for(issuer_a, 'stale-a', refresh: 'r-old', expires_in: -1))
+      refresh = stub_request(:post, "#{issuer_a}/token")
+                .with(body: hash_including('grant_type' => 'refresh_token', 'refresh_token' => 'r-old'))
+                .to_return(token_body('fresh-a', refresh: 'r-new'))
+
+      token = provider.access_token
+
+      expect(refresh).to have_been_requested
+      expect(token&.access_token).to eq('fresh-a')
+      expect(authorization_header_for(provider)).to eq('Bearer fresh-a')
+      in_use = storage.get_token(server_url)
+      expect(in_use&.access_token).to eq('fresh-a')
+      expect(in_use&.refresh_token).to eq('r-new')
+      expect(in_use&.issuer).to eq(issuer_a)
+    end
+  end
+
+  # ------------------------------------------------------------- codex coverage
+  # A 2025-11-25 token names no authorization server; it is bound to the one
+  # in use the first time it is read. That binding is a write to the slot in
+  # use, so it answers to the same rule as adoption.
+  describe 'an issuer-less token bound while another provider completes a switch' do
+    before do
+      storage.set_server_metadata(server_url, server_metadata(issuer_a))
+      storage.set_client_info(server_url, client_info('client-a', issuer_a))
+    end
+
+    it 'leaves the switch its token rather than binding over it' do
+      storage.set_token(server_url, MCPClient::Auth::Token.new(access_token: 'legacy', expires_in: 3600))
+      provider = provider_for
+      at_read = Queue.new
+      resume = Queue.new
+      # Paused with the issuer-less record already in hand: the switch that
+      # follows is what the binding write must not land on top of.
+      storage.after_get_token = lambda { |url|
+        next unless url == server_url
+
+        storage.after_get_token = nil
+        at_read << true
+        resume.pop
+      }
+
+      binding_thread = Thread.new { provider.access_token }
+      at_read.pop
+      challenge_to_b(provider_for)
+      storage.set_server_metadata(server_url, server_metadata(issuer_b))
+      storage.set_token(server_url, token_for(issuer_b, 'token-b'))
+      resume << true
+      binding_thread.join(5)
+
+      expect(storage.get_token(server_url)&.access_token).to eq('token-b')
+      expect(binding_thread.value&.access_token).not_to eq('legacy')
     end
   end
 

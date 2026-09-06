@@ -121,12 +121,45 @@ module MCPClient
 
         # Make the token kept for the authorization server in use the token in
         # use again.
+        #
+        # The reads above are not the state the write may trust: a switch of
+        # authorization server another provider validated in between made ITS
+        # token the one in use, and this one stale. So the re-validation and
+        # the write are one step, under the same lock the switch, the code
+        # exchange and the refresh response take — and a switch that got in
+        # first keeps its token, which is the one this caller is handed.
         # @return [Token, nil]
         def adopt_token_kept_for_issuer_in_use
           issuer = current_issuer_for_tokens
           kept = issuer && token_kept_for_issuer(issuer)
           return nil unless kept
 
+          with_authorization_state_lock do
+            in_use = token_in_use_after_switch
+            next in_use if in_use
+            # The authorization server itself may have moved while this
+            # adoption waited; a token kept for the server that is gone is not
+            # made the token in use.
+            next nil unless current_issuer_for_tokens == issuer
+
+            adopt_kept_token(kept)
+          end
+        end
+
+        # The token the slot holds now, when it is one this resource may
+        # present: what a switch validated meanwhile stored there.
+        # @return [Token, nil]
+        def token_in_use_after_switch
+          token = stored_token
+          return nil unless token && !retired_token?(token)
+
+          bound = bind_token_issuer(token)
+          bound if bound && token_for_current_issuer?(bound)
+        end
+
+        # @param kept [Token] the token kept for the authorization server in use
+        # @return [Token] the token the caller may present
+        def adopt_kept_token(kept)
           logger.debug('Using the OAuth token kept for the authorization server this resource now uses again')
           begin
             storage.set_token(server_url, kept)
@@ -349,16 +382,36 @@ module MCPClient
           # it cannot attribute an unbound token either.
           return nil if @challenge_error
 
-          current = stored_server_metadata&.issuer
-          return nil unless current
+          # Read, attribute, write: one step, for the reason adoption takes the
+          # same lock. The record this was read from need not be the one in the
+          # slot by now — a switch validated meanwhile stored its own token
+          # there — and binding these bytes over it would hand one
+          # authorization server's token to another.
+          with_authorization_state_lock do
+            next nil unless slot_still_holds_unbound?(token)
 
-          bound = token.with_issuer(current)
-          begin
-            storage.set_token(server_url, bound)
-          rescue StandardError => e
-            logger.debug("The stored OAuth token could not be re-stored with its issuer (#{e.class})")
+            current = stored_server_metadata&.issuer
+            next nil unless current
+
+            bound = token.with_issuer(current)
+            begin
+              storage.set_token(server_url, bound)
+            rescue StandardError => e
+              logger.debug("The stored OAuth token could not be re-stored with its issuer (#{e.class})")
+            end
+            bound
           end
-          bound
+        end
+
+        # Whether the slot still holds the very issuer-less record that is
+        # about to be attributed to the authorization server in use.
+        # @param token [Token] the record read from the slot
+        # @return [Boolean]
+        def slot_still_holds_unbound?(token)
+          current = stored_token
+          return false unless current.respond_to?(:issuer) && current.issuer.nil?
+
+          current.respond_to?(:access_token) && current.access_token == token.access_token
         end
       end
     end
