@@ -502,7 +502,7 @@ class MrtrScriptedStdio < MCPClient::ServerStdio
 
   def start_stderr_reader; end
 
-  def send_request(request)
+  def send_request(request, _generation = nil)
     @sent_lock.synchronize { @sent << request }
   end
 

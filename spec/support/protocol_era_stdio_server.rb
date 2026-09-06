@@ -235,7 +235,8 @@ end
 # @return [Boolean] whether the mode answered the request itself
 def answered_by_mode?(msg)
   case MODE
-  when 'modern', 'modern-one-shot', 'modern-exit-on-call', 'mrtr-one-shot', 'future-only' then answered_by_modern_mode?(msg)
+  when 'modern', 'modern-one-shot', 'modern-exit-on-call', 'mrtr-one-shot', 'future-only'
+    answered_by_modern_mode?(msg)
   when 'modern-mute-list' then answered_by_modern_mute_list?(msg)
   when 'legacy-one-shot', 'legacy-broken-init', 'late-discover' then answered_by_legacy_mode?(msg)
   when 'modern-then-ping' then answered_by_modern_then_ping?(msg)
@@ -265,7 +266,10 @@ def answered_by_modern_mode?(msg)
     # and not replay it on the replacement process.
     exit 0 if msg['method'] == 'tools/call'
   when 'mrtr-one-shot'
-    return mrtr_one_shot(msg) if msg['method'] == 'tools/call'
+    return false unless msg['method'] == 'tools/call'
+
+    mrtr_one_shot(msg)
+    return true
   end
   false
 end
