@@ -38,7 +38,12 @@ RSpec.describe 'MCP 2026-07-28 Streamable HTTP — round 6' do
     stub_request(:post, url).to_return do |request|
       body = JSON.parse(request.body)
       seen << body
-      responder = responders.fetch(body['method'])
+      # A modern tools/call reads the tool list first on this branch (the
+      # header-bearing parameters come from the definition), so a fixture
+      # that only scripts the call is served a plain definition of `t`.
+      responder = responders.fetch(body['method']) do
+        ->(b) { json_response(b['id'], 'tools' => [{ 'name' => 't', 'inputSchema' => { 'type' => 'object' } }]) }
+      end
       responder.respond_to?(:call) ? responder.call(body) : json_response(body['id'], responder)
     end
     seen
