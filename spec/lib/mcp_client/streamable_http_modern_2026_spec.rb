@@ -441,7 +441,11 @@ RSpec.describe 'MCP 2026-07-28 Streamable HTTP modern mode' do
         sleep 0.05
 
         expect(elicitation_calls).to eq(0)
-        expect(requests.none? { |r| r[:body]['id'] == 'srv-1' && r[:body].key?('result') }).to be(true)
+        # Nothing at all is sent back for that id: an error reply is a reply
+        # too, and a modern server never asked for one.
+        answers = requests.select { |r| r[:body]['id'] == 'srv-1' }
+        expect(answers).to be_empty
+        expect(requests.map { |r| r[:body]['method'] }).to eq(%w[server/discover tools/call])
       end
 
       it 'ignores SSE comment keep-alive lines' do
