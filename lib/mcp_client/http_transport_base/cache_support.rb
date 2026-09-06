@@ -92,13 +92,36 @@ module MCPClient
           @transport.send(:note_request_authorization,
                           MCPClient::ResultCaching.authorization_header_value(env.request_headers))
           env[SENT_AUTHORIZATION_KEY] = @transport.send(:recorded_request_authorization)
+          # Each attempt the retry middleware makes is received on its own.
+          env[RESPONSE_RECEIVED_AT_KEY] = nil
+          stamp_first_chunk(env)
         end
 
         # The bytes are in hand and nothing of the host's has run on them
         # yet: the TTL of whatever this response carries starts here (MCP
-        # 2026-07-28 caching, "Freshness Calculation").
+        # 2026-07-28 caching, "Freshness Calculation") -- or already started,
+        # when the response was read as a stream.
         def on_complete(env)
-          env[RESPONSE_RECEIVED_AT_KEY] = @transport.send(:monotonic_now)
+          env[RESPONSE_RECEIVED_AT_KEY] ||= @transport.send(:monotonic_now)
+        end
+
+        private
+
+        # A response read as a stream is in hand from its first chunk, and
+        # what that chunk carries -- a notification, a server request -- is
+        # handled while the stream is still open. The TTL runs from receipt,
+        # not from whatever the host made of the stream on the way: the stamp
+        # goes on ahead of the transport's own on_data handler.
+        # @param env [Faraday::Env] the outgoing request environment
+        # @return [void]
+        def stamp_first_chunk(env)
+          inner = env.request.on_data
+          return unless inner
+
+          env.request.on_data = lambda do |chunk, size, data_env|
+            env[RESPONSE_RECEIVED_AT_KEY] ||= @transport.send(:monotonic_now)
+            inner.call(chunk, size, data_env)
+          end
         end
       end
 

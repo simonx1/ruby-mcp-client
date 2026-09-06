@@ -1106,27 +1106,52 @@ RSpec.describe 'MCP 2026-07-28 cacheable results — round 5' do
   end
 
   describe 'on HTTP+SSE' do
+    let(:messages) { 'https://example.com/messages' }
     let(:server) do
-      MCPClient::ServerSSE.new(base_url: 'https://example.com/sse', headers: { 'Authorization' => 'Bearer alice' })
+      MCPClient::ServerSSE.new(base_url: 'https://example.com/sse', headers: { 'Authorization' => 'Bearer alice' },
+                               read_timeout: 5, retries: 0)
     end
 
     before do
       allow(server).to receive(:ensure_initialized)
+      %i[@connection_established @sse_connected @initialized].each { |name| server.instance_variable_set(name, true) }
       server.instance_variable_set(:@protocol_version, '2025-11-25')
+      server.instance_variable_set(:@rpc_endpoint, messages)
     end
 
-    it 'records the resource templates hint' do
-      allow(server).to receive(:rpc_request).with('resources/templates/list', anything)
-                                            .and_return({ 'resourceTemplates' => [], 'ttlMs' => 60_000 })
+    # The request goes out on a real POST and its answer arrives as an SSE
+    # event: the path a 2025-11-25 server takes, credentials on the wire and
+    # all. The script answers with the result of a request body.
+    def answer_posts(&script)
+      stub_request(:post, messages).to_return do |request|
+        body = JSON.parse(request.body)
+        message = { 'jsonrpc' => '2.0', 'id' => body['id'], 'result' => script.call(body) }
+        server.send(:parse_and_handle_sse_event, "event: message\ndata: #{JSON.generate(message)}\n\n")
+        { status: 202, body: '' }
+      end
+    end
 
-      server.list_resource_templates
+    it 'records the resource templates hint and serves the list from it' do
+      lists = 0
+      answer_posts do |body|
+        raise "unexpected #{body['method']}" unless body['method'] == 'resources/templates/list'
 
+        lists += 1
+        { 'resourceTemplates' => [{ 'uriTemplate' => 'file:///{x}', 'name' => "t#{lists}" }], 'ttlMs' => 60_000 }
+      end
+
+      expect(server.list_resource_templates['resourceTemplates'].map(&:name)).to eq(['t1'])
       expect(server.cache_info(:templates)).to include(ttl_ms: 60_000, fresh: true)
+      expect(server.list_resource_templates['resourceTemplates'].map(&:name)).to eq(['t1'])
+      expect(lists).to eq(1)
+      expect(a_request(:post, messages).with(headers: { 'Authorization' => 'Bearer alice' })).to have_been_made.once
     end
 
     it 'does not serve a private entry after the Authorization header changes' do
       reads = 0
-      allow(server).to receive(:rpc_request).with('resources/read', anything) do
+      answer_posts do |body|
+        raise "unexpected #{body['method']}" unless body['method'] == 'resources/read'
+
         reads += 1
         contents("read #{reads}").merge('ttlMs' => 60_000, 'cacheScope' => 'private')
       end
@@ -1135,6 +1160,8 @@ RSpec.describe 'MCP 2026-07-28 cacheable results — round 5' do
       server.instance_variable_get(:@headers)['Authorization'] = 'Bearer bob'
 
       expect(server.read_resource('file:///a').first.text).to eq('read 2')
+      expect(a_request(:post, messages).with(headers: { 'Authorization' => 'Bearer alice' })).to have_been_made.once
+      expect(a_request(:post, messages).with(headers: { 'Authorization' => 'Bearer bob' })).to have_been_made.once
     end
   end
 end

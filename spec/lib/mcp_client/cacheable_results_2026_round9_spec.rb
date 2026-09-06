@@ -113,6 +113,7 @@ RSpec.describe 'MCP 2026-07-28 cacheable results — round 9' do
     server.send(:record_paginated_cache_hint, :tools, [{ 'tools' => [], 'ttlMs' => 60_000 }])
 
     remembered = Thread.current[server.send(:recorded_entries_key)][:tools]
+    expect(remembered).not_to be_nil
     expect(remembered).not_to be_a(MCPClient::CachedResult)
     expect(remembered.instance_variables).to be_empty
   end

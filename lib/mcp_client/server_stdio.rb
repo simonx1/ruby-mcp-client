@@ -545,7 +545,7 @@ module MCPClient
       ensure_initialized
       # A null result reaches the shared guard as-is: it is a malformed
       # response, not an empty resource.
-      read_resource_with_cache(uri) { rpc_request('resources/read', { 'uri' => uri }) }
+      read_resource_with_cache(uri) { |sent| rpc_request('resources/read', { 'uri' => sent }) }
     rescue MCPClient::Errors::ServerError => e
       raise if e.protocol_error?
       raise resource_not_found_error(uri, e) if resource_not_found_response?(e)

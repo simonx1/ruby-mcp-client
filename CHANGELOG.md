@@ -7,6 +7,22 @@ metadata). Each feature lands in its own PR; this section accumulates them.
 
 ### Cacheable results (`ttlMs` / `cacheScope`)
 
+- **A read is keyed by the URI its request went out with, whatever the host
+  does to the string it passed (round 38).** The cache key was taken from the
+  caller's string on entry while the request carrying it was serialized later,
+  so a host that rewrote that string in place in between (a concurrent caller,
+  a callback) had B's contents filed under A, and the next read of A was
+  answered from them. One immutable snapshot now names the request, its key
+  and its entry.
+- **A plain-HTTP response read as a stream is dated from its first chunk
+  (round 38).** Receipt was recorded when the response completed, after the
+  notifications the stream carried had been handed to the host, so a slow
+  callback lengthened the TTL of the result that followed it. The stamp now
+  goes on ahead of the transport's own stream handler.
+- **An empty-string cursor is followed like any other (round 38).** Cursors
+  are opaque and the empty string is one a server may hand out; only a
+  missing `nextCursor` ends an automatically paginated list (a cursor handed
+  out twice still stops it).
 - **A result is bound to the parameters its own request went out with, not to
   the ones the host holds by the time the answer is in (round 36).** The
   host's `request_meta` was merged into `params._meta` shallowly, so a request

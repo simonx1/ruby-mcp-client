@@ -441,24 +441,26 @@ RSpec.describe 'MCP 2026-07-28 cacheable results — round 36' do
 
   describe 'a ttlMs that runs out with nobody asking' do
     it 'is not a poll interval: nothing is fetched until the next access' do
-      clock = { now: 1000.0 }
       lists = 0
       stub_request(:post, url).to_return do |request|
         body = JSON.parse(request.body)
         next json_response(body['id'], discover_result) unless body['method'] == 'tools/list'
 
         lists += 1
-        json_response(body['id'], { 'tools' => [tool("t#{lists}")], 'ttlMs' => 1_000, 'cacheScope' => 'public' })
+        json_response(body['id'], { 'tools' => [tool("t#{lists}")], 'ttlMs' => 50, 'cacheScope' => 'public' })
       end
 
       server = streamable
-      allow(server).to receive(:monotonic_now) { clock[:now] }
+      threads_before = Thread.list.size
       expect(server.list_tools.map(&:name)).to eq(['t1'])
 
-      clock[:now] += 5
-      # Expiry alone fetches nothing ("clients SHOULD NOT treat ttlMs as a
-      # polling interval"); the entry is simply stale when it is next read.
+      # Real time, so that anything scheduled to run at expiry would have
+      # run: the TTL is long gone, nothing was fetched and nothing was
+      # started to fetch ("clients SHOULD NOT treat ttlMs as a polling
+      # interval"); the entry is simply stale when it is next read.
+      sleep 0.2
       expect(lists).to eq(1)
+      expect(Thread.list.size).to eq(threads_before)
       expect(server.cache_info(:tools)[:fresh]).to be(false)
 
       expect(server.list_tools.map(&:name)).to eq(['t2'])

@@ -299,6 +299,23 @@ RSpec.describe 'MCP 2026-07-28 cacheable results — round 37' do
         server&.cleanup
       end
 
+      it 'raises a -32603 from the re-fetch, caches nothing, and asks again next time' do
+        reads = stub_read(MCPClient::Errors::Codes::INTERNAL_ERROR, '2026-07-28')
+        server = build_server('2026-07-28')
+        read_after_expiry(server)
+
+        # Every transport reports a failed read the same way: wrapped, with
+        # the server's message, never as a cached value.
+        expect { server.read_resource('file:///a') }.to raise_error(MCPClient::Errors::ResourceReadError, /gone/)
+        # The expired entry is still there, and still expired: nothing of
+        # the failure was stored and nothing stale is served from it.
+        expect(server.cache_info(:read, 'file:///a')).to include(fresh: false)
+        expect(server.read_resource('file:///a').map(&:text)).to eq(['v3'])
+        expect(reads.call).to eq(3)
+      ensure
+        server&.cleanup
+      end
+
       it 'keeps -32602 a plain Invalid params on a legacy server' do
         reads = stub_read(MCPClient::Errors::Codes::INVALID_PARAMS, '2025-11-25')
         server = build_server('2025-11-25')
@@ -316,6 +333,41 @@ RSpec.describe 'MCP 2026-07-28 cacheable results — round 37' do
       def stub_read(code, era) = stub_expiring_http_read(code, era)
 
       def build_server(era) = era == '2026-07-28' ? plain_http : plain_http(protocol: :legacy)
+
+      it_behaves_like 'read errors that cache nothing'
+    end
+
+    context 'on HTTP+SSE (POST -> SSE event -> result store -> waiter)' do
+      def stub_read(code, era)
+        @era = era
+        @reads = 0
+        @script = lambda do |request|
+          raise "unexpected #{request['method']}" unless request['method'] == 'resources/read'
+
+          @reads += 1
+          if @reads == 2
+            { 'error' => { 'code' => code, 'message' => 'gone' } }
+          else
+            { 'result' => { 'contents' => [{ 'uri' => 'file:///a', 'text' => "v#{@reads}" }], 'ttlMs' => 20 } }
+          end
+        end
+        -> { @reads }
+      end
+
+      def build_server(era)
+        server = MCPClient::ServerSSE.new(base_url: 'https://example.com/sse', read_timeout: 5, retries: 0)
+        server.instance_variable_set(:@connection_established, true)
+        server.instance_variable_set(:@sse_connected, true)
+        server.instance_variable_set(:@initialized, true)
+        server.instance_variable_set(:@protocol_version, era)
+        server.instance_variable_set(:@rpc_endpoint, 'https://example.com/messages')
+        allow(server).to receive(:post_json_rpc_request) do |request|
+          message = { 'jsonrpc' => '2.0', 'id' => request['id'] }.merge(@script.call(request))
+          server.send(:parse_and_handle_sse_event, "event: message\ndata: #{JSON.generate(message)}\n\n")
+          nil
+        end
+        server
+      end
 
       it_behaves_like 'read errors that cache nothing'
     end

@@ -290,7 +290,10 @@ module MCPClient
         items.concat(Array(page_items))
         pages += 1
 
-        break if next_cursor.nil? || next_cursor.to_s.empty?
+        # Only a missing (null) nextCursor ends the list: a cursor is opaque,
+        # and the empty string is one a server may hand out. A cursor handed
+        # out twice stops the walk below.
+        break if next_cursor.nil?
 
         if seen_cursors[next_cursor]
           @logger.warn("Pagination for #{kind} stopped: server returned a repeated cursor #{next_cursor.inspect}")

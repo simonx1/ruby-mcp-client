@@ -864,9 +864,17 @@ module MCPClient
     # produced by retrying a request through the multi round-trip requests
     # mechanism MUST NOT be cached").
     # @param uri [String] the resource URI
-    # @yield fetches the raw resources/read result
+    # @yieldparam uri [String] the URI to put on the wire: the snapshot the
+    #   entry is keyed by, not the caller's string as it may read by then
+    # @yieldreturn [Hash] the raw resources/read result
     # @return [Array<MCPClient::ResourceContent>]
     def read_resource_with_cache(uri)
+      # One immutable URI names the request, its key and its entry: a host
+      # that rewrites the string it passed while the read is under way (a
+      # concurrent caller, a callback) must not have B's contents filed
+      # under A ("a cached response MUST NOT be served across different
+      # request parameters").
+      uri = -uri.to_s
       key = read_cache_key(uri)
       cached = private_entry_for_current_context(key)
       # An invalidation (a resources/updated notification, a cleanup) that
@@ -885,7 +893,7 @@ module MCPClient
 
       epoch = cache_epoch(key)
       started = monotonic_now
-      result = yield
+      result = yield(uri)
       # The TTL runs from receipt — before the response's notifications were
       # dispatched — not from the end of the conversion below.
       received_at = response_received_at(since: started)
