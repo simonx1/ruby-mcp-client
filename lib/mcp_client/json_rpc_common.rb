@@ -816,6 +816,14 @@ module MCPClient
       declared_extensions.key?(TASKS_EXTENSION)
     end
 
+    # The result types this client implements on top of the core ones, per
+    # extension: declaring the tasks extension makes a CreateTaskResult
+    # (resultType "task") an accepted answer on the requests it allows.
+    # @return [Hash{String => Array<String>}]
+    def implemented_extension_result_types
+      { TASKS_EXTENSION => ['task'] }
+    end
+
     # The resultType of a result object. MCP 2026-07-28 makes the field
     # required, but "for backward compatibility with servers implementing
     # earlier protocol versions, which do not include resultType, clients

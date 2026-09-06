@@ -344,7 +344,10 @@ RSpec.describe 'MCP 2026-07-28 tasks extension — verification round' do
       end
       retransmission = Thread.new do
         Thread.current[:retransmitting] = true
-        client.send(:retransmit_pending_update, { srv: stdio, task_id: 'task-1' })
+        # The observation the poll made says the task is asking but not for what:
+        # everything still pending is the retransmission's to send.
+        asking = MCPClient::Task.from_json({ 'taskId' => 'task-1', 'status' => 'input_required' }, server: stdio)
+        client.send(:retransmit_pending_update, asking, { srv: stdio, task_id: 'task-1' })
       end
       # The retransmission has done everything it does before taking the lock;
       # the host's own answer for the same key now lands and is confirmed.

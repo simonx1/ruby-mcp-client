@@ -123,7 +123,10 @@ RSpec.describe 'MCP 2026-07-28 tasks extension — round 14' do
     end
     retransmission = Thread.new do
       Thread.current[:retransmitting] = true
-      client.send(:retransmit_pending_update, { srv: stdio, task_id: 'task-1' })
+      # The observation the poll made says the task is asking but not for what:
+      # everything still pending is the retransmission's to send.
+      asking = MCPClient::Task.from_json({ 'taskId' => 'task-1', 'status' => 'input_required' }, server: stdio)
+      client.send(:retransmit_pending_update, asking, { srv: stdio, task_id: 'task-1' })
     end
     snapshot_taken.pop
     client.update_task(task, { 'k1' => { 'action' => 'decline' } })
@@ -149,23 +152,31 @@ RSpec.describe 'MCP 2026-07-28 tasks extension — round 14' do
     expect(client.send(:task_state, stdio, 'task-1')[:pending_update]).to be_nil
   end
 
-  it 'drops the bookkeeping of a previous server session' do
+  # A stateless 2026-07-28 peer holds no session a process replacement could
+  # end (round 43): the task it created, and the answers the host already
+  # gave it, are what the process that comes next is asked about. Only a
+  # 2025-11-25 handshake opens a session whose end takes its bookkeeping
+  # with it (round 43 pins that side).
+  it 'keeps the bookkeeping of a stateless peer across a process replacement' do
     client = client_for(stdio)
     script_stdio(stdio, [{ 'result' => discover_result }, tool_list, { 'result' => task_result }, { 'result' => {} }])
     task = client.call_tool_as_task('slow', {})
     client.update_task(task, { 'k1' => { 'action' => 'decline' } })
     states = client.instance_variable_get(:@task_states)
+    epoch = stdio.session_epoch
     expect(states.keys.count { |k| k.first == stdio.object_id }).to eq(1)
 
     stdio.cleanup
     client.send(:task_state, stdio, 'task-2')
 
+    expect(stdio.session_epoch).to eq(epoch)
     kept = states.keys.select { |k| k.first == stdio.object_id }
-    expect(kept.map { |k| k[1] }.uniq).to eq([stdio.session_epoch])
-    expect(kept.map(&:last)).to eq(['task-2'])
+    expect(kept.map { |k| k[1] }.uniq).to eq([epoch])
+    expect(kept.map(&:last)).to eq(%w[task-1 task-2])
+    expect(states[kept.first][:answered]).to include('k1')
   end
 
-  it 'forgets every task on Client#cleanup' do
+  it 'keeps a stateless peer\'s task bookkeeping on Client#cleanup' do
     client = client_for(stdio)
     script_stdio(stdio, [{ 'result' => discover_result }, tool_list, { 'result' => task_result }, { 'result' => {} }])
     task = client.call_tool_as_task('slow', {})
@@ -173,6 +184,9 @@ RSpec.describe 'MCP 2026-07-28 tasks extension — round 14' do
 
     client.cleanup
 
-    expect(client.instance_variable_get(:@task_states)).to be_nil.or be_empty
+    states = client.instance_variable_get(:@task_states)
+    entry = states.find { |lookup, _| lookup.first == stdio.object_id && lookup.last == 'task-1' }
+    expect(entry).not_to be_nil
+    expect(entry.last[:answered]).to include('k1')
   end
 end
