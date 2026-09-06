@@ -11,6 +11,14 @@ module MCPClient
       include OriginPolicy
       include JsonRpcCommon
 
+      # Returned by #check_for_result when nothing has arrived for the
+      # request yet. The stored result is whatever `result` member the
+      # response carried, so `null` and `false` are answers the client must
+      # deliver (and validate) rather than truthiness the waiter can read as
+      # "still outstanding" — doing that waited out the whole read timeout
+      # and cancelled a request the server had already answered.
+      NO_RESULT = Object.new.freeze
+
       # Generic JSON-RPC request: send method with params and return result
       # @param method [String] JSON-RPC method name
       # @param params [Hash] parameters for the request
@@ -89,7 +97,15 @@ module MCPClient
         request_id = @mutex.synchronize { @request_id += 1 }
         json_rpc_request = build_jsonrpc_request('initialize', initialization_params, request_id)
         @logger.debug("Performing initialize RPC: #{json_rpc_request}")
-        result = send_jsonrpc_request(json_rpc_request)
+        begin
+          result = send_jsonrpc_request(json_rpc_request)
+        rescue MCPClient::Errors::UnsupportedProtocolVersionError => e
+          # As on the HTTP transports: the versions a modern-only server
+          # names in `data` are the diagnostic a legacy configuration needs,
+          # so they are spelled out rather than dropped by connect's wrap.
+          raise MCPClient::Errors::ConnectionError,
+                "Initialize failed: #{e.message} (server supports: #{e.supported.join(', ')})"
+        end
         unless result.is_a?(Hash)
           # A non-object initialize result means the handshake did not succeed.
           # Continuing would enter the Operation phase without ever sending the
@@ -187,9 +203,13 @@ module MCPClient
 
           unless response.success?
             # 5xx failures are plausibly transient (retryable); 4xx and other
-            # statuses are deterministic and raise a plain (non-retryable) error.
-            error_class = (500..599).cover?(response.status) ? MCPClient::Errors::TransientServerError : MCPClient::Errors::ServerError
-            raise error_class, "Server returned error: #{response.status} #{response.reason_phrase}"
+            # statuses are deterministic and raise a plain (non-retryable)
+            # error — typed when the body carries a JSON-RPC error (MCP
+            # 2026-07-28 protocol errors ride in 400/404 bodies).
+            message = "Server returned error: #{response.status} #{response.reason_phrase}"
+            raise MCPClient::Errors::TransientServerError, message if (500..599).cover?(response.status)
+
+            raise jsonrpc_error_from_http_response(response, message)
           end
 
           response
@@ -276,7 +296,7 @@ module MCPClient
       def wait_for_result_with_timeout(request_id, start_time, timeout)
         loop do
           result = check_for_result(request_id)
-          return result if result
+          return result unless result.equal?(NO_RESULT)
 
           unless connection_active?
             raise MCPClient::Errors::ConnectionError,
@@ -294,24 +314,33 @@ module MCPClient
 
       # Check if a result is available for the given request ID
       # @param request_id [Integer] the request ID to check
-      # @return [Hash, nil] the result if available, nil otherwise
+      # @return [Object] the result if one has arrived, NO_RESULT otherwise
       # @raise [MCPClient::Errors::ServerError] if the stored result is a JSON-RPC error response
       def check_for_result(request_id)
+        arrived = false
         result = nil
         @mutex.synchronize do
-          result = @sse_results.delete(request_id) if @sse_results.key?(request_id)
+          if @sse_results.key?(request_id)
+            arrived = true
+            result = @sse_results.delete(request_id)
+          end
         end
+        return NO_RESULT unless arrived
 
-        if result
-          record_activity
-          # SseParser#process_response? stores JSON-RPC error responses under
-          # the Symbol :error key; deliver them to the caller as ServerError
-          # (MCP lifecycle "Error Handling") instead of timing out.
-          raise_sse_error_response(result[:error]) if result.is_a?(Hash) && result.key?(:error)
-          return result
+        record_activity
+        # SseParser#process_response? stores JSON-RPC error responses under
+        # the Symbol :error key; deliver them to the caller as ServerError
+        # (MCP lifecycle "Error Handling") instead of timing out.
+        raise_sse_error_response(result[:error]) if result.is_a?(Hash) && result.key?(:error)
+        # …and an envelope that carried neither member under :no_answer.
+        if result.is_a?(Hash) && result[:no_answer]
+          raise MCPClient::Errors::InvalidResultError,
+                "Invalid result: the response to request #{request_id} carried neither a result nor an error member"
         end
-
-        nil
+        # Same resultType invariant as process_jsonrpc_response on the
+        # other transports: an unrecognized value is an invalid response.
+        validate_result_type!(result)
+        result
       end
 
       # Raise a ServerError for a JSON-RPC error response received over SSE,
@@ -319,10 +348,9 @@ module MCPClient
       # @param error [Hash, nil] the JSON-RPC error object ('code', 'message', 'data')
       # @raise [MCPClient::Errors::ServerError] always
       def raise_sse_error_response(error)
-        error ||= {}
-        message = error['message'] || 'Unknown server error'
-        message = "#{message} (code #{error['code']})" if error['code']
-        raise MCPClient::Errors::ServerError, message
+        typed = MCPClient::Errors::ServerError.from_jsonrpc(error)
+        message = typed.code ? "#{typed.message} (code #{typed.code})" : typed.message
+        raise typed.class.new(message, code: typed.code, data: typed.data)
       end
 
       # Parse a direct (non-SSE) JSON-RPC response

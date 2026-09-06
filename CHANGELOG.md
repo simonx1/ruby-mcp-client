@@ -1,5 +1,137 @@
 # Changelog
 
+## Unreleased — MCP 2026-07-28
+
+Groundwork for the 2026-07-28 protocol revision (stateless, per-request
+metadata). Each feature lands in its own PR; this section accumulates them.
+
+### Protocol foundations
+
+- **Version constants.** `MCPClient::LATEST_PROTOCOL_VERSION` (`2026-07-28`),
+  `MODERN_PROTOCOL_VERSIONS` (per-request metadata revisions) and
+  `LEGACY_PROTOCOL_VERSIONS` (initialize-handshake revisions).
+  `SUPPORTED_PROTOCOL_VERSIONS` is now their union; `PROTOCOL_VERSION` stays
+  `2025-11-25` because it is the version the legacy `initialize` request asks
+  for, and a server answering `initialize` with a modern version is rejected.
+- **Typed JSON-RPC errors.** `MCPClient::Errors::ServerError` now carries the
+  JSON-RPC `code` and `data` (`ServerError.new(msg, code:, data:)`, fully
+  backward compatible). `ServerError.from_jsonrpc(error)` builds the
+  2026-07-28 spec-defined errors: `HeaderMismatchError` (-32020),
+  `MissingRequiredClientCapabilityError` (-32021, `#required_capabilities`)
+  and `UnsupportedProtocolVersionError` (-32022, `#supported`, `#requested`).
+  `MCPClient::Errors::Codes` holds the code constants and the allocation
+  policy helpers. All four transports raise these typed errors.
+- **Only a well-formed error identifies a modern server.**
+  `#modern_protocol_error?` (which suppresses the legacy `initialize`
+  fallback, and lets the error propagate through the public wrappers) is true
+  only for an error carrying the wire shape its schema mandates: the JSON-RPC
+  `message` string, plus `requiredCapabilities` as an object for -32021 and
+  `supported: string[]` with `requested: string` for -32022. Those are the
+  schema's types and nothing more — an empty `supported` list still marks a
+  modern server that named no version this client can retry with, which is a
+  failed negotiation rather than evidence of a legacy peer. An error object
+  with no JSON-RPC `message` at all is malformed at the JSON-RPC level and
+  does not even earn a typed class — it stays a plain `ServerError` with its
+  `code` and `data` preserved. A legacy endpoint or intermediary emitting a
+  bare -3202x code therefore cannot suppress the fallback. For -32021 that
+  check follows the schema all the way down: `requiredCapabilities` is typed
+  as `ClientCapabilities`, so its members must be objects too — a body
+  claiming `{"elicitation": []}` is malformed and does not identify a modern
+  server — and so is one whose nested members break the schema's types
+  (`elicitation.form`/`.url` and `sampling.context`/`.tools` are objects,
+  `experimental`/`extensions` map names to objects). Exactly the schema's
+  constraints, and no more: ClientCapabilities is an open object, so a
+  vendor member beside `form`, anything inside `roots`, or an unknown
+  capability of any shape is still well-formed, and such a rejection reaches
+  the caller as the typed error with its `#required_capabilities` readable
+  instead of being flattened into a `ToolCallError`. `#modern_http_protocol_error?` is the
+  Streamable-HTTP-specific predicate: it additionally recognizes an unknown
+  method answered with HTTP 404 and a JSON-RPC -32601 body, which that
+  transport's backward compatibility rules name as a modern-server signal.
+  That -32601 is typed as `MCPClient::Errors::MethodNotFoundError` (a plain
+  `ServerError` for every other purpose) and, like the reserved codes, only
+  when its error object is well-formed: a 404 page dressed up as
+  `{"error": {"code": -32601}}` with no `message` identifies nobody. That
+  body is read according to the era the session was negotiated under. On a
+  session negotiated under 2025-11-25 the session rule is unconditional —
+  "when receiving HTTP 404 in response to a request containing an
+  `Mcp-Session-Id`, the client MUST start a new session" names the status and
+  the session id and takes no exception for what the body carries, and a
+  server on that revision answers the session rather than the request. Off
+  such a session (an era never established, or a modern one whose server
+  assigned a session id 2026-07-28 gives it no reason to assign) a
+  well-formed -32601 is the answer to the request itself (an unknown method),
+  and replaying it after a fresh initialize would only ask the unknown method
+  again. That body is read the way every other HTTP error body is: a JSON-RPC
+  2.0 envelope, size-bounded, gunzipped when the response says so — an
+  "error" member outside an envelope, an oversized or undecodable body is no
+  answer at all. It is
+  deliberately separate from `#modern_protocol_error?`, because on stdio a
+  bare -32601 is exactly what a legacy peer answers a modern probe with and
+  must keep the `initialize` fallback alive. When a modern-only server
+  rejects `initialize` with -32022, `connect` on every transport names the
+  versions it supports in the `ConnectionError` message (`server supports:
+  2026-07-28`), with the typed error as its `cause`; the list travels in the
+  error's `data`, so the peer's prose alone would not have shown it.
+- **A response answers with a result or an error, never with neither.**
+  JSON-RPC 2.0 section 5: "Either the result member or error member MUST be
+  included". An SSE envelope carrying neither answers nothing, and is raised
+  as `MCPClient::Errors::InvalidResultError` rather than delivered as a
+  successful `nil` — the member's presence is what decides, so an explicit
+  `"result": null` (or `false`) is still the answer it is.
+- **A host's `conn.response :json` middleware is respected on both paths.**
+  It decodes every body, not only the 4xx ones the error path reads, so a
+  successful result is taken from the decoded object instead of being parsed
+  a second time (`undefined method 'strip' for a Hash`), and a body already
+  decoded is described in logs by its type rather than measured in bytes.
+- **`resultType`.** Every result is checked: an absent field is treated as
+  `"complete"` (earlier-protocol servers, and modern ones that omit it), and
+  any unrecognized value raises `MCPClient::Errors::InvalidResultError` (a
+  `ServerError`, so it is answered rather than re-sent), as the spec
+  requires — in every era: `resultType` is a name 2026-07-28 coined, so a
+  server that sends one is 2026-aware whatever version the session
+  negotiated, and a value this client cannot interpret is never silently
+  read as `"complete"`. `"input_required"` passes through for the multi round-trip
+  handling that follows, but only on a modern session: the pattern exists
+  only in 2026-07-28, so a handshake-era server claiming an unfinished result
+  is malformed. No operation that projects a field out of the result
+  (`read_resource`, every `*/list` including each page of a paginated one,
+  and `completion/complete`) flattens an unfinished one into an empty
+  success — they raise, with the whole result on the error's `data` so a host
+  can drive the round trip itself. `call_tool` and `get_prompt` return the
+  whole result and so pass a continuation through untouched; `Client#call_tool`
+  skips its `outputSchema` conformance check for one, since an unfinished
+  result carries the continuation rather than the tool's output.
+- **Typed errors from HTTP error bodies.** 2026-07-28 servers carry their
+  protocol errors in the body of an HTTP 400 (and an unknown method as a 404
+  with -32601). The HTTP, Streamable HTTP and SSE transports now parse a
+  JSON-RPC error out of a 4xx body and raise the typed error (with the HTTP
+  status prefixed to the message, and the code, data and HTTP status
+  preserved), so a dual-era client can tell a modern rejection from a legacy
+  one. 5xx responses stay `TransientServerError`. The body is read whether it
+  arrives raw or already decoded by host-configured response middleware
+  (`faraday_config` with `conn.response :json`, with or without
+  `conn.response :raise_error`); a raw body is size-bounded and incrementally
+  gunzipped before it is parsed.
+- **Resource not found.** A `resources/read` error with the legacy `-32002`
+  code — or `-32602` from a modern (2026-07-28) server — now raises
+  `MCPClient::Errors::ResourceNotFound` on every transport instead of a
+  generic `ResourceReadError`. On a legacy session `-32602` stays the
+  generic Invalid params it always was. `protocol_version` / `modern?` are
+  now readable on every transport.
+- **Protocol errors survive every public method.** `call_tool`, `get_prompt`,
+  `read_resource`, the list operations, `complete` and `log_level=` re-raise a
+  typed protocol error instead of wrapping it in a `ToolCallError` /
+  `PromptGetError` / `ResourceReadError` / bare `ServerError`, so the `code`,
+  the `data` and — for -32021 — `requiredCapabilities` reach the host that has
+  to act on them. Ordinary application errors are still wrapped as before.
+- **An SSE result of `null` or `false` is an answer.** The SSE transport
+  stored whatever `result` member arrived, and the waiter's truthiness check
+  could not tell one from "nothing has arrived yet": the caller waited out its
+  whole read timeout and sent a cancellation for a request the server had
+  already answered. Arrival is now tracked separately from the value, so such
+  a response is delivered (and `resultType`-validated) immediately.
+
 ## 2.1.0 — Hostile-Server Hardening (2026-08-04)
 
 A security pass over every transport, driven by an external scan of the 2.0.0

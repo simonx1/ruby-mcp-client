@@ -116,8 +116,16 @@ module MCPClient
               # (JSON.parse only produces String keys, so this cannot collide
               # with a success result) for the waiter to raise ServerError.
               { error: data['error'] }
-            else
+            elsif data.key?('result')
+              # An explicit null (or false) result is an answer; only the
+              # member's presence decides that.
               data['result']
+            else
+              # JSON-RPC 2.0 section 5: "Either the result member or error
+              # member MUST be included". An envelope carrying neither answers
+              # nothing, and reading its absent result as a delivered nil
+              # would turn a malformed response into a successful call.
+              { no_answer: true }
             end
         end
 

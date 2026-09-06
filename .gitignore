@@ -71,3 +71,6 @@ examples/__pycache__/
 # Local, real secrets for the example runner (Zapier MCP token, etc.).
 # Copy examples/secrets.env.example -> examples/secrets.env and fill it in.
 examples/secrets.env
+
+# Bundler install path (BUNDLE_PATH: vendor/bundle)
+/vendor/

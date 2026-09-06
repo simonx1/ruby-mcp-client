@@ -11,7 +11,7 @@ module MCPClient
 
     # Lightweight response wrapper for Faraday exception payloads (Hashes),
     # so the exception path and the default path share one challenge pipeline.
-    NormalizedResponse = Struct.new(:status, :headers)
+    NormalizedResponse = Struct.new(:status, :headers, :body)
 
     # One auth-param (name = token / quoted-string) as it appears in a
     # WWW-Authenticate challenge (RFC 7235 §2.1, optional whitespace around '=').
@@ -184,7 +184,17 @@ module MCPClient
       json_rpc_request = build_jsonrpc_request('initialize', initialization_params, request_id)
       @logger.debug("Performing initialize RPC: #{json_rpc_request}")
 
-      result = send_jsonrpc_request(json_rpc_request)
+      begin
+        result = send_jsonrpc_request(json_rpc_request)
+      rescue MCPClient::Errors::UnsupportedProtocolVersionError => e
+        # A modern-only server SHOULD name the versions it supports when
+        # rejecting initialize (basic/versioning), and this message may be
+        # the only diagnostic a legacy configuration can surface. The list
+        # travels in `data`, not in the peer's prose, so spell it out here
+        # (as stdio does) rather than letting connect's generic wrap drop it.
+        raise MCPClient::Errors::ConnectionError,
+              "Initialize failed: #{e.message} (server supports: #{e.supported.join(', ')})"
+      end
       unless result.is_a?(Hash)
         raise MCPClient::Errors::ConnectionError,
               "Server returned invalid initialize result: #{result.inspect}"
@@ -254,12 +264,7 @@ module MCPClient
           req.body = request.to_json
         end
 
-        # MCP 2025-11-25 session management: HTTP 404 for a request carrying
-        # Mcp-Session-Id means the session expired — the client MUST start a
-        # new session with a fresh InitializeRequest (without a session ID).
-        if response.status == 404 && session_restart_applicable?(sent_session_id)
-          return restart_session_and_resend(request, sent_session_id)
-        end
+        return restart_session_and_resend(request, sent_session_id) if expired_session?(response, sent_session_id)
 
         handle_http_error_response(response) unless response.success?
         handle_successful_response(response, request)
@@ -271,9 +276,18 @@ module MCPClient
       rescue Faraday::ResourceNotFound => e
         # User-configured raise_error middleware surfaces 404 as an exception;
         # apply the same session-expiry recovery as the response path.
-        return restart_session_and_resend(request, sent_session_id) if session_restart_applicable?(sent_session_id)
+        if expired_session?(normalize_error_response(e.response) || NormalizedResponse.new(404, {}, nil),
+                            sent_session_id)
+          return restart_session_and_resend(request, sent_session_id)
+        end
 
-        raise MCPClient::Errors::ServerError, "Client error: HTTP 404 #{e.message}"
+        raise client_error_from_exception(e, 404)
+      rescue Faraday::ClientError => e
+        # Other 4xx raised by raise_error middleware: same body inspection as
+        # the response path, so a 400 carrying a modern JSON-RPC error still
+        # becomes the typed error (never a retryable TransportError).
+        status = e.response.is_a?(Hash) ? (e.response[:status] || e.response['status']) : nil
+        raise client_error_from_exception(e, status || 400)
       rescue Faraday::ConnectionFailed => e
         raise MCPClient::Errors::ConnectionError, "Server connection lost: #{e.message}"
       rescue Faraday::TimeoutError => e
@@ -310,6 +324,60 @@ module MCPClient
       end
     end
 
+    # Whether a 404 means the session this request went out under has expired.
+    #
+    # MCP 2025-11-25 session management: "When receiving HTTP 404 in response
+    # to a request containing an Mcp-Session-Id, the client MUST start a new
+    # session by sending a new InitializeRequest without a session ID." The
+    # rule names the status and the session id and takes no exception for what
+    # the body carries, so on a session negotiated under that revision the 404
+    # is read as the expiry it is — a server on the era this session speaks
+    # answers the session, not the request.
+    #
+    # Off such a session — an era never established, or a modern one whose
+    # server assigned a session id 2026-07-28 gives it no reason to assign —
+    # a well-formed -32601 IS the answer to this very request (unknown
+    # method), and replaying it after a fresh initialize would only ask the
+    # unknown method a second time.
+    # @param response [#status, #body, nil] the normalized 404 response
+    # @param sent_session_id [String, nil] the session id the request carried
+    # @return [Boolean]
+    def expired_session?(response, sent_session_id)
+      return false unless response && response.status == 404
+      return false unless session_restart_applicable?(sent_session_id)
+
+      legacy_session? || !method_not_found_answer?(response)
+    end
+
+    # Whether this transport negotiated a handshake-era revision, which is
+    # what makes Mcp-Session-Id — and the session-expiry rule that goes with
+    # it — part of the protocol in force.
+    # @return [Boolean]
+    def legacy_session?
+      MCPClient::LEGACY_PROTOCOL_VERSIONS.include?(@protocol_version)
+    end
+
+    # Whether a 404 body is a well-formed JSON-RPC -32601 — MCP 2026-07-28's
+    # "unknown method" answer to the request itself — rather than a
+    # 2025-11-25 session expiry, which answers nothing.
+    #
+    # Read the way every other HTTP error body is (jsonrpc_error_in_body): a
+    # JSON-RPC 2.0 envelope, size-bounded, gunzipped when the response says
+    # so. Anything else — an "error" member outside an envelope, an oversized
+    # or undecodable body — is not an answer to this request and leaves the
+    # 404 meaning what 2025-11-25 says it means.
+    # @param response [#body, nil] the 404 response, if its body is readable
+    # @return [Boolean]
+    def method_not_found_answer?(response)
+      return false unless response
+
+      error = jsonrpc_error_in_body(response)
+      return false unless error.is_a?(Hash)
+
+      (error['code'] || error[:code]) == MCPClient::Errors::Codes::METHOD_NOT_FOUND &&
+        (error['message'] || error[:message]).is_a?(String)
+    end
+
     # Whether a 404 should trigger a session restart: only when the 404'd
     # request was actually sent with a session id and no restart is already
     # in flight (a restart's own resend answering 404 must not loop).
@@ -319,6 +387,18 @@ module MCPClient
       return false if sent_session_id.nil?
 
       @mutex.synchronize { !@restarting_session }
+    end
+
+    # Build the ServerError for a 4xx surfaced as a Faraday::ClientError by
+    # user-configured raise_error middleware, inspecting the body like the
+    # response path does.
+    # @param error [Faraday::ClientError] the middleware exception
+    # @param status [Integer] the HTTP status
+    # @return [MCPClient::Errors::ServerError]
+    def client_error_from_exception(error, status)
+      response = normalize_error_response(error.response) || NormalizedResponse.new(status, {}, nil)
+      response.status ||= status
+      jsonrpc_error_from_http_response(response, "Client error: HTTP #{status} #{error.message}".strip)
     end
 
     # Apply headers to the HTTP request (can be overridden by subclasses)
@@ -363,7 +443,8 @@ module MCPClient
 
       status = raw[:status] || raw['status']
       headers = raw[:headers] || raw['headers'] || {}
-      NormalizedResponse.new(status, headers)
+      body = raw[:body] || raw['body']
+      NormalizedResponse.new(status, headers, body)
     end
 
     # Handle HTTP error responses
@@ -385,7 +466,11 @@ module MCPClient
       when 400..499
         # Deterministic client errors: the request was processed/rejected and
         # will not succeed on retry, so raise a plain (non-retryable) ServerError.
-        raise MCPClient::Errors::ServerError, "Client error: HTTP #{response.status}#{reason_text}"
+        # MCP 2026-07-28 carries its protocol errors in the body of a 400
+        # (HeaderMismatch, UnsupportedProtocolVersion,
+        # MissingRequiredClientCapability) and an unknown method as a 404
+        # with -32601, so a JSON-RPC error body becomes the typed error.
+        raise jsonrpc_error_from_http_response(response, "Client error: HTTP #{response.status}#{reason_text}")
       when 500..599
         # Server-side failures are plausibly transient: raise the retryable
         # subclass so with_retry can re-attempt them.
