@@ -187,12 +187,17 @@ RSpec.describe 'MCP 2026-07-28 deprecations (round 9)' do
     it 'lets the contender stand down when the reservation succeeds' do
       reserver = Thread.new { MCPClient::Deprecations.warn(:roots, gated_logger) }
       gated_logger.await_entry
-      contender = Thread.new { MCPClient::Deprecations.warn(:roots, working_logger) }
-      sleep 0.05
+      # The contender runs to completion on this thread while the reserver is
+      # parked inside its logger: the slot is reserved and cannot settle until
+      # this example releases it, so the interleaving under test is the one
+      # that happened, not the one a sleep hoped for. A contender does not
+      # queue for a notice in flight, so this returns at once.
+      contended = MCPClient::Deprecations.warn(:roots, working_logger)
+      expect(MCPClient::Deprecations.emitted?(:roots)).to be(false)
       gated_logger.release(:succeed)
 
       expect(reserver.value).to be(true)
-      expect(contender.value).to be(false)
+      expect(contended).to be(false)
       # Exactly one notice: the contender waited for the outcome rather than
       # logging a duplicate.
       expect(gated_logger.messages.size).to eq(1)

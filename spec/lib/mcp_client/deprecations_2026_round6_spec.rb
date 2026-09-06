@@ -8,6 +8,23 @@ require 'spec_helper'
 # the notices fire from the transport entry points a host can reach without a
 # Client, and the once-per-process bookkeeping survives a fork.
 RSpec.describe 'MCP 2026-07-28 deprecations (round 6)' do
+  # The child's report, or a prompt failure: a bookkeeping regression that
+  # leaves the child blocked must fail this example, not wedge the suite on
+  # an unbounded pipe read.
+  def bounded_fork_report(reader, pid)
+    report = reader.wait_readable(10) ? reader.read : nil
+    reader.close
+    deadline = Process.clock_gettime(Process::CLOCK_MONOTONIC) + 10
+    until Process.waitpid(pid, Process::WNOHANG)
+      raise 'forked worker did not exit' if Process.clock_gettime(Process::CLOCK_MONOTONIC) > deadline
+
+      sleep 0.01
+    end
+    report or raise 'forked worker reported nothing within 10s'
+  ensure
+    Process.kill('KILL', pid) rescue nil # rubocop:disable Style/RescueModifier
+  end
+
   let(:output) { StringIO.new }
   let(:logger) { Logger.new(output) }
 
@@ -227,9 +244,7 @@ RSpec.describe 'MCP 2026-07-28 deprecations (round 6)' do
         exit!(0)
       end
       writer.close
-      report = reader.read
-      reader.close
-      Process.wait(pid)
+      report = bounded_fork_report(reader, pid)
 
       expect(report).to eq("true\ttrue")
       # The parent's own bookkeeping is untouched by the child.

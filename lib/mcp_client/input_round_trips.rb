@@ -69,6 +69,14 @@ module MCPClient
         )
       end
 
+      # The handler this reaches is the same callback a legacy
+      # server-initiated request would have used, so Roots and Sampling are
+      # just as deprecated here (SEP-2577). The notice precedes the
+      # sampling.tools refusal below, as it precedes the handler's own
+      # -32602 on the server-initiated path: the deprecated values were on
+      # the wire and a host with a handler asked for them, whichever
+      # sub-capability the request then trips over.
+      warn_input_request_deprecated(request_method, request['params'])
       if undeclared_sampling_tool_use?(request_method, request['params'])
         raise MCPClient::Errors::InputRequiredError.new(
           "Server requested tool-enabled #{shown_method} (key #{shown_key}) but the sampling.tools " \
@@ -76,10 +84,6 @@ module MCPClient
         )
       end
 
-      # The handler this reaches is the same callback a legacy
-      # server-initiated request would have used, so Roots and Sampling are
-      # just as deprecated here (SEP-2577).
-      warn_input_request_deprecated(request_method, request['params'])
       begin
         response = instance_variable_get(handler_ivar).call(key, request['params'] || {})
       rescue StandardError => e

@@ -17,6 +17,23 @@ require 'webmock/rspec'
 #     negotiated after the callback is registered, so reading it at
 #     registration time reads "not modern" for every server there is.
 RSpec.describe 'MCP 2026-07-28 deprecations (round 12)' do
+  # The child's report, or a prompt failure: a bookkeeping regression that
+  # leaves the child blocked must fail this example, not wedge the suite on
+  # an unbounded pipe read.
+  def bounded_fork_report(reader, pid)
+    report = reader.wait_readable(10) ? reader.read : nil
+    reader.close
+    deadline = Process.clock_gettime(Process::CLOCK_MONOTONIC) + 10
+    until Process.waitpid(pid, Process::WNOHANG)
+      raise 'forked worker did not exit' if Process.clock_gettime(Process::CLOCK_MONOTONIC) > deadline
+
+      sleep 0.01
+    end
+    report or raise 'forked worker reported nothing within 10s'
+  ensure
+    Process.kill('KILL', pid) rescue nil # rubocop:disable Style/RescueModifier
+  end
+
   let(:output) { StringIO.new }
   let(:logger) { Logger.new(output) }
 
@@ -183,9 +200,7 @@ RSpec.describe 'MCP 2026-07-28 deprecations (round 12)' do
         exit!(0)
       end
       writer.close
-      report = reader.read
-      reader.close
-      Process.waitpid(pid)
+      report = bounded_fork_report(reader, pid)
       gated.release
       holder.join
 

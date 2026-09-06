@@ -251,6 +251,22 @@ metadata). Each feature lands in its own PR; this section accumulates them.
   non-empty `roots/list` answer — never the empty answer a client that never
   configured a root gives).
 
+- **Sampling notices precede the `sampling.tools` refusal on the multi
+  round-trip path (round 13).** A 2026-07-28 sampling input request that
+  carried `tools` / `toolChoice` this client never declared was refused
+  before the Sampling and `includeContext` notices could fire, while the
+  same request served as a 2025-11-25 server-initiated request warned first
+  and was then refused by the handler. The notice now precedes the refusal
+  on both eras: the deprecated values were on the wire and a host with a
+  sampling handler asked for them. Round 13 also pins what every earlier
+  example on these paths took for granted: the stdio transport's response
+  envelope (result and error) for a legacy sampling request once its notice
+  is out, the `includeContext` value reaching the sampling handler
+  unchanged after being reported, multi round-trip failures with notices
+  enabled, a complete discovery -> input_required -> continuation exchange
+  for a modern URL elicitation next to the legacy response envelope, and
+  `notifications/elicitation/complete` ignored on either era.
+
 ### JSON Schema handling
 
 - **Dynamic references bind against the evaluation path, `contains`

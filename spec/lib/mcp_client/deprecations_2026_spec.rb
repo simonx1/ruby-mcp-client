@@ -276,6 +276,8 @@ RSpec.describe 'MCP 2026-07-28 deprecations' do
     strict = instance_double(Logger, warn: nil)
 
     expect(MCPClient::Deprecations.warn(:roots, strict)).to be(true)
+    # Returning true is a claim that the notice was written: pin the write.
+    expect(strict).to have_received(:warn).with(a_string_matching(/Roots .*deprecated/)).once
   end
 
   it 'logs outside its lock so a logger may consult the registry' do
