@@ -334,10 +334,19 @@ module MCPClient
     # @param params [Hash, nil] notification params
     # @return [void]
     def handle_server_cancellation(params)
-      subscription = subscription_by_id(params.is_a?(Hash) ? params['requestId'] : nil)
-      return unless subscription
+      return unless params.is_a?(Hash)
 
-      reason = params['reason'].is_a?(String) ? params['reason'] : nil
+      # "Malformed notifications MAY be ignored": a reason that is not a
+      # string is one, and so is a request id of another type than the one
+      # this client issued — the registry is keyed by the id's text, so the
+      # type is checked on the subscription found (basic/patterns/cancellation
+      # "Error handling"). Neither may end a stream the server still serves.
+      reason = params['reason']
+      return unless reason.nil? || reason.is_a?(String)
+
+      subscription = subscription_by_id(params['requestId'])
+      return unless subscription && subscription.id == params['requestId']
+
       @logger.info("Server cancelled subscription #{subscription.id}: " \
                    "#{sanitize_log_text(reason || 'no reason given')}")
       unregister_subscription(subscription)

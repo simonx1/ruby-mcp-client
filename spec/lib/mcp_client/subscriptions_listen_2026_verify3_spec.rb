@@ -360,6 +360,21 @@ RSpec.describe 'MCP 2026-07-28 subscriptions/listen, verification pass 3' do
       server.instance_variable_set(:@protocol_version, MCPClient::LATEST_PROTOCOL_VERSION)
     end
 
+    # codex round 5 [P2]: without a concurrent close the cancellation was never
+    # sent at all — the write raised, the subscription ended with the error,
+    # and the server was left serving `listen(n)` with nobody able to name it.
+    # "Abandoning" a request on stdio is a cancellation naming its id
+    # (basic/transports/stdio "Cancellation"), whoever abandons it.
+    it 'cancels the request a failed write may have put on the pipe before reporting the failure' do
+      expect { server.listen(notifications: { tools_list_changed: true }, ack_timeout: false) }
+        .to raise_error(MCPClient::Errors::TransportError, /Broken pipe/)
+
+      listen = written.find { |message| message['method'] == 'subscriptions/listen' }
+      expect(written.map { |message| message['method'] }).to eq(%w[subscriptions/listen notifications/cancelled])
+      expect(written.last['params']['requestId']).to eq(listen['id'])
+      expect(server.subscriptions).to be_empty
+    end
+
     it 'still cancels the request the failed write put on the pipe, and only after it' do
       writing = Thread::Queue.new
       release = Thread::Queue.new
@@ -490,6 +505,96 @@ RSpec.describe 'MCP 2026-07-28 subscriptions/listen, verification pass 3' do
       expect(subscription.error).to be_a(MCPClient::Errors::ConnectionError)
       expect(subscription.error.message).to include('maximum buffered size')
       expect(listen_requests.size).to eq(1)
+    end
+  end
+
+  # codex round 5 [P2]: the buffer was trimmed only at an event terminator, so
+  # a server keeping the stream alive with complete comment lines alone —
+  # `:\r\n`, which the transport specification permits and tells clients to
+  # ignore — grew it without bound until the cap ended the subscription.
+  describe 'a listen stream kept alive with comment lines' do
+    include_context 'a scripted HTTP session'
+
+    # The parser, fed what arrives: comment lines are dropped on arrival, a
+    # comment still missing its line end is kept until it arrives, and a CR
+    # at the very end is not taken for the whole of a CRLF.
+    it 'discards complete comment lines on arrival and keeps an unfinished one' do
+      subscription = MCPClient::Subscription.new(server: server, requested: { 'toolsListChanged' => true })
+      subscription.assign_id(1)
+      state = { finished: nil, scanned: 0, framing: :sse }
+      buffer = +''
+
+      buffer << (":\r\n" * 2000)
+      server.send(:consume_listen_events, buffer, subscription, state)
+      expect(buffer).to eq('')
+
+      buffer << ': keep-al'
+      server.send(:consume_listen_events, buffer, subscription, state)
+      expect(buffer).to eq(': keep-al')
+
+      buffer << "ive\r"
+      server.send(:consume_listen_events, buffer, subscription, state)
+      expect(buffer).to eq(": keep-alive\r")
+
+      buffer << "\ndata: {\"jsonrpc\":\"2.0\",\"method\":\"notifications/tools/list_changed\"," \
+                "\"params\":{}}\r\n:\r\n\r\n"
+      server.send(:consume_listen_events, buffer, subscription, state)
+      expect(buffer).to eq('')
+      expect(subscription).not_to be_closed
+    end
+
+    it 'discards complete comment lines as they arrive and keeps delivering' do
+      stub_const('MCPClient::HttpTransportBase::ListenStream::LISTEN_MAX_BUFFER_BYTES', 512)
+      stub_const('MCPClient::HttpTransportBase::ListenStream::LISTEN_RECONNECT_DELAY', 30)
+      received = []
+      stub_listen do |body|
+        id = body['id']
+        closing = { 'jsonrpc' => '2.0', 'id' => id,
+                    'result' => { 'resultType' => 'complete', '_meta' => { sub_meta => id } } }
+        change = { 'jsonrpc' => '2.0', 'method' => 'notifications/tools/list_changed',
+                   'params' => { '_meta' => { sub_meta => id } } }
+        { status: 200, headers: { 'Content-Type' => 'text/event-stream' },
+          body: "#{":\r\n" * 2000}#{sse_response(ack_message(id, { 'toolsListChanged' => true }))[:body]}" \
+                "#{": keep-alive\n" * 500}\r#{sse_response(change, closing)[:body]}" }
+      end
+
+      subscription = server.listen(notifications: { tools_list_changed: true }) { |method, _p| received << method }
+      wait_until { subscription.closed? }
+
+      expect(subscription.error).to be_nil
+      expect(subscription).to be_closed_gracefully
+      expect(subscription.acknowledged).to eq({ 'toolsListChanged' => true })
+      wait_until { received.any? }
+      expect(received).to eq(['notifications/tools/list_changed'])
+    end
+  end
+
+  # The skip-and-continue branches of the stream parser: an event that is not
+  # JSON, or not a JSON object, is skipped and the stream goes on.
+  describe 'a listen stream carrying an unreadable event' do
+    include_context 'a scripted HTTP session'
+
+    it 'skips it and keeps delivering what follows' do
+      received = []
+      stub_listen do |body|
+        id = body['id']
+        closing = { 'jsonrpc' => '2.0', 'id' => id,
+                    'result' => { 'resultType' => 'complete', '_meta' => { sub_meta => id } } }
+        change = { 'jsonrpc' => '2.0', 'method' => 'notifications/tools/list_changed',
+                   'params' => { '_meta' => { sub_meta => id } } }
+        { status: 200, headers: { 'Content-Type' => 'text/event-stream' },
+          body: "event: message\ndata: {not json\n\n" \
+                "#{sse_response(ack_message(id, { 'toolsListChanged' => true }))[:body]}" \
+                "event: message\ndata: [1, 2]\n\n#{sse_response(change, closing)[:body]}" }
+      end
+
+      subscription = server.listen(notifications: { tools_list_changed: true }) { |method, _p| received << method }
+      wait_until { subscription.closed? }
+
+      expect(subscription).to be_closed_gracefully
+      expect(subscription.acknowledged).to eq({ 'toolsListChanged' => true })
+      wait_until { received.any? }
+      expect(received).to eq(['notifications/tools/list_changed'])
     end
   end
 end

@@ -311,7 +311,7 @@ RSpec.describe 'MCP 2026-07-28 subscriptions/listen — round 7' do
       expect(subscription.requested).to be_frozen
     end
 
-    it 'keeps the request a later reconnect would send unchanged' do
+    it 'serializes the normalized filter detached from the strings the caller passed' do
       uris = ['file:///a'.dup]
       filter = MCPClient::Subscription.normalize_filter('resourceSubscriptions' => uris)
 

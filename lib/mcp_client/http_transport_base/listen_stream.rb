@@ -32,6 +32,13 @@ module MCPClient
       # An event ends at a blank line — two line terminators in a row, in any
       # mix. CRLF is matched first so one CRLF is never read as two.
       EVENT_TERMINATOR = /(?:\r\n|\r(?!\n)|\n){2}/
+      # A complete comment line (one starting with a colon) — the keep-alive
+      # the transport specification lets a server send and tells a client to
+      # ignore. A comment ending in a bare CR at the very end of the buffer is
+      # left alone: its LF may be in the next chunk, and dropping the CR
+      # alone could turn the line terminator before it into an event
+      # terminator that was never on the wire.
+      COMMENT_LINE = /(?:\A|(?<=[\r\n])):[^\r\n]*(?:\r\n|\n|\r(?=[^\n]))/
 
       # Ready the connection a subscription is about to be opened on, and mark
       # this connection as one listen streams may still be opened on.
@@ -586,6 +593,7 @@ module MCPClient
       # @return [Symbol, nil] :closed once the subscription ended
       def consume_listen_events(buffer, subscription, state = { scanned: 0 })
         finished = nil
+        discard_comment_lines(buffer, state)
         while (separator = match_event_terminator(buffer, [state[:scanned].to_i - 3, 0].max))
           event = buffer.slice!(0, separator.end(0))
           state[:scanned] = 0
@@ -602,6 +610,17 @@ module MCPClient
         # like the offset String#match takes.
         state[:scanned] = buffer.length
         finished
+      end
+
+      # Drop the complete comment lines the buffer holds, wherever they sit.
+      # Waiting for the next event terminator to drop them let a stream kept
+      # alive with comment lines alone — a server MAY do exactly that — grow
+      # the buffer without bound, until the cap ended the subscription.
+      # @param buffer [String] mutable stream buffer
+      # @param state [Hash] the scan state; rewound when anything was dropped
+      # @return [void]
+      def discard_comment_lines(buffer, state)
+        state[:scanned] = 0 if buffer.gsub!(COMMENT_LINE, '')
       end
 
       # @param buffer [String] the stream buffer

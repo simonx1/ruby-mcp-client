@@ -76,8 +76,11 @@ RSpec.describe 'MCP 2026-07-28 subscriptions/listen' do
       expect(subscription.server).to equal(server)
     end
 
-    it 'rejects an unknown filter key' do
+    it 'rejects an unknown filter key, and an array that is not all strings' do
       expect { server.listen(notifications: { bogus: true }) }.to raise_error(ArgumentError, /bogus/)
+      expect { server.listen(notifications: { resource_subscriptions: ['file:///a', 1] }) }
+        .to raise_error(ArgumentError, /array of strings/)
+      expect(written.count { |m| m['method'] == 'subscriptions/listen' }).to eq(0)
     end
 
     # The reserved per-request protocol fields (basic/index "_meta") are as
@@ -128,6 +131,33 @@ RSpec.describe 'MCP 2026-07-28 subscriptions/listen' do
       expect(general.map(&:first)).to eq(%w[notifications/tools/list_changed notifications/resources/list_changed])
     end
 
+    # Ordering is per subscription: "other subscriptions MAY be interleaved
+    # before this one's acknowledgment" (basic/patterns/subscriptions), so a
+    # later listen's acknowledgment and notifications arrive — and are
+    # delivered — while an earlier one is still unanswered.
+    it 'delivers a later subscription while an earlier listen is still unanswered' do
+      received_b = []
+      sub_a = server.listen(notifications: { tools_list_changed: true })
+      sub_b = server.listen(notifications: { resources_list_changed: true }) { |m, _p| received_b << m }
+
+      server.handle_line(line('jsonrpc' => '2.0', 'method' => 'notifications/subscriptions/acknowledged',
+                              'params' => { '_meta' => { SUB_ID_META => sub_b.id },
+                                            'notifications' => { 'resourcesListChanged' => true } }))
+      server.handle_line(line('jsonrpc' => '2.0', 'method' => 'notifications/resources/list_changed',
+                              'params' => { '_meta' => { SUB_ID_META => sub_b.id } }))
+      wait_for { received_b.any? }
+
+      expect(sub_b).to be_active
+      expect(received_b).to eq(['notifications/resources/list_changed'])
+      expect(sub_a.state).to eq(:pending)
+      expect(sub_a.acknowledged).to be_nil
+
+      server.handle_line(line('jsonrpc' => '2.0', 'method' => 'notifications/subscriptions/acknowledged',
+                              'params' => { '_meta' => { SUB_ID_META => sub_a.id },
+                                            'notifications' => { 'toolsListChanged' => true } }))
+      expect(sub_a).to be_active
+    end
+
     it 'treats a response to the listen request as a graceful closure' do
       subscription = server.listen(notifications: { tools_list_changed: true })
 
@@ -170,11 +200,60 @@ RSpec.describe 'MCP 2026-07-28 subscriptions/listen' do
 
       cancelled = written.find { |m| m['method'] == 'notifications/cancelled' }
       expect(cancelled['params']['requestId']).to eq(subscription.id)
+      # A notification, never a request: a server would wait on the latter's
+      # response for ever (basic/transports/stdio "Cancellation").
+      expect(cancelled).not_to have_key('id')
+      expect(cancelled['jsonrpc']).to eq('2.0')
       expect(subscription.state).to eq(:closed)
       server.handle_line(line('jsonrpc' => '2.0', 'method' => 'notifications/tools/list_changed',
                               'params' => { '_meta' => { SUB_ID_META => subscription.id } }))
       expect(received).to be_empty
       expect(subscription.close).to be_nil
+    end
+
+    # basic/patterns/cancellation "Error handling": a malformed cancellation
+    # notification, and one naming an unknown or already completed request,
+    # are ignored — neither may end a stream the server is still serving.
+    describe 'a server cancellation that names no live listen of its own' do
+      def cancellation(params)
+        line('jsonrpc' => '2.0', 'method' => 'notifications/cancelled', 'params' => params)
+      end
+
+      it 'ignores one whose reason is malformed' do
+        subscription = server.listen(notifications: { tools_list_changed: true })
+
+        server.handle_line(cancellation('requestId' => subscription.id, 'reason' => []))
+
+        expect(subscription).not_to be_closed
+        expect(server.subscriptions.values).to eq([subscription])
+      end
+
+      it 'ignores one for an unknown id, one whose id is of another type, and one naming no request' do
+        subscription = server.listen(notifications: { tools_list_changed: true })
+
+        server.handle_line(cancellation('requestId' => 999_999))
+        server.handle_line(cancellation('requestId' => subscription.id.to_s))
+        server.handle_line(cancellation({}))
+        server.handle_line(line('jsonrpc' => '2.0', 'method' => 'notifications/cancelled'))
+
+        expect(subscription).not_to be_closed
+        expect(subscription.state).to eq(:pending)
+      end
+
+      it 'ignores one for a request that already completed, and still ends the live one it names' do
+        finished = server.listen(notifications: { tools_list_changed: true })
+        live = server.listen(notifications: { prompts_list_changed: true })
+        closing = { 'resultType' => 'complete', '_meta' => { SUB_ID_META => finished.id } }
+        server.handle_line(line('jsonrpc' => '2.0', 'id' => finished.id, 'result' => closing))
+
+        server.handle_line(cancellation('requestId' => finished.id, 'reason' => 'late'))
+        expect(live).not_to be_closed
+
+        server.handle_line(cancellation('requestId' => live.id, 'reason' => 'done'))
+        expect(live).to be_closed
+        expect(live).not_to be_closed_gracefully
+        expect(finished).to be_closed_gracefully
+      end
     end
 
     it 'delivers a notification without a subscriptionId to the general listener only' do
@@ -315,7 +394,7 @@ RSpec.describe 'MCP 2026-07-28 subscriptions/listen' do
       requests = stub_server([
                                lambda do |id|
                                  sse(":\r\n\r\n", ack(id, { 'toolsListChanged' => true }),
-                                     ': keep-alive',
+                                     ": keep-alive\n\n",
                                      { 'jsonrpc' => '2.0', 'method' => 'notifications/tools/list_changed',
                                        'params' => { '_meta' => { SUB_ID_META => id } } },
                                      { 'jsonrpc' => '2.0', 'id' => id,
@@ -367,7 +446,32 @@ RSpec.describe 'MCP 2026-07-28 subscriptions/listen' do
       expect(subscription).to be_closed_gracefully
     end
 
-    it 'closes the stream to cancel and does not reconnect' do
+    # Resumability left with the GET stream: a dropped listen stream is
+    # re-issued as a fresh POST under a new id, whatever SSE `id:`/`retry:`
+    # fields the old stream carried — never a GET, never Last-Event-ID.
+    it 're-issues a fresh POST after a drop, whatever id and retry fields the old stream carried' do
+      requests = stub_server([
+                               ->(id) { "id: 7\nretry: 5\n#{sse(ack(id, { 'toolsListChanged' => true }))}" },
+                               lambda do |id|
+                                 sse(ack(id, { 'toolsListChanged' => true }),
+                                     { 'jsonrpc' => '2.0', 'id' => id,
+                                       'result' => { 'resultType' => 'complete', '_meta' => { SUB_ID_META => id } } })
+                               end
+                             ])
+      stub_const('MCPClient::HttpTransportBase::ListenStream::LISTEN_RECONNECT_DELAY', 0.01)
+
+      subscription = server.listen(notifications: { tools_list_changed: true })
+      wait_until { subscription.state == :closed }
+
+      listens = requests.select { |r| r[:body]['method'] == 'subscriptions/listen' }
+      expect(listens.size).to eq(2)
+      expect(listens[1][:body]['id']).not_to eq(listens[0][:body]['id'])
+      expect(listens[1][:headers].keys.map(&:downcase)).not_to include('last-event-id')
+      expect(a_request(:get, url)).not_to have_been_made
+      expect(subscription).to be_closed_gracefully
+    end
+
+    it 'does not re-issue the listen after a close that lands during the re-open backoff' do
       requests = stub_server([->(id) { sse(ack(id, { 'toolsListChanged' => true })) }])
       stub_const('MCPClient::HttpTransportBase::ListenStream::LISTEN_RECONNECT_DELAY', 0.5)
 
@@ -450,6 +554,37 @@ RSpec.describe 'MCP 2026-07-28 subscriptions/listen' do
       expect { described_class.normalize_filter({ tools_list_changed: 'yes' }) }.to raise_error(ArgumentError)
       expect { described_class.normalize_filter({ resource_subscriptions: 'a' }) }.to raise_error(ArgumentError)
       expect { described_class.normalize_filter(nil) }.to raise_error(ArgumentError)
+    end
+
+    it 'rejects an array with a non-string member, and keeps empty and false values as given' do
+      expect { described_class.normalize_filter({ resource_subscriptions: ['file:///a', 1] }) }
+        .to raise_error(ArgumentError, /array of strings/)
+      expect { described_class.normalize_filter({ task_ids: [nil] }) }.to raise_error(ArgumentError, /array of strings/)
+      expect(described_class.normalize_filter({})).to eq({})
+      expect(described_class.normalize_filter({ tools_list_changed: false })).to eq({ 'toolsListChanged' => false })
+      expect(described_class.normalize_filter({ resource_subscriptions: [] })).to eq({ 'resourceSubscriptions' => [] })
+    end
+  end
+
+  # This branch routes the messages of a 2025-11-25 GET events stream through
+  # the same routing the listen streams use; an untagged list-change
+  # notification there still reaches the host and still drops the cache.
+  describe 'a notification on a 2025-11-25 events stream' do
+    it 'reaches the host callback untagged and drops the list cache' do
+      server = MCPClient::ServerStreamableHTTP.new(base_url: 'https://example.com', endpoint: '/mcp', retries: 0)
+      server.instance_variable_set(:@protocol_version, '2025-11-25')
+      server.instance_variable_set(:@connection_established, true)
+      server.instance_variable_set(:@initialized, true)
+      server.instance_variable_set(:@tools, [MCPClient::Tool.from_json({ 'name' => 't', 'description' => 'd',
+                                                                         'inputSchema' => {} }, server: server)])
+      received = []
+      server.on_notification { |method, params| received << [method, params] }
+
+      server.send(:dispatch_server_message, 'jsonrpc' => '2.0', 'method' => 'notifications/tools/list_changed',
+                                            'params' => {})
+
+      expect(received).to eq([['notifications/tools/list_changed', {}]])
+      expect(server.instance_variable_get(:@tools)).to be_nil
     end
   end
 end
@@ -739,20 +874,29 @@ RSpec.describe 'MCP 2026-07-28 subscriptions/listen — round 2' do
   describe 'client logging' do
     it 'sanitizes the subscription id and reason from server notifications' do
       output = StringIO.new
-      stdio = MCPClient::ServerStdio.new(command: 'echo test')
+      logger = Logger.new(output)
+      logger.level = Logger::DEBUG
+      # The transport and the client log to the one place: the transport
+      # reports the cancellation of the subscription, the client the request.
+      stdio = MCPClient::ServerStdio.new(command: 'echo test', logger: logger)
       allow(MCPClient::ServerFactory).to receive(:create).and_return(stdio)
-      client = MCPClient::Client.new(mcp_server_configs: [{ type: 'stdio', command: 'x' }], logger: Logger.new(output))
+      client = MCPClient::Client.new(mcp_server_configs: [{ type: 'stdio', command: 'x' }], logger: logger)
       client.logger.level = Logger::DEBUG
 
-      stdio.instance_variable_get(:@notification_callback).call(
-        'notifications/subscriptions/acknowledged',
-        { '_meta' => { SUB_ID_META => "1\nWARN forged" }, 'notifications' => {} }
-      )
-      stdio.instance_variable_get(:@notification_callback).call(
-        'notifications/cancelled', { 'requestId' => 1, 'reason' => "bye\nWARN forged" }
-      )
+      subscription = MCPClient::Subscription.new(server: stdio, requested: {})
+      subscription.assign_id(1)
+      stdio.register_subscription(subscription)
+
+      # Routed as they are off the wire: through the transport's subscription
+      # bookkeeping first, then on to the host's callback.
+      stdio.send(:route_notification, 'notifications/subscriptions/acknowledged',
+                 { '_meta' => { SUB_ID_META => "1\nWARN forged" }, 'notifications' => {} })
+      stdio.send(:route_notification, 'notifications/cancelled', { 'requestId' => 1, 'reason' => "bye\nWARN forged" })
 
       expect(output.string).not_to include("\nWARN forged")
+      # The reason is logged — escaped, on the one line.
+      expect(output.string).to include('Server cancelled subscription 1: bye\x0AWARN forged')
+      expect(subscription).to be_closed
     end
   end
 

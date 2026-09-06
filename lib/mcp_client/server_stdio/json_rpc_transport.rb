@@ -121,19 +121,19 @@ module MCPClient
         #
         # Both of those happen however the write ends. A write that raised may
         # still have put the request on the pipe, and the id is recorded for
-        # exactly that reason; leaving the cancellation on the success path
-        # left the server serving a stream this client had stopped reading and
-        # could no longer name. The pipe is named on both, so the cancellation
-        # goes to the process the request went to and to no other.
+        # exactly that reason; whether that request is then cancelled is
+        # decided with the failure's verdict (see {#fail_open_attempt}). The
+        # pipe is named on both, so the cancellation goes to the process the
+        # request went to and to no other.
         subscription.record_outstanding_listen(id, stdin)
         begin
           send_request(request, io: stdin)
         ensure
           subscription.mark_listen_written(id)
-          cancel_outstanding_listens(subscription, io: stdin) if subscription.closed_by_client?
         end
+        cancel_outstanding_listens(subscription, io: stdin) if subscription.closed_by_client?
       rescue StandardError => e
-        fail_open_attempt(subscription, taken ? id : nil, e)
+        fail_open_attempt(subscription, taken ? id : nil, e, io: stdin)
       end
 
       # Undo the listen attempt that just failed — but only when the
@@ -174,19 +174,31 @@ module MCPClient
       # (the request could not be built) arrives with no id: nothing was
       # registered for it, and no newer attempt can have superseded it, so
       # the failure is the caller's — or the next session's — to hear about.
+      # A failure that is the caller's own abandons the request the write may
+      # have put on the pipe, and abandoning a request on stdio is a
+      # cancellation naming its id (basic/transports/stdio "Cancellation"):
+      # left unnamed, the server was serving `listen(n)` for a subscription
+      # that had ended with the error, and nothing this client held could
+      # cancel it any more. It is sent best effort, to the pipe the request
+      # went to. A superseded attempt's request went to a process the restart
+      # has replaced, and a deferred hand-over's to one on its way out —
+      # neither is cancelled on a pipe that is gone.
       # @param subscription [MCPClient::Subscription]
       # @param id [Integer, String, nil] the listen id this attempt sent
       #   under; nil when it failed before taking one
       # @param error [StandardError] why it failed
+      # @param io [IO, nil] the pipe the request was written to
       # @return [void]
       # @raise [StandardError] the failure, when it was still this attempt's
-      def fail_open_attempt(subscription, id, error)
+      def fail_open_attempt(subscription, id, error, io: nil)
         unregister_subscription_id(subscription, id) if id
         failure = subscription_failure(error)
         case subscription.fail_attempt(id, failure)
         when :superseded then fail_superseded_attempt(subscription, id, error)
         when :deferred then defer_reestablished_attempt(subscription, id, error)
-        else raise failure
+        else
+          cancel_outstanding_listens(subscription, io: io) if io && id
+          raise failure
         end
       end
 

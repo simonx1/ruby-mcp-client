@@ -397,8 +397,16 @@ RSpec.describe 'MCP 2026-07-28 subscriptions/listen — round 11' do
       expect(listens).to be_empty
     end
 
-    it 'leaves a re-issued subscription for the next process' do
+    # codex round 5 [P2]: a hand-over whose request could not even be built was
+    # put back on the queue "for the next process" — but the process it was
+    # being handed to is healthy, so no next process was coming: the
+    # subscription stayed :reconnecting for ever, its previous acknowledgment
+    # keeping the watchdog from expiring it, and the host was never told. A
+    # failure before the request took an id says nothing about the process;
+    # it is the subscription's own, and the subscription ends with it.
+    it 'ends a subscription whose re-issued request could not be built, so the host is told' do
       subscription = server.listen(notifications: { tools_list_changed: true })
+      acknowledge(subscription)
       # Only the listen's own construction fails: a provider that raised for
       # every request would take the restart's server/discover down with it.
       allow(server).to receive(:build_jsonrpc_request).and_wrap_original do |original, method, *rest|
@@ -409,10 +417,27 @@ RSpec.describe 'MCP 2026-07-28 subscriptions/listen — round 11' do
 
       server.send(:handle_server_exit)
 
+      expect(subscription).to be_closed
+      expect(subscription.error).to be_a(MCPClient::Errors::TransportError)
+      expect(subscription.error.message).to include('metadata unavailable')
+      expect(server.reconnecting_subscriptions).to be_empty
+      expect(server.subscriptions).to be_empty
+      expect(listens.size).to eq(1)
+    end
+
+    it 'still leaves a hand-over whose write failed for the next process' do
+      subscription = server.listen(notifications: { tools_list_changed: true })
+      allow(server).to receive(:send_request).and_wrap_original do |original, request, **options|
+        raise Errno::EPIPE if request['method'] == 'subscriptions/listen' && listens.size >= 1
+
+        original.call(request, **options)
+      end
+
+      server.send(:handle_server_exit)
+
       expect(subscription).not_to be_closed
       expect(subscription).to be_reconnecting
       expect(server.reconnecting_subscriptions).to include(subscription)
-      expect(listens.size).to eq(1)
     end
   end
 
@@ -779,9 +804,13 @@ RSpec.describe 'MCP 2026-07-28 subscriptions/listen — round 11' do
     # over an allowed connection, so the probe would never reach the peer.
     before { WebMock.disable! }
 
+    # WebMock is restored whatever the fixtures do: a `peer` that failed to
+    # construct would fail again here, and every mocked example after this
+    # one would then try a real connection.
     after do
       server&.cleanup
       peer&.stop
+    ensure
       WebMock.enable!
       WebMock.disable_net_connect!(allow_localhost: true)
     end

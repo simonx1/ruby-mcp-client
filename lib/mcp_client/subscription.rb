@@ -508,6 +508,14 @@ module MCPClient
     # hand-over to a new session that could not be written
     # ({#reestablishing?}), which goes back to waiting for the next one; or
     # the caller's own request, which ends with the error.
+    # A hand-over is deferred only when it is the *process* that could not be
+    # written to: that process is on its way out, and the next one drains the
+    # queue. An attempt that failed before it took an id at all (the request
+    # could not be built) says nothing about the process, which stays up and
+    # healthy — nothing would ever drain the queue on it, and the previous
+    # acknowledgment would keep the watchdog from expiring it: the
+    # subscription stayed :reconnecting for ever with the host never told. So
+    # that failure is the subscription's own, and it ends with it.
     # @param id [Integer, String, nil] the listen id the attempt sent under;
     #   nil for an attempt that failed before it took one (the request could
     #   not be built), which no newer attempt can have superseded
@@ -520,7 +528,7 @@ module MCPClient
         return :superseded if id && @id != id
         return :failed if @state == :closed
 
-        if @reestablishing
+        if @reestablishing && id
           @state = :reconnecting
           return :deferred
         end

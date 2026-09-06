@@ -281,6 +281,7 @@ RSpec.describe 'MCP 2026-07-28 subscriptions/listen — round 4' do
         wait_until { subscription.closed? }
 
         expect(subscription.error).to be_a(MCPClient::Errors::ServerError)
+        expect(subscription.error.code).to eq(-32_602)
         expect(subscription.error.message).to include('unknown notification')
       end
     end
