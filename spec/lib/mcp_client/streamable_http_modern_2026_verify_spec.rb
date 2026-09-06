@@ -196,6 +196,41 @@ RSpec.describe 'MCP 2026-07-28 Streamable HTTP modern mode — verification' do
         expect(requests.count { |r| r['method'] == 'tools/list' }).to eq(2)
       end
 
+      # The re-issue replaces the lost request; it does not start the clock
+      # again. A caller that asked for one timeout would otherwise wait twice
+      # it — the maximum timeout the spec asks for "regardless of progress"
+      # is the one the probe's replacement already honours.
+      it 'gives a re-issued request the time left on the original budget' do
+        bounds = []
+        recorder = Class.new(Faraday::Middleware) do
+          define_method(:on_request) do |env|
+            body = begin
+              JSON.parse(env.body.to_s)
+            rescue JSON::ParserError
+              nil
+            end
+            bounds << env.request.context[:mcp_deadline] if body && body['method'] == 'tools/list'
+          end
+        end
+        server = klass.new(base_url: 'https://example.com', endpoint: '/mcp', retries: 0, read_timeout: 30,
+                           faraday_config: ->(conn) { conn.builder.insert(0, recorder) })
+        lists = 0
+        stub_posts(
+          'server/discover' => discover_result,
+          'tools/list' => lambda do |body, _reqs|
+            lists += 1
+            lists == 1 ? truncated_event : json_response(body['id'], { 'tools' => [] })
+          end
+        )
+        stub_request(:get, url).to_return(status: 405, body: '')
+
+        expect(server.list_tools).to eq([])
+
+        expect(bounds.size).to eq(2)
+        expect(bounds.uniq.size).to eq(1)
+        server.cleanup
+      end
+
       # --- Discovery boundaries.
 
       it 'falls back to initialize when a 2xx probe answer is an object without supportedVersions' do
@@ -280,7 +315,10 @@ RSpec.describe 'MCP 2026-07-28 Streamable HTTP modern mode — verification' do
         # is a hair under discover_timeout by the time the request is built.
         expect(probe_timeout).to be_within(0.1).of(3)
         expect(probe_deadline - started).to be_within(0.5).of(3)
-        expect(list_timeout).to eq(30)
+        # Clamped to what is left of the request's own budget, like the probe:
+        # the socket timeout never outlives the deadline it shares with the
+        # one replacement a lost stream is allowed.
+        expect(list_timeout).to be_within(0.1).of(30)
         expect(list_deadline - started).to be_within(0.5).of(30)
         server.cleanup
       end

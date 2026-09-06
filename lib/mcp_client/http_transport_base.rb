@@ -170,8 +170,14 @@ module MCPClient
 
       result = with_retry(method) do
         sent_version = protocol_version
+        # One budget for the exchange and the one replacement the re-issue
+        # rule allows: the maximum timeout the spec asks for holds "regardless
+        # of progress", and a lost stream is not progress. The probe already
+        # shares its deadline with its own replacement.
+        budget = timeout || @read_timeout
+        deadline = budget && (monotonic_now + budget)
         begin
-          send_request_and_parse(method, params, timeout)
+          send_request_and_parse(method, params, timeout, deadline)
         rescue MCPClient::Errors::UnsupportedProtocolVersionError => e
           # MCP 2026-07-28 basic/versioning: select a mutually supported
           # version from the error's list and retry. The server rejected the
@@ -184,7 +190,7 @@ module MCPClient
           @logger.info("Server does not support protocol version #{sent_version}; " \
                        "retrying #{method} with #{version}")
           @protocol_version = version
-          send_request_and_parse(method, params, timeout)
+          send_request_and_parse(method, params, timeout, deadline)
         end
       rescue MCPClient::Errors::ResponseStreamClosedError => e
         # Modern Streamable HTTP has no resumption: "a broken response stream
@@ -202,7 +208,7 @@ module MCPClient
         # from the parser; one that died at the socket reaches here from
         # connection_failure_error. Both are the same loss.
         @logger.warn("#{e.message}; re-issuing #{method} as a new request")
-        send_request_and_parse(method, params, timeout)
+        send_request_and_parse(method, params, timeout, deadline)
       end
       # Every server/discover answer is validated and applied: a later
       # heartbeat may advertise new versions or capabilities.
@@ -214,11 +220,13 @@ module MCPClient
     # @param method [String] JSON-RPC method name
     # @param params [Hash] parameters for the request
     # @param timeout [Numeric, nil] per-request timeout override
+    # @param deadline [Float, nil] monotonic instant this exchange and the one
+    #   replacement the re-issue rule allows must finish by
     # @return [Object] result from the JSON-RPC response
-    def send_request_and_parse(method, params, timeout)
+    def send_request_and_parse(method, params, timeout, deadline = nil)
       request_id = @mutex.synchronize { @request_id += 1 }
       request = build_jsonrpc_request(method, params, request_id)
-      send_jsonrpc_request(request, timeout: timeout)
+      send_jsonrpc_request(request, timeout: timeout, deadline: deadline)
     rescue MCPClient::Errors::RequestTimeoutError
       # MCP lifecycle: on timeout the sender SHOULD cancel the abandoned
       # request. On modern Streamable HTTP closing the response stream IS the

@@ -124,10 +124,13 @@ RSpec.describe 'Request timeouts and cancellation (MCP 2025-11-25)' do
 
       server.rpc_request('tools/list', {}, timeout: 42)
 
-      expect(captured_options.timeout).to eq(42)
+      # Clamped to what is left of the request's own budget: the socket
+      # timeout never outlives the deadline the request shares with the one
+      # replacement a lost response stream is allowed.
+      expect(captured_options.timeout).to be_within(0.1).of(42)
       # The same bound covers connection setup (a stalled TLS handshake
       # delivers no byte for the deadline check to see).
-      expect(captured_options.open_timeout).to eq(42)
+      expect(captured_options.open_timeout).to be_within(0.1).of(42)
     end
   end
 
