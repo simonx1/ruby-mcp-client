@@ -147,14 +147,13 @@ module MCPClient
     # @param method [String] the JSON-RPC method the caller wants to send
     # @raise [MCPClient::Errors::CapabilityError]
     def require_capability!(*path, method:)
-      # A DiscoverResult whose ttlMs has elapsed is re-fetched on the next
-      # use of what it declared (MCP 2026-07-28 caching: a stale result is
-      # re-fetched on access) BEFORE the capability is judged at all: the
-      # server may have enabled a capability the stale result lacked, or
-      # withdrawn one it still lists. A result that carried no hint, or a
-      # zero, negative or malformed one, is stale at once.
-      if respond_to?(:modern?, true) && modern? && respond_to?(:discovery_fresh?, true) && !discovery_fresh?
-        @logger&.debug("The server/discover result is stale; refreshing it before #{method}")
+      # A DiscoverResult that may no longer be reused is re-fetched on the
+      # next use of what it declared (MCP 2026-07-28 caching: a stale result
+      # is re-fetched on access) BEFORE the capability is judged at all: the
+      # server may have enabled a capability the old result lacked, or
+      # withdrawn one it still lists.
+      if respond_to?(:modern?, true) && modern? && discovery_refresh_needed?
+        @logger&.debug("The server/discover result may not be reused; refreshing it before #{method}")
         rpc_request('server/discover')
       end
       return if capability?(*path)
@@ -162,6 +161,33 @@ module MCPClient
       raise MCPClient::Errors::CapabilityError,
             "Server #{name || self.class.name} did not declare the #{path.join('.')} capability " \
             "required for #{method}"
+    end
+
+    # Whether the DiscoverResult behind the negotiated capabilities may still
+    # answer for the request about to go out.
+    #
+    # It is a cacheable result like any other, so it is bound by both of the
+    # caching rules the lists and reads obey: its ttlMs, counted from receipt
+    # (a result with no hint, or a zero, negative or malformed one, is stale
+    # at once), and — for a privately scoped result, which is what a server
+    # that declares no scope gets — the authorization context and effective
+    # parameters of the request that produced it. "Private responses MUST NOT
+    # be shared across authorization contexts (e.g. a different access token
+    # requires a different cache)", and the capabilities a server declares
+    # are exactly the kind of answer that differs between two tokens.
+    # @return [Boolean]
+    def discovery_refresh_needed?
+      return false unless respond_to?(:discovery_fresh?, true)
+      return true unless discovery_fresh?
+      return false unless respond_to?(:cache_fresh?, true)
+
+      reusable = cache_fresh?(:discover)
+      # The lookup holds the evaluation of the host's request_meta for the
+      # request it expected to follow. Nothing is sent when the result stands,
+      # so it is dropped rather than left on this thread for whichever request
+      # goes out next (see ResultCaching#release_serving_request_meta).
+      release_serving_request_meta if reusable && respond_to?(:release_serving_request_meta, true)
+      !reusable
     end
 
     # Clean up the server connection

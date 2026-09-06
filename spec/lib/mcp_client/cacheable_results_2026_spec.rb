@@ -33,6 +33,24 @@ RSpec.describe 'MCP 2026-07-28 cacheable results' do
     it 'treats a negative or non-numeric ttlMs as 0' do
       expect(described_class.from_result({ 'ttlMs' => -5 }, :v, now: 1.0).fresh?(now: 1.0)).to be(false)
       expect(described_class.from_result({ 'ttlMs' => 'soon' }, :v, now: 1.0).fresh?(now: 1.0)).to be(false)
+      [nil, true, [1], { 'ms' => 1 }].each do |malformed|
+        entry = described_class.from_result({ 'ttlMs' => malformed }, :v, now: 1.0)
+        expect(entry.fresh?(now: 1.0)).to be(false), malformed.inspect
+      end
+    end
+
+    # An explicit null is a hint the server sent, however malformed: it says
+    # 0, and it says so on a 2025-11-25 server too, where an ABSENT ttlMs
+    # would have left the client's own heuristic in charge instead.
+    it 'distinguishes an explicitly null ttlMs from an absent one' do
+      explicit = described_class.from_result({ 'ttlMs' => nil }, :v, now: 1.0)
+      expect(explicit.hint?).to be(true)
+      expect(explicit.ttl_ms).to eq(0)
+      expect(explicit.fresh?(now: 1.0)).to be(false)
+
+      absent = described_class.from_result({}, :v, now: 1.0)
+      expect(absent.hint?).to be(false)
+      expect(absent.fresh?(now: 1_000_000.0)).to be(true)
     end
 
     it 'carries no hint when ttlMs is absent (older servers) and stays fresh by heuristic' do
@@ -827,11 +845,17 @@ RSpec.describe 'MCP 2026-07-28 cacheable results — round 4' do
     expect(modern.list_tools.size).to eq(2)
 
     legacy = MCPClient::ServerStdio.new(command: 'echo test', read_timeout: 1, protocol: :legacy)
-    script_stdio(legacy, [{ 'result' => { 'protocolVersion' => '2025-11-25', 'capabilities' => {},
-                                          'serverInfo' => { 'name' => 's', 'version' => '1' } } },
-                          { 'result' => { 'tools' => [tool('a')] } }])
+    sent = script_stdio(legacy, [{ 'result' => { 'protocolVersion' => '2025-11-25', 'capabilities' => {},
+                                                 'serverInfo' => { 'name' => 's', 'version' => '1' } } },
+                                 { 'result' => { 'tools' => [tool('a')] } },
+                                 { 'result' => { 'tools' => [tool('a'), tool('b')] } }])
     expect(legacy.list_tools.size).to eq(1)
     expect(legacy.cache_fresh?(:tools)).to be(true)
+    # "Fresh" is the entry's verdict; what stdio does with it is the second
+    # half of the claim. It holds no list of its own for an unhinted result,
+    # so the next call asks the server again rather than serving the entry.
+    expect(legacy.list_tools.size).to eq(2)
+    expect(sent.map { |req| req['method'] }.count('tools/list')).to eq(2)
   end
 
   it 'treats a page without ttlMs as expired when combining modern pages' do

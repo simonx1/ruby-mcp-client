@@ -374,11 +374,15 @@ RSpec.describe 'MCP 2026-07-28 stateless protocol (stdio) — round 5' do
                                                            extra: { 'ttlMs' => 10 }) },
                              { 'result' => completion }
                            ])
-      # The clock: at discovery, at the first gate (fresh), at the second
-      # gate (expired) and at the second discovery.
-      allow(server).to receive(:discovery_clock).and_return(100.0, 100.0, 200.0, 200.0)
+      # The transport's own clock, which dates the result on receipt and is
+      # the one the gate reads: fresh at discovery, expired by the second
+      # call. (Stubbing a fixed sequence of readings would pin how many
+      # times each path samples it, not the freshness rule.)
+      clock = { now: 100.0 }
+      allow(server).to receive(:monotonic_now) { clock[:now] }
 
       expect { server.complete(ref: prompt_ref, argument: argument) }.to raise_error(MCPClient::Errors::CapabilityError)
+      clock[:now] += 1.0
       expect(server.complete(ref: prompt_ref, argument: argument)['values']).to eq(['ada'])
       expect(requests_in(written).map do |r|
         r['method']

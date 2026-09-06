@@ -98,21 +98,27 @@ RSpec.describe 'MCP 2026-07-28 cacheable results — round 17' do
 
     inside = Queue.new
     release = Queue.new
+    # Only the first fresh verdict is held open, and this thread never
+    # competes for that signal: the reader is its only consumer. (Holding
+    # every verdict would park the clear itself if it consulted freshness,
+    # with nothing left to release it.)
+    gate = Mutex.new
+    gated = false
     allow(client).to receive(:caches_fresh?).and_wrap_original do |m, *args|
       fresh = m.call(*args)
-      if fresh
+      if gate.synchronize { fresh && !gated && (gated = true) }
         inside << true
         release.pop
       end
       fresh
     end
     reader = Thread.new do
-      inside.pop
+      raise 'the hit never reached the freshness verdict' unless inside.pop(timeout: 10)
+
       client.send(:process_notification, server, 'notifications/tools/list_changed', {})
       :cleared
     end
     hit = Thread.new { client.list_tools }
-    inside.pop if reader.alive? && inside.size.positive?
     # The freshness verdict is reached outside the lock (it consults the
     # servers), so the clear does not wait for it; the verdict is then
     # revalidated under the lock and the overtaken hit fetches again

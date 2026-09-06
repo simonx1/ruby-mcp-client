@@ -7,6 +7,22 @@ metadata). Each feature lands in its own PR; this section accumulates them.
 
 ### Cacheable results (`ttlMs` / `cacheScope`)
 
+- **The `server/discover` result is reused under the same two rules as every
+  other cached result (round 40).** The capability gate reuses the
+  `DiscoverResult`, and it now asks the cache entry whether that result may
+  answer for the request about to go out, instead of consulting its `ttlMs`
+  alone. A privately scoped result -- which is what a server that declares no
+  `cacheScope` gets -- is therefore no longer reused after the access token or
+  the effective request parameters changed ("Private responses MUST NOT be
+  shared across authorization contexts"); the capabilities a server declares
+  are exactly the kind of answer that differs between two tokens, so a session
+  that rotated its credentials probes again before a capability is granted or
+  refused. A public result is still shared, as the server allowed. The
+  freshness of the result now also runs from the receipt of the response
+  rather than from the moment the client applied it: everything in between --
+  a notification delivered off the same stream, host middleware, a slow parse
+  -- is time the result has already spent, so `cache_info(:discover)` and the
+  gate no longer disagree when applying the response took a while.
 - **A streamed result is dated from the chunk that completed it, a stale
   `server/discover` is refreshed on every transport, and an empty unhinted list
   is asked for again on HTTP (round 39).** A response read as a stream was

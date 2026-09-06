@@ -571,26 +571,35 @@ module MCPClient
       @protocol_version = version
       @supported_versions = versions
       @last_discover_result = result
-      record_cache_hint(:discover, result)
+      entry = record_cache_hint(:discover, result)
       @capabilities = capabilities || {}
       @instructions = result['instructions']
       info = meta && meta[META_SERVER_INFO]
       @server_info = info if info.is_a?(Hash)
-      record_discovery_freshness(result)
+      record_discovery_freshness(result, entry)
       result
     end
 
     # Record a DiscoverResult's cache hints (CacheableResult: ttlMs,
     # cacheScope). A ttlMs of zero means the result is immediately stale.
     # @param result [Hash] the DiscoverResult
+    # @param entry [MCPClient::CachedResult, nil] the cache entry this result was recorded as
     # @return [void]
-    def record_discovery_freshness(result)
+    def record_discovery_freshness(result, entry = nil)
       # One reading of ttlMs for every cached result, on one clock, so
       # cache_info(:discover) and this decision never disagree: a JSON number
       # of milliseconds; zero is immediately stale, and a negative, absent or
       # malformed hint is treated as zero (a DiscoverResult without a hint is
       # re-read on the next access that needs it).
-      @discovery_expires_at = discovery_clock + (MCPClient::CachedResult.normalize_ttl(result['ttlMs']) / 1000.0)
+      #
+      # It runs from the RECEIPT of the response, which is what the entry was
+      # dated by ("fresh for that many milliseconds" after it arrived), not
+      # from this moment: everything between the response arriving and the
+      # client getting round to applying it — a notification delivered off
+      # the same stream, host middleware, a slow parse — is time the result
+      # has already spent, not time it is owed.
+      received = entry&.received_at || discovery_clock
+      @discovery_expires_at = received + (MCPClient::CachedResult.normalize_ttl(result['ttlMs']) / 1000.0)
       scope = result['cacheScope']
       @discovery_cache_scope = scope.is_a?(String) ? scope : nil
     end

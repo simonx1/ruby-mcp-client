@@ -82,6 +82,11 @@ RSpec.describe 'MCP 2026-07-28 cacheable results — round 10' do
   describe 'a request that fails before any response under Faraday middleware' do
     let(:token) { { value: 'alice' } }
 
+    # What this pins is the middleware case: the token the request goes out
+    # with is the middleware's, so the entry's parameters are opaque and the
+    # fallback is refused before authorization is ever consulted. The
+    # authorization rule itself is pinned in round 40, on knowable
+    # parameters, where disabling the match really does redden an example.
     it 'has no private stale fallback' do
       calls = 0
       stub_request(:post, url).to_return do |request|
