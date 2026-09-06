@@ -2036,7 +2036,13 @@ module MCPClient
         usable = in_use.nil? || in_use.client_secret_expired? ? nil : in_use
         return usable if usable && answers_for_issuer?(usable, issuer)
 
-        registration_for_issuer(issuer) || in_use
+        # Never the record whose secret was just filtered out: an
+        # authorization request discards an expired registration and registers
+        # again (#usable_client_info), so presenting that secret here is the
+        # disagreement between the two paths this method exists to prevent.
+        # With nothing left to present the refresh is skipped, and the host
+        # authorizes — which is what re-registers.
+        registration_for_issuer(issuer) || usable
       end
 
       # A refresh token (and a client secret) is only ever presented to the

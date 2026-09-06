@@ -351,7 +351,10 @@ RSpec.describe 'OAuth challenge handling (MCP 2025-11-25)' do
       expect(provider.handle_unauthorized_response(response_with(header))).to be_nil
 
       expect(a_request(:get, 'https://evil.example/prm')).not_to have_been_made
-      expect(provider.challenge_scope).to be_nil
+      # Nothing of this header is usable, the scope included: it neither
+      # supplies a challenged scope nor withdraws the one a Bearer challenge
+      # recorded, which the following step-up still has to satisfy.
+      expect(provider.challenge_scope).to eq('old:scope')
     end
 
     it 'still drives discovery and scope from a normal Bearer challenge' do

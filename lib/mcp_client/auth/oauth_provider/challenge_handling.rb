@@ -38,6 +38,14 @@ module MCPClient
           # drive Bearer scope selection or resource metadata discovery. A
           # header without a Bearer challenge carries no usable Bearer params.
           bearer_params = bearer_challenge_segment(www_authenticate)
+          # A header naming only schemes this client cannot answer — Basic,
+          # Negotiate — is not a Bearer challenge, so it says nothing about
+          # the scopes this resource wants and nothing about where its
+          # metadata lives. The reset below belongs to a Bearer challenge
+          # that carried no scope; letting a Basic 401 make it would drop the
+          # scope an insufficient_scope challenge required, and the step-up
+          # that follows would ask for less than the server demanded.
+          return nil unless bearer_params
 
           # MCP 2025-11-25: "Clients MUST treat the scopes provided in the
           # challenge as authoritative for satisfying the current request" —
