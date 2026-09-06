@@ -180,7 +180,11 @@ module MCPClient
         # the refresh (or the discovery it needs) cannot run right now. What
         # comes back is judged against the authorization server that is
         # current NOW, not the one the refresh was started with.
+        resource = server_url
         refreshed = refresh_if_possible(token)
+        # A provider retargeted at another resource while the refresh was in
+        # flight has nothing of the previous resource to present.
+        return nil unless server_url == resource
         return refreshed if token_bytes?(refreshed) && token_for_current_issuer?(refreshed)
         # The discovery a refresh ran may have retired this very token.
         return nil if token.expired? || retired_token?(token) || !token_for_current_issuer?(token)
@@ -231,11 +235,17 @@ module MCPClient
         # own, A's state could end up alongside B's verifier, issuer and
         # client, and A's code would then be redeemed at B.
         state = SecureRandom.urlsafe_base64(32)
+        # What this request asks for is what the next step-up challenge has
+        # to be unioned with — and, recorded with the request, what a token
+        # response that omits `scope` granted.
+        @requested_scope = resolved_scope
         pkce = PKCE.new(issuer: server_metadata.issuer,
                         iss_parameter_supported: server_metadata.iss_parameter_supported?,
                         client_id: client_info.client_id,
                         redirect_uri: client_info.metadata.redirect_uris.first,
-                        state: state)
+                        state: state,
+                        resource: server_url,
+                        scope: @requested_scope)
         storage.set_pkce(server_url, pkce)
 
         # The separate slot is still written: it is the documented storage
@@ -308,6 +318,10 @@ module MCPClient
       # @raise [MCPClient::Errors::ConnectionError] when the response is no longer this resource's to keep
       def accept_exchanged_token(token, pkce)
         raise_authorization_server_changed!(pkce.issuer) unless exchange_target_current?(pkce.issuer)
+        # Two resources may share an authorization server and still be two
+        # audiences: a token bought for the resource the request named is
+        # never stored as another resource's, however alike their issuers.
+        raise_resource_changed!(pkce.resource) unless request_resource_current?(pkce)
 
         store_token(token)
 
@@ -337,16 +351,68 @@ module MCPClient
         stored.issuer == issuer
       end
 
+      # Whether the resource a request was made for is still the one this
+      # provider serves. A record made before the resource was recorded says
+      # nothing, and is judged by its issuer alone.
+      # @param pkce [PKCE] the per-request record
+      # @return [Boolean]
+      def request_resource_current?(pkce)
+        return true unless pkce.respond_to?(:resource) && pkce.resource.is_a?(String)
+
+        pkce.resource == server_url
+      end
+
+      # @param recorded [String] the resource the request was made for
+      # @raise [MCPClient::Errors::ConnectionError]
+      def raise_resource_changed!(recorded)
+        raise MCPClient::Errors::ConnectionError,
+              'Authorization response rejected: the resource changed during the flow ' \
+              "(the token was issued for #{safe_error_text(recorded)}); restart the authorization"
+      end
+
       # Delete the pending-flow records of one authorization request, leaving
       # a newer request's records alone.
       # @param pkce [PKCE] the per-request record whose flow just ended
       # @return [void]
       def discard_pending_request(pkce)
         pending = stored_pkce
-        storage.delete_pkce(server_url) if pending.nil? || same_request?(pending, pkce)
+        discard_pending_pkce(pkce) if pending.nil? || same_request?(pending, pkce)
         recorded = pkce.state if pkce.respond_to?(:state)
         stored_state = storage.get_state(server_url)
-        storage.delete_state(server_url) if recorded.nil? || stored_state.nil? || stored_state == recorded
+        discard_pending_state(recorded) if recorded.nil? || stored_state.nil? || stored_state == recorded
+      end
+
+      # Read, compare, delete: a flow started in between loses its record to
+      # the delete. The storage interface has no conditional delete, but a
+      # backend that answers the delete with the record it removed (the
+      # in-memory one does, as does anything Hash-backed) says whose record
+      # went, and a newer flow's is put back.
+      # @param pkce [PKCE] the record whose flow just ended
+      # @return [void]
+      def discard_pending_pkce(pkce)
+        removed = removed_record(storage.delete_pkce(server_url), PKCE)
+        return unless removed.respond_to?(:code_verifier) && !same_request?(removed, pkce)
+
+        storage.set_pkce(server_url, removed)
+      end
+
+      # @param recorded [String, nil] the state of the request whose flow just ended
+      # @return [void]
+      def discard_pending_state(recorded)
+        removed = storage.delete_state(server_url)
+        return unless recorded && removed.is_a?(String) && removed != recorded
+
+        storage.set_state(server_url, removed)
+      end
+
+      # The record a delete answered with, if it answered with one.
+      # @param removed [Object, nil] what the backend returned
+      # @param klass [Class] the record class
+      # @return [Object, nil]
+      def removed_record(removed, klass)
+        normalize_record(removed, klass)
+      rescue ArgumentError
+        nil
       end
 
       # @param one [PKCE, Object] the record currently in the pending-flow slot
@@ -1663,10 +1729,6 @@ module MCPClient
         # Use the redirect_uri that was actually registered
         registered_redirect_uri = client_info.metadata.redirect_uris.first
 
-        # What this request asks for is what the next step-up challenge has
-        # to be unioned with.
-        @requested_scope = resolved_scope
-
         params = {
           response_type: 'code',
           client_id: client_info.client_id,
@@ -1792,7 +1854,9 @@ module MCPClient
           access_token: data['access_token'],
           token_type: data['token_type'],
           expires_in: data['expires_in'],
-          scope: data['scope'],
+          # "scope: OPTIONAL, if identical to the scope requested by the
+          # client" (RFC 6749 Section 5.1): omitted means granted as asked.
+          scope: data['scope'].nil? ? requested_scope_of(pkce) : data['scope'],
           refresh_token: data['refresh_token'],
           issuer: server_metadata.issuer
         )
@@ -1820,6 +1884,8 @@ module MCPClient
         return nil unless server_metadata && client_info
         return nil unless refresh_permitted?(token, client_info, server_metadata)
 
+        # The resource the refresh is made for, judged again over the response.
+        resource = server_url
         params = {
           grant_type: 'refresh_token',
           refresh_token: token.refresh_token,
@@ -1857,12 +1923,14 @@ module MCPClient
           access_token: data['access_token'],
           token_type: data['token_type'],
           expires_in: data['expires_in'],
-          scope: data['scope'],
+          # A refresh that asks for no scope is granted the original one (RFC
+          # 6749 Section 6), so a response that omits it keeps the known set.
+          scope: data['scope'].nil? ? token.scope : data['scope'],
           refresh_token: data['refresh_token'] || token.refresh_token,
           issuer: server_metadata.issuer
         )
 
-        accept_refreshed_token(new_token, server_metadata.issuer)
+        accept_refreshed_token(new_token, server_metadata.issuer, resource)
       rescue JSON::ParserError => e
         logger.warn("Invalid token refresh response: #{describe_parse_error(e, response&.body)}")
         nil
@@ -1885,8 +1953,16 @@ module MCPClient
       # stored-token path makes.
       # @param new_token [Token] the token the refresh response carried
       # @param issuer [String] the authorization server the refresh was made with
+      # @param resource [String] the resource the refresh was made for
       # @return [Token, nil] the token, or nil when it is no longer this resource's to keep
-      def accept_refreshed_token(new_token, issuer)
+      def accept_refreshed_token(new_token, issuer, resource)
+        # A provider retargeted at another resource meanwhile — one that may
+        # share the authorization server — is not handed the previous
+        # resource's token as its own.
+        unless resource == server_url
+          logger.warn('Discarding the refreshed token: the resource changed while the refresh was in flight')
+          return nil
+        end
         unless refresh_target_current?(issuer)
           logger.warn('Discarding the refreshed token: the authorization server changed while the refresh ' \
                       'was in flight')
@@ -1895,6 +1971,13 @@ module MCPClient
 
         store_token(new_token)
         new_token
+      end
+
+      # The scope an authorization request asked for, as recorded with it.
+      # @param pkce [PKCE] the per-request record
+      # @return [String, nil]
+      def requested_scope_of(pkce)
+        pkce.scope if pkce.respond_to?(:scope) && pkce.scope.is_a?(String)
       end
 
       # Whether a refresh made with an authorization server is still this

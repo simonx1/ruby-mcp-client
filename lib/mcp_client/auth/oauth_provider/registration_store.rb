@@ -189,10 +189,25 @@ module MCPClient
           key = client_registration_key(issuer)
           return nil if key == server_url
 
-          record = read_client_info(key)
+          record = registration_under_key(key, issuer)
           return nil unless record && record_bound_to?(record, issuer) && !record.client_secret_expired?
 
           record
+        end
+
+        # The record kept under one authorization server's key, bound to that
+        # server. The key names the server, so credentials a host seeded there
+        # without `issuer:` — the documented alternative to naming it on the
+        # record — belong to it as much as a record that says so itself.
+        # @param key [String] the per-issuer storage key
+        # @param issuer [String] the authorization server the key is derived from
+        # @return [ClientInfo, nil]
+        def registration_under_key(key, issuer)
+          record = read_client_info(key)
+          return record unless record.respond_to?(:issuer) && record.issuer.nil? && record.respond_to?(:with_issuer)
+          return record if portable_client?(record)
+
+          record.with_issuer(issuer)
         end
 
         # One read of a per-issuer key. A backend given a key it has never
@@ -219,12 +234,23 @@ module MCPClient
         # @return [ClientInfo] the same credentials
         def adopt_client_info(client_info, issuer)
           current = stored_client_info
-          return client_info if current && current.client_id == client_info.client_id &&
-                                record_bound_to?(current, issuer)
+          return client_info if current && same_credentials?(current, client_info) && record_bound_to?(current, issuer)
 
           preserve_client_registration(current)
           write_client_info!(client_info)
           client_info
+        end
+
+        # Whether two records are the same credentials: the same client id
+        # is not enough, since a dynamic registration and a pre-registered
+        # client of one authorization server may share it with different
+        # secrets — and the code is redeemed with whatever the slot holds.
+        # @param one [ClientInfo]
+        # @param other [ClientInfo]
+        # @return [Boolean]
+        def same_credentials?(one, other)
+          one.client_id == other.client_id && one.client_secret == other.client_secret &&
+            resolved_registration_type(one) == resolved_registration_type(other)
         end
 
         # MCP 2026-07-28 "Authorization Server Binding": credentials are keyed
@@ -331,7 +357,7 @@ module MCPClient
           key = client_registration_key(client_info.issuer)
           return if key == server_url
           if !pre_registered_for?(client_info, client_info.issuer) &&
-             pre_registered_for?(read_client_info(key), client_info.issuer)
+             pre_registered_for?(registration_under_key(key, client_info.issuer), client_info.issuer)
             return
           end
 

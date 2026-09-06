@@ -146,9 +146,18 @@ RSpec.describe MCPClient::Auth::OAuthProvider do
         expect(p.send(:extract_resource_metadata_url, header)).to eq('https://mcp.example.com/meta')
       end
 
-      it 'falls back to the legacy resource parameter' do
-        header = 'Bearer resource="https://mcp.example.com/legacy"'
-        expect(p.send(:extract_resource_metadata_url, header)).to eq('https://mcp.example.com/legacy')
+      it 'falls back to a legacy resource parameter naming a protected resource metadata document' do
+        header = 'Bearer resource="https://mcp.example.com/.well-known/oauth-protected-resource/legacy"'
+        expect(p.send(:extract_resource_metadata_url, header))
+          .to eq('https://mcp.example.com/.well-known/oauth-protected-resource/legacy')
+      end
+
+      # RFC 9728 names the parameter resource_metadata; a bare `resource` is a
+      # resource identifier (RFC 8707), and reading the MCP endpoint as a
+      # metadata document would stand in the way of the well-known fallback.
+      it 'ignores a legacy resource parameter that is a resource identifier' do
+        header = 'Bearer realm="mcp", resource="https://mcp.example.com/mcp"'
+        expect(p.send(:extract_resource_metadata_url, header)).to be_nil
       end
 
       it 'tolerates whitespace around the parameter equals sign' do

@@ -61,11 +61,33 @@ module MCPClient
           # honour: an earlier document, and an earlier refusal, are forgotten
           # before the fetch so a failed fetch leaves the flow waiting on this
           # URL rather than completing against stale state.
+          previous = [@challenge_metadata_url, @challenge_resource_metadata, @challenge_error]
           @challenge_metadata_url = url
           @challenge_resource_metadata = nil
           @challenge_error = nil
 
-          adopt_challenge_metadata(url)
+          begin
+            adopt_challenge_metadata(url)
+          rescue MCPClient::Errors::ConnectionError
+            # A step-up challenge (403 insufficient_scope) says this operation
+            # needs more scopes, not that the authorization server moved: the
+            # token in hand stays valid (MCP 2026-07-28 step-up authorization).
+            # Metadata that could not be fetched therefore leaves the known
+            # server in place instead of making it unknown, which would
+            # withhold that token from every other operation. A document that
+            # was fetched and REFUSED is a different matter and stands.
+            @challenge_metadata_url, @challenge_resource_metadata, @challenge_error = previous \
+              if step_up_challenge?(bearer_params) && @challenge_error.nil?
+            raise
+          end
+        end
+
+        # Whether a Bearer challenge asks for more scopes (SEP-835 / MCP
+        # 2026-07-28 step-up), as opposed to reporting an invalid token.
+        # @param bearer_params [String, nil] the Bearer challenge's parameters
+        # @return [Boolean]
+        def step_up_challenge?(bearer_params)
+          bearer_params && extract_challenge_param(bearer_params, 'error') == 'insufficient_scope'
         end
 
         # Fetch, validate and adopt the resource metadata a challenge named.
@@ -170,8 +192,24 @@ module MCPClient
             return m[1]
           end
 
-          # Legacy fallback: resource="https://..."
-          params.match(/resource\s*=\s*"([^"]+)"/)&.captures&.first
+          # Legacy fallback: resource="https://.../.well-known/oauth-protected-resource"
+          legacy = params.match(/resource\s*=\s*"([^"]+)"/)&.captures&.first
+          legacy if legacy && protected_resource_metadata_url?(legacy)
+        end
+
+        # RFC 9728 names the challenge parameter `resource_metadata`; a
+        # `resource` parameter is a resource identifier (RFC 8707), not a
+        # document. It is read as a metadata URL only when it points at a
+        # protected resource metadata well-known location — read as one
+        # otherwise, the MCP endpoint itself would be fetched as metadata,
+        # fail, and stand in the way of the well-known fallback MCP
+        # 2026-07-28 requires when the challenge names no document.
+        # @param url [String] the parameter value
+        # @return [Boolean]
+        def protected_resource_metadata_url?(url)
+          URI.parse(url).path.to_s.include?('/.well-known/oauth-protected-resource')
+        rescue URI::InvalidURIError
+          false
         end
 
         # Extract the Bearer challenge's own parameter segment from a (possibly

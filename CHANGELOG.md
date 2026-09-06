@@ -504,6 +504,34 @@ metadata). Each feature lands in its own PR; this section accumulates them.
   asks for. This request's parameters are now the only ones with those
   names; every other endpoint parameter (`tenant`, `brand`, a locale) is
   retained as before.
+  Five more checks were about the wrong thing, or not made. A token is
+  bound to the *resource* its request named as much as to its issuer: two
+  MCP servers may share an authorization server and still be two audiences,
+  so a provider retargeted at another server while a code exchange or a
+  refresh was in flight no longer stores the token the response carries as
+  the other server's — the exchange is refused, the refresh discarded, and
+  nothing of the previous resource is presented. A token response that omits
+  `scope` granted exactly what was asked (RFC 6749 §5.1; a refresh keeps the
+  original grant, §6), so the requested scope is recorded with the
+  per-request record and persisted with the token instead of `nil`, which
+  had a rebuilt provider's step-up union trade away every permission the
+  client already held. Credentials seeded only under
+  `client_registration_key(issuer)`, without `issuer:` on the record, are
+  bound to that authorization server by their key, as documented, instead of
+  being skipped. A pre-registered record sharing a client id with a dynamic
+  registration in the slot is adopted (the slot was left holding the old
+  secret, which the code exchange then posted). A completion's cleanup that
+  raced a flow started between its read and its delete deleted that flow's
+  record; a backend whose delete answers with the removed record (the
+  in-memory one, and anything Hash-backed) has it put back. A 403
+  `insufficient_scope` challenge is a step-up, not an authorization server
+  change: when its `resource_metadata` could not be fetched, the still-valid
+  token was withheld from every other operation as if the server had become
+  unknown, and the known server now stays in place. And a legacy `resource=`
+  challenge parameter is read as a metadata URL only when it names a
+  protected resource metadata document — RFC 9728's parameter is
+  `resource_metadata`, and a bare resource identifier had the MCP endpoint
+  fetched as metadata, which stood in the way of the well-known fallback.
 
 ### Tasks extension (`io.modelcontextprotocol/tasks`)
 

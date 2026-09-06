@@ -552,7 +552,7 @@ module MCPClient
     # PKCE (Proof Key for Code Exchange) helper
     class PKCE
       attr_reader :code_verifier, :code_challenge, :code_challenge_method, :issuer, :iss_parameter_supported,
-                  :client_id, :redirect_uri, :state
+                  :client_id, :redirect_uri, :state, :resource, :scope
 
       # Generate PKCE parameters
       # @param code_verifier [String, nil] Existing code verifier (for deserialization)
@@ -572,8 +572,16 @@ module MCPClient
       #   (and the `state` value, if used)": keeping the state in a slot of its own lets two flows sharing
       #   one storage backend interleave their writes until one flow's state names another flow's record,
       #   so it is recorded here as well and checked against the callback's state
+      # @param resource [String, nil] the resource (the MCP server URL) the authorization request named,
+      #   so the token the code buys is only ever kept for that resource — a provider retargeted at
+      #   another resource of the same authorization server while the exchange is in flight must not
+      #   store it as the other resource's token (MCP 2026-07-28 token audience binding)
+      # @param scope [String, nil] the scope the authorization request asked for: a token response
+      #   that omits `scope` granted exactly that (RFC 6749 Section 5.1), and the step-up union of a
+      #   rebuilt provider must not lose it
       def initialize(code_verifier: nil, code_challenge: nil, code_challenge_method: nil, issuer: nil,
-                     iss_parameter_supported: nil, client_id: nil, redirect_uri: nil, state: nil)
+                     iss_parameter_supported: nil, client_id: nil, redirect_uri: nil, state: nil,
+                     resource: nil, scope: nil)
         @code_verifier = code_verifier || generate_code_verifier
         @code_challenge = code_challenge || generate_code_challenge(@code_verifier)
         @code_challenge_method = code_challenge_method || 'S256'
@@ -587,6 +595,8 @@ module MCPClient
         @client_id = client_id
         @redirect_uri = redirect_uri
         @state = state
+        @resource = resource
+        @scope = scope
       end
 
       # Convert to hash for serialization
@@ -602,6 +612,8 @@ module MCPClient
         hash[:client_id] = @client_id if @client_id
         hash[:redirect_uri] = @redirect_uri if @redirect_uri
         hash[:state] = @state if @state
+        hash[:resource] = @resource if @resource
+        hash[:scope] = @scope if @scope
         hash
       end
 
@@ -629,7 +641,9 @@ module MCPClient
         new(code_verifier: verifier, code_challenge: challenge, code_challenge_method: method, issuer: issuer,
             iss_parameter_supported: supported, client_id: data[:client_id] || data['client_id'],
             redirect_uri: data[:redirect_uri] || data['redirect_uri'],
-            state: data[:state] || data['state'])
+            state: data[:state] || data['state'],
+            resource: data[:resource] || data['resource'],
+            scope: data[:scope] || data['scope'])
       end
 
       private
