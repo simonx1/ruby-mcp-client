@@ -1681,7 +1681,7 @@ RSpec.describe 'Client#call_tool does not run output validation on an unfinished
   end
   let(:unfinished) do
     { 'resultType' => 'input_required', 'requestState' => 'continue-later',
-      'inputRequests' => [{ 'type' => 'elicitation' }] }
+      'inputRequests' => { 'city' => { 'type' => 'elicitation', 'mode' => 'form', 'message' => 'which city?' } } }
   end
 
   before do
@@ -1722,9 +1722,10 @@ end
 RSpec.describe 'an unfinished result survives the HTTP transports off the wire' do
   let(:base_url) { 'https://example.com' }
   let(:endpoint) { '/rpc' }
+  # The schema's InputRequests wire shape: a map from identifier to request.
   let(:unfinished) do
     { 'resultType' => 'input_required', 'requestState' => 'continue-later',
-      'inputRequests' => [{ 'type' => 'elicitation', 'message' => 'which city?' }] }
+      'inputRequests' => { 'city' => { 'type' => 'elicitation', 'mode' => 'form', 'message' => 'which city?' } } }
   end
 
   shared_examples 'accepts and preserves a continuation' do
@@ -1754,7 +1755,8 @@ RSpec.describe 'an unfinished result survives the HTTP transports off the wire' 
           # Not the "unrecognized resultType" rejection: the transport
           # accepted the discriminator and the WRAPPER declined to flatten it.
           expect(e.data).to eq(unfinished)
-          expect(e.data['inputRequests']).to eq([{ 'type' => 'elicitation', 'message' => 'which city?' }])
+          expect(e.data['inputRequests'])
+            .to eq({ 'city' => { 'type' => 'elicitation', 'mode' => 'form', 'message' => 'which city?' } })
         end
     end
 

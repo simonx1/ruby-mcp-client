@@ -184,7 +184,17 @@ module MCPClient
       json_rpc_request = build_jsonrpc_request('initialize', initialization_params, request_id)
       @logger.debug("Performing initialize RPC: #{json_rpc_request}")
 
-      result = send_jsonrpc_request(json_rpc_request)
+      begin
+        result = send_jsonrpc_request(json_rpc_request)
+      rescue MCPClient::Errors::UnsupportedProtocolVersionError => e
+        # A modern-only server SHOULD name the versions it supports when
+        # rejecting initialize (basic/versioning), and this message may be
+        # the only diagnostic a legacy configuration can surface. The list
+        # travels in `data`, not in the peer's prose, so spell it out here
+        # (as stdio does) rather than letting connect's generic wrap drop it.
+        raise MCPClient::Errors::ConnectionError,
+              "Initialize failed: #{e.message} (server supports: #{e.supported.join(', ')})"
+      end
       unless result.is_a?(Hash)
         raise MCPClient::Errors::ConnectionError,
               "Server returned invalid initialize result: #{result.inspect}"

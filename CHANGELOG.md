@@ -37,13 +37,24 @@ metadata). Each feature lands in its own PR; this section accumulates them.
   check follows the schema all the way down: `requiredCapabilities` is typed
   as `ClientCapabilities`, so its members must be objects too — a body
   claiming `{"elicitation": []}` is malformed and does not identify a modern
-  server. `#modern_http_protocol_error?` is the Streamable-HTTP-specific
-  predicate: it additionally recognizes an unknown method answered with HTTP
-  404 and a JSON-RPC -32601 body, which that transport's backward
-  compatibility rules name as a modern-server signal. It is deliberately
-  separate from `#modern_protocol_error?`, because on stdio a bare -32601 is
-  exactly what a legacy peer answers a modern probe with and must keep the
-  `initialize` fallback alive.
+  server — and so is one whose nested members break the schema's types
+  (`elicitation`/`sampling` hold objects, `experimental`/`extensions` map
+  names to objects, `roots.listChanged` is a boolean); unknown capability
+  names are accepted. `#modern_http_protocol_error?` is the
+  Streamable-HTTP-specific predicate: it additionally recognizes an unknown
+  method answered with HTTP 404 and a JSON-RPC -32601 body, which that
+  transport's backward compatibility rules name as a modern-server signal.
+  That -32601 is typed as `MCPClient::Errors::MethodNotFoundError` (a plain
+  `ServerError` for every other purpose) and, like the reserved codes, only
+  when its error object is well-formed: a 404 page dressed up as
+  `{"error": {"code": -32601}}` with no `message` identifies nobody. It is
+  deliberately separate from `#modern_protocol_error?`, because on stdio a
+  bare -32601 is exactly what a legacy peer answers a modern probe with and
+  must keep the `initialize` fallback alive. When a modern-only server
+  rejects `initialize` with -32022, `connect` on every transport names the
+  versions it supports in the `ConnectionError` message (`server supports:
+  2026-07-28`), with the typed error as its `cause`; the list travels in the
+  error's `data`, so the peer's prose alone would not have shown it.
 - **`resultType`.** Every result is checked: an absent field is treated as
   `"complete"` (earlier-protocol servers, and modern ones that omit it), and
   any unrecognized value raises `MCPClient::Errors::InvalidResultError` (a

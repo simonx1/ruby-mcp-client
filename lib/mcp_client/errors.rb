@@ -166,6 +166,7 @@ module MCPClient
       # @return [Class] the error class that code maps to
       def self.error_class_for(code)
         case code
+        when Codes::METHOD_NOT_FOUND then MethodNotFoundError
         when Codes::HEADER_MISMATCH then HeaderMismatchError
         when Codes::MISSING_REQUIRED_CLIENT_CAPABILITY then MissingRequiredClientCapabilityError
         when Codes::UNSUPPORTED_PROTOCOL_VERSION then UnsupportedProtocolVersionError
@@ -198,12 +199,14 @@ module MCPClient
       # #jsonrpc_error_from_http_response sets http_status, and it assigns a
       # code solely from a body that carried `"jsonrpc": "2.0"` and an error
       # object. An error that never arrived over HTTP has no status and is
-      # therefore never recognized here.
+      # therefore never recognized here. The 404 rule itself lives on
+      # MethodNotFoundError, which from_jsonrpc assigns only to a -32601 whose
+      # error object is well-formed (a string `message`): a 404 page dressed
+      # up as `{"error": {"code": -32601}}` is malformed at the JSON-RPC
+      # level and identifies nobody, exactly like a bare -3202x.
       # @return [Boolean]
       def modern_http_protocol_error?
-        return true if modern_protocol_error?
-
-        http_status == 404 && code == Codes::METHOD_NOT_FOUND
+        modern_protocol_error?
       end
 
       # Whether the error is protocol-level (a modern spec error or an
@@ -249,6 +252,19 @@ module MCPClient
       end
     end
 
+    # -32601 Method not found. A class of its own so that the Streamable HTTP
+    # backward-compatibility rule ("HTTP 404 with a JSON-RPC -32601 body is
+    # a modern server") can require a well-formed JSON-RPC error object the
+    # same way the reserved -3202x codes do: from_jsonrpc assigns this class
+    # only when the error carries a string `message`.
+    class MethodNotFoundError < ServerError
+      # @return [Boolean] whether this arrived as an HTTP 404, the pairing
+      #   Streamable HTTP names as a modern-server signal
+      def modern_http_protocol_error?
+        http_status == 404
+      end
+    end
+
     # -32020 HeaderMismatch (MCP 2026-07-28, Streamable HTTP): the HTTP
     # headers mirrored from the request body (Mcp-Method, Mcp-Name,
     # Mcp-Param-*, MCP-Protocol-Version) are missing, malformed, or do not
@@ -271,17 +287,46 @@ module MCPClient
 
       # The schema types this error's data as `requiredCapabilities:
       # ClientCapabilities`, an object whose members (experimental, roots,
-      # sampling, elicitation, and any extension) are themselves objects. A
-      # body whose members are arrays or scalars is not that type, and must
-      # not claim the signal that separates a well-formed modern rejection
-      # from a legacy peer or an intermediary emitting a bare -32021. The
-      # member NAMES are deliberately not checked: the capability set is
-      # extensible, and an unknown-but-well-typed one still comes from a peer
+      # sampling, elicitation, and any extension) are themselves objects, and
+      # it types those objects too: `elicitation` and `sampling` hold
+      # objects (form/url, context/tools), `experimental` and `extensions`
+      # map names to objects, and `roots.listChanged` is a boolean. A body
+      # that breaks any of that is not ClientCapabilities, and must not
+      # claim the signal that separates a well-formed modern rejection from
+      # a legacy peer or an intermediary emitting a bare -32021. Unknown
+      # member NAMES are deliberately accepted: the capability set is
+      # extensible, and an unknown-but-object one still comes from a peer
       # that speaks the schema.
       # @return [Boolean] whether data.requiredCapabilities is ClientCapabilities-shaped
       def well_formed?
         caps = data_member('requiredCapabilities')
-        caps.is_a?(Hash) && caps.each_value.all?(Hash)
+        caps.is_a?(Hash) && caps.all? { |name, value| capability_well_formed?(name, value) }
+      end
+
+      # Capabilities whose members the schema types as objects.
+      OBJECT_MEMBER_CAPABILITIES = %w[elicitation sampling experimental extensions].freeze
+
+      private
+
+      # @param name [String, Symbol] the capability name
+      # @param value [Object] its declared value
+      # @return [Boolean] whether the value has the shape the schema gives that capability
+      def capability_well_formed?(name, value)
+        return false unless value.is_a?(Hash)
+
+        case name.to_s
+        when *OBJECT_MEMBER_CAPABILITIES then value.each_value.all?(Hash)
+        when 'roots' then roots_well_formed?(value)
+        else true
+        end
+      end
+
+      # @param roots [Hash] the declared roots capability
+      # @return [Boolean] whether listChanged, when present, is a boolean
+      def roots_well_formed?(roots)
+        return true unless roots.key?('listChanged') || roots.key?(:listChanged)
+
+        [true, false].include?(roots.key?('listChanged') ? roots['listChanged'] : roots[:listChanged])
       end
     end
 

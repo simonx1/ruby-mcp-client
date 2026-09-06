@@ -125,11 +125,20 @@ RSpec.describe 'MCP 2026-07-28 protocol foundations' do
       end
 
       it 'builds a plain ServerError for any other code, keeping code and data' do
-        error = described_class.from_jsonrpc('code' => -32_601, 'message' => 'Method not found', 'data' => 'x')
+        error = described_class.from_jsonrpc('code' => -32_000, 'message' => 'Server error', 'data' => 'x')
         expect(error.class).to eq(described_class)
-        expect(error.code).to eq(-32_601)
+        expect(error.code).to eq(-32_000)
         expect(error.data).to eq('x')
-        expect(error.message).to eq('Method not found')
+        expect(error.message).to eq('Server error')
+      end
+
+      it 'builds a MethodNotFoundError for a well-formed -32601, which is still a plain protocol error' do
+        error = described_class.from_jsonrpc('code' => -32_601, 'message' => 'Method not found')
+        expect(error).to be_a(MCPClient::Errors::MethodNotFoundError)
+        expect(error.modern_protocol_error?).to be(false)
+        expect(error.protocol_error?).to be(false)
+        # Off the HTTP wire it is nothing more than "method not found".
+        expect(error.modern_http_protocol_error?).to be(false)
       end
 
       it 'copes with a malformed error object' do
