@@ -336,19 +336,29 @@ RSpec.describe 'MCP 2026-07-28 tasks extension — round 43' do
       expect(update['params']['inputResponses']).to eq({ 'consent' => { 'action' => 'accept' } })
     end
 
-    it 'still hands a 2025-11-25 elicitationId to the host when the request carries one' do
+    # The session here is 2026-07-28 (it answers server/discover), and the
+    # deprecations branch removed elicitationId from the modern URL-mode host
+    # contract: a modern server that sends the field anyway cannot smuggle a
+    # correlation id to the host through it, and the client names the field in
+    # one warning without quoting its value. The 2025-11-25 contract, key
+    # present and all, is pinned on that branch.
+    it 'keeps a modern server from smuggling an elicitationId to the host' do
       seen = []
+      logger = instance_double(Logger, warn: nil, info: nil, debug: nil, error: nil, :level= => nil)
       client = client_for(stdio, elicitation_handler: lambda { |_message, details|
         seen << details
         { action: 'accept' }
       })
+      client.instance_variable_set(:@logger, logger)
       request = url_request.merge('params' => url_request['params'].merge('elicitationId' => 'e-1'))
       asks = detailed_task(status: 'input_required', 'inputRequests' => { 'consent' => request })
       scripted(stdio, 'tasks/get' => [asks, done], 'tasks/update' => [{}])
 
       client.wait_for_task('task-1', timeout: 5)
 
-      expect(seen.first).to include('elicitationId' => 'e-1')
+      expect(seen.first).not_to have_key('elicitationId')
+      expect(seen.first).to eq({ 'mode' => 'url', 'url' => 'https://consent.example.com/session/1' })
+      expect(logger).to have_received(:warn).with(/elicitationId/).at_least(:once)
     end
 
     def sampling_request(tools: true)
