@@ -17,11 +17,13 @@ RSpec.describe 'MCP 2026-07-28 protocol foundations — round 7' do
     let(:endpoint) { '/rpc' }
     let(:method_not_found) { { 'code' => -32_601, 'message' => 'Method not found' } }
 
+    # The era is deliberately left unestablished: these examples are about
+    # how the 404 BODY is decoded, and on a session negotiated under
+    # 2025-11-25 the expiry rule is unconditional on the body (round 8).
     def session_server(klass, **opts)
       server = klass.new(base_url: base_url, endpoint: endpoint, retries: 0, **opts)
       server.instance_variable_set(:@connection_established, true)
       server.instance_variable_set(:@initialized, true)
-      server.instance_variable_set(:@protocol_version, '2025-11-25')
       server.instance_variable_set(:@session_id, 'session-abc')
       server
     end

@@ -264,16 +264,7 @@ module MCPClient
           req.body = request.to_json
         end
 
-        # MCP 2025-11-25 session management: HTTP 404 for a request carrying
-        # Mcp-Session-Id means the session expired — the client MUST start a
-        # new session with a fresh InitializeRequest (without a session ID).
-        # Unless the 404 carries a well-formed -32601: that is MCP 2026-07-28's
-        # answer to THIS request (unknown method), not a session expiry, and
-        # restarting on it would re-send the same unknown method.
-        if response.status == 404 && session_restart_applicable?(sent_session_id) &&
-           !method_not_found_answer?(response)
-          return restart_session_and_resend(request, sent_session_id)
-        end
+        return restart_session_and_resend(request, sent_session_id) if expired_session?(response, sent_session_id)
 
         handle_http_error_response(response) unless response.success?
         handle_successful_response(response, request)
@@ -285,8 +276,8 @@ module MCPClient
       rescue Faraday::ResourceNotFound => e
         # User-configured raise_error middleware surfaces 404 as an exception;
         # apply the same session-expiry recovery as the response path.
-        if session_restart_applicable?(sent_session_id) &&
-           !method_not_found_answer?(normalize_error_response(e.response))
+        if expired_session?(normalize_error_response(e.response) || NormalizedResponse.new(404, {}, nil),
+                            sent_session_id)
           return restart_session_and_resend(request, sent_session_id)
         end
 
@@ -331,6 +322,39 @@ module MCPClient
       ensure
         @restarting_session = false
       end
+    end
+
+    # Whether a 404 means the session this request went out under has expired.
+    #
+    # MCP 2025-11-25 session management: "When receiving HTTP 404 in response
+    # to a request containing an Mcp-Session-Id, the client MUST start a new
+    # session by sending a new InitializeRequest without a session ID." The
+    # rule names the status and the session id and takes no exception for what
+    # the body carries, so on a session negotiated under that revision the 404
+    # is read as the expiry it is — a server on the era this session speaks
+    # answers the session, not the request.
+    #
+    # Off such a session — an era never established, or a modern one whose
+    # server assigned a session id 2026-07-28 gives it no reason to assign —
+    # a well-formed -32601 IS the answer to this very request (unknown
+    # method), and replaying it after a fresh initialize would only ask the
+    # unknown method a second time.
+    # @param response [#status, #body, nil] the normalized 404 response
+    # @param sent_session_id [String, nil] the session id the request carried
+    # @return [Boolean]
+    def expired_session?(response, sent_session_id)
+      return false unless response && response.status == 404
+      return false unless session_restart_applicable?(sent_session_id)
+
+      legacy_session? || !method_not_found_answer?(response)
+    end
+
+    # Whether this transport negotiated a handshake-era revision, which is
+    # what makes Mcp-Session-Id — and the session-expiry rule that goes with
+    # it — part of the protocol in force.
+    # @return [Boolean]
+    def legacy_session?
+      MCPClient::LEGACY_PROTOCOL_VERSIONS.include?(@protocol_version)
     end
 
     # Whether a 404 body is a well-formed JSON-RPC -32601 — MCP 2026-07-28's

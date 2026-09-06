@@ -96,15 +96,20 @@ end
 # is what tells them apart: a JSON-RPC error answering THIS request is that
 # answer, not a session expiry, and restarting the session on it would send
 # a fresh initialize and the very same unknown method again.
-RSpec.describe 'a 404 answering a well-formed -32601 is method-not-found even on a session with an id' do
+# Off a session negotiated under 2025-11-25 — an era never established, or a
+# modern one whose server assigned a session id anyway — a well-formed -32601
+# under 404 is MCP 2026-07-28's answer to the request itself. On such a
+# session the expiry rule of that revision is unconditional instead; round 8
+# pins that side.
+RSpec.describe 'a 404 answering a well-formed -32601 is method-not-found off a negotiated legacy session' do
   let(:base_url) { 'https://example.com' }
   let(:endpoint) { '/rpc' }
 
-  def session_server(klass)
+  def session_server(klass, era: nil)
     server = klass.new(base_url: base_url, endpoint: endpoint, retries: 0)
     server.instance_variable_set(:@connection_established, true)
     server.instance_variable_set(:@initialized, true)
-    server.instance_variable_set(:@protocol_version, '2025-11-25')
+    server.instance_variable_set(:@protocol_version, era)
     server.instance_variable_set(:@session_id, 'session-abc')
     server
   end
@@ -133,7 +138,7 @@ RSpec.describe 'a 404 answering a well-formed -32601 is method-not-found even on
     end
 
     it "still restarts the session on a 404 that is not a JSON-RPC answer, on #{klass}" do
-      server = session_server(klass)
+      server = session_server(klass, era: '2025-11-25')
       stub_request(:post, "#{base_url}#{endpoint}").to_return do |request|
         body = JSON.parse(request.body)
         case body['method']

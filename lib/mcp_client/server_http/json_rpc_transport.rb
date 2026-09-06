@@ -16,9 +16,13 @@ module MCPClient
       # @return [Hash] the parsed result
       # @raise [MCPClient::Errors::TransportError] if parsing fails
       # @raise [MCPClient::Errors::ServerError] if the response contains an error
+      # A host's `conn.response :json` middleware decodes the body before it
+      # reaches here — the README offers that middleware for the error path,
+      # and it applies to every response — so an already-decoded object is
+      # taken as it is rather than parsed a second time.
       def parse_response(response, _request = nil)
-        body = response.body.strip
-        data = JSON.parse(body)
+        body = response.body
+        data = body.is_a?(String) ? JSON.parse(body.strip) : body
         process_jsonrpc_response(data)
       rescue JSON::ParserError => e
         raise MCPClient::Errors::TransportError, "Invalid JSON response from server: #{describe_parse_error(e)}"

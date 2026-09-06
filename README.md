@@ -457,11 +457,12 @@ MCPClient.http_config(base_url: 'https://internal.company.com') do |faraday|
 end
 ```
 
-Response middleware you add here is respected on the error path: if a
+Response middleware you add here is respected on both paths: if a
 `conn.response :json` middleware (with or without `conn.response :raise_error`)
-has already decoded an HTTP 4xx body, the JSON-RPC error it carries is still
-recognized, so a protocol rejection keeps its `code`, `data` and typed error
-class instead of degrading to a bare `ServerError`.
+has already decoded the body, a successful result is read from the decoded
+object rather than parsed a second time, and the JSON-RPC error an HTTP 4xx
+carries is still recognized, so a protocol rejection keeps its `code`, `data`
+and typed error class instead of degrading to a bare `ServerError`.
 
 ### Server Definition JSON
 

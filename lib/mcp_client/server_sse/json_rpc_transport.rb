@@ -332,6 +332,11 @@ module MCPClient
         # the Symbol :error key; deliver them to the caller as ServerError
         # (MCP lifecycle "Error Handling") instead of timing out.
         raise_sse_error_response(result[:error]) if result.is_a?(Hash) && result.key?(:error)
+        # …and an envelope that carried neither member under :no_answer.
+        if result.is_a?(Hash) && result[:no_answer]
+          raise MCPClient::Errors::InvalidResultError,
+                "Invalid result: the response to request #{request_id} carried neither a result nor an error member"
+        end
         # Same resultType invariant as process_jsonrpc_response on the
         # other transports: an unrecognized value is an invalid response.
         validate_result_type!(result)

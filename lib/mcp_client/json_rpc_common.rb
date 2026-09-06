@@ -103,10 +103,13 @@ module MCPClient
     end
 
     # A log-safe description of a payload body: its size, never its content.
-    # @param body [String, nil] the response/request body
+    # A host's `conn.response :json` middleware hands the decoded object here
+    # instead of the bytes it came from; say so rather than measuring it.
+    # @param body [String, Object, nil] the response/request body
     # @return [String]
     def describe_body_size(body)
-      return 'empty body' if body.nil? || body.empty?
+      return 'empty body' if body.nil? || (body.respond_to?(:empty?) && body.empty?)
+      return "decoded #{body.class} body" unless body.is_a?(String)
 
       "#{body.bytesize} bytes"
     end

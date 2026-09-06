@@ -52,15 +52,20 @@ metadata). Each feature lands in its own PR; this section accumulates them.
   `ServerError` for every other purpose) and, like the reserved codes, only
   when its error object is well-formed: a 404 page dressed up as
   `{"error": {"code": -32601}}` with no `message` identifies nobody. That
-  body is read before the 2025-11-25 session rule: a 404 answering a request
-  that carried an `Mcp-Session-Id` starts a fresh session only when it is NOT
-  a well-formed -32601 — that one is the answer to the request itself (an
-  unknown method), and restarting on it would re-send the same method. The
-  404 body is read the way every other HTTP error body is: a JSON-RPC 2.0
-  envelope, size-bounded, gunzipped when the response says so — an "error"
-  member outside an envelope, an oversized or undecodable body is no answer
-  and leaves the 404 a session expiry, and a compressed well-formed -32601
-  is the typed error without a restart. It is
+  body is read according to the era the session was negotiated under. On a
+  session negotiated under 2025-11-25 the session rule is unconditional —
+  "when receiving HTTP 404 in response to a request containing an
+  `Mcp-Session-Id`, the client MUST start a new session" names the status and
+  the session id and takes no exception for what the body carries, and a
+  server on that revision answers the session rather than the request. Off
+  such a session (an era never established, or a modern one whose server
+  assigned a session id 2026-07-28 gives it no reason to assign) a
+  well-formed -32601 is the answer to the request itself (an unknown method),
+  and replaying it after a fresh initialize would only ask the unknown method
+  again. That body is read the way every other HTTP error body is: a JSON-RPC
+  2.0 envelope, size-bounded, gunzipped when the response says so — an
+  "error" member outside an envelope, an oversized or undecodable body is no
+  answer at all. It is
   deliberately separate from `#modern_protocol_error?`, because on stdio a
   bare -32601 is exactly what a legacy peer answers a modern probe with and
   must keep the `initialize` fallback alive. When a modern-only server
@@ -68,6 +73,17 @@ metadata). Each feature lands in its own PR; this section accumulates them.
   versions it supports in the `ConnectionError` message (`server supports:
   2026-07-28`), with the typed error as its `cause`; the list travels in the
   error's `data`, so the peer's prose alone would not have shown it.
+- **A response answers with a result or an error, never with neither.**
+  JSON-RPC 2.0 section 5: "Either the result member or error member MUST be
+  included". An SSE envelope carrying neither answers nothing, and is raised
+  as `MCPClient::Errors::InvalidResultError` rather than delivered as a
+  successful `nil` — the member's presence is what decides, so an explicit
+  `"result": null` (or `false`) is still the answer it is.
+- **A host's `conn.response :json` middleware is respected on both paths.**
+  It decodes every body, not only the 4xx ones the error path reads, so a
+  successful result is taken from the decoded object instead of being parsed
+  a second time (`undefined method 'strip' for a Hash`), and a body already
+  decoded is described in logs by its type rather than measured in bytes.
 - **`resultType`.** Every result is checked: an absent field is treated as
   `"complete"` (earlier-protocol servers, and modern ones that omit it), and
   any unrecognized value raises `MCPClient::Errors::InvalidResultError` (a
