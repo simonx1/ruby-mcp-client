@@ -197,8 +197,19 @@ RSpec.describe 'MCP 2026-07-28 stateless protocol (stdio)' do
     # extension branch registers itself as an implementation).
     it 'refuses to advertise a result-type-adding extension this client does not implement' do
       transport.protocol_version = '2026-07-28'
+      # The tasks extension branch implements it; the refusal is the rule for
+      # a client that does not, whichever extension that is.
+      transport.define_singleton_method(:implemented_extension_result_types) { {} }
+
       expect { transport.declare_extension('io.modelcontextprotocol/tasks') }
         .to raise_error(ArgumentError, /"task".*not implement/)
+    end
+
+    it 'advertises the tasks extension this client does implement' do
+      transport.protocol_version = '2026-07-28'
+      transport.declare_extension('io.modelcontextprotocol/tasks')
+
+      expect(transport.accepted_result_types).to include('task')
     end
 
     it 'rejects extension identifiers without the mandatory prefix' do

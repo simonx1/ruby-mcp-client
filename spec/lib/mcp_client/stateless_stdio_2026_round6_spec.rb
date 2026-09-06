@@ -438,7 +438,12 @@ RSpec.describe 'MCP 2026-07-28 stateless protocol (stdio) — round 6' do
       end.new
     end
 
+    # This branch implements the tasks extension, so the refusal is shown on
+    # a transport that does not: the rule is about the client's own
+    # implementation, not about which extension it is.
     it 'cannot be advertised by a client that does not implement it' do
+      transport.define_singleton_method(:implemented_extension_result_types) { {} }
+
       expect { transport.declare_extension('io.modelcontextprotocol/tasks') }
         .to raise_error(ArgumentError, /result type "task".*not implement/)
       expect(transport.declared_extensions).to be_empty
