@@ -1430,6 +1430,40 @@ RSpec.describe 'MCP 2026-07-28 Streamable HTTP — a response stream that really
         expect(@fixture.received.count { |r| r['method'] == 'tools/call' }).to eq(2)
       end
 
+      # Round 4: the tools/list a modern call reads first is an exchange of
+      # its own. Its one re-issue is its own, and so is the call's.
+      it 'gives the prerequisite list and the call one re-issue each on a real socket' do
+        broken = Hash.new(0)
+        start_server do |message|
+          case message['method']
+          when 'server/discover' then jsonrpc(message, discovery)
+          when 'tools/list'
+            broken['tools/list'] += 1
+            broken['tools/list'] == 1 ? MidStreamCloseServer::CLOSE_MID_STREAM : jsonrpc(message, { 'tools' => [] })
+          when 'tools/call'
+            broken['tools/call'] += 1
+            broken['tools/call'] == 1 ? MidStreamCloseServer::CLOSE_MID_STREAM : jsonrpc(message, { 'content' => [] })
+          end
+        end
+
+        expect(transport(klass).call_tool('t', {})).to eq({ 'content' => [] })
+        expect(methods_received).to eq(%w[server/discover tools/list tools/list tools/call tools/call])
+      end
+
+      it 'surfaces a prerequisite list lost twice on a real socket without sending the call' do
+        start_server do |message|
+          case message['method']
+          when 'server/discover' then jsonrpc(message, discovery)
+          when 'tools/list' then MidStreamCloseServer::CLOSE_MID_STREAM
+          else jsonrpc(message, { 'content' => [] })
+          end
+        end
+
+        expect { transport(klass).call_tool('t', {}) }
+          .to raise_error(MCPClient::Errors::ResponseStreamClosedError)
+        expect(methods_received).to eq(%w[server/discover tools/list tools/list])
+      end
+
       it 'attempts exactly one request when the connection was never established' do
         start_server { |message| jsonrpc(message, discovery) }
         port = @fixture.port

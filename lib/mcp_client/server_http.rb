@@ -255,15 +255,13 @@ module MCPClient
         ensure_connected
 
         # Follow nextCursor across pages so the full prompt list is returned.
-        prompts = request_paginated_list('prompts/list', 'prompts')
-
-        @mutex.synchronize do
-          @prompts = prompts.map do |prompt_data|
-            MCPClient::Prompt.from_json(prompt_data, server: self)
-          end
+        generation = @mutex.synchronize { list_generation(:prompts) }
+        prompts = request_paginated_list('prompts/list', 'prompts').map do |prompt_data|
+          MCPClient::Prompt.from_json(prompt_data, server: self)
         end
-
-        @mutex.synchronize { @prompts }
+        # A list invalidated while in flight is returned but not cached.
+        @mutex.synchronize { @prompts = prompts if list_generation(:prompts) == generation }
+        prompts
       rescue MCPClient::Errors::ConnectionError, MCPClient::Errors::TransportError, MCPClient::Errors::ServerError
         raise
       rescue StandardError => e
@@ -306,6 +304,7 @@ module MCPClient
 
         params = {}
         params['cursor'] = cursor if cursor
+        generation = @mutex.synchronize { list_generation(:resources) }
         result = require_complete_result!(rpc_request('resources/list', params), 'resources/list')
 
         resources = (result['resources'] || []).map do |resource_data|
@@ -314,8 +313,9 @@ module MCPClient
 
         resources_result = { 'resources' => resources, 'nextCursor' => result['nextCursor'] }
 
+        # A list invalidated while in flight is returned but not cached.
         @mutex.synchronize do
-          @resources_result = resources_result unless cursor
+          @resources_result = resources_result if !cursor && list_generation(:resources) == generation
         end
 
         resources_result

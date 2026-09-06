@@ -9,10 +9,11 @@ module MCPClient
     # crosses when it hands control to host code, since an error from the far
     # side of that boundary is what these recoveries must not act on.
     module RequestRecovery
-      # Marks an error that escaped host code this transport handed control to
-      # while a response was still being parsed. It belongs to whatever that
-      # code was doing -- typically a request of its own -- and never to the
-      # exchange whose response reached it.
+      # Marks an error that escaped another exchange run from inside this one:
+      # host code this transport handed control to while a response was still
+      # being parsed, or the tools/list a tools/call reads first to derive its
+      # headers. It belongs to that exchange -- which had its own recovery --
+      # and never to the one it surfaced in.
       module NestedExchange; end
 
       private

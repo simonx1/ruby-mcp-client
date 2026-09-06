@@ -16,7 +16,11 @@ metadata). Each feature lands in its own PR; this section accumulates them.
   decimal, booleans lowercase; absent or null arguments produce no header. The tool list is fetched on
   demand when a tool is called before `tools/list`. An argument that cannot
   be mirrored (a float, an object, an integer outside the IEEE754 safe
-  range) fails the call locally with `ValidationError`.
+  range) fails the call locally with `ValidationError`. So does an argument
+  given under both a String and a Symbol key with different values: the body
+  carries both, and no header can agree with two values. A value that starts
+  with `=?base64?` and ends with `?=` is sentinel-shaped even when the two
+  markers overlap (`=?base64?=`), and is encoded.
 - **The `Mcp-Param-*` namespace is client-owned on a modern session.** It is
   derived from the call's arguments and from nothing else, so a header of
   that name supplied in `headers:` is dropped from modern requests (matching
@@ -48,9 +52,13 @@ metadata). Each feature lands in its own PR; this section accumulates them.
   escaped host code the transport called back into while parsing a response —
   a notification listener's own rejected `tools/call` is that request's
   failure, and the request whose response reached the listener has already
-  been executed. Transport list caches now follow `list_changed`
-  notifications, and neither they nor the client-level tool cache can be
-  overwritten by a fetch that started before the refresh.
+  been executed. The same holds for the `tools/list` a call reads first to
+  derive its headers: that list has a re-issue of its own, and its failure
+  surfaces as its own instead of spending the call's re-issue or refresh on
+  a request that never went out. Transport tool, prompt and resource caches
+  now follow `list_changed` notifications, and none of them — nor the
+  client-level tool cache — can be overwritten by a fetch that started
+  before the change.
 - **A result is validated against the definition its call went out under.**
   The transport records the definition each `tools/call` request derived its
   `Mcp-Param-*` headers from (`MCPClient::CalledToolDefinition`), and

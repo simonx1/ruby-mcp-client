@@ -788,6 +788,8 @@ RSpec.describe 'MCP 2026-07-28 x-mcp-header — two calls in flight at once' do
     start = Queue.new
     proceed = Queue.new
     read = {}
+    left_behind = {}
+    key = server.send(:called_tool_definition_key)
     # Fully overlapping: both slots are open before either records, and both
     # have recorded before either reads back.
     threads = %w[a b].map do |name|
@@ -800,6 +802,9 @@ RSpec.describe 'MCP 2026-07-28 x-mcp-header — two calls in flight at once' do
           proceed.pop(timeout: 5)
           read[name] = server.send(:take_called_tool_definition, name)&.first
         end
+        # The slots were opened on this worker, so this is the thread that
+        # tells whether closing the outermost one left anything behind.
+        left_behind[name] = Thread.current[key]
       end
     end
     2.times { expect(opened.pop(timeout: 5)).not_to be_nil }
@@ -809,7 +814,7 @@ RSpec.describe 'MCP 2026-07-28 x-mcp-header — two calls in flight at once' do
     threads.each { |t| t.join(5) }
 
     expect(read.transform_values { |tool| tool&.name }).to eq({ 'a' => 'a', 'b' => 'b' })
-    expect(Thread.current[server.send(:called_tool_definition_key)]).to be_nil
+    expect(left_behind).to eq({ 'a' => nil, 'b' => nil })
     server.cleanup
   end
 
@@ -1012,6 +1017,16 @@ RSpec.describe 'MCP 2026-07-28 x-mcp-header — shared by both HTTP transports' 
           { 'text' => 'us west 1' } => { 'Mcp-Param-Text' => 'us west 1' },
           { 'text' => 'US-West-1' } => { 'Mcp-Param-Text' => 'US-West-1' },
           { 'text' => "\tindented" } => { 'Mcp-Param-Text' => '=?base64?CWluZGVudGVk?=' },
+          # Trailing-only whitespace is as unsafe as leading; an interior tab
+          # is as safe as an interior space; NUL and DEL are controls.
+          { 'text' => 'a ' } => { 'Mcp-Param-Text' => '=?base64?YSA=?=' },
+          { 'text' => "a\tb" } => { 'Mcp-Param-Text' => "a\tb" },
+          { 'text' => "a\0b" } => { 'Mcp-Param-Text' => '=?base64?YQBi?=' },
+          { 'text' => "a\x7Fb" } => { 'Mcp-Param-Text' => '=?base64?YX9i?=' },
+          # The two markers overlap, and the value is sentinel-shaped all the same.
+          { 'text' => '=?base64?=' } => { 'Mcp-Param-Text' => '=?base64?PT9iYXNlNjQ/PQ==?=' },
+          # One line however long: Base64 in a field value is never wrapped.
+          { 'text' => 'é' * 60 } => { 'Mcp-Param-Text' => "=?base64?#{['é' * 60].pack('m0')}?=" },
           { 'flag' => false } => { 'Mcp-Param-Flag' => 'false' },
           { 'n' => 0 } => { 'Mcp-Param-N' => '0' },
           { 'n' => 42.0 } => { 'Mcp-Param-N' => '42' }
@@ -1164,7 +1179,10 @@ RSpec.describe 'MCP 2026-07-28 x-mcp-header — paginated and shrinking lists' d
     expect(param_headers(calls[1][:headers])).to be_empty
   end
 
-  it 'fails the call when the refreshed definition no longer carries the tool at all' do
+  # The failure here is the server's second rejection; nothing local fails a
+  # call for a definition the refreshed list lacks (see round 4 for the retry
+  # that succeeds without one).
+  it 'retries without any mirrored header when the refreshed definition no longer carries the tool' do
     listed = [annotated_tool('Region')]
     requests = []
     stub_request(:post, url).to_return do |request|
@@ -1242,9 +1260,12 @@ RSpec.describe 'MCP 2026-07-28 x-mcp-header — list_changed invalidation on bot
 
         notify(server, dispatcher, 'notifications/prompts/list_changed')
         expect(server.list_prompts.map(&:name)).to eq(['p2'])
+        expect(server.list_resources['resources'].map(&:name)).to eq(['r1'])
+        expect(server.list_tools.map(&:name)).to eq(['t2'])
 
         notify(server, dispatcher, 'notifications/resources/list_changed')
         expect(server.list_resources['resources'].map(&:name)).to eq(['r2'])
+        expect(server.list_prompts.map(&:name)).to eq(['p2'])
         expect(server.list_tools.map(&:name)).to eq(['t2'])
       end
 

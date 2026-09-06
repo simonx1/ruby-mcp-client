@@ -35,9 +35,12 @@ module MCPClient
     # as an encoding of nothing.
     HEADER_SAFE_VALUE = /\A(?:[\x21-\x7E](?:[\x20-\x7E\t]*[\x21-\x7E])?)?\z/
 
-    # The Base64 sentinel format; a plain value matching it must itself be
-    # encoded to avoid ambiguity.
-    BASE64_SENTINEL = /\A=\?base64\?.*\?=\z/m
+    # The Base64 sentinel markers; a plain value that starts with the one and
+    # ends with the other must itself be encoded to avoid ambiguity. The rule
+    # is on the start and the end alone: "=?base64?=" is sentinel-shaped even
+    # though its two markers overlap.
+    BASE64_SENTINEL_START = '=?base64?'
+    BASE64_SENTINEL_END = '?='
 
     module_function
 
@@ -102,7 +105,7 @@ module MCPClient
     # @return [String] the header value
     def encode_header_value(value)
       text = value.to_s.encode('UTF-8')
-      return text if text.match?(HEADER_SAFE_VALUE) && !text.match?(BASE64_SENTINEL)
+      return text if text.match?(HEADER_SAFE_VALUE) && !sentinel_shaped?(text)
 
       "=?base64?#{[text].pack('m0')}?="
     end
@@ -133,13 +136,27 @@ module MCPClient
       end
     end
 
+    # @param text [String] a UTF-8 header value
+    # @return [Boolean] whether the value would read as a Base64 sentinel
+    def sentinel_shaped?(text)
+      text.start_with?(BASE64_SENTINEL_START) && text.end_with?(BASE64_SENTINEL_END)
+    end
+
     # Read the argument at an exact property path, accepting String or
-    # Symbol keys at each step.
+    # Symbol keys at each step. A step given under both kinds of key with
+    # different values is rejected: the JSON body serializes both, which one
+    # the server reads is its business, and no header can agree with an
+    # argument that is two values.
     # @return [Object, nil] the value, nil when absent (or explicitly null)
+    # @raise [MCPClient::Errors::ValidationError] on conflicting String/Symbol keys
     def dig_argument(arguments, path)
       path.reduce(arguments) do |node, key|
         return nil unless node.is_a?(Hash)
 
+        if node.key?(key) && node.key?(key.to_sym) && node[key] != node[key.to_sym]
+          raise MCPClient::Errors::ValidationError,
+                "Argument #{path.join('.')} is given under both a String and a Symbol key with different values"
+        end
         node.key?(key) ? node[key] : node[key.to_sym]
       end
     end

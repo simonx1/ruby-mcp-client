@@ -75,9 +75,19 @@ module MCPClient
       # The tool list used for header extraction, fetched on demand. Mirroring
       # is a MUST, so a list that cannot be fetched fails the call rather than
       # letting it go out without the headers an intermediary may route on.
+      #
+      # That fetch is an exchange of its own, with a recovery of its own (its
+      # one re-issue, its own with_retry attempts), and it runs inside the
+      # call's recovery block: an error escaping it is marked so the call does
+      # not mistake it for its own rejection or lost stream and spend the one
+      # re-issue or refresh it has on a request that never went out.
       # @return [Array<MCPClient::Tool>]
+      # @raise [MCPClient::Errors::MCPError] the list's own failure, marked NestedExchange
       def known_tools_for_headers
         @mutex.synchronize { @tools } || list_tools
+      rescue StandardError => e
+        e.extend(RequestRecovery::NestedExchange) unless e.frozen?
+        raise
       end
     end
   end
