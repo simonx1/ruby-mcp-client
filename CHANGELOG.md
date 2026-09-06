@@ -15,10 +15,10 @@ metadata). Each feature lands in its own PR; this section accumulates them.
   could be stale before its result arrived; the receipt is now the arrival of
   the chunk that completed the answer. The capability gate re-fetches a
   `server/discover` result whose `ttlMs` has elapsed before refusing a
-  capability on the HTTP transports as it already did on stdio, and both judge
-  freshness by the one rule every cached result uses (a negative or malformed
-  hint is stale at once; a missing one keeps the negotiated result in force
-  until the next probe) on the transport's own clock, so `cache_info(:discover)`
+  capability on the HTTP transports as it already did on stdio -- before the
+  capability is judged at all -- and both judge freshness by the one rule
+  every cached result uses (an absent, zero, negative or malformed hint is
+  stale at once) on the transport's own clock, so `cache_info(:discover)`
   never disagrees with the decision. An empty list an older server put no hint
   on is asked for again on the HTTP transports, as the client's own cache and
   the stdio transport already did, instead of being kept for the life of the

@@ -335,13 +335,12 @@ RSpec.describe 'MCP 2026-07-28 cacheable results — round 39' do
       expect(server.cache_info(:discover)[:fresh]).to be(false)
       expect(server.send(:discovery_fresh?)).to be(false)
 
-      # No hint: the negotiated result is in force until the next probe.
+      # No hint: "if ttlMs is absent, clients SHOULD assume 0" -- the result
+      # is stale at once, on both readings, and re-read on the next access
+      # that needs it (the stateless stdio branch pins the re-discovery).
       server.send(:apply_discover_result, discover)
-      expect(server.cache_info(:discover)).to include(ttl_ms: nil, fresh: true)
-      expect(server.send(:discovery_fresh?)).to be(true)
-      clock[:now] += 1_000_000
-      expect(server.cache_info(:discover)[:fresh]).to be(true)
-      expect(server.send(:discovery_fresh?)).to be(true)
+      expect(server.cache_info(:discover)).to include(ttl_ms: 0, fresh: false)
+      expect(server.send(:discovery_fresh?)).to be(false)
     end
   end
 

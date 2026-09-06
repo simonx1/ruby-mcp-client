@@ -974,9 +974,10 @@ on the HTTP transports ("Clients MAY serve stale responses if errors occur
 during re-fetching"); the SSE and stdio transports raise instead, and an
 authorization failure never serves a stale copy, so it reaches your auth flow.
 
-A `server/discover` result is the session's negotiated state: with a `ttlMs`
-it is re-fetched once that has elapsed and a capability it lacked is asked
-for, on every transport; without one it stays in force until the next probe.
+A `server/discover` result is judged by the one rule every cached result
+uses: once its `ttlMs` has elapsed (an absent, zero, negative or malformed
+hint is stale at once) it is re-fetched on the next access that needs it,
+before a capability is judged, on every transport.
 
 ## Server Notifications
 
