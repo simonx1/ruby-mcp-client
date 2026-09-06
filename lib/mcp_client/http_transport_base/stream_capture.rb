@@ -1,6 +1,7 @@
 # frozen_string_literal: true
 
 require 'zlib'
+require_relative 'bounded_inflate'
 
 module MCPClient
   module HttpTransportBase
@@ -62,9 +63,7 @@ module MCPClient
       #   (truncated inside the deflate stream, or over the bound)
       def inflate_delivered_gzip(body)
         inflater = Zlib::Inflate.new(Zlib::MAX_WBITS + 32)
-        inflated = inflater.inflate(body)
-        limit = inflate_limit
-        limit && inflated.bytesize > limit ? nil : inflated
+        BoundedInflate.inflate(inflater, body, inflate_limit)
       rescue Zlib::Error
         nil
       ensure

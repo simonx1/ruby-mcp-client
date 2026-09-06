@@ -100,8 +100,36 @@ module MCPClient
           raise MCPClient::Errors::TransportError, "Invalid gzip response from server: #{e.message}"
         end
 
+        # A stream cut after the deflate data — footer only — still delivered
+        # its answer; a delivered answer settles the request, as on a socket
+        # that died after the final event (re-issuing would run it again).
+        delivered = delivered_before_truncation(response, request, e)
+        return delivered unless delivered.nil?
+
         raise MCPClient::Errors::ResponseStreamClosedError,
               "Response stream closed before delivering the response: #{e.message}"
+      end
+
+      # The answer a gzip body that lost its footer delivered, parsed the
+      # ordinary way; nil when the deflate data itself stopped short of it.
+      # @param response [Faraday::Response] the response whose body failed to decode
+      # @param request [Hash, nil] the originating JSON-RPC request
+      # @param error [Zlib::Error] the decode failure
+      # @return [Object, nil] the parsed result
+      def delivered_before_truncation(response, request, error)
+        return nil unless request.is_a?(Hash) && request.key?('id')
+
+        body = inflate_delivered_gzip(response.body.to_s)
+        return nil if body.nil? || body.empty?
+
+        sse = sse_framed_body?(body)
+        body = complete_sse_events(body) if sse
+        return nil if body.empty? || !body_carries_response?(body, sse, request['id'])
+
+        @logger.warn("Response stream ended after the response arrived (#{error.message}); " \
+                     "keeping the delivered #{request['method']} response instead of re-issuing it")
+        data = sse ? parse_sse_response(body, request['id'], live_event_count(response)) : JSON.parse(body.strip)
+        process_jsonrpc_response(data)
       end
 
       # Every complete event of a response stream is handed over while the

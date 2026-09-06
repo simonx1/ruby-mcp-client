@@ -1,6 +1,7 @@
 # frozen_string_literal: true
 
 require 'zlib'
+require_relative 'bounded_inflate'
 
 module MCPClient
   module HttpTransportBase
@@ -13,7 +14,12 @@ module MCPClient
     # a JSON body never yields anything. Events are counted, terminated or
     # not dispatched, in the same order the completed body splits into them.
     class SseEventScanner
-      SSE_START = /\A(?::|(?:data|event|id|retry):)/
+      # An event stream opens with a comment or a field — any field: one
+      # the client does not know is ignored, not a reason to stop reading
+      # (SSE "Parsing an event stream"). A body that opens a JSON value is
+      # never an event stream.
+      SSE_START = /\A(?::|[^\n:{\[]+:)/n
+      BOM = "\xEF\xBB\xBF".b
       GZIP_MAGIC = "\x1F\x8B".b
 
       # @return [Integer] complete events seen so far
@@ -84,11 +90,11 @@ module MCPClient
       # @param bytes [String] gzip bytes as they arrived
       # @return [String, nil] the text they expand to; nil once the stream is unusable
       def inflate(bytes)
-        text = @inflater.inflate(bytes)
-        @inflated += text.bytesize
-        return text unless @max_inflated_bytes && @inflated > @max_inflated_bytes
+        text = BoundedInflate.inflate(@inflater, bytes, @max_inflated_bytes, @inflated)
+        return stop_scanning if text.nil?
 
-        stop_scanning
+        @inflated += text.bytesize
+        text
       rescue Zlib::Error
         stop_scanning
       end
@@ -108,6 +114,8 @@ module MCPClient
       def scanning?
         return @sse unless @sse.nil?
 
+        # The UTF-8 decode step of the SSE algorithm drops one leading BOM.
+        @normalized.delete_prefix!(BOM) if @scanned.zero?
         content = @normalized.sub(/\A\n+/, '')
         return false unless content.bytesize >= 6 || content.include?("\n")
 

@@ -1,6 +1,8 @@
 # frozen_string_literal: true
 
 require 'spec_helper'
+require 'zlib'
+require 'stringio'
 
 RSpec.describe MCPClient::HttpTransportBase::SseEventScanner do
   def events_from(*chunks)
@@ -60,9 +62,73 @@ RSpec.describe MCPClient::HttpTransportBase::SseEventScanner do
     expect(count).to eq(0)
   end
 
-  it 'never scans a gzip body' do
-    events, = events_from("\x1F\x8B\x08\x00".b, "\n\n\n\n")
+  # SSE "Parsing an event stream": a field whose name the client does not
+  # know is ignored, not a reason to stop reading the stream. A server that
+  # opens its stream with one still has its ping answered while the stream
+  # is open.
+  it 'scans a stream whose first field is one it does not know' do
+    events, = events_from("x-ignore: 1\ndata: a\n\n")
+
+    expect(events).to eq(["x-ignore: 1\ndata: a"])
+  end
+
+  it 'skips a leading byte-order mark' do
+    events, = events_from("\xEF\xBB\xBF".b, "data: a\n\n")
+
+    expect(events).to eq(['data: a'])
+  end
+
+  def gzip(text)
+    StringIO.new.tap { |io| Zlib::GzipWriter.wrap(io) { |gz| gz.write(text) } }.string
+  end
+
+  # Streamable HTTP offers gzip on every request, so a live stream is usually
+  # a compressed one: its events are inflated as the bytes arrive.
+  it 'inflates a gzip body and yields its events as they arrive' do
+    compressed = gzip("data: a\n\ndata: b\n\n")
+    half = compressed.bytesize / 2
+    events, count = events_from(compressed[0, half], compressed[half..])
+
+    expect(events).to eq(['data: a', 'data: b'])
+    expect(count).to eq(2)
+  end
+
+  it 'yields a compressed event before the gzip footer has arrived' do
+    compressed = gzip("data: a\n\n")
+    events, = events_from(compressed[0, compressed.bytesize - 8])
+
+    expect(events).to eq(['data: a'])
+  end
+
+  it 'stops scanning a gzip body that is not an event stream' do
+    events, count = events_from(gzip('{"jsonrpc":"2.0","id":1,"result":{}}'))
 
     expect(events).to be_empty
+    expect(count).to eq(0)
+  end
+
+  # The peer controls the compression ratio. The bound is applied to the
+  # inflated pieces as zlib produces them, so a body that expands far past
+  # it is never allocated in full before the check.
+  it 'stops scanning a gzip body once its expansion crosses the bound, before allocating it' do
+    bomb = gzip("#{'a' * (8 * 1024 * 1024)}\n\ndata: late\n\n")
+    inflated = 0
+    allow_any_instance_of(Zlib::Inflate).to receive(:inflate).and_wrap_original do |original, bytes, &block|
+      if block
+        original.call(bytes) do |piece|
+          inflated += piece.bytesize
+          block.call(piece)
+        end
+      else
+        original.call(bytes).tap { |text| inflated += text.bytesize }
+      end
+    end
+    scanner = described_class.new(max_inflated_bytes: 1024)
+    events = []
+    scanner.feed(bomb) { |event| events << event }
+
+    expect(events).to be_empty
+    expect(scanner.count).to eq(0)
+    expect(inflated).to be <= 1024 + (64 * 1024)
   end
 end

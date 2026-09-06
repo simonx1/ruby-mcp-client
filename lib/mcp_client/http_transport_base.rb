@@ -749,7 +749,18 @@ module MCPClient
     # @param body [String] a response body
     # @return [String] the body with LF line terminators
     def normalize_sse_newlines(body)
-      body.gsub(/\r\n|\r/, "\n")
+      without_bom(body).gsub(/\r\n|\r/, "\n")
+    end
+
+    # The UTF-8 decode step of the SSE algorithm drops one leading byte-order
+    # mark; the field it precedes must still be recognized.
+    # @param body [String] a response body
+    # @return [String]
+    def without_bom(body)
+      bom = body.encoding == Encoding::BINARY ? SseEventScanner::BOM : "\uFEFF".encode(body.encoding)
+      body.start_with?(bom) ? body[bom.length..] : body
+    rescue EncodingError
+      body
     end
 
     # @param body [String] a response body
