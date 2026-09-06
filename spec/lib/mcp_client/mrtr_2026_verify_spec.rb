@@ -583,7 +583,7 @@ RSpec.describe 'MCP 2026-07-28 MRTR verification — server/discover never answe
     sent = script_stdio(server, [{ 'result' => input_required_discover },
                                  { 'result' => { 'tools' => [] } }])
 
-    expect { server.list_tools }.to raise_error(MCPClient::Errors::MCPError, /input_required/)
+    expect { server.list_tools }.to raise_error(MCPClient::Errors::ToolCallError, /input_required/)
     expect(sent.map { |r| r['method'] }).to eq(['server/discover'])
     expect(server.instance_variable_get(:@protocol_version)).to be_nil
     expect(server.instance_variable_get(:@last_discover_result)).to be_nil
@@ -593,7 +593,7 @@ RSpec.describe 'MCP 2026-07-28 MRTR verification — server/discover never answe
     server = modern_stdio(protocol: :modern)
     script_stdio(server, [{ 'result' => input_required_discover }, { 'result' => input_required_discover }])
 
-    expect { server.ping }.to raise_error(MCPClient::Errors::MCPError, /input_required/)
+    expect { server.ping }.to raise_error(MCPClient::Errors::ModernServerError, /input_required/)
   end
 
   it 'rejects an input_required server/discover on plain HTTP' do
@@ -602,7 +602,7 @@ RSpec.describe 'MCP 2026-07-28 MRTR verification — server/discover never answe
     stub_request(:post, 'https://example.com/mcp')
       .to_return { |request| json_response(JSON.parse(request.body)['id'], input_required_discover) }
 
-    expect { http.connect }.to raise_error(MCPClient::Errors::MCPError, /input_required/)
+    expect { http.connect }.to raise_error(MCPClient::Errors::ModernServerError, /input_required/)
     expect(http.instance_variable_get(:@last_discover_result)).to be_nil
     http.cleanup
   end
@@ -613,7 +613,7 @@ RSpec.describe 'MCP 2026-07-28 MRTR verification — server/discover never answe
     stub_request(:post, 'https://example.com/mcp')
       .to_return { |request| json_response(JSON.parse(request.body)['id'], input_required_discover) }
 
-    expect { server.connect }.to raise_error(MCPClient::Errors::MCPError, /input_required/)
+    expect { server.connect }.to raise_error(MCPClient::Errors::ModernServerError, /input_required/)
     expect(server.instance_variable_get(:@last_discover_result)).to be_nil
     server.cleanup
   end
@@ -626,7 +626,7 @@ RSpec.describe 'MCP 2026-07-28 MRTR verification — server/discover never answe
                           { 'result' => input_required_discover }])
     server.list_tools
 
-    expect { server.ping }.to raise_error(MCPClient::Errors::MCPError, /input_required/)
+    expect { server.ping }.to raise_error(MCPClient::Errors::InvalidResultError, /input_required/)
     expect(server.instance_variable_get(:@last_discover_result)).to eq(discover_result)
   end
 end
@@ -1286,7 +1286,7 @@ RSpec.describe 'MCP 2026-07-28 MRTR verification — round trips over real stdio
     end
 
     begin
-      expect { server.list_tools }.to raise_error(MCPClient::Errors::MCPError, /input_required/)
+      expect { server.list_tools }.to raise_error(MCPClient::Errors::ToolCallError, /input_required/)
       expect(sent.map { |r| r['method'] }).to eq(['server/discover'])
     ensure
       reader.close unless reader.closed?
@@ -1309,7 +1309,7 @@ RSpec.describe 'MCP 2026-07-28 MRTR verification — an input_required discover 
                                                  'capabilities' => {}, 'requestState' => 'pending' } },
                                  { 'result' => { 'protocolVersion' => '2025-11-25', 'capabilities' => {} } }])
 
-    expect { server.list_tools }.to raise_error(MCPClient::Errors::MCPError, /input_required/)
+    expect { server.list_tools }.to raise_error(MCPClient::Errors::ToolCallError, /input_required/)
     expect(sent.map { |r| r['method'] }).to eq(['server/discover'])
   end
 
@@ -1323,7 +1323,7 @@ RSpec.describe 'MCP 2026-07-28 MRTR verification — an input_required discover 
                                   'capabilities' => {}, 'requestState' => 'pending' })
     end
 
-    expect { http.connect }.to raise_error(MCPClient::Errors::MCPError, /input_required/)
+    expect { http.connect }.to raise_error(MCPClient::Errors::ModernServerError, /input_required/)
     expect(bodies).to eq(['server/discover'])
     http.cleanup
   end
@@ -1347,7 +1347,7 @@ RSpec.describe 'MCP 2026-07-28 MRTR verification — an unfinished discover with
                                  { 'result' => { 'protocolVersion' => '2025-11-25', 'capabilities' => {} } },
                                  { 'result' => { 'tools' => [] } }])
 
-    expect { server.list_tools }.to raise_error(MCPClient::Errors::MCPError, /input_required/)
+    expect { server.list_tools }.to raise_error(MCPClient::Errors::ToolCallError, /input_required/)
     expect(sent.map { |r| r['method'] }).to eq(['server/discover'])
     expect(server.instance_variable_get(:@protocol_version)).to be_nil
   end
@@ -1361,7 +1361,7 @@ RSpec.describe 'MCP 2026-07-28 MRTR verification — an unfinished discover with
       json_response(body['id'], state_only_discover)
     end
 
-    expect { http.connect }.to raise_error(MCPClient::Errors::MCPError, /input_required/)
+    expect { http.connect }.to raise_error(MCPClient::Errors::ModernServerError, /input_required/)
     expect(bodies).to eq(['server/discover'])
     http.cleanup
   end
@@ -1375,7 +1375,7 @@ RSpec.describe 'MCP 2026-07-28 MRTR verification — an unfinished discover with
       json_response(body['id'], state_only_discover)
     end
 
-    expect { server.connect }.to raise_error(MCPClient::Errors::MCPError, /input_required/)
+    expect { server.connect }.to raise_error(MCPClient::Errors::ModernServerError, /input_required/)
     expect(bodies).to eq(['server/discover'])
     server.cleanup
   end
@@ -1391,7 +1391,7 @@ RSpec.describe 'MCP 2026-07-28 MRTR verification — an unfinished discover with
       json_response(body['id'], state_only_discover)
     end
 
-    2.times { expect { http.connect }.to raise_error(MCPClient::Errors::MCPError, /input_required/) }
+    2.times { expect { http.connect }.to raise_error(MCPClient::Errors::ModernServerError, /input_required/) }
 
     expect(bodies).to eq(%w[server/discover server/discover])
     expect(http.instance_variable_get(:@confirmed_era)).to eq(:modern)
