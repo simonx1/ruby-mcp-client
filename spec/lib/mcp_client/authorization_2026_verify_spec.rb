@@ -141,10 +141,16 @@ RSpec.describe 'MCP 2026-07-28 authorization — verification pass' do
       expect(storage.get_token(server_url).issuer).to eq(issuer_b)
     end
 
-    it 'hands the caller nothing rather than a token of the previous authorization server' do
+    # Round 40: what is in use NOW is presented on the very call whose refresh
+    # was discarded, not on the next one — and it is the new server's token,
+    # never the previous server's.
+    it 'hands the caller the token of the authorization server now in use, not the previous one' do
       refresh_answers_after_the_switch
 
-      expect(provider_for.access_token).to be_nil
+      token = provider_for.access_token
+
+      expect(token.access_token).to eq('token-b')
+      expect(token.issuer).to eq(issuer_b)
     end
 
     it 'says why the refresh response was discarded' do

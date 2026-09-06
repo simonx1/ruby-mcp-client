@@ -4,6 +4,7 @@ require 'faraday'
 require 'json'
 require 'uri'
 require 'ipaddr'
+require 'monitor'
 require_relative '../auth'
 require_relative 'peer_text'
 require_relative 'oauth_provider/challenge_handling'
@@ -18,6 +19,12 @@ module MCPClient
     # Handles the complete OAuth flow including server discovery, client registration,
     # authorization, token exchange, and refresh
     class OAuthProvider
+      # One lock per storage backend and resource for the pending-flow records
+      # (see {#with_pending_flow_lock}); storage backends are weak keys.
+      PENDING_FLOW_LOCKS = ObjectSpace::WeakMap.new
+      PENDING_FLOW_LOCKS_GUARD = Mutex.new
+      private_constant :PENDING_FLOW_LOCKS, :PENDING_FLOW_LOCKS_GUARD
+
       # One auth-param (name = token / quoted-string) as it appears in a
       # WWW-Authenticate challenge (RFC 7235 §2.1, optional whitespace around
       # '='). Mirrors HttpTransportBase::AUTH_PARAM so provider-side challenge
@@ -186,6 +193,14 @@ module MCPClient
         # flight has nothing of the previous resource to present.
         return nil unless server_url == resource
         return refreshed if token_bytes?(refreshed) && token_for_current_issuer?(refreshed)
+
+        # The token in use may have changed hands while the refresh was in
+        # flight — retired by a challenge another provider sharing the storage
+        # handled, replaced by a flow it completed: what is in use NOW is what
+        # is presented, and the token this refresh started from is not.
+        current = token_in_use
+        return presentable_token(current) unless current && same_token?(current, token)
+
         # The discovery a refresh ran may have retired this very token.
         return nil if token.expired? || retired_token?(token) || !token_for_current_issuer?(token)
 
@@ -246,12 +261,14 @@ module MCPClient
                         state: state,
                         resource: server_url,
                         scope: @requested_scope)
-        storage.set_pkce(server_url, pkce)
+        with_pending_flow_lock do
+          storage.set_pkce(server_url, pkce)
 
-        # The separate slot is still written: it is the documented storage
-        # interface, and a callback handler (or an older version of this
-        # library) reads the state from it.
-        storage.set_state(server_url, state)
+          # The separate slot is still written: it is the documented storage
+          # interface, and a callback handler (or an older version of this
+          # library) reads the state from it.
+          storage.set_state(server_url, state)
+        end
 
         # Build authorization URL
         build_authorization_url(server_metadata, client_info, pkce, state)
@@ -375,18 +392,39 @@ module MCPClient
       # @param pkce [PKCE] the per-request record whose flow just ended
       # @return [void]
       def discard_pending_request(pkce)
-        pending = stored_pkce
-        discard_pending_pkce(pkce) if pending.nil? || same_request?(pending, pkce)
-        recorded = pkce.state if pkce.respond_to?(:state)
-        stored_state = storage.get_state(server_url)
-        discard_pending_state(recorded) if recorded.nil? || stored_state.nil? || stored_state == recorded
+        with_pending_flow_lock do
+          pending = stored_pkce
+          discard_pending_pkce(pkce) if pending.nil? || same_request?(pending, pkce)
+          recorded = pkce.state if pkce.respond_to?(:state)
+          stored_state = storage.get_state(server_url)
+          discard_pending_state(recorded) if recorded.nil? || stored_state.nil? || stored_state == recorded
+        end
+      end
+
+      # The pending-flow records of one resource in one storage backend are
+      # written, and read-compared-deleted, under one in-process lock: a flow
+      # another provider (or thread) starts while a completed flow discards
+      # its records waits for the delete instead of losing its records to it.
+      # The storage interface has no conditional delete, and a backend need
+      # not answer a delete with the record it removed, so the window has to
+      # be closed on this side. The lock is re-entrant: a flow the SAME
+      # thread starts from inside a storage callback is not deadlocked, and
+      # falls back to the put-back a record-answering delete allows.
+      # @return [Object] the block's value
+      def with_pending_flow_lock(&)
+        lock = PENDING_FLOW_LOCKS_GUARD.synchronize do
+          (PENDING_FLOW_LOCKS[storage] ||= {})[server_url] ||= Monitor.new
+        end
+        lock.synchronize(&)
       end
 
       # Read, compare, delete: a flow started in between loses its record to
       # the delete. The storage interface has no conditional delete, but a
       # backend that answers the delete with the record it removed (the
       # in-memory one does, as does anything Hash-backed) says whose record
-      # went, and a newer flow's is put back.
+      # went, and a newer flow's is put back — and, held under
+      # {#with_pending_flow_lock}, the newer flow cannot start in between at
+      # all within one process.
       # @param pkce [PKCE] the record whose flow just ended
       # @return [void]
       def discard_pending_pkce(pkce)
@@ -1930,7 +1968,7 @@ module MCPClient
           issuer: server_metadata.issuer
         )
 
-        accept_refreshed_token(new_token, server_metadata.issuer, resource)
+        accept_refreshed_token(new_token, server_metadata.issuer, resource, token)
       rescue JSON::ParserError => e
         logger.warn("Invalid token refresh response: #{describe_parse_error(e, response&.body)}")
         nil
@@ -1954,8 +1992,9 @@ module MCPClient
       # @param new_token [Token] the token the refresh response carried
       # @param issuer [String] the authorization server the refresh was made with
       # @param resource [String] the resource the refresh was made for
+      # @param refreshed [Token, nil] the token the refresh was made with
       # @return [Token, nil] the token, or nil when it is no longer this resource's to keep
-      def accept_refreshed_token(new_token, issuer, resource)
+      def accept_refreshed_token(new_token, issuer, resource, refreshed = nil)
         # A provider retargeted at another resource meanwhile — one that may
         # share the authorization server — is not handed the previous
         # resource's token as its own.
@@ -1966,6 +2005,15 @@ module MCPClient
         unless refresh_target_current?(issuer)
           logger.warn('Discarding the refreshed token: the authorization server changed while the refresh ' \
                       'was in flight')
+          return nil
+        end
+        # What shared storage shows is what another provider did meanwhile: a
+        # challenge it validated retired the token being refreshed, or a flow
+        # it completed replaced it. This provider's own view of the
+        # authorization server says nothing about either, so the response is
+        # kept only while the token it refreshed is still the token in use.
+        unless refreshed_token_in_use?(refreshed)
+          logger.warn('Discarding the refreshed token: the token it refreshed is no longer the token in use')
           return nil
         end
 

@@ -581,6 +581,9 @@ RSpec.describe 'MCP 2026-07-28 authorization — round 38' do
 
     it 'does not hand back a token this client retired' do
       provider = provider_for
+      # Both copies a persisted token has: the slot in use and the one under
+      # its own authorization server's key.
+      storage.set_token(provider.client_registration_key(issuer_a), token_for(issuer_a, 'token-a'))
       stub_request(:get, prm_url).to_return(
         status: 200, headers: json,
         body: { 'resource' => server_url, 'authorization_servers' => [issuer_b] }.to_json

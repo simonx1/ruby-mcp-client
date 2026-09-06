@@ -532,6 +532,25 @@ metadata). Each feature lands in its own PR; this section accumulates them.
   protected resource metadata document — RFC 9728's parameter is
   `resource_metadata`, and a bare resource identifier had the MCP endpoint
   fetched as metadata, which stood in the way of the well-known fallback.
+- **What another provider did meanwhile is read from the storage they share
+  (round 40).** A refresh response is kept only while the token it refreshed
+  is still the token in use: a provider sharing the storage backend may have
+  handled a 401 challenge that moved the resource to another authorization
+  server and retired that token, or completed a flow that replaced it, and the
+  refreshing provider's own view of the authorization server said nothing of
+  either — it stored and presented the old server's bytes after the change
+  had been validated. What is in use now is what is presented, the token the
+  refresh started from is not. A token retired outright is retired wherever
+  it is kept: the copy under its own authorization server's key is re-stored
+  as retired when the backend refuses to delete it, exactly as the slot in use
+  already was, so a provider built after a restart — which holds no
+  in-process retirement marker — refuses it too instead of adopting a copy
+  that still looked live. And the pending-flow records of one resource in one
+  storage backend are written, and read-compared-deleted, under one
+  in-process lock: a flow started by another thread while a completed flow
+  discards its records no longer loses its PKCE record and state to that
+  delete on a backend whose delete answers with nothing — the storage
+  interface never required it to answer with the removed record.
 
 ### Tasks extension (`io.modelcontextprotocol/tasks`)
 

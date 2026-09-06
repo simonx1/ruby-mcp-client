@@ -193,6 +193,9 @@ RSpec.describe 'MCP 2026-07-28 authorization — round 35' do
 
       expect(message).to be_a(String)
       expect(message).to be_valid_encoding
+      # The printable part of the description is kept, not replaced by a
+      # generic message.
+      expect(message).to include('denied')
     end
 
     it 'lets the browser callback complete for an error_description of %FF' do

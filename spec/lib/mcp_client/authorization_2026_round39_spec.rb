@@ -398,7 +398,9 @@ RSpec.describe 'MCP 2026-07-28 authorization — round 39' do
   end
 
   describe 'a real provider behind the HTTP transport' do
-    it 'presents the token bound to the discovered authorization server' do
+    # The stored token belongs to the authorization server in use here; the
+    # token of ANOTHER server, which must not be attached, is round 40's case.
+    it 'attaches the stored token of the authorization server in use' do
       seed(server_url)
       storage.set_token(server_url, token_for('bound'))
       server = MCPClient::ServerHTTP.new(base_url: 'https://mcp.example.com', endpoint: '/mcp',

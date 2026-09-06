@@ -186,7 +186,23 @@ module MCPClient
             storage.respond_to?(:delete_token) ? storage.delete_token(key) : storage.set_token(key, nil)
           rescue StandardError => e
             logger.debug("The retired OAuth token could not be removed from #{key.inspect} (#{e.class})")
+            mark_kept_token_retired(key)
           end
+        end
+
+        # A copy the backend refuses to delete is re-stored as retired, exactly
+        # as the slot in use is: a provider built after a restart holds no
+        # in-process retirement marker, so every copy in storage has to say
+        # for itself that it was retired, or it would be adopted as live.
+        # @param key [String] the per-authorization-server key of the copy
+        # @return [void]
+        def mark_kept_token_retired(key)
+          kept = normalize_record(storage.get_token(key), Token)
+          return unless kept.respond_to?(:with_issuer) && !kept.retired?
+
+          storage.set_token(key, kept.with_issuer(Token::RETIRED_ISSUER))
+        rescue StandardError => e
+          logger.debug("The retired OAuth token under #{key.inspect} could not be marked retired (#{e.class})")
         end
 
         # @return [Token, nil]
@@ -223,6 +239,31 @@ module MCPClient
           # return to that server finds it (MCP 2026-07-28 keeps tokens per
           # authorization server).
           preserve_token(token)
+        end
+
+        # @param refreshed [Token, nil] the token a refresh was made with
+        # @return [Boolean] whether it is still the token in use (a refresh made
+        #   with no token to compare, as from a direct call, is not judged)
+        def refreshed_token_in_use?(refreshed)
+          return true unless refreshed.respond_to?(:access_token)
+
+          current = stored_token_or_nil
+          return false unless current.respond_to?(:access_token) && !retired_token?(current)
+
+          same_token?(current, refreshed)
+        end
+
+        # @return [Boolean] whether two records carry the same token
+        def same_token?(one, other)
+          one.access_token == other.access_token && one.refresh_token == other.refresh_token
+        end
+
+        # @param token [Token, nil] the token in use
+        # @return [Token, nil] the token when it can be presented now
+        def presentable_token(token)
+          return nil unless token && !token.expired? && token_for_current_issuer?(token)
+
+          token
         end
 
         # Whether a token was retired in this process: a bound token when its
