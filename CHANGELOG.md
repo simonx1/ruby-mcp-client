@@ -552,6 +552,24 @@ metadata). Each feature lands in its own PR; this section accumulates them.
   delete on a backend whose delete answers with nothing — the storage
   interface never required it to answer with the removed record.
 
+- **Forty-second review round.** The checks that accept a code exchange or a
+  refresh and the write that keeps its token are one step: they run under the
+  same per-resource lock a validated change of authorization server takes, so
+  a switch can no longer store its token between another response's checks and
+  its write and have it overwritten. A change of authorization server made in
+  shared storage by another provider is reconciled here before the next
+  request resolves its scope — the scopes cached for the previous server are
+  dropped and the protected resource metadata read again, instead of asking
+  the new server for scopes only the previous one advertised. The step-up
+  union preserves what was PREVIOUSLY requested: a first authorization has
+  requested nothing and holds no grant, so the challenge decides it alone and
+  the configured scope joins the union from the request after it (with
+  `scope: :all` the first request had been widened to every scope the
+  authorization server advertises). And an `insufficient_scope` challenge
+  raises the typed step-up error whatever status carries it: RFC 6750 pairs it
+  with 403, servers send it on 401 too, and a host that rescues
+  `InsufficientScopeError` to run the step-up flow missed exactly those.
+
 - **Forty-first review round.** Pre-registered credentials that name no
   authorization server are never presented on a refresh, expired or not: the
   binding is judged on the record before the secret's lifetime is, so an
