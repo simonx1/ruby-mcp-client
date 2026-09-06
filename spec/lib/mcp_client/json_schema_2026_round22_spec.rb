@@ -197,15 +197,15 @@ RSpec.describe 'MCP 2026-07-28 JSON Schema handling — round 22' do
       # warning is made again, and it names what the new schema uses.
       refreshed = MCPClient::Tool.from_json(
         { 'name' => 't', 'description' => 'd', 'inputSchema' => { 'type' => 'object' },
-          'outputSchema' => { 'type' => 'object', 'allOf' => [true],
-                              'unevaluatedProperties' => false } }, server: mock_server
+          'outputSchema' => { 'type' => 'object', 'properties' => { 'a' => { 'contentSchema' => true } } } },
+        server: mock_server
       )
       allow(mock_server).to receive(:list_tools).and_return([refreshed])
       client.send(:invalidate_caches_for_notification, mock_server, 'notifications/tools/list_changed')
 
       client.call_tool('t', {})
       expect(log.string.scan('validation is partial').size).to eq(2)
-      expect(log.string).to include('unevaluatedProperties')
+      expect(log.string).to include('contentSchema')
 
       # And a refreshed dialect is refused, rather than read from the memo
       # the first definition filled in.

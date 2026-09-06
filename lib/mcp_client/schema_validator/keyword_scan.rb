@@ -64,36 +64,43 @@ module MCPClient
 
         # An embedded resource declaring its own $schema is scanned under it.
         dialect = embedded_dialect(schema, dialect) || dialect
-        referenced = referenced_position(schema, root, depth, scan, dialect) if schema['$ref'].is_a?(String)
         if dialect == DRAFT_07 && schema.key?('$ref')
           # Nothing beside the $ref is applied; the definitions stay reachable.
+          referenced = [referenced_position(schema, root, depth, scan, dialect)].compact
           return queue_scan(scan, schema, depth, dialect, referenced, :each_definition)
         end
 
+        # A dynamic reference that names no dynamic anchor is the plain
+        # reference it resolves to: applied, and scanned like one.
+        dynamic, plain = DYNAMIC_REFERENCE_KEYWORDS.select { |k| schema.key?(k) && keyword_known?(k, dialect) }
+                                                   .partition do |k|
+          dynamic_reference?(schema, k, root, scan[:dialect], scan)
+        end
         found.concat((schema.keys & UNSUPPORTED_KEYWORDS).select do |k|
-          # A node that evaluates `unevaluatedItems` / `unevaluatedProperties`
-          # itself leaves no gap to report (see {Composition#unevaluated_applied?}).
-          keyword_known?(k, dialect) && !unevaluated_applied?(schema, k, dialect)
+          keyword_known?(k, dialect) && (!DYNAMIC_REFERENCE_KEYWORDS.include?(k) || dynamic.include?(k))
         end)
+        referenced = (['$ref'] + plain).filter_map { |k| referenced_position(schema, root, depth, scan, dialect, k) }
         queue_scan(scan, schema, depth, dialect, referenced, :each_subschema)
       end
 
       # Queue the positions under a schema object (in document order, the
-      # stack being read from its end), then what its reference reaches.
+      # stack being read from its end), then what its references reach.
       # @param walker [Symbol] :each_subschema or :each_definition
       # @return [void]
       def queue_scan(scan, schema, depth, dialect, referenced, walker)
         positions = []
         send(walker, schema, dialect) { |sub| positions << [sub, depth + 1, dialect] }
         scan[:pending].concat(positions.reverse)
-        scan[:pending] << referenced if referenced
+        scan[:pending].concat(referenced.reverse)
       end
 
-      # The position what a local `$ref` applies is scanned at (unresolvable
-      # or external references are the preflight's business).
+      # The position what a local reference applies is scanned at
+      # (unresolvable or external references are the preflight's business).
+      # @param keyword [String] `$ref`, or a dynamic reference applied as one
       # @return [Array, nil]
-      def referenced_position(schema, root, depth, scan, dialect)
-        ref = schema['$ref']
+      def referenced_position(schema, root, depth, scan, dialect, keyword = '$ref')
+        ref = schema[keyword]
+        return nil unless ref.is_a?(String)
         return nil if external_ref?(ref, root, scan[:dialect], scan, from: schema)
 
         target = resolve_reference(root, ref, scan[:dialect], scan, from: schema)

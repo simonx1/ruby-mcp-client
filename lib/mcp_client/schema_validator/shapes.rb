@@ -243,9 +243,18 @@ module MCPClient
         problems << '$recursiveAnchor must be a boolean' unless boolean_value?(schema['$recursiveAnchor'])
       end
 
+      # A vocabulary is identified by a URI (Core Section 8.1.2), never by a
+      # relative reference.
       # @return [Boolean]
       def vocabulary_map?(value)
-        value.is_a?(Hash) && value.all? { |uri, required| uri_reference?(uri.to_s) && boolean_value?(required) }
+        value.is_a?(Hash) && value.all? { |uri, required| absolute_uri?(uri.to_s) && boolean_value?(required) }
+      end
+
+      # @return [Boolean] whether the value is a URI with a scheme
+      def absolute_uri?(value)
+        !URI::RFC3986_PARSER.parse(value).scheme.nil?
+      rescue URI::InvalidURIError
+        false
       end
 
       # A `pattern`, and every `patternProperties` key, must be an ECMA-262
@@ -253,28 +262,35 @@ module MCPClient
       # Section 4.3) within the length bound. One that is not is a malformed
       # keyword: the schema is unusable, not a schema without the pattern
       # (which admitted every string).
+      # @param deadline [Float, nil] monotonic deadline the check runs under
       # @return [void]
-      def check_pattern_shapes(schema, dialect, problems)
+      def check_pattern_shapes(schema, dialect, problems, deadline = nil)
         pattern = schema['pattern']
-        problem = pattern_shape_problem('pattern', pattern) if pattern.is_a?(String)
+        problem = pattern_shape_problem('pattern', pattern, deadline) if pattern.is_a?(String)
         problems << problem if problem
         patterns = schema['patternProperties'] if keyword_known?('patternProperties', dialect)
         return unless patterns.is_a?(Hash)
 
         patterns.each_key do |key|
-          problem = pattern_shape_problem('patternProperties pattern', key.to_s)
+          break unless problems.empty?
+
+          problem = pattern_shape_problem('patternProperties pattern', key.to_s, deadline)
           problems << problem if problem
         end
       end
 
       # @return [String, nil] why a pattern cannot be used
-      def pattern_shape_problem(keyword, pattern)
+      def pattern_shape_problem(keyword, pattern, deadline = nil)
         return "#{keyword} is longer than #{MAX_PATTERN_LENGTH} characters" if pattern.length > MAX_PATTERN_LENGTH
+        return 'validation aborted: validation time budget exhausted during the schema check' if
+          budget_exhausted?(deadline)
 
-        ecma_regexp(pattern, PATTERN_MATCH_TIMEOUT)
+        ecma_regexp(pattern, PATTERN_MATCH_TIMEOUT, deadline)
         nil
       rescue RegexpError => e
         "#{keyword} #{clip(pattern.inspect)} is not an ECMA-262 regular expression (#{clip(e.message)})"
+      rescue Aborted => e
+        "validation aborted: #{e.message}"
       end
 
       # exclusiveMinimum / exclusiveMaximum are numbers in every supported

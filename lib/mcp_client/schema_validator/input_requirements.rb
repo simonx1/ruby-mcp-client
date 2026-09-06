@@ -47,16 +47,27 @@ module MCPClient
       end
 
       # One position's requirements, and what it applies next. Under draft-07
-      # nothing beside a `$ref` is applied (draft-07 Core Section 8.3).
+      # nothing beside a `$ref` is applied (draft-07 Core Section 8.3) — the
+      # draft-07 of the resource the position belongs to, which an embedded
+      # resource declares for itself (2020-12 Core Section 9.3.2), not the
+      # document root's.
       # @return [void]
       def read_requirements(node, root, scan)
         ref = node['$ref']
         queue_referenced(node, ref, root, scan) if ref.is_a?(String)
-        return if scan[:dialect] == DRAFT_07 && node.key?('$ref')
+        return if position_dialect(node, root, scan) == DRAFT_07 && node.key?('$ref')
 
         scan[:required].concat(node['required'].map(&:to_s)) if node['required'].is_a?(Array)
         scan[:properties] = node['properties'].merge(scan[:properties]) if node['properties'].is_a?(Hash)
         scan[:pending].concat(node['allOf'].reverse) if node['allOf'].is_a?(Array)
+      end
+
+      # The dialect in force at a position: the one the anchor index recorded
+      # for its resource, else the root's.
+      # @return [String, nil]
+      def position_dialect(node, root, scan)
+        scan[:anchors] ||= anchor_index(root, scan[:dialect])
+        indexed_dialect(node, scan) || scan[:dialect]
       end
 
       # Queue what a local reference reaches (an external one is never

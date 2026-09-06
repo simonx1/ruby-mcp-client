@@ -9,10 +9,10 @@ module MCPClient
     # undecided.
     #
     # Everything here is decided by the instance and this schema object
-    # alone, which is why it can be evaluated at all — `unevaluatedItems` and
-    # `unevaluatedProperties` included, but only at a node that produces
-    # every annotation they read ({Composition#unevaluated_applied?}); where
-    # a composition produces them, they stay out.
+    # alone, which is why it can be evaluated at all. What the keywords
+    # evaluate of the value is recorded on the application's {Evaluated} as
+    # they go, and `unevaluatedItems` / `unevaluatedProperties` read that
+    # record once every applicator has run ({Evaluation#apply_unevaluated}).
     module Instances
       # Validate an object against the keywords that apply to it: `required`,
       # the property-count bounds, the required half of a dependency, the
@@ -21,8 +21,10 @@ module MCPClient
       # @param data [Hash] the object
       # @param schema [Hash] string-keyed schema
       # @param path [String] location for error messages
+      # @param evaluated [Evaluated, nil] where the members the keywords
+      #   evaluate are recorded
       # @return [Array<String>] validation errors
-      def validate_object(data, schema, path, ctx, dialect = ctx.dialect)
+      def validate_object(data, schema, path, ctx, dialect = ctx.dialect, evaluated = nil)
         errors = []
         Array(schema['required']).each do |raw_name|
           name = raw_name.to_s
@@ -30,34 +32,27 @@ module MCPClient
         end
         errors.concat(validate_property_counts(data, schema, path))
         errors.concat(validate_dependent_required(data, schema, path, dialect))
-        errors.concat(validate_named_properties(data, schema, path, ctx))
-        errors.concat(validate_other_properties(data, schema, path, ctx, dialect))
-        errors.concat(validate_unevaluated_properties(data, schema, path, ctx, dialect))
+        errors.concat(validate_named_properties(data, schema, path, ctx, evaluated))
+        errors.concat(validate_other_properties(data, schema, path, ctx, dialect, evaluated))
       end
 
-      # `unevaluatedProperties` (JSON Schema 2020-12 Core Section 11.3),
-      # where this node produces every annotation it reads: it then applies
-      # to exactly the members `properties`, `patternProperties` and
-      # `additionalProperties` left over, which is what
-      # {Composition#uncovered_property?} already answers. A node carrying an
-      # in-place applicator is another matter — the annotations come from a
-      # whole composition there — and stays unevaluated (and reported).
+      # `unevaluatedProperties` (JSON Schema 2020-12 Core Section 11.3): the
+      # keyword's schema applies to every member nothing applied to the
+      # value evaluated — not this node's own property keywords, not any
+      # applicator that passed. The members are as many as the peer sent, so
+      # the sweep consults the deadline as it goes.
+      # @param app [Evaluation::Application] the finished application
+      # @param sub [Object] the keyword's schema
       # @return [Array<String>] validation errors
-      def validate_unevaluated_properties(data, schema, path, ctx, dialect)
-        sub = schema['unevaluatedProperties']
-        return [] unless unevaluated_applied?(schema, 'unevaluatedProperties', dialect)
-        # An `additionalProperties` schema evaluates every member the node did
-        # not name, so nothing is left over (and one that is `false` has
-        # already failed the node).
-        return [] if schema.key?('additionalProperties') && schema_value?(schema['additionalProperties'])
-
-        named = schema['properties'].is_a?(Hash) ? schema['properties'].keys.map(&:to_s) : []
-        patterns = schema['patternProperties'].is_a?(Hash) ? schema['patternProperties'].keys.map(&:to_s) : []
+      def unevaluated_property_errors(app, sub)
+        data = app.data
+        ctx = app.ctx
+        path = app.path
         data.flat_map do |key, value|
           check_deadline(ctx)
-          name = key.to_s
-          next [] if named.include?(name) || patterns.any? { |p| pattern_matches?(p, name, ctx.deadline) }
+          next [] if app.evaluated.property?(key)
 
+          name = key.to_s
           unevaluated_errors(value, sub, "#{path}/#{name}", ctx,
                              "#{path}: property '#{clip(name)}' is not allowed (unevaluatedProperties is false)")
         end
@@ -115,8 +110,9 @@ module MCPClient
       end
 
       # The `properties` schemas, applied in the order the schema names them.
+      # Each member the keyword names is evaluated by it (its annotation).
       # @return [Array<String>] validation errors
-      def validate_named_properties(data, schema, path, ctx)
+      def validate_named_properties(data, schema, path, ctx, evaluated = nil)
         properties = schema['properties']
         return [] unless properties.is_a?(Hash)
 
@@ -128,6 +124,7 @@ module MCPClient
           key = data.key?(name) ? name : (name.to_sym if data.key?(name.to_sym))
           next if key.nil?
 
+          evaluated&.name!(name)
           # A property is a smaller instance, so the hops taken to reach this
           # schema cannot repeat forever below it: the budget counts a chain
           # of references applied to one value, not how deep the data nests.
@@ -143,7 +140,7 @@ module MCPClient
       # matching schema, and one left over by both goes to
       # `additionalProperties` (JSON Schema 2020-12 Core Sections 10.3.2.1-3).
       # @return [Array<String>] validation errors
-      def validate_other_properties(data, schema, path, ctx, dialect)
+      def validate_other_properties(data, schema, path, ctx, dialect, evaluated = nil)
         patterns = schema['patternProperties'] if keyword_known?('patternProperties', dialect)
         patterns = nil unless patterns.is_a?(Hash)
         names = schema_value?(schema['propertyNames']) ? schema['propertyNames'] : nil
@@ -157,20 +154,24 @@ module MCPClient
           # node of its own: the deadline is consulted here so a huge object
           # cannot run the walk past the budget between two nodes it visits.
           check_deadline(ctx)
-          property_errors(key.to_s, value, path, ctx,
+          property_errors(key.to_s, value, path, ctx, evaluated,
                           names: names, patterns: patterns, additional: additional, named: named)
         end
       end
 
-      # One member's errors under the property applicators.
+      # One member's errors under the property applicators. A member a
+      # pattern matched or `additionalProperties` applied to is evaluated by
+      # that keyword (its annotation); `propertyNames` evaluates the name,
+      # never the member.
       # @return [Array<String>] validation errors
-      def property_errors(name, value, path, ctx, names:, patterns:, additional:, named:)
+      def property_errors(name, value, path, ctx, evaluated, names:, patterns:, additional:, named:)
         errors = names.nil? ? [] : property_name_errors(name, names, path, ctx)
         matched = false
         patterns&.each do |pattern, sub|
           next unless schema_value?(sub) && pattern_matches?(pattern.to_s, name, ctx.deadline)
 
           matched = true
+          evaluated&.name!(name)
           errors.concat(validate_child(value, sub, "#{path}/#{name}", ctx))
         end
         return errors if matched || named.include?(name) || additional.nil?
@@ -182,6 +183,7 @@ module MCPClient
           return errors.push("#{path}: property '#{clip(name)}' is not allowed (additionalProperties is false)")
         end
 
+        evaluated&.name!(name)
         errors.concat(validate_child(value, additional, "#{path}/#{name}", ctx))
       end
 
@@ -214,8 +216,10 @@ module MCPClient
       # @param data [Array] the array
       # @param schema [Hash] string-keyed schema
       # @param path [String] location for error messages
+      # @param evaluated [Evaluated, nil] where the items the keywords
+      #   evaluate are recorded
       # @return [Array<String>] validation errors
-      def validate_array(data, schema, path, ctx, dialect = ctx.dialect)
+      def validate_array(data, schema, path, ctx, dialect = ctx.dialect, evaluated = nil)
         errors = []
         min_items = schema['minItems']
         max_items = schema['maxItems']
@@ -226,29 +230,26 @@ module MCPClient
           errors << "#{path}: expected at most #{max_items} items, got #{data.length}"
         end
         errors.concat(validate_unique_items(data, schema, path, ctx))
-        errors.concat(validate_items(data, schema, path, ctx, dialect))
-        errors.concat(validate_unevaluated_items(data, schema, path, ctx, dialect))
-        errors.concat(validate_contains(data, schema, path, ctx, dialect))
+        errors.concat(validate_items(data, schema, path, ctx, dialect, evaluated))
+        errors.concat(validate_contains(data, schema, path, ctx, dialect, evaluated))
       end
 
-      # `unevaluatedItems` (JSON Schema 2020-12 Core Section 11.2) at a node
-      # that produces every annotation it reads: the items past the ones the
-      # tuple keywords in force evaluated, which
-      # {Composition#evaluated_item_count} already counts. As with
-      # `unevaluatedProperties`, a node carrying an in-place applicator — or
-      # a `contains`, whose matches annotate the items they matched — keeps
-      # the keyword unevaluated and reported.
+      # `unevaluatedItems` (JSON Schema 2020-12 Core Section 11.2): the
+      # keyword's schema applies to every item nothing applied to the value
+      # evaluated — not the tuple keywords, not `contains`, not any
+      # applicator that passed.
+      # @param app [Evaluation::Application] the finished application
+      # @param sub [Object] the keyword's schema
       # @return [Array<String>] validation errors
-      def validate_unevaluated_items(data, schema, path, ctx, dialect)
-        sub = schema['unevaluatedItems']
-        return [] unless unevaluated_applied?(schema, 'unevaluatedItems', dialect)
-
-        covered = evaluated_item_count(schema, dialect)
-        return [] if covered == Float::INFINITY || data.length <= covered
-
+      def unevaluated_item_errors(app, sub)
+        data = app.data
+        ctx = app.ctx
+        path = app.path
         errors = []
-        (covered...data.length).each do |idx|
+        data.each_index do |idx|
           check_deadline(ctx)
+          next if app.evaluated.item?(idx)
+
           errors.concat(unevaluated_errors(data[idx], sub, "#{path}/#{idx}", ctx,
                                            "#{path}: item #{idx} is not allowed (unevaluatedItems is false)"))
         end
@@ -256,9 +257,11 @@ module MCPClient
       end
 
       # The item schemas: the positional ones first, then the schema that
-      # covers what follows them.
+      # covers what follows them. The tuple evaluates the leading items it
+      # covers and a schema for the rest evaluates every item (their
+      # annotations).
       # @return [Array<String>] validation errors
-      def validate_items(data, schema, path, ctx, dialect)
+      def validate_items(data, schema, path, ctx, dialect, evaluated = nil)
         items = schema['items']
         # 2020-12 puts positional schemas in prefixItems (items must be a
         # schema); draft-07 and 2019-09 put them in an items array and know no
@@ -276,6 +279,7 @@ module MCPClient
                end
         return [] if positional.empty? && !schema_value?(rest)
 
+        note_evaluated_items(evaluated, positional, rest, data)
         errors = []
         data.each_with_index do |item, idx|
           # As in {.validate_other_properties}: the array's length is the
@@ -296,6 +300,16 @@ module MCPClient
           errors.concat(validate_child(item, item_schema, "#{path}/#{idx}", ctx))
         end
         errors
+      end
+
+      # The tuple evaluates the leading items it covers; a schema for the
+      # rest evaluates every item (their annotations).
+      # @return [void]
+      def note_evaluated_items(evaluated, positional, rest, data)
+        return unless evaluated
+
+        evaluated.prefix!([positional.length, data.length].min)
+        evaluated.all! if schema_value?(rest)
       end
 
       # uniqueItems (JSON Schema 2020-12 Validation Section 6.4.3). Equality is
@@ -372,8 +386,10 @@ module MCPClient
       # @param schema [Hash] string-keyed schema
       # @param path [String] location for error messages
       # @param dialect [String, nil] the dialect in force
+      # @param evaluated [Evaluated, nil] where the items `contains` matched
+      #   are recorded (its annotation, 2020-12 Core Section 10.3.1.3)
       # @return [Array<String>] validation errors
-      def validate_contains(data, schema, path, ctx, dialect)
+      def validate_contains(data, schema, path, ctx, dialect, evaluated = nil)
         return [] unless keyword_known?('contains', dialect) && schema_value?(schema['contains'])
 
         min = contains_min(schema, dialect)
@@ -384,7 +400,7 @@ module MCPClient
           return ["#{path}: contains requires between #{min} and #{max} matching items, which no count satisfies"]
         end
 
-        hits, unsure = count_contains_matches(data, schema['contains'], path, ctx)
+        hits, unsure = count_contains_matches(data, schema['contains'], path, ctx, evaluated)
         errors = []
         errors << "#{path}: expected at least #{min} items matching contains, got #{hits}" if hits + unsure < min
         errors << "#{path}: expected at most #{max} items matching contains, got #{hits}" if max && hits > max
@@ -397,14 +413,17 @@ module MCPClient
       # could not evaluate is not left behind as this node's uncertainty.
       # @return [Array(Integer, Integer)] the items that matched, and those the
       #   validator could not decide
-      def count_contains_matches(data, sub, path, ctx)
+      def count_contains_matches(data, sub, path, ctx, evaluated = nil)
         hits = 0
         unsure = 0
         data.each_with_index do |item, idx|
           before = ctx.undecided
           errors = speculatively(ctx) { validate_child(item, sub, "#{path}/#{idx}", ctx) }
-          if errors.empty?
-            ctx.undecided > before ? unsure += 1 : hits += 1
+          if errors.empty? && ctx.undecided > before
+            unsure += 1
+          elsif errors.empty?
+            hits += 1
+            evaluated&.index!(idx)
           end
           ctx.undecided = before
         end

@@ -366,6 +366,34 @@ module MCPClient
         resource_start?(schema)
       end
 
+      # Whether a dynamic reference is dynamic at all. A `$dynamicRef` whose
+      # initial target — resolved exactly as a `$ref` is — declares a
+      # `$dynamicAnchor` of the name the fragment carries may be re-bound by
+      # the dynamic scope a validation was entered through (2020-12 Core
+      # Section 8.2.3.2); one naming a pointer, or a plain `$anchor`, is the
+      # `$ref` it resolves to. A `$recursiveRef` is dynamic where its target
+      # carries `$recursiveAnchor: true` (2019-09 Core Section 8.2.4.2.2).
+      # A reference that resolves to nothing usable is taken as dynamic: it
+      # is not shown to be a plain one, and the preflight reports it.
+      # @param schema [Hash] the schema object holding the reference
+      # @param keyword [String] `$dynamicRef` or `$recursiveRef`
+      # @param root [Hash] the normalized root schema
+      # @param dialect [String, nil] the canonical root dialect
+      # @param resolver [Hash, Context] holder of the memoized anchor index
+      # @return [Boolean]
+      def dynamic_reference?(schema, keyword, root, dialect, resolver)
+        ref = schema[keyword]
+        return true unless ref.is_a?(String) && !external_ref?(ref, root, dialect, resolver, from: schema)
+
+        target = resolve_reference(root, ref, dialect, resolver, from: schema)
+        return true if target.equal?(UNRESOLVED)
+        return false unless target.is_a?(Hash)
+        return target['$recursiveAnchor'] == true if keyword == '$recursiveRef'
+
+        fragment = ref.include?('#') ? decoded_fragment(ref[ref.index('#')..]) : nil
+        !fragment.nil? && !fragment.start_with?('/') && !fragment.empty? && target['$dynamicAnchor'] == fragment
+      end
+
       # @return [Array<String>] the plain names a schema object declares
       def anchor_names(schema, dialect)
         names = if dialect == DRAFT_07

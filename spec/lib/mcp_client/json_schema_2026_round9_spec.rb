@@ -96,10 +96,12 @@ RSpec.describe 'MCP 2026-07-28 JSON Schema handling — round 9' do
       expect(validator.validate({}, old)).to contain_exactly(a_string_matching(/not supported/))
     end
 
-    it 'ignores a $schema that is not at a resource root' do
+    it 'refuses a $schema that is not at a resource root' do
+      # A `$schema` is read at a resource root only; anywhere else it is a
+      # malformed keyword (round 32), never silently applied or ignored.
       schema = { 'properties' => { 'c' => { '$schema' => 'http://json-schema.org/draft-04/schema#',
                                             'type' => 'string' } } }
-      expect(validator.check_schema(schema)).to be_empty
+      expect(validator.check_schema(schema)).to contain_exactly(a_string_matching(/\$schema.*resource root/))
     end
   end
 

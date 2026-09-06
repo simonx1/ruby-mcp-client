@@ -42,8 +42,8 @@ RSpec.describe 'MCP 2026-07-28 JSON Schema handling — verification round' do
 
     it 'scans a long chain of shallow references for unsupported keywords' do
       scanned = chained_refs(400)
-      scanned['$defs']['400'] = { 'allOf' => [true], 'unevaluatedItems' => false }
-      expect(on_thread { validator.unsupported_keywords(scanned) }).to contain_exactly('unevaluatedItems')
+      scanned['$defs']['400'] = { 'format' => 'uuid' }
+      expect(on_thread { validator.unsupported_keywords(scanned) }).to contain_exactly('format')
     end
 
     it 'validates against a long chain on the hop budget, never on the call stack' do
@@ -222,9 +222,8 @@ RSpec.describe 'MCP 2026-07-28 JSON Schema handling — verification round' do
     end
 
     it 'scans a modern definitions bag for unsupported keywords' do
-      schema = { 'type' => 'array', 'definitions' => { 'x' => { 'allOf' => [true],
-                                                                'unevaluatedItems' => false } } }
-      expect(validator.unsupported_keywords(schema)).to contain_exactly('unevaluatedItems')
+      schema = { 'type' => 'array', 'definitions' => { 'x' => { 'format' => 'uuid' } } }
+      expect(validator.unsupported_keywords(schema)).to contain_exactly('format')
     end
 
     it 'leaves $defs unknown to draft-07' do

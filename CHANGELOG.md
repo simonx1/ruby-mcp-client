@@ -7,6 +7,68 @@ metadata). Each feature lands in its own PR; this section accumulates them.
 
 ### JSON Schema handling
 
+- **The annotation-driven keywords are evaluated, the dynamic references
+  narrowed to the dynamic ones, and the checks that ran outside the rules
+  brought under them (fifth verification round).**
+
+  - *`unevaluatedProperties` and `unevaluatedItems` beside a composition.*
+    The previous round refused, in `:strict`, every result whose schema used
+    one of the two beside an in-place applicator — including a conforming
+    `{"id": "1"}` against the canonical closed composition `{"$ref": ...,
+    "unevaluatedProperties": false}` SEP-2106 made legal on a tool schema —
+    and let `{"id": "1", "secret": "leak"}` through in `:warn`. Both
+    verdicts were wrong. The annotations a whole composition produces (JSON
+    Schema 2020-12 Core Sections 11.2 and 11.3: what `properties`,
+    `patternProperties`, `additionalProperties`, `prefixItems`, `items`,
+    `contains` and the two keywords themselves evaluated) are now collected
+    through every `$ref`, `allOf`, `anyOf`, `oneOf`, `if`/`then`/`else` and
+    `dependentSchemas` that passed — never from a failed branch, never from
+    a cousin — and the keyword is applied to what is left, wherever it
+    appears. `{"id": "1"}` conforms, `secret` is rejected in `:strict` and
+    warned about in `:warn`, on the synchronous, streaming and task paths
+    alike, and neither keyword is reported as unsupported any more.
+  - *The dynamic references are dynamic only where they are.* A
+    `$dynamicRef` naming a pointer or a plain `$anchor`, and a
+    `$recursiveRef` whose target carries no `$recursiveAnchor: true`, are
+    the plain references the specification says they are (2020-12 Core
+    Section 8.2.3.2, 2019-09 Core Section 8.2.4.2.1): they are applied as a
+    `$ref` — `{"$dynamicRef": "#/$defs/n"}` accepted `"bad"` against an
+    integer definition — and checked as one at preflight. Only a reference
+    the dynamic scope could re-bind stays unevaluated, reported, and refused
+    in `:strict`.
+  - *ECMA-262 word boundaries and group numbering.* Ruby's `\b` knows
+    every Unicode letter, so `"é"` satisfied `"\b"` and `not` reversed the
+    verdict; ECMA-262 defines the assertion over `[A-Za-z0-9_]`, and the
+    translation now spells it that way. ECMA-262 numbers named and unnamed
+    groups alike while Ruby stops capturing unnamed groups once a named one
+    exists, so `^(?<a>x)(y)\2$` — a valid pattern matching `"xyy"` — was
+    refused at preflight; every group is now written as a named one and a
+    numeric back-reference names the group it numbers.
+  - *The preflight under the deadline.* Checking a schema translated and
+    compiled every pattern it holds without consulting the validation-wide
+    deadline (700 patterns of 9,999 characters cost seconds past a 20 ms
+    budget before the late error). The check reads the deadline before
+    every position and every pattern, reports the exhausted budget where it
+    stops, and `check_schema` gets a budget of its own when the caller
+    names none.
+  - *Malformed core declarations.* A `$schema` on a subschema that is no
+    resource root was ignored; it is read at a resource root only (2020-12
+    Core Section 8.1.1) and is refused elsewhere. A `$vocabulary` keyed by a
+    relative reference was accepted; a vocabulary is identified by a URI.
+  - *An embedded resource's dialect governs what it requires of the
+    arguments.* The local check of a call's required arguments read every
+    position under the document root's dialect, so a draft-07 resource
+    embedded in a 2020-12 document had the `required` beside its `$ref`
+    counted (draft-07 ignores the sibling) and the call refused. Each
+    position is read under its own resource's dialect.
+  - *An output dialect this client cannot read stops the call before it is
+    sent*, as an input one already did, rather than after the tool has run;
+    and an error result under such a schema is refused too — the dialect
+    error is not limited to successful results.
+  - *A streamed chunk without `resultType` that is no CallToolResult* (a
+    progress object) was read as a complete result and checked against the
+    tool's output schema; only a chunk shaped as a result is.
+
 - **A bounded pattern translation, the rest of ECMA-262, malformed core
   keywords, a strict gate over what is not evaluated, and the retry's own
   definition (fourth verification round).**

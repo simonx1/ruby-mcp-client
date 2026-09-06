@@ -1,6 +1,7 @@
 # frozen_string_literal: true
 
 require 'uri'
+require_relative 'schema_validator/annotations'
 require_relative 'schema_validator/dialects'
 require_relative 'schema_validator/normalization'
 require_relative 'schema_validator/uri_references'
@@ -150,48 +151,36 @@ module MCPClient
     MAX_NODE_DEPTH = 256
 
     # JSON Schema keywords that affect validation but that this validator
-    # may not evaluate: the dynamic references (whose target depends on the
-    # dynamic scope a validation was entered through), the two keywords
-    # decided by annotations collected across a whole composition
-    # (`unevaluatedItems` / `unevaluatedProperties`), and the two that only
+    # may not evaluate: the dynamic references where they are dynamic (a
+    # target the dynamic scope a validation was entered through could
+    # re-bind, which this validator does not track), and the two that only
     # annotate in the default dialect (`format`, asserted by full validators
     # in format-assertion mode, and `contentSchema`). Where one of them is
     # left unevaluated, validation is partial: data may pass here that a full
     # validator would reject.
     #
-    # The annotation-driven pair is only *sometimes* in this position: at a
-    # node that produces every annotation it reads there is no composition to
-    # collect anything from, and {Composition#unevaluated_applied?} says so —
-    # {Instances} applies the keyword there and the scan does not report it.
-    # The dynamic references are always here: a dynamic scope is not
-    # something a node can produce for itself.
+    # A dynamic reference is only *sometimes* in this position: one naming
+    # a pointer or a plain anchor is the `$ref` it resolves to, and is
+    # applied as one ({Evaluation#applied_references});
+    # {References#dynamic_reference?} tells the two apart, and the scan
+    # reports only the dynamic ones.
     #
-    # Every other standard keyword is evaluated. A standard assertion left
-    # unevaluated is not a smaller report but a wrong verdict: it makes a
-    # composition branch undecided, and an undecided branch is accepted
-    # wherever the composition is monotonic (`allOf`, `anyOf`), so the
-    # instance passes a schema that rejects it.
-    UNSUPPORTED_KEYWORDS = %w[
-      $dynamicRef $recursiveRef contentSchema format
-      unevaluatedProperties unevaluatedItems
-    ].freeze
+    # Every other standard keyword is evaluated — `unevaluatedItems` and
+    # `unevaluatedProperties` from the annotations {Evaluation} collects
+    # across a whole composition. A standard assertion left unevaluated is
+    # not a smaller report but a wrong verdict: it makes a composition
+    # branch undecided, and an undecided branch is accepted wherever the
+    # composition is monotonic (`allOf`, `anyOf`), so the instance passes a
+    # schema that rejects it.
+    UNSUPPORTED_KEYWORDS = %w[$dynamicRef $recursiveRef contentSchema format].freeze
 
     # Unsupported keywords that are annotations, not assertions (`format`
     # is annotation-only in the default 2020-12 vocabulary, `contentSchema`
     # only annotates): their presence decides nothing about an instance.
     ANNOTATION_KEYWORDS = %w[format contentSchema].freeze
 
-    # Unsupported assertions by the instance type they apply to; an
-    # assertion of another type is a no-op for the instance (JSON Schema
-    # 2020-12 Validation Section 6: keywords apply only to their type), so
-    # it cannot leave a branch undecided.
-    UNSUPPORTED_ASSERTIONS_BY_TYPE = {
-      Hash => %w[unevaluatedProperties],
-      Array => %w[unevaluatedItems]
-    }.freeze
-
-    # Unsupported keywords that apply to every instance.
-    UNSUPPORTED_ASSERTIONS_ANY_TYPE = %w[$dynamicRef $recursiveRef].freeze
+    # The references whose target may depend on the dynamic scope.
+    DYNAMIC_REFERENCE_KEYWORDS = %w[$dynamicRef $recursiveRef].freeze
 
     # Wall-clock budget for a single validate call (pattern matching and the
     # walk itself). Schemas come from the remote server, so an expensive
@@ -309,14 +298,22 @@ module MCPClient
     # every `$ref` resolves inside the document to a schema (a network or
     # otherwise external reference is never dereferenced and makes the
     # schema unusable rather than permissive).
+    # The check runs under a deadline like a validation does: the schema is
+    # the peer's, and reading it (translating and compiling its patterns
+    # above all) costs what the peer's text costs.
     # @param schema [Object] the schema (string or symbol keys)
     # @param counter [Hash] filled in with the preflight state, so a caller
     #   can tell one kind of problem from another (`:unsupported_dialect`)
+    # @param deadline [Float, nil] monotonic deadline for the whole check
+    #   (PATTERN_MATCH_TIMEOUT from now when none is given)
     # @return [Array<String>] problems (empty when the schema is usable)
-    def self.check_schema(schema, counter = {})
-      check_normalized(normalize_schema(schema), counter)
+    def self.check_schema(schema, counter = {}, deadline: nil)
+      counter[:deadline] = deadline || (Process.clock_gettime(Process::CLOCK_MONOTONIC) + PATTERN_MATCH_TIMEOUT)
+      check_normalized(normalize_schema(schema, deadline: counter[:deadline]), counter)
     rescue TooLarge => e
       [e.message]
+    rescue Aborted => e
+      ["validation aborted: #{e.message}"]
     end
 
     # The dialect a schema declares (at its root or at an embedded resource
@@ -366,6 +363,8 @@ module MCPClient
       counter.update(count: 0, dialect: canonical_dialect(declared), walked: {}.compare_by_identity,
                      depths: lexical_depths(root, canonical_dialect(declared)))
       walk_schema(root, root, 0, counter, problems)
+      exhausted = problems.empty? && budget_exhausted?(counter[:deadline])
+      problems << 'validation aborted: validation time budget exhausted during the schema check' if exhausted
       problems.concat(anchor_index_problems(root, counter)) if problems.empty?
       problems.uniq
     end
@@ -421,6 +420,11 @@ module MCPClient
     # @return [void]
     def self.walk_position(walk, schema, depth, dialect)
       return unless schema_value?(schema)
+      # The positions are as many as the peer's document holds, and each
+      # may cost a pattern's translation: the deadline is consulted before
+      # every one, and a check past it stops there ({.check_normalized}
+      # reports it).
+      return if budget_exhausted?(walk.counter[:deadline])
       return unless admit_schema?(schema, depth, walk.counter, walk.problems)
 
       if resource_root?(schema, dialect) && schema.key?('$schema')
@@ -428,6 +432,13 @@ module MCPClient
         return record_embedded_dialect_problem(walk, schema, problem) if problem
 
         dialect = embedded_dialect(schema, dialect)
+      elsif schema.key?('$schema') && !schema.equal?(walk.root) && !resource_start?(schema)
+        # A `$schema` is read at a schema resource root only (JSON Schema
+        # 2020-12 Core Section 8.1.1); anywhere else it is a malformed
+        # keyword, not an absent one.
+        walk.problems << '$schema is only allowed at a schema resource root (the document root, or a ' \
+                         'subschema declaring an $id)'
+        return
       end
       referenced = schema.key?('$ref') ? check_ref(walk, schema, depth, dialect) : []
       # draft-07: the $ref replaces its siblings, so the applicators next to
@@ -436,6 +447,7 @@ module MCPClient
       # through references.
       return queue_definitions(walk, schema, depth, dialect, referenced) if dialect == DRAFT_07 && schema.key?('$ref')
 
+      referenced.concat(check_dynamic_refs(walk, schema, depth, dialect))
       check_keyword_shapes(walk, schema, dialect)
       queue_subschemas(walk, schema, depth, dialect, referenced)
     end
@@ -475,11 +487,6 @@ module MCPClient
     # @return [void]
     def self.check_keyword_shapes(walk, schema, dialect)
       problems = walk.problems
-      %w[$dynamicRef $recursiveRef].each do |keyword|
-        next unless schema.key?(keyword) && keyword_known?(keyword, dialect)
-
-        check_dynamic_ref(walk, schema, keyword, dialect)
-      end
       if dialect == DEFAULT_DIALECT && schema['items'].is_a?(Array)
         problems << 'items must be a schema in JSON Schema 2020-12 (positional schemas go in prefixItems)'
       end
@@ -488,7 +495,7 @@ module MCPClient
       check_exclusive_bounds(schema, dialect, problems)
       check_identifier_shapes(schema, dialect, problems)
       check_core_keyword_shapes(schema, dialect, problems)
-      check_pattern_shapes(schema, dialect, problems)
+      check_pattern_shapes(schema, dialect, problems, walk.counter[:deadline])
     end
 
     # Account for a schema (object or boolean) about to be walked: once per
@@ -556,18 +563,18 @@ module MCPClient
     # pointer may lead into a bag the dialect does not walk (`$defs` under
     # draft-07), and what a reference applies must be usable too.
     # @return [Array<Array>] the positions the reference reaches
-    def self.check_ref(walk, schema, depth, dialect)
+    def self.check_ref(walk, schema, depth, dialect, keyword = '$ref')
       root = walk.root
       counter = walk.counter
       problems = walk.problems
-      ref = schema['$ref']
+      ref = schema[keyword]
       unless ref.is_a?(String)
-        problems << "$ref must be a string, got #{json_type(ref)}"
+        problems << "#{keyword} must be a string, got #{json_type(ref)}"
         return []
       end
       if external_ref?(ref, root, counter[:dialect], counter, from: schema)
-        problems << "external $ref #{clip(ref.inspect)} is not dereferenced (only references inside the schema " \
-                    'document are resolved; network $ref resolution is disabled)'
+        problems << "external #{keyword} #{clip(ref.inspect)} is not dereferenced (only references inside the " \
+                    'schema document are resolved; network $ref resolution is disabled)'
         return []
       end
 
@@ -576,7 +583,7 @@ module MCPClient
         position = referenced_target_position(walk, target, hop, from, depth, dialect)
         positions << position if position
       end
-      problems << problem if problem
+      problems << problem.sub('$ref', keyword) if problem
       positions
     end
 
@@ -628,18 +635,31 @@ module MCPClient
       problems << "schema has more than #{MAX_SUBSCHEMAS} subschemas" if counter[:count] > MAX_SUBSCHEMAS
     end
 
-    # A `$dynamicRef` / `$recursiveRef` is not evaluated, but one pointing
-    # outside the document would need a fetch, which never happens: the
-    # schema is unusable.
-    # @return [void]
-    def self.check_dynamic_ref(walk, schema, keyword, _dialect)
-      ref = schema[keyword]
-      # A reference that is not a URI reference at all names nothing: it is
-      # not silently ignored (a malformed keyword is not an absent one).
-      return walk.problems << "#{keyword} must be a string, got #{json_type(ref)}" unless ref.is_a?(String)
-      return unless external_ref?(ref, walk.root, walk.counter[:dialect], walk.counter, from: schema)
+    # The dynamic references of a schema object. One that names no dynamic
+    # anchor is the plain reference it resolves to and is checked (and what
+    # it reaches queued) exactly as a `$ref` is; a dynamic one is not
+    # evaluated, but one pointing outside the document would need a fetch,
+    # which never happens: the schema is unusable.
+    # @return [Array<Array>] the positions the plain ones reach
+    def self.check_dynamic_refs(walk, schema, depth, dialect)
+      DYNAMIC_REFERENCE_KEYWORDS.flat_map do |keyword|
+        next [] unless schema.key?(keyword) && keyword_known?(keyword, dialect)
 
-      walk.problems << "external #{keyword} #{clip(ref.inspect)} is not dereferenced"
+        ref = schema[keyword]
+        # A reference that is not a URI reference at all names nothing: it
+        # is not silently ignored (a malformed keyword is not an absent one).
+        unless ref.is_a?(String)
+          walk.problems << "#{keyword} must be a string, got #{json_type(ref)}"
+          next []
+        end
+        if external_ref?(ref, walk.root, walk.counter[:dialect], walk.counter, from: schema)
+          walk.problems << "external #{keyword} #{clip(ref.inspect)} is not dereferenced"
+          next []
+        end
+        next [] if dynamic_reference?(schema, keyword, walk.root, walk.counter[:dialect], walk.counter)
+
+        check_ref(walk, schema, depth, dialect, keyword)
+      end
     end
 
     # Follow a local reference (and the references it leads to) at
@@ -709,8 +729,9 @@ module MCPClient
       # document included.
       deadline ||= Process.clock_gettime(Process::CLOCK_MONOTONIC) + PATTERN_MATCH_TIMEOUT
       root = normalize_schema(schema, deadline: deadline)
-      # `preflight` comes back holding the state the check read the schema under.
-      problems = check_normalized(root, preflight = {})
+      # `preflight` comes back holding the state the check read the schema
+      # under; the check runs under the validation's deadline.
+      problems = check_normalized(root, preflight = { deadline: deadline })
       return problems.map { |problem| "#{path}: #{problem}" } unless problems.empty?
 
       # The index the preflight built is the one this validation reads (the
@@ -767,7 +788,7 @@ module MCPClient
           # A speculative application's errors are a verdict, not output, and
           # do not count toward MAX_ERRORS while it runs.
           ctx.speculative += 1 if step[3]
-          step = start_node(data, step[1], path, ctx, step[2])
+          step = start_node(data, step[1], path, ctx, step[2], collecting: step[5])
           next
         end
 
@@ -776,7 +797,9 @@ module MCPClient
 
         resumed = pending.pop
         ctx.speculative -= 1 if resumed[3]
-        step = resumed[4].call(errors)
+        # The finished application hands back its verdict and what it
+        # evaluated of the value, for the applicator that applied it.
+        step = resumed[4].call(errors, step[2])
       end
     end
 

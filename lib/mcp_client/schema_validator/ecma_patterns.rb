@@ -45,13 +45,25 @@ module MCPClient
       ECMA_ANY_CLASS = '[\\s\\S]'
 
       # The escapes ECMA-262 defines, which Ruby reads the same way: the
-      # class escapes, the assertions, the control escapes, a hex or
-      # control-letter escape and a Unicode property. `\s` / `\S` are
-      # defined by both but over different sets, the digits are
-      # back-references or legacy octal escapes, `\u` may spell a surrogate
-      # pair and `\k` a named back-reference, so those are rewritten rather
-      # than kept.
-      ECMA_KEPT_ESCAPES = 'bBdDwWfnrtvxcpP'
+      # class escapes, the control escapes, a hex or control-letter escape
+      # and a Unicode property. `\s` / `\S` are defined by both but over
+      # different sets, `\b` / `\B` over different word characters, the
+      # digits are back-references or legacy octal escapes, `\u` may spell
+      # a surrogate pair and `\k` a named back-reference, so those are
+      # rewritten rather than kept.
+      ECMA_KEPT_ESCAPES = 'dDwWfnrtvxcpP'
+
+      # ECMA-262's word characters: `\w` is [A-Za-z0-9_] there, and its
+      # word-boundary assertions are defined over exactly those, while Ruby's
+      # `\b` knows every Unicode letter — so "é" has a boundary in Ruby and
+      # none in ECMA-262.
+      ECMA_WORD = '[A-Za-z0-9_]'
+
+      # `\b`: a word character on exactly one side.
+      ECMA_WORD_BOUNDARY = "(?:(?<=#{ECMA_WORD})(?!#{ECMA_WORD})|(?<!#{ECMA_WORD})(?=#{ECMA_WORD}))".freeze
+
+      # `\B`: word characters on both sides, or on neither.
+      ECMA_NON_BOUNDARY = "(?:(?<=#{ECMA_WORD})(?=#{ECMA_WORD})|(?<!#{ECMA_WORD})(?!#{ECMA_WORD}))".freeze
 
       # The characters that may follow `(?` in ECMA-262: a non-capturing
       # group, a lookahead, and (after `<`) a lookbehind or a named group.
@@ -89,8 +101,10 @@ module MCPClient
           pattern.length > MAX_PATTERN_LENGTH
 
         chars = pattern.chars
-        scan = { chars: chars, index: 0, out: +'', deadline: deadline, read: 0, last: :none }
-        scan[:groups], scan[:names] = count_capture_groups(chars)
+        scan = { chars: chars, index: 0, out: +'', deadline: deadline, read: 0, last: :none, opened: 0 }
+        scan[:order] = count_capture_groups(chars)
+        scan[:groups] = scan[:order].length
+        scan[:names] = scan[:order].compact
         while scan[:index] < chars.length
           note_translation_progress(scan)
           chars[scan[:index]] == '[' ? copy_character_class(scan) : copy_ecma_token(scan)
@@ -108,14 +122,16 @@ module MCPClient
           budget_exhausted?(scan[:deadline])
       end
 
-      # The capturing groups a pattern declares, in one pass: what a numeric
-      # escape refers to depends on how many there are (Annex B.1.4: a
-      # number past the count is a legacy octal escape), and a named escape
-      # on which names exist.
-      # @return [Array(Integer, Array<String>)] the count and the names
+      # The capturing groups a pattern declares, in order and in one pass:
+      # what a numeric escape refers to depends on how many there are (Annex
+      # B.1.4: a number past the count is a legacy octal escape) and on which
+      # one it names — ECMA-262 numbers named and unnamed groups alike,
+      # left to right, while Ruby stops capturing unnamed groups once a
+      # named one exists, so the numbering is kept here and every group is
+      # written as a named one there ({#copy_group_opener}).
+      # @return [Array<String, nil>] each group's name, nil for an unnamed one
       def count_capture_groups(chars)
-        count = 0
-        names = []
+        order = []
         index = 0
         in_class = false
         while index < chars.length
@@ -127,16 +143,21 @@ module MCPClient
           in_class = true if char == '['
           in_class = false if char == ']' && in_class
           if char == '(' && !in_class
-            count += 1 if chars[index + 1] != '?'
+            order << nil if chars[index + 1] != '?'
             name = group_name_at(chars, index + 2)
-            if name
-              count += 1
-              names << name
-            end
+            order << name if name
           end
           index += 1
         end
-        [count, names]
+        order
+      end
+
+      # The Ruby name of a capturing group, by its ECMA-262 number: its own
+      # where it has one, a generated one otherwise.
+      # @param number [Integer] the group's number, from 1
+      # @return [String]
+      def group_name_for(scan, number)
+        scan[:order][number - 1] || "__mcp_g#{number}"
       end
 
       # The name of a `(?<name>` group opening at the index of its `<`.
@@ -194,7 +215,9 @@ module MCPClient
         index = scan[:index]
         if chars[index + 1] != '?'
           scan[:index] += 1
-          return emit(scan, '(', :none)
+          scan[:opened] += 1
+          # Beside a named group Ruby would not capture this one at all.
+          return emit(scan, scan[:names].empty? ? '(' : "(?<#{group_name_for(scan, scan[:opened])}>", :none)
         end
 
         opener = chars[index + 2].to_s
@@ -203,8 +226,10 @@ module MCPClient
                 "invalid group at index #{index}"
         end
 
-        if opener == '<' && !'=!'.include?(chars[index + 3].to_s) && !group_name_at(chars, index + 2)
-          raise SyntaxError, "invalid group name at index #{index}"
+        if opener == '<' && !'=!'.include?(chars[index + 3].to_s)
+          raise SyntaxError, "invalid group name at index #{index}" unless group_name_at(chars, index + 2)
+
+          scan[:opened] += 1
         end
 
         scan[:index] += 3
@@ -280,8 +305,10 @@ module MCPClient
         # Inside a class Ruby reads the nested one as a union, which is
         # what a member set complement means there.
         return "[^#{ECMA_SPACE_MEMBERS}]" if char == 'S'
+        # `\b` is a backspace inside a class and a word boundary outside it;
         # `\B` asserts outside a class and is an identity escape inside one.
-        return 'B' if in_class && char == 'B'
+        return in_class ? '\\b' : ECMA_WORD_BOUNDARY if char == 'b'
+        return in_class ? 'B' : ECMA_NON_BOUNDARY if char == 'B'
         return "\\#{char}" if ECMA_KEPT_ESCAPES.include?(char)
 
         # An identity escape: a letter stands for itself, and punctuation
@@ -302,7 +329,10 @@ module MCPClient
         (digits << chars[scan[:index]]) && scan[:index] += 1 while chars[scan[:index]].to_s.match?(/\d/)
         number = digits.to_i
         if number.positive? && number <= scan[:groups] && !in_class
-          return emit(scan, "(?(#{number})\\#{number}|)", :atom)
+          return emit(scan, "(?(#{number})\\#{number}|)", :atom) if scan[:names].empty?
+
+          name = group_name_for(scan, number)
+          return emit(scan, "(?(<#{name}>)\\k<#{name}>|)", :atom)
         end
 
         octal = digits.match(/\A[0-7]{1,3}/)&.to_s

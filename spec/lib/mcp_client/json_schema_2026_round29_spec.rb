@@ -259,25 +259,27 @@ RSpec.describe 'MCP 2026-07-28 JSON Schema handling — round 29' do
       expect(validator.unsupported_keywords({ 'prefixItems' => [true], 'unevaluatedItems' => false })).to be_empty
     end
 
-    it 'still defers the keyword where a composition produces the annotations' do
-      # An in-place applicator contributes annotations this validator does not
-      # collect, so the keyword stays unevaluated — reported, never guessed.
+    it 'evaluates the keyword where a composition produces the annotations' do
+      # An in-place applicator's annotations are collected (round 31), so the
+      # keyword is evaluated there too — and decides a `not` like any other.
       composed = { 'allOf' => [{ 'properties' => { 'a' => true } }], 'unevaluatedProperties' => false }
-      expect(validator.unsupported_keywords(composed)).to contain_exactly('unevaluatedProperties')
+      expect(validator.unsupported_keywords(composed)).to be_empty
       expect(validator.validate({ 'a' => 1 }, composed)).to be_empty
-      # ... and never decides a non-monotonic composition on that guess.
-      expect(validator.validate({ 'a' => 1 }, { 'not' => composed })).to be_empty
+      expect(validator.validate({ 'a' => 1, 'b' => 2 }, composed)).to contain_exactly(a_string_matching(/'b'/))
+      expect(validator.validate({ 'a' => 1 }, { 'not' => composed })).not_to be_empty
 
       referenced = { '$ref' => '#/$defs/p', 'unevaluatedProperties' => false,
                      '$defs' => { 'p' => { 'properties' => { 'a' => true } } } }
-      expect(validator.unsupported_keywords(referenced)).to contain_exactly('unevaluatedProperties')
+      expect(validator.unsupported_keywords(referenced)).to be_empty
       expect(validator.validate({ 'a' => 1 }, referenced)).to be_empty
+      expect(validator.validate({ 'a' => 1, 'b' => 2 }, referenced)).not_to be_empty
     end
 
-    it 'still defers unevaluatedItems beside contains, whose matches annotate' do
+    it 'evaluates unevaluatedItems beside contains, whose matches annotate' do
       schema = { 'contains' => { 'type' => 'string' }, 'unevaluatedItems' => false }
-      expect(validator.unsupported_keywords(schema)).to contain_exactly('unevaluatedItems')
-      expect(validator.validate(['x', 1], schema)).to be_empty
+      expect(validator.unsupported_keywords(schema)).to be_empty
+      expect(validator.validate(['x'], schema)).to be_empty
+      expect(validator.validate(['x', 1], schema)).to contain_exactly(a_string_matching(/item 1/))
     end
 
     it 'leaves the keyword alone in a dialect that does not define it' do

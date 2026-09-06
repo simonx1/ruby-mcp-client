@@ -171,24 +171,20 @@ RSpec.describe MCPClient::SchemaValidator do
     end
 
     it 'detects top-level unsupported keywords' do
-      # `unevaluatedProperties` beside an in-place applicator: the annotations
-      # it reads come from a whole composition there, so it stays unevaluated
-      # (a node that produces them itself now applies the keyword).
+      # `unevaluatedProperties` is evaluated, beside an in-place applicator
+      # too; `format` only annotates in 2020-12 and is reported.
       schema = { 'type' => 'object', 'allOf' => [true], 'unevaluatedProperties' => false, 'format' => 'custom' }
-      expect(described_class.unsupported_keywords(schema)).to contain_exactly('unevaluatedProperties', 'format')
+      expect(described_class.unsupported_keywords(schema)).to contain_exactly('format')
     end
 
     it 'detects every keyword in the unsupported list' do
-      keywords = %w[$dynamicRef $recursiveRef contentSchema format
-                    unevaluatedProperties unevaluatedItems]
+      keywords = %w[$dynamicRef $recursiveRef contentSchema format]
       expect(described_class::UNSUPPORTED_KEYWORDS).to match_array(keywords)
       keywords.each do |keyword|
-        # Under a dialect that defines the keyword.
+        # Under a dialect that defines the keyword. A dynamic reference that
+        # is no string resolves to nothing, and is reported as dynamic.
         dialect = described_class::DIALECT_KEYWORDS.fetch(keyword, [described_class::DEFAULT_DIALECT]).first
         schema = { '$schema' => dialect, keyword => {} }
-        # The annotation-driven pair is evaluated where a node produces every
-        # annotation it reads, so it is reported beside an in-place applicator.
-        schema['allOf'] = [true] if keyword.start_with?('unevaluated')
         expect(described_class.unsupported_keywords(schema)).to eq([keyword])
       end
     end
@@ -230,8 +226,8 @@ RSpec.describe MCPClient::SchemaValidator do
     end
 
     it 'detects unsupported keywords nested inside applicator schemas' do
-      schema = { 'anyOf' => [{ 'type' => 'object', 'allOf' => [true], 'unevaluatedProperties' => false }] }
-      expect(described_class.unsupported_keywords(schema)).to contain_exactly('unevaluatedProperties')
+      schema = { 'anyOf' => [{ 'type' => 'object', 'properties' => { 'a' => { 'format' => 'uuid' } } }] }
+      expect(described_class.unsupported_keywords(schema)).to contain_exactly('format')
     end
 
     it 'does not mistake property names for keywords' do
@@ -280,9 +276,9 @@ RSpec.describe MCPClient::SchemaValidator do
     end
 
     it 'handles symbol-keyed schemas' do
-      schema = { type: 'object', allOf: [true], unevaluatedProperties: false,
+      schema = { type: 'object', allOf: [true], unevaluatedProperties: false, contentSchema: true,
                  properties: { a: { anyOf: [{ format: 'email' }] } } }
-      expect(described_class.unsupported_keywords(schema)).to contain_exactly('unevaluatedProperties', 'format')
+      expect(described_class.unsupported_keywords(schema)).to contain_exactly('contentSchema', 'format')
     end
 
     it 'returns an empty array for non-hash input' do
@@ -452,8 +448,8 @@ RSpec.describe MCPClient::Client do
             'conditions' => { 'type' => 'string', 'format' => 'custom' }
           },
           'required' => %w[temperature conditions],
-          # Beside an in-place applicator, `unevaluatedProperties` reads
-          # annotations this validator does not collect and stays unevaluated.
+          # `unevaluatedProperties` beside an in-place applicator is evaluated
+          # from the composition's annotations; only `format` annotates.
           'allOf' => [{ 'type' => 'object' }],
           'unevaluatedProperties' => false
         }
@@ -467,20 +463,29 @@ RSpec.describe MCPClient::Client do
       it 'warns that validation is partial, naming the unsupported keywords, in the default mode' do
         expect(build_client.call_tool('get_weather', {})).to eq(result)
         expect(log_output.string).to match(/get_weather.*validation is partial: schema uses unsupported keywords/)
-        expect(log_output.string).to include('format').and include('unevaluatedProperties')
+        expect(log_output.string).to include('format')
+        expect(log_output.string).not_to include('unevaluatedProperties')
       end
 
       # Round 30: an assertion this validator does not evaluate leaves the
       # result unshown to conform, and :strict is a gate — a warning beside a
       # returned result was a silent pass in everything but the log.
-      it 'refuses the result in :strict mode, since the schema cannot be shown to accept it' do
+      it 'returns the conforming result in :strict mode: format only annotates' do
+        client = build_client(validate_structured_content: :strict)
+
+        expect(client.call_tool('get_weather', {})).to eq(result)
+        expect(log_output.string).to match(/get_weather.*validation is partial: schema uses unsupported keywords/)
+        expect(log_output.string).to include('format')
+      end
+
+      it 'rejects, in :strict mode, a member the closed composition leaves unevaluated' do
+        leak = { 'content' => [],
+                 'structuredContent' => { 'temperature' => 22.5, 'conditions' => 'sunny', 'secret' => 'x' } }
+        allow(mock_server).to receive(:call_tool).and_return(leak)
         client = build_client(validate_structured_content: :strict)
 
         expect { client.call_tool('get_weather', {}) }
-          .to raise_error(MCPClient::Errors::ValidationError,
-                          /get_weather.*cannot be checked.*does not evaluate.*unevaluatedProperties/m)
-        expect(log_output.string).to match(/get_weather.*validation is partial: schema uses unsupported keywords/)
-        expect(log_output.string).to include('format').and include('unevaluatedProperties')
+          .to raise_error(MCPClient::Errors::ValidationError, /'secret' is not allowed \(unevaluatedProperties/)
       end
 
       it 'still validates and reports mismatches on the supported subset' do

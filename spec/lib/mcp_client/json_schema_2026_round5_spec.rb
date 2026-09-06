@@ -116,9 +116,13 @@ RSpec.describe 'MCP 2026-07-28 JSON Schema handling — round 5' do
     expect(validator.check_schema(external)).to contain_exactly(a_string_matching(/external \$recursiveRef/))
     expect(validator.validate(1, external)).not_to be_empty
 
-    local = { '$schema' => draft2019, '$recursiveRef' => '#' }
+    local = { '$schema' => draft2019, '$recursiveAnchor' => true, '$recursiveRef' => '#' }
     expect(validator.check_schema(local)).to be_empty
     expect(validator.unsupported_keywords(local)).to eq(['$recursiveRef'])
+    # Without a `$recursiveAnchor: true` at its target it is a plain `#`.
+    plain = { '$schema' => draft2019, '$recursiveRef' => '#' }
+    expect(validator.check_schema(plain)).to be_empty
+    expect(validator.unsupported_keywords(plain)).to eq([])
   end
 
   describe 'an empty outputSchema' do

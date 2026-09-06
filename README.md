@@ -373,20 +373,23 @@ data = result['structuredContent']  # Type-safe structured data
 # minContains/maxContains, string bounds and pattern (an ECMA-262 regular
 # expression, translated before it is matched), numeric bounds and multipleOf,
 # allOf/anyOf/oneOf/not, if/then/else, $ref/$defs/definitions inside the
-# document, and unevaluatedItems/unevaluatedProperties at a node that produces
-# every annotation they read (no allOf/anyOf/oneOf/if/$ref/dependentSchemas
-# beside them, and no contains beside unevaluatedItems). What is NOT evaluated
-# is unevaluatedItems/unevaluatedProperties where a composition produces those
-# annotations, the dynamic references ($dynamicRef, $recursiveRef), which need
-# a dynamic scope this client does not track, and the two keywords that only
-# annotate (format, contentSchema). When a schema uses one of those, call_tool
-# logs a "validation is partial" warning naming them (in both modes), since
-# data may pass this check that a full validator would reject; an unevaluated
-# keyword is never read as a match for not/oneOf/if either. In strict mode a
-# schema using one of the unevaluated ASSERTIONS (the dynamic references, or
-# unevaluatedItems/unevaluatedProperties beside a composition) refuses the
-# result with a ValidationError, since it cannot be shown to conform; the two
-# annotation-only keywords do not. A pattern is bounded to 10,000 characters
+# document, and unevaluatedItems/unevaluatedProperties from the annotations
+# the whole composition produces (what properties/patternProperties/
+# additionalProperties, prefixItems/items/contains and the two keywords
+# themselves evaluated, collected through every $ref/allOf/anyOf/oneOf/
+# if-then-else/dependentSchemas that passed — never from a cousin). A
+# $dynamicRef or $recursiveRef that names no dynamic anchor is the plain
+# reference it resolves to and is applied as one. What is NOT evaluated is a
+# dynamic reference the dynamic scope could re-bind (a $dynamicRef to a
+# $dynamicAnchor, a $recursiveRef to a $recursiveAnchor: true), which needs a
+# scope this client does not track, and the two keywords that only annotate
+# (format, contentSchema). When a schema uses one of those, call_tool logs a
+# "validation is partial" warning naming them (in both modes), since data may
+# pass this check that a full validator would reject; an unevaluated keyword
+# is never read as a match for not/oneOf/if either. In strict mode a schema
+# using such a dynamic reference refuses the result with a ValidationError,
+# since it cannot be shown to conform; the two annotation-only keywords do
+# not. A pattern is bounded to 10,000 characters
 # and must be an ECMA-262 expression (Ruby-only syntax such as inline flags
 # or possessive quantifiers makes the schema unusable). By default a
 # violation (mismatch, or missing structuredContent on a successful result)

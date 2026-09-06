@@ -534,12 +534,11 @@ RSpec.describe 'MCP 2026-07-28 JSON Schema handling — round 28' do
       supported = { 'multipleOf' => 2, 'uniqueItems' => true, 'contains' => true, 'minContains' => 1,
                     'maxContains' => 2, 'minProperties' => 1, 'maxProperties' => 2,
                     'additionalProperties' => false, 'patternProperties' => {}, 'propertyNames' => true,
-                    'dependentRequired' => {}, 'dependentSchemas' => {} }
+                    'dependentRequired' => {}, 'dependentSchemas' => {},
+                    'allOf' => [true], 'unevaluatedProperties' => false, 'unevaluatedItems' => false }
       expect(validator.unsupported_keywords(supported)).to be_empty
-      partial = { 'unevaluatedProperties' => false, 'format' => 'email', '$dynamicRef' => '#a',
-                  '$dynamicAnchor' => 'a' }
-      expect(validator.unsupported_keywords(partial))
-        .to contain_exactly('$dynamicRef', 'unevaluatedProperties', 'format')
+      partial = { 'format' => 'email', '$dynamicRef' => '#a', '$dynamicAnchor' => 'a' }
+      expect(validator.unsupported_keywords(partial)).to contain_exactly('$dynamicRef', 'format')
     end
   end
 end

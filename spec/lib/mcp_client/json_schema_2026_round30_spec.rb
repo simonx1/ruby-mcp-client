@@ -278,36 +278,46 @@ RSpec.describe 'MCP 2026-07-28 JSON Schema handling — round 30' do
     end
 
     describe 'a schema this validator cannot fully evaluate' do
-      # This validator does not collect the annotations a composition
-      # produces, so it cannot show the result conforms — and :strict is a
-      # gate: a result it cannot show to conform is refused, not returned
-      # beside a warning.
-      it 'refuses the result in :strict mode' do
+      # :strict is a gate: a result the validator cannot show to conform is
+      # refused, not returned beside a warning. Since round 31 that is only
+      # a dynamic reference the dynamic scope could re-bind; the closed
+      # composition is evaluated, and its verdict is what :strict enforces.
+      it 'rejects the leaked property in :strict mode, on the closed composition' do
         client = client_over(stub_server(closed, leak), :strict)
 
         expect { client.call_tool('t', {}) }
-          .to raise_error(MCPClient::Errors::ValidationError,
-                          /cannot be checked.*does not evaluate.*unevaluatedProperties/m)
+          .to raise_error(MCPClient::Errors::ValidationError, /'secret' is not allowed \(unevaluatedProperties/)
+        expect(log_output.string).not_to include('validation is partial')
       end
 
-      it 'refuses it on every call, not only the one that logged the warning' do
+      it 'rejects it on every call' do
         client = client_over(stub_server(closed, leak), :strict)
 
         2.times do
           expect { client.call_tool('t', {}) }
             .to raise_error(MCPClient::Errors::ValidationError, /unevaluatedProperties/)
         end
-        expect(log_output.string.scan('validation is partial').size).to eq(1)
+        expect(log_output.string).not_to include('validation is partial')
       end
 
-      it 'refuses the other assertions it does not evaluate the same way' do
-        [{ 'allOf' => [{ 'properties' => { 'id' => true } }], 'unevaluatedProperties' => false },
-         { '$dynamicRef' => '#/$defs/n', '$defs' => { 'n' => { 'type' => 'integer' } } },
-         { '$schema' => draft2019, '$recursiveRef' => '#' }].each do |schema|
+      it 'refuses the dynamic references it does not evaluate the same way, and only those' do
+        [{ '$dynamicRef' => '#node', '$defs' => { 'n' => { '$dynamicAnchor' => 'node', 'type' => 'object' } } },
+         { '$schema' => draft2019, '$recursiveAnchor' => true, 'type' => 'object', '$recursiveRef' => '#' }]
+          .each do |schema|
           client = client_over(stub_server(schema, leak), :strict)
           expect { client.call_tool('t', {}) }
             .to raise_error(MCPClient::Errors::ValidationError, /does not evaluate/), schema.inspect
         end
+        # A pointer-form `$dynamicRef` and a `$recursiveRef` to a root without
+        # `$recursiveAnchor` are the plain references they resolve to.
+        [{ '$dynamicRef' => '#/$defs/n', '$defs' => { 'n' => { 'type' => 'object' } } },
+         { '$schema' => draft2019, 'type' => 'object',
+           'properties' => { 'child' => { '$recursiveRef' => '#' } } }].each do |schema|
+          expect(client_over(stub_server(schema, leak), :strict).call_tool('t', {})).to eq(leak), schema.inspect
+        end
+        composed = { 'allOf' => [{ 'properties' => { 'id' => true } }], 'unevaluatedProperties' => false }
+        expect { client_over(stub_server(composed, leak), :strict).call_tool('t', {}) }
+          .to raise_error(MCPClient::Errors::ValidationError, /'secret' is not allowed/)
         items = { 'contains' => { 'type' => 'string' }, 'unevaluatedItems' => false }
         result = { 'resultType' => 'complete', 'content' => [], 'structuredContent' => ['x', 1] }
         expect { client_over(stub_server(items, result), :strict).call_tool('t', {}) }
@@ -322,12 +332,13 @@ RSpec.describe 'MCP 2026-07-28 JSON Schema handling — round 30' do
         expect(log_output.string).to include('validation is partial')
       end
 
-      it 'keeps warning once, and returns the result, in :warn mode' do
+      it 'warns about the leaked property on every call, and returns the result, in :warn mode' do
         client = client_over(stub_server(closed, leak), :warn)
 
         expect(client.call_tool('t', {})).to eq(leak)
         expect(client.call_tool('t', {})).to eq(leak)
-        expect(log_output.string.scan('validation is partial').size).to eq(1)
+        expect(log_output.string.scan('\'secret\' is not allowed').size).to eq(2)
+        expect(log_output.string).not_to include('validation is partial')
       end
 
       it 'refuses on the streaming path too' do

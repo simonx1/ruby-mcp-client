@@ -19,11 +19,18 @@ module MCPClient
     # same-instance applications run on an explicit stack here (this
     # module's `pending` list) rather than on the interpreter's: a step is
     # requested by returning `[:apply, schema, ref_depth, speculative,
-    # continuation]` and finished by returning `[:done, errors]`, and
-    # {SchemaValidator.validate_node} drives the two until the outermost
-    # application is done. A Ruby frame is then spent only on a step into a
-    # child value ({SchemaValidator.validate_child}), which is exactly what
-    # MAX_NODE_DEPTH bounds.
+    # continuation, collect]` and finished by returning `[:done, errors,
+    # evaluated]`, and {SchemaValidator.validate_node} drives the two until
+    # the outermost application is done. A Ruby frame is then spent only on
+    # a step into a child value ({SchemaValidator.validate_child}), which is
+    # exactly what MAX_NODE_DEPTH bounds.
+    #
+    # Every application of a schema to an object or an array keeps what it
+    # evaluated of the value (an {Evaluated}): the annotations
+    # `unevaluatedProperties` and `unevaluatedItems` read, collected from the
+    # node's own keywords and from every in-place applicator whose subschema
+    # passed. A subschema hands its own record back with its verdict, and a
+    # failed one hands back nothing.
     module Evaluation
       # One (sub)schema being applied to one value: the instance and the
       # context are fixed for a whole trampoline (the same value throughout),
@@ -33,13 +40,27 @@ module MCPClient
       # @!attribute counted_before
       #   @return [Integer] ctx.errors when the application began, so only
       #     this node's own errors are charged to MAX_ERRORS
+      # @!attribute evaluated
+      #   @return [Evaluated, nil] what was evaluated of an object or array
+      # @!attribute collecting
+      #   @return [Boolean] whether an unevaluated keyword at this node or at
+      #     one applying it to the same value reads the annotations, so every
+      #     branch that passes must be evaluated rather than the first one
       Application = Struct.new(:data, :path, :ctx, :schema, :dialect, :ref_depth, :errors, :counted_before,
-                               keyword_init: true)
+                               :evaluated, :collecting, keyword_init: true)
 
       # The composition keywords, in the order they are applied. Each step
       # takes the application and a continuation, and returns a step.
       COMPOSITION_STEPS = %i[compose_all_of compose_any_of compose_one_of compose_not compose_conditional
                              compose_dependent_schemas].freeze
+
+      # The keywords that apply another schema to the same instance before
+      # the node's own keywords: `$ref`, and the dynamic references where
+      # they name no dynamic anchor and so are the plain references the
+      # specification says they are (2020-12 Core Section 8.2.3.2, 2019-09
+      # Core Section 8.2.4.2.1). Applied in this order, each alongside the
+      # others (draft-07's `$ref` alone replaces its siblings).
+      REFERENCE_KEYWORDS = %w[$ref $dynamicRef $recursiveRef].freeze
 
       # Begin applying one (sub)schema to the value, under the bound on the
       # walk itself: one more node visited.
@@ -48,65 +69,100 @@ module MCPClient
       # @param path [String] location for error messages
       # @param ctx [Context] the validation context
       # @param ref_depth [Integer] $ref hops taken to reach this schema
-      # @return [Array] a step: [:done, errors] or [:apply, ...]
+      # @param collecting [Boolean] whether the annotations this application
+      #   produces are read by an unevaluated keyword above it
+      # @return [Array] a step: [:done, errors, evaluated] or [:apply, ...]
       # @raise [Aborted] when a bound is hit
-      def start_node(data, schema, path, ctx, ref_depth)
+      def start_node(data, schema, path, ctx, ref_depth, collecting: false)
         count_visit(ctx)
-        return [:done, []] if schema == true
-        return [:done, count_errors(ctx, ["#{path}: schema false accepts no value"])] if schema == false
-        return [:done, []] unless schema.is_a?(Hash)
+        return [:done, [], nil] if schema == true
+        return [:done, count_errors(ctx, ["#{path}: schema false accepts no value"]), nil] if schema == false
+        return [:done, [], nil] unless schema.is_a?(Hash)
 
-        app = Application.new(data: data, path: path, ctx: ctx, schema: schema,
-                              dialect: node_dialect(schema, ctx), ref_depth: ref_depth,
-                              errors: [], counted_before: ctx.errors)
-        schema.key?('$ref') ? apply_ref(app) : apply_keywords(app)
+        dialect = node_dialect(schema, ctx)
+        app = Application.new(data: data, path: path, ctx: ctx, schema: schema, dialect: dialect,
+                              ref_depth: ref_depth, errors: [], counted_before: ctx.errors,
+                              evaluated: (Evaluated.new if data.is_a?(Hash) || data.is_a?(Array)),
+                              collecting: collecting || reads_annotations?(schema, dialect))
+        apply_references(app, applied_references(app))
       end
 
-      # Apply the local `$ref` of a schema object. draft-07: "$ref" replaces
-      # the schema it appears in; later drafts apply it alongside the sibling
-      # keywords.
+      # @param schema [Hash]
+      # @param dialect [String, nil]
+      # @return [Boolean] whether the node carries an unevaluated keyword
+      #   that reads the annotations of the schemas applied to its value
+      def reads_annotations?(schema, dialect)
+        %w[unevaluatedProperties unevaluatedItems].any? do |keyword|
+          keyword_known?(keyword, dialect) && schema_value?(schema[keyword])
+        end
+      end
+
+      # The reference keywords a node applies as plain references: `$ref`
+      # and each dynamic reference that names no dynamic anchor (one that
+      # does is left unevaluated, see {Composition#partial_keywords?}).
       # @param app [Application]
+      # @return [Array<String>]
+      def applied_references(app)
+        REFERENCE_KEYWORDS.select do |keyword|
+          next false unless app.schema.key?(keyword) && keyword_known?(keyword, app.dialect)
+
+          keyword == '$ref' || !dynamic_reference?(app.schema, keyword, app.ctx.root, app.ctx.dialect, app.ctx)
+        end
+      end
+
+      # Apply the references a schema object carries, one after the other,
+      # then its own keywords. draft-07: "$ref" replaces the schema it
+      # appears in; later drafts apply it alongside the sibling keywords.
+      # @param app [Application]
+      # @param keywords [Array<String>] the references still to apply
       # @return [Array] a step
-      def apply_ref(app)
-        replaces = app.dialect == DRAFT_07
-        kind, target = ref_target(app)
+      def apply_references(app, keywords)
+        return apply_keywords(app) if keywords.empty?
+
+        keyword = keywords.first
+        replaces = keyword == '$ref' && app.dialect == DRAFT_07
+        kind, target = ref_target(app, keyword)
         if kind == :errors
-          return [:done, target] if replaces
+          return [:done, target, app.evaluated] if replaces
 
           app.errors.concat(target)
-          return apply_keywords(app)
+          return apply_references(app, keywords.drop(1))
         end
 
-        [:apply, target, app.ref_depth + 1, false, lambda do |errors|
-          next [:done, errors] if replaces
+        [:apply, target, app.ref_depth + 1, false, lambda do |errors, evaluated|
+          next [:done, errors, evaluated] if replaces
 
           app.errors.concat(errors)
-          apply_keywords(app)
-        end]
+          app.evaluated&.merge!(evaluated) if errors.empty?
+          apply_references(app, keywords.drop(1))
+        end, app.collecting]
       end
 
-      # Resolve the reference a schema object carries.
+      # Resolve a reference a schema object carries.
       # @param app [Application]
+      # @param keyword [String] `$ref`, or a dynamic reference applied as one
       # @return [Array(Symbol, Object)] [:target, schema] or [:errors, errors]
       # @raise [Aborted] when the hop budget is exhausted
-      def ref_target(app)
+      def ref_target(app, keyword = '$ref')
         ctx = app.ctx
-        ref = app.schema['$ref']
+        ref = app.schema[keyword]
         if unusable_ref?(ref, ctx, app.schema)
-          return ref_problem(app, "external $ref #{clip(ref.inspect)} is not dereferenced")
+          return ref_problem(app, "external #{keyword} #{clip(ref.inspect)} is not dereferenced")
         end
         if app.ref_depth >= MAX_REF_DEPTH
-          raise Aborted, "$ref chain exceeds #{MAX_REF_DEPTH} hops (cycle?) at #{clip(ref.inspect)}"
+          raise Aborted, "#{keyword} chain exceeds #{MAX_REF_DEPTH} hops (cycle?) at #{clip(ref.inspect)}"
         end
 
         target = resolve_reference(ctx.root, ref, ctx.dialect, ctx, from: app.schema)
-        return ref_problem(app, "unresolvable local $ref #{clip(ref.inspect)}") if target.equal?(UNRESOLVED)
-        return ref_problem(app, "$ref #{clip(ref.inspect)} does not point at a schema") unless schema_value?(target)
+        return ref_problem(app, "unresolvable local #{keyword} #{clip(ref.inspect)}") if target.equal?(UNRESOLVED)
+        unless schema_value?(target)
+          return ref_problem(app, "#{keyword} #{clip(ref.inspect)} does not point at a schema")
+        end
 
         [:target, target]
       end
 
-      # @param ref [Object] the `$ref` value
+      # @param ref [Object] the reference's value
       # @param ctx [Context] the validation context
       # @param from [Hash] the schema object holding the reference
       # @return [Boolean] whether it is a reference this validator never follows
@@ -139,8 +195,8 @@ module MCPClient
 
         errors.concat(validate_enum(data, schema, app.path))
         case data
-        when Hash then errors.concat(validate_object(data, schema, app.path, app.ctx, app.dialect))
-        when Array then errors.concat(validate_array(data, schema, app.path, app.ctx, app.dialect))
+        when Hash then errors.concat(validate_object(data, schema, app.path, app.ctx, app.dialect, app.evaluated))
+        when Array then errors.concat(validate_array(data, schema, app.path, app.ctx, app.dialect, app.evaluated))
         when String then errors.concat(validate_string(data, schema, app.path, app.ctx.deadline))
         when Numeric then errors.concat(validate_number(data, schema, app.path, app.dialect))
         end
@@ -158,18 +214,37 @@ module MCPClient
         send(COMPOSITION_STEPS[index], app) { compose(app, index + 1) }
       end
 
-      # Finish an application: a keyword the validator does not evaluate
-      # makes this node's verdict partial, so a pass here is not a proof for
-      # not / oneOf / if. A node its supported assertions already rejected is
-      # decided whatever else it holds, and pays for no such measurement.
-      # Errors raised by nested nodes were counted when they were produced;
-      # only this node's own errors are new.
+      # Finish an application. The unevaluated keywords come last: they read
+      # what every other keyword and every passed applicator evaluated of the
+      # value. A keyword the validator does not evaluate makes this node's
+      # verdict partial, so a pass here is not a proof for not / oneOf / if.
+      # A node its supported assertions already rejected is decided whatever
+      # else it holds, and pays for no such measurement. Errors raised by
+      # nested nodes were counted when they were produced; only this node's
+      # own errors are new.
       # @param app [Application]
       # @return [Array] a step
       def finish_node(app)
         ctx = app.ctx
-        ctx.undecided += 1 if app.errors.empty? && partial_keywords?(app.schema, app.dialect, app.data, ctx.deadline)
-        [:done, count_errors(ctx, app.errors, already_counted: ctx.errors - app.counted_before)]
+        apply_unevaluated(app) if app.errors.empty? && app.evaluated
+        ctx.undecided += 1 if app.errors.empty? && partial_keywords?(app.schema, app.dialect, app.data, ctx)
+        [:done, count_errors(ctx, app.errors, already_counted: ctx.errors - app.counted_before), app.evaluated]
+      end
+
+      # `unevaluatedProperties` / `unevaluatedItems` (JSON Schema 2020-12
+      # Core Sections 11.3 and 11.2): the keyword's schema applies to every
+      # member or item nothing applied to this value evaluated, and what it
+      # validated counts as evaluated from then on.
+      # @param app [Application]
+      # @return [void]
+      def apply_unevaluated(app)
+        keyword = app.data.is_a?(Hash) ? 'unevaluatedProperties' : 'unevaluatedItems'
+        sub = app.schema[keyword]
+        return unless keyword_known?(keyword, app.dialect) && schema_value?(sub)
+
+        errors = app.data.is_a?(Hash) ? unevaluated_property_errors(app, sub) : unevaluated_item_errors(app, sub)
+        app.errors.concat(errors)
+        app.evaluated.all!
       end
 
       # The schema half of a dependency: `dependentSchemas` in 2019-09 and
@@ -214,13 +289,15 @@ module MCPClient
         return cont.call if idx >= subs.length
 
         trigger, sub = subs[idx]
-        [:apply, sub, app.ref_depth, false, lambda do |errors|
-          next dependency_branch(app, subs, idx + 1, cont) if errors.empty?
-
-          app.errors << "#{app.path}: does not satisfy the schema required by property " \
-                        "'#{clip(trigger)}' (#{clip(errors.first.to_s)})"
+        [:apply, sub, app.ref_depth, false, lambda do |errors, evaluated|
+          if errors.empty?
+            app.evaluated&.merge!(evaluated)
+          else
+            app.errors << "#{app.path}: does not satisfy the schema required by property " \
+                          "'#{clip(trigger)}' (#{clip(errors.first.to_s)})"
+          end
           dependency_branch(app, subs, idx + 1, cont)
-        end]
+        end, app.collecting]
       end
 
       # allOf: the first failing branch decides it, and later branches are
@@ -242,25 +319,36 @@ module MCPClient
       def all_of_branch(app, subs, idx, cont)
         return cont.call if idx >= subs.length
 
-        [:apply, subs[idx], app.ref_depth, false, lambda do |errors|
-          next all_of_branch(app, subs, idx + 1, cont) if errors.empty?
+        [:apply, subs[idx], app.ref_depth, false, lambda do |errors, evaluated|
+          if errors.empty?
+            app.evaluated&.merge!(evaluated)
+            next all_of_branch(app, subs, idx + 1, cont)
+          end
 
           app.errors << "#{app.path}: does not satisfy allOf/#{idx} (#{clip(errors.first.to_s)})"
           cont.call
-        end]
+        end, app.collecting]
       end
 
       # anyOf is monotonic: a definite pass decides it whatever the other
-      # branches, and only undecided branches leave it undecided.
+      # branches, and only undecided branches leave it undecided. Where an
+      # unevaluated keyword reads the annotations, every branch is evaluated
+      # (each one that passes contributes what it evaluated); otherwise the
+      # first definite pass ends it, so a branch that cannot change the
+      # outcome cannot abort a decided validation.
       # @param app [Application]
       # @return [Array] a step
       def compose_any_of(app, &cont)
         subs = app.schema['anyOf']
         return cont.call unless subs.is_a?(Array)
 
-        branch_verdicts(app, subs, stop: ->(vs) { vs.include?(:pass) },
-                                   decided: ->(vs) { vs.all?(:fail) }) do |verdicts|
-          app.errors << "#{app.path}: does not satisfy any schema in anyOf" if verdicts.all?(:fail)
+        branch_verdicts(app, subs, stop: ->(vs) { !app.collecting && vs.include?(:pass) },
+                                   decided: ->(vs) { vs.all?(:fail) }) do |verdicts, evaluations|
+          if verdicts.all?(:fail)
+            app.errors << "#{app.path}: does not satisfy any schema in anyOf"
+          else
+            merge_passed(app, verdicts, evaluations)
+          end
           cont.call
         end
       end
@@ -274,13 +362,23 @@ module MCPClient
         return cont.call unless subs.is_a?(Array)
 
         branch_verdicts(app, subs, stop: ->(vs) { vs.count(:pass) > 1 },
-                                   decided: ->(vs) { vs.none?(:undecided) }) do |verdicts|
+                                   decided: ->(vs) { vs.none?(:undecided) }) do |verdicts, evaluations|
           matches = verdicts.count(:pass)
           if matches > 1 || (verdicts.none?(:undecided) && matches != 1)
             app.errors << "#{app.path}: satisfies #{matches} schemas in oneOf, expected exactly one"
+          elsif matches == 1
+            merge_passed(app, verdicts, evaluations)
           end
           cont.call
         end
+      end
+
+      # Take over what every passed branch evaluated of the value.
+      # @return [void]
+      def merge_passed(app, verdicts, evaluations)
+        return unless app.evaluated
+
+        verdicts.each_with_index { |verdict, idx| app.evaluated.merge!(evaluations[idx]) if verdict == :pass }
       end
 
       # @param app [Application]
@@ -288,7 +386,7 @@ module MCPClient
       def compose_not(app, &cont)
         return cont.call unless app.schema.key?('not')
 
-        branch_verdict(app, app.schema['not']) do |verdict|
+        branch_verdict(app, app.schema['not']) do |verdict, _evaluated|
           app.errors << "#{app.path}: value satisfies the schema in not" if verdict == :pass
           cont.call
         end
@@ -297,22 +395,26 @@ module MCPClient
       # if / then / else. An `if` without `then` or `else` asserts nothing
       # (JSON Schema 2020-12 Section 10.2.2.1) and is not evaluated; an
       # undecided condition applies neither branch, but may still be settled
-      # by the branches agreeing ({#unconditional_conditional}).
+      # by the branches agreeing ({#unconditional_conditional}). A condition
+      # that passed evaluated the value, and so does the branch applied.
       # @param app [Application]
       # @return [Array] a step
       def compose_conditional(app, &cont)
         schema = app.schema
         return cont.call unless schema.key?('if') && (schema.key?('then') || schema.key?('else'))
 
-        branch_verdict(app, schema['if']) do |verdict|
+        branch_verdict(app, schema['if']) do |verdict, evaluated|
           branch = { pass: 'then', fail: 'else' }[verdict]
           next unconditional_conditional(app, cont) if branch.nil?
+
+          app.evaluated&.merge!(evaluated) if verdict == :pass
           next cont.call unless schema.key?(branch)
 
-          [:apply, schema[branch], app.ref_depth, false, lambda do |errors|
+          [:apply, schema[branch], app.ref_depth, false, lambda do |errors, branch_evaluated|
             app.errors.concat(errors)
+            app.evaluated&.merge!(branch_evaluated) if errors.empty?
             cont.call
-          end]
+          end, app.collecting]
         end
       end
 
@@ -332,17 +434,17 @@ module MCPClient
         return cont.call unless schema.key?('then') && schema.key?('else')
 
         undecided = app.ctx.undecided
-        [:apply, schema['then'], app.ref_depth, true, lambda do |then_errors|
+        [:apply, schema['then'], app.ref_depth, true, lambda do |then_errors, _evaluated|
           next resume_conditional(app, undecided, cont) if then_errors.empty?
 
-          [:apply, schema['else'], app.ref_depth, true, lambda do |else_errors|
+          [:apply, schema['else'], app.ref_depth, true, lambda do |else_errors, _else_evaluated|
             unless else_errors.empty?
               app.errors << "#{app.path}: fails both then and else of an if this validator cannot decide " \
                             "(#{clip(then_errors.first.to_s)})"
             end
             resume_conditional(app, undecided, cont)
-          end]
-        end]
+          end, app.collecting]
+        end, app.collecting]
       end
 
       # Resume after measuring the branches: what they could not evaluate is
@@ -353,27 +455,30 @@ module MCPClient
         cont.call
       end
 
-      # The verdicts of a keyword's branches. Evaluation stops as soon as the
-      # branches seen so far settle the composition (`stop`): a branch that
-      # cannot change the outcome is not evaluated, so it cannot abort a
-      # decided validation. Once the composition is decided — early, or after
-      # every branch (`decided`) — the uncertainty count is restored to what
-      # it was before the branches ran.
+      # The verdicts of a keyword's branches, and what each branch evaluated.
+      # Evaluation stops as soon as the branches seen so far settle the
+      # composition (`stop`): a branch that cannot change the outcome is not
+      # evaluated, so it cannot abort a decided validation. Once the
+      # composition is decided — early, or after every branch (`decided`) —
+      # the uncertainty count is restored to what it was before the branches
+      # ran.
       # @param app [Application]
       # @param subs [Array] the branches
       # @return [Array] a step
       def branch_verdicts(app, subs, stop:, decided:, &cont)
         before = app.ctx.undecided
         verdicts = []
+        evaluations = []
         advance = nil
         advance = lambda do
           if verdicts.length >= subs.length || stop.call(verdicts)
             app.ctx.undecided = before if stop.call(verdicts) || decided.call(verdicts)
-            next cont.call(verdicts)
+            next cont.call(verdicts, evaluations)
           end
 
-          branch_verdict(app, subs[verdicts.length]) do |verdict|
+          branch_verdict(app, subs[verdicts.length]) do |verdict, evaluated|
             verdicts << verdict
+            evaluations << evaluated
             advance.call
           end
         end
@@ -387,21 +492,22 @@ module MCPClient
       # evaluate. Non-monotonic compositions (not, oneOf, if) never treat
       # :undecided as a match. A definite verdict leaves no uncertainty
       # behind: what a failing branch could not evaluate does not matter once
-      # it failed.
+      # it failed. The continuation also receives what the branch evaluated
+      # of the value (nothing, for a failed one).
       # @param app [Application]
       # @param sub [Object] the branch schema
       # @return [Array] a step
       def branch_verdict(app, sub, &cont)
         ctx = app.ctx
         before = ctx.undecided
-        [:apply, sub, app.ref_depth, true, lambda do |errors|
+        [:apply, sub, app.ref_depth, true, lambda do |errors, evaluated|
           unless errors.empty?
             ctx.undecided = before
-            next cont.call(:fail)
+            next cont.call(:fail, nil)
           end
 
-          cont.call(ctx.undecided == before ? :pass : :undecided)
-        end]
+          cont.call(ctx.undecided == before ? :pass : :undecided, evaluated)
+        end, app.collecting]
       end
     end
   end

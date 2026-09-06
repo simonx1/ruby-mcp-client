@@ -729,12 +729,19 @@ module MCPClient
 
     # Whether a streamed chunk is the call's answer rather than an update on
     # its way. MCP 2026-07-28 makes `resultType` required and has clients
-    # treat an absent one as "complete", which is what every pre-2026 server
-    # sends.
+    # treat an absent one as "complete" — a rule for *results*, which is
+    # what every pre-2026 server sends. A chunk that carries no `resultType`
+    # and is shaped as no CallToolResult (a progress object, say) is an
+    # update on the way, not an answer to check against an output schema.
     # @param chunk [Object] one chunk of a streaming tools/call
     # @return [Boolean]
     def complete_call_result?(chunk)
-      chunk.is_a?(Hash) && MCPClient::JsonRpcCommon.result_type(chunk) == 'complete'
+      return false unless chunk.is_a?(Hash) && MCPClient::JsonRpcCommon.result_type(chunk) == 'complete'
+
+      # The members a CallToolResult is made of; a chunk carrying none of
+      # them (and no `resultType`) is not a result at all.
+      chunk.key?('resultType') || chunk.key?(:resultType) ||
+        %w[content structuredContent isError].any? { |member| chunk.key?(member) || chunk.key?(member.to_sym) }
     end
 
     # Hand the host's identity and request metadata to a transport.
@@ -1091,6 +1098,11 @@ module MCPClient
       schema = tool.schema
       state = input_schema_state(tool)
       reject_unsupported_dialect!(tool, state, 'input')
+      # An output schema nothing here could read is refused before the call
+      # too: the dialect error is due whatever the tool would answer, and a
+      # (possibly destructive) tool is not run for a result that cannot be
+      # checked.
+      reject_unsupported_dialect!(tool, output_schema_state(tool), 'output')
       # An input schema the validator cannot interpret asserts nothing: the
       # call goes out and the server judges its arguments.
       return if state[:unusable]
@@ -1137,6 +1149,10 @@ module MCPClient
     #   is missing from a successful result or does not match the schema
     def validate_structured_content!(tool, result)
       return result unless tool.structured_output? && result.is_a?(Hash)
+
+      # A dialect this client cannot read is an error for every result, an
+      # error result included (the MUST is not limited to successful ones).
+      reject_unsupported_dialect!(tool, output_schema_state(tool), 'output')
       return result if result['isError'] || result[:isError]
       # An unfinished result (MCP 2026-07-28 resultType "input_required") is
       # not a successful one either: it carries the continuation instead of
@@ -1146,7 +1162,6 @@ module MCPClient
       return result unless MCPClient::JsonRpcCommon.result_type(result) == 'complete'
 
       unsupported = warn_partial_schema_coverage(tool)
-      reject_unsupported_dialect!(tool, output_schema_state(tool), 'output')
       reject_partial_schema_coverage!(tool, unsupported)
 
       # MCP 2026-07-28: structuredContent "can be any JSON value (object,
@@ -1322,12 +1337,11 @@ module MCPClient
     end
 
     # :strict is a gate. A schema using an assertion this validator does not
-    # evaluate (the dynamic references, `unevaluatedItems` /
-    # `unevaluatedProperties` where a composition produces the annotations
-    # they read) cannot be shown to accept the result, and a result not shown
-    # to conform is refused there — a warning beside a returned value was a
-    # silent pass in everything but the log. A keyword that only annotates
-    # (`format`, `contentSchema`) decides nothing and does not refuse.
+    # evaluate (a dynamic reference the dynamic scope could re-bind) cannot
+    # be shown to accept the result, and a result not shown to conform is
+    # refused there — a warning beside a returned value was a silent pass in
+    # everything but the log. A keyword that only annotates (`format`,
+    # `contentSchema`) decides nothing and does not refuse.
     # @param tool [MCPClient::Tool] the tool whose output schema is being used
     # @param unsupported [Array<String>] what {#warn_partial_schema_coverage} found
     # @return [void]
