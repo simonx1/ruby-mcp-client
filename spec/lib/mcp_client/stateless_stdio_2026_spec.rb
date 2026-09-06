@@ -267,7 +267,8 @@ RSpec.describe 'MCP 2026-07-28 stateless protocol (stdio)' do
     # of these methods individually; pagination is included because a second
     # page must merge `_meta` into the params, not replace them.
     it 'carries the required _meta on every rewired request method, pagination included' do
-      sent = script_stdio(server, [{ 'result' => discover_result },
+      capabilities = { 'tools' => {}, 'completions' => {} }
+      sent = script_stdio(server, [{ 'result' => discover_result(capabilities: capabilities) },
                                    { 'result' => { 'prompts' => [], 'nextCursor' => 'page-2' } },
                                    { 'result' => { 'prompts' => [] } },
                                    { 'result' => { 'messages' => [] } },
@@ -281,7 +282,8 @@ RSpec.describe 'MCP 2026-07-28 stateless protocol (stdio)' do
       server.list_resources
       server.read_resource('file:///x')
       server.list_resource_templates
-      server.rpc_request('completion/complete', { 'ref' => { 'type' => 'ref/prompt' } })
+      completion = server.complete(ref: { 'type' => 'ref/prompt', 'name' => 'greet' },
+                                   argument: { 'name' => 'name', 'value' => 'a' })
 
       expect(sent.map { |r| r['method'] }).to eq(%w[server/discover prompts/list prompts/list prompts/get
                                                     resources/list resources/read resources/templates/list
@@ -295,7 +297,11 @@ RSpec.describe 'MCP 2026-07-28 stateless protocol (stdio)' do
       expect(sent[2]['params']['cursor']).to eq('page-2')
       expect(sent[3]['params']).to include('name' => 'greet', 'arguments' => { 'name' => 'ada' })
       expect(sent[5]['params']['uri']).to eq('file:///x')
-      expect(sent[7]['params']['ref']).to eq({ 'type' => 'ref/prompt' })
+      # The public method, not rpc_request: its wire parameters and its
+      # projection of the result are what a host sees.
+      expect(sent[7]['params']).to include('ref' => { 'type' => 'ref/prompt', 'name' => 'greet' },
+                                           'argument' => { 'name' => 'name', 'value' => 'a' })
+      expect(completion).to eq({ 'values' => [] })
     end
 
     it 'sends the host client_info instead of the default identity when one is configured' do

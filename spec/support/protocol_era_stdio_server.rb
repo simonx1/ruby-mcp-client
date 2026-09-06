@@ -15,6 +15,11 @@
 #                     been answered, so an unexpected termination after a
 #                     successful handshake is observable
 #   legacy            reject server/discover, then run the initialize handshake
+#   legacy-one-shot   like legacy, but exit as soon as one tools/list has
+#                     been answered, so a restart of a legacy process has to
+#                     run the whole handshake again
+#   legacy-broken-init reject server/discover AND initialize, so a failed
+#                     legacy handshake against a real process is observable
 #   legacy-ping-first like legacy, but send a `ping` request before answering
 #                     anything and refuse to process further input until the
 #                     response arrives (a legacy server MAY ping at startup;
@@ -127,6 +132,17 @@ def meta_violation(msg)
   if modern_request?(msg)
     missing = REQUIRED_MODERN_META.reject { |key| meta.key?(key) }
     return "modern request is missing required _meta: #{missing.join(', ')}" if missing.any?
+
+    # Presence is not enough: the values are typed by the spec, and a
+    # client that put `null` where a version or an object belongs has
+    # stopped conforming just as surely as one that dropped the key.
+    version = meta['io.modelcontextprotocol/protocolVersion']
+    unless version.to_s.match?(/\A\d{4}-\d{2}-\d{2}\z/)
+      return 'modern request _meta protocolVersion is not a YYYY-MM-DD string'
+    end
+    unless meta['io.modelcontextprotocol/clientCapabilities'].is_a?(Hash)
+      return 'modern request _meta clientCapabilities is not an object'
+    end
   else
     leaked = meta.keys.select { |key| key.to_s.start_with?(MODERN_META_PREFIX) }
     return "2025-11-25 request carried modern _meta: #{leaked.join(', ')}" if leaked.any?
@@ -149,6 +165,13 @@ def handle_request(msg)
   case MODE
   when 'modern'
     return respond(msg['id'], discover_result(['2026-07-28'])) if msg['method'] == 'server/discover'
+  when 'legacy-one-shot'
+    if msg['method'] == 'tools/list'
+      respond(msg['id'], { 'tools' => tools })
+      exit 0
+    end
+  when 'legacy-broken-init'
+    return respond_error(msg['id'], 'initialize refused', -32_602) if msg['method'] == 'initialize'
   when 'modern-one-shot'
     return respond(msg['id'], discover_result(['2026-07-28'])) if msg['method'] == 'server/discover'
 

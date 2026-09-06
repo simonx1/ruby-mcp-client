@@ -1455,7 +1455,11 @@ module MCPClient
         # notifications/roots/list_changed was removed in MCP 2026-07-28: a
         # modern server reads roots through the multi round-trip pattern
         # when it needs them, and has no channel to be told they changed.
-        next if server.respond_to?(:modern?) && server.modern?
+        # Judged by the ESTABLISHED era: while a probe is in flight the
+        # version is only a proposal, and a server that then falls back to
+        # the handshake can still ask for roots — so the transport, which
+        # settles the era before it writes anything, makes the call.
+        next if server.respond_to?(:protocol_era) && server.protocol_era == :modern
 
         begin
           server.rpc_notify('notifications/roots/list_changed', {})

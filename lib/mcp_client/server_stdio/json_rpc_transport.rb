@@ -12,7 +12,11 @@ module MCPClient
       # @return [void]
       # @raise [MCPClient::Errors::ConnectionError] if initialization fails
       def ensure_initialized
-        return if @initialized && !transport_retired?
+        # Read the retirement flag FIRST. A restart clears @initialized and
+        # then the flag; a thread reading them the other way round could see
+        # a stale handshake next to a cleared flag and skip the lock, then
+        # register a request against a transport that is being replaced.
+        return if !transport_retired? && @initialized
 
         @init_lock.synchronize do
           # The subprocess behind a completed handshake exited under it:
@@ -238,6 +242,18 @@ module MCPClient
         result.key?('resultType') || result.key?(:resultType) || discover_result?(result)
       end
 
+      # Whether a response, as it comes off the wire, could only have been
+      # written by a modern server: a result carrying a 2026-07-28 marker, or
+      # one of the spec-defined modern errors in its mandated shape.
+      # @param msg [Hash] a JSON-RPC response
+      # @return [Boolean]
+      def identifies_modern_server?(msg)
+        return true if modern_discover_answer?(msg)
+        return false unless msg.key?('error')
+
+        MCPClient::Errors::ServerError.from_jsonrpc(msg['error']).modern_protocol_error?
+      end
+
       # @param modern_answer [Boolean] whether the answer identified a modern server
       # @param message [String] what was wrong with it
       # @return [StandardError] the failure the probe should propagate
@@ -340,6 +356,27 @@ module MCPClient
       rescue StandardError
         @mutex.synchronize { @awaiting.delete(req_id) }
         raise
+      end
+
+      # Write a registered request, unless the transport it was registered on
+      # has been replaced since. Replacement is judged by the transport
+      # generation, which every teardown and every spawn bumps: a restart in
+      # between has dropped the id from @awaiting, and the process the
+      # request was built for is gone.
+      # @param req [Hash] the JSON-RPC request
+      # @param generation [Integer] the transport generation the id was registered on
+      # @return [Hash, nil] the request once written, or nil when the
+      #   transport was replaced under it before it was written (it was not sent)
+      # @raise [MCPClient::Errors::TransportError] on write errors
+      def send_if_current(req, generation)
+        unless generation == @transport_generation
+          @logger.debug("The transport was replaced before #{req['method']} was sent; re-issuing it")
+          @mutex.synchronize { @awaiting.delete(req['id']) }
+          return nil
+        end
+
+        send_request(req)
+        req
       end
 
       # Send a JSON-RPC request and return nothing
@@ -450,10 +487,9 @@ module MCPClient
       # @yieldparam version [String, nil] the protocol version the request declares
       # @return [Object] result from the JSON-RPC response
       def send_request_and_wait(method, params, timeout)
-        req_id = next_id
-        req = build_registered_request(method, params, req_id)
-        yield declared_protocol_version(req) if block_given?
-        send_request(req)
+        req_id, = send_on_current_transport(method, params) do |built|
+          yield declared_protocol_version(built) if block_given?
+        end
         begin
           res = wait_response(req_id, timeout: timeout)
         rescue MCPClient::Errors::RequestTimeoutError
@@ -463,6 +499,30 @@ module MCPClient
           raise
         end
         process_jsonrpc_response(res)
+      end
+
+      # Register, build and write a request on the transport that is current
+      # when it is written. Between registering the id and writing, the
+      # host's request_meta provider runs, and in that window the subprocess
+      # may exit and another thread restart it: the restart drops every
+      # outstanding id, so a request written afterwards would go out
+      # unregistered and its answer be discarded as unsolicited. Nothing has
+      # been sent when that is detected, so the request is simply rebuilt —
+      # after waiting for the restart to complete — and sent registered.
+      # @param method [String] JSON-RPC method
+      # @param params [Hash] parameters for the request
+      # @yieldparam req [Hash] the request as built, before it is written
+      # @return [Array(Integer, Hash)] the registered id and the request
+      def send_on_current_transport(method, params)
+        loop do
+          generation = @transport_generation
+          req_id = next_id
+          req = build_registered_request(method, params, req_id)
+          yield req if block_given?
+          return [req_id, req] if send_if_current(req, generation)
+
+          ensure_initialized
+        end
       end
 
       # The protocol version a built request declares in its `_meta`. Read

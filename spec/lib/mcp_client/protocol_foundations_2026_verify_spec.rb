@@ -1764,6 +1764,7 @@ RSpec.describe 'an unfinished result survives the HTTP transports off the wire' 
           .to raise_error(MCPClient::Errors::InputRequiredError, /input_required/) do |e|
             expect(e.data).to eq(unfinished)
             expect(e.request_state).to eq('continue-later')
+            expect(e.input_requests).to eq({ 'city' => city_request })
           end
       end
     end
@@ -1774,7 +1775,7 @@ RSpec.describe 'an unfinished result survives the HTTP transports off the wire' 
       expect { server.read_resource('file:///x') }
         .to raise_error(MCPClient::Errors::InputRequiredError, /input_required/) do |e|
           expect(e.data).to eq(unfinished)
-          expect(e.data['inputRequests']).to eq({ 'city' => city_request })
+          expect(e.input_requests).to eq({ 'city' => city_request })
         end
     end
 

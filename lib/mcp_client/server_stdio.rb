@@ -97,6 +97,7 @@ module MCPClient
       # thread only ever speaks for the transport it was started for.
       @transport_generation = 0
       @transport_retired = false
+      @modern_answer_received = false
     end
 
     # Server info from the initialize response
@@ -129,6 +130,9 @@ module MCPClient
         @stdin, @stdout, @stderr, @wait_thread = Open3.popen3(@command)
       end
       @transport_generation += 1
+      # A fresh process has said nothing yet: what the previous one wrote
+      # identifies nothing about this one.
+      @modern_answer_received = false
       pin_pipe_encodings
       true
     rescue StandardError => e
@@ -254,6 +258,13 @@ module MCPClient
       id = msg['id']
       return unless id
 
+      # The answer is recorded as identifying the peer BEFORE it is queued
+      # and before the next line is read: the thread waiting for it may not
+      # run until after the server has written its next line, and if that
+      # line is a request a modern server MUST NOT have written, it must
+      # already be known as prohibited traffic — a legacy accommodation is
+      # only owed while the probe is unanswered.
+      @modern_answer_received = true if identifies_modern_server?(msg)
       @mutex.synchronize do
         # Only retain a response that corresponds to an outstanding request.
         # Late responses (arriving after the caller timed out) and unsolicited
@@ -278,14 +289,16 @@ module MCPClient
     # then wait for the response before doing anything else, so treating its
     # request as prohibited modern traffic deadlocks the negotiation.
     #
-    # The one exception is a client configured protocol: :modern, which has
-    # already ruled out the legacy fallback that the accommodation exists
-    # for. It will never speak legacy, so it never runs a host callback for a
-    # server request nor writes the response back — not even while its own
-    # probe is still in flight.
+    # Two exceptions. A client configured protocol: :modern has already
+    # ruled out the legacy fallback that the accommodation exists for: it
+    # will never speak legacy, so it never runs a host callback for a server
+    # request nor writes the response back — not even while its own probe is
+    # still in flight. And once the reader has seen an answer only a modern
+    # server could have written, the server is modern whatever the
+    # negotiating thread has got round to applying.
     # @return [Boolean]
     def modern_peer?
-      protocol_era == :modern || @protocol_mode == :modern
+      protocol_era == :modern || @protocol_mode == :modern || @modern_answer_received
     end
 
     # List all prompts available from the MCP server
