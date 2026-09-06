@@ -102,30 +102,59 @@ module MCPClient
 
       # One pause of a continuation that asked for nothing, as the host steers
       # it. Returns the pace for the next such pause.
+      #
+      # The host's control is host code: it may open a window, ask a person
+      # and come back much later. That time belongs to the request, so the
+      # deadline is read against the clock as it stands when the control
+      # returns, not as it stood when the answer arrived — otherwise a
+      # control that deliberates for most of the timeout still buys itself a
+      # full pause and another request on top of it.
       # @param wait [InputRequiredWait] what the host is told
       # @param deadline [Float, nil] the request timeout on the wait clock
-      # @param now [Float] the wait clock when the answer arrived
       # @return [Numeric] the next delay
-      # @raise [MCPClient::Errors::InputRequiredError] cancelled, or the pause would pass the timeout
-      def pace_input_round_trip(wait, deadline, now)
+      # @raise [MCPClient::Errors::InputRequiredError] cancelled, or out of time for the pause
+      def pace_input_round_trip(wait, deadline)
         decision = @input_required_wait_callback&.call(wait)
-        return wait.delay if decision == :retry
-
+        now = input_wait_clock
         if decision == :cancel
           raise MCPClient::Errors::InputRequiredError.new(
             "#{wait.rpc_method} cancelled by the host while waiting for out-of-band input " \
             "(round trip #{wait.round_trip})", data: wait.result
           )
         end
-        if deadline && now + wait.delay > deadline
+        # "Retry now" skips the pause, so only a deadline that has already
+        # passed stops it: the request it would re-send is over either way.
+        pause = decision == :retry ? 0 : wait.delay
+        if deadline && now + pause > deadline
           raise MCPClient::Errors::InputRequiredError.new(
             "#{wait.rpc_method} is still waiting for out-of-band input at the request timeout " \
             "(round trip #{wait.round_trip}); resume it from the continuation", data: wait.result
           )
         end
+        return wait.delay if decision == :retry
 
         sleep(wait.delay)
         [wait.delay * 2, INPUT_RETRY_MAX_DELAY].min
+      end
+
+      # @param started [Float] the wait clock when the request began
+      # @param timeout [Numeric, nil] the per-request timeout, when the caller gave one
+      # @return [Float, nil] the wait clock reading the waits of this request must not pass
+      def input_wait_deadline(started, timeout)
+        bound = input_wait_timeout(timeout)
+        bound ? started + bound : nil
+      end
+
+      # The bound an out-of-band wait is measured against. A caller that named
+      # no timeout still runs under one — the transport's configured read
+      # timeout — and a wait that outlived it would outlive the request it
+      # belongs to. A transport that bounds nothing (a host adapter that sets
+      # no read timeout) leaves the round-trip ceiling as the only limit.
+      # @param timeout [Numeric, nil] the per-request timeout, when the caller gave one
+      # @return [Numeric, nil] the seconds the waits of this request share
+      def input_wait_timeout(timeout)
+        bound = timeout || (@read_timeout if defined?(@read_timeout))
+        bound if bound.is_a?(Numeric) && bound.positive?
       end
 
       # @return [Float] the monotonic clock, in seconds, the out-of-band waits are bounded by

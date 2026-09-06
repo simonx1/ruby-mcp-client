@@ -257,8 +257,10 @@ rescue MCPClient::Errors::InputRequiredError => e
 end
 ```
 
-A wait never runs past the request's own timeout either; the error it raises
-then is resumable in the same way.
+A wait never runs past the timeout the request runs under either — the one
+given to the call, or the transport's configured `read_timeout` when the call
+named none — and the time your own control spends deciding counts against it.
+The error it raises then is resumable in the same way.
 
 Sampling tool calling (SEP-1577) is opt-in: pass `sampling_supports_tools: true`
 to declare the `sampling.tools` capability. The handler then receives the full

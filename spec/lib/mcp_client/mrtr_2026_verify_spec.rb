@@ -314,8 +314,11 @@ end
 RSpec.describe 'MCP 2026-07-28 MRTR verification — pacing, logs and plain HTTP' do
   include MrtrVerifyHelpers
 
+  # Round 7: waits are bounded by the transport's read timeout when the caller
+  # names none, and the curve this example pins runs to 22.5s of them — so the
+  # transport is given the room, and the bound is pinned in round 7's own file.
   it 'caps the growing retry delay instead of doubling without bound' do
-    server = modern_stdio
+    server = modern_stdio(read_timeout: 120)
     responses = [{ 'result' => discover_result }]
     7.times { |i| responses << { 'result' => input_required(nil, state: "s#{i}") } }
     responses << { 'result' => { 'content' => [] } }

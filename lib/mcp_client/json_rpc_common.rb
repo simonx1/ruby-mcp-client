@@ -929,7 +929,7 @@ module MCPClient
       round_trips = 0
       delay = INPUT_RETRY_DELAY
       started = input_wait_clock
-      deadline = timeout ? started + timeout : nil
+      deadline = input_wait_deadline(started, timeout)
       while MCPClient::JsonRpcCommon.result_type(result) == 'input_required'
         # Read on the wire spelling, whatever the transport's JSON middleware
         # did to the keys: a symbolized inputRequests/requestState would
@@ -957,7 +957,7 @@ module MCPClient
           wait = InputRequiredWait.new(rpc_method: method, round_trip: round_trips, delay: delay,
                                        request_state: result['requestState'], result: result,
                                        elapsed: now - started)
-          delay = pace_input_round_trip(wait, deadline, now)
+          delay = pace_input_round_trip(wait, deadline)
         end
         result = yield(retry_params)
       end

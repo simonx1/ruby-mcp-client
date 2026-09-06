@@ -59,10 +59,26 @@ metadata). Each feature lands in its own PR; this section accumulates them.
   parties SHOULD validate sampling message content (client/sampling
   "Security Considerations"): a message without a `"user"`/`"assistant"`
   role or without content, a user message mixing tool results with other
-  content, and an assistant tool use not answered by the user message that
-  follows it are refused with
+  content, an assistant tool use not answered by the user message that
+  follows it (the last message included), and a content block of a known
+  type without the fields that type needs — a `text` block with no text, an
+  `image` or `audio` block with no data or mimeType, a `tool_use` with no
+  `id`, a `tool_result` with no `toolUseId` — are refused with
   `-32602` on a 2025-11-25 session and fail the round trip locally on a
-  2026-07-28 one, and the host's sampler is never invoked for them.
+  2026-07-28 one, and the host's sampler is never invoked for them. Two
+  identifiers that are merely absent no longer correlate a use with a
+  result. A block of a type this client does not know is passed through: the
+  content types are an open set, and refusing one would break a session with
+  a server using a type added after this release. The refusal names the
+  block's type, never its content.
+- **An out-of-band wait is bounded by the timeout its request runs under.**
+  A call that named no `timeout:` still runs under the transport's
+  configured `read_timeout`, and that now bounds its waits as an explicit
+  timeout does; the time the host's own `on_input_required_wait` control
+  spends deciding counts against the bound, so a control that deliberates
+  for most of the timeout can no longer buy a full pause and another request
+  on top of it. A transport that configures no read timeout is unbounded as
+  before, with the round-trip ceiling as its only limit.
 - **Limits and errors.** More than 10 consecutive `input_required` answers,
   an input request this client cannot honour (unknown method, no handler,
   handler error) or a malformed `inputRequests` raise

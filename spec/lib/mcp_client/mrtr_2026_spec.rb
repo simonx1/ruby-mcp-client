@@ -540,8 +540,11 @@ RSpec.describe 'MCP 2026-07-28 multi round-trip requests — pacing and URL mode
     sent
   end
 
+  # Round 7: an unbounded wait is bounded by the transport's read timeout when
+  # the caller names none; the growth curve is what this example pins, so its
+  # transport is given room for the 3.5s of pauses it walks through.
   it 'paces retries of requestState-only answers with a growing delay' do
-    server = MCPClient::ServerStdio.new(command: 'echo test', read_timeout: 1)
+    server = MCPClient::ServerStdio.new(command: 'echo test', read_timeout: 60)
     delays = []
     allow(server).to receive(:sleep) { |d| delays << d }
     script_stdio(server, [{ 'result' => discover_result },

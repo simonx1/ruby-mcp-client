@@ -85,8 +85,11 @@ RSpec.describe 'MCP 2026-07-28 multi round-trip requests — round 6' do
   end
 
   describe 'the out-of-band wait is the host\'s to steer' do
+    # Round 7: the waits are bounded by the transport's read timeout when the
+    # caller names none, and this example paces through 1.5s of them — so the
+    # transport is given room for what the example is about.
     it 'asks the host before each paced retry and waits by default' do
-      stdio = modern_stdio
+      stdio = modern_stdio(read_timeout: 30)
       waits = []
       stdio.on_input_required_wait { |wait| waits << wait }
       sent = script_stdio(stdio, [{ 'result' => discover_result }, { 'result' => state_only('s1') },
@@ -179,8 +182,11 @@ RSpec.describe 'MCP 2026-07-28 multi round-trip requests — round 6' do
     end
 
     it 'bounds the wait by the request timeout and hands back the continuation' do
-      stdio = modern_stdio
-      clock = [0.0, 0.0, 0.6, 1.3, 2.5]
+      stdio = modern_stdio(read_timeout: 30)
+      # Two readings a round from round 7 on: one for the wait's own elapsed,
+      # one after the host's control returns, which is what the pause is
+      # measured from. Round 1 pauses at 0.0; round 2 is over the 1.0 bound.
+      clock = [0.0, 0.0, 0.0, 0.6, 0.6]
       allow(stdio).to receive(:input_wait_clock) { clock.shift || 9.0 }
       sent = script_stdio(stdio, [{ 'result' => discover_result }, { 'result' => state_only('s1') },
                                   { 'result' => state_only('s2') }, { 'result' => state_only('s3') },

@@ -1710,9 +1710,7 @@ module MCPClient
     # @return [Array(String, nil), Array(nil, Array<String>)] the problem, or the tool uses now pending
     def sampling_message_problem(message, index, pending)
       blocks = sampling_message_blocks(message)
-      unless blocks
-        return ["message #{index} must be an object with a role of \"user\" or \"assistant\" and content", nil]
-      end
+      return [sampling_shape_problem(message, index), nil] unless blocks
 
       role = message['role'] || message[:role]
       uses = blocks.select { |block| sampling_block_type(block) == 'tool_use' }
@@ -1747,6 +1745,25 @@ module MCPClient
       "message #{index} tool results do not match the tool uses of message #{index - 1}"
     end
 
+    # Which half of the message's shape is wrong, so the host is told what to
+    # look at: the envelope, or a content block that carries no meaning.
+    # @param message [Object] a sampling message
+    # @param index [Integer] its position
+    # @return [String] the problem
+    def sampling_shape_problem(message, index)
+      blocks = message.is_a?(Hash) ? (message['content'] || message[:content]) : nil
+      blocks = [blocks] if blocks.is_a?(Hash)
+      if blocks.is_a?(Array)
+        bad = blocks.find { |block| !sampling_block_well_formed?(block) }
+        if bad
+          type = sampling_block_type(bad)
+          named = type ? "a #{type.inspect} content block" : 'a content block'
+          return "message #{index} carries #{named} without the fields its type requires"
+        end
+      end
+      "message #{index} must be an object with a role of \"user\" or \"assistant\" and content"
+    end
+
     # @param message [Object] a sampling message
     # @return [Array<Hash>, nil] its content blocks, nil unless the message is well formed
     def sampling_message_blocks(message)
@@ -1754,9 +1771,40 @@ module MCPClient
 
       blocks = message['content'] || message[:content]
       blocks = [blocks] if blocks.is_a?(Hash)
-      return nil unless blocks.is_a?(Array) && !blocks.empty? && blocks.all? { |block| sampling_block_type(block) }
+      return nil unless blocks.is_a?(Array) && !blocks.empty?
+      return nil unless blocks.all? { |block| sampling_block_well_formed?(block) }
 
       blocks
+    end
+
+    # The fields a content block of a known type must carry for the message
+    # rules to mean anything: the text of a text block, the payload of an
+    # image or audio block, and — the reason the correlation rules can be
+    # checked at all — the identifier of a tool use and of the tool result
+    # answering it. A type this client does not know is the host's to read,
+    # not this client's to refuse: refusing it would break a session with a
+    # server using a content type added after this release.
+    # @param block [Object] a content block
+    # @return [Boolean] whether the block can be handed to the host
+    def sampling_block_well_formed?(block)
+      type = sampling_block_type(block)
+      return false unless type
+
+      case type
+      when 'text' then sampling_block_string?(block, 'text')
+      when 'image', 'audio' then sampling_block_string?(block, 'data') && sampling_block_string?(block, 'mimeType')
+      when 'tool_use' then sampling_block_string?(block, 'id')
+      when 'tool_result' then sampling_block_string?(block, 'toolUseId')
+      else true
+      end
+    end
+
+    # @param block [Hash] a content block
+    # @param field [String] the field it must carry
+    # @return [Boolean] whether the field is a non-empty String
+    def sampling_block_string?(block, field)
+      value = block[field] || block[field.to_sym]
+      value.is_a?(String) && !value.empty?
     end
 
     # @param block [Object] a content block
