@@ -196,7 +196,13 @@ RSpec.describe 'MCP 2026-07-28 multi round-trip requests' do
       sent = script_stdio(server, responses)
 
       expect(server.call_tool('t', {})['content'].first['text']).to eq('finally')
-      expect(sent.count { |r| r['method'] == 'tools/call' }).to eq(11)
+      calls = sent.select { |r| r['method'] == 'tools/call' }
+      expect(calls.size).to eq(11)
+      # Every continuation carries the fulfilled answer and the state; the
+      # scripted queue would otherwise be satisfied by state-only retries.
+      expect(calls.drop(1).map { |r| r['params']['inputResponses'] })
+        .to all(eq({ 'a' => { 'action' => 'accept', 'content' => { 'name' => 'x' } } }))
+      expect(calls.drop(1).map { |r| r['params']['requestState'] }).to all(eq('opaque-state'))
     end
 
     it 'gives up on the eleventh round trip' do
@@ -206,8 +212,12 @@ RSpec.describe 'MCP 2026-07-28 multi round-trip requests' do
       sent = script_stdio(server, responses)
 
       expect { server.call_tool('t', {}) }.to raise_error(MCPClient::Errors::InputRequiredError, /round trips/)
-      # Eleven requests: the original plus the ten permitted continuations.
-      expect(sent.count { |r| r['method'] == 'tools/call' }).to eq(11)
+      # Eleven requests: the original plus the ten permitted continuations,
+      # each of them carrying the fulfilled answer.
+      calls = sent.select { |r| r['method'] == 'tools/call' }
+      expect(calls.size).to eq(11)
+      expect(calls.drop(1).map { |r| r['params']['inputResponses'] })
+        .to all(eq({ 'a' => { 'action' => 'accept', 'content' => { 'name' => 'x' } } }))
     end
 
     it 'raises InputRequiredError without retrying when an input request cannot be fulfilled' do
