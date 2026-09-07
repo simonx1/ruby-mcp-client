@@ -41,7 +41,7 @@ with a revision it cannot speak (supported: `2025-11-25`, `2025-06-18`,
 - **Sampling**: Server-requested LLM completions with modelPreferences
 - **Completion**: Autocomplete for prompts/resources with context
 - **Logging**: Server log messages with level filtering
-- **Tasks**: Task-augmented `tools/call` — create with a `ttl`, poll `tasks/get`, retrieve via `tasks/result`, plus `tasks/list` and `tasks/cancel`
+- **Tasks**: Task-augmented `tools/call` — declare the `io.modelcontextprotocol/tasks` extension, poll `tasks/get`, answer `inputRequests` with `tasks/update`, and `tasks/cancel`. On 2025-11-25 servers the earlier surface (a requested `ttl`, `tasks/result`, `tasks/list`) is still spoken
 - **Audio**: Audio content type support
 - **Progress & Cancellation**: `progressToken` plumbing with per-call callbacks; automatic `notifications/cancelled` for abandoned requests
 - **Metadata**: `icons`, `title` and `_meta` parsed on tools, prompts and resources
@@ -377,7 +377,12 @@ client = MCPClient::Client.new(
   mcp_server_configs: [...],
   validate_structured_content: :strict # raises MCPClient::Errors::ValidationError on violation
 )
-# Task-delivered results (get_task_result) are not validated yet.
+# A task-delivered result (get_task_result) is validated the same way when the
+# task is named with a Task handle: the handle call_tool_as_task returns carries
+# the definition its creating call went out under, and every handle of that task
+# keeps it — the one a get_task refresh returns, and the one a wait_for_task
+# hands back. A bare task ID identifies no tool, so a result fetched by ID is
+# not validated.
 ```
 
 A result is checked against the tool definition the request that produced it
@@ -567,27 +572,42 @@ Try it locally: `python3 examples/echo_server_streamable.py &` then
 `./examples/tasks_example.rb` runs the full lifecycle against a task-capable
 demo server.
 
+On MCP 2026-07-28 the client must declare the extension for the server to be
+allowed to answer with a task at all:
+
 ```ruby
+client = MCPClient.create_client(mcp_server_configs: [...],
+                                 extensions: ['io.modelcontextprotocol/tasks'])
+
 tool = client.find_tool('long_job')
 tool.supports_task?   # execution.taskSupport is optional/required?
 
-# Create the task (returns immediately); ttl is the requested lifetime in ms
-task = client.call_tool_as_task('long_job', { input: 'data' }, ttl: 60_000)
+# Create the task (returns immediately). The server sets the lifetime it
+# grants (ttlMs) and the pace it wants to be polled at (pollIntervalMs).
+task = client.call_tool_as_task('long_job', { input: 'data' })
 
-# Poll until the task reaches a terminal (or input-required) status,
-# honoring the server's suggested poll interval
+# Drive the whole lifecycle: polls tasks/get at the server's pace, answers
+# any inputRequests through your elicitation/sampling handlers with
+# tasks/update, and returns the finished task.
+finished = client.wait_for_task(task)
+result = finished.result               # the CallToolResult the task produced
+
+# Or step it yourself
 until task.terminal? || task.input_required?
   sleep((task.poll_interval || 1000) / 1000.0)
   task = client.get_task(task)          # tasks/get, routed to the task's own server
 end
+result = client.get_task_result(task)   # read from tasks/get on 2026-07-28
 
-# Retrieve the underlying result (e.g. a CallToolResult) via tasks/result
-result = client.get_task_result(task)
-
-# List and cancel tasks
-page = client.list_tasks               # { tasks: [...], next_cursor: ... }
-client.cancel_task(task)               # tasks/cancel
+client.cancel_task(task)                # tasks/cancel
 ```
+
+On a 2026-07-28 server `tasks/result` and `tasks/list` are gone: the outcome
+is read from `tasks/get`, `client.list_tasks` raises, and a `ttl:` passed to
+`call_tool_as_task` is ignored (the server grants `ttlMs`). Against a
+2025-11-25 server the earlier surface still applies — `ttl:` is sent,
+`get_task_result` uses `tasks/result`, and `client.list_tasks` pages
+`tasks/list`.
 
 Task IDs are only unique within the server that issued them, so pass the `Task`
 returned by `call_tool_as_task` — it carries its own server. A bare task ID also
@@ -602,6 +622,22 @@ client.on_notification do |server, method, params|
   puts "Task #{params['taskId']} -> #{params['status']}" if method == 'notifications/tasks/status'
 end
 ```
+
+Notifications announce; they do not drive. A `notifications/tasks` (2026-07-28,
+on a `listen` stream) that carries `inputRequests` reaches the listeners exactly
+as it arrived — the client answers input requests only inside `wait_for_task`
+(and `call_tool`), or when the host sends the answers itself with
+`update_task`. A host that follows a task through notifications hands it to
+`wait_for_task` when it wants the requests answered.
+
+Handles outlive a process only as far as the host keeps them: `task.to_h`
+serializes a handle, and `MCPClient::Task.from_json(hash, server: server)` (or
+the bare `taskId` with `server:`) names the same task in another client, which
+can `get_task`, `wait_for_task` or `cancel_task` it. Every handle a creation, a
+`get_task` refresh, a `wait_for_task` or a cancellation hands back within one
+client also names the *lifetime* of its task: once the server has handed the
+same id to a new task, that handle raises `TaskReplacedError` instead of
+reaching the replacement.
 
 ### Elicitation (Server-initiated user interactions)
 
@@ -1062,7 +1098,11 @@ than the peer's:
   chunks. Server configurations are logged with credential-bearing keys redacted.
 - **Host exceptions are not reflected to the server.** A raising elicitation,
   sampling or roots handler yields a constant JSON-RPC error message; the detail
-  stays in your local log.
+  stays in your local log. When a server asks for several inputs at once (MCP
+  2026-07-28 multi round-trip requests) and one of them fails, the answers your
+  handler already produced are kept rather than thrown away: a task's poll loop
+  sends them with its next `tasks/update` and never puts an answered request to
+  your handler a second time.
 
 ## Requirements
 

@@ -29,6 +29,16 @@ RSpec.describe MCPClient::HttpTransportBase do
         { 'result' => 'test' }
       end
 
+      # The session-epoch counter the transports inherit from ServerBase:
+      # the module moves it whenever a session ends.
+      def session_epoch
+        @session_epoch || 0
+      end
+
+      def bump_session_epoch
+        @session_epoch = session_epoch + 1
+      end
+
       # Stub ensure_connected
       def ensure_connected
         # no-op for testing

@@ -23,7 +23,16 @@ require_relative 'mcp_client/server_sse'
 require_relative 'mcp_client/server_http'
 require_relative 'mcp_client/server_streamable_http'
 require_relative 'mcp_client/server_factory'
+require_relative 'mcp_client/client/task_support'
+require_relative 'mcp_client/client/task_api'
 require_relative 'mcp_client/client'
+
+# The tasks extension's SubscriptionFilter field (extensions/tasks
+# "Subscriptions"): `taskIds`, beyond the four published core fields. Known
+# to the filter from the start so a host can spell it before declaring the
+# extension; MCPClient::Client#listen still refuses it on a client that has
+# not declared the extension.
+MCPClient::Subscription.register_filter_field('taskIds', :string_array, alias_name: 'task_ids')
 require_relative 'mcp_client/version'
 require_relative 'mcp_client/config_parser'
 require_relative 'mcp_client/auth'
@@ -133,7 +142,8 @@ module MCPClient
       client = Client.new(
         mcp_server_configs: configs,
         logger: options[:logger],
-        sampling_handler: options[:sampling_handler]
+        sampling_handler: options[:sampling_handler],
+        extensions: options[:extensions]
       )
 
       # Connect all servers
@@ -171,7 +181,8 @@ module MCPClient
       client = Client.new(
         mcp_server_configs: [config],
         logger: options[:logger],
-        sampling_handler: options[:sampling_handler]
+        sampling_handler: options[:sampling_handler],
+        extensions: options[:extensions]
       )
       client.servers.first.connect
       client

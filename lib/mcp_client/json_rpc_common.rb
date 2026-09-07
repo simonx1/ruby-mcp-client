@@ -16,6 +16,7 @@ require_relative 'result_caching'
 require_relative 'request_metadata'
 require_relative 'round_trip_marker'
 require_relative 'result_completeness'
+require_relative 'session_pin'
 
 module MCPClient
   # Shared retry/backoff logic for JSON-RPC transports
@@ -31,6 +32,10 @@ module MCPClient
     # The `_meta` a request carries, the fingerprint a cached result is bound
     # to, and the evaluation a cache decision holds for the request it leads to.
     include RequestMetadata
+    # Requests may be pinned to the session they belong to (see SessionPin).
+    include SessionPin
+
+    # Input requests of a multi-round tool call (see InputRoundTrips).
 
     # JSON-RPC methods with arbitrary side effects that MUST NOT be re-sent
     # automatically. Even a "transient" failure (5xx, dropped connection,
@@ -38,7 +43,9 @@ module MCPClient
     # so a retry could execute the operation twice — and JSON-RPC has no
     # idempotency key to make the duplicate safe. Callers who want to retry
     # such an operation must decide that explicitly.
-    NON_IDEMPOTENT_METHODS = %w[tools/call].freeze
+    # tasks/update (MCP 2026-07-28 tasks extension) delivers one-shot input
+    # responses: a replay could advance a task twice.
+    NON_IDEMPOTENT_METHODS = %w[tools/call tasks/update].freeze
 
     # Execute the block with retry/backoff for transient errors only.
     #
@@ -541,6 +548,7 @@ module MCPClient
       end
 
       reject_input_required_discover!(result)
+      reject_task_result_discover!(result)
       versions = result['supportedVersions']
       unless versions.is_a?(Array) && versions.all?(String)
         raise MCPClient::Errors::ConnectionError, 'server/discover result has no supportedVersions list'
@@ -674,9 +682,16 @@ module MCPClient
     # Generate initialization parameters for MCP protocol
     # @return [Hash] the initialization parameters
     def initialization_params
+      # Extension negotiation is a 2026-07-28 mechanism (basic/versioning
+      # "Extension Negotiation", carried in every modern request's _meta):
+      # the 2025-11-25 handshake has no such capability, and an extension
+      # defined for 2026-07-28 (the tasks extension, say) is not advertised
+      # to a server that negotiates the legacy protocol.
+      capabilities = client_capabilities
+      capabilities.delete('extensions')
       {
         'protocolVersion' => MCPClient::PROTOCOL_VERSION,
-        'capabilities' => client_capabilities,
+        'capabilities' => capabilities,
         'clientInfo' => client_info_payload
       }
     end
@@ -787,6 +802,29 @@ module MCPClient
     # the others were introduced with the discriminator itself.
     LEGACY_RESULT_TYPES = %w[complete].freeze
 
+    # The MCP 2026-07-28 tasks extension (extensions/tasks): once declared in
+    # the per-request clientCapabilities, a server MAY answer a supported
+    # request with a CreateTaskResult (resultType "task").
+    TASKS_EXTENSION = 'io.modelcontextprotocol/tasks'
+
+    # Requests the tasks extension allows a CreateTaskResult for. "A client
+    # that receives CreateTaskResult in response to an unsupported request
+    # type MUST interpret this as an invalid response".
+    TASK_METHODS = %w[tools/call].freeze
+
+    # @return [Boolean] whether the host declared the tasks extension
+    def tasks_extension_declared?
+      declared_extensions.key?(TASKS_EXTENSION)
+    end
+
+    # The result types this client implements on top of the core ones, per
+    # extension: declaring the tasks extension makes a CreateTaskResult
+    # (resultType "task") an accepted answer on the requests it allows.
+    # @return [Hash{String => Array<String>}]
+    def implemented_extension_result_types
+      { TASKS_EXTENSION => ['task'] }
+    end
+
     # The resultType of a result object. MCP 2026-07-28 makes the field
     # required, but "for backward compatibility with servers implementing
     # earlier protocol versions, which do not include resultType, clients
@@ -835,16 +873,6 @@ module MCPClient
 
       extra = implemented_extension_result_types.select { |id, _| declared_extensions.key?(id) }.values.flatten
       extra.empty? ? CORE_RESULT_TYPES : (CORE_RESULT_TYPES + extra).uniq.freeze
-    end
-
-    # The result types of the extensions this client implements, by
-    # extension identifier: what a declared extension may widen the accepted
-    # result types with. The core client implements none; a transport that
-    # implements a result-type-adding extension (the tasks extension, say)
-    # overrides this.
-    # @return [Hash{String => Array<String>}]
-    def implemented_extension_result_types
-      {}
     end
 
     # Which request field mirrors into the Mcp-Name header (MCP 2026-07-28
@@ -933,13 +961,6 @@ module MCPClient
     INPUT_RETRY_DELAY = 0.5
     INPUT_RETRY_MAX_DELAY = 5
 
-    # Input request methods and the transport callback that fulfils each.
-    INPUT_REQUEST_HANDLERS = {
-      'elicitation/create' => :@elicitation_request_callback,
-      'sampling/createMessage' => :@sampling_request_callback,
-      'roots/list' => :@roots_list_request_callback
-    }.freeze
-
     # Drive a request through the multi round-trip pattern (MCP 2026-07-28
     # basic/patterns/mrtr): while the server answers with an
     # InputRequiredResult, fulfil its inputRequests through the registered
@@ -998,6 +1019,7 @@ module MCPClient
         result = yield(retry_params)
       end
       mark_round_trip_result(round_trips.positive?)
+      reject_task_result_on_unsupported_method!(method, result)
       result
     rescue MCPClient::Errors::InputRequiredError => e
       # Every failure of the round trip hands the continuation back: the
@@ -1006,6 +1028,45 @@ module MCPClient
       e.request_params ||= params
       e.transport ||= self
       raise
+    end
+
+    # A CreateTaskResult is only a valid answer to the request types the
+    # tasks extension covers (TASK_METHODS); anywhere else it is an invalid
+    # response (extensions/tasks "Capability Negotiation").
+    # @param method [String] the JSON-RPC method
+    # @param result [Object] the final result
+    # @return [void]
+    # @raise [MCPClient::Errors::InvalidResultError]
+    def reject_task_result_on_unsupported_method!(method, result)
+      return unless MCPClient::JsonRpcCommon.result_type(result) == 'task'
+      return if TASK_METHODS.include?(method)
+
+      raise MCPClient::Errors::InvalidResultError,
+            "Invalid result: resultType \"task\" is only valid for #{TASK_METHODS.join(', ')}, not #{method}"
+    end
+
+    # server/discover is not one of the request types the tasks extension
+    # covers, so a CreateTaskResult there is invalid and MUST NOT be applied:
+    # the probe would otherwise adopt a protocol version and install
+    # capabilities out of a task creation, and the discovery-shaped members a
+    # non-conforming server bolted onto it would override the discriminator.
+    # The ordinary rejection ({#reject_task_result_on_unsupported_method!})
+    # runs in the round-trip resolver, which discovery does not go through.
+    #
+    # Like the input_required sibling this is a ModernServerError, not an
+    # InvalidResultError: resultType is a 2026-07-28 field, so a server that
+    # answered with one is modern and the era is settled — it must never be
+    # retried with the initialize handshake, nor sent on to the legacy
+    # transports by MCPClient.connect.
+    # @param result [Object] the server/discover result
+    # @return [void]
+    # @raise [MCPClient::Errors::ModernServerError] if the result is a CreateTaskResult
+    def reject_task_result_discover!(result)
+      return unless MCPClient::JsonRpcCommon.result_type(result) == 'task'
+
+      raise MCPClient::Errors::ModernServerError,
+            'Server answered server/discover with a task result; resultType "task" is ' \
+            "only valid for #{TASK_METHODS.join(', ')}"
     end
 
     # Notifications the 2026-07-28 revision removed; never written to a

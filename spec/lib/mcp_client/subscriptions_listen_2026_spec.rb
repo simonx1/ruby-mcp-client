@@ -576,9 +576,12 @@ RSpec.describe 'MCP 2026-07-28 subscriptions/listen' do
                                                 resource_subscriptions: ['a'], resources_list_changed: false }))
         .to eq({ 'toolsListChanged' => true, 'promptsListChanged' => true, 'resourceSubscriptions' => ['a'],
                  'resourcesListChanged' => false })
-      # The published SubscriptionFilter has four members; the tasks
-      # extension registers its own (see round 13).
-      expect { described_class.normalize_filter({ task_ids: ['t'] }) }.to raise_error(ArgumentError, /Unknown/)
+      # The published SubscriptionFilter has four members; an extension
+      # registers its own (see round 13). This branch implements the tasks
+      # extension, so taskIds is registered and normalizes like the rest;
+      # a field nothing registered is still refused.
+      expect(described_class.normalize_filter({ task_ids: ['t'] })).to eq({ 'taskIds' => ['t'] })
+      expect { described_class.normalize_filter({ made_up_field: ['t'] }) }.to raise_error(ArgumentError, /Unknown/)
       expect { described_class.normalize_filter({ tools_list_changed: 'yes' }) }.to raise_error(ArgumentError)
       expect { described_class.normalize_filter({ resource_subscriptions: 'a' }) }.to raise_error(ArgumentError)
       expect { described_class.normalize_filter(nil) }.to raise_error(ArgumentError)

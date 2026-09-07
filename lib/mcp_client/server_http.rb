@@ -243,7 +243,7 @@ module MCPClient
       session_id = response.headers['mcp-session-id'] || response.headers['Mcp-Session-Id']
       if session_id
         if valid_session_id?(session_id)
-          @session_id = session_id
+          capture_session_id(session_id)
           @logger.debug("Captured session ID: #{@session_id}")
         else
           @logger.warn("Invalid session ID format received: #{session_id.inspect}")
@@ -602,6 +602,10 @@ module MCPClient
     # Clean up the server connection
     # Properly closes HTTP connections and clears cached state
     def cleanup
+      # Only an established session ends a task's namespace; a sessionless
+      # (MCP 2026-07-28) connection is merely closed, and a connection that
+      # never came up has nothing to end — see #ending_session?.
+      bump_session_epoch if ending_session?
       @mutex.synchronize do
         # Attempt to terminate session before cleanup
         terminate_session if @session_id

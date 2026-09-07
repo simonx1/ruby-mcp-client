@@ -1000,6 +1000,16 @@ module MCPClient
       buffer.clear
     end
 
+    # Whether #cleanup ends a session: only a 2025-11-25 handshake opens
+    # one, and only once it completed. A stateless 2026-07-28 peer, a
+    # process that never got through its handshake and a probe still in
+    # flight leave nothing session-scoped behind — task ids and their
+    # bookkeeping stay what they are for the process that comes next.
+    # @return [Boolean]
+    def ending_session?
+      @initialized && !modern_peer?
+    end
+
     # Clean up the server connection
     # Closes all stdio handles and terminates any running processes and threads
     # following the MCP 2025-11-25 stdio shutdown sequence (basic/lifecycle.mdx):
@@ -1078,6 +1088,15 @@ module MCPClient
       @transport_lock.synchronize do
         return nil unless @stdin && generation == @transport_generation
 
+        # Past this point the reader threads speak for a transport that is
+        # being dismantled on purpose: their EOF must not retire whatever
+        # replaces it. A 2025-11-25 handshake opened a session that ends
+        # with the process. A stateless 2026-07-28 peer holds none: a task it
+        # created outlives the connection exactly as it does over sessionless
+        # HTTP, so the process that replaces this one is asked about it
+        # rather than the task being written off as gone with a session that
+        # never existed.
+        bump_session_epoch if ending_session?
         @transport_generation += 1
         claimed = TornDownTransport.new(generation: @transport_generation, stdin: @stdin, stdout: @stdout,
                                         stderr: @stderr, wait_thread: @wait_thread, reader_thread: @reader_thread,

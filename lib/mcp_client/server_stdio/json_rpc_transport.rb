@@ -704,6 +704,7 @@ module MCPClient
         # result has validated.
         result = process_jsonrpc_response(res, method: 'server/discover')
         reject_input_required_discover!(result)
+        reject_task_result_discover!(result)
         unless discover_result?(result)
           raise invalid_discover_answer(modern_answer, 'answered without a DiscoverResult')
         end
@@ -878,6 +879,12 @@ module MCPClient
       # @raise [MCPClient::Errors::TransportError] on write errors
       def send_request(req, generation = nil, io: @stdin)
         @logger.debug("Sending JSONRPC request: #{describe_jsonrpc_message(req)}")
+        # A request pinned to a session that has since ended is not written at
+        # all: its payload names something else in the replacement session.
+        # The pin is read outside the transport lock (the two locks never
+        # nest); a restart completing between this check and the write moves
+        # the transport generation, which the locked check below catches.
+        @mutex.synchronize { check_session_pin! }
         @transport_lock.synchronize do
           # A replacement whose negotiation has not completed is not current
           # either, whatever its generation says: an ordinary request written
@@ -885,9 +892,19 @@ module MCPClient
           return :replaced if generation && (generation != @transport_generation || @negotiating)
           raise IOError, 'the server process is gone' unless io
 
+          # The write goes to the pipe this request was recorded against,
+          # never to whichever pipe the transport holds by now.
           io.puts(req.to_json)
         end
         :sent
+      rescue MCPClient::Errors::SessionChangedError, MCPClient::Errors::TaskReplacedError
+        # A refusal, not a failure: the pin (or the caller's own pre-write
+        # guard, see {MCPClient::SessionPin#guarded_writes}) turned the write
+        # down. Nothing was written, nothing will answer this id, and the
+        # refusal keeps its type — a definite "this request is not to be
+        # sent" must not reach the caller as an ambiguous transport failure.
+        @mutex.synchronize { @awaiting.delete(req['id']) } if req.is_a?(Hash) && req['id']
+        raise
       rescue StandardError => e
         # A request that failed to send will never receive a response, so drop
         # its awaiting marker; otherwise a broken transport (e.g. the server
@@ -1020,6 +1037,10 @@ module MCPClient
       # @yieldparam version [String, nil] the protocol version the request declares
       # @return [Object] result from the JSON-RPC response
       def send_request_and_wait(method, params, timeout)
+        # As late as a request pinned to a session can be held back: every
+        # reconnect on the way here (ensure_initialized, a retry after the
+        # child exited) has happened by now.
+        check_session_pin!
         req_id, = send_on_current_transport(method, params) do |built|
           clear_response_received_at if respond_to?(:clear_response_received_at, true)
           yield declared_protocol_version(built) if block_given?

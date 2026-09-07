@@ -8,6 +8,10 @@ end
 require 'rspec'
 $LOAD_PATH.unshift File.expand_path('../lib', __dir__)
 require 'mcp_client'
+
+# The MCP 2026-07-28 tasks extension identifier, shared by the tasks specs so
+# that every one of them runs on its own as well as in the suite.
+TASKS_EXT = MCPClient::JsonRpcCommon::TASKS_EXTENSION unless defined?(TASKS_EXT)
 require 'webmock/rspec'
 require 'vcr'
 require 'openai'

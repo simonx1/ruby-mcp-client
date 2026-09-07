@@ -1,16 +1,27 @@
 # frozen_string_literal: true
 
+require_relative 'errors'
+
 module MCPClient
-  # Fulfilling the InputRequests of an unfinished answer (MCP 2026-07-28
-  # multi round-trip requests). There is no per-key error channel in
-  # InputResponses, so a request this client cannot honour fails the whole
-  # round trip rather than answering part of it.
+  # Fulfilment of the input requests an `input_required` result carries
+  # (MCP 2026-07-28 multi-round tool requests). Mixed into
+  # {MCPClient::JsonRpcCommon}, whose host supplies the registered handlers.
   module InputRoundTrips
-    private
+    # Input request methods and the transport callback that fulfils each.
+    INPUT_REQUEST_HANDLERS = {
+      'elicitation/create' => :@elicitation_request_callback,
+      'sampling/createMessage' => :@sampling_request_callback,
+      'roots/list' => :@roots_list_request_callback
+    }.freeze
 
     # Fulfil every input request through the handler registered for its
     # method. There is no per-key error channel in InputResponses, so any
     # request this client cannot honour fails the whole round trip.
+    #
+    # The answers produced before the failure travel with the error
+    # ({MCPClient::Errors::InputRequiredError#answered_so_far}): a request the
+    # host already answered has been put to a person, and a caller that can
+    # keep it — the tasks extension's poll loop — must not ask them again.
     # @param input_requests [Hash] the InputRequests map
     # @param result [Hash] the InputRequiredResult (for error data)
     # @return [Hash] the InputResponses map
@@ -21,9 +32,13 @@ module MCPClient
                                                         data: result)
       end
 
-      input_requests.to_h do |key, request|
-        [key, fulfil_input_request(key, request, result)]
+      responses = {}
+      input_requests.each do |key, request|
+        responses[key] = fulfil_input_request(key, request, result)
+      rescue MCPClient::Errors::InputRequiredError => e
+        raise e.with_answered_so_far(responses)
       end
+      responses
     end
 
     # @param key [String] the server-assigned request key
@@ -41,7 +56,7 @@ module MCPClient
 
       request_method = request['method']
       shown_method = sanitize_log_text(request_method.inspect)
-      handler_ivar = MCPClient::JsonRpcCommon::INPUT_REQUEST_HANDLERS[request_method]
+      handler_ivar = INPUT_REQUEST_HANDLERS[request_method]
       unless handler_ivar
         raise MCPClient::Errors::InputRequiredError.new(
           "Unsupported input request method #{shown_method} for key #{shown_key}", data: result
@@ -53,6 +68,7 @@ module MCPClient
           '(the capability was not declared)', data: result
         )
       end
+
       if undeclared_sampling_tool_use?(request_method, request['params'])
         raise MCPClient::Errors::InputRequiredError.new(
           "Server requested tool-enabled #{shown_method} (key #{shown_key}) but the sampling.tools " \

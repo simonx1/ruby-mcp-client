@@ -12,6 +12,7 @@ require_relative 'http_transport_base/era_detection'
 require_relative 'http_transport_base/listen_stream'
 require_relative 'http_transport_base/cache_support'
 require_relative 'http_transport_base/tool_listing'
+require_relative 'http_transport_base/session_recovery'
 
 require_relative 'http_transport_base/param_headers'
 require_relative 'http_transport_base/stream_recovery'
@@ -31,6 +32,7 @@ module MCPClient
     include ListenStream
     include CacheSupport
     include ToolListing
+    include SessionRecovery
 
     # Lightweight response wrapper for Faraday exception payloads (Hashes),
     # so the exception path and the default path share one challenge pipeline.
@@ -189,6 +191,12 @@ module MCPClient
 
       return true unless @session_id
 
+      # The session is over from here whatever the DELETE answers (every
+      # outcome below clears the id), and it ends without a #cleanup: the
+      # epoch moves so nothing keyed by it — the tasks extension's task ids,
+      # answered and pending input keys — outlives it into the session the
+      # next request establishes, which may reuse those very ids.
+      bump_session_epoch
       conn = http_connection
 
       begin
@@ -218,29 +226,6 @@ module MCPClient
         @session_id = nil
         false
       end
-    end
-
-    # Resend a request against the freshly restarted session — unless doing so
-    # could execute a side effect twice.
-    #
-    # A 404 usually means the server rejected the request outright, but it does
-    # not prove that: a session can expire after the tool ran. Automatic
-    # session recovery is worth having for idempotent methods, and would
-    # otherwise be a hole straight through the no-replay guarantee that
-    # with_retry enforces for NON_IDEMPOTENT_METHODS.
-    #
-    # Raises ConnectionError (which with_retry never retries) so no other path
-    # can turn this into a second attempt.
-    # @param request [Hash] the JSON-RPC request that hit the expired session
-    # @return [Faraday::Response] the response to the resent request
-    # @raise [MCPClient::Errors::ConnectionError] for a non-idempotent method
-    def resend_after_session_restart(request)
-      method = request['method']
-      return send_http_request(request) unless NON_IDEMPOTENT_METHODS.include?(method)
-
-      raise MCPClient::Errors::ConnectionError,
-            "Session expired during #{method}; a new session was started but the request was NOT resent " \
-            'because it may already have executed. Retry it explicitly if that is safe.'
     end
 
     # Validate session ID format
@@ -295,6 +280,64 @@ module MCPClient
     attr_reader :discover_timeout
 
     private
+
+    # Whether tearing this connection down ends an MCP session — and with it
+    # the namespace a task id and an input request key live in.
+    #
+    # A legacy transport's session is the one `initialize` opened (named by
+    # Mcp-Session-Id when the server assigned one, unnamed otherwise): closing
+    # the connection ends it, the next request opens another with a fresh
+    # handshake, and the server may hand the ids of the old one out again — so
+    # the epoch must move. MCP 2026-07-28 removed the handshake and the
+    # session with it: a modern transport is sessionless (it never sends an
+    # Mcp-Session-Id — this client only ever captures one from an initialize
+    # response, which a modern server does not send), a task lives for its own
+    # ttlMs in the server's own id namespace, and a reconnect resumes exactly
+    # what was there before. Ending the connection there is not a task
+    # namespace reset: throwing away the answered keys and the undelivered
+    # tasks/update of a task that is still alive would ask the host to answer
+    # an input request twice and drop an answer the server never confirmed,
+    # and it would make the task's own handles refuse tasks/get, tasks/update
+    # and tasks/cancel for a session that never existed. A modern server that
+    # does hand a task id out again is handled where it happens, by the task
+    # registry's per-creation lifetime.
+    # A 2025-11-25 session is the one the server assigned with an
+    # Mcp-Session-Id, and assigning one is optional ("Session Management"): a
+    # legacy server that never sent the header kept no session state for this
+    # client, so there is nothing for a cleanup to end there either, and its
+    # durable tasks — and the handles naming them — outlive the connection
+    # exactly as a modern server's do. What decides is therefore the session
+    # id itself, not the era; the era only decides while it is still unknown,
+    # when a session may yet be assigned and the connection counts as
+    # session-bearing until the probe settles.
+    # @return [Boolean]
+    def session_bearing_connection?
+      !@session_id.nil? || protocol_era.nil?
+    end
+
+    # Whether #cleanup ends a session. A transport nothing was ever sent
+    # through has none to end: a first connect failing on its way, or a
+    # transport a host restored a task handle into before anything was sent
+    # — and until the era is known the connection counts as session-bearing,
+    # so without this the epoch would move on that first connect and the
+    # restored handle be refused for a session that never existed (and, on a
+    # sessionless 2026-07-28 server, never will).
+    # @return [Boolean]
+    def ending_session?
+      session_bearing_connection? && (@connection_established || @initialized)
+    end
+
+    # Store the session id a handshake established. A handshake that lands a
+    # different id on a live session replaced it — the 404 recovery is only
+    # one way there, and none of them goes through #cleanup — so the epoch
+    # moves with it: task ids and input keys are per session and reusable,
+    # and nothing the previous one recorded may colour the next.
+    # @param session_id [String] the validated id the server assigned
+    # @return [void]
+    def capture_session_id(session_id)
+      bump_session_epoch if @session_id && @session_id != session_id
+      @session_id = session_id
+    end
 
     # Validate and store the protocol-mode options shared by the HTTP transports.
     # @param protocol [Symbol] :auto, :modern or :legacy
@@ -411,6 +454,7 @@ module MCPClient
       # — unless it carries a resultType, which only a modern server writes
       # (see #invalid_discover_answer).
       reject_input_required_discover!(result)
+      reject_task_result_discover!(result)
       raise invalid_discover_answer(result, 'answered without a DiscoverResult') unless discover_result?(result)
 
       apply_discover_result(result)
@@ -493,11 +537,20 @@ module MCPClient
     # @raise [MCPClient::Errors::TransportError] if response isn't valid JSON
     # @raise [MCPClient::Errors::ToolCallError] for other errors during request execution
     def send_jsonrpc_request(request, timeout: nil, deadline: nil, extra_headers: {})
+      # As late as a request pinned to a session can be held back: every
+      # reconnect on the way here (ensure_connected, a retry after the
+      # connection dropped) has happened by now.
+      check_session_pin!
       @logger.debug("Sending JSON-RPC request: #{describe_jsonrpc_message(request)}")
 
       begin
         exchange_jsonrpc(request, timeout: timeout, deadline: deadline, extra_headers: extra_headers)
-      rescue MCPClient::Errors::ConnectionError, MCPClient::Errors::TransportError, MCPClient::Errors::ServerError
+      # A pre-write refusal keeps its type: the late pin check inside
+      # #send_http_request turns a request down (or the caller's own guard
+      # does, see {MCPClient::SessionPin#guarded_writes}) and nothing was
+      # written, which is not an error of executing the request.
+      rescue MCPClient::Errors::ConnectionError, MCPClient::Errors::TransportError,
+             MCPClient::Errors::ServerError, MCPClient::Errors::TaskReplacedError
         raise
       rescue JSON::ParserError => e
         raise MCPClient::Errors::TransportError, "Invalid JSON response from server: #{describe_parse_error(e)}"
@@ -542,7 +595,15 @@ module MCPClient
       conn = http_connection
       # The session id this request goes out with: a later 404 is attributed
       # to it, not to a fresh session another caller established meanwhile.
-      sent_session_id = @mutex.synchronize { @session_id }
+      # The pin is re-checked in the same critical section: a cleanup or a
+      # reconnect completing between the check in #send_jsonrpc_request and
+      # this capture would otherwise select the session that replaced the
+      # one the request belongs to (the epoch is bumped before the session
+      # is torn down and re-established under this monitor).
+      sent_session_id = @mutex.synchronize do
+        check_session_pin!
+        @session_id
+      end
       timeout, deadline = request_bounds(timeout, deadline)
       # ResponseBodyCapture fills this in as the body arrives, so the bytes
       # that made it are still here when Faraday raises instead of returning.
@@ -623,17 +684,7 @@ module MCPClient
       # socket and stalls the TLS handshake never delivers a byte for the
       # deadline check to see.
       req.options.timeout = req.options.open_timeout = timeout if timeout
-      # The wire header must match the captured id exactly: a restart
-      # completing between capture and header attachment would otherwise
-      # attach a different (or fresh) session than the one attributed to
-      # this request at 404-handling time.
-      if req.headers.key?('Mcp-Session-Id')
-        if sent_session_id
-          req.headers['Mcp-Session-Id'] = sent_session_id
-        else
-          req.headers.delete('Mcp-Session-Id')
-        end
-      end
+      apply_captured_session_id(req, request, sent_session_id)
       req.body = request.to_json
     end
 
@@ -668,33 +719,6 @@ module MCPClient
         end
         message.is_a?(Hash) && !message.key?('method') &&
           (message['id'] == request_id || message['id'].to_s == request_id.to_s)
-      end
-    end
-
-    # Start a new session after the server invalidated the current one, then
-    # resend the original request once. The @restarting_session flag prevents
-    # a second restart if the fresh session also answers 404.
-    # @param request [Hash] the JSON-RPC request that hit the expired session
-    # @param expired_session_id [String] the session id the 404'd request was sent with
-    # @return [Faraday::Response] the response to the resent request
-    def restart_session_and_resend(request, expired_session_id)
-      # Serialized on the transport monitor so concurrent 404s trigger a
-      # single restart; the monitor is reentrant, so the nested
-      # perform_initialize/id generation inside is safe.
-      @mutex.synchronize do
-        # Recheck now that the monitor is held: another caller may already
-        # have restarted the session while this one waited. If so, skip the
-        # extra initialize and just resend against the fresh session.
-        return resend_after_session_restart(request) if @session_id != expired_session_id
-
-        @logger.warn("Session #{@session_id} no longer valid (HTTP 404); starting a new session")
-        @restarting_session = true
-        @session_id = nil
-        @last_event_id = nil if instance_variable_defined?(:@last_event_id)
-        perform_initialize
-        resend_after_session_restart(request)
-      ensure
-        @restarting_session = false
       end
     end
 
@@ -752,15 +776,29 @@ module MCPClient
         (error['message'] || error[:message]).is_a?(String)
     end
 
-    # Whether a 404 should trigger a session restart: only when the 404'd
-    # request was actually sent with a session id and no restart is already
-    # in flight (a restart's own resend answering 404 must not loop).
-    # @param sent_session_id [String, nil] session id captured when the request was sent
-    # @return [Boolean] true if session restart recovery applies
-    def session_restart_applicable?(sent_session_id)
-      return false if sent_session_id.nil?
+    # Put the captured session id on the wire, whatever @session_id says by
+    # now: the header must match the id this request was cleared for and is
+    # attributed to at 404-handling time. It is set (or removed)
+    # unconditionally — #apply_request_headers reads @session_id outside the
+    # monitor, so a concurrent recovery that nils it (a 404 restart running
+    # its replacement handshake) would otherwise send this pinned request
+    # with no session header at all, where the server may run it in another
+    # session. The handshake that establishes a session carries none.
+    # @param req [Faraday::Request] the request being built
+    # @param request [Hash] the JSON-RPC request
+    # @param sent_session_id [String, nil] the session id captured under the monitor
+    # @return [void]
+    def apply_captured_session_id(req, request, sent_session_id)
+      return if request['method'] == 'initialize'
 
-      @mutex.synchronize { !@restarting_session }
+      # A modern session has none at all -- the client MUST NOT send
+      # Mcp-Session-Id -- so what such a request was cleared for is "no
+      # session", whatever a non-conforming server got itself recorded.
+      if sent_session_id && !modern?
+        req.headers['Mcp-Session-Id'] = sent_session_id
+      else
+        req.headers.delete('Mcp-Session-Id')
+      end
     end
 
     # Build the ServerError for a 4xx surfaced as a Faraday::ClientError by
