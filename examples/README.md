@@ -62,7 +62,7 @@ handshake, no session id, no GET event stream.
 
 | Example | What it shows |
 |---------|---------------|
-| `mcp_2026_07_28_features.rb` | Era detection, cacheable results (`ttlMs` / `cacheScope`), structured output, `x-mcp-header` parameters, the three typed errors |
+| `mcp_2026_07_28_features.rb` | Era detection, cacheable results (`ttlMs` / `cacheScope`), structured output, `x-mcp-header` parameters, the three typed errors, and the tasks extension |
 | `subscriptions_listen_example.rb` | `subscriptions/listen` streams — what the server acknowledged, what it refused, notifications, graceful close |
 | `multi_round_trip_example.rb` | `resultType: "input_required"` answered by the elicitation handler, and `InputRequiredError` without one |
 

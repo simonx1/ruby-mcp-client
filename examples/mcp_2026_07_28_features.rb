@@ -120,6 +120,34 @@ begin
     check("#{trigger} raises #{klass.name.split('::').last}", false, "got #{e.class}: #{e.message[0, 60]}")
   end
 
+  # --- 6. Tasks extension -------------------------------------------------
+  # Tasks are an extension in this revision: the server offers it in
+  # discovery, the client declares it, and only then may a tools/call be
+  # answered with a task handle instead of a result. A client that declares
+  # nothing gets an ordinary result from the same tool.
+  section('6. Tasks extension')
+  tasked = MCPClient::Client.new(
+    mcp_server_configs: [MCPClient.streamable_http_config(base_url: server_url)],
+    extensions: ['io.modelcontextprotocol/tasks'],
+    logger: logger
+  )
+  begin
+    handle = tasked.call_tool_as_task('slow_build', { 'target' => 'app' })
+    failures << 'task handle' unless check('tools/call answered with a task', !handle.task_id.nil?,
+                                           "#{handle.task_id} (#{handle.status})")
+    finished = tasked.wait_for_task(handle, timeout: 30)
+    built = (finished.result['content'] || [])&.first&.fetch('text', nil)
+    failures << 'task result' unless check('polled to completion', finished.completed?, built)
+  ensure
+    tasked.cleanup
+  end
+
+  # The same tool, called by this client, which declared no extension.
+  plain = client.call_tool('slow_build', { 'target' => 'app' })
+  plain_text = (plain['content'] || plain[:content])&.first&.fetch('text', nil)
+  failures << 'task optional' unless check('undeclared client gets an ordinary result',
+                                           plain_text.to_s.include?('built'), plain_text)
+
   puts
   if failures.empty?
     puts '✅ MCP 2026-07-28 features demo completed successfully'

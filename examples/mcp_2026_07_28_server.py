@@ -63,6 +63,11 @@ META_CLIENT_INFO = "io.modelcontextprotocol/clientInfo"
 META_CLIENT_CAPS = "io.modelcontextprotocol/clientCapabilities"
 META_SERVER_INFO = "io.modelcontextprotocol/serverInfo"
 META_SUBSCRIPTION_ID = "io.modelcontextprotocol/subscriptionId"
+META_CLIENT_CAPS_EXTENSIONS = "extensions"
+
+# Tasks are negotiated per request: the server offers the extension in
+# discovery, and each request that wants task behaviour declares it back.
+TASKS_EXTENSION = "io.modelcontextprotocol/tasks"
 
 # JSON-RPC codes the 2026-07-28 revision adds.
 HEADER_MISMATCH = -32020
@@ -236,6 +241,11 @@ def handle_discover(request_id, params):
                 "tools": {"listChanged": True},
                 "resources": {"subscribe": True, "listChanged": True},
                 "prompts": {"listChanged": True},
+                # Tasks are an extension in this revision, and a client only
+                # accepts a task result from a server that negotiated it here.
+                # Without this the slow_build tool below is unreachable
+                # through the documented `extensions:` API.
+                "extensions": {TASKS_EXTENSION: {}},
             },
             "serverInfo": SERVER_INFO,
             "ttlMs": 60_000,
@@ -427,7 +437,28 @@ def run_task(task_id):
         }
 
 
-def slow_build_tool(request_id, arguments):
+def client_declared_tasks(params):
+    """Whether THIS request's client capabilities declare the tasks extension."""
+    caps = request_meta(params).get(META_CLIENT_CAPS) or {}
+    extensions = caps.get(META_CLIENT_CAPS_EXTENSIONS) or {}
+    return TASKS_EXTENSION in extensions
+
+
+def slow_build_tool(request_id, arguments, params):
+    # taskSupport is "optional", so this tool owes an ordinary result to a
+    # client that did not ask for task behaviour. Answering such a client with
+    # resultType "task" would leave work running that it may not accept and
+    # cannot collect: it rejects the unrecognized result type outright.
+    if not client_declared_tasks(params):
+        time.sleep(0.2)
+        return result(
+            request_id,
+            {
+                "content": [{"type": "text", "text": f"built {arguments.get('target', 'default')}"}],
+                "isError": False,
+            },
+        )
+
     task_id = f"task-{uuid.uuid4().hex[:8]}"
     created = now_iso()
     with tasks_lock:
@@ -456,6 +487,10 @@ def slow_build_tool(request_id, arguments):
 
 
 def handle_tasks_get(request_id, params):
+    if not client_declared_tasks(params):
+        return error(request_id, MISSING_CAPABILITY, "tasks/get needs the tasks extension",
+                     {"requiredCapabilities": {"extensions": {TASKS_EXTENSION: {}}}})
+
     task_id = (params or {}).get("taskId")
     with tasks_lock:
         task = tasks.get(task_id)
@@ -470,7 +505,9 @@ def handle_tasks_get(request_id, params):
             "pollIntervalMs": 200,
         }
         if task["status"] == "completed" and task["result"]:
-            payload.update(task["result"])
+            # A completed DetailedTask carries the tool's result as a nested
+            # `result` object, not merged into the task itself.
+            payload["result"] = task["result"]
     return result(request_id, payload)
 
 
@@ -485,7 +522,7 @@ def handle_tools_call(request_id, params):
     if name == "create_ticket":
         return create_ticket_tool(request_id, arguments, params)
     if name == "slow_build":
-        return slow_build_tool(request_id, arguments)
+        return slow_build_tool(request_id, arguments, params)
     return error(request_id, -32602, f"unknown tool: {name}")
 
 

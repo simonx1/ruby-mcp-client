@@ -77,20 +77,26 @@ begin
     puts "  ← #{method} #{round}"
   end
 
-  puts "\nClosing the subscription…"
-  subscription.close
-
-  # The server ends a subscription by answering the listen request; the client
-  # reports that as a graceful close rather than a dropped stream.
+  # This server ends the subscription itself once it has sent its three
+  # notifications: the response to the listen request IS the graceful end. A
+  # host that wants to stop earlier calls subscription.close instead, which
+  # ends the stream from this side.
+  puts "\nWaiting for the server to end the subscription…"
   deadline = Time.now + 5
   sleep 0.05 while !subscription.closed? && Time.now < deadline
+  subscription.close unless subscription.closed?
+
   puts "  state: #{subscription.state}"
+  puts "  ended by the server, gracefully: #{subscription.closed_gracefully?}"
 
   puts
-  if notifications.size >= 3 && subscription.closed?
+  # closed? alone would be true even if this side had given up on it, so the
+  # graceful flag is what says the server answered the listen request.
+  if notifications.size >= 3 && subscription.closed_gracefully?
     puts '✅ subscriptions/listen demo completed successfully'
   else
-    puts "❌ expected 3 notifications and a closed subscription, got #{notifications.size} and #{subscription.state}"
+    puts "❌ expected 3 notifications and a graceful close, got #{notifications.size} " \
+         "and #{subscription.state} (graceful: #{subscription.closed_gracefully?})"
     exit 1
   end
 rescue StandardError => e
