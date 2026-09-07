@@ -278,7 +278,9 @@ RSpec.describe 'MCP 2026-07-28 multi round-trip requests — round 5' do
                                                        'x-mcp-header' => lock.synchronize { headers[name] } } } }
             { 'name' => name, 'inputSchema' => schema }
           end
-          json_response(body['id'], { 'tools' => tools })
+          # Hinted: a hint-less modern list is re-read ahead of every call on
+          # this branch, which would hide the one-refresh-per-call count.
+          json_response(body['id'], { 'tools' => tools, 'ttlMs' => 60_000 })
         when 'tools/call'
           name = body['params']['name']
           first = lock.synchronize do

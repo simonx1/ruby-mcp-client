@@ -50,7 +50,10 @@ module MCPClient
           # A continuation is a request of its own and gets its own budget --
           # the wait before it is bounded separately (see InputWaits).
           budget = timeout || @read_timeout
-          deadline = budget && (monotonic_now + budget)
+          # The real monotonic clock, never the stubbable #monotonic_now the
+          # caching layer exposes: a test that freezes cache time must not
+          # make every request's deadline expire on arrival.
+          deadline = budget && (Process.clock_gettime(Process::CLOCK_MONOTONIC) + budget)
           stream_reissued = false
           header_refreshed = header_refresh_done
           begin
@@ -131,7 +134,7 @@ module MCPClient
       # @yield the host code
       # @return [Object] the block's value
       def dispatching_to_host(&)
-        called_tool_definition_slot(&)
+        outside_called_tool_definition(&)
       rescue StandardError => e
         e.extend(NestedExchange) unless e.frozen?
         raise

@@ -157,11 +157,15 @@ module MCPClient
         register_pending_request(request['id'])
 
         begin
+          clear_response_received_at if respond_to?(:clear_response_received_at, true)
           response = post_json_rpc_request(request)
 
           if @use_sse
+            # Dated by check_for_result from the stream's arrival time.
             wait_for_sse_result(request, timeout: timeout)
           else
+            # Dated from receipt, before the body is decoded.
+            note_response_received_at if respond_to?(:note_response_received_at, true)
             parse_direct_response(response)
           end
         rescue MCPClient::Errors::ConnectionError, MCPClient::Errors::TransportError, MCPClient::Errors::ServerError
@@ -194,6 +198,7 @@ module MCPClient
         @mutex.synchronize do
           @pending_request_ids.delete(request_id)
           @sse_results.delete(request_id)
+          @sse_result_arrivals&.delete(request_id)
         end
       end
 
@@ -262,8 +267,14 @@ module MCPClient
             h.delete('Accept')
             h.delete('Cache-Control')
           end).each { |k, v| req.headers[k] = v }
+          # MCP 2026-07-28 caching: the result is bound to the credentials
+          # this very request carries.
+          if respond_to?(:note_request_authorization, true)
+            note_request_authorization(authorization_header_value(req.headers))
+          end
           req.body = request.to_json
         end
+        note_sent_authorization(response) if respond_to?(:note_sent_authorization, true)
 
         msg = "Received JSON-RPC response: #{response.status}"
         msg += " (#{describe_body_size(response.body)})" if response.respond_to?(:body)
@@ -330,28 +341,35 @@ module MCPClient
       def check_for_result(request_id)
         arrived = false
         result = nil
+        arrival = nil
         @mutex.synchronize do
           if @sse_results.key?(request_id)
             arrived = true
             result = @sse_results.delete(request_id)
           end
+          arrival = @sse_result_arrivals&.delete(request_id)
         end
         return NO_RESULT unless arrived
 
-        record_activity
-        # SseParser#process_response? stores JSON-RPC error responses under
-        # the Symbol :error key; deliver them to the caller as ServerError
-        # (MCP lifecycle "Error Handling") instead of timing out.
-        raise_sse_error_response(result[:error]) if result.is_a?(Hash) && result.key?(:error)
-        # …and an envelope that carried neither member under :no_answer.
-        if result.is_a?(Hash) && result[:no_answer]
-          raise MCPClient::Errors::InvalidResultError,
-                "Invalid result: the response to request #{request_id} carried neither a result nor an error member"
+        if arrived
+          record_activity
+          note_response_received_at(arrival || monotonic_now) if respond_to?(:note_response_received_at, true)
+          # SseParser#process_response? stores JSON-RPC error responses under
+          # the Symbol :error key; deliver them to the caller as ServerError
+          # (MCP lifecycle "Error Handling") instead of timing out.
+          raise_sse_error_response(result[:error]) if result.is_a?(Hash) && result.key?(:error)
+          # …and an envelope that carried neither member under :no_answer.
+          if result.is_a?(Hash) && result[:no_answer]
+            raise MCPClient::Errors::InvalidResultError,
+                  "Invalid result: the response to request #{request_id} carried neither a result nor an error member"
+          end
+          # Same resultType invariant as process_jsonrpc_response on the
+          # other transports: an unrecognized value is an invalid response.
+          validate_result_type!(result)
+          return result
         end
-        # Same resultType invariant as process_jsonrpc_response on the
-        # other transports: an unrecognized value is an invalid response.
-        validate_result_type!(result)
-        result
+
+        nil
       end
 
       # The legacy HTTP+SSE transport never negotiates a modern revision, so

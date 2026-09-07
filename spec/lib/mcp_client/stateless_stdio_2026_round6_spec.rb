@@ -342,11 +342,16 @@ RSpec.describe 'MCP 2026-07-28 stateless protocol (stdio) — round 6' do
                              { 'result' => discover_result(capabilities: { 'completions' => {} }) },
                              { 'result' => completion }
                            ])
-      # Discovered at 100.0; the first gate at 100.999 is fresh, the second
-      # at exactly 101.0 is not.
-      allow(server).to receive(:discovery_clock).and_return(100.0, 100.999, 101.0, 101.0)
+      # The first call discovers, at 100.0, so the deadline is 101.0: the
+      # gate at 100.999 is still fresh and refuses locally, the one at
+      # exactly 101.0 is not and discovers again.
+      clock = { now: 100.0 }
+      allow(server).to receive(:monotonic_now) { clock[:now] }
 
       expect { server.complete(ref: prompt_ref, argument: argument) }.to raise_error(MCPClient::Errors::CapabilityError)
+      clock[:now] = 100.999
+      expect { server.complete(ref: prompt_ref, argument: argument) }.to raise_error(MCPClient::Errors::CapabilityError)
+      clock[:now] = 101.0
       expect(server.complete(ref: prompt_ref, argument: argument)['values']).to eq(['ada'])
       expect(methods_in(written)).to eq(%w[server/discover server/discover completion/complete])
     end
@@ -373,10 +378,14 @@ RSpec.describe 'MCP 2026-07-28 stateless protocol (stdio) — round 6' do
 
     it 'exposes the freshness deadline through discovery_fresh? across the boundary' do
       wire_stdio(server, [{ 'result' => discover_result(extra: { 'ttlMs' => 500 }) }])
-      allow(server).to receive(:discovery_clock).and_return(10.0, 10.4, 10.5)
+      # Received at 10.0, so the deadline is 10.5.
+      clock = { now: 10.0 }
+      allow(server).to receive(:monotonic_now) { clock[:now] }
       server.ping
 
+      clock[:now] = 10.4
       expect(server.discovery_fresh?).to be(true)
+      clock[:now] = 10.5
       expect(server.discovery_fresh?).to be(false)
     end
   end

@@ -920,8 +920,13 @@ module MCPClient
           # timeout so neither @pending nor @awaiting accumulates entries.
           msg = @pending.delete(id)
           transport_gone = @transport_retired || !dropped_requests.delete?(id).nil?
+          arrival = (@response_arrivals ||= {}).delete(id)
           @awaiting.delete(id)
-          return msg if msg
+          if msg
+            # The response's receipt time is the reader's, not this wake-up.
+            note_response_received_at(arrival || monotonic_now) if respond_to?(:note_response_received_at, true)
+            return msg
+          end
 
           if transport_gone
             raise MCPClient::Errors::TransportError,
@@ -949,23 +954,6 @@ module MCPClient
       # @raise [MCPClient::Errors::ServerError] if server returns an error
       # @raise [MCPClient::Errors::TransportError] on transport errors
       # @raise [MCPClient::Errors::ToolCallError] on tool call errors
-      # Like {ServerBase#require_capability!}, except that a modern server's
-      # capabilities come from a DiscoverResult with a freshness hint: one
-      # whose ttlMs has elapsed (a zero ttlMs is "immediately stale") is
-      # refreshed on the next access before the capability is judged at all
-      # (server/utilities/caching) — the server may have enabled the
-      # capability since, or withdrawn one the stale result still lists.
-      # @param path [Array<String, Symbol>] capability key path
-      # @param method [String] the JSON-RPC method the caller wants to send
-      # @raise [MCPClient::Errors::CapabilityError]
-      def require_capability!(*path, method:)
-        if modern? && !discovery_fresh?
-          @logger.debug("The server/discover result is stale; refreshing it before #{method}")
-          rpc_request('server/discover')
-        end
-        super
-      end
-
       def rpc_request(method, params = {}, timeout: nil)
         freshly_probed = !@initialized || transport_retired?
         ensure_initialized
@@ -1033,6 +1021,7 @@ module MCPClient
       # @return [Object] result from the JSON-RPC response
       def send_request_and_wait(method, params, timeout)
         req_id, = send_on_current_transport(method, params) do |built|
+          clear_response_received_at if respond_to?(:clear_response_received_at, true)
           yield declared_protocol_version(built) if block_given?
         end
         begin

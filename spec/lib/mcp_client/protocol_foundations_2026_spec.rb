@@ -308,6 +308,9 @@ RSpec.describe 'MCP 2026-07-28 protocol foundations' do
 
       def stub_read_error(code, message)
         allow(server).to receive(:rpc_request).and_raise(MCPClient::Errors::ServerError.new(message, code: code))
+        # The read path establishes the session before it snapshots the cache epoch
+        allow(server).to receive(:ensure_connected) if server.respond_to?(:ensure_connected, true)
+        allow(server).to receive(:ensure_initialized) if server.respond_to?(:ensure_initialized, true)
       end
 
       include_examples 'maps resource-not-found codes'
@@ -318,6 +321,9 @@ RSpec.describe 'MCP 2026-07-28 protocol foundations' do
 
       def stub_read_error(code, message)
         allow(server).to receive(:rpc_request).and_raise(MCPClient::Errors::ServerError.new(message, code: code))
+        # The read path establishes the session before it snapshots the cache epoch
+        allow(server).to receive(:ensure_connected) if server.respond_to?(:ensure_connected, true)
+        allow(server).to receive(:ensure_initialized) if server.respond_to?(:ensure_initialized, true)
       end
 
       include_examples 'maps resource-not-found codes'
@@ -328,6 +334,9 @@ RSpec.describe 'MCP 2026-07-28 protocol foundations' do
 
       def stub_read_error(code, message)
         allow(server).to receive(:rpc_request).and_raise(MCPClient::Errors::ServerError.new(message, code: code))
+        # The read path establishes the session before it snapshots the cache epoch
+        allow(server).to receive(:ensure_connected) if server.respond_to?(:ensure_connected, true)
+        allow(server).to receive(:ensure_initialized) if server.respond_to?(:ensure_initialized, true)
       end
 
       include_examples 'maps resource-not-found codes'
@@ -556,6 +565,7 @@ RSpec.describe 'resource-not-found mapping is protocol-era aware' do
   it 'keeps a legacy server -32602 as ResourceReadError' do
     server = MCPClient::ServerHTTP.new(base_url: 'https://example.com')
     server.instance_variable_set(:@protocol_version, '2025-11-25')
+    allow(server).to receive(:ensure_connected)
     allow(server).to receive(:rpc_request).and_raise(MCPClient::Errors::ServerError.new('Invalid params',
                                                                                         code: -32_602))
 
@@ -565,6 +575,7 @@ RSpec.describe 'resource-not-found mapping is protocol-era aware' do
   it 'maps a modern server -32602 to ResourceNotFound' do
     server = MCPClient::ServerHTTP.new(base_url: 'https://example.com')
     server.instance_variable_set(:@protocol_version, '2026-07-28')
+    allow(server).to receive(:ensure_connected)
     allow(server).to receive(:rpc_request).and_raise(MCPClient::Errors::ServerError.new('Resource not found',
                                                                                         code: -32_602))
 
@@ -731,6 +742,7 @@ RSpec.describe 'typed protocol errors survive the public transport methods' do
     it "propagates them from #{klass}#call_tool, #get_prompt and #read_resource" do
       server = klass.new(base_url: 'https://example.com')
       allow(server).to receive(:rpc_request).and_raise(capability_error)
+      allow(server).to receive(:ensure_connected)
 
       expect { server.call_tool('t', {}) }.to raise_error(MCPClient::Errors::MissingRequiredClientCapabilityError)
       expect { server.get_prompt('p', {}) }.to raise_error(MCPClient::Errors::MissingRequiredClientCapabilityError)

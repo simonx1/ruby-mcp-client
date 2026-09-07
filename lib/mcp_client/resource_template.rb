@@ -1,9 +1,13 @@
 # frozen_string_literal: true
 
+require_relative 'deep_copy'
+
 module MCPClient
   # Representation of an MCP resource template
   # Resource templates allow servers to expose parameterized resources using URI templates
   class ResourceTemplate
+    include MCPClient::DeepCopy
+
     # @!attribute [r] uri_template
     #   @return [String] URI template following RFC 6570
     # @!attribute [r] name

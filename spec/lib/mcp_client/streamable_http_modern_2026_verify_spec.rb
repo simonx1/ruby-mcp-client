@@ -1441,7 +1441,13 @@ RSpec.describe 'MCP 2026-07-28 Streamable HTTP — a response stream that really
           when 'server/discover' then jsonrpc(message, discovery)
           when 'tools/list'
             broken['tools/list'] += 1
-            broken['tools/list'] == 1 ? MidStreamCloseServer::CLOSE_MID_STREAM : jsonrpc(message, { 'tools' => [] })
+            # A hint on the list: the re-issued call reads it back instead of
+            # asking for it again (cacheable results, on the branch above).
+            if broken['tools/list'] == 1
+              MidStreamCloseServer::CLOSE_MID_STREAM
+            else
+              jsonrpc(message, { 'tools' => [], 'ttlMs' => 60_000 })
+            end
           when 'tools/call'
             broken['tools/call'] += 1
             broken['tools/call'] == 1 ? MidStreamCloseServer::CLOSE_MID_STREAM : jsonrpc(message, { 'content' => [] })

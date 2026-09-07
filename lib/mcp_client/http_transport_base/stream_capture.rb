@@ -28,9 +28,9 @@ module MCPClient
       # @raise [MCPClient::Errors::RequestTimeoutError] when the deadline already passed
       def request_bounds(timeout, deadline)
         budget = timeout || @read_timeout
-        return [budget, budget && (monotonic_now + budget)] unless deadline
+        return [budget, budget && (Process.clock_gettime(Process::CLOCK_MONOTONIC) + budget)] unless deadline
 
-        remaining = deadline - monotonic_now
+        remaining = deadline - Process.clock_gettime(Process::CLOCK_MONOTONIC)
         raise MCPClient::Errors::RequestTimeoutError, 'Request timed out: its deadline has passed' if remaining <= 0
 
         [budget ? [budget, remaining].min : remaining, deadline]

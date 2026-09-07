@@ -407,7 +407,7 @@ RSpec.describe 'MCP 2026-07-28 MRTR verification — pacing, logs and plain HTTP
       when 'tools/list'
         schema = { 'type' => 'object',
                    'properties' => { 'region' => { 'type' => 'string', 'x-mcp-header' => header } } }
-        json_response(body['id'], { 'tools' => [{ 'name' => 'q', 'inputSchema' => schema }] })
+        json_response(body['id'], { 'tools' => [{ 'name' => 'q', 'inputSchema' => schema }], 'ttlMs' => 60_000 })
       when 'tools/call'
         headers_seen << request.headers
         if calls == 1
@@ -458,7 +458,7 @@ RSpec.describe 'MCP 2026-07-28 MRTR verification — pacing, logs and plain HTTP
       when 'tools/list'
         schema = { 'type' => 'object',
                    'properties' => { 'region' => { 'type' => 'string', 'x-mcp-header' => header } } }
-        json_response(body['id'], { 'tools' => [{ 'name' => 'q', 'inputSchema' => schema }] })
+        json_response(body['id'], { 'tools' => [{ 'name' => 'q', 'inputSchema' => schema }], 'ttlMs' => 60_000 })
       when 'tools/call'
         case calls
         when 1
@@ -968,6 +968,10 @@ RSpec.describe 'MCP 2026-07-28 MRTR verification — a continuation survives the
       bodies << body
       calls = bodies.count { |b| b['method'] == 'tools/call' }
       next json_response(body['id'], discover_result) if body['method'] == 'server/discover'
+      # The call reads tools/list for its headers, before the first attempt
+      # and again before the retry unless the list is bounded; only the call
+      # itself is answered with the round trip.
+      next json_response(body['id'], { 'tools' => [], 'ttlMs' => 60_000 }) if body['method'] == 'tools/list'
 
       result = if calls == 1
                  input_required({ 'a' => form_elicit_request }, state: 'st')

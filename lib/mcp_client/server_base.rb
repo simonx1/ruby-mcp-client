@@ -147,11 +147,47 @@ module MCPClient
     # @param method [String] the JSON-RPC method the caller wants to send
     # @raise [MCPClient::Errors::CapabilityError]
     def require_capability!(*path, method:)
+      # A DiscoverResult that may no longer be reused is re-fetched on the
+      # next use of what it declared (MCP 2026-07-28 caching: a stale result
+      # is re-fetched on access) BEFORE the capability is judged at all: the
+      # server may have enabled a capability the old result lacked, or
+      # withdrawn one it still lists.
+      if respond_to?(:modern?, true) && modern? && discovery_refresh_needed?
+        @logger&.debug("The server/discover result may not be reused; refreshing it before #{method}")
+        rpc_request('server/discover')
+      end
       return if capability?(*path)
 
       raise MCPClient::Errors::CapabilityError,
             "Server #{name || self.class.name} did not declare the #{path.join('.')} capability " \
             "required for #{method}"
+    end
+
+    # Whether the DiscoverResult behind the negotiated capabilities may still
+    # answer for the request about to go out.
+    #
+    # It is a cacheable result like any other, so it is bound by both of the
+    # caching rules the lists and reads obey: its ttlMs, counted from receipt
+    # (a result with no hint, or a zero, negative or malformed one, is stale
+    # at once), and — for a privately scoped result, which is what a server
+    # that declares no scope gets — the authorization context and effective
+    # parameters of the request that produced it. "Private responses MUST NOT
+    # be shared across authorization contexts (e.g. a different access token
+    # requires a different cache)", and the capabilities a server declares
+    # are exactly the kind of answer that differs between two tokens.
+    # @return [Boolean]
+    def discovery_refresh_needed?
+      return false unless respond_to?(:discovery_fresh?, true)
+      return true unless discovery_fresh?
+      return false unless respond_to?(:cache_fresh?, true)
+
+      reusable = cache_fresh?(:discover)
+      # The lookup holds the evaluation of the host's request_meta for the
+      # request it expected to follow. Nothing is sent when the result stands,
+      # so it is dropped rather than left on this thread for whichever request
+      # goes out next (see ResultCaching#release_serving_request_meta).
+      release_serving_request_meta if reusable && respond_to?(:release_serving_request_meta, true)
+      !reusable
     end
 
     # Clean up the server connection
@@ -290,7 +326,10 @@ module MCPClient
         items.concat(Array(page_items))
         pages += 1
 
-        break if next_cursor.nil? || next_cursor.to_s.empty?
+        # Only a missing (null) nextCursor ends the list: a cursor is opaque,
+        # and the empty string is one a server may hand out. A cursor handed
+        # out twice stops the walk below.
+        break if next_cursor.nil?
 
         if seen_cursors[next_cursor]
           @logger.warn("Pagination for #{kind} stopped: server returned a repeated cursor #{next_cursor.inspect}")
@@ -321,9 +360,95 @@ module MCPClient
     # @return [Array<Hash>] all raw item hashes collected across pages
     # @raise [MCPClient::Errors::TransportError] if a page result is not a Hash or Array
     def request_paginated_list(method, key)
-      collect_paginated(key) do |cursor|
+      # The cursor the page request now in flight carries, so a rejection can
+      # be told apart from an -32602 the first page's request earned.
+      page = { cursor: nil }
+      restarting_rejected_cursor(key, page) { collect_list_pages(method, key, page) }
+    end
+
+    # Collect a paginated list once more from its first page when the server
+    # rejects a cursor it had issued.
+    #
+    # MCP pagination: a cursor the server no longer accepts (-32602) ends the
+    # sequence the pages collected so far belong to, so the list is collected
+    # again from the beginning rather than failing a caller who only asked for
+    # a list. A second rejection is the server's answer and is raised, as is a
+    # rejection of the first page's own request — it carries no cursor.
+    # @param key [String] the result array key (for the log line)
+    # @param page [Hash] holds the cursor of the request in flight
+    # @yield collects every page of the list
+    # @return [Object] the block's value
+    def restarting_rejected_cursor(key, page)
+      restarted = false
+      begin
+        page[:cursor] = nil
+        yield
+      rescue MCPClient::Errors::ServerError => e
+        raise if restarted || !page[:cursor] || !cursor_rejected?(e)
+
+        @logger.warn("Pagination for #{key} restarted: the server rejected a cursor it had issued")
+        restarted = true
+        retry
+      end
+    end
+
+    # @param error [MCPClient::Errors::ServerError] a page request's failure
+    # @return [Boolean] whether it rejects the cursor the request carried
+    def cursor_rejected?(error)
+      respond_to?(:invalid_cursor_error?, true) && invalid_cursor_error?(error)
+    end
+
+    # Send one page request of an auto-paginated list, dropping the entry the
+    # list is cached under when the server rejects the cursor it carried.
+    #
+    # A cursor names a position in one sequence of pages: once the server has
+    # forgotten it, the pages cached from that sequence are gone with it, and
+    # a restart that then fails transiently must not serve them back. Only the
+    # entry goes — the fetch already collecting this list replaces the
+    # transport's own copy, and an invalidation of a fetch's own making is not
+    # a change the host has to hear about (which would restart that fetch).
+    # A rejection of the first page's request carries no cursor and says
+    # nothing about the cache, so it leaves it alone.
+    # @param kind [Symbol, nil] the list kind
+    # @param cursor [String, nil] the cursor this page request carries
+    # @yield sends the page request
+    # @return [Object] the block's value
+    def fetch_list_page(kind, cursor)
+      yield
+    rescue MCPClient::Errors::ServerError => e
+      raise unless kind && cursor && cursor_rejected?(e) && respond_to?(:invalidate_cache, true)
+
+      invalidate_cache(kind)
+      raise
+    end
+
+    # Collect every page of a list, recording what each page was answered
+    # under so the cache can bind the combined list to it.
+    # @param method [String] the list method
+    # @param key [String] the result array key
+    # @param page [Hash] holds the cursor of the request in flight
+    # @return [Array<Hash>] all raw item hashes collected across pages
+    def collect_list_pages(method, key, page)
+      pages = []
+      received_ats = []
+      contexts = []
+      fingerprints = []
+      page[:cursor] = nil
+      epoch = list_cache_epoch(method) if respond_to?(:list_cache_epoch, true)
+      kind = respond_to?(:list_kind_for, true) ? list_kind_for(method) : nil
+      items = collect_paginated(key) do |cursor|
         params = cursor ? { cursor: cursor } : {}
-        result = require_complete_result!(rpc_request(method, params), method)
+        started = respond_to?(:monotonic_now, true) ? monotonic_now : nil
+        page[:cursor] = cursor
+        # A cursor the server no longer accepts ends the sequence its pages
+        # belong to: what was cached under that sequence goes with it, so a
+        # restart that then fails cannot serve it back (MCP pagination).
+        answer = fetch_list_page(kind, cursor) { rpc_request(method, params) }
+        result = require_complete_result!(answer, method)
+        pages << result
+        received_ats << response_received_at(since: started) if respond_to?(:response_received_at, true)
+        contexts << (respond_to?(:request_authorization_context, true) ? request_authorization_context : nil)
+        fingerprints << (respond_to?(:request_params_fingerprint, true) ? request_params_fingerprint : nil)
         case result
         when Hash
           [result[key] || [], result['nextCursor']]
@@ -334,6 +459,22 @@ module MCPClient
                 "Invalid #{method} response: expected an object or array, got #{result.class}"
         end
       end
+      # MCP 2026-07-28 caching: every page carries its own ttlMs; the list is
+      # fresh only as long as its shortest-lived page, and pages fetched
+      # under differing credentials or parameters are never served combined.
+      if respond_to?(:record_list_cache_hint, true)
+        record_list_cache_hint(method, pages, received_ats, contexts: contexts, params: fingerprints, epoch: epoch)
+      end
+      items
+    end
+
+    # Whether a cached list of the given kind may still be served (MCP
+    # 2026-07-28 caching); transports without freshness hints keep caching
+    # until a change notification.
+    # @param _kind [Symbol]
+    # @return [Boolean]
+    def cache_fresh?(_kind)
+      true
     end
 
     # Initialize logger with proper formatter handling

@@ -10,11 +10,12 @@ require_relative 'http_transport_base/sse_event_scanner'
 require_relative 'http_transport_base/stream_capture'
 require_relative 'http_transport_base/era_detection'
 require_relative 'http_transport_base/listen_stream'
+require_relative 'http_transport_base/cache_support'
+require_relative 'http_transport_base/tool_listing'
 
 require_relative 'http_transport_base/param_headers'
 require_relative 'http_transport_base/stream_recovery'
 require_relative 'http_transport_base/request_recovery'
-require_relative 'http_transport_base/list_caches'
 
 module MCPClient
   # Base module for HTTP-based JSON-RPC transports
@@ -27,8 +28,9 @@ module MCPClient
     include ParamHeaders
     include StreamRecovery
     include RequestRecovery
-    include ListCaches
     include ListenStream
+    include CacheSupport
+    include ToolListing
 
     # Lightweight response wrapper for Faraday exception payloads (Hashes),
     # so the exception path and the default path share one challenge pipeline.
@@ -129,12 +131,25 @@ module MCPClient
 
     # Best-effort notifications/cancelled for a request the client stopped
     # waiting on. Failures are swallowed.
+    #
+    # It is sent for the abandoned request, on that request's own thread and
+    # after it, and it brings nothing back to cache: the credentials it
+    # carries are whatever the host holds by now -- a rotation, a refresh --
+    # and they must not stand in for the ones the abandoned request went out
+    # with, which are what its failure is judged by (MCP 2026-07-28 caching,
+    # cacheScope "private": a stale copy may be served only to the context
+    # the failed request itself carried).
     # @param request_id [Integer] id of the abandoned request
     # @return [void]
     def send_cancellation_notification(request_id)
       notif = build_jsonrpc_notification('notifications/cancelled',
                                          { 'requestId' => request_id, 'reason' => 'Request timed out' })
-      send_http_request(notif)
+      abandoned = recorded_request_authorization
+      begin
+        send_http_request(notif)
+      ensure
+        restore_request_authorization(abandoned)
+      end
     rescue StandardError => e
       @logger.debug("Failed to send cancellation notification: #{e.message}")
     end
@@ -185,6 +200,7 @@ module MCPClient
           req.headers['Mcp-Protocol-Version'] = @protocol_version if @protocol_version
           # MCP: authorization MUST be included in every HTTP request
           @oauth_provider&.apply_authorization(req)
+          note_request_authorization(authorization_header_value(req.headers))
         end
 
         if response.success?
@@ -375,7 +391,7 @@ module MCPClient
       # trickle of SSE keep-alives would never time out and every caller
       # waiting on the connection monitor would block with it. One deadline
       # covers the probe and its one re-issue.
-      deadline = @discover_timeout && (monotonic_now + @discover_timeout)
+      deadline = @discover_timeout && (Process.clock_gettime(Process::CLOCK_MONOTONIC) + @discover_timeout)
       result = begin
         send_discover_request(deadline)
       rescue MCPClient::Errors::ResponseStreamClosedError => e
@@ -433,11 +449,6 @@ module MCPClient
       send_jsonrpc_request(request, timeout: @discover_timeout, deadline: deadline)
     end
 
-    # @return [Float] a monotonic clock reading in seconds
-    def monotonic_now
-      Process.clock_gettime(Process::CLOCK_MONOTONIC)
-    end
-
     # @param result [Object] a JSON-RPC result
     # @return [Boolean] whether it has the DiscoverResult shape
     def discover_result?(result)
@@ -485,8 +496,7 @@ module MCPClient
       @logger.debug("Sending JSON-RPC request: #{describe_jsonrpc_message(request)}")
 
       begin
-        response = send_http_request(request, timeout: timeout, deadline: deadline, extra_headers: extra_headers)
-        parse_response(response, request)
+        exchange_jsonrpc(request, timeout: timeout, deadline: deadline, extra_headers: extra_headers)
       rescue MCPClient::Errors::ConnectionError, MCPClient::Errors::TransportError, MCPClient::Errors::ServerError
         raise
       rescue JSON::ParserError => e
@@ -503,37 +513,50 @@ module MCPClient
     # @param request [Hash] the JSON-RPC request
     # @return [Faraday::Response] the HTTP response
     # @raise [MCPClient::Errors::ConnectionError] if connection fails
+    # What an answered POST means: the session it was sent under may have
+    # expired, its body may have been cut short, it may carry an error, or it
+    # settles the request.
+    # @param response [Faraday::Response] the answer as it arrived
+    # @param request [Hash] the JSON-RPC message that was sent
+    # @param sent_session_id [String, nil] the session id the request carried
+    # @param capture [Hash] the capture state of this exchange
+    # @return [Faraday::Response] the response the caller settles on
+    def settle_http_response(response, request, sent_session_id, capture)
+      # MCP 2026-07-28 caching: the result is bound to the Authorization
+      # the request went out with, middleware included.
+      note_sent_authorization(response)
+
+      return restart_session_and_resend(request, sent_session_id) if expired_session?(response, sent_session_id)
+      # A body that stopped short of its Content-Length was cut on the way,
+      # exactly like a socket that died mid-body — it just did not raise.
+      return truncated_body_outcome(request, capture) if capture[:mcp_short_body]
+
+      handle_http_error_response(response) unless response.success?
+      handle_successful_response(response, request)
+
+      log_response(response)
+      response
+    end
+
     def send_http_request(request, timeout: nil, deadline: nil, extra_headers: {})
       conn = http_connection
-      # Capture the session id this request goes out with — the value
-      # apply_request_headers attaches — so a later 404 is attributed to the
-      # id that actually accompanied the request, not to whatever @session_id
-      # holds by 404-handling time (another caller may have completed a
-      # restart in between, and its fresh session must not be re-initialized).
+      # The session id this request goes out with: a later 404 is attributed
+      # to it, not to a fresh session another caller established meanwhile.
       sent_session_id = @mutex.synchronize { @session_id }
       timeout, deadline = request_bounds(timeout, deadline)
       # ResponseBodyCapture fills this in as the body arrives, so the bytes
       # that made it are still here when Faraday raises instead of returning.
       capture = { mcp_body_buffer: +'', mcp_deadline: deadline,
-                  mcp_stream_listener: response_stream_listener(request), mcp_inflate_limit: inflate_limit }
+                  mcp_stream_listener: response_stream_listener(request), mcp_inflate_limit: inflate_limit,
+                  mcp_response_id: (request['id'] if request.is_a?(Hash)) }
 
       begin
         response = with_request_watchdog(deadline) do
-          conn.post(@endpoint) do |req|
+          post_json_rpc(conn) do |req|
             prepare_http_request(req, request, sent_session_id, timeout, capture, extra_headers)
           end
         end
-
-        return restart_session_and_resend(request, sent_session_id) if expired_session?(response, sent_session_id)
-        # A body that stopped short of its Content-Length was cut on the way,
-        # exactly like a socket that died mid-body — it just did not raise.
-        return truncated_body_outcome(request, capture) if capture[:mcp_short_body]
-
-        handle_http_error_response(response) unless response.success?
-        handle_successful_response(response, request)
-
-        log_response(response)
-        response
+        settle_http_response(response, request, sent_session_id, capture)
       rescue Faraday::UnauthorizedError, Faraday::ForbiddenError => e
         handle_auth_error(e)
       rescue Faraday::ResourceNotFound => e
@@ -752,16 +775,34 @@ module MCPClient
       jsonrpc_error_from_http_response(response, "Client error: HTTP #{status} #{error.message}".strip)
     end
 
+    # POST a JSON-RPC request; a failure before any response records the
+    # Authorization the request went out with when Faraday kept it.
+    # @param conn [Faraday::Connection]
+    # @yield [Faraday::Request]
+    # @return [Faraday::Response]
+    def post_json_rpc(conn, &)
+      conn.post(@endpoint, &)
+    rescue Faraday::Error => e
+      note_failed_request_authorization(e)
+      raise
+    end
+
     # Apply headers to the HTTP request (can be overridden by subclasses)
     # @param req [Faraday::Request] HTTP request
     # @param _request [Hash] JSON-RPC request
     def apply_request_headers(req, request)
+      # The freshness probe models its request on the last method sent.
+      @probe_method = request['method'] if request.is_a?(Hash) && request['method'].is_a?(String)
       # Apply all headers including custom ones
       @headers.each { |k, v| req.headers[k] = v }
 
       # Apply OAuth authorization if available
       @logger.debug("OAuth provider present: #{@oauth_provider ? 'yes' : 'no'}")
       @oauth_provider&.apply_authorization(req)
+      note_request_authorization(authorization_header_value(req.headers))
+      # Middleware installed through faraday_config may still change the
+      # header: the context of this attempt is known once it was sent.
+      note_request_authorization_pending if @faraday_config
 
       # MCP 2026-07-28: every POST carries MCP-Protocol-Version (matching the
       # body's _meta), Mcp-Method and, for named requests, Mcp-Name.
@@ -928,11 +969,18 @@ module MCPClient
       # Apply user's Faraday customizations after defaults
       @faraday_config&.call(conn)
 
-      # Appended last, so it is the innermost handler: its on_complete puts
-      # the streamed body back before any user middleware (raise_error and
-      # friends) inspects it, and the retry middleware above it re-enters it
-      # on every attempt.
-      conn.builder.use(ResponseBodyCapture)
+      # Appended below any user middleware: the capture's on_complete puts the
+      # streamed body back before raise_error and friends inspect it, and the
+      # retry middleware above re-enters it on every attempt.
+      begin
+        conn.builder.use(ResponseBodyCapture)
+      rescue StandardError => e
+        @logger.debug("Could not install the response capture middleware: #{e.class}")
+      end
+      # Innermost of all, so its on_request sees the Authorization a request
+      # finally carries -- after the host's middleware has run (MCP 2026-07-28
+      # caching binds an entry to the credentials it was fetched with).
+      record_sent_authorization(conn)
 
       conn
     end

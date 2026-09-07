@@ -1,5 +1,7 @@
 # frozen_string_literal: true
 
+require_relative 'deep_copy'
+
 module MCPClient
   # Representation of MCP resource content
   # Resources can contain either text or binary data
@@ -43,6 +45,24 @@ module MCPClient
       @blob = blob
       @annotations = annotations
       @meta = meta
+    end
+
+    # A copy that shares nothing mutable with the original (cached contents
+    # are handed out as copies, so a caller's edits stay its own).
+    # @param source [ResourceContent]
+    # @return [void]
+    def initialize_copy(source)
+      super
+      @uri = source.uri.dup if source.uri
+      @name = source.name.dup if source.name
+      @title = source.title.dup if source.title
+      @mime_type = source.mime_type.dup if source.mime_type
+      @text = source.text.dup if source.text
+      @blob = source.blob.dup if source.blob
+      # Iterative: peer-supplied annotations or _meta may be nested deeper
+      # than the Ruby stack allows.
+      @annotations = MCPClient::DeepCopy.copy(source.annotations)
+      @meta = MCPClient::DeepCopy.copy(source.meta)
     end
 
     # Create a ResourceContent instance from JSON data

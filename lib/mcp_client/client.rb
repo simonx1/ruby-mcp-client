@@ -3,12 +3,17 @@
 require 'logger'
 require 'securerandom'
 require_relative 'client/sampling_validation'
+require_relative 'deep_copy'
+require_relative 'client/list_aggregation'
+require_relative 'client/cache_slices'
 
 module MCPClient
   # MCP Client for integrating with the Model Context Protocol
   # This is the main entry point for using MCP tools
   class Client
     include SamplingValidation
+    include ListAggregation
+    include CacheSlices
 
     # Elicitation modes implemented by this client (MCP 2025-11-25).
     # Requests with a mode outside this set are rejected with -32602.
@@ -102,6 +107,22 @@ module MCPClient
       # tools/list_changed).
       @tool_cache_generation = 0
       @cache_mutex = Mutex.new
+      # The effective-parameter fingerprint each server's slice of a list
+      # cache was filled under (MCP 2026-07-28 caching: a result is served
+      # only to a request that would carry the same parameters).
+      @cache_params = Hash.new { |h, k| h[k] = {}.compare_by_identity }
+      # Which servers have filled their slice of a list cache, so a snapshot
+      # is known to be complete however few items it holds: a server that
+      # legitimately lists nothing must be served from the cache too, not
+      # asked again on every call.
+      @cache_filled = {}
+      # One lock for the list caches and their parameter tags: a freshness
+      # check and the copy it approves are one snapshot, and the notification
+      # thread's clears wait for it.
+      @cache_mutex = Mutex.new
+      # Bumped by every write under @cache_mutex, so a freshness verdict
+      # reached outside the lock can be revalidated before a copy is served.
+      @cache_version = 0
       # Active progressToken -> callback registrations (MCP progress utility)
       @progress_callbacks = {}
       @progress_mutex = Mutex.new
@@ -147,29 +168,14 @@ module MCPClient
     # @raise [MCPClient::Errors::ConnectionError] on authorization failures
     # @raise [MCPClient::Errors::PromptGetError] if no prompts could be retrieved from any server
     def list_prompts(cache: true)
-      return @prompt_cache.values if cache && !@prompt_cache.empty?
-
-      prompts = []
-      connection_errors = []
-
-      servers.each do |server|
-        server.list_prompts.each do |prompt|
-          cache_key = cache_key_for(server, prompt.name)
-          @prompt_cache[cache_key] = prompt
-          prompts << prompt
+      holding_request_meta('prompts/list') do
+        if cache && (snapshot = cached_snapshot(:prompts, @prompt_cache))
+          release_held_request_meta
+          return snapshot
         end
-      rescue MCPClient::Errors::ConnectionError => e
-        # Fast-fail on authorization errors for better user experience
-        # If this is the first server or we haven't collected any prompts yet,
-        # raise the auth error directly to avoid cascading error messages
-        raise e if e.message.include?('Authorization failed') && prompts.empty?
 
-        # Store the error and try other servers
-        connection_errors << e
-        @logger.error("Server error: #{e.message}")
+        collect_prompts_from_servers(cache)
       end
-
-      prompts
     end
 
     # Gets a specific prompt by name with the given parameters
@@ -227,44 +233,24 @@ module MCPClient
     # @raise [MCPClient::Errors::ConnectionError] on authorization failures
     # @raise [MCPClient::Errors::ResourceReadError] if no resources could be retrieved from any server
     def list_resources(cache: true, cursor: nil)
-      # If cursor is provided, we can only query one server (the one that provided the cursor)
-      # This is a limitation of aggregating multiple servers
-      if cursor
-        # For now, just use the first server when cursor is provided
-        # In a real implementation, you'd need to track which server the cursor came from
-        return servers.first.list_resources(cursor: cursor) if servers.any?
+      holding_request_meta('resources/list') do
+        # If cursor is provided, we can only query one server (the one that provided the cursor)
+        # This is a limitation of aggregating multiple servers
+        if cursor
+          # For now, just use the first server when cursor is provided
+          return servers.first.list_resources(cursor: cursor) if servers.any?
 
-        return { 'resources' => [], 'nextCursor' => nil }
-      end
-
-      # Use cache if available and no cursor
-      return { 'resources' => @resource_cache.values, 'nextCursor' => nil } if cache && !@resource_cache.empty?
-
-      resources = []
-      connection_errors = []
-
-      servers.each do |server|
-        result = server.list_resources
-        resource_list = result['resources'] || []
-
-        resource_list.each do |resource|
-          cache_key = cache_key_for(server, resource.uri)
-          @resource_cache[cache_key] = resource
-          resources << resource
+          return { 'resources' => [], 'nextCursor' => nil }
         end
-      rescue MCPClient::Errors::ConnectionError => e
-        # Fast-fail on authorization errors for better user experience
-        # If this is the first server or we haven't collected any resources yet,
-        # raise the auth error directly to avoid cascading error messages
-        raise e if e.message.include?('Authorization failed') && resources.empty?
 
-        # Store the error and try other servers
-        connection_errors << e
-        @logger.error("Server error: #{e.message}")
+        # Use cache if available and no cursor
+        if cache && (snapshot = cached_snapshot(:resources, @resource_cache))
+          release_held_request_meta
+          return { 'resources' => snapshot, 'nextCursor' => nil }
+        end
+
+        collect_resources_from_servers(cache)
       end
-
-      # Return hash format consistent with server methods
-      { 'resources' => resources, 'nextCursor' => nil }
     end
 
     # Reads a specific resource by URI
@@ -290,47 +276,14 @@ module MCPClient
     # @raise [MCPClient::Errors::ConnectionError] on authorization failures
     # @raise [MCPClient::Errors::ToolCallError] if no tools could be retrieved from any server
     def list_tools(cache: true)
-      cached = @cache_mutex.synchronize { @tool_cache.values if cache && !@tool_cache.empty? }
-      return cached if cached
-
-      # Read before the fetch so a cache emptied while it runs is noticed.
-      # The mutex is never held across a request: a response may dispatch a
-      # notification, on this very thread, that empties the cache again.
-      generation = @cache_mutex.synchronize { @tool_cache_generation }
-      tools = []
-      connection_errors = []
-      fetched = {}
-
-      servers.each do |server|
-        server.list_tools.each do |tool|
-          fetched[cache_key_for(server, tool.name)] = tool
-          tools << tool
+      holding_request_meta('tools/list') do
+        if cache && (snapshot = cached_snapshot(:tools, @tool_cache))
+          release_held_request_meta
+          return snapshot
         end
-      rescue MCPClient::Errors::ConnectionError => e
-        # Fast-fail on authorization errors for better user experience
-        # If this is the first server or we haven't collected any tools yet,
-        # raise the auth error directly to avoid cascading error messages
-        raise e if e.message.include?('Authorization failed') && tools.empty?
 
-        # Store the error and try other servers
-        connection_errors << e
-        @logger.error("Server error: #{e.message}")
+        collect_tools_from_servers(cache)
       end
-
-      # A tools/list_changed while this fetch ran -- the one a HeaderMismatch
-      # refresh announces included -- already replaced these definitions.
-      # They still answer this caller, but caching them would hand the
-      # superseded ones to the next.
-      @cache_mutex.synchronize { @tool_cache.merge!(fetched) if @tool_cache_generation == generation }
-
-      # If we didn't get any tools from any server but have servers configured, report failure
-      if tools.empty? && !servers.empty?
-        raise connection_errors.first if connection_errors.any?
-
-        @logger.warn('No tools found from any server.')
-      end
-
-      tools
     end
 
     # Calls a specific tool by name with the given parameters
@@ -413,14 +366,36 @@ module MCPClient
     # Clean up all server connections
     def cleanup
       servers.each(&:cleanup)
+      # The transports forgot their results; the slices built from them go too.
+      clear_cache
     end
 
-    # Clear the cached tools so that next list_tools will fetch fresh data
+    # The list kinds this client caches, each with the transport-level cache
+    # behind it.
+    CACHED_LIST_KINDS = %i[tools prompts resources].freeze
+
+    # Clear the cached lists so that the next list_tools, list_prompts or
+    # list_resources fetches fresh data.
     # @return [void]
     def clear_cache
       clear_tool_cache
-      @prompt_cache.clear
-      @resource_cache.clear
+      @cache_mutex.synchronize do
+        @cache_version += 1
+        @prompt_cache.clear
+        @resource_cache.clear
+        # A slice's tag goes with the slice: a leftover tag must not vouch
+        # for a server whose slice a later, partial refill never rebuilt.
+        @cache_params.clear
+        @cache_filled.clear
+      end
+      # The promise is fresh data, and a transport holding a list the server
+      # bounded with a positive `ttlMs` (MCP 2026-07-28
+      # server/utilities/caching) would answer the next listing from it
+      # without sending anything at all. Dropped outside this client's lock:
+      # each transport takes its own.
+      servers.each do |server|
+        CACHED_LIST_KINDS.each { |kind| refresh_server_cache(server, kind) }
+      end
     end
 
     # Register a callback for JSON-RPC notifications from servers
@@ -918,10 +893,20 @@ module MCPClient
         clear_tool_cache
       when 'notifications/prompts/list_changed'
         logger.warn("[#{server_id}] Prompt list has changed, clearing prompt cache")
-        @prompt_cache.clear
+        @cache_mutex.synchronize do
+          @cache_version += 1
+          @prompt_cache.clear
+          @cache_params.delete(:prompts)
+          @cache_filled.delete(:prompts)
+        end
       when 'notifications/resources/list_changed'
         logger.warn("[#{server_id}] Resource list has changed, clearing resource cache")
-        @resource_cache.clear
+        @cache_mutex.synchronize do
+          @cache_version += 1
+          @resource_cache.clear
+          @cache_params.delete(:resources)
+          @cache_filled.delete(:resources)
+        end
       end
     end
 
@@ -1306,21 +1291,11 @@ module MCPClient
     # @return [void]
     def clear_tool_cache
       @cache_mutex.synchronize do
+        @cache_version += 1
         @tool_cache.clear
+        @cache_params.delete(:tools)
         @tool_cache_generation += 1
       end
-    end
-
-    # Run one call with a slot of its own for the definition the transport's
-    # request goes out under (MCPClient::CalledToolDefinition). Transports
-    # that do not mirror tool parameters into headers record nothing, and the
-    # call runs unwrapped.
-    # @param server [MCPClient::ServerBase] the transport the call goes to
-    # @return [Object] the block's value
-    def with_called_tool_definition(server, &block)
-      return block.call unless server.respond_to?(:called_tool_definition_slot, true)
-
-      server.send(:called_tool_definition_slot, &block)
     end
 
     # The definition the transport's own tools/call request went out under,
