@@ -97,5 +97,42 @@ module MCPClient
     def called_tool_definition_key
       :"mcp_client_called_tool_definition_#{object_id}"
     end
+
+    # Pin the definition the HeaderMismatch retry was checked against, so
+    # the retry's headers are derived from that very definition. Between
+    # the check and the send the list would otherwise be looked up again,
+    # and on a list the server bounds with `ttlMs: 0` another lookup is
+    # another fetch — possibly of a definition the check never read.
+    # @param name [String] the tool named in the retried request
+    # @param tool [MCPClient::Tool, nil] the definition the check read (nil
+    #   when the refreshed list no longer carries the tool)
+    # @return [void]
+    def pin_retry_definition(name, tool)
+      Thread.current[pinned_retry_definition_key] = [name.to_s, tool]
+    end
+
+    # Take the pinned definition for a request, if the retry of that very
+    # tool pinned one. Taken rather than read: it describes one send.
+    # @param name [String] the tool named in the request being sent
+    # @return [Array(MCPClient::Tool, nil), nil] a one-element array holding
+    #   the definition, or nil when nothing is pinned for the tool
+    def take_pinned_retry_definition(name)
+      pinned = Thread.current[pinned_retry_definition_key]
+      return nil unless pinned.is_a?(Array) && pinned.first == name.to_s
+
+      Thread.current[pinned_retry_definition_key] = nil
+      [pinned.last]
+    end
+
+    # Drop a pin the retry never consumed (it raised before sending).
+    # @return [void]
+    def clear_pinned_retry_definition
+      Thread.current[pinned_retry_definition_key] = nil
+    end
+
+    # @return [Symbol] this transport's thread-local key for the pin
+    def pinned_retry_definition_key
+      :"mcp_client_pinned_retry_definition_#{object_id}"
+    end
   end
 end

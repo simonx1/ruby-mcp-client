@@ -775,6 +775,10 @@ RSpec.describe 'MCP 2026-07-28 x-mcp-header — a failure that escaped host code
       { 'content' => [] }
     end
     allow(server).to receive(:refresh_tools_after_header_mismatch)
+    # The refreshed definition's dialect is checked before the retry goes
+    # out; that check is pinned by the JSON Schema examples, and this one is
+    # about the recovery alone, with no connection to resolve a tool through.
+    allow(server).to receive(:reject_unreadable_refreshed_schema!)
 
     expect(server.send(:attempt_request, 'tools/call', {}, nil, false) { nil }).to eq({ 'content' => [] })
     expect(attempts).to eq(2)

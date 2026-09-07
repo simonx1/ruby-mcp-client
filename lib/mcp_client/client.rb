@@ -19,6 +19,10 @@ module MCPClient
     include MCPClient::Client::TaskSupport
     include MCPClient::Client::TaskApi
 
+    # Ceiling on the schema-violation text that reaches a log line or an
+    # exception (the validator already bounds its error count).
+    MAX_VIOLATION_TEXT = 4000
+
     # Elicitation modes implemented by this client (MCP 2025-11-25).
     # Requests with a mode outside this set are rejected with -32602.
     SUPPORTED_ELICITATION_MODES = %w[form url].freeze
@@ -299,6 +303,9 @@ module MCPClient
     # @param parameters [Hash] the parameters to pass to the tool
     # @param server [String, Symbol, Integer, MCPClient::ServerBase, nil] optional server to use
     # @return [Object] the result of the tool invocation
+    # @raise [MCPClient::Errors::ValidationError] when the parameters miss a
+    #   required property, or the tool's inputSchema declares a JSON Schema
+    #   dialect this client does not support (MCP 2026-07-28)
     def call_tool(tool_name, parameters, server: nil, progress: nil)
       tool = resolve_tool(tool_name, server: server)
 
@@ -357,7 +364,7 @@ module MCPClient
         # method does not change.
         result = complete_task_result(tool_name, server, result, task_epoch)
 
-        validate_structured_content!(called || tool, result)
+        validate_called_result!(called || tool, result)
       end
     end
 
@@ -421,6 +428,7 @@ module MCPClient
       # each transport takes its own.
       servers.each do |server|
         CACHED_LIST_KINDS.each { |kind| refresh_server_cache(server, kind) }
+        forget_schema_checks
       end
     end
 
@@ -533,8 +541,10 @@ module MCPClient
         # pin the enumeration takes (see #streamed_call_chunks) — this one
         # covers a transport that sends while building it.
         stream = pinned_to_session(server, task_epoch) { server.call_tool_streaming(tool_name, parameters) }
-        return stream unless task_epoch || (tasks_extension? && modern_server?(server))
-
+        # Every stream goes through the wrapper, whether or not tasks are in
+        # play: "Clients SHOULD validate structured results against this
+        # schema" is about a result, not about the method that fetched it, and
+        # so is the dialect a result's schema declares.
         streamed_call_chunks(stream, tool, tool_name, server, epoch: task_epoch)
       rescue MCPClient::Errors::ConnectionError => e
         # Add server identity information to the error for better context
@@ -695,7 +705,11 @@ module MCPClient
               # it to the call's result, validated as #call_tool does — against
               # the definition a mid-stream refresh (HeaderMismatch recovery)
               # may have replaced.
-              next yielder << chunk unless resolve && task_result?(chunk)
+              task = resolve && task_result?(chunk)
+              # A chunk that is neither a task nor a complete CallToolResult is
+              # progress, not an answer: only a result is checked against the
+              # tool's outputSchema.
+              next yielder << chunk unless task || complete_call_result?(chunk)
 
               # The definition the stream's one request went out under, read
               # before a task is waited for (see #call_tool) and read once:
@@ -705,12 +719,29 @@ module MCPClient
                 called = called_tool_definition(server, tool_name)
                 read_called = true
               end
-              result = complete_task_result(tool_name, server, chunk, epoch)
-              yielder << validate_structured_content!(called || tool, result)
+              result = task ? complete_task_result(tool_name, server, chunk, epoch) : chunk
+              yielder << validate_called_result!(called || tool, result)
             end
           end
         end
       end
+    end
+
+    # Whether a streamed chunk is the call's answer rather than an update on
+    # its way. MCP 2026-07-28 makes `resultType` required and has clients
+    # treat an absent one as "complete" — a rule for *results*, which is
+    # what every pre-2026 server sends. A chunk that carries no `resultType`
+    # and is shaped as no CallToolResult (a progress object, say) is an
+    # update on the way, not an answer to check against an output schema.
+    # @param chunk [Object] one chunk of a streaming tools/call
+    # @return [Boolean]
+    def complete_call_result?(chunk)
+      return false unless chunk.is_a?(Hash) && MCPClient::JsonRpcCommon.result_type(chunk) == 'complete'
+
+      # The members a CallToolResult is made of; a chunk carrying none of
+      # them (and no `resultType`) is not a result at all.
+      chunk.key?('resultType') || chunk.key?(:resultType) ||
+        %w[content structuredContent isError].any? { |member| chunk.key?(member) || chunk.key?(member.to_sym) }
     end
 
     # Hand the host's identity and request metadata to a transport.
@@ -1055,31 +1086,53 @@ module MCPClient
       end
     end
 
-    # Validate parameters against tool JSON schema (checks required properties)
+    # Validate parameters against tool JSON schema (checks required
+    # properties, through the root's `$ref` chain and `allOf` members). A
+    # schema declaring a dialect this client does not implement is refused
+    # outright, so the call is never sent under a schema nothing could read.
     # @param tool [MCPClient::Tool] tool definition with schema
     # @param parameters [Hash] parameters to validate
-    # @raise [MCPClient::Errors::ValidationError] when required params are missing
+    # @raise [MCPClient::Errors::ValidationError] when required params are
+    #   missing, or the schema's dialect is not supported
     def validate_params!(tool, parameters)
       schema = tool.schema
+      state = input_schema_state(tool)
+      reject_unsupported_dialect!(tool, state, 'input')
+      # An output schema nothing here could read is refused before the call
+      # too: the dialect error is due whatever the tool would answer, and a
+      # (possibly destructive) tool is not run for a result that cannot be
+      # checked.
+      reject_unsupported_dialect!(tool, output_schema_state(tool), 'output')
+      # An input schema the validator cannot interpret asserts nothing: the
+      # call goes out and the server judges its arguments.
+      return if state[:unusable]
       return unless schema.is_a?(Hash)
 
-      required = schema['required'] || schema[:required]
-      return unless required.is_a?(Array)
+      # What the schema requires through every applicator that applies
+      # unconditionally: the root, its `$ref` chain, its `allOf` members (the
+      # tools spec: clients SHOULD follow `$ref` resolution when validating
+      # tool inputs). A conditional branch is the server's to judge.
+      required, properties = MCPClient::SchemaValidator.input_requirements(schema)
+      return if required.empty?
 
-      properties = schema['properties'] || schema[:properties] || {}
-
-      missing = required.map(&:to_s) - parameters.keys.map(&:to_s)
+      missing = required - parameters.keys.map(&:to_s)
 
       # Exclude required params that have a default value in the schema,
       # since the server will apply the default.
       missing = missing.reject do |param|
-        prop = properties[param] || properties[param.to_sym]
-        prop.is_a?(Hash) && (prop.key?('default') || prop.key?(:default))
+        prop = properties[param]
+        prop.is_a?(Hash) && prop.key?('default')
       end
 
       return unless missing.any?
 
       raise MCPClient::Errors::ValidationError, "Missing required parameters: #{missing.join(', ')}"
+    end
+
+    # @param result [Hash] a tool result
+    # @return [Symbol, String, nil] the key its structuredContent sits under
+    def structured_content_key(result)
+      [:structuredContent, 'structuredContent'].find { |k| result.key?(k) }
     end
 
     # Validate a tools/call result's structuredContent against the tool's
@@ -1102,7 +1155,14 @@ module MCPClient
     #   is missing from a successful result or does not match the schema
     def validate_structured_content!(tool, result)
       return result unless tool.structured_output? && result.is_a?(Hash)
-      return result if result['isError'] || result[:isError]
+
+      # A dialect this client cannot read is an error for every result, an
+      # error result included (the MUST is not limited to successful ones).
+      reject_unsupported_dialect!(tool, output_schema_state(tool), 'output')
+      # An error result may carry no structuredContent at all; one that does
+      # is bound by the output schema like any other (the tools specification
+      # exempts nothing about error results), so what is there is checked.
+      return result if (result['isError'] || result[:isError]) && !structured_content_key(result)
       # An unfinished result (MCP 2026-07-28 resultType "input_required") is
       # not a successful one either: it carries the continuation instead of
       # the tool's output. Checking it for structuredContent would fail the
@@ -1110,40 +1170,207 @@ module MCPClient
       # the continuation away with it.
       return result unless MCPClient::JsonRpcCommon.result_type(result) == 'complete'
 
-      warn_partial_schema_coverage(tool)
+      unsupported = warn_partial_schema_coverage(tool)
+      reject_partial_schema_coverage!(tool, unsupported)
 
-      structured = result.key?('structuredContent') ? result['structuredContent'] : result[:structuredContent]
-      if structured.nil?
+      # MCP 2026-07-28: structuredContent "can be any JSON value (object,
+      # array, string, number, boolean, or null)", so presence is decided by
+      # the key, not by the value. MCP 2025-11-25 types it as an object, so on
+      # a session negotiated to that revision anything else — a null, an
+      # array, a string, a number, a boolean — is what it was there: no
+      # structured content at all. The widening is a 2026-07-28 rule and does
+      # not reach back over a legacy session.
+      key = structured_content_key(result)
+      key = nil if key && !result[key].is_a?(Hash) && legacy_server?(tool.server)
+      # Dropping the non-object leaves an error result what it was: one
+      # carrying no structured content, which it is allowed to be. Reporting
+      # it as a successful result missing its output would refuse — in
+      # :strict, raise on — a result the tools specification permits.
+      return result if key.nil? && (result['isError'] || result[:isError])
+
+      unless key
         handle_structured_content_violation(
-          "Tool '#{tool.name}' declares an output schema but its successful result carries no structuredContent " \
-          '(required by the MCP 2025-11-25 tools spec)'
+          "Tool '#{sanitize_peer_log_text(tool.name.to_s)}' declares an output schema but its successful result " \
+          'carries no structuredContent (required by the MCP tools spec)'
         )
         return result
       end
 
-      errors = MCPClient::SchemaValidator.validate(structured, tool.output_schema)
+      # An unusable output schema (unsupported dialect, external $ref, out of
+      # bounds) is a violation too, never a permissive pass.
+      errors = MCPClient::SchemaValidator.validate(result[key], tool.output_schema)
       unless errors.empty?
+        # Schema and data text is peer-controlled: it is sanitized and
+        # bounded before it reaches a log line or an exception.
         handle_structured_content_violation(
-          "Structured content for tool '#{tool.name}' does not match its output schema: #{errors.join('; ')}"
+          "Structured content for tool '#{sanitize_peer_log_text(tool.name.to_s)}' does not match its output " \
+          "schema: #{sanitize_peer_log_text(errors.join('; '))[0, MAX_VIOLATION_TEXT]}"
         )
       end
       result
     end
 
+    # What the preflight made of a tool's inputSchema, checked once per tool
+    # definition. A schema the validator cannot use is warned about (MCP
+    # 2026-07-28: an unsupported dialect, a network `$ref` that is never
+    # dereferenced, or a schema beyond the resource bounds); for everything
+    # but an unsupported dialect the call still goes out — the server owns
+    # argument validation — and the host learns that local parameter checks
+    # are incomplete.
+    # @param tool [MCPClient::Tool]
+    # @return [Hash] :unusable and the :dialect that is not supported, if any
+    def input_schema_state(tool)
+      return {} if tool.schema.nil?
+
+      # Keyed by the definition's identity as well, so a refreshed tool
+      # definition (list_changed, cache expiry, HeaderMismatch recovery) is
+      # re-checked while the copies the client cache hands out are not. The
+      # identity, not the schema's hash: hashing a peer-supplied document
+      # walks it whole (or overflows the stack) before the bounded check
+      # could reject it.
+      @input_schema_warnings ||= {}
+      key = [tool.server&.object_id, tool.name]
+      known = @input_schema_warnings[key]
+      return known if known && known[:identity].equal?(tool_definition_identity(tool))
+
+      preflight = {}
+      problems = MCPClient::SchemaValidator.check_schema(tool.schema, preflight)
+      state = { identity: tool_definition_identity(tool), unusable: !problems.empty?,
+                dialect: preflight[:unsupported_dialect] }
+      @input_schema_warnings[key] = state
+      warn_unusable_input_schema(tool, problems)
+      state
+    end
+
+    # @param problems [Array<String>] why the input schema is unusable
+    # @return [void]
+    def warn_unusable_input_schema(tool, problems)
+      return if problems.empty?
+
+      @logger.warn("Tool '#{sanitize_peer_log_text(tool.name.to_s)}' input schema is not usable for validation: " \
+                   "#{sanitize_peer_log_text(problems.join('; '))}")
+    end
+
+    # MCP 2026-07-28 basic "Implementation Requirements": a client "MUST
+    # handle unsupported dialects gracefully by returning an appropriate
+    # error indicating the dialect is not supported". A dialect this client
+    # does not implement is not a schema it may quietly skip — it cannot
+    # know what the arguments must look like, and the caller must be able to
+    # see that — so the call is refused before it is sent. SEP-2106 assigns
+    # no JSON-RPC code to this, so it is a library error, not a wire one.
+    # The requirement is not conditional on the structured-content mode: a
+    # dialect the client cannot read is not a result it may choose to only
+    # log, on an input schema or on an output one.
+    # @param state [Hash] the memoized preflight state
+    # @param kind [String] which schema the dialect was declared on
+    # @return [void]
+    # @raise [MCPClient::Errors::ValidationError] when the dialect is unsupported
+    def reject_unsupported_dialect!(tool, state, kind)
+      dialect = state[:dialect]
+      return unless dialect
+
+      raise MCPClient::Errors::ValidationError,
+            "Tool '#{sanitize_peer_log_text(tool.name.to_s)}' #{kind} schema declares the JSON Schema dialect " \
+            "#{sanitize_peer_log_text(dialect.inspect)[0, MAX_VIOLATION_TEXT]}: that dialect is not supported " \
+            "(supported: #{MCPClient::SchemaValidator::SUPPORTED_DIALECTS.join(', ')})"
+    end
+
+    # What the preflight made of a tool's outputSchema, checked once per
+    # definition (keyed like {#input_schema_state}). Only the dialect is kept:
+    # every other reason the schema is unusable is reported through
+    # {#handle_structured_content_violation}, which the host's mode decides.
+    # @param tool [MCPClient::Tool]
+    # @return [Hash] the :dialect that is not supported, if any
+    def output_schema_state(tool)
+      return {} if tool.output_schema.nil?
+
+      @output_schema_dialects ||= {}
+      key = [tool.server&.object_id, tool.name]
+      known = @output_schema_dialects[key]
+      return known if known && known[:identity].equal?(tool_definition_identity(tool))
+
+      preflight = {}
+      MCPClient::SchemaValidator.check_schema(tool.output_schema, preflight)
+      @output_schema_dialects[key] = { identity: tool_definition_identity(tool),
+                                       dialect: preflight[:unsupported_dialect] }
+    end
+
+    # Validate the result of a call against the definition the request that
+    # was answered actually went out under. A transport's HeaderMismatch
+    # recovery re-derives a call's Mcp-Param-* headers from a refreshed
+    # tools/list, so the attempt that came back may carry an input schema
+    # this client never resolved — and {#validate_params!} refused the
+    # dialect of the definition the call was prepared from, not of the one it
+    # was sent under.
+    # @param tool [MCPClient::Tool] the answering definition
+    # @param result [Object] the raw tools/call result
+    # @return [Object] the result, unchanged
+    # @raise [MCPClient::Errors::ValidationError]
+    def validate_called_result!(tool, result)
+      reject_unsupported_dialect!(tool, input_schema_state(tool), 'input')
+      validate_structured_content!(tool, result)
+    end
+
+    # @param srv [MCPClient::ServerBase] the transport
+    # @return [Boolean] whether the session was negotiated to a revision
+    #   before 2026-07-28 (a transport that cannot say is not assumed legacy)
+    def legacy_server?(srv)
+      !srv.nil? && srv.respond_to?(:modern?) && srv.modern? == false
+    end
+
+    # The token naming a tool definition ({MCPClient::Tool#schema_identity});
+    # a tool-like object without one is identified by itself.
+    # @param tool [MCPClient::Tool, Object]
+    # @return [Object]
+    def tool_definition_identity(tool)
+      tool.respond_to?(:schema_identity) ? tool.schema_identity : tool
+    end
+
     # Warn (in both :warn and :strict modes) when a tool's output schema uses
     # JSON Schema keywords the built-in validator cannot evaluate, so partial
-    # coverage is never silent.
+    # coverage is never silent. The schema is scanned once per definition
+    # (keyed like {#warn_unusable_input_schema}), not on every result.
     # @param tool [MCPClient::Tool] the tool whose output schema is being used
-    # @return [void]
+    # @return [Array<String>] the unsupported keywords the schema uses
     def warn_partial_schema_coverage(tool)
+      @output_schema_coverage ||= {}
+      key = [tool.server&.object_id, tool.name]
+      known = @output_schema_coverage[key]
+      return known[:unsupported] if known && known[:identity].equal?(tool_definition_identity(tool))
+
       unsupported = MCPClient::SchemaValidator.unsupported_keywords(tool.output_schema)
-      return if unsupported.empty?
+      @output_schema_coverage[key] = { identity: tool_definition_identity(tool), unsupported: unsupported }
+      return unsupported if unsupported.empty?
 
       @logger.warn(
-        "Structured content check for tool '#{tool.name}': validation is partial: schema uses unsupported " \
+        "Structured content check for tool '#{sanitize_peer_log_text(tool.name.to_s)}': validation is partial: " \
+        'schema uses unsupported ' \
         "keywords: #{unsupported.join(', ')} (full JSON Schema 2020-12 evaluation is not implemented, so " \
         'conforming-looking data may still violate the schema)'
       )
+      unsupported
+    end
+
+    # :strict is a gate. A schema using an assertion this validator does not
+    # evaluate (a dynamic reference only the evaluation path could bind) cannot
+    # be shown to accept the result, and a result not shown to conform is
+    # refused there — a warning beside a returned value was a silent pass in
+    # everything but the log. A keyword that only annotates (`format`,
+    # `contentSchema`) decides nothing and does not refuse.
+    # @param tool [MCPClient::Tool] the tool whose output schema is being used
+    # @param unsupported [Array<String>] what {#warn_partial_schema_coverage} found
+    # @return [void]
+    # @raise [MCPClient::Errors::ValidationError] in :strict mode
+    def reject_partial_schema_coverage!(tool, unsupported)
+      return unless @validate_structured_content == :strict
+
+      assertions = unsupported - MCPClient::SchemaValidator::ANNOTATION_KEYWORDS
+      return if assertions.empty?
+
+      raise MCPClient::Errors::ValidationError,
+            "Structured content for tool '#{sanitize_peer_log_text(tool.name.to_s)}' cannot be checked against " \
+            'its output schema: the schema uses keywords this validator does not evaluate ' \
+            "(#{assertions.join(', ')}), so the result is not shown to conform"
     end
 
     # Log a structured-content conformance violation and, in :strict mode,
@@ -1223,6 +1450,26 @@ module MCPClient
       return nil unless server.respond_to?(:take_called_tool_definition, true)
 
       server.send(:take_called_tool_definition, tool_name.to_s)&.first
+    end
+
+    # Forget the once-per-definition schema checks of the tool definitions a
+    # cache slice no longer holds. Their keys name a tool definition, so a
+    # server that keeps renaming its tools would otherwise grow both memos
+    # without bound; a definition still served is checked again on its next
+    # use, which its identity token decides anyway.
+    # @param server [MCPClient::ServerBase, nil] the server whose entries go,
+    #   or nil for every server
+    # @return [void]
+    def forget_schema_checks(server = nil)
+      [@input_schema_warnings, @output_schema_coverage, @output_schema_dialects].each do |memo|
+        next unless memo
+
+        if server
+          memo.delete_if { |(server_id, _name), _| server_id == server.object_id }
+        else
+          memo.clear
+        end
+      end
     end
 
     # Generate a cache key for server-specific items

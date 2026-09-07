@@ -363,16 +363,39 @@ data = result['structuredContent']  # Type-safe structured data
 # Per MCP 2025-11-25, clients SHOULD validate structured results against the
 # tool's output schema, and a tool that declares an outputSchema must return
 # structuredContent in successful results. call_tool checks both automatically
-# for the common JSON Schema keywords (type, properties, required, items, enum,
-# numeric/string bounds). The full 2020-12 vocabulary ($ref/$dynamicRef/$defs,
-# allOf/anyOf/oneOf/not, if/then/else, additionalProperties, patternProperties,
-# propertyNames, prefixItems, contains/minContains/maxContains, uniqueItems,
-# multipleOf, format, dependentRequired/dependentSchemas, minProperties/
-# maxProperties, unevaluated*) is NOT evaluated: when a schema uses any of
-# those keywords, call_tool logs a "validation is partial" warning naming them
-# (in both modes), since data may pass this check that a full validator would
-# reject. By default a violation (mismatch, or missing structuredContent on a
-# successful result) logs a warning; opt in to strict mode to raise instead:
+# (so does call_tool_streaming, for a chunk that is a complete result, and so
+# does a task's result), against the JSON Schema vocabulary this client
+# evaluates: type, enum/const, properties/required, patternProperties,
+# additionalProperties, propertyNames, minProperties/maxProperties,
+# dependentRequired/dependentSchemas (draft-07 dependencies),
+# items/prefixItems/additionalItems, minItems/maxItems, uniqueItems (JSON
+# equality, so an object is never equal to an array), contains with
+# minContains/maxContains, string bounds and pattern (an ECMA-262 regular
+# expression, translated before it is matched), numeric bounds and multipleOf,
+# allOf/anyOf/oneOf/not, if/then/else, $ref/$defs/definitions inside the
+# document, and unevaluatedItems/unevaluatedProperties from the annotations
+# the whole composition produces (what properties/patternProperties/
+# additionalProperties, prefixItems/items/contains and the two keywords
+# themselves evaluated, collected through every $ref/allOf/anyOf/oneOf/
+# if-then-else/dependentSchemas that passed — never from a cousin). A
+# $dynamicRef or $recursiveRef that names no dynamic anchor is the plain
+# reference it resolves to and is applied as one; one that does binds to the
+# outermost resource of the DYNAMIC SCOPE declaring that anchor — the
+# resources the evaluation actually entered, tracked as it enters them, so a
+# duplicate anchor in a resource the instance never enters decides nothing.
+# What is NOT evaluated is the two keywords that only annotate
+# (format, contentSchema). When a schema uses one of those, call_tool logs a
+# "validation is partial" warning naming them (in both modes), since data may
+# pass this check that a full validator would reject; an unevaluated keyword
+# is never read as a match for not/oneOf/if either. A pattern is bounded to
+# 10,000 characters and must be an ECMA-262 expression (Ruby-only syntax such
+# as inline flags or possessive quantifiers makes the schema unusable). Two
+# ECMA-262 constructs Ruby's engine cannot reproduce — a back-reference to a
+# group a quantifier repeats (ECMA-262 clears it at each iteration, Ruby
+# keeps it) and a variable-length lookbehind — make the schema unusable too,
+# rather than being answered under the other engine's rules. By default a
+# violation (mismatch, or missing structuredContent on a successful result)
+# logs a warning; opt in to strict mode to raise instead:
 client = MCPClient::Client.new(
   mcp_server_configs: [...],
   validate_structured_content: :strict # raises MCPClient::Errors::ValidationError on violation
@@ -392,6 +415,58 @@ rejection makes the client refresh `tools/list` and retry with recomputed
 that is the one it is validated against. A `tools/list_changed` that merely
 arrives while the call is in flight never changes the definition the result is
 checked against — the server never saw the replacement.
+
+What counts as structured content follows the revision the session was
+negotiated to. MCP 2026-07-28 widened `structuredContent` to any JSON value,
+so a present `null`, array, string, number or boolean is structured content
+and is validated against the output schema. MCP 2025-11-25 types it as an
+object: on a session negotiated to that revision anything else is no
+structured content at all, and a tool that declares an `outputSchema` and
+sends one is reported as having returned none. A transport that cannot say
+which revision it negotiated is not assumed legacy.
+
+#### JSON Schema dialects and references
+
+The built-in validator reads JSON Schema 2020-12 (the MCP default), 2019-09
+and draft-07. Per MCP 2026-07-28 an unsupported dialect must be reported as
+an error, so a tool whose `inputSchema` declares one this client does not
+implement is refused before the request is sent:
+
+```ruby
+# inputSchema: {"$schema": "urn:unknown-dialect", ...}
+client.call_tool('t', {})
+# => raises MCPClient::Errors::ValidationError:
+#    "...input schema declares the JSON Schema dialect \"urn:unknown-dialect\":
+#     that dialect is not supported (supported: ...)"
+```
+
+The same applies to an `outputSchema`: an unsupported dialect there raises a
+`ValidationError` in both modes, since the client cannot read the schema at
+all — unlike a structured-content mismatch, which the
+`validate_structured_content` mode decides. The definition checked is the one
+the answered request actually went out under, so a `HeaderMismatch` retry
+under a refreshed schema is covered too — and since the rejection means the
+server did not execute the attempt, a refreshed `inputSchema` whose dialect
+this client cannot read stops the retry before it is sent rather than after
+the tool has run. A schema that is merely unusable for another reason (a
+`$ref` that would need a network fetch, a document past the resource bounds,
+a malformed keyword value — the metadata keywords included, which must be
+written as the type JSON Schema gives them) is warned about, and for an input
+schema the call still goes out, since the server owns argument validation.
+
+Two schema resources may not answer to one URI: a document whose `$id`s (or
+whose `$anchor` names within one resource) collide is unusable, since which
+declaration a reference lands on would otherwise depend on the order the
+document was read in.
+
+References are resolved inside the document only — nothing is ever fetched —
+but a document that bundles the resources it uses is resolved in full: a
+`$ref` naming an embedded `$id` (`"urn:example:s"`, a relative URI against the
+base an enclosing `$id` established, or the empty reference `""`) resolves to
+that resource, and only a reference to a resource the document does not carry
+is reported as external. Under 2020-12 and 2019-09 `definitions` behaves as
+the `$defs` it was renamed from, as the meta-schema of both dialects retains
+it.
 
 ### Roots
 

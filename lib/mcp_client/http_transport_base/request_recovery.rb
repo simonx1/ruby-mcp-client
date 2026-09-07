@@ -69,6 +69,11 @@ module MCPClient
             header_refreshed = true
             yield
             refresh_tools_after_header_mismatch(e)
+            # The rejected attempt did not run the tool; this retry is the
+            # send that would. A refreshed definition whose inputSchema
+            # declares an unreadable dialect must therefore stop the call
+            # here, not after it has been executed.
+            reject_unreadable_refreshed_schema!(params)
             retry
           rescue MCPClient::Errors::ResponseStreamClosedError => e
             # Modern Streamable HTTP has no resumption: "a broken response
@@ -92,6 +97,10 @@ module MCPClient
             retry
           end
         end
+      ensure
+        # A pin the retry never consumed (it raised before sending) must not
+        # outlive the request it was for.
+        clear_pinned_retry_definition
       end
 
       # Send the request, renegotiating the protocol version once if the server

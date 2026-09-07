@@ -140,6 +140,9 @@ RSpec.describe 'MCP 2026-07-28 cacheable results — round 31' do
       end
       server.send(:note_request_params, { 'a' => 1 })
       server.send(:mark_round_trip_result, true)
+      # Round 30 of the JSON Schema work: the definition a HeaderMismatch
+      # retry was checked against is pinned on the thread for the send.
+      server.send(:pin_retry_definition, 'greet', nil) if server.respond_to?(:pin_retry_definition, true)
       Thread.current[server.send(:recorded_entries_key)] = { tools: Object.new }
       Thread.current[server.send(:served_entries_key)] = { tools: [Object.new, nil] }
       Thread.current[server.send(:response_received_key)] = 1.0

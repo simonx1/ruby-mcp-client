@@ -506,9 +506,9 @@ RSpec.describe MCPClient::Tool do
         expect(tool.structured_output?).to be false
       end
 
-      it 'returns false when output_schema is empty' do
+      it 'returns true when output_schema is the empty schema (it accepts every value)' do
         t = described_class.new(name: 't', description: 'd', schema: {}, output_schema: {})
-        expect(t.structured_output?).to be false
+        expect(t.structured_output?).to be true
       end
 
       it 'returns true when output_schema is present' do
