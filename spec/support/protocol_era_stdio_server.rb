@@ -14,6 +14,11 @@
 #   modern-one-shot   like modern, but exit as soon as one tools/list has
 #                     been answered, so an unexpected termination after a
 #                     successful handshake is observable
+#   mrtr-one-shot     like modern, but answer the first tools/call with an
+#                     InputRequiredResult and exit, so the continuation the
+#                     client sends next meets a retired transport; a
+#                     tools/call that carries inputResponses is completed,
+#                     echoing the answers and the state it arrived with
 #   legacy            reject server/discover, then run the initialize handshake
 #   legacy-one-shot   like legacy, but exit as soon as one tools/list has
 #                     been answered, so a restart of a legacy process has to
@@ -154,7 +159,7 @@ def modern_request?(msg)
   # 2025-11-25 server, and the same mode name covers both.
   return !REPLACEMENT if MODE == 'modern-then-ping'
 
-  %w[modern modern-one-shot modern-exit-on-call future-only].include?(MODE)
+  %w[modern modern-one-shot modern-exit-on-call mrtr-one-shot future-only].include?(MODE)
 end
 
 # @param msg [Hash] the request
@@ -188,6 +193,29 @@ def meta_violation(msg)
   nil
 end
 
+# Answer one tools/call for the mrtr-one-shot mode: an unfinished result the
+# first time, the completion afterwards. Between the two the process exits,
+# so the continuation only completes if the client restarted the server and
+# kept the answers it had already gathered.
+# @param msg [Hash] the tools/call request
+# @return [void]
+def mrtr_one_shot(msg)
+  params = msg['params'] || {}
+  answers = params['inputResponses']
+  if answers
+    text = "#{answers.dig('a', 'content', 'name')}/#{params['requestState']}"
+    return respond(msg['id'], { 'content' => [{ 'type' => 'text', 'text' => text }] })
+  end
+
+  elicitation = { 'method' => 'elicitation/create',
+                  'params' => { 'mode' => 'form', 'message' => 'Who?',
+                                'requestedSchema' => { 'type' => 'object' } } }
+  respond(msg['id'], { 'resultType' => 'input_required', 'inputRequests' => { 'a' => elicitation },
+                       'requestState' => 'st' })
+  # Terminate unexpectedly while the client is gathering that input.
+  exit 0
+end
+
 # @param msg [Hash] the request
 # @return [void]
 def handle_request(msg)
@@ -207,7 +235,8 @@ end
 # @return [Boolean] whether the mode answered the request itself
 def answered_by_mode?(msg)
   case MODE
-  when 'modern', 'modern-one-shot', 'modern-exit-on-call', 'future-only' then answered_by_modern_mode?(msg)
+  when 'modern', 'modern-one-shot', 'modern-exit-on-call', 'mrtr-one-shot', 'future-only'
+    answered_by_modern_mode?(msg)
   when 'modern-mute-list' then answered_by_modern_mute_list?(msg)
   when 'legacy-one-shot', 'legacy-broken-init', 'late-discover' then answered_by_legacy_mode?(msg)
   when 'modern-then-ping' then answered_by_modern_then_ping?(msg)
@@ -236,6 +265,11 @@ def answered_by_modern_mode?(msg)
     # Terminate with the call unanswered: the client must fail it promptly
     # and not replay it on the replacement process.
     exit 0 if msg['method'] == 'tools/call'
+  when 'mrtr-one-shot'
+    return false unless msg['method'] == 'tools/call'
+
+    mrtr_one_shot(msg)
+    return true
   end
   false
 end

@@ -30,18 +30,29 @@ module MCPClient
       def rpc_request(method, params = {}, timeout: nil)
         ensure_initialized
 
-        with_retry(method) do
-          request_id = @mutex.synchronize { @request_id += 1 }
-          request = build_jsonrpc_request(method, params, request_id)
-          begin
-            send_jsonrpc_request(request, timeout: timeout)
-          rescue MCPClient::Errors::RequestTimeoutError
-            # MCP lifecycle: on timeout the sender SHOULD issue a cancellation
-            # notification for the abandoned request and stop waiting.
-            send_cancellation_notification(request_id) if cancellable_request?(method, params)
-            raise
-          end
+        # The multi round-trip resolver sits outside the per-attempt retry, so
+        # a retry carrying inputResponses/requestState keeps them through
+        # transport retries — the same shape as the other transports, so an
+        # input_required answer is validated and fulfilled here as well.
+        resolve_input_round_trips(method, params, timeout) do |attempt_params|
+          with_retry(method) { send_one_request(method, attempt_params, timeout) }
         end
+      end
+
+      # One request on the wire: build it, send it and wait for its answer.
+      # @param method [String] JSON-RPC method
+      # @param params [Hash] the params of this attempt
+      # @param timeout [Numeric, nil] per-request timeout
+      # @return [Object] the result
+      def send_one_request(method, params, timeout)
+        request_id = @mutex.synchronize { @request_id += 1 }
+        request = build_jsonrpc_request(method, params, request_id)
+        send_jsonrpc_request(request, timeout: timeout)
+      rescue MCPClient::Errors::RequestTimeoutError
+        # MCP lifecycle: on timeout the sender SHOULD issue a cancellation
+        # notification for the abandoned request and stop waiting.
+        send_cancellation_notification(request_id) if request_id && cancellable_request?(method, params)
+        raise
       end
 
       # Best-effort notifications/cancelled for a request the client stopped

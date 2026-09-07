@@ -4,10 +4,17 @@ require 'json'
 require 'zlib'
 require 'stringio'
 require_relative 'header_params'
+require_relative 'json_rpc_common/envelopes'
+require_relative 'json_rpc_common/error_bodies'
+require_relative 'json_rpc_common/input_waits'
 
 module MCPClient
   # Shared retry/backoff logic for JSON-RPC transports
   module JsonRpcCommon
+    include Envelopes
+    include ErrorBodies
+    include InputWaits
+
     # JSON-RPC methods with arbitrary side effects that MUST NOT be re-sent
     # automatically. Even a "transient" failure (5xx, dropped connection,
     # malformed response) can arrive AFTER the server received the request,
@@ -436,6 +443,7 @@ module MCPClient
         raise MCPClient::Errors::ConnectionError, "Server returned an invalid server/discover result (#{result.class})"
       end
 
+      reject_input_required_discover!(result)
       versions = result['supportedVersions']
       unless versions.is_a?(Array) && versions.all?(String)
         raise MCPClient::Errors::ConnectionError, 'server/discover result has no supportedVersions list'
@@ -608,23 +616,25 @@ module MCPClient
     # @return [Hash] the capabilities object for the initialize request
     def client_capabilities
       capabilities = {}
-      # MCP 2026-07-28 delivers roots/sampling/elicitation through the multi
-      # round-trip pattern (InputRequiredResult), not server-initiated
-      # requests. Until that pattern is implemented, modern requests declare
-      # none of these: a server MUST NOT ask for what the client did not
-      # declare, so an unfulfillable input request is never provoked.
-      unless modern?
-        if registered_callback?(:@elicitation_request_callback)
-          # Both defined elicitation modes are implemented (an empty object
-          # would mean form-only per the spec's backwards-compatibility rule).
-          capabilities['elicitation'] = { 'form' => {}, 'url' => {} }
-        end
-        capabilities['roots'] = { 'listChanged' => true } if registered_callback?(:@roots_list_request_callback)
-        if registered_callback?(:@sampling_request_callback)
-          # SEP-1577: servers may only send tool-enabled sampling requests when
-          # the client declares the sampling.tools sub-capability.
-          capabilities['sampling'] = sampling_tools_supported? ? { 'tools' => {} } : {}
-        end
+      # On a modern server these features are served through the multi
+      # round-trip pattern (InputRequiredResult), on a legacy one through
+      # server-initiated requests; either way they are declared only when
+      # the host registered a handler, since the server MUST NOT ask for
+      # what the client did not declare.
+      if registered_callback?(:@elicitation_request_callback)
+        # Both defined elicitation modes are implemented (an empty object
+        # would mean form-only per the spec's backwards-compatibility rule).
+        capabilities['elicitation'] = { 'form' => {}, 'url' => {} }
+      end
+      if registered_callback?(:@roots_list_request_callback)
+        # notifications/roots/list_changed was removed in 2026-07-28, so the
+        # modern roots capability has no listChanged flag.
+        capabilities['roots'] = modern? ? {} : { 'listChanged' => true }
+      end
+      if registered_callback?(:@sampling_request_callback)
+        # SEP-1577: servers may only send tool-enabled sampling requests when
+        # the client declares the sampling.tools sub-capability.
+        capabilities['sampling'] = sampling_tools_supported? ? { 'tools' => {} } : {}
       end
       capabilities['extensions'] = declared_extensions.dup unless declared_extensions.empty?
       # NOTE: we intentionally do NOT declare a client `tasks` capability. That
@@ -685,6 +695,27 @@ module MCPClient
       'complete'
     end
 
+    # Restore the wire spelling of a peer's own JSON object. JSON object keys
+    # are always strings, but a host's response middleware may symbolize the
+    # keys of everything it parses (Faraday's :json parser with
+    # symbolize_names) — the middleware ::result_type already tolerates for
+    # the resultType discriminator. Undoing it once, on the protocol object
+    # about to be read, keeps every lookup below (and the params the input
+    # handlers see) on the shape the protocol defines. Values are returned
+    # untouched, so an opaque requestState is still echoed verbatim.
+    # @param value [Object] a parsed JSON value
+    # @return [Object] the same value with Symbol keys spelled as Strings
+    def self.restore_wire_keys(value)
+      case value
+      when Hash
+        value.to_h { |key, member| [key.is_a?(Symbol) ? key.to_s : key, restore_wire_keys(member)] }
+      when Array
+        value.map { |member| restore_wire_keys(member) }
+      else
+        value
+      end
+    end
+
     # Result types this transport accepts. Overridden (widened) by transports
     # that negotiated a result-type-adding extension.
     # @return [Array<String>]
@@ -737,101 +768,10 @@ module MCPClient
       return result if type == 'complete'
 
       message = "#{method} answered with resultType #{type.to_s[0, 64].inspect}, which this " \
-                'client cannot carry through (multi round-trip requests are not implemented)'
+                'client cannot carry through'
       raise MCPClient::Errors::InputRequiredError.new(message, data: result) if type == 'input_required'
 
       raise MCPClient::Errors::InvalidResultError.new("Invalid result: #{message}", data: result)
-    end
-
-    # Build the error for a 4xx response: the typed JSON-RPC error when the
-    # body is a JSON-RPC error response (with the HTTP status prefixed to the
-    # peer's message), otherwise a plain ServerError with the fallback text.
-    # @param response [Faraday::Response] the 4xx response
-    # @param fallback [String] message when the body carries no JSON-RPC error
-    # @return [MCPClient::Errors::ServerError]
-    def jsonrpc_error_from_http_response(response, fallback)
-      status = response.status
-      error = jsonrpc_error_in_body(response)
-      return MCPClient::Errors::ServerError.new(fallback).tap { |e| e.http_status = status } unless error
-
-      typed = MCPClient::Errors::ServerError.from_jsonrpc(error)
-      typed.class.new("#{fallback}: #{typed.message}", code: typed.code, data: typed.data)
-           .tap { |e| e.http_status = status }
-    end
-
-    # Ceiling on the size of an HTTP error body inspected for a JSON-RPC
-    # error. A protocol error response is a few hundred bytes; the body is
-    # peer-controlled, so anything larger is not parsed at all rather than
-    # handed to JSON.parse.
-    MAX_ERROR_BODY_BYTES = 64 * 1024
-
-    # Extract a JSON-RPC error object from an HTTP error body, if there is one.
-    # Only a JSON-RPC 2.0 error response is recognized; anything else is
-    # ignored.
-    # @param response [Faraday::Response] the HTTP response
-    # @return [Hash, nil] the JSON-RPC `error` member, or nil
-    def jsonrpc_error_in_body(response)
-      return nil unless response.respond_to?(:body)
-
-      data = decoded_error_body(response)
-      # Only a JSON-RPC 2.0 error response counts; an arbitrary JSON body
-      # with an "error" member is not a protocol error.
-      return nil unless data.is_a?(Hash) && (data['jsonrpc'] || data[:jsonrpc]) == '2.0'
-
-      error = data['error'] || data[:error]
-      error.is_a?(Hash) ? error : nil
-    end
-
-    # The error body as a decoded object.
-    #
-    # A host may configure the connection (faraday_config) with response
-    # middleware — `conn.response :json` — that decodes the body before it
-    # reaches this transport, on the exception path (`raise_error`) as well
-    # as the response path. That already-parsed body carries the same
-    # protocol error, so it is accepted as-is; only a raw String body is
-    # size-bounded, gunzipped and parsed here (the middleware has already
-    # spent the memory for the ones it decoded).
-    # @param response [Faraday::Response] the HTTP response
-    # @return [Object, nil] the decoded body, or nil when it cannot be read
-    def decoded_error_body(response)
-      body = response.body
-      return body if body.is_a?(Hash)
-      return nil unless body.is_a?(String) && !body.empty?
-      return nil if oversized_error_body?(body)
-
-      headers = response.respond_to?(:headers) ? response.headers || {} : {}
-      encoding = headers['content-encoding'] || headers['Content-Encoding'] || ''
-      body = gunzip_bounded(body) if encoding.include?('gzip')
-      return nil if body.nil?
-
-      JSON.parse(body)
-    rescue JSON::ParserError, Zlib::Error => e
-      @logger.debug("HTTP error body is not a JSON-RPC error: #{e.class}")
-      nil
-    end
-
-    # @param body [String] an HTTP error body
-    # @return [Boolean] whether it exceeds the inspection ceiling (logged)
-    def oversized_error_body?(body)
-      return false if body.bytesize <= MAX_ERROR_BODY_BYTES
-
-      @logger.debug("Ignoring HTTP error body of #{body.bytesize} bytes (over #{MAX_ERROR_BODY_BYTES})")
-      true
-    end
-
-    # Decompress a gzip error body, giving up once the expansion passes the
-    # inspection ceiling (a compressed 4xx body is peer-controlled too).
-    # @param body [String] gzip data
-    # @return [String, nil] the decompressed body, or nil when too large
-    def gunzip_bounded(body)
-      reader = Zlib::GzipReader.new(StringIO.new(body))
-      expanded = reader.read(MAX_ERROR_BODY_BYTES + 1) || ''
-      return expanded if expanded.bytesize <= MAX_ERROR_BODY_BYTES
-
-      @logger.debug("Ignoring gzip HTTP error body expanding past #{MAX_ERROR_BODY_BYTES} bytes")
-      nil
-    ensure
-      reader&.close
     end
 
     # Which request field mirrors into the Mcp-Name header (MCP 2026-07-28
@@ -901,27 +841,189 @@ module MCPClient
       result = envelope_member(response, 'result')
       validate_result_type!(result)
       record_server_info(result, method: method)
-      reject_unfulfillable_input_required!(result)
       result
     end
 
-    # Read a member of a decoded JSON-RPC envelope.
-    #
-    # The README offers Faraday's JSON middleware for reading a server's error
-    # bodies, and that middleware decodes every response — under
-    # `symbolize_names` the envelope arrives keyed by Symbol. The members are
-    # the peer's, not the host's, so both spellings name the same thing: read
-    # the wire spelling first and fall back to the Symbol one. Anything that
-    # is no Hash is indexed as before, so a malformed envelope fails where it
-    # always did.
-    # @param response [Object] the decoded JSON-RPC envelope
-    # @param name [String] the member's name in its wire spelling
-    # @return [Object, nil] the member, or nil when the envelope carries none
-    def envelope_member(response, name)
-      return response[name] unless response.is_a?(Hash)
-      return response[name] if response.key?(name)
+    # Client requests a server MAY answer with an InputRequiredResult (MCP
+    # 2026-07-28 basic/patterns/mrtr "Supported Requests"); on any other
+    # request such a result is invalid.
+    MRTR_METHODS = %w[tools/call resources/read prompts/get].freeze
 
-      response[name.to_sym]
+    # Ceiling on consecutive input_required answers to one logical request.
+    # Servers MAY keep asking, but an unbounded loop is a hostile server.
+    MAX_INPUT_ROUND_TRIPS = 10
+
+    # Pause before retrying an InputRequiredResult that asked for nothing
+    # (requestState only — e.g. a URL-mode elicitation still in progress out
+    # of band). The client MAY retry immediately, but a tight loop would just
+    # burn the round-trip budget; doubles up to the maximum.
+    INPUT_RETRY_DELAY = 0.5
+    INPUT_RETRY_MAX_DELAY = 5
+
+    # Input request methods and the transport callback that fulfils each.
+    INPUT_REQUEST_HANDLERS = {
+      'elicitation/create' => :@elicitation_request_callback,
+      'sampling/createMessage' => :@sampling_request_callback,
+      'roots/list' => :@roots_list_request_callback
+    }.freeze
+
+    # Drive a request through the multi round-trip pattern (MCP 2026-07-28
+    # basic/patterns/mrtr): while the server answers with an
+    # InputRequiredResult, fulfil its inputRequests through the registered
+    # handlers and retry the original request — as an independent request
+    # with a new id — carrying inputResponses keyed like the requests and
+    # the opaque requestState echoed verbatim (omitted when the server sent
+    # none). A result without inputRequests asks for nothing this client can
+    # fulfil, so it is retried after a growing pause (INPUT_RETRY_DELAY) that
+    # the host steers through {#on_input_required_wait} and that never runs
+    # past the request timeout: the continuation is handed back instead, on
+    # an error {#resume_input_required} accepts.
+    # @param method [String] the JSON-RPC method
+    # @param params [Hash] the original params
+    # @param timeout [Numeric, nil] per-request timeout, also bounding the waits
+    # @yieldparam params [Hash] params for one attempt (original, or with inputResponses)
+    # @yieldreturn [Object] the attempt's result
+    # @return [Object] the final (complete) result
+    # @raise [MCPClient::Errors::InvalidResultError] input_required on an unsupported method
+    # @raise [MCPClient::Errors::InputRequiredError] when a round trip cannot be fulfilled, is
+    #   cancelled or times out, or too many occur — carrying the continuation
+    def resolve_input_round_trips(method, params, timeout = nil)
+      result = yield(params)
+      round_trips = 0
+      delay = INPUT_RETRY_DELAY
+      started = input_wait_clock
+      deadline = input_wait_deadline(started, timeout)
+      while MCPClient::JsonRpcCommon.result_type(result) == 'input_required'
+        # Read on the wire spelling, whatever the transport's JSON middleware
+        # did to the keys: a symbolized inputRequests/requestState would
+        # otherwise be invisible here and the retry would go out with neither
+        # the fulfilled answers nor the state the server MUST get back.
+        result = MCPClient::JsonRpcCommon.restore_wire_keys(result)
+        unless modern? && MRTR_METHODS.include?(method)
+          raise MCPClient::Errors::InvalidResultError.new(
+            "Invalid result: input_required is only valid for #{MRTR_METHODS.join(', ')} " \
+            "on an MCP 2026-07-28 server, not #{method} (#{protocol_version})", data: result
+          )
+        end
+
+        round_trips += 1
+        if round_trips > MAX_INPUT_ROUND_TRIPS
+          raise MCPClient::Errors::InputRequiredError.new(
+            "Server kept requesting input for #{method} after #{MAX_INPUT_ROUND_TRIPS} round trips", data: result
+          )
+        end
+
+        @logger.debug("#{method} requires input (round trip #{round_trips}); fulfilling and retrying")
+        retry_params = retry_params_for(params, result)
+        unless retry_params.key?('inputResponses')
+          now = input_wait_clock
+          wait = InputRequiredWait.new(rpc_method: method, round_trip: round_trips, delay: delay,
+                                       request_state: result['requestState'], result: result,
+                                       elapsed: now - started)
+          delay = pace_input_round_trip(wait, deadline)
+        end
+        result = yield(retry_params)
+      end
+      result
+    rescue MCPClient::Errors::InputRequiredError => e
+      # Every failure of the round trip hands the continuation back: the
+      # request it was driving, for #resume_input_required.
+      e.request_method ||= method
+      e.request_params ||= params
+      e.transport ||= self
+      raise
+    end
+
+    # Fulfil every input request through the handler registered for its
+    # method. There is no per-key error channel in InputResponses, so any
+    # request this client cannot honour fails the whole round trip.
+    # @param input_requests [Hash] the InputRequests map
+    # @param result [Hash] the InputRequiredResult (for error data)
+    # @return [Hash] the InputResponses map
+    # @raise [MCPClient::Errors::InputRequiredError]
+    def fulfil_input_requests(input_requests, result)
+      unless input_requests.is_a?(Hash)
+        raise MCPClient::Errors::InputRequiredError.new('Malformed InputRequiredResult: inputRequests is not an object',
+                                                        data: result)
+      end
+
+      input_requests.to_h do |key, request|
+        [key, fulfil_input_request(key, request, result)]
+      end
+    end
+
+    # @param key [String] the server-assigned request key
+    # @param request [Hash] the input request ({ 'method' => ..., 'params' => ... })
+    # @param result [Hash] the InputRequiredResult (for error data)
+    # @return [Hash] the handler's result
+    # @raise [MCPClient::Errors::InputRequiredError]
+    def fulfil_input_request(key, request, result)
+      shown_key = sanitize_log_text(key.to_s.inspect)
+      unless request.is_a?(Hash) && request['method'].is_a?(String) &&
+             (request['params'].nil? || request['params'].is_a?(Hash))
+        raise MCPClient::Errors::InputRequiredError.new("Malformed input request #{shown_key} (method/params)",
+                                                        data: result)
+      end
+
+      request_method = request['method']
+      shown_method = sanitize_log_text(request_method.inspect)
+      handler_ivar = INPUT_REQUEST_HANDLERS[request_method]
+      unless handler_ivar
+        raise MCPClient::Errors::InputRequiredError.new(
+          "Unsupported input request method #{shown_method} for key #{shown_key}", data: result
+        )
+      end
+      unless registered_callback?(handler_ivar)
+        raise MCPClient::Errors::InputRequiredError.new(
+          "Server requested #{shown_method} (key #{shown_key}) but no handler is registered for it " \
+          '(the capability was not declared)', data: result
+        )
+      end
+      if undeclared_sampling_tool_use?(request_method, request['params'])
+        raise MCPClient::Errors::InputRequiredError.new(
+          "Server requested tool-enabled #{shown_method} (key #{shown_key}) but the sampling.tools " \
+          'capability was not declared', data: result
+        )
+      end
+
+      begin
+        response = instance_variable_get(handler_ivar).call(key, request['params'] || {})
+      rescue StandardError => e
+        # The exception text is host-internal; it stays in the local log.
+        @logger.error("Handler for #{shown_method} (key #{shown_key}) raised: #{e.message}")
+        raise MCPClient::Errors::InputRequiredError.new(
+          "Handler for #{shown_method} (key #{shown_key}) failed", data: result
+        )
+      end
+      unless response.is_a?(Hash)
+        raise MCPClient::Errors::InputRequiredError.new(
+          "Handler for #{shown_method} (key #{shown_key}) returned #{response.class}, expected a result object",
+          data: result
+        )
+      end
+      if (error = response['error'] || response[:error])
+        message = error.is_a?(Hash) ? (error['message'] || error[:message]) : error
+        raise MCPClient::Errors::InputRequiredError.new(
+          "Handler for #{shown_method} (key #{shown_key}) failed: #{sanitize_log_text(message)}", data: result
+        )
+      end
+
+      response
+    end
+
+    # SEP-1577 (sampling tool calling): a server MUST NOT send `tools` or
+    # `toolChoice` to a client that did not declare the sampling.tools
+    # sub-capability. On a server-initiated request the client answers -32602;
+    # InputResponses has no per-request error channel, so on the multi
+    # round-trip path the whole round trip fails instead — the sampler is
+    # never invoked with a request this client never advertised support for.
+    # @param method [String] the input request method
+    # @param params [Hash, nil] the input request params
+    # @return [Boolean] whether this is tool-enabled sampling without the declaration
+    def undeclared_sampling_tool_use?(method, params)
+      return false unless method == 'sampling/createMessage' && !sampling_tools_supported?
+
+      params.is_a?(Hash) && (params.key?('tools') || params.key?('toolChoice'))
     end
 
     # Notifications the 2026-07-28 revision removed; never written to a
@@ -932,22 +1034,6 @@ module MCPClient
     # @return [Boolean] whether it must be dropped for a modern server
     def suppressed_modern_notification?(method)
       modern? && REMOVED_MODERN_NOTIFICATIONS.include?(method)
-    end
-
-    # An InputRequiredResult asks the client to fulfil server requests and
-    # retry. This client declares no capability a modern server could use
-    # for that yet, so such a result cannot be honoured and must not be
-    # mistaken for the operation's result.
-    # @param result [Object] a JSON-RPC result
-    # @return [void]
-    # @raise [MCPClient::Errors::InputRequiredError]
-    def reject_unfulfillable_input_required!(result)
-      return unless MCPClient::JsonRpcCommon.result_type(result) == 'input_required'
-
-      raise MCPClient::Errors::InputRequiredError.new(
-        'Server returned an input_required result (multi round-trip request) that this client cannot fulfil',
-        data: result
-      )
     end
 
     # Servers SHOULD identify themselves in every result's `_meta`

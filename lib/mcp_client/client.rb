@@ -427,6 +427,34 @@ module MCPClient
       @notification_listeners << block
     end
 
+    # Register the host's control over a multi round-trip request's
+    # out-of-band wait on every server (MCP 2026-07-28 client/elicitation
+    # "URL Mode": manual retry/cancel controls). See
+    # {MCPClient::JsonRpcCommon#on_input_required_wait} for the contract.
+    # @param block [Proc] callback that receives an InputRequiredWait
+    # @return [void]
+    def on_input_required_wait(&block)
+      @input_required_wait_handler = block
+      @servers.each do |server|
+        server.on_input_required_wait(&block) if server.respond_to?(:on_input_required_wait)
+      end
+    end
+
+    # Resume a multi round-trip request from the continuation an
+    # {MCPClient::Errors::InputRequiredError} carries, on the transport that
+    # raised it. The result is the transport's, as {#call_tool} would have
+    # returned it before validation.
+    # @param error [MCPClient::Errors::InputRequiredError] a resumable error
+    # @param timeout [Numeric, nil] per-request timeout for the resumed request
+    # @return [Object] the final (complete) result
+    # @raise [ArgumentError] if the error carries no continuation or names no transport
+    def resume_input_required(error, timeout: nil)
+      transport = error.respond_to?(:transport) ? error.transport : nil
+      raise ArgumentError, 'the error names no transport to resume on' unless transport
+
+      transport.resume_input_required(error, timeout: timeout)
+    end
+
     # Set the roots for this client (MCP 2025-06-18)
     # When roots are changed, a notification is sent to all connected servers
     # @param new_roots [Array<MCPClient::Root, Hash>] the new roots to set
@@ -1331,7 +1359,7 @@ module MCPClient
       # precedes everything else — an undeclared mode is -32602 even when no
       # handler is configured.
       unless SUPPORTED_ELICITATION_MODES.include?(mode)
-        @logger.warn("Rejecting elicitation request with unsupported mode '#{mode}'")
+        @logger.warn("Rejecting elicitation request with unsupported mode '#{sanitize_peer_log_text(mode.to_s)}'")
         return jsonrpc_error_result(-32_602, "Elicitation mode '#{mode}' is not supported")
       end
 
@@ -1383,7 +1411,9 @@ module MCPClient
       # Validate schema if present
       if schema
         schema_errors = ElicitationValidator.validate_schema(schema)
-        @logger.warn("Elicitation schema validation warnings: #{schema_errors.join('; ')}") unless schema_errors.empty?
+        unless schema_errors.empty?
+          @logger.warn("Elicitation schema validation warnings: #{sanitize_peer_log_text(schema_errors.join('; '))}")
+        end
       end
 
       # Call the user-defined handler
@@ -1426,7 +1456,11 @@ module MCPClient
     # @param params [Hash] original request params (for schema validation)
     # @return [Hash] formatted response
     def format_elicitation_response(result, params)
-      response = normalize_elicitation_result(result)
+      response = if (params['mode'] || 'form') == 'url'
+                   normalize_url_elicitation_result(result)
+                 else
+                   normalize_elicitation_result(result)
+                 end
 
       # Per the ElicitResult schema, content is only present when the action
       # is accept and the mode was form; it is omitted for decline/cancel and
@@ -1449,6 +1483,29 @@ module MCPClient
       end
 
       response
+    end
+
+    # A URL-mode elicitation reports the user's consent to open the URL, so
+    # only an explicit answer counts: `true` or an ElicitResult with an
+    # `action` of accept/decline/cancel. Anything else — a bare value, a form
+    # style content hash, nil — is not consent and is answered with cancel.
+    # @param result [Object] handler result
+    # @return [Hash] normalized ElicitResult without content
+    def normalize_url_elicitation_result(result)
+      return { 'action' => 'accept' } if result == true
+
+      action = result.is_a?(Hash) ? (result['action'] || result[:action]) : nil
+      if %w[accept decline cancel].include?(action.to_s)
+        # ElicitResult carries `_meta` in every mode; only `content` is
+        # form-mode-specific, and format_elicitation_response strips it.
+        meta = result['_meta'] || result[:_meta]
+        return { 'action' => action.to_s, '_meta' => meta }.compact
+      end
+
+      unless result.nil? || result == false
+        @logger.warn('URL-mode elicitation handler gave no explicit action; answering cancel (consent is explicit)')
+      end
+      { 'action' => 'cancel' }
     end
 
     # Normalize a handler's return value into a string-keyed ElicitResult
@@ -1487,14 +1544,21 @@ module MCPClient
       ElicitationValidator.validate_content(response['content'], schema)
     end
 
-    # Ensure the action value conforms to MCP spec (accept, decline, cancel)
-    # Falls back to accept for unknown action values.
+    # Ensure the action value conforms to MCP spec (accept, decline, cancel).
+    # An action outside that set is not consent the user gave, so it is
+    # answered as cancel — the verdict URL mode reaches for the same handler
+    # result — rather than rewritten into an accept. (A handler that returns
+    # bare content and no action at all is the documented convenience shape
+    # and never reaches here; see #normalize_elicitation_result.)
+    # @param result [Hash] the normalized ElicitResult
+    # @return [Hash] the result, with an unrecognized action answered as cancel
     def normalised_action_response(result)
       action = result['action']
       return result if %w[accept decline cancel].include?(action)
 
-      @logger.warn("Unknown elicitation action '#{action}', defaulting to accept")
-      result.merge('action' => 'accept')
+      @logger.warn("Unknown elicitation action '#{sanitize_peer_log_text(action.to_s)}'; answering cancel " \
+                   '(consent is explicit)')
+      result.merge('action' => 'cancel')
     end
 
     # Normalize roots array - convert Hashes to Root objects (MCP 2025-06-18)
@@ -1523,23 +1587,35 @@ module MCPClient
       { 'roots' => @roots.map(&:to_h) }
     end
 
+    # Whether a server may be told the roots list changed. MCP forbids using a
+    # capability that was not declared during initialization, so the
+    # notification goes only to sessions whose declared client capabilities
+    # include roots: a transport that registers the handlers for the modern
+    # multi round-trip pattern but has no server-request channel to serve
+    # them on (plain HTTP on a legacy session) declares none, however it
+    # answers respond_to?.
+    # @param server [Object] an MCP server transport
+    # @return [Boolean]
+    def roots_list_changed_recipient?(server)
+      return false unless server.respond_to?(:on_roots_list_request)
+      # notifications/roots/list_changed was removed in MCP 2026-07-28: a
+      # modern server reads roots through the multi round-trip pattern when it
+      # needs them, and has no channel to be told they changed.
+      # Judged by the ESTABLISHED era: while a probe is in flight the version
+      # is only a proposal, and a server that then falls back to the handshake
+      # can still ask for roots — so the transport, which settles the era
+      # before it writes anything, makes the call.
+      return false if server.respond_to?(:protocol_era) && server.protocol_era == :modern
+      return true unless server.respond_to?(:client_capabilities)
+
+      server.client_capabilities.key?('roots')
+    end
+
     # Send notification to all servers that roots have changed (MCP 2025-06-18)
     # @return [void]
     def notify_roots_changed
       @servers.each do |server|
-        # Only notify sessions where the roots capability could be declared:
-        # MCP forbids using capabilities that were not negotiated, and
-        # transports without a server-request channel (plain HTTP) never
-        # declare roots.
-        next unless server.respond_to?(:on_roots_list_request)
-        # notifications/roots/list_changed was removed in MCP 2026-07-28: a
-        # modern server reads roots through the multi round-trip pattern
-        # when it needs them, and has no channel to be told they changed.
-        # Judged by the ESTABLISHED era: while a probe is in flight the
-        # version is only a proposal, and a server that then falls back to
-        # the handshake can still ask for roots — so the transport, which
-        # settles the era before it writes anything, makes the call.
-        next if server.respond_to?(:protocol_era) && server.protocol_era == :modern
+        next unless roots_list_changed_recipient?(server)
 
         begin
           server.rpc_notify('notifications/roots/list_changed', {})
@@ -1576,6 +1652,15 @@ module MCPClient
       end
 
       messages = params['messages'] || []
+      # Both parties SHOULD validate message content (sampling.mdx
+      # "Security Considerations"): the role, the content, a user message of
+      # tool results carrying nothing else, and every assistant tool use
+      # answered by the message that follows it.
+      if (problem = sampling_history_problem(messages))
+        @logger.warn("Rejecting sampling request with a malformed history: #{problem}")
+        return jsonrpc_error_result(-32_602, "Invalid params: #{problem}")
+      end
+
       model_preferences = normalize_model_preferences(params['modelPreferences'])
       system_prompt = params['systemPrompt']
       max_tokens = params['maxTokens']
@@ -1596,6 +1681,139 @@ module MCPClient
         # and stays in the local log rather than crossing to the server.
         jsonrpc_error_result(-32_603, 'Sampling error')
       end
+    end
+
+    # What is wrong with a sampling history, if anything, by the rules of
+    # MCP 2026-07-28 client/sampling: every message has a role of "user" or
+    # "assistant" and content; a user message containing tool results
+    # contains only tool results; every assistant message with tool uses is
+    # followed by a user message consisting entirely of the matching tool
+    # results before any other message.
+    # @param messages [Array<Hash>] the sampling messages
+    # @return [String, nil] the problem, nil when the history is well formed
+    def sampling_history_problem(messages)
+      return 'messages must be an array' unless messages.is_a?(Array)
+
+      pending = nil
+      messages.each_with_index do |message, index|
+        problem, pending = sampling_message_problem(message, index, pending)
+        return problem if problem
+      end
+      return "the last message leaves its tool uses (#{pending.join(', ')}) unanswered" if pending
+
+      nil
+    end
+
+    # @param message [Object] a sampling message
+    # @param index [Integer] its position
+    # @param pending [Array<String>, nil] the tool use ids the previous message left to answer
+    # @return [Array(String, nil), Array(nil, Array<String>)] the problem, or the tool uses now pending
+    def sampling_message_problem(message, index, pending)
+      blocks = sampling_message_blocks(message)
+      return [sampling_shape_problem(message, index), nil] unless blocks
+
+      role = message['role'] || message[:role]
+      uses = blocks.select { |block| sampling_block_type(block) == 'tool_use' }
+      results = blocks.select { |block| sampling_block_type(block) == 'tool_result' }
+      return ["message #{index} carries tool uses in a #{role} message", nil] if uses.any? && role != 'assistant'
+
+      if pending
+        problem = sampling_tool_results_problem(index, role, blocks, results, pending)
+        return [problem, nil] if problem
+      elsif results.any? && results.size != blocks.size
+        # The spec forbids the mixing, not a results-only message on its own:
+        # a server may hand over the results without the history before them.
+        return ["message #{index} mixes tool results with other content", nil]
+      end
+      [nil, (uses.map { |block| (block['id'] || block[:id]).to_s } if uses.any?)]
+    end
+
+    # @param index [Integer] the position of the message answering the tool uses
+    # @param role [String] its role
+    # @param blocks [Array<Hash>] its content blocks
+    # @param results [Array<Hash>] the tool results among them
+    # @param pending [Array<String>] the tool use ids to answer
+    # @return [String, nil] the problem, nil when the message answers exactly those uses
+    def sampling_tool_results_problem(index, role, blocks, results, pending)
+      unless role == 'user' && results.size == blocks.size
+        return "message #{index} must consist only of the tool results answering message #{index - 1}"
+      end
+
+      ids = results.map { |block| (block['toolUseId'] || block[:toolUseId]).to_s }
+      return nil if ids.sort == pending.sort
+
+      "message #{index} tool results do not match the tool uses of message #{index - 1}"
+    end
+
+    # Which half of the message's shape is wrong, so the host is told what to
+    # look at: the envelope, or a content block that carries no meaning.
+    # @param message [Object] a sampling message
+    # @param index [Integer] its position
+    # @return [String] the problem
+    def sampling_shape_problem(message, index)
+      blocks = message.is_a?(Hash) ? (message['content'] || message[:content]) : nil
+      blocks = [blocks] if blocks.is_a?(Hash)
+      if blocks.is_a?(Array)
+        bad = blocks.find { |block| !sampling_block_well_formed?(block) }
+        if bad
+          type = sampling_block_type(bad)
+          named = type ? "a #{type.inspect} content block" : 'a content block'
+          return "message #{index} carries #{named} without the fields its type requires"
+        end
+      end
+      "message #{index} must be an object with a role of \"user\" or \"assistant\" and content"
+    end
+
+    # @param message [Object] a sampling message
+    # @return [Array<Hash>, nil] its content blocks, nil unless the message is well formed
+    def sampling_message_blocks(message)
+      return nil unless message.is_a?(Hash) && %w[user assistant].include?(message['role'] || message[:role])
+
+      blocks = message['content'] || message[:content]
+      blocks = [blocks] if blocks.is_a?(Hash)
+      return nil unless blocks.is_a?(Array) && !blocks.empty?
+      return nil unless blocks.all? { |block| sampling_block_well_formed?(block) }
+
+      blocks
+    end
+
+    # The fields a content block of a known type must carry for the message
+    # rules to mean anything: the text of a text block, the payload of an
+    # image or audio block, and — the reason the correlation rules can be
+    # checked at all — the identifier of a tool use and of the tool result
+    # answering it. A type this client does not know is the host's to read,
+    # not this client's to refuse: refusing it would break a session with a
+    # server using a content type added after this release.
+    # @param block [Object] a content block
+    # @return [Boolean] whether the block can be handed to the host
+    def sampling_block_well_formed?(block)
+      type = sampling_block_type(block)
+      return false unless type
+
+      case type
+      when 'text' then sampling_block_string?(block, 'text')
+      when 'image', 'audio' then sampling_block_string?(block, 'data') && sampling_block_string?(block, 'mimeType')
+      when 'tool_use' then sampling_block_string?(block, 'id')
+      when 'tool_result' then sampling_block_string?(block, 'toolUseId')
+      else true
+      end
+    end
+
+    # @param block [Hash] a content block
+    # @param field [String] the field it must carry
+    # @return [Boolean] whether the field is a non-empty String
+    def sampling_block_string?(block, field)
+      value = block[field] || block[field.to_sym]
+      value.is_a?(String) && !value.empty?
+    end
+
+    # @param block [Object] a content block
+    # @return [String, nil] its type, nil unless it is an object with a String type
+    def sampling_block_type(block)
+      return nil unless block.is_a?(Hash)
+
+      type = block['type'] || block[:type]
+      type.is_a?(String) ? type : nil
     end
 
     # Call sampling handler with appropriate arity

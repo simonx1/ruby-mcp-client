@@ -541,12 +541,16 @@ RSpec.describe 'MCP 2026-07-28 stateless protocol (stdio) — round 6' do
       end
     end
 
+    # From the multi round-trip branch on, input_required is only valid on
+    # tools/call, resources/read and prompts/get: an unfinished list is an
+    # invalid result, still carrying the whole answer, never an empty list.
     it 'never flattens an unfinished tools/list page into an empty list' do
       wire_stdio(server, [{ 'result' => discover_result }, { 'result' => unfinished }])
 
-      expect { server.list_tools }.to raise_error(MCPClient::Errors::InputRequiredError) do |e|
-        expect(e.data).to eq(unfinished)
-      end
+      expect { server.list_tools }
+        .to raise_error(MCPClient::Errors::InvalidResultError, /input_required is only valid/) do |e|
+          expect(e.data).to eq(unfinished)
+        end
     end
   end
 

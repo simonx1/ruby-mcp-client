@@ -410,6 +410,21 @@ module MCPClient
     # the server could have asked for. Exposes the server's input requests
     # and opaque request state so a host can drive the round trip itself.
     class InputRequiredError < ServerError
+      # The request the round trip was driving, when the error was raised by
+      # the round-trip resolver: what {JsonRpcCommon#resume_input_required}
+      # re-issues, with the requestState echoed and no inputResponses.
+      # @return [String, nil] the JSON-RPC method
+      attr_accessor :request_method
+      # @return [Hash, nil] the original request params
+      attr_accessor :request_params
+      # @return [Object, nil] the transport that raised the error
+      attr_accessor :transport
+
+      # @return [Boolean] whether the error carries a continuation to resume from
+      def resumable?
+        request_method.is_a?(String)
+      end
+
       # @return [Hash] the InputRequests map (key => request object)
       def input_requests
         requests = data.is_a?(Hash) ? (data['inputRequests'] || data[:inputRequests]) : nil

@@ -87,13 +87,14 @@ module MCPClient
         method = 'server/discover'
       end
 
-      result = with_retry(method) do
-        # One budget for the exchange and every replacement it may need: the
-        # maximum timeout the spec asks for holds "regardless of progress",
-        # and neither a lost stream nor a rejected header set is progress. The
-        # probe already shares its deadline with its own replacement.
-        budget = timeout || @read_timeout
-        send_with_recovery(method, params, timeout, budget && (monotonic_now + budget))
+      header_refresh_done = false
+      # The multi round-trip resolver sits outside the per-attempt recovery,
+      # so a retry carrying inputResponses/requestState keeps them through
+      # version renegotiation, the HeaderMismatch refresh and a re-issued
+      # stream. Each attempt is a request of its own, with its own id and its
+      # own budget; the deadline lives in attempt_request.
+      result = resolve_input_round_trips(method, params, timeout) do |attempt_params|
+        attempt_request(method, attempt_params, timeout, header_refresh_done) { header_refresh_done = true }
       end
       # Every server/discover answer is validated and applied: a later
       # heartbeat may advertise new versions or capabilities.
@@ -384,10 +385,14 @@ module MCPClient
         @logger.warn("#{e.message}; re-issuing server/discover as a new request")
         send_discover_request(deadline)
       end
-      # A 2xx that is not a DiscoverResult (e.g. a permissive legacy endpoint
-      # answering any method) is not a modern answer: let the probe treat it
-      # as legacy rather than fail on a malformed modern result. A result
-      # carrying a resultType is the exception — see #invalid_discover_answer.
+      # The input_required rejection comes first: an InputRequiredResult need
+      # only carry `requestState`, so an unfinished discover answer does not
+      # have to look like a DiscoverResult at all, and testing the shape first
+      # would classify it as a permissive legacy endpoint. Any other 2xx that
+      # is not a DiscoverResult is a legacy answer the probe may fall back on
+      # — unless it carries a resultType, which only a modern server writes
+      # (see #invalid_discover_answer).
+      reject_input_required_discover!(result)
       raise invalid_discover_answer(result, 'answered without a DiscoverResult') unless discover_result?(result)
 
       apply_discover_result(result)

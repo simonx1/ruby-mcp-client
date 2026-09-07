@@ -545,7 +545,10 @@ RSpec.describe 'MCP 2026-07-28 stateless protocol (stdio) — round 4' do
       expect(sent.first['params']['_meta'][R4_META::META_PROTOCOL_VERSION]).to eq(MCPClient::LATEST_PROTOCOL_VERSION)
     end
 
-    it 'declares no capabilities even with roots, elicitation and sampling callbacks registered' do
+    # The multi round-trip branch declares, on the probe as on every other
+    # request, the input requests the registered handlers can serve: the
+    # server MUST NOT ask for what the client did not declare.
+    it 'declares the input requests it can serve, on the probe as on every request' do
       sent, = script_stdio(server, [{ 'result' => discover_result }, { 'result' => tool_list_result }])
       server.on_roots_list_request { |_id, _params| { 'roots' => [] } }
       server.on_elicitation_request { |_id, _params| { 'action' => 'accept' } }
@@ -553,7 +556,8 @@ RSpec.describe 'MCP 2026-07-28 stateless protocol (stdio) — round 4' do
 
       server.list_tools
 
-      expect(sent.map { |req| req['params']['_meta'][R4_META::META_CLIENT_CAPABILITIES] }).to eq([{}, {}])
+      declared = { 'elicitation' => { 'form' => {}, 'url' => {} }, 'roots' => {}, 'sampling' => {} }
+      expect(sent.map { |req| req['params']['_meta'][R4_META::META_CLIENT_CAPABILITIES] }).to eq([declared, declared])
     end
   end
 

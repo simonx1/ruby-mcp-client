@@ -723,17 +723,14 @@ RSpec.describe 'input_required is a modern-era result type' do
     transport.process_jsonrpc_response({ 'jsonrpc' => '2.0', 'id' => 1, 'result' => result })
   end
 
-  it 'recognizes it once a modern revision is established' do
+  it 'accepts it once a modern revision is established' do
     transport.protocol_version = '2026-07-28'
     result = { 'resultType' => 'input_required', 'requestState' => 'continue-later' }
 
-    # Recognized, not accepted: this client cannot fulfil the round trip, so
-    # the result surfaces as the InputRequired condition with the whole
-    # answer on `data` — never as an invalid result, and never flattened.
-    expect { process(result) }.to raise_error(MCPClient::Errors::InputRequiredError) do |e|
-      expect(e.data).to eq(result)
-      expect(e.request_state).to eq('continue-later')
-    end
+    # The parser hands it on: the multi round-trip resolver that wraps every
+    # request is what drives it to a finished answer, and what reports the
+    # condition when it cannot.
+    expect(process(result)).to eq(result)
     expect(transport.accepted_result_types).to include('input_required')
   end
 
@@ -758,12 +755,15 @@ end
 
 # --- Round 3, finding B: a read must never be flattened while incomplete ----
 #
-# read_resource projects `contents` out of the result. This client does not
-# drive multi round-trip requests yet, so an InputRequiredResult reaching the
-# wrapper must surface — presenting a continuation as an empty successful
-# read loses the requestState and lies about the outcome.
+# read_resource projects `contents` out of the result, so an unfinished result
+# reaching the wrapper must surface: presenting a continuation as an empty
+# successful read loses the requestState and lies about the outcome. The
+# transports below stub the request layer, which pins the wrapper's own guard
+# (require_complete_result!) whatever the round-trip resolver does; the stdio
+# context drives the real resolver with a round trip it cannot fulfil.
 RSpec.describe 'read_resource never presents an unfinished read as an empty one' do
   let(:incomplete) { { 'resultType' => 'input_required', 'requestState' => 'continue-later' } }
+  let(:unfinished_message) { /input/ }
 
   shared_examples 'surfaces an incomplete resources/read result' do
     it 'raises instead of returning an empty content list on a modern session' do
@@ -771,7 +771,7 @@ RSpec.describe 'read_resource never presents an unfinished read as an empty one'
       stub_read_result(incomplete)
 
       expect { server.read_resource('file:///x.txt') }
-        .to raise_error(MCPClient::Errors::InputRequiredError, /input_required/) do |e|
+        .to raise_error(MCPClient::Errors::InputRequiredError, unfinished_message) do |e|
           expect(e).not_to be_a(MCPClient::Errors::ResourceReadError)
           expect(e.protocol_error?).to be(true)
           # The continuation is preserved, not discarded: a host can drive
@@ -792,11 +792,25 @@ RSpec.describe 'read_resource never presents an unfinished read as an empty one'
 
   context 'with ServerStdio' do
     let(:server) { MCPClient::ServerStdio.new(command: 'echo test') }
+    # The only context that reaches the round-trip resolver, so its unfinished
+    # answer asks for something no handler is registered for: the round trip
+    # ends on the first answer instead of being retried ten times.
+    let(:incomplete) do
+      { 'resultType' => 'input_required', 'requestState' => 'continue-later',
+        'inputRequests' => { 'a' => { 'method' => 'elicitation/create', 'params' => { 'message' => 'Who?' } } } }
+    end
+    let(:unfinished_message) { /no handler is registered/ }
 
+    # Answers exactly one resources/read; a retry finds nothing left, so an
+    # unfinished read that is quietly retried fails the example rather than
+    # sleeping its way to the round-trip ceiling.
     def stub_read_result(result)
       server.instance_variable_set(:@initialized, true)
       allow(server).to receive(:send_request)
-      allow(server).to receive(:wait_response).and_return({ 'jsonrpc' => '2.0', 'id' => 1, 'result' => result })
+      answers = [{ 'jsonrpc' => '2.0', 'id' => 1, 'result' => result }]
+      allow(server).to receive(:wait_response) do
+        answers.shift or raise 'resources/read was sent twice'
+      end
     end
 
     include_examples 'surfaces an incomplete resources/read result'
@@ -1569,9 +1583,9 @@ end
 # resources/read. read_resource was pinned in round 3; every other wrapper
 # that projects a field out of the result still turned an unfinished answer
 # into a successful empty one -- an empty tool list, a dropped second page,
-# The condition is reported as InputRequired wherever it is caught: the
-# response parser refuses a round trip this client cannot drive, and the
-# projector guard below it reports the same answer the same way.
+# On a method the round-trip pattern does not cover, an unfinished answer
+# is malformed rather than a continuation to drive: the resolver names the
+# three methods it is valid for and carries the whole answer on the error.
 # or an empty completion -- discarding the requestState with it.
 RSpec.describe 'no list or completion wrapper flattens an unfinished result' do
   let(:incomplete) { { 'resultType' => 'input_required', 'requestState' => 'continue-later' } }
@@ -1580,7 +1594,7 @@ RSpec.describe 'no list or completion wrapper flattens an unfinished result' do
     it 'raises instead of returning an empty tool list' do
       answer_with(incomplete)
 
-      expect { server.list_tools }.to raise_error(MCPClient::Errors::InputRequiredError, /input_required/) do |e|
+      expect { server.list_tools }.to raise_error(MCPClient::Errors::InvalidResultError, /input_required/) do |e|
         expect(e.data).to eq(incomplete)
         expect(e).not_to be_a(MCPClient::Errors::ToolCallError)
       end
@@ -1589,7 +1603,7 @@ RSpec.describe 'no list or completion wrapper flattens an unfinished result' do
     it 'raises instead of returning an empty prompt list' do
       answer_with(incomplete)
 
-      expect { server.list_prompts }.to raise_error(MCPClient::Errors::InputRequiredError, /input_required/) do |e|
+      expect { server.list_prompts }.to raise_error(MCPClient::Errors::InvalidResultError, /input_required/) do |e|
         expect(e.data).to eq(incomplete)
         expect(e).not_to be_a(MCPClient::Errors::PromptGetError)
       end
@@ -1598,14 +1612,14 @@ RSpec.describe 'no list or completion wrapper flattens an unfinished result' do
     it 'raises instead of returning an empty resource list' do
       answer_with(incomplete)
 
-      expect { server.list_resources }.to raise_error(MCPClient::Errors::InputRequiredError, /input_required/)
+      expect { server.list_resources }.to raise_error(MCPClient::Errors::InvalidResultError, /input_required/)
     end
 
     it 'raises instead of returning an empty resource template list' do
       answer_with(incomplete)
 
       expect { server.list_resource_templates }
-        .to raise_error(MCPClient::Errors::InputRequiredError, /input_required/)
+        .to raise_error(MCPClient::Errors::InvalidResultError, /input_required/)
     end
 
     it 'raises instead of returning an empty completion' do
@@ -1614,7 +1628,7 @@ RSpec.describe 'no list or completion wrapper flattens an unfinished result' do
         server.complete(ref: { 'type' => 'ref/prompt', 'name' => 'p' }, argument: { 'name' => 'a', 'value' => '' })
       end
 
-      expect(&request).to raise_error(MCPClient::Errors::InputRequiredError, /input_required/) do |e|
+      expect(&request).to raise_error(MCPClient::Errors::InvalidResultError, /input_required/) do |e|
         expect(e.data).to eq(incomplete)
       end
     end
@@ -1666,7 +1680,7 @@ RSpec.describe 'no list or completion wrapper flattens an unfinished result' do
           headers: { 'Content-Type' => 'application/json' } }
       end
 
-      expect { server.list_tools }.to raise_error(MCPClient::Errors::InputRequiredError, /input_required/)
+      expect { server.list_tools }.to raise_error(MCPClient::Errors::InvalidResultError, /input_required/)
     end
   end
 end
@@ -1691,6 +1705,10 @@ RSpec.describe 'Client#call_tool does not run output validation on an unfinished
       server: mock_server
     )
   end
+  # The built-in transports resolve a continuation themselves (the multi
+  # round-trip branch) and never hand one up; a transport of the host's own
+  # that does is what this pins, so the Client's output validation gate is
+  # exercised directly on the published InputRequests wire shape.
   let(:unfinished) do
     { 'resultType' => 'input_required', 'requestState' => 'continue-later',
       'inputRequests' => { 'city' => { 'method' => 'elicitation/create',
@@ -1743,9 +1761,16 @@ RSpec.describe 'an unfinished result survives the HTTP transports off the wire' 
       'params' => { 'mode' => 'form', 'message' => 'which city?', 'requestedSchema' => { 'type' => 'object' } } }
   end
   let(:unfinished) do
+    # inputRequests is a MAP of server-assigned key => request object, not a
+    # list: the resolver keys its inputResponses by the same names.
     { 'resultType' => 'input_required', 'requestState' => 'continue-later',
       'inputRequests' => { 'city' => city_request } }
   end
+
+  # Anything the operation under test needs on the way (a modern call_tool
+  # reads tools/list first) answers complete, so only the call itself is
+  # unfinished.
+  let(:complete_list) { { 'result' => { 'resultType' => 'complete', 'tools' => [], 'prompts' => [] } } }
 
   shared_examples 'accepts and preserves a continuation' do
     before do
@@ -1763,7 +1788,7 @@ RSpec.describe 'an unfinished result survives the HTTP transports off the wire' 
         respond_with('result' => unfinished)
 
         expect { server.public_send(operation, 'x', {}) }
-          .to raise_error(MCPClient::Errors::InputRequiredError, /input_required/) do |e|
+          .to raise_error(MCPClient::Errors::InputRequiredError, /no handler is registered/) do |e|
             expect(e.data).to eq(unfinished)
             expect(e.request_state).to eq('continue-later')
             expect(e.input_requests).to eq({ 'city' => city_request })
@@ -1775,9 +1800,9 @@ RSpec.describe 'an unfinished result survives the HTTP transports off the wire' 
       respond_with('result' => unfinished)
 
       expect { server.read_resource('file:///x') }
-        .to raise_error(MCPClient::Errors::InputRequiredError, /input_required/) do |e|
+        .to raise_error(MCPClient::Errors::InputRequiredError, /no handler is registered/) do |e|
           expect(e.data).to eq(unfinished)
-          expect(e.input_requests).to eq({ 'city' => city_request })
+          expect(e.data['inputRequests'].keys).to eq(['city'])
         end
     end
 
@@ -1814,8 +1839,12 @@ RSpec.describe 'an unfinished result survives the HTTP transports off the wire' 
 
     def respond_with(response)
       stub_request(:post, "#{base_url}#{endpoint}").to_return do |request|
-        id = JSON.parse(request.body)['id']
-        { status: 200, body: JSON.generate({ 'jsonrpc' => '2.0', 'id' => id }.merge(response)),
+        body = JSON.parse(request.body)
+        # Only the operation under test answers unfinished: a modern call_tool
+        # reads tools/list first, to derive its Mcp-Param-* headers, and a list
+        # answering this way would fail before the call ever went out.
+        answer = MCPClient::JsonRpcCommon::MRTR_METHODS.include?(body['method']) ? response : complete_list
+        { status: 200, body: JSON.generate({ 'jsonrpc' => '2.0', 'id' => body['id'] }.merge(answer)),
           headers: { 'Content-Type' => 'application/json' } }
       end
     end
@@ -1828,8 +1857,9 @@ RSpec.describe 'an unfinished result survives the HTTP transports off the wire' 
 
     def respond_with(response)
       stub_request(:post, "#{base_url}#{endpoint}").to_return do |request|
-        id = JSON.parse(request.body)['id']
-        payload = JSON.generate({ 'jsonrpc' => '2.0', 'id' => id }.merge(response))
+        body = JSON.parse(request.body)
+        answer = MCPClient::JsonRpcCommon::MRTR_METHODS.include?(body['method']) ? response : complete_list
+        payload = JSON.generate({ 'jsonrpc' => '2.0', 'id' => body['id'] }.merge(answer))
         { status: 200, body: "event: message\ndata: #{payload}\n\n",
           headers: { 'Content-Type' => 'text/event-stream' } }
       end
@@ -1903,11 +1933,15 @@ RSpec.describe 'ServerSSE resource errors and unfinished reads off the stream' d
 
   it 'surfaces an unfinished read with the continuation on the error data' do
     server.instance_variable_set(:@protocol_version, '2026-07-28')
-    unfinished = { 'resultType' => 'input_required', 'requestState' => 'continue-later' }
+    unfinished = { 'resultType' => 'input_required', 'requestState' => 'continue-later',
+                   'inputRequests' => { 'city' => { 'method' => 'elicitation/create',
+                                                    'params' => { 'mode' => 'form', 'message' => 'which city?' } } } }
     answer_with('result' => unfinished)
 
+    # The transport drives the round trip; with no handler for the request
+    # it raises the typed error carrying the whole continuation.
     expect { server.read_resource('file:///x') }
-      .to raise_error(MCPClient::Errors::InputRequiredError, /input_required/) do |e|
+      .to raise_error(MCPClient::Errors::InputRequiredError, /no handler is registered/) do |e|
         expect(e.data).to eq(unfinished)
       end
   end

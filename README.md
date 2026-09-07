@@ -228,11 +228,48 @@ client = MCPClient.connect('http://server/mcp',
 )
 ```
 
+Sampling histories are checked before the handler runs (MCP 2026-07-28
+client/sampling: both parties SHOULD validate message content): every message
+needs a `"user"`/`"assistant"` role and content, a user message holding tool
+results holds nothing else, and each assistant tool use is answered by the user
+message that follows it. A malformed history is refused with `-32602` (or fails
+the multi round-trip locally on a 2026-07-28 server) and the handler is not
+invoked.
+
+A multi round-trip request may wait on an interaction that happens out of band
+(a URL-mode elicitation): the server keeps answering with only a
+`requestState`, and the client retries with a growing pause. The host steers
+that wait, and can resume a request it stopped:
+
+```ruby
+client.on_input_required_wait do |wait|
+  # wait.rpc_method, wait.round_trip, wait.delay, wait.request_state,
+  # wait.result, wait.elapsed
+  :cancel if user_pressed_cancel?   # :retry retries now; anything else waits the pace
+end
+
+begin
+  client.call_tool('checkout', { 'cart' => cart })
+rescue MCPClient::Errors::InputRequiredError => e
+  # e.resumable? — the continuation (e.request_method, e.request_params,
+  # e.request_state) is carried by every error the round trip raises
+  client.resume_input_required(e) if e.resumable? && user_pressed_retry?
+end
+```
+
+A wait never runs past the timeout the request runs under either — the one
+given to the call, or the transport's configured `read_timeout` when the call
+named none — and the time your own control spends deciding counts against it.
+The error it raises then is resumable in the same way.
+
 Sampling tool calling (SEP-1577) is opt-in: pass `sampling_supports_tools: true`
 to declare the `sampling.tools` capability. The handler then receives the full
 request params (including `tools`/`toolChoice`) as an optional fifth argument;
 without the opt-in, tool-enabled sampling requests are rejected with `-32602`
-as the spec requires:
+as the spec requires. On a 2026-07-28 server, where sampling arrives as an
+input request inside a multi round-trip answer and `inputResponses` has no
+per-request error channel, the same rejection fails the whole round trip with
+`MCPClient::Errors::InputRequiredError` and the handler is never invoked:
 
 ```ruby
 client = MCPClient::Client.new(
@@ -301,7 +338,11 @@ that negotiated the corresponding capability; otherwise
 capabilities that were not negotiated). `Client#log_level=` skips
 non-logging servers instead of failing. Declared *client* capabilities are
 derived from what the host actually registered (handlers, roots), never
-hardcoded.
+hardcoded — and they gate the client's own traffic too:
+`notifications/roots/list_changed` goes only to a session that declared
+`roots` (never to a 2026-07-28 server, which removed the notification, and
+never to plain HTTP on a legacy session, which has no server-request channel
+to serve roots on).
 
 ### Completion (Autocomplete)
 
@@ -384,6 +425,18 @@ client = MCPClient::Client.new(
   }
 )
 ```
+
+In form mode the handler may return the content on its own (`{ 'field' =>
+'value' }`), which is sent as an `accept`. An explicit `action` must be one of
+`accept`, `decline` or `cancel` — any other value is answered `cancel`, since
+it is not consent the user gave.
+
+In URL mode the handler's second argument is
+`{ 'mode' => 'url', 'url' => ..., 'elicitationId' => ... }` and its answer is
+consent, not data: only an explicit `action` of `accept`, `decline` or `cancel`
+(or a literal `true` for accept) counts — anything else is answered `cancel`.
+`content` is dropped, since it is form-mode only, while a handler-supplied
+`_meta` is passed through.
 
 ## Advanced Configuration
 
