@@ -18,8 +18,13 @@ module MCPClient
       # rejected the request before executing it, so the retry cannot
       # duplicate a side effect. A refresh that fails re-raises the rejection:
       # that is the actionable error.
+      # The list this refresh read is returned, not just cached: the retry
+      # goes out under the definition ITS OWN refresh brought. Two calls to
+      # one tool rejected at the same time each refresh, and the transport's
+      # cache holds whichever landed last — so a retry that re-read the cache
+      # could send another caller's definition.
       # @param error [MCPClient::Errors::HeaderMismatchError] the rejection
-      # @return [void]
+      # @return [Array<MCPClient::Tool>] the list this refresh fetched
       def refresh_tools_after_header_mismatch(error)
         @logger.warn("#{sanitize_log_text(error.message)}; refreshing tools/list and retrying tools/call once")
         refresh_tools_cache
@@ -39,14 +44,17 @@ module MCPClient
       # retry keeps the invariant the check is for: the call is never sent
       # under a schema nothing could read.
       # @param params [Hash] the tools/call params being re-sent
+      # @param refreshed [Array<MCPClient::Tool>, nil] the list this call's own
+      #   refresh read; the transport's cache is consulted only without one
       # @return [void]
       # @raise [MCPClient::Errors::ValidationError] when the refreshed input
       #   or output schema declares a dialect this client does not implement
-      def reject_unreadable_refreshed_schema!(params)
+      def reject_unreadable_refreshed_schema!(params, refreshed = nil)
         return unless params.is_a?(Hash)
 
         name = (params['name'] || params[:name]).to_s
-        tool = known_tools_for_headers.find { |t| t.name.to_s == name }
+        list = refreshed.is_a?(Array) ? refreshed : known_tools_for_headers
+        tool = list.find { |t| t.name.to_s == name }
         # The definition checked here is the one the retry goes out under
         # ({#mcp_param_headers} takes it): a second lookup could bring
         # another, unchecked one.

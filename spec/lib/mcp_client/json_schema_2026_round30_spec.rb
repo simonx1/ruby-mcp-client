@@ -453,10 +453,14 @@ RSpec.describe 'MCP 2026-07-28 JSON Schema handling — round 30' do
         when 'tools/list'
           next json_response(body['id'], listing('Region')) unless rejected
 
-          # The refresh and the dialect check read a readable definition; any
-          # list read after those declares a dialect nothing here can read.
+          # The refresh reads a readable definition; any list read after it
+          # declares a dialect nothing here can read. The refresh hands its
+          # own list to the dialect check and to the retry, so one list is
+          # all this sequence may cost — a second would mean the check went
+          # back to the transport's cache, and it would bring the dialect
+          # that fails the call.
           lists_after_rejection += 1
-          readable = lists_after_rejection <= 2
+          readable = lists_after_rejection <= 1
           json_response(body['id'], listing('Zone', dialect: readable ? nil : 'urn:unknown-dialect'))
         when 'tools/call'
           calls << request.headers.slice('Mcp-Param-Region', 'Mcp-Param-Zone')
@@ -478,7 +482,7 @@ RSpec.describe 'MCP 2026-07-28 JSON Schema handling — round 30' do
       expect(client.call_tool('execute_sql', { 'region' => 'eu' }))
         .to eq({ 'resultType' => 'complete', 'content' => [] })
       expect(calls).to eq([{ 'Mcp-Param-Region' => 'eu' }, { 'Mcp-Param-Zone' => 'eu' }])
-      expect(lists_at_retry).to eq(2)
+      expect(lists_at_retry).to eq(1)
       client.cleanup
     end
   end

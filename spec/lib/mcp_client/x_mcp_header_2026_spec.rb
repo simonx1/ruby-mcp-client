@@ -310,6 +310,33 @@ RSpec.describe 'MCP 2026-07-28 x-mcp-header custom headers' do
       expect(call[:headers].keys.grep(/\AMcp-Param-/)).to be_empty
     end
 
+    # A HeaderMismatch retry must go out under the definition ITS OWN refresh
+    # read. The pin is per-thread, but it used to be filled from the
+    # transport's shared tool cache — so when two calls to one tool were
+    # rejected at the same time, whichever refresh wrote the cache last
+    # supplied the definition for both, and a caller could re-send under
+    # another caller's header. The refresh now hands its own list to the check
+    # that pins.
+    it 'pins the retry to the list its own refresh read, not the cached one' do
+      stub_server(tools: [sql_tool(header: 'Cached')])
+      server.list_tools
+
+      # What another caller's concurrent refresh would have left behind.
+      cached = server.instance_variable_get(:@tools)
+      expect(cached.map(&:name)).to include('execute_sql')
+
+      mine = [MCPClient::Tool.from_json(sql_tool(header: 'Mine'), server: server)]
+      request = { 'method' => 'tools/call',
+                  'params' => { 'name' => 'execute_sql',
+                                'arguments' => { 'region' => 'eu', 'query' => 'SELECT 1' } } }
+
+      server.send(:reject_unreadable_refreshed_schema!, request['params'], mine)
+      headers = server.send(:mcp_param_headers, request)
+
+      expect(headers).to eq({ 'Mcp-Param-Mine' => 'eu' })
+      expect(headers.keys).not_to include('Mcp-Param-Cached')
+    end
+
     it 'Base64-encodes a value that is not header-safe' do
       requests = stub_server(tools: [sql_tool])
 
