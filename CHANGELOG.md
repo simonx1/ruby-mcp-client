@@ -1,9 +1,68 @@
 # Changelog
 
-## Unreleased — MCP 2026-07-28
+## 3.0.0 — MCP 2026-07-28 (2026-09-07)
 
-Groundwork for the 2026-07-28 protocol revision (stateless, per-request
-metadata). Each feature lands in its own PR; this section accumulates them.
+Full support for the MCP 2026-07-28 protocol revision. The revision makes the
+protocol stateless: there is no `initialize` handshake, no session and no
+server-to-client request channel. A client identifies a server with a
+`server/discover` probe and carries its own identity in each request's
+`_meta`; anything the server needs back it asks for through the result.
+
+**Existing code keeps working.** The client detects which revision a server
+speaks and adapts, and every 2025-11-25 and earlier server behaves exactly as
+it did in 2.1.0. The major version marks the size of the new surface and the
+behaviour changes listed below, not a rewrite of the API you already use.
+
+### What is new, in one line each
+
+| Feature | Entry point |
+|---------|-------------|
+| Stateless protocol, era detection | `server.modern?`, `protocol_era`, `protocol: :auto/:modern/:legacy` |
+| Per-request metadata | `MCPClient::Client.new(request_meta:)` |
+| Streamable HTTP modern mode | no session id, no GET stream, broken-stream re-issue |
+| Custom headers from tool parameters | `x-mcp-header` → `Mcp-Param-*`, `MCPClient::HeaderParams` |
+| Multi round-trip requests | `resultType: "input_required"`, `InputRequiredError` |
+| Subscriptions | `client.listen(notifications:)` |
+| Cacheable results | `ttlMs` / `cacheScope`, `server.cache_info` |
+| Tasks extension | `extensions: ['io.modelcontextprotocol/tasks']`, `call_tool_as_task` |
+| Authorization | RFC 9207 `iss` validation, issuer-bound tokens and clients |
+| JSON Schema | 2020-12 dialects, local `$ref`, composition bounds |
+| Deprecations | `MCPClient::Deprecations` registry and notices |
+
+### Behaviour changes to be aware of when upgrading
+
+- **Every HTTP and stdio connection now begins with a `server/discover`
+  probe.** A legacy server answers it with an error and the client falls back
+  to `initialize`, which costs one extra round trip on first connect. Skip the
+  probe with `protocol: :legacy`, or bound it with `discover_timeout:`.
+- **Tool definitions with an invalid `x-mcp-header` annotation are excluded
+  from `list_tools` with a warning** rather than being offered and failing at
+  call time.
+- **`structuredContent` is validated against the tool's `outputSchema`** when
+  the tool declares one, and an unsupported JSON Schema dialect is reported as
+  an error rather than silently skipped.
+- **Results with `cacheScope: "private"` are bound to the credentials their
+  request went out with** and are never served to another authorization
+  context.
+- **Roots, Sampling, Logging, the HTTP+SSE transport and OAuth Dynamic Client
+  Registration now log a deprecation notice** once per feature per process on
+  first use. They keep working; silence the notices with
+  `MCPClient::Deprecations.enabled = false`.
+
+### Examples
+
+`examples/mcp_2026_07_28_server.py` is a Flask server that speaks the new
+revision, with three clients against it: `mcp_2026_07_28_features.rb`,
+`subscriptions_listen_example.rb` and `multi_round_trip_example.rb`. All
+examples are run by `examples/run_all_examples.sh`.
+
+### Test suite
+
+The specs written during development — one file per adversarial review round —
+were consolidated into one canonical and one `*_regressions_spec.rb` file per
+feature. Only specs whose every covered line and branch is covered elsewhere
+were removed, measured with line-and-branch coverage: 296 files and 5550
+examples became 103 files and 4391 examples with no coverage lost.
 
 ### Deprecations (feature lifecycle policy)
 
