@@ -275,16 +275,87 @@ RSpec.describe 'MCP 2026-07-28 authorization' do
       end
     end
 
+    # The rest of the suite runs with notices off (spec_helper), because they
+    # are once per process and would make examples order-dependent; an example
+    # that wants one turns them on for its own duration.
+    def with_notices
+      MCPClient::Deprecations.enabled = true
+      MCPClient::Deprecations.reset!
+      yield
+    ensure
+      MCPClient::Deprecations.reset!
+      MCPClient::Deprecations.enabled = false
+    end
+
     it 'registers a localhost redirect as a native application and warns that DCR is deprecated' do
-      output = StringIO.new
-      provider = provider_for(logger: Logger.new(output))
-      stub_discovery(provider, as_meta(registration_endpoint: registration_endpoint))
-      registered
+      with_notices do
+        output = StringIO.new
+        provider = provider_for(logger: Logger.new(output))
+        stub_discovery(provider, as_meta(registration_endpoint: registration_endpoint))
+        registered
 
-      provider.start_authorization_flow
+        provider.start_authorization_flow
 
-      expect(registration_bodies.first['application_type']).to eq('native')
-      expect(output.string).to match(/Dynamic Client Registration is deprecated/)
+        expect(registration_bodies.first['application_type']).to eq('native')
+        expect(output.string).to match(/Dynamic Client Registration .*deprecated/)
+      end
+    end
+
+    # What is deprecated is registering, not authorizing: the notice hangs on
+    # register_client and not on the priority order that reaches it, so a
+    # client that never registers is never told it uses a deprecated feature.
+    it 'stays silent for pre-registered credentials, which never register' do
+      with_notices do
+        output = StringIO.new
+        storage.set_client_info(server_url, client_info)
+        provider = provider_for(logger: Logger.new(output))
+        stub_discovery(provider, as_meta(registration_endpoint: registration_endpoint))
+        registration = stub_request(:post, registration_endpoint)
+
+        provider.start_authorization_flow
+
+        expect(registration).not_to have_been_requested
+        expect(MCPClient::Deprecations.emitted?(:dynamic_client_registration)).to be(false)
+        expect(output.string).not_to match(/Dynamic Client Registration/)
+      end
+    end
+
+    it 'stays silent for a Client ID Metadata Document client, the migration it names' do
+      with_notices do
+        output = StringIO.new
+        cimd_url = 'https://app.example.com/oauth/client-metadata.json'
+        provider = provider_for(logger: Logger.new(output), client_id_metadata_url: cimd_url)
+        stub_discovery(provider, as_meta(client_id_metadata_document_supported: true,
+                                         registration_endpoint: registration_endpoint))
+        registration = stub_request(:post, registration_endpoint)
+
+        provider.start_authorization_flow
+
+        expect(storage.get_client_info(server_url).registration_type).to eq('cimd')
+        expect(registration).not_to have_been_requested
+        expect(MCPClient::Deprecations.emitted?(:dynamic_client_registration)).to be(false)
+      end
+    end
+
+    # The notice is written before the request goes out, so a registration
+    # that then fails must still fail with ITS error: a logger that raises
+    # inside the notice may not replace the authorization server's answer.
+    it 'reports the registration failure even when the notice cannot be written' do
+      with_notices do
+        # A logger that writes, so the notice reaches it, and then fails on
+        # the write itself.
+        raising = Class.new(Logger) do
+          def warn(*) = raise(IOError, 'log device gone')
+        end.new(StringIO.new)
+        provider = provider_for(logger: raising)
+        stub_discovery(provider, as_meta(registration_endpoint: registration_endpoint))
+        registered(json_answer(400, { error: 'invalid_client_metadata' }))
+
+        expect { provider.start_authorization_flow }
+          .to raise_error(MCPClient::Errors::ConnectionError, /registration/i)
+        expect(registration_bodies.size).to eq(1)
+        expect(MCPClient::Deprecations.emitted?(:dynamic_client_registration)).to be(false)
+      end
     end
 
     it 'registers a custom-scheme redirect as native and a remote https redirect as web' do

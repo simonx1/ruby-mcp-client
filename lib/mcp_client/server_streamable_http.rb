@@ -314,7 +314,12 @@ module MCPClient
     #   'critical', 'alert', 'emergency')
     # @return [Hash] empty result on success
     # @raise [MCPClient::Errors::ServerError] if server returns an error
+    # @deprecated Logging is deprecated since MCP 2026-07-28 (SEP-2577);
+    #   earliest removal is the first revision released on or after
+    #   2027-07-28. Have the server log to stderr (stdio) or use
+    #   OpenTelemetry instead.
     def log_level=(level)
+      MCPClient::Deprecations.warn(:logging, @logger)
       ensure_connected
       # MCP 2026-07-28 removed logging/setLevel: the level travels per request
       # in _meta["io.modelcontextprotocol/logLevel"].
@@ -706,6 +711,13 @@ module MCPClient
     end
 
     # Register a callback for roots/list requests (MCP 2025-06-18)
+    #
+    # @deprecated Roots is deprecated since MCP 2026-07-28 (SEP-2577); earliest
+    #   removal is the first revision released on or after 2027-07-28. Registering
+    #   a handler is not itself use of Roots — a handler that answers with no root
+    #   exposes nothing deprecated — but a handler that answers with a root adopts
+    #   the deprecated feature and raises the notice. Pass directories or files
+    #   through tool parameters, resource URIs or server configuration instead.
     # @param block [Proc] callback that receives (request_id, params) and returns response hash
     # @return [void]
     def on_roots_list_request(&block)
@@ -713,6 +725,11 @@ module MCPClient
     end
 
     # Register a callback for sampling requests (MCP 2025-11-25)
+    #
+    # @deprecated Sampling is deprecated since MCP 2026-07-28 (SEP-2577); earliest
+    #   removal is the first revision released on or after 2027-07-28. Integrate
+    #   directly with the LLM provider API instead of serving
+    #   sampling/createMessage.
     # @param block [Proc] callback that receives (request_id, params) and returns response hash
     # @return [void]
     def on_sampling_request(&block)
@@ -1361,6 +1378,10 @@ module MCPClient
 
       # Call the registered callback
       result = @roots_list_request_callback.call(request_id, params)
+      # Serving a roots/list answer that carries a root means this host
+      # declared, and is using, the deprecated Roots capability (SEP-2577) —
+      # with or without a Client. An empty answer is not use of it.
+      warn_roots_deprecated(result)
 
       # Send the response back to the server (echoing related-task _meta)
       send_roots_list_response(request_id, merge_related_task_meta(result, params))
@@ -1374,9 +1395,17 @@ module MCPClient
       # If no callback is registered, return error
       unless @sampling_request_callback
         @logger.warn('Received sampling request but no callback registered, returning error')
-        send_error_response(request_id, -1, 'Sampling not supported')
+        # sampling.mdx § Error Handling reserves -1 for "User rejected sampling
+        # request"; a capability this client never declared is an unsupported
+        # method (-32601, Method not found), as Client#handle_sampling_request answers.
+        send_error_response(request_id, -32_601, 'Sampling not supported')
         return
       end
+
+      # Sampling, and the includeContext values it may carry, are deprecated
+      # (SEP-2577, SEP-2596) — with or without a Client.
+      warn_sampling_deprecated(params)
+      return if refused_undeclared_sampling_tools?(request_id, params)
 
       # Call the registered callback
       result = @sampling_request_callback.call(request_id, params)

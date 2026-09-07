@@ -6,6 +6,8 @@ require_relative 'client/sampling_validation'
 require_relative 'deep_copy'
 require_relative 'client/list_aggregation'
 require_relative 'client/cache_slices'
+require_relative 'client/notification_routing'
+require_relative 'deprecations'
 require_relative 'client/task_support'
 require_relative 'client/task_api'
 
@@ -16,6 +18,7 @@ module MCPClient
     include SamplingValidation
     include ListAggregation
     include CacheSlices
+    include NotificationRouting
     include MCPClient::Client::TaskSupport
     include MCPClient::Client::TaskApi
 
@@ -27,19 +30,38 @@ module MCPClient
     # Requests with a mode outside this set are rejected with -32602.
     SUPPORTED_ELICITATION_MODES = %w[form url].freeze
 
-    # @!attribute [r] servers
-    #   @return [Array<MCPClient::ServerBase>] list of servers
-    # @!attribute [r] tool_cache
-    #   @return [Hash<String, MCPClient::Tool>] cache of tools by composite key (server_id:name)
-    # @!attribute [r] prompt_cache
-    #   @return [Hash<String, MCPClient::Prompt>] cache of prompts by composite key (server_id:name)
-    # @!attribute [r] resource_cache
-    #   @return [Hash<String, MCPClient::Resource>] cache of resources by composite key (server_id:uri)
-    # @!attribute [r] logger
-    #   @return [Logger] logger for client operations
-    # @!attribute [r] roots
-    #   @return [Array<MCPClient::Root>] list of MCP roots (MCP 2025-06-18)
-    attr_reader :servers, :tool_cache, :prompt_cache, :resource_cache, :logger, :roots
+    # These readers are declared one per line with an ordinary doc comment
+    # rather than grouped under `@!attribute` directives, because the directive
+    # form loses documentation silently: YARD drops the docstring of the LAST
+    # directive in a block preceding a combined `attr_reader`, re-registering
+    # that name from the statement itself with the leftover (empty) docstring.
+    # The `roots` deprecation below was absent from the generated API
+    # documentation for exactly that reason, while every check that read the
+    # source found it.
+
+    # @return [Array<MCPClient::ServerBase>] list of servers
+    attr_reader :servers
+
+    # @return [Hash<String, MCPClient::Tool>] cache of tools by composite key (server_id:name)
+    attr_reader :tool_cache
+
+    # @return [Hash<String, MCPClient::Prompt>] cache of prompts by composite key (server_id:name)
+    attr_reader :prompt_cache
+
+    # @return [Hash<String, MCPClient::Resource>] cache of resources by composite key (server_id:uri)
+    attr_reader :resource_cache
+
+    # @return [Logger] logger for client operations
+    attr_reader :logger
+
+    # @return [Array<MCPClient::Root>] list of MCP roots (MCP 2025-06-18)
+    # @deprecated Roots is deprecated since MCP 2026-07-28 (SEP-2577); earliest
+    #   removal is the first revision released on or after 2027-07-28. Reading the
+    #   list is not itself a first use of the feature — the notice follows
+    #   configuring a root or serving one — but the list is a deprecated feature's
+    #   state, and a host reading it is holding one. Pass directories or files
+    #   through tool parameters, resource URIs or server configuration instead.
+    attr_reader :roots
 
     # Supported modes for structuredContent validation (MCP 2025-11-25):
     # :warn logs a warning on mismatch, :strict raises a ValidationError.
@@ -68,8 +90,13 @@ module MCPClient
     # @param mcp_server_configs [Array<Hash>] configurations for MCP servers
     # @param logger [Logger, nil] optional logger, defaults to STDOUT
     # @param elicitation_handler [Proc, nil] optional handler for elicitation requests (MCP 2025-06-18)
-    # @param roots [Array<MCPClient::Root, Hash>, nil] optional list of roots (MCP 2025-06-18)
-    # @param sampling_handler [Proc, nil] optional handler for sampling requests (MCP 2025-11-25)
+    # @param roots [Array<MCPClient::Root, Hash>, nil] optional list of roots (MCP 2025-06-18).
+    #   Deprecated since MCP 2026-07-28 (SEP-2577); earliest removal is the first revision
+    #   released on or after 2027-07-28. Pass directories or files through tool parameters,
+    #   resource URIs or server configuration instead.
+    # @param sampling_handler [Proc, nil] optional handler for sampling requests (MCP 2025-11-25).
+    #   Deprecated since MCP 2026-07-28 (SEP-2577); earliest removal is the first revision
+    #   released on or after 2027-07-28. Integrate directly with the LLM provider API instead.
     # @param sampling_supports_tools [Boolean] whether the sampling handler supports tool use
     #   (MCP 2025-11-25 / SEP-1577); declares the sampling.tools capability and forwards
     #   tools/toolChoice params to the handler instead of rejecting tool-enabled requests
@@ -144,12 +171,14 @@ module MCPClient
       @notification_listeners = []
       # Elicitation handler (MCP 2025-06-18)
       @elicitation_handler = elicitation_handler
-      # Sampling handler (MCP 2025-11-25)
+      # Sampling handler (MCP 2025-11-25; deprecated in 2026-07-28, SEP-2577)
       @sampling_handler = sampling_handler
+      MCPClient::Deprecations.warn(:sampling, @logger) if sampling_handler
       # Whether the sampling handler supports tool use (SEP-1577)
       @sampling_supports_tools = sampling_supports_tools
-      # Roots (MCP 2025-06-18)
+      # Roots (MCP 2025-06-18; deprecated in 2026-07-28, SEP-2577)
       @roots = normalize_roots(roots)
+      MCPClient::Deprecations.warn(:roots, @logger) unless @roots.empty?
       # Register default and user-defined notification handlers on each server
       @servers.each do |server|
         configure_server_identity(server, client_info, request_meta)
@@ -158,8 +187,13 @@ module MCPClient
         # supports: transports derive their declared client capabilities from
         # the callbacks registered before connecting, and MCP forbids using
         # capabilities that were not negotiated.
+        # The transports call the callback with (request_id, params) only, so
+        # the asking server is closed over here: the URL-mode host contract
+        # depends on its protocol era (MCP 2026-07-28 removed elicitationId).
         if @elicitation_handler && server.respond_to?(:on_elicitation_request)
-          server.on_elicitation_request(&method(:handle_elicitation_request))
+          server.on_elicitation_request do |request_id, request_params|
+            handle_elicitation_request(request_id, request_params, server)
+          end
         end
         # The client always implements the roots feature (roots/list and
         # list_changed notifications), independent of the current roots list.
@@ -469,9 +503,14 @@ module MCPClient
 
     # Set the roots for this client (MCP 2025-06-18)
     # When roots are changed, a notification is sent to all connected servers
+    # @deprecated Roots are deprecated since MCP 2026-07-28 (SEP-2577);
+    #   earliest removal is the first revision released on or after
+    #   2027-07-28. Pass directories or files through tool parameters,
+    #   resource URIs or server configuration instead.
     # @param new_roots [Array<MCPClient::Root, Hash>] the new roots to set
     # @return [void]
     def roots=(new_roots)
+      MCPClient::Deprecations.warn(:roots, @logger)
       @roots = normalize_roots(new_roots)
       # Notify servers that roots have changed
       notify_roots_changed
@@ -646,11 +685,16 @@ module MCPClient
 
     # Set the logging level on all connected servers (MCP 2025-06-18)
     # To set on a specific server, use: client.find_server('name').log_level = 'debug'
+    # @deprecated Logging is deprecated since MCP 2026-07-28 (SEP-2577);
+    #   earliest removal is the first revision released on or after
+    #   2027-07-28. Have the server log to stderr (stdio) or use
+    #   OpenTelemetry instead.
     # @param level [String] the log level ('debug', 'info', 'notice', 'warning', 'error',
     #   'critical', 'alert', 'emergency')
     # @return [Array<Hash>] results from servers
     # @raise [MCPClient::Errors::ServerError] if server returns an error
     def log_level=(level)
+      MCPClient::Deprecations.warn(:logging, @logger)
       @servers.filter_map do |srv|
         # MCP lifecycle: only use capabilities that were successfully
         # negotiated — skip servers whose NEGOTIATED set lacks logging.
@@ -785,153 +829,12 @@ module MCPClient
       srv.respond_to?(:capabilities) && !srv.capabilities.nil?
     end
 
-    # Wire this client's own notification processing and the host's listeners
-    # onto the transport.
-    #
-    # The cache invalidation goes on the transport's own invalidation hook,
-    # which runs *before* a notification is delivered to a subscription's
-    # listeners — so a listener reacting to a `list_changed` notification
-    # re-fetches instead of reading the entry the notification just
-    # invalidated. Everything else this client does with a notification is host
-    # code or leads to it (logging, progress callbacks, task status), and stays
-    # on the callback that runs last, behind the delivery. A transport that
-    # emits no such hook — a host-supplied adapter written against the older
-    # interface, say — keeps the invalidation on `on_notification`, ahead of
-    # everything else there: it routes no subscriptions, so there is no
-    # delivery for it to be ahead of.
-    #
-    # Which of the two it is cannot be answered by whether the transport *has*
-    # the hook: every {MCPClient::ServerBase} subclass inherits it, so the
-    # answer was yes for every custom adapter as well, and one that fans its
-    # notifications out through `@notification_callback` alone — exactly what
-    # the interface used to be — silently stopped invalidating anything. The
-    # question is whether the hook actually *ran* for the notification in
-    # hand, and the hook answers it itself: every path that emits it does so
-    # immediately before the host callback and on the same thread
-    # ({MCPClient::JsonRpcCommon#notify_cache_invalidation}), so a callback
-    # that arrives without that mark is one nothing invalidated for. Having
-    # the hook still decides whether one is *registered* — a host may supply
-    # an object that is no ServerBase at all — but no longer decides who
-    # invalidates.
-    # @param server [MCPClient::ServerBase] the server to wire
-    # @return [void]
-    def register_notification_handlers(server)
-      if server.class.method_defined?(:on_cache_invalidation)
-        server.on_cache_invalidation do |method, _params|
-          invalidate_caches_for_notification(server, method)
-          Thread.current[CACHE_INVALIDATION_MARK] = [server, method]
-        end
-      end
-      server.on_notification do |method, params|
-        mark = Thread.current[CACHE_INVALIDATION_MARK]
-        Thread.current[CACHE_INVALIDATION_MARK] = nil
-        invalidate_caches_for_notification(server, method) unless mark_covers?(mark, server, method)
-        # Default notification processing (e.g., logging, progress)
-        process_notification(server, method, params)
-        # Invoke user-defined listeners
-        @notification_listeners.each { |cb| cb.call(server, method, params) }
-      end
-    end
-
     # @param mark [Array, nil] what the invalidation hook left behind
     # @param server [MCPClient::ServerBase] the transport routing now
     # @param method [String] the notification being routed
     # @return [Boolean] whether the mark is this notification's
     def mark_covers?(mark, server, method)
       mark.is_a?(Array) && mark[0].equal?(server) && mark[1] == method
-    end
-
-    # Drop the caches a notification invalidates.
-    #
-    # Registered on the transport's `on_cache_invalidation` hook, which runs
-    # before the notification is delivered to a subscription's listeners — so a
-    # listener that reacts to a `list_changed` notification by calling
-    # `list_tools` (or the prompt/resource equivalents) re-fetches instead of
-    # reading the entry the notification just invalidated. It used to ride on
-    # `on_notification`, which round 10 moved to the end of the routing order
-    # for good reason: that callback is host code and may block the very reader
-    # the delivery came from. Only the cache drops moved forward; everything
-    # else {#process_notification} does still runs behind the delivery.
-    # @param server [MCPClient::ServerBase] the server that emitted it
-    # @param method [String] JSON-RPC notification method
-    # @return [void]
-    def invalidate_caches_for_notification(server, method)
-      server_id = notification_server_id(server)
-      case method
-      when 'notifications/tools/list_changed'
-        logger.warn("[#{server_id}] Tool list has changed, clearing tool cache")
-        clear_tool_cache
-      when 'notifications/prompts/list_changed'
-        logger.warn("[#{server_id}] Prompt list has changed, clearing prompt cache")
-        @cache_mutex.synchronize do
-          @cache_version += 1
-          @prompt_cache.clear
-          @cache_params.delete(:prompts)
-          @cache_filled.delete(:prompts)
-        end
-      when 'notifications/resources/list_changed'
-        logger.warn("[#{server_id}] Resource list has changed, clearing resource cache")
-        @cache_mutex.synchronize do
-          @cache_version += 1
-          @resource_cache.clear
-          @cache_params.delete(:resources)
-          @cache_filled.delete(:resources)
-        end
-      end
-    end
-
-    # @param server [MCPClient::ServerBase] the server that emitted a notification
-    # @return [String] the identity used to prefix its log lines
-    def notification_server_id(server)
-      server.name ? "#{server.class}[#{server.name}]" : server.class.to_s
-    end
-
-    # Process incoming JSON-RPC notifications with default handlers
-    # @param server [MCPClient::ServerBase] the server that emitted the notification
-    # @param method [String] JSON-RPC notification method
-    # @param params [Hash] parameters for the notification
-    # @return [void]
-    def process_notification(server, method, params)
-      server_id = notification_server_id(server)
-      case method
-      when 'notifications/tools/list_changed', 'notifications/prompts/list_changed',
-           'notifications/resources/list_changed'
-        # Already handled, ahead of the delivery to any subscription listener
-        # (see {#invalidate_caches_for_notification}).
-        nil
-      when 'notifications/resources/updated'
-        logger.warn("[#{server_id}] Resource #{params['uri']} updated")
-      when 'notifications/message'
-        # MCP 2025-06-18: Handle logging messages from server
-        handle_log_message(server_id, params)
-      when 'notifications/tasks/status', 'notifications/tasks'
-        # (both handled below; the legacy method carries the flat 2025 shape)
-        # MCP 2025-11-25: task status update (params are a flat Task);
-        # MCP 2026-07-28 tasks extension: notifications/tasks carries a
-        # DetailedTask (only ever on a subscriptions/listen stream).
-        handle_task_status_notification(server_id, params, method)
-      when 'notifications/subscriptions/acknowledged'
-        # MCP 2026-07-28: the transport already recorded the acknowledged
-        # filter on the Subscription; log for observability.
-        sub_id = params&.dig('_meta', 'io.modelcontextprotocol/subscriptionId')
-        logger.debug("[#{server_id}] Subscription #{sanitize_peer_log_text(sub_id.to_s)} acknowledged")
-      when 'notifications/cancelled'
-        # MCP 2025-11-25 cancellation utility: the server cancelled one of its
-        # own in-flight requests (sampling/elicitation). Server-request
-        # dispatch is synchronous per transport, so by the time this arrives
-        # the handler has usually completed; receivers MAY ignore
-        # cancellations they cannot honor — log for observability. On MCP
-        # 2026-07-28 it only ever tears down a subscriptions/listen stream,
-        # which the transport handled before this point.
-        request_id = sanitize_peer_log_text(params&.dig('requestId').to_s)
-        reason = sanitize_peer_log_text((params&.dig('reason') || 'no reason given').to_s)
-        logger.debug("[#{server_id}] Server cancelled request #{request_id}: #{reason}")
-      when 'notifications/progress'
-        handle_progress_notification(server_id, params)
-      else
-        # Log unknown notification types for debugging purposes
-        logger.debug("[#{server_id}] Received unknown notification: #{method} - #{params}")
-      end
     end
 
     # Handle logging message notification from server (MCP 2025-06-18)
@@ -999,6 +902,7 @@ module MCPClient
     end
 
     def handle_log_message(server_id, params)
+      MCPClient::Deprecations.warn(:logging, @logger)
       level = params['level'] || 'info'
       logger_name = params['logger']
       data = params['data']
@@ -1541,8 +1445,11 @@ module MCPClient
     # Supports both form mode (structured data) and URL mode (out-of-band interaction).
     # @param _request_id [String, Integer] the JSON-RPC request ID (unused at client layer)
     # @param params [Hash] the elicitation parameters
+    # @param server [MCPClient::ServerBase, nil] the server that asked, so the
+    #   URL-mode host contract can follow its protocol era; nil (an era that
+    #   was never established) keeps the 2025-11-25 contract
     # @return [Hash] the elicitation response
-    def handle_elicitation_request(_request_id, params)
+    def handle_elicitation_request(_request_id, params, server = nil)
       mode = params['mode'] || 'form'
       # MCP 2025-11-25: requests with a mode not declared in client
       # capabilities MUST be rejected with -32602 (Invalid params). This check
@@ -1564,7 +1471,7 @@ module MCPClient
 
       begin
         result = if mode == 'url'
-                   handle_url_elicitation(params, message)
+                   handle_url_elicitation(params, message, server)
                  else
                    handle_form_elicitation(params, message)
                  end
@@ -1622,12 +1529,10 @@ module MCPClient
     # Handle URL mode elicitation (MCP 2025-11-25)
     # @param params [Hash] the elicitation parameters
     # @param message [String] the human-readable message
+    # @param server [MCPClient::ServerBase, nil] the server that asked
     # @return [Object] handler result
-    def handle_url_elicitation(params, message)
-      # elicitationId is a 2025-11-25 field: MCP 2026-07-28 dropped it, and a
-      # request without one hands the handler no such key rather than a nil.
-      details = { 'mode' => 'url', 'url' => params['url'] }
-      details['elicitationId'] = params['elicitationId'] if params.key?('elicitationId')
+    def handle_url_elicitation(params, message, server = nil)
+      url_params = url_elicitation_metadata(params, server)
 
       # Call handler with URL-mode specific params
       case @elicitation_handler.arity
@@ -1636,10 +1541,44 @@ module MCPClient
       when 1
         @elicitation_handler.call(message)
       when 2, -1
-        @elicitation_handler.call(message, details)
+        @elicitation_handler.call(message, url_params)
       else
-        @elicitation_handler.call(message, details, params['metadata'])
+        @elicitation_handler.call(message, url_params, params['metadata'])
       end
+    end
+
+    # The URL-mode metadata handed to the host. MCP 2026-07-28 (changelog,
+    # minor change 11) removed the `elicitationId` field along with
+    # `notifications/elicitation/complete`: under the multi round-trip
+    # requests pattern the client learns the outcome by retrying the original
+    # request, and a server that must correlate an elicitation across retries
+    # carries its own identifier in `requestState`. So a modern server's
+    # contract has no such key at all — not even a nil one — and a
+    # non-conforming modern server that sends the field anyway cannot smuggle
+    # a correlation id to the host through it. For a server on an earlier
+    # revision the field is part of the protocol and the contract is
+    # unchanged, key present (nil when the server sent none) and all; a nil
+    # server (an era that was never established) is treated the same way.
+    # @param params [Hash] the elicitation parameters
+    # @param server [MCPClient::ServerBase, nil] the server that asked
+    # @return [Hash] the metadata hash for the host's handler
+    def url_elicitation_metadata(params, server)
+      metadata = { 'mode' => 'url', 'url' => params['url'] }
+      return metadata.merge('elicitationId' => params['elicitationId']) unless modern_server?(server)
+
+      if params.key?('elicitationId')
+        # Dropping the field is the protocol decision; saying so is a
+        # courtesy. A logger that raises costs the notice, never the
+        # elicitation — the value is a server-chosen correlation id, so the
+        # message names the field and never quotes it.
+        begin
+          @logger.warn('Ignoring elicitationId on a URL-mode elicitation request: MCP 2026-07-28 removed the field ' \
+                       '(the outcome is learned by retrying the original request; correlate via requestState)')
+        rescue StandardError
+          nil
+        end
+      end
+      metadata
     end
 
     # Format and validate the elicitation response

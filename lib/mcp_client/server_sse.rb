@@ -8,10 +8,16 @@ require 'logger'
 require 'faraday'
 require 'faraday/retry'
 require 'faraday/follow_redirects'
+require_relative 'deprecations'
 
 module MCPClient
   # Implementation of MCP server that communicates via Server-Sent Events (SSE)
   # Useful for communicating with remote MCP servers over HTTP
+  #
+  # @deprecated The HTTP+SSE transport has been deprecated since MCP
+  #   2025-03-26 and is listed in the 2026-07-28 deprecated features
+  #   registry (SEP-2596); earliest removal is three months after SEP-2596
+  #   reaches Final. Use {MCPClient::ServerStreamableHTTP}.
   #
   # @note Elicitation Support (MCP 2025-06-18)
   #   This transport FULLY supports server-initiated elicitation requests via bidirectional
@@ -431,7 +437,12 @@ module MCPClient
     #   'critical', 'alert', 'emergency')
     # @return [Hash] empty result on success
     # @raise [MCPClient::Errors::ServerError] if server returns an error
+    # @deprecated Logging is deprecated since MCP 2026-07-28 (SEP-2577);
+    #   earliest removal is the first revision released on or after
+    #   2027-07-28. Have the server log to stderr (stdio) or use
+    #   OpenTelemetry instead.
     def log_level=(level)
+      MCPClient::Deprecations.warn(:logging, @logger)
       ensure_initialized
       require_capability!('logging', method: 'logging/setLevel')
       rpc_request('logging/setLevel', { level: level })
@@ -452,7 +463,15 @@ module MCPClient
     # @return [Boolean] true if connection was successful
     # @raise [MCPClient::Errors::ConnectionError] if connection fails
     def connect
-      return true if @mutex.synchronize { @connection_established }
+      # An already-established connection is another use of the transport,
+      # and another chance at the notice: the first connect may have found
+      # notices disabled, a logger above WARN or a logger that raised, all of
+      # which leave the slot unspent. A long-lived connection would otherwise
+      # never retry it.
+      if @mutex.synchronize { @connection_established }
+        MCPClient::Deprecations.warn(:http_sse_transport, @logger)
+        return true
+      end
 
       # Check for pre-existing auth error (needed for tests)
       pre_existing_auth_error = @mutex.synchronize { @auth_error }
@@ -467,6 +486,10 @@ module MCPClient
         effective_timeout = [@read_timeout || 30, 30].min
         wait_for_connection(timeout: effective_timeout)
         start_activity_monitor
+        # The notice is about using the transport: MCPClient.connect builds
+        # (and tries) an SSE server while probing a URL that may end up on
+        # another transport, so only an established connection counts.
+        MCPClient::Deprecations.warn(:http_sse_transport, @logger)
         true
       rescue MCPClient::Errors::ConnectionError => e
         cleanup
@@ -619,6 +642,13 @@ module MCPClient
     end
 
     # Register a callback for roots/list requests (MCP 2025-06-18)
+    #
+    # @deprecated Roots is deprecated since MCP 2026-07-28 (SEP-2577); earliest
+    #   removal is the first revision released on or after 2027-07-28. Registering
+    #   a handler is not itself use of Roots — a handler that answers with no root
+    #   exposes nothing deprecated — but a handler that answers with a root adopts
+    #   the deprecated feature and raises the notice. Pass directories or files
+    #   through tool parameters, resource URIs or server configuration instead.
     # @param block [Proc] callback that receives (request_id, params) and returns response hash
     # @return [void]
     def on_roots_list_request(&block)
@@ -626,6 +656,11 @@ module MCPClient
     end
 
     # Register a callback for sampling requests (MCP 2025-11-25)
+    #
+    # @deprecated Sampling is deprecated since MCP 2026-07-28 (SEP-2577); earliest
+    #   removal is the first revision released on or after 2027-07-28. Integrate
+    #   directly with the LLM provider API instead of serving
+    #   sampling/createMessage.
     # @param block [Proc] callback that receives (request_id, params) and returns response hash
     # @return [void]
     def on_sampling_request(&block)
@@ -712,6 +747,10 @@ module MCPClient
 
       # Call the registered callback
       result = @roots_list_request_callback.call(request_id, params)
+      # Serving a roots/list answer that carries a root means this host
+      # declared, and is using, the deprecated Roots capability (SEP-2577) —
+      # with or without a Client. An empty answer is not use of it.
+      warn_roots_deprecated(result)
 
       # Send the response back to the server (echoing related-task _meta)
       send_roots_list_response(request_id, merge_related_task_meta(result, params))
@@ -744,9 +783,17 @@ module MCPClient
       # If no callback is registered, return error
       unless @sampling_request_callback
         @logger.warn('Received sampling request but no callback registered, returning error')
-        send_error_response(request_id, -1, 'Sampling not supported')
+        # sampling.mdx § Error Handling reserves -1 for "User rejected sampling
+        # request"; a capability this client never declared is an unsupported
+        # method (-32601, Method not found), as Client#handle_sampling_request answers.
+        send_error_response(request_id, -32_601, 'Sampling not supported')
         return
       end
+
+      # Sampling, and the includeContext values it may carry, are deprecated
+      # (SEP-2577, SEP-2596) — with or without a Client.
+      warn_sampling_deprecated(params)
+      return if refused_undeclared_sampling_tools?(request_id, params)
 
       # Call the registered callback
       result = @sampling_request_callback.call(request_id, params)

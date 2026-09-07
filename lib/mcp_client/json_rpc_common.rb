@@ -6,6 +6,7 @@ require 'json'
 require 'zlib'
 require 'stringio'
 require_relative 'deep_copy'
+require_relative 'deprecation_notices'
 require_relative 'header_params'
 require_relative 'json_rpc_common/envelopes'
 require_relative 'json_rpc_common/error_bodies'
@@ -26,6 +27,7 @@ module MCPClient
     include InputWaits
     include RoundTripMarker
     include ResultCompleteness
+    include DeprecationNotices
     include SubscriptionSupport
     include InputRoundTrips
     include ResultCaching
@@ -424,7 +426,12 @@ module MCPClient
     def with_request_meta(params, claim: :none)
       params = merge_meta_spellings(params)
       defaults = host_request_meta(claim)
-      return params if defaults.empty? && !modern? && !reserved_meta_supplied?(params)
+      if defaults.empty? && !modern? && !reserved_meta_supplied?(params)
+        # Legacy traffic is passed through untouched — a `_meta` the caller
+        # supplied goes out as it stands, unless it names a transport-owned key.
+        warn_request_log_level_deprecated(params.is_a?(Hash) ? (params['_meta'] || params[:_meta]) : nil)
+        return params
+      end
 
       params = params.is_a?(Hash) ? params.dup : {}
       supplied = params.delete('_meta')
@@ -451,6 +458,7 @@ module MCPClient
       # server/utilities/caching: a result is bound to the parameters of the
       # request that produced it).
       params['_meta'] = MCPClient::DeepCopy.copy(meta)
+      warn_request_log_level_deprecated(meta)
       params
     end
 
@@ -772,6 +780,13 @@ module MCPClient
     # before connect so the initialize request advertises it; it only takes
     # effect when a sampling request callback is also registered, since
     # sampling.tools is a sub-capability of sampling.
+    #
+    # @deprecated Sampling is deprecated since MCP 2026-07-28 (SEP-2577);
+    #   earliest removal is the first revision released on or after
+    #   2027-07-28, and this sub-capability goes with the capability it
+    #   refines. Declaring it raises no notice of its own — serving a
+    #   sampling/createMessage request does. Integrate directly with the LLM
+    #   provider API instead.
     # @return [void]
     def declare_sampling_tools
       @sampling_tools_supported = true
@@ -786,6 +801,32 @@ module MCPClient
     # @return [Boolean] whether the host opted into sampling tool use
     def sampling_tools_supported?
       instance_variable_defined?(:@sampling_tools_supported) && @sampling_tools_supported
+    end
+
+    # SEP-1577 (schema.ts CreateMessageRequestParams.tools/.toolChoice): "The
+    # client MUST return an error if this field is provided but
+    # ClientCapabilities.sampling.tools is not declared." The 2025-11-25
+    # server-initiated path refuses here, before any handler sees the request,
+    # with the Invalid params code sampling.mdx § Error Handling uses; the
+    # multi round-trip path refuses the same way in InputRoundTrips.
+    # @param request_id [String, Integer] the JSON-RPC request ID
+    # @param params [Hash] the sampling/createMessage params
+    # @return [Boolean] true when the request was refused (and answered)
+    def refused_undeclared_sampling_tools?(request_id, params)
+      return false unless undeclared_sampling_tool_use?('sampling/createMessage', params)
+
+      # The line is a courtesy to the host; the refusal is the answer the peer
+      # is owed. A logger that fails here must not turn Invalid params into
+      # the dispatcher's Internal error.
+      begin
+        @logger.warn('Rejecting tool-enabled sampling request: sampling.tools capability not declared')
+      rescue StandardError
+        nil
+      end
+      send_error_response(request_id, -32_602,
+                          'Invalid params: tools/toolChoice provided but the sampling.tools ' \
+                          'capability was not declared')
+      true
     end
 
     # Result types defined by the core protocol (basic/index.mdx "ResultType").
