@@ -46,7 +46,8 @@ def section(title)
 end
 
 def check(label, condition, detail = nil)
-  puts "  #{condition ? '✅' : '❌'} #{label}#{detail ? " — #{detail}" : ''}"
+  suffix = detail ? " — #{detail}" : ''
+  puts "  #{condition ? '✅' : '❌'} #{label}#{suffix}"
   condition
 end
 

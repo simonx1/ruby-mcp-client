@@ -73,7 +73,8 @@ begin
     break unless method
 
     notifications << method
-    puts "  ← #{method} #{(params['round'] ? "(round #{params['round']})" : '')}"
+    round = params['round'] ? "(round #{params['round']})" : ''
+    puts "  ← #{method} #{round}"
   end
 
   puts "\nClosing the subscription…"

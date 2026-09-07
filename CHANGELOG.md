@@ -31,6 +31,9 @@ behaviour changes listed below, not a rewrite of the API you already use.
 
 ### Behaviour changes to be aware of when upgrading
 
+- **Ruby 3.3 or newer is required.** The floor moved from 3.2 to 3.3 after
+  2.1.0 shipped, so this is the release that carries it for anyone upgrading
+  from 2.1.0.
 - **Every HTTP and stdio connection now begins with a `server/discover`
   probe.** A legacy server answers it with an error and the client falls back
   to `initialize`, which costs one extra round trip on first connect. Skip the
@@ -55,6 +58,27 @@ behaviour changes listed below, not a rewrite of the API you already use.
 revision, with three clients against it: `mcp_2026_07_28_features.rb`,
 `subscriptions_listen_example.rb` and `multi_round_trip_example.rb`. All
 examples are run by `examples/run_all_examples.sh`.
+
+### Fixed during release review
+
+- **The lock serializing a resource's authorization state could be replaced
+  while it was held.** The registry was an `ObjectSpace::WeakMap`, which holds
+  its *values* weakly as well as its keys; the value is the table of
+  per-resource monitors and nothing else referenced it, so a garbage collection
+  between two acquisitions dropped it and the next caller built a fresh
+  monitor. Two providers sharing one storage could then be inside the critical
+  section at the same time — the section that keeps a token from being written
+  over state that changed after it was validated. It is an
+  `ObjectSpace::WeakKeyMap` now: weak keys, strong values.
+
+### Known issue
+
+- Two `tools/call` rejections with `-32020` that overlap in time can both
+  re-send under the tool definition whichever refresh landed last, because the
+  retry re-derives its headers from the transport's shared tool cache. It needs
+  concurrent calls to one tool and a server that changes its `x-mcp-header`
+  annotations between refreshes. The spec that pins the intended behaviour is
+  in the suite, skipped, with the diagnosis next to it.
 
 ### Test suite
 

@@ -6844,3 +6844,89 @@ RSpec.describe 'MCP 2026-07-28 authorization — round 43' do
     end
   end
 end
+
+# --- release review: the authorization-state lock outlives a GC -------------
+
+# The lock that serializes a resource's authorization state lived in an
+# ObjectSpace::WeakMap, whose VALUES are weak as well as its keys. The
+# registry's value is the hash holding the per-resource monitors, and nothing
+# else referenced it: a garbage collection between two acquisitions dropped it,
+# the next caller built a fresh monitor, and two providers sharing one storage
+# entered the critical section at the same time. The section guards
+# read-compare-write on the token slot, so what it costs is a token accepted
+# against state that changed underneath it.
+RSpec.describe 'MCP 2026-07-28 authorization — the authorization-state lock' do
+  let(:server_url) { 'https://mcp.example.com/mcp' }
+  let(:redirect_uri) { 'http://localhost:8080/callback' }
+  let(:logger) { Logger.new(File::NULL) }
+  let(:storage) { MCPClient::Auth::OAuthProvider::MemoryStorage.new }
+
+  def provider
+    MCPClient::Auth::OAuthProvider.new(server_url: server_url, redirect_uri: redirect_uri,
+                                       logger: logger, storage: storage)
+  end
+
+  it 'keeps two providers on one storage out of the critical section at once, across a GC' do
+    first = provider
+    second = provider
+    inside = Queue.new
+    release = Queue.new
+    second_entered = Queue.new
+
+    holder = Thread.new do
+      first.send(:with_authorization_state_lock) do
+        inside << true
+        # The window the bug needed: nothing outside the registry referenced
+        # the monitor table, so a collection here replaced it.
+        3.times { GC.start }
+        release.pop
+      end
+    end
+
+    inside.pop
+    contender = Thread.new do
+      second.send(:with_authorization_state_lock) { second_entered << true }
+    end
+
+    # The contender must still be waiting: it may only enter once the holder
+    # leaves. Without the fix it enters immediately on its own fresh monitor.
+    entered_early = begin
+      second_entered.pop(timeout: 0.5)
+    rescue StandardError
+      nil
+    end
+    expect(entered_early).to be_nil
+
+    release << true
+    holder.join(5)
+    expect(second_entered.pop(timeout: 5)).to be(true)
+    contender.join(5)
+  end
+
+  it 'hands the same lock to every provider sharing a storage and resource' do
+    first = provider
+    monitors = []
+    first.send(:with_authorization_state_lock) { monitors << Thread.current }
+    3.times { GC.start }
+
+    # A second acquisition after a collection must reuse the first monitor;
+    # comparing the objects directly is what the WeakMap could not promise.
+    registry = MCPClient::Auth::OAuthProvider.const_get(:AUTHORIZATION_STATE_LOCKS)
+    table = registry[storage]
+    expect(table).not_to be_nil
+    lock = table[server_url]
+    expect(lock).to be_a(Monitor)
+
+    3.times { GC.start }
+    expect(registry[storage]&.fetch(server_url, nil)).to equal(lock)
+  end
+
+  # Weak KEYS so a storage the host drops takes its locks with it, and strong
+  # VALUES so a collection cannot swap the monitor table out from under a held
+  # lock. Whether a given object is collected on a given GC is not something a
+  # suite can pin, but which map is in use decides both properties.
+  it 'holds storages weakly and their monitor tables strongly' do
+    registry = MCPClient::Auth::OAuthProvider.const_get(:AUTHORIZATION_STATE_LOCKS)
+    expect(registry).to be_a(ObjectSpace::WeakKeyMap)
+  end
+end

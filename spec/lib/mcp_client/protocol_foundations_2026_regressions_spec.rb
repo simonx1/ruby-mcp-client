@@ -2547,8 +2547,19 @@ RSpec.describe 'MCP 2026-07-28 protocol foundations — round 7' do
     end
 
     def posted_methods
-      WebMock::RequestRegistry.instance.requested_signatures.hash.keys
-                              .map { |signature| JSON.parse(signature.body)['method'] }
+      # WebMock's registry is process-global, so a GET, a body-less request or
+      # a non-JSON body from anywhere else in the suite passes through here.
+      # Only this session's JSON-RPC posts have a method to report.
+      WebMock::RequestRegistry.instance.requested_signatures.hash.keys.filter_map do |signature|
+        body = signature.body
+        next if body.nil? || body.empty?
+
+        begin
+          JSON.parse(body)['method']
+        rescue JSON::ParserError
+          nil
+        end
+      end
     end
 
     def gzip(text)
@@ -2738,8 +2749,19 @@ RSpec.describe 'MCP 2026-07-28 protocol foundations — round 8' do
     let(:method_not_found) { { 'code' => -32_601, 'message' => 'Method not found' } }
 
     def posted_methods
-      WebMock::RequestRegistry.instance.requested_signatures.hash.keys
-                              .map { |signature| JSON.parse(signature.body)['method'] }
+      # WebMock's registry is process-global, so a GET, a body-less request or
+      # a non-JSON body from anywhere else in the suite passes through here.
+      # Only this session's JSON-RPC posts have a method to report.
+      WebMock::RequestRegistry.instance.requested_signatures.hash.keys.filter_map do |signature|
+        body = signature.body
+        next if body.nil? || body.empty?
+
+        begin
+          JSON.parse(body)['method']
+        rescue JSON::ParserError
+          nil
+        end
+      end
     end
 
     # The old session answers `vendor/unknown` with a well-formed -32601
