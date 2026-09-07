@@ -486,7 +486,13 @@ RSpec.describe 'MCP 2026-07-28 subscriptions/listen' do
       expect(listens.size).to eq(2)
       expect(listens[1][:body]['id']).not_to eq(listens[0][:body]['id'])
       expect(listens[1][:headers].keys.map(&:downcase)).not_to include('last-event-id')
-      expect(a_request(:get, url)).not_to have_been_made
+      # This server's own traffic. WebMock's registry is process-global, so a
+      # legacy session's events thread leaking out of another example would
+      # otherwise fail this: what the example claims is that THIS transport
+      # never opens a GET, and its events thread is where a GET would come from.
+      expect(server.instance_variable_get(:@events_thread)).to be_nil
+      expect(a_request(:get, url).with(headers: { 'Mcp-Protocol-Version' => '2026-07-28' }))
+        .not_to have_been_made
       expect(subscription).to be_closed_gracefully
     end
 

@@ -804,7 +804,11 @@ RSpec.describe 'MCP 2026-07-28 subscriptions/listen — round 11' do
       deliveries = [received.pop(timeout: 3), received.pop(timeout: 3)]
       expect(deliveries).to contain_exactly([:tools, 'notifications/tools/list_changed'],
                                             [:prompts, 'notifications/prompts/list_changed'])
-      expect(a_request(:get, url)).not_to have_been_made
+      # This server's own traffic, not the process-global registry: another
+      # example's leaked events thread must not decide this one.
+      expect(server.instance_variable_get(:@events_thread)).to be_nil
+      expect(a_request(:get, url).with(headers: { 'Mcp-Protocol-Version' => '2026-07-28' }))
+        .not_to have_been_made
     end
   end
 
