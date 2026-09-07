@@ -548,9 +548,11 @@ RSpec.describe 'MCP 2026-07-28 stateless protocol (stdio) — verification round
     it 'stamps _meta on the outgoing requests of every configured server' do
       first = MCPClient::ServerStdio.new(command: 'echo one', read_timeout: 1)
       second = MCPClient::ServerStdio.new(command: 'echo two', read_timeout: 1)
-      sent_first, = script_stdio(first, [{ 'result' => discover_result }, { 'result' => tool_list_result }])
-      sent_second, = script_stdio(second, [{ 'error' => { 'code' => -32_601, 'message' => 'nope' } },
-                                           { 'result' => legacy_init_result }, { 'result' => tool_list_result }])
+      sent_first, written_first = script_stdio(first, [{ 'result' => discover_result },
+                                                       { 'result' => tool_list_result }])
+      sent_second, written_second = script_stdio(second, [{ 'error' => { 'code' => -32_601, 'message' => 'nope' } },
+                                                          { 'result' => legacy_init_result },
+                                                          { 'result' => tool_list_result }])
       allow(MCPClient::ServerFactory).to receive(:create).and_return(first, second)
       calls = 0
       client = MCPClient::Client.new(
@@ -571,10 +573,13 @@ RSpec.describe 'MCP 2026-07-28 stateless protocol (stdio) — verification round
       end
       expect(sent_first.map { |req| req['method'] }).to eq(%w[server/discover tools/list])
       expect(sent_second.map { |req| req['method'] }).to eq(%w[server/discover initialize tools/list])
-      # Exactly one evaluation per outgoing request, not one per client and
-      # not a cached value reused across requests: >= would be satisfied by
-      # redundant evaluations, which is the other way to get this wrong.
-      expect(calls).to eq(sent_first.size + sent_second.size)
+      # Exactly one evaluation per outgoing MESSAGE -- the legacy handshake's
+      # notifications/initialized goes straight to stdin rather than through
+      # send_request, and it is built like anything else. Not one per client,
+      # and not a cached value reused: >= would be satisfied by redundant
+      # evaluations, which is the other way to get this wrong.
+      outgoing = sent_first.size + sent_second.size + written_first.size + written_second.size
+      expect(calls).to eq(outgoing)
       expect((sent_first + sent_second).map { |req| req['params']['_meta']['traceparent'] }.uniq.size)
         .to eq(sent_first.size + sent_second.size)
     end

@@ -80,7 +80,9 @@ module MCPClient
         name: config[:name],
         logger: logger,
         oauth_provider: config[:oauth_provider],
-        faraday_config: config[:faraday_config]
+        faraday_config: config[:faraday_config],
+        protocol: config[:protocol] || :auto,
+        discover_timeout: config[:discover_timeout]
       )
     end
 
@@ -104,7 +106,9 @@ module MCPClient
         faraday_config: config[:faraday_config],
         max_decompressed_body_bytes:
           config[:max_decompressed_body_bytes] ||
-            MCPClient::ServerStreamableHTTP::JsonRpcTransport::MAX_DECOMPRESSED_BODY_BYTES
+            MCPClient::ServerStreamableHTTP::JsonRpcTransport::MAX_DECOMPRESSED_BODY_BYTES,
+        protocol: config[:protocol] || :auto,
+        discover_timeout: config[:discover_timeout]
       )
     end
 

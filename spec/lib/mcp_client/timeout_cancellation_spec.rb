@@ -87,7 +87,8 @@ RSpec.describe 'Request timeouts and cancellation (MCP 2025-11-25)' do
       allow(server).to receive(:http_connection).and_return(conn)
       calls = []
       allow(conn).to receive(:post) do |_endpoint, &blk|
-        req = Struct.new(:headers, :body, :options).new({}, nil, Struct.new(:timeout).new(nil))
+        req = Struct.new(:headers, :body, :options).new({}, nil,
+                                                        Struct.new(:timeout, :open_timeout, :context).new(nil, nil))
         blk&.call(req)
         body = req.body && JSON.parse(req.body)
         calls << body
@@ -111,7 +112,8 @@ RSpec.describe 'Request timeouts and cancellation (MCP 2025-11-25)' do
       conn = double('conn')
       allow(server).to receive(:http_connection).and_return(conn)
       allow(conn).to receive(:post) do |_endpoint, &blk|
-        req = Struct.new(:headers, :body, :options).new({}, nil, Struct.new(:timeout).new(nil))
+        req = Struct.new(:headers, :body, :options).new({}, nil,
+                                                        Struct.new(:timeout, :open_timeout, :context).new(nil, nil))
         blk&.call(req)
         captured_options = req.options
         Struct.new(:status, :headers, :body, :success?).new(
@@ -122,7 +124,13 @@ RSpec.describe 'Request timeouts and cancellation (MCP 2025-11-25)' do
 
       server.rpc_request('tools/list', {}, timeout: 42)
 
-      expect(captured_options.timeout).to eq(42)
+      # Clamped to what is left of the request's own budget: the socket
+      # timeout never outlives the deadline the request shares with the one
+      # replacement a lost response stream is allowed.
+      expect(captured_options.timeout).to be_within(0.1).of(42)
+      # The same bound covers connection setup (a stalled TLS handshake
+      # delivers no byte for the deadline check to see).
+      expect(captured_options.open_timeout).to be_within(0.1).of(42)
     end
   end
 

@@ -40,7 +40,8 @@ RSpec.describe MCPClient::ServerStreamableHTTP, 'POST SSE response stream handli
 
   # The request issued after connect gets JSON-RPC id 2 (initialize used id 1)
   let(:rpc_result) { { 'ok' => true, 'value' => 42 } }
-  let(:rpc_response) { { jsonrpc: '2.0', id: 2, result: rpc_result } }
+  # ids: 1 = server/discover probe (legacy 400), 2 = initialize, 3 = the request under test
+  let(:rpc_response) { { jsonrpc: '2.0', id: 3, result: rpc_result } }
 
   def sse_event(payload, type: 'message', id: nil)
     lines = []

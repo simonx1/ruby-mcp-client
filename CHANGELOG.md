@@ -5,6 +5,199 @@
 Groundwork for the 2026-07-28 protocol revision (stateless, per-request
 metadata). Each feature lands in its own PR; this section accumulates them.
 
+### Streamable HTTP modern mode (no sessions, request metadata headers)
+
+- **Era detection over HTTP** (Streamable HTTP "Backward Compatibility").
+  Both HTTP transports POST `server/discover` first. A `DiscoverResult`, or a
+  recognized modern JSON-RPC error in a **400** body (`UnsupportedProtocolVersion`
+  is retried with an advertised version; `HeaderMismatch` and
+  `MissingRequiredClientCapability` are surfaced), marks the server modern. A
+  404 carrying -32601 is a modern server without discovery support
+  (tolerated, capabilities unknown, on every connection rather than only the
+  first). Any other 4xx — or a 2xx that is not a
+  `DiscoverResult` — is a legacy server: the `initialize` handshake runs as
+  before. The status is part of the rule: a reserved code under 200 (a
+  permissive legacy endpoint echoing an error object) or under 405 says
+  nothing modern and falls back like any other legacy answer, while an
+  ordinary request after the era is settled still raises the typed error
+  whatever the status. **Both verdicts are cached** for the transport, so a
+  server once found modern never gets `initialize` on a later connection,
+  however a later probe fails — and a reconnect probe that fails
+  inconclusively (timeout, 5xx, broken stream) is reported as that failure,
+  not as "modern but incompatible". `protocol:` and `discover_timeout:` are
+  accepted by
+  `http_config`, `streamable_http_config`, the factory and `MCPClient.connect`.
+- **Only a genuine rejection settles the era.** A probe whose exchange never
+  completed says nothing about the server: 401/403, 5xx (including a 5xx
+  surfaced as an exception by user-configured `raise_error` middleware, which
+  now raises `TransientServerError` like the default response path), timeouts,
+  an oversized body and a broken response stream all propagate instead of
+  recording a (cached, permanent) legacy verdict. The probe itself goes
+  through the modern re-issue path: a `server/discover` whose response stream
+  dies is re-sent once with a new request id before the failure is reported.
+- **A modern verdict survives the transport detector.** A modern-but-
+  incompatible server now raises `MCPClient::Errors::ModernServerError` (a
+  `ConnectionError` subclass), which `MCPClient.connect` re-raises for an
+  ambiguous URL instead of falling through to the legacy SSE and HTTP+POST
+  transports. `MCPClient.connect(url, protocol: :modern)` likewise no longer
+  falls back to those legacy-only transports, and now outranks the URL-suffix
+  heuristic: a URL ending in `/sse` is a path, not a protocol declaration, so
+  asking for a modern server selects Streamable HTTP there instead of the
+  legacy-only SSE transport (which silently drops the option). This covers a
+  server whose
+  `DiscoverResult` (or well-formed `-32022` list) advertises no version this
+  client speaks: discovery settled the era even though it settled no version,
+  so the era is cached and a later connection never sends `initialize`.
+- **Request metadata headers.** Every modern POST carries
+  `MCP-Protocol-Version` (equal to the body's `_meta`), `Mcp-Method` and, for
+  `tools/call`, `prompts/get` and `resources/read`, `Mcp-Name` (also for the
+  tasks extension's `taskId`). Values that are not header-safe use the
+  `=?base64?…?=` sentinel encoding (`encode_header_value`).
+- **No protocol-level session.** Modern connections send no
+  `Mcp-Session-Id`, open no GET event stream, send no DELETE, and never use
+  `Last-Event-ID`. Closing the stream is the cancellation signal (no
+  `notifications/cancelled` on timeout). Server-initiated JSON-RPC requests on
+  a response stream are dropped with a warning; SSE comment keep-alives are
+  ignored. `ping` maps to `server/discover` and `log_level=` to the
+  per-request `_meta` level.
+- **A broken response stream is re-issued, `tools/call` included** (changelog
+  major change 9: "A broken response stream loses the in-flight request;
+  clients **MUST** re-issue it as a new request with a new request ID"). The
+  rule has no per-method exception, and this revision makes the broken stream
+  itself the cancellation signal the server MUST act on — it "**MUST NOT** send
+  any further messages" for the cancelled request — so the replacement request
+  is what the protocol expects rather than a blind replay. Exactly one
+  re-issue is made, for every method: `with_retry` never retries a
+  `ResponseStreamClosedError`, so a second broken stream surfaces as that
+  error instead of looping (previously an idempotent method could multiply
+  the replacement by the retry budget). The other no-replay guarantees are
+  unchanged — a 5xx, a timeout, an oversized body or an expired session
+  during `tools/call` is never re-sent, because in none of those cases was
+  the server told to stop.
+
+  Every way a stream can be lost takes that one path: a break between SSE
+  events, a break inside an event's JSON, and **a socket that dies mid-body**.
+  The last is what a broken stream actually looks like on the wire — Faraday
+  raises rather than handing back a truncated body — and it previously
+  surfaced as a plain `ConnectionError` with no replacement request. That now
+  includes the failures production Streamable HTTP actually raises: an
+  **HTTPS** body whose TLS session dies mid-read (`Faraday::SSLError`, a
+  *sibling* of `ConnectionFailed`, not a subclass), a **gzip** body that stops
+  before its footer (Streamable HTTP always offers gzip), and a generic
+  `IOError` ("closed stream"). A socket failure that proves the request never
+  reached the server (connection refused, DNS, unreachable network, **a TLS
+  handshake that never completed**), and a notification (which has no response
+  to lose), still raise `ConnectionError` and are never replaced.
+
+  **A response that did arrive settles its request.** The re-issue rule is
+  about an in-flight request that was *lost*, so a socket that dies after the
+  final SSE event must not make a `tools/call` run twice. Response bodies are
+  now read as they stream in, so the bytes that arrived survive the failure
+  Faraday raises: if they carry this request's complete answer, that answer is
+  returned (or its JSON-RPC error raised) instead of a replacement request
+  going out. A final event whose terminating blank line never arrived was
+  never dispatched and does not count as delivered — on a response Faraday
+  completed normally exactly as on a broken socket, so a modern server that
+  ends the body inside an event gets the request re-issued (a legacy server
+  keeps the lenient parse it always had). The same salvage applies when the
+  stream *stalls* after the final event until the request times out: the
+  delivered answer settles the request and the timeout only tears the idle
+  socket down. A completed gzip body that is corrupt rather than truncated
+  is a bad response (`TransportError`), not a broken stream to re-issue.
+- **SSE framing follows the specification's line terminators.** Both HTTP
+  parsers now treat CRLF, CR and LF alike, so a server that frames its events
+  with bare CR is read rather than mistaken for a stream that delivered
+  nothing (and, on a modern server, re-issued).
+- **Every request is bounded regardless of progress** (2026-07-28
+  cancellation/timeouts: implementations "SHOULD always enforce a maximum
+  timeout regardless of progress"). The timeouts used to set only Faraday's
+  socket timeout, which measures the gap between reads: a request answered
+  with an endless drip of SSE keep-alives never timed out — a probe blocked
+  every caller waiting on the connection, and a `tools/call` with a
+  per-request `timeout:` never closed its stream. Now the probe gets one
+  deadline (`discover_timeout`) that also covers its re-issue, whose socket
+  timeout is the time *left* on it rather than a fresh allowance, and every
+  other request gets a deadline from its own `timeout:` or the transport's
+  `read_timeout`, enforced while the body arrives. The same bound covers
+  connection setup: a server that accepts the socket and then stalls the TLS
+  handshake delivers no byte for the deadline check to see, so the socket
+  timeout clamped to the time left is applied to opening the connection too,
+  not only to reading from it.
+- **Plain HTTP + SSE response streams.** `ServerHTTP` now advertises and
+  parses `text/event-stream` responses, and reads them **as they arrive**:
+  each complete event is acted on while the response is still open, so a
+  progress or log notification reaches the callback before the server has
+  finished, and on a **legacy** stream — where the server may still send
+  requests, and a receiver "MUST respond promptly" to `ping` — a `ping` is
+  answered with an empty result and any other server-initiated method with
+  JSON-RPC `-32601` on its own POST while the stream is open, rather than
+  only once it has ended (a server that waits for its ping to be answered
+  before sending the result would otherwise deadlock against the client).
+  On a **modern** stream server requests are dropped, as 2026-07-28 requires. A
+  stream that carries only a response to a *different* request is treated as
+  a lost stream on a modern server (both HTTP transports) instead of
+  completing the call with someone else's result; the lenient
+  single-response fallback remains for legacy servers, which echo ids loosely.
+  `ServerStreamableHTTP` reads its POST response streams the same way: a
+  progress notification reaches the callback while the tool is still running
+  (and before a timeout ends the stream, when it never finishes), and a
+  legacy server's `ping` on the stream is answered while it is open. A body
+  that arrives gzip-encoded, which Streamable HTTP asks for on every request,
+  is inflated as it arrives so its events are read live too. Events handed
+  over while the body arrived are not delivered a second time when the
+  completed body — or the answer salvaged from a stream that then broke or
+  stalled — is parsed. The live reader follows the specification's line
+  terminators as closely as the completed parse: a bare CR ending an event's
+  blank line dispatches it at once (the server may be waiting for the
+  answer), the LF of a CRLF that arrives in the next chunk is not a second
+  terminator, and a stream that opens with a blank line is still read.
+- **A delivered gzip answer is a delivered answer.** The salvage of a response
+  that arrived before its stream broke inflates a gzip-encoded capture before
+  looking for the answer, so a `tools/call` whose compressed result was
+  fully delivered is settled rather than re-issued and run again.
+  The same holds when it is the gzip decoder rather than the socket that
+  reports the loss: a body cut after its deflate data — footer only — still
+  delivered its final event in full, and the Streamable HTTP parser now
+  keeps that answer instead of treating the missing footer as a lost
+  request. A body whose deflate data itself stops short is still re-issued,
+  and a complete body with a bad footer CRC is still a bad response.
+- **Gzip is inflated under its bound as it happens.** The live event scanner
+  and the salvage of a compressed answer inflated a body whole and measured
+  it afterwards, so a small compressed body could expand far past
+  `max_decompressed_body_bytes` before the check. Both now inflate through
+  zlib's piecewise form under that bound and stop at the first piece that
+  would cross it.
+- **The live reader follows the SSE parsing rules for the start of a
+  stream.** A stream that opens with a field the client does not know
+  (`x-anything: …`) or with a UTF-8 byte-order mark is read — unknown fields
+  are ignored, not a reason to stop reading — so a ping sent behind one is
+  still answered while the stream is open, and a progress notification
+  behind one is not delayed until the body ends.
+- **The era is unknown while the probe is in flight.** `server/discover`
+  proposes 2026-07-28 but has not established it, and a 2025-11-25 server
+  may send a request on the probe's own response stream and wait for the
+  answer before rejecting the probe. A server-initiated request on a
+  response stream is now dropped only once the era is *established* modern;
+  during the probe a `ping` is answered (and any other method gets
+  `-32601`) as on any legacy stream, so such a server is negotiated down to
+  `initialize` instead of timing out. A modern server never sends one, so
+  answering costs nothing.
+- **A malformed `-32601` identifies no modern server.** The backward
+  compatibility rule ("HTTP 404 with a JSON-RPC `-32601` body is a modern
+  server") now requires a well-formed error object, exactly like the reserved
+  `-3202x` codes: a 404 whose error lacks a string `message` is a legacy
+  rejection, the client falls back to `initialize`, and no modern verdict is
+  cached from it.
+- **Reconnection is serialized.** `ensure_connected` now holds the transport
+  monitor across its "is the connection up?" check and the
+  cleanup/reconnect that follows, so a caller that observed a dead connection
+  can no longer tear down the connection another caller established in the
+  meantime (which terminated its session and re-ran the era probe).
+- **`MCP-Protocol-Version` is taken from the request body.** The header is
+  built from the `_meta` the body was built with, not from the transport's
+  current version, so a concurrent version switch between building the body
+  and attaching its headers can no longer make the two disagree.
+
 ### Stateless protocol on stdio (server/discover, per-request `_meta`)
 
 - **No handshake for modern servers.** On stdio the client now probes with

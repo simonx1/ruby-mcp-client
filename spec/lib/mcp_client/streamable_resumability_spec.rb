@@ -308,7 +308,8 @@ RSpec.describe 'Streamable HTTP resumability (SEP-1699)' do
       stub_connect!
       # The replayed response arrives on a GET carrying the cursor (registered
       # after the general GET stub so it takes precedence for cursor requests)
-      resumed = { jsonrpc: '2.0', id: 2, result: { 'content' => [] } }
+      # ids: 1 = server/discover probe (legacy), 2 = initialize, 3 = tools/call
+      resumed = { jsonrpc: '2.0', id: 3, result: { 'content' => [] } }
       stub_request(:get, "#{base_url}#{endpoint}")
         .with(headers: { 'Last-Event-ID' => 'evt-42' })
         .to_return(status: 200, body: "id: evt-43\nevent: message\ndata: #{resumed.to_json}\n\n",

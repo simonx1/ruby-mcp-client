@@ -420,11 +420,15 @@ RSpec.describe 'HTTP connect surfaces the versions a modern-only server supports
     )
   end
 
+  # On this branch the HTTP transports probe with server/discover and never
+  # fall back to the handshake once the server has answered as a modern one,
+  # so the failure is the typed modern-server error - still naming what the
+  # server would accept, still carrying the rejection as its cause.
   [MCPClient::ServerHTTP, MCPClient::ServerStreamableHTTP].each do |klass|
     it "names the supported versions and keeps the typed error as the cause on #{klass}" do
       server = klass.new(base_url: base_url, endpoint: endpoint, retries: 0)
 
-      expect { server.connect }.to raise_error(MCPClient::Errors::ConnectionError) do |e|
+      expect { server.connect }.to raise_error(MCPClient::Errors::ModernServerError) do |e|
         expect(e.message).to include('server supports: 2026-07-28')
         expect(e.cause).to be_a(MCPClient::Errors::UnsupportedProtocolVersionError)
         expect(e.cause.supported).to eq(['2026-07-28'])

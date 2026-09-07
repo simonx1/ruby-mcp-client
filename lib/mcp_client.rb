@@ -101,7 +101,7 @@ module MCPClient
 
     # Connect to a single server
     def connect_single(target, **options, &)
-      transport = options[:transport]&.to_sym || detect_transport(target)
+      transport = options[:transport]&.to_sym || detect_transport(target, options)
 
       case transport
       when :stdio
@@ -183,7 +183,17 @@ module MCPClient
       begin
         logger.debug("MCPClient.connect: Attempting Streamable HTTP connection to #{url}")
         return connect_streamable_http(url, **options, &)
+      rescue Errors::ModernServerError
+        # The probe identified a modern (2026-07-28+) MCP server. The era is
+        # settled, so the legacy SSE and HTTP+POST fallbacks cannot do better
+        # — and trying them would hide the real, actionable failure.
+        raise
       rescue Errors::ConnectionError, Errors::TransportError => e
+        # protocol: :modern rules out the initialize handshake, and both
+        # remaining fallbacks are legacy-only transports that silently ignore
+        # the option.
+        raise if modern_only?(options)
+
         errors << "Streamable HTTP: #{e.message}"
         logger.debug("MCPClient.connect: Streamable HTTP failed: #{e.message}")
       end
@@ -210,8 +220,18 @@ module MCPClient
             "Failed to connect to #{url}. Tried all transports:\n  #{errors.join("\n  ")}"
     end
 
+    # Whether the caller demanded a modern (2026-07-28+) server, which rules
+    # out falling back to the legacy-only transports.
+    # @param options [Hash] the connect options
+    # @return [Boolean]
+    def modern_only?(options)
+      options[:protocol].respond_to?(:to_sym) && options[:protocol].to_sym == :modern
+    end
+
     # Detect transport type from target
-    def detect_transport(target)
+    # @param target [String, Array] the connection target
+    # @param options [Hash] the connect options, consulted for protocol:
+    def detect_transport(target, options = {})
       return :stdio if target.is_a?(Array) && stdio_command_array?(target)
       return :stdio if stdio_target?(target)
 
@@ -228,6 +248,11 @@ module MCPClient
       end
 
       path = uri.path.to_s.downcase
+      # A URL path is not a protocol declaration: protocol: :modern asks for a
+      # 2026-07-28 server, which only Streamable HTTP can speak. Honouring the
+      # /sse suffix there would select the legacy-only SSE transport, which
+      # drops the option and opens a GET stream instead of probing.
+      return :streamable_http if modern_only?(options)
       return :sse if path.end_with?('/sse')
       return :streamable_http if path.end_with?('/mcp')
 
@@ -295,7 +320,9 @@ module MCPClient
     def extract_http_options(options)
       extract_common_options(options).merge({
         headers: options[:headers] || {},
-        endpoint: options[:endpoint]
+        endpoint: options[:endpoint],
+        protocol: options[:protocol],
+        discover_timeout: options[:discover_timeout]
       }.compact)
     end
 
@@ -318,7 +345,7 @@ module MCPClient
 
     # Build config hash for a target
     def build_config_for_target(target, **options, &)
-      transport = options[:transport]&.to_sym || detect_transport(target)
+      transport = options[:transport]&.to_sym || detect_transport(target, options)
 
       case transport
       when :stdio
@@ -437,7 +464,7 @@ module MCPClient
   #   (e.g., SSL settings, custom middleware). The block is called after default configuration is applied.
   # @return [Hash] server configuration
   def self.http_config(base_url:, endpoint: '/rpc', headers: {}, read_timeout: 30, retries: 3, retry_backoff: 1,
-                       name: nil, logger: nil, &faraday_config)
+                       name: nil, logger: nil, protocol: :auto, discover_timeout: nil, &faraday_config)
     {
       type: 'http',
       base_url: base_url,
@@ -448,6 +475,8 @@ module MCPClient
       retry_backoff: retry_backoff,
       name: name,
       logger: logger,
+      protocol: protocol,
+      discover_timeout: discover_timeout,
       faraday_config: faraday_config
     }
   end
@@ -472,7 +501,7 @@ module MCPClient
                                   retry_backoff: 1, name: nil, logger: nil,
                                   max_decompressed_body_bytes:
                                     MCPClient::ServerStreamableHTTP::JsonRpcTransport::MAX_DECOMPRESSED_BODY_BYTES,
-                                  &faraday_config)
+                                  protocol: :auto, discover_timeout: nil, &faraday_config)
     {
       type: 'streamable_http',
       base_url: base_url,
@@ -484,6 +513,8 @@ module MCPClient
       name: name,
       logger: logger,
       max_decompressed_body_bytes: max_decompressed_body_bytes,
+      protocol: protocol,
+      discover_timeout: discover_timeout,
       faraday_config: faraday_config
     }
   end
