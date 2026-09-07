@@ -54,6 +54,22 @@ Each of these spawns its own Python server over stdio — no external server or 
 | `test_structured_outputs.rb` | Structured tool outputs and output schemas |
 | `test_tool_annotations.rb` | Tool annotation hints |
 
+### MCP 2026-07-28 (stateless protocol)
+
+All three run against `mcp_2026_07_28_server.py` on port `8933`, the only
+example server that speaks the 2026-07-28 revision: no `initialize`
+handshake, no session id, no GET event stream.
+
+| Example | What it shows |
+|---------|---------------|
+| `mcp_2026_07_28_features.rb` | Era detection, cacheable results (`ttlMs` / `cacheScope`), structured output, `x-mcp-header` parameters, the three typed errors |
+| `subscriptions_listen_example.rb` | `subscriptions/listen` streams — what the server acknowledged, what it refused, notifications, graceful close |
+| `multi_round_trip_example.rb` | `resultType: "input_required"` answered by the elicitation handler, and `InputRequiredError` without one |
+
+Point them elsewhere with `MCP_SERVER_URL`. Note that `examples/secrets.env`
+may set that variable for the remote examples, so the harness pins it per
+example.
+
 ### Echo Servers (FastMCP / Flask)
 
 The harness starts the paired Python server, then runs the Ruby client against it.
@@ -93,6 +109,7 @@ Server-initiated user interactions over stdio, SSE, and Streamable HTTP. The `te
 | File | Role |
 |------|------|
 | `echo_server.py` | FastMCP SSE echo server |
+| `mcp_2026_07_28_server.py` | MCP 2026-07-28 server (Flask, `:8933`): `server/discover`, cache hints, `x-mcp-header`, `input_required`, tasks, listen streams |
 | `echo_server_streamable.py` | Flask Streamable HTTP echo server |
 | `echo_server_with_annotations.py` | Echo server advertising tool annotations |
 | `mcp_2025_11_25_server.py` | Backs `test_mcp_2025_11_25.rb` |
