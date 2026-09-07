@@ -695,8 +695,11 @@ RSpec.describe 'MCP 2026-07-28 x-mcp-header — a call nested by a listener that
       stub_server(sent) { |body| header_mismatch(body['id'], 'Mcp-Param-Audit missing') }
       client = nesting_client(factory)
 
-      expect { client.call_tool('charge', { 'region' => 'eu' }) }
-        .to raise_error(MCPClient::Errors::HeaderMismatchError, /Mcp-Param-Audit missing/)
+      # The listener's own failure is isolated by the notification routing --
+      # a listener that raises must not fail the request whose response
+      # carried the notification -- so the outer call returns. What matters
+      # here is the wire: `charge` had already executed, and it is sent once.
+      expect(client.call_tool('charge', { 'region' => 'eu' })).to be_a(Hash)
       expect(sent).to eq([['server/discover', nil], ['tools/list', nil], ['tools/call', 'charge'],
                           ['tools/call', 'audit'], ['tools/list', nil], ['tools/call', 'audit']])
       client.cleanup
@@ -709,12 +712,54 @@ RSpec.describe 'MCP 2026-07-28 x-mcp-header — a call nested by a listener that
       stub_server(sent) { sse_response([]) }
       client = nesting_client(factory)
 
-      expect { client.call_tool('charge', { 'region' => 'eu' }) }
-        .to raise_error(MCPClient::Errors::ResponseStreamClosedError)
+      # The listener's own failure is isolated by the notification routing --
+      # a listener that raises must not fail the request whose response
+      # carried the notification -- so the outer call returns. What matters
+      # here is the wire: `charge` had already executed, and it is sent once.
+      expect(client.call_tool('charge', { 'region' => 'eu' })).to be_a(Hash)
       expect(sent).to eq([['server/discover', nil], ['tools/list', nil], ['tools/call', 'charge'],
                           ['tools/call', 'audit'], ['tools/call', 'audit']])
       client.cleanup
     end
+  end
+end
+
+# The notification routing isolates a listener's own failure, so in practice
+# one rarely reaches an outer exchange's recovery. The marker is what makes
+# that safe rather than lucky: a failure carrying it is never recovered from,
+# whichever path delivered it. Pinned directly, since the routing above would
+# otherwise be the only thing under test.
+RSpec.describe 'MCP 2026-07-28 x-mcp-header — a failure that escaped host code' do
+  let(:server) { MCPClient::ServerHTTP.new(base_url: 'https://example.com', endpoint: '/rpc', retries: 0) }
+
+  before { allow(server).to receive(:modern?).and_return(true) }
+
+  it 'is never recovered from, so the exchange it reached is not re-sent' do
+    attempts = 0
+    allow(server).to receive(:send_request_with_version_retry) do
+      attempts += 1
+      raise MCPClient::Errors::HeaderMismatchError.new('Mcp-Param-Audit missing')
+                                                  .extend(MCPClient::HttpTransportBase::RequestRecovery::NestedExchange)
+    end
+    expect(server).not_to receive(:refresh_tools_after_header_mismatch)
+
+    expect { server.send(:attempt_request, 'tools/call', {}, nil, false) { nil } }
+      .to raise_error(MCPClient::Errors::HeaderMismatchError, /Mcp-Param-Audit missing/)
+    expect(attempts).to eq(1)
+  end
+
+  it 'still recovers from a rejection of the exchange own request' do
+    attempts = 0
+    allow(server).to receive(:send_request_with_version_retry) do
+      attempts += 1
+      raise MCPClient::Errors::HeaderMismatchError, 'Mcp-Param-Zone missing' if attempts == 1
+
+      { 'content' => [] }
+    end
+    allow(server).to receive(:refresh_tools_after_header_mismatch)
+
+    expect(server.send(:attempt_request, 'tools/call', {}, nil, false) { nil }).to eq({ 'content' => [] })
+    expect(attempts).to eq(2)
   end
 end
 

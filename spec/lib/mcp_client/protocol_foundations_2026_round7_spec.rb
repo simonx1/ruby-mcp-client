@@ -161,11 +161,22 @@ RSpec.describe 'MCP 2026-07-28 protocol foundations — round 7' do
         expect(server.public_send(operation, 'file:///x')).to be(true)
       end
 
-      it "raises InvalidResultError from #{operation} for an unknown discriminator on a modern session" do
+      # MCP 2026-07-28 replaced resources/subscribe and resources/unsubscribe
+      # with the subscriptions/listen stream (the subscriptions branch), so on
+      # a modern session neither legacy request is ever sent: the operation
+      # goes through the listen path, whose own answers are validated there
+      # (see SubscriptionSupport — an unknown resultType never closes a
+      # subscription).
+      it "routes #{operation} through the listen stream on a modern session, never the legacy request" do
         server.instance_variable_set(:@protocol_version, '2026-07-28')
+        via = operation == :subscribe_resource ? :subscribe_resource_via_listen : :unsubscribe_resource_via_listen
+        allow(server).to receive(via).and_return(true)
+        allow(server).to receive(:rpc_request).and_call_original
         answer({ 'resultType' => 'weird' })
 
-        expect { server.public_send(operation, 'file:///x') }.to raise_error(MCPClient::Errors::InvalidResultError)
+        expect(server.public_send(operation, 'file:///x')).to be(true)
+        expect(server).to have_received(via).with('file:///x')
+        expect(server).not_to have_received(:rpc_request).with(%r{resources/(un)?subscribe}, anything)
       end
     end
   end
