@@ -503,14 +503,25 @@ RSpec.describe 'MCP 2026-07-28 stateless protocol (stdio) — verification round
       server = MCPClient::ServerStdio.new(command: fixture_command('modern-one-shot', transcript),
                                           read_timeout: 2, discover_timeout: 2)
 
-      expect(server.list_tools.map(&:name)).to eq(['echo'])
-      first_pid = transcript_pids(transcript).first
-      # Captured while they are still the live ones: the exit releases them.
+      # The handles are captured BEFORE the request that makes this fixture
+      # exit: it exits as soon as one tools/list is served, so a capture after
+      # that call races the transport's own release and reads nils. connect
+      # alone is not enough — the reader thread is started by the handshake,
+      # so the session is initialized here too, and the captures below are
+      # asserted to be live rather than trusted to be.
+      server.connect
+      server.send(:ensure_initialized)
       dead_pipes = %i[@stdin @stdout @stderr].map { |ivar| server.instance_variable_get(ivar) }
       dead_reader = server.instance_variable_get(:@reader_thread)
+      expect(dead_pipes).to all(be_truthy)
+      expect(dead_reader).to be_a(Thread)
+
+      expect(server.list_tools.map(&:name)).to eq(['echo'])
+      first_pid = transcript_pids(transcript).first
       wait_for('the subprocess to exit') { !process_alive?(first_pid) }
       # The reader thread notices the closed stdout and hands the exit on;
-      # waiting for it to finish keeps the restart deterministic.
+      # waiting for it to finish keeps the restart deterministic. The handle
+      # is a real thread (asserted above), so this waits for something.
       wait_for('the old reader thread to finish') { !dead_reader.alive? }
 
       expect(server.list_tools.map(&:name)).to eq(['echo'])

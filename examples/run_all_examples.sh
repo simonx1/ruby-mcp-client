@@ -293,6 +293,35 @@ fi
 stop_server
 
 # =========================================================================
+# Group C2 — MCP 2026-07-28 server (mcp_2026_07_28_server.py, :8933)
+#
+# The stateless revision: no initialize handshake, no session, no GET stream.
+# These three examples are the only ones that exercise it.
+# =========================================================================
+section "Group C2 · mcp_2026_07_28_server.py (Streamable HTTP, :8933)"
+start_server "mcp_2026_07_28_server.py" 8933 "$LOG_DIR/_server_2026.log" \
+  "$PYTHON" examples/mcp_2026_07_28_server.py
+if wait_ready 40; then
+  # MCP_SERVER_URL is pinned per example: secrets.env may set it for the
+  # remote-service examples in Group G, and these three must reach the local
+  # 2026 server rather than whatever that points at.
+  run_example "mcp_2026_07_28_features.rb" "features demo completed successfully" - -- \
+    env MCP_SERVER_URL=http://localhost:8933/mcp \
+    bundle exec ruby examples/mcp_2026_07_28_features.rb
+  run_example "subscriptions_listen_example.rb" "demo completed successfully" - -- \
+    env MCP_SERVER_URL=http://localhost:8933/mcp \
+    bundle exec ruby examples/subscriptions_listen_example.rb
+  run_example "multi_round_trip_example.rb" "demo completed successfully" - -- \
+    env MCP_SERVER_URL=http://localhost:8933/mcp \
+    bundle exec ruby examples/multi_round_trip_example.rb
+else
+  skip_example "mcp_2026_07_28_features.rb"      "mcp_2026_07_28_server.py (:8933) not ready"
+  skip_example "subscriptions_listen_example.rb" "mcp_2026_07_28_server.py (:8933) not ready"
+  skip_example "multi_round_trip_example.rb"     "mcp_2026_07_28_server.py (:8933) not ready"
+fi
+stop_server
+
+# =========================================================================
 # Group D — elicitation Flask server (elicitation_streamable_server.py, :8000)
 # =========================================================================
 section "Group D · elicitation_streamable_server.py (:8000)"
