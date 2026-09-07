@@ -189,11 +189,28 @@ RSpec.describe 'OAuth challenge handling (MCP 2025-11-25)' do
     end
 
     describe 'scope resolution priority' do
-      it 'prefers the challenge scope over everything else' do
+      # The challenge decides what the CURRENT operation needs; MCP
+      # 2026-07-28 step-up then asks for "the union of the client's
+      # PREVIOUSLY REQUESTED scope set and the scopes from the current
+      # challenge", so the configured scope is not traded away for it — once
+      # it has actually been requested. A first authorization has no
+      # previously requested set, and the challenge decides it alone.
+      it 'asks for the challenge scope alone until something was requested' do
         provider.scope = 'configured:scope'
         provider.instance_variable_set(:@challenge_scope, 'challenge:scope')
 
-        expect(provider.send(:resolved_scope)).to eq('challenge:scope')
+        expect(provider.send(:resolved_scope).split).to contain_exactly('challenge:scope')
+        expect(provider.send(:selected_scope)).to eq('challenge:scope')
+      end
+
+      it 'adds the challenge scope to what this client already asked for' do
+        provider.scope = 'configured:scope'
+        provider.instance_variable_set(:@requested_scope, 'configured:scope')
+        provider.instance_variable_set(:@challenge_scope, 'challenge:scope')
+
+        expect(provider.send(:resolved_scope).split)
+          .to contain_exactly('configured:scope', 'challenge:scope')
+        expect(provider.send(:selected_scope)).to eq('challenge:scope')
       end
 
       it 'falls back to the configured scope when there is no challenge' do
@@ -334,7 +351,10 @@ RSpec.describe 'OAuth challenge handling (MCP 2025-11-25)' do
       expect(provider.handle_unauthorized_response(response_with(header))).to be_nil
 
       expect(a_request(:get, 'https://evil.example/prm')).not_to have_been_made
-      expect(provider.challenge_scope).to be_nil
+      # Nothing of this header is usable, the scope included: it neither
+      # supplies a challenged scope nor withdraws the one a Bearer challenge
+      # recorded, which the following step-up still has to satisfy.
+      expect(provider.challenge_scope).to eq('old:scope')
     end
 
     it 'still drives discovery and scope from a normal Bearer challenge' do

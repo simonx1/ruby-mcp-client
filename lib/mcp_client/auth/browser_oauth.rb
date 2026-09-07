@@ -3,6 +3,7 @@
 require 'socket'
 require 'uri'
 require 'cgi'
+require_relative 'peer_text'
 require_relative 'oauth_provider'
 
 module MCPClient
@@ -10,6 +11,8 @@ module MCPClient
     # Browser-based OAuth authentication flow helper
     # Provides a complete OAuth flow using browser authentication with a local callback server
     class BrowserOAuth
+      include PeerText
+
       # @!attribute [r] oauth_provider
       #   @return [OAuthProvider] The OAuth provider instance
       # @!attribute [r] callback_port
@@ -89,7 +92,11 @@ module MCPClient
 
           # Complete OAuth flow
           @logger.debug('Completing OAuth authorization flow')
-          token = @oauth_provider.complete_authorization_flow(result[:code], result[:state])
+          token = if result.key?(:iss)
+                    @oauth_provider.complete_authorization_flow(result[:code], result[:state], iss: result[:iss])
+                  else
+                    @oauth_provider.complete_authorization_flow(result[:code], result[:state])
+                  end
 
           @logger.info("\nAuthentication successful!")
           token
@@ -134,7 +141,10 @@ module MCPClient
               # Server was closed, exit loop
               break
             rescue StandardError => e
-              @logger.error("Error handling callback request: #{e.message}")
+              # The request being handled is whatever the browser (or
+              # anything else that reached the loopback port) sent: an
+              # exception raised over it can quote those bytes.
+              @logger.error("Error handling callback request: #{safe_error_text(e.message)}")
             end
           end
         end
@@ -161,7 +171,11 @@ module MCPClient
         return unless parts.length >= 2
 
         method, path = parts[0..1]
-        @logger.debug("Received #{method} request: #{path}")
+        # The query string of a callback carries the authorization code (and
+        # the state that binds it to this flow): a credential, and a
+        # single-use one only until someone reads the log. Only the path is
+        # logged, and only after the peer's bytes are made safe.
+        @logger.debug("Received #{method} request: #{safe_error_text(path.split('?', 2).first.to_s)}")
 
         # Read and discard headers until blank line (with limit to prevent memory exhaustion)
         header_count = 0
@@ -187,22 +201,9 @@ module MCPClient
         params = parse_query_params(query_string || '')
         @logger.debug("Callback params: #{params.keys.join(', ')}")
 
-        # Extract OAuth parameters
-        code = params['code']
-        state = params['state']
-        error = params['error']
-        error_description = params['error_description']
-
         # Update result and signal waiting thread
         mutex.synchronize do
-          if error
-            result[:error] = error_description || error
-          elsif code && state
-            result[:code] = code
-            result[:state] = state
-          else
-            result[:error] = 'Invalid callback: missing code or state parameter'
-          end
+          record_callback(result, params, query_string.to_s)
           result[:completed] = true
 
           condition.signal
@@ -218,19 +219,123 @@ module MCPClient
         client&.close
       end
 
-      # Parse URL query parameters
+      # Store what the callback carried: the error text of an error response
+      # (after the RFC 9207 issuer check), or the code, state and iss of a
+      # success response the provider accepted. The browser is answered only
+      # after that check, so a rejected callback shows the error page, never
+      # "successful".
+      # @param result [Hash] the shared result
+      # @param params [Hash] callback parameters
+      # @param query_string [String] the raw query the parameters were parsed from
+      # @return [void]
+      def record_callback(result, params, query_string = '')
+        if (repeated = repeated_parameter(query_string))
+          return result[:error] = "Invalid callback: the #{repeated} parameter is included more than once " \
+                                  '(RFC 6749 Section 3.1)'
+        end
+
+        code = params['code']
+        state = params['state']
+        if params['error']
+          result[:error] = authorization_error_text(params, params['error_description'] || params['error'])
+        elsif code && state
+          problem = success_callback_problem(params)
+          return result[:error] = problem if problem
+
+          result[:code] = code
+          result[:state] = state
+          # RFC 9207 issuer identification, validated again by the provider
+          result[:iss] = params['iss'] if params.key?('iss')
+        else
+          result[:error] = 'Invalid callback: missing code or state parameter'
+        end
+      end
+
+      # Why a success callback is not acceptable, or nil when it is.
+      # @param params [Hash] callback parameters
+      # @return [String, nil]
+      def success_callback_problem(params)
+        return nil unless @oauth_provider.respond_to?(:validate_authorization_response!)
+
+        @oauth_provider.validate_authorization_response!(params['state'], iss: params['iss'])
+        nil
+      rescue MCPClient::Errors::ConnectionError, ArgumentError => e
+        e.message
+      end
+
+      # The text to surface for an error callback: the provider validates the
+      # response's issuer first and refuses a mismatching one.
+      # @param params [Hash] callback parameters
+      # @param fallback [String] the error text when the provider cannot validate
+      # @return [String]
+      def authorization_error_text(params, fallback)
+        return fallback unless @oauth_provider.respond_to?(:authorization_error_message)
+
+        @oauth_provider.authorization_error_message(params)
+      rescue MCPClient::Errors::ConnectionError => e
+        e.message
+      end
+
+      # The name of the first callback parameter that appears more than once,
+      # or nil when each appears at most once.
+      #
+      # RFC 6749 Section 3.1: "Request and response parameters MUST NOT be
+      # included more than once." The parsed parameters are a Hash, where the
+      # last value of a repeated name silently wins — so
+      # `?iss=attacker&iss=recorded` passes every check this client makes
+      # while a reader that takes the first value (a proxy, a log pipeline, a
+      # differently written client sharing the redirect URI) sees another
+      # authorization server entirely. That disagreement is the whole reason
+      # the RFC forbids the repetition, and there is nothing to reconcile
+      # here: the response is refused, whether the values conflict or not,
+      # and whichever parameter was repeated.
+      # @param query_string [String] the raw query string of the callback
+      # @return [String, nil] the repeated parameter's name
+      # @private
+      def repeated_parameter(query_string)
+        seen = {}
+        PeerText.decodable(query_string).split('&').each do |param|
+          next if param.empty?
+
+          name = decoded_parameter(param.split('=', 2).first.to_s)
+          return safe_error_text(name) if seen.key?(name)
+
+          seen[name] = true
+        end
+        nil
+      end
+
+      # Parse URL query parameters.
+      #
+      # `CGI.unescape` tags its result UTF-8 whatever the escapes decoded to,
+      # so a callback of `?error_description=%FF` yields a String that
+      # `strip`, `match` and `split` all raise `ArgumentError` on. The query
+      # of a callback is the peer's bytes as much as a response body is, so
+      # every name and value is made decodable here, once, at the point it
+      # stops being bytes and starts being text — nothing downstream (the
+      # state comparison, the log line, the error page) can then choke on it.
       # @param query_string [String] Query string from URL
       # @return [Hash] Parsed parameters
       # @private
       def parse_query_params(query_string)
         params = {}
-        query_string.split('&').each do |param|
+        PeerText.decodable(query_string).split('&').each do |param|
           next if param.empty?
 
           key, value = param.split('=', 2)
-          params[CGI.unescape(key)] = CGI.unescape(value || '')
+          params[decoded_parameter(key)] = decoded_parameter(value || '')
         end
         params
+      end
+
+      # One percent-decoded callback parameter, as text.
+      # @param value [String] a raw name or value from the query string
+      # @return [String] the decoded value as valid UTF-8
+      # @private
+      def decoded_parameter(value)
+        PeerText.decodable(CGI.unescape(value))
+      rescue StandardError
+        PeerText::UNREADABLE_TEXT
       end
 
       # Send HTTP response to client

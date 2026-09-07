@@ -956,6 +956,82 @@ See [OAUTH.md](OAUTH.md) for full documentation.
 - **PKCE** — authorization refuses to proceed when the authorization server
   does not advertise `code_challenge_methods_supported` including `S256`.
 
+### Authorization server binding (2026-07-28)
+
+- **Registration state is per authorization server (SEP-2352)** — credentials
+  *and tokens* are stored under the MCP server URL (the record in use) *and*
+  under `provider.client_registration_key(issuer)`, so two authorization
+  servers behind one MCP server each keep their own registration state
+  instead of replacing one another. Seed pre-registered credentials for a
+  specific authorization server with
+  `storage.set_client_info(provider.client_registration_key(issuer), creds)`.
+- **Pre-registered credentials must name their authorization server** — a
+  `client_id` (and any secret with it) is issued by one authorization server,
+  so credentials that name none are not bound to whichever server discovery
+  happens to find: that would send the secret registered with one server to
+  another. Store them with `issuer:` on the `ClientInfo`, or under
+  `client_registration_key(issuer)`; without it, authorization raises a
+  `ConnectionError` saying so and nothing is sent anywhere. A Client ID
+  Metadata Document id is portable and needs no issuer.
+- **Pre-registered credentials outrank what the client registered itself** —
+  when an authorization server has credentials of its own under
+  `client_registration_key(issuer)`, they are used ahead of a Client ID
+  Metadata Document id (which answers for every server) and ahead of a
+  dynamic registration in the slot, as the MCP registration priority order
+  requires — and a dynamic registration never overwrites them.
+- **A token is kept for each authorization server** — when the authorization
+  server changes, the token of the previous one is set aside under its own
+  key rather than thrown away, and picked up again if that server becomes the
+  one in use. A token this client retired (a 401 challenge naming another
+  authorization server) is deleted wherever it is kept, and no token is ever
+  presented to an authorization server other than the one that issued it.
+- **A registration a flow needs must reach storage** — a backend that cannot
+  persist the credentials in use raises instead of returning an authorization
+  URL whose callback would then report "Missing PKCE or client info". The
+  per-authorization-server copy stays best-effort.
+- **A refresh presents the credentials in the slot a host writes to** — a
+  secret rotated under the MCP server URL is used, not the older copy kept
+  under the authorization server's own key. Authorization and refresh pick the
+  same record.
+- **A refresh and a code exchange are both re-checked when the response
+  arrives** — a token from an authorization server that stopped being this
+  resource's while the request was in flight is discarded rather than stored
+  over the current server's token or presented, and a code exchange that
+  arrives late no longer deletes the pending authorization request another
+  flow started meanwhile.
+- **One per-request record** — the `state`, the PKCE verifier, the expected
+  issuer, the client id and the redirect URI of an authorization request are
+  written together, and the callback's `state` is checked against the record
+  the other checks read. Two flows sharing one storage backend can no longer
+  interleave their writes until one flow's state names the other flow's
+  request.
+- **Scopes accumulate across step-ups** — re-authorizing after an
+  `insufficient_scope` challenge asks for the union of the scopes already
+  requested and the ones the challenge names, so getting `files:write` does
+  not give up `files:read`. "Already requested" survives a restart: it covers
+  the configured scope and the scope the authorization server granted the
+  token in hand, not only what this provider object last asked for. It is
+  scoped to one authorization server, so another server's scopes are never
+  asked of the new one.
+- **An authorization request parameter appears once** — the authorization
+  endpoint's own query string is retained (RFC 6749 §3.1), but an endpoint of
+  `https://as.example/authorize?scope=openid` does not add a second `scope`
+  to the request; the same for `state`, `client_id` and the PKCE parameters.
+  Everything else the endpoint carries (`tenant`, `brand`, a locale) is kept.
+- **Only a token type the client understands is presented** — `token_type` is
+  REQUIRED (RFC 6749 §5.1) and must be `Bearer` (§7.1). A `DPoP` or `mac`
+  token is refused where it is issued and where it is read back, and so is a
+  response that names no type at all: §5.1 defines no default, and §7.1
+  forbids using a token whose type the client does not understand.
+- **Every redirect URI is `localhost` or HTTPS** — MCP 2026-07-28
+  "Communication Security". `http://app.example.com/callback` is refused when
+  it is configured and when a registration response registers it; plain HTTP
+  on the loopback interface and RFC 8252 private-use schemes
+  (`com.example.app:/cb`) are unaffected.
+- **A callback parameter may appear once** — RFC 6749 §3.1: `BrowserOAuth`
+  refuses a callback that repeats `iss`, `state`, `code` or any other
+  parameter instead of silently taking the last value.
+
 ## Cacheable Results (MCP 2026-07-28)
 
 A 2026-07-28 server may bound a result with `ttlMs` (how long the client MAY
@@ -1079,7 +1155,7 @@ default behaviour — but it is worth knowing what the client will refuse:
 | `retry:` directives | Honored, but floored so `retry: 0` cannot drive a reconnect loop |
 | SSE event IDs | Bounded length, printable ASCII only (they are echoed in `Last-Event-ID`) |
 | Legacy SSE `endpoint` events | Must stay on the connection's origin; off-origin redirects are refused, so configured credential headers never reach another host |
-| OAuth discovery URLs from a peer | Must be HTTPS, and rejected when the host is a *literal* loopback/private/link-local address (unless the configured server is itself local); a refused challenge fails closed. Hostnames are not resolved, so a public name pointing at a private address is not caught — see the note below |
+| OAuth discovery URLs from a peer | Must be HTTPS, and rejected when the host is a *literal* loopback/private/link-local address. The only exception is a local stack: a configured server URL on the loopback interface (`localhost`, `*.localhost`, 127.0.0.0/8, `::1`) may be sent to a plain-HTTP *loopback* URL — never to a link-local or otherwise private one. A refused challenge fails closed. Hostnames are not resolved, so a public name pointing at a private address is not caught — see the note below |
 | Unsolicited JSON-RPC responses | Discarded — only IDs with an outstanding request are accepted |
 | Server-initiated requests | Replies are bounded by a concurrency budget rather than spawning unbounded threads |
 | Schema `pattern` values | Matched under a whole-operation time budget; a timeout fails validation rather than silently passing |

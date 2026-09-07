@@ -928,20 +928,26 @@ module MCPClient
       @logger.debug("OAuth challenge processing failed: #{e.message}")
     end
 
-    # Raise the appropriate error for a 401/403: an insufficient_scope 403
+    # Raise the appropriate error for a 401/403: an insufficient_scope
     # challenge (SEP-835) raises InsufficientScopeError exposing the required
     # scopes so hosts can run a step-up authorization flow.
+    #
+    # The status the challenge arrives with does not change what it is. RFC
+    # 6750 Section 3.1 pairs insufficient_scope with 403, and authorization
+    # servers and resource servers do send it on 401 as well; a host that
+    # rescues the typed error to run the step-up flow would otherwise miss
+    # exactly those.
     # @param response [Faraday::Response] the 401/403 response
     # @raise [MCPClient::Errors::InsufficientScopeError, MCPClient::Errors::ConnectionError]
     def raise_authorization_error(response)
       challenge = bearer_challenge_segment(www_authenticate_header(response))
 
-      if response.status == 403 && insufficient_scope_challenge?(challenge)
+      if insufficient_scope_challenge?(challenge)
         scope = challenge[/(?:^|[\s,])scope\s*=\s*"([^"]*)"/i, 1] ||
                 challenge[/(?:^|[\s,])scope\s*=\s*([^,\s"]+)/i, 1]
         description = challenge[/(?:^|[\s,])error_description\s*=\s*"([^"]*)"/i, 1]
         raise MCPClient::Errors::InsufficientScopeError.new(
-          "Authorization failed: HTTP 403 insufficient_scope#{" (required scopes: #{scope})" if scope}",
+          "Authorization failed: HTTP #{response.status} insufficient_scope#{" (required scopes: #{scope})" if scope}",
           scope: scope, error_description: description
         )
       end
@@ -957,6 +963,11 @@ module MCPClient
     # @return [String, nil] the Bearer challenge's parameters (possibly empty),
     #   or nil when the header has no Bearer challenge
     def bearer_challenge_segment(header)
+      # Peer bytes, made decodable before any pattern is run over them:
+      # `gsub` and `match` raise `ArgumentError` on invalid UTF-8, and a
+      # challenge that crashed the code reading it would surface as the
+      # client's own ArgumentError instead of an authorization error.
+      header = MCPClient::Auth::PeerText.decodable(header) if header
       return nil unless header
 
       # Locate the Bearer scheme token only OUTSIDE quoted strings: a quoted
