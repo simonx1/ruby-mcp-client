@@ -106,7 +106,7 @@ RSpec.describe 'MCP 2026-07-28 Streamable HTTP modern mode' do
 
     describe 'era detection' do
       it 'goes modern on a DiscoverResult and never opens a GET stream, initializes or terminates a session' do
-        get_stub = stub_request(:get, url).to_return(status: 405, body: '')
+        stub_request(:get, url).to_return(status: 405, body: '')
         delete_stub = stub_request(:delete, url).to_return(status: 200, body: '')
         requests = stub_modern_server('server/discover' => discover_result, 'tools/list' => { 'tools' => [] })
 
@@ -118,7 +118,12 @@ RSpec.describe 'MCP 2026-07-28 Streamable HTTP modern mode' do
         expect(server.protocol_era).to eq(:modern)
         expect(server.capabilities).to eq({ 'tools' => {}, 'logging' => {} })
         expect(server.server_info).to eq({ 'name' => 'modern', 'version' => '1' })
-        expect(get_stub).not_to have_been_requested
+        # This server's own traffic: a modern session sends its protocol
+        # version on every request and never a session id. A GET from another
+        # example's events thread would otherwise fail this one.
+        expect(a_request(:get, url).with(headers: { 'Mcp-Protocol-Version' => '2026-07-28' }))
+          .not_to have_been_made
+        expect(server.instance_variable_get(:@events_thread)).to be_nil
         expect(delete_stub).not_to have_been_requested
       end
 
@@ -243,6 +248,9 @@ RSpec.describe 'MCP 2026-07-28 Streamable HTTP modern mode' do
           fresh.connect
           expect(requests).to eq(%w[server/discover initialize notifications/initialized])
           expect(fresh.protocol_era).to eq(:legacy)
+          # A legacy session runs an events thread; without this it outlives
+          # the example and its GETs land in whichever example is running next.
+          fresh.cleanup
           fresh.cleanup
         end
       end
