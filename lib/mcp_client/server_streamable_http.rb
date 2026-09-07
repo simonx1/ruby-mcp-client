@@ -231,14 +231,7 @@ module MCPClient
       begin
         ensure_connected
 
-        tools_data = request_tools_list
-        @mutex.synchronize do
-          @tools = tools_data.map do |tool_data|
-            MCPClient::Tool.from_json(tool_data, server: self)
-          end
-        end
-
-        @mutex.synchronize { @tools }
+        fetch_tools_list
       rescue MCPClient::Errors::ConnectionError, MCPClient::Errors::TransportError, MCPClient::Errors::ServerError
         # Re-raise these errors directly
         raise
@@ -257,7 +250,7 @@ module MCPClient
     # @raise [MCPClient::Errors::ConnectionError] if server is disconnected
     def call_tool(tool_name, parameters)
       rpc_request('tools/call', build_named_request_params(tool_name, parameters))
-    rescue MCPClient::Errors::ConnectionError, MCPClient::Errors::TransportError
+    rescue MCPClient::Errors::ConnectionError, MCPClient::Errors::TransportError, MCPClient::Errors::ValidationError
       # Re-raise connection/transport errors directly to match test expectations
       raise
     rescue MCPClient::Errors::ServerError => e
@@ -347,14 +340,14 @@ module MCPClient
       begin
         ensure_connected
 
+        generation = @mutex.synchronize { list_generation(:prompts) }
         prompts_data = request_prompts_list
-        @mutex.synchronize do
-          @prompts = prompts_data.map do |prompt_data|
-            MCPClient::Prompt.from_json(prompt_data, server: self)
-          end
+        prompts = prompts_data.map do |prompt_data|
+          MCPClient::Prompt.from_json(prompt_data, server: self)
         end
-
-        @mutex.synchronize { @prompts }
+        # A list invalidated while in flight is returned but not cached.
+        @mutex.synchronize { @prompts = prompts if list_generation(:prompts) == generation }
+        prompts
       rescue MCPClient::Errors::ConnectionError, MCPClient::Errors::TransportError, MCPClient::Errors::ServerError
         # Re-raise these errors directly
         raise
@@ -398,6 +391,7 @@ module MCPClient
 
         params = {}
         params['cursor'] = cursor if cursor
+        generation = @mutex.synchronize { list_generation(:resources) }
         result = require_complete_result!(rpc_request('resources/list', params), 'resources/list')
 
         resources = (result['resources'] || []).map do |resource_data|
@@ -406,8 +400,9 @@ module MCPClient
 
         resources_result = { 'resources' => resources, 'nextCursor' => result['nextCursor'] }
 
+        # A list invalidated while in flight is returned but not cached.
         @mutex.synchronize do
-          @resources_result = resources_result unless cursor
+          @resources_result = resources_result if !cursor && list_generation(:resources) == generation
         end
 
         resources_result
@@ -707,11 +702,13 @@ module MCPClient
       end
 
       # Follow nextCursor across pages so the full tool list is returned even
-      # when the server paginates.
+      # when the server paginates. A list invalidated while in flight is
+      # returned but not cached.
+      generation = @mutex.synchronize { tools_generation }
       tools = request_paginated_list('tools/list', 'tools')
 
-      @mutex.synchronize { @tools_data = tools }
-      @mutex.synchronize { @tools_data.dup }
+      @mutex.synchronize { @tools_data = tools if tools_generation == generation }
+      tools.dup
     end
 
     # Request the prompts list using JSON-RPC
@@ -722,11 +719,13 @@ module MCPClient
         return @prompts_data.dup if @prompts_data
       end
 
-      # Follow nextCursor across pages so the full prompt list is returned.
+      # Follow nextCursor across pages so the full prompt list is returned. A
+      # list invalidated while in flight is returned but not cached.
+      generation = @mutex.synchronize { list_generation(:prompts) }
       prompts = request_paginated_list('prompts/list', 'prompts')
 
-      @mutex.synchronize { @prompts_data = prompts }
-      @mutex.synchronize { @prompts_data.dup }
+      @mutex.synchronize { @prompts_data = prompts if list_generation(:prompts) == generation }
+      prompts.dup
     end
 
     # Request the resources list using JSON-RPC
@@ -1166,6 +1165,17 @@ module MCPClient
     # interleaved on a POST SSE response stream.
     # @param message [Hash] the parsed JSON-RPC message
     def dispatch_server_message(message)
+      # Host code reached from here -- a notification listener, a handler for
+      # a server-initiated request -- may issue a request of its own while the
+      # response that carried this message is still being parsed. That request
+      # is an exchange of its own, and the call still waiting for this response
+      # must keep both its recorded definition and its own failures
+      # (HttpTransportBase::RequestRecovery#dispatching_to_host).
+      dispatching_to_host { dispatch_server_message_now(message) }
+    end
+
+    # @param message [Hash] the parsed JSON-RPC message
+    def dispatch_server_message_now(message)
       if protocol_era == :modern && message['method'] && message.key?('id')
         # MCP 2026-07-28: "The server MUST NOT send independent JSON-RPC
         # requests on this stream" — server-to-client interactions are
@@ -1186,6 +1196,7 @@ module MCPClient
         handle_server_request(message)
       elsif message['method'] && !message.key?('id')
         # Handle server notifications (messages without id)
+        invalidate_cache_for_notification(message['method'])
         @notification_callback&.call(message['method'], message['params'])
       elsif message.key?('id')
         # A response replayed on the events stream after its POST stream was

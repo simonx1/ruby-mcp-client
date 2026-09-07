@@ -83,6 +83,14 @@ result = client.call_tool('example_tool', { param: 'value' })
 client.cleanup
 ```
 
+**Configured headers:** `headers:` values are sent on every request, with one
+reserved namespace. On a modern (MCP 2026-07-28) HTTP session the client owns
+`Mcp-Param-*`: those headers are derived from a `tools/call`'s own arguments
+(the tool's `x-mcp-header` annotations), so any header of that name given in
+`headers:` is dropped from modern requests rather than standing in for an
+argument the call did not carry. Legacy sessions, where the namespace has no
+protocol meaning, send it unchanged.
+
 **Transport Detection:**
 
 | URL Pattern | Transport |
@@ -181,6 +189,14 @@ client = MCPClient::Client.new(
 )
 # Task-delivered results (get_task_result) are not validated yet.
 ```
+
+A result is checked against the tool definition the request that produced it
+went out under. That matters on a modern HTTP session, where a `HeaderMismatch`
+rejection makes the client refresh `tools/list` and retry with recomputed
+`Mcp-Param-*` headers: the retry is answered under the refreshed definition, so
+that is the one it is validated against. A `tools/list_changed` that merely
+arrives while the call is in flight never changes the definition the result is
+checked against — the server never saw the replacement.
 
 ### Roots
 

@@ -62,7 +62,10 @@ RSpec.describe 'MCP 2026-07-28 Streamable HTTP modern mode' do
     stub_request(:post, url).to_return do |request|
       body = JSON.parse(request.body)
       requests << { headers: request.headers, body: body }
-      responder = responders.fetch(body['method']) { raise "unexpected method #{body['method']}" }
+      # A modern tools/call fetches tools/list first (x-mcp-header extraction).
+      responder = responders.fetch(body['method']) do
+        body['method'] == 'tools/list' ? { 'tools' => [] } : raise("unexpected method #{body['method']}")
+      end
       responder.respond_to?(:call) ? responder.call(body, request) : json_response(body['id'], responder)
     end
     requests
@@ -445,7 +448,8 @@ RSpec.describe 'MCP 2026-07-28 Streamable HTTP modern mode' do
         # too, and a modern server never asked for one.
         answers = requests.select { |r| r[:body]['id'] == 'srv-1' }
         expect(answers).to be_empty
-        expect(requests.map { |r| r[:body]['method'] }).to eq(%w[server/discover tools/call])
+        # A modern call reads tools/list first (to derive its headers).
+        expect(requests.map { |r| r[:body]['method'] }).to eq(%w[server/discover tools/list tools/call])
       end
 
       it 'ignores SSE comment keep-alive lines' do
@@ -516,7 +520,7 @@ RSpec.describe 'MCP 2026-07-28 Streamable HTTP modern mode' do
 
       server.call_tool('echo', { 'x' => 1 })
 
-      expect(requests.map { |r| r[:body]['method'] }).to eq(%w[server/discover tools/call])
+      expect(requests.map { |r| r[:body]['method'] }).to eq(%w[server/discover tools/list tools/call])
       expect(server.protocol_era).to eq(:modern)
       expect(requests.last[:headers]['Mcp-Protocol-Version']).to eq('2026-07-28')
       expect(requests.last[:headers]['Mcp-Method']).to eq('tools/call')
@@ -594,7 +598,12 @@ RSpec.describe 'MCP 2026-07-28 Streamable HTTP modern mode' do
       expect(transport.encode_header_value('Hello, 世界')).to eq('=?base64?SGVsbG8sIOS4lueVjA==?=')
       expect(transport.encode_header_value(' padded ')).to eq('=?base64?IHBhZGRlZCA=?=')
       expect(transport.encode_header_value("line1\nline2")).to eq('=?base64?bGluZTEKbGluZTI=?=')
-      expect(transport.encode_header_value('')).to eq('=?base64??=')
+    end
+
+    it 'passes an empty string through as an empty field value' do
+      # RFC 9110 field values may be empty, and the spec's string conversion
+      # is "as-is" for anything a plain ASCII header can carry.
+      expect(transport.encode_header_value('')).to eq('')
     end
 
     it 'encodes a plain value that itself matches the sentinel pattern' do

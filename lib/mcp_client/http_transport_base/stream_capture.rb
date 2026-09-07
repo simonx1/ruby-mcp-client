@@ -133,12 +133,27 @@ module MCPClient
       # @param response [Faraday::Response, NormalizedResponse] the completed response
       # @return [Integer]
       def live_event_count(response)
+        capture_state(response)[:mcp_live_events].to_i
+      end
+
+      # The failure the stream listener raised while the body arrived, if
+      # any: it could not abort the read (see ResponseBodyCapture), so the
+      # transport raises it in place of the response it was interleaved with.
+      # @param response [Faraday::Response, NormalizedResponse] the completed response
+      # @return [StandardError, nil]
+      def stream_listener_error(response)
+        capture_state(response)[:mcp_stream_error]
+      end
+
+      # @param response [Faraday::Response, NormalizedResponse] a completed response
+      # @return [Hash] the ResponseBodyCapture state of its exchange (empty when none)
+      def capture_state(response)
         context = if response.respond_to?(:env) && response.env.respond_to?(:request)
                     response.env.request&.context
                   elsif response.respond_to?(:context)
                     response.context
                   end
-        context.is_a?(Hash) ? context[:mcp_live_events].to_i : 0
+        context.is_a?(Hash) ? context : {}
       end
     end
   end

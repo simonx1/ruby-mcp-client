@@ -88,6 +88,12 @@ module MCPClient
         MCPClient::ServerFactory.create(config, logger: @logger)
       end
       @tool_cache = {}
+      # Bumped whenever the tool cache is emptied, so a list_tools that was
+      # already in flight can tell that its definitions were superseded while
+      # it ran (MCP 2026-07-28: a HeaderMismatch refresh announces itself as a
+      # tools/list_changed).
+      @tool_cache_generation = 0
+      @cache_mutex = Mutex.new
       # Active progressToken -> callback registrations (MCP progress utility)
       @progress_callbacks = {}
       @progress_mutex = Mutex.new
@@ -281,15 +287,20 @@ module MCPClient
     # @raise [MCPClient::Errors::ConnectionError] on authorization failures
     # @raise [MCPClient::Errors::ToolCallError] if no tools could be retrieved from any server
     def list_tools(cache: true)
-      return @tool_cache.values if cache && !@tool_cache.empty?
+      cached = @cache_mutex.synchronize { @tool_cache.values if cache && !@tool_cache.empty? }
+      return cached if cached
 
+      # Read before the fetch so a cache emptied while it runs is noticed.
+      # The mutex is never held across a request: a response may dispatch a
+      # notification, on this very thread, that empties the cache again.
+      generation = @cache_mutex.synchronize { @tool_cache_generation }
       tools = []
       connection_errors = []
+      fetched = {}
 
       servers.each do |server|
         server.list_tools.each do |tool|
-          cache_key = cache_key_for(server, tool.name)
-          @tool_cache[cache_key] = tool
+          fetched[cache_key_for(server, tool.name)] = tool
           tools << tool
         end
       rescue MCPClient::Errors::ConnectionError => e
@@ -302,6 +313,12 @@ module MCPClient
         connection_errors << e
         @logger.error("Server error: #{e.message}")
       end
+
+      # A tools/list_changed while this fetch ran -- the one a HeaderMismatch
+      # refresh announces included -- already replaced these definitions.
+      # They still answer this caller, but caching them would hand the
+      # superseded ones to the next.
+      @cache_mutex.synchronize { @tool_cache.merge!(fetched) if @tool_cache_generation == generation }
 
       # If we didn't get any tools from any server but have servers configured, report failure
       if tools.empty? && !servers.empty?
@@ -334,19 +351,33 @@ module MCPClient
       # caller's callback while the request is active.
       parameters, token = setup_progress_tracking(parameters, progress)
 
-      result = begin
-        server.call_tool(tool_name, parameters)
-      rescue MCPClient::Errors::ConnectionError => e
-        # Add server identity information to the error for better context
-        server_id = server.name ? "#{server.class}[#{server.name}]" : server.class.name
-        raise MCPClient::Errors::ToolCallError, "Error calling tool '#{tool_name}': #{e.message} (Server: #{server_id})"
-      ensure
-        # Tokens are only valid for the lifetime of the request: dropping the
-        # registration filters out stale post-completion notifications.
-        unregister_progress_callback(token) if token
-      end
+      # The call and the re-resolve that follows it share one slot for the
+      # definition the transport's request goes out under, so a call that a
+      # notification listener nests inside this one cannot leave its own
+      # there.
+      with_called_tool_definition(server) do
+        result = begin
+          server.call_tool(tool_name, parameters)
+        rescue MCPClient::Errors::ConnectionError => e
+          # Add server identity information to the error for better context
+          server_id = server.name ? "#{server.class}[#{server.name}]" : server.class.name
+          raise MCPClient::Errors::ToolCallError,
+                "Error calling tool '#{tool_name}': #{e.message} (Server: #{server_id})"
+        ensure
+          # Tokens are only valid for the lifetime of the request: dropping the
+          # registration filters out stale post-completion notifications.
+          unregister_progress_callback(token) if token
+        end
 
-      validate_structured_content!(tool, result)
+        # MCP 2026-07-28 HeaderMismatch recovery re-derives a call's
+        # Mcp-Param-* headers from a refreshed tools/list, so the attempt that
+        # was answered may have gone out under a definition this client never
+        # resolved. Validate against that one -- never against the transport's
+        # current list, which a tools/list_changed racing the call may already
+        # have replaced with a definition the server never used.
+        tool = called_tool_definition(server, tool_name) || tool
+        validate_structured_content!(tool, result)
+      end
     end
 
     # Convert MCP tools to OpenAI function specifications
@@ -384,7 +415,7 @@ module MCPClient
     # Clear the cached tools so that next list_tools will fetch fresh data
     # @return [void]
     def clear_cache
-      @tool_cache.clear
+      clear_tool_cache
       @prompt_cache.clear
       @resource_cache.clear
     end
@@ -770,7 +801,7 @@ module MCPClient
       case method
       when 'notifications/tools/list_changed'
         logger.warn("[#{server_id}] Tool list has changed, clearing tool cache")
-        @tool_cache.clear
+        clear_tool_cache
       when 'notifications/resources/updated'
         logger.warn("[#{server_id}] Resource #{params['uri']} updated")
       when 'notifications/prompts/list_changed'
@@ -1124,6 +1155,47 @@ module MCPClient
       end
 
       matching_tools.first
+    end
+
+    # Empty the tool cache and move its generation on, so a list_tools that
+    # is already fetching does not put the emptied definitions back.
+    # @return [void]
+    def clear_tool_cache
+      @cache_mutex.synchronize do
+        @tool_cache.clear
+        @tool_cache_generation += 1
+      end
+    end
+
+    # Run one call with a slot of its own for the definition the transport's
+    # request goes out under (MCPClient::CalledToolDefinition). Transports
+    # that do not mirror tool parameters into headers record nothing, and the
+    # call runs unwrapped.
+    # @param server [MCPClient::ServerBase] the transport the call goes to
+    # @return [Object] the block's value
+    def with_called_tool_definition(server, &block)
+      return block.call unless server.respond_to?(:called_tool_definition_slot, true)
+
+      server.send(:called_tool_definition_slot, &block)
+    end
+
+    # The definition the transport's own tools/call request went out under,
+    # taken from the transport so it is spent on this one re-resolve.
+    #
+    # It is read back rather than re-listed because a list is only ever the
+    # transport's *current* answer: a tools/list_changed that raced the call
+    # has already replaced it, and the server answered under the definition
+    # the request carried.
+    # @param server [MCPClient::ServerBase] the transport the call went to
+    # @param tool_name [String] the tool being re-resolved
+    # @return [MCPClient::Tool, nil] the definition the answering attempt went
+    #   out under, or nil when the transport recorded none (or recorded that
+    #   its list did not carry the tool), in which case the definition the
+    #   caller resolved before the call stands
+    def called_tool_definition(server, tool_name)
+      return nil unless server.respond_to?(:take_called_tool_definition, true)
+
+      server.send(:take_called_tool_definition, tool_name.to_s)&.first
     end
 
     # Reject a plain (synchronous) call for a tool whose execution.taskSupport is

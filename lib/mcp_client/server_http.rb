@@ -166,14 +166,7 @@ module MCPClient
       begin
         ensure_connected
 
-        tools_data = request_tools_list
-        @mutex.synchronize do
-          @tools = tools_data.map do |tool_data|
-            MCPClient::Tool.from_json(tool_data, server: self)
-          end
-        end
-
-        @mutex.synchronize { @tools }
+        fetch_tools_list
       rescue MCPClient::Errors::ConnectionError, MCPClient::Errors::TransportError, MCPClient::Errors::ServerError
         # Re-raise these errors directly
         raise
@@ -192,7 +185,7 @@ module MCPClient
     # @raise [MCPClient::Errors::ConnectionError] if server is disconnected
     def call_tool(tool_name, parameters)
       rpc_request('tools/call', build_named_request_params(tool_name, parameters))
-    rescue MCPClient::Errors::ConnectionError, MCPClient::Errors::TransportError
+    rescue MCPClient::Errors::ConnectionError, MCPClient::Errors::TransportError, MCPClient::Errors::ValidationError
       # Re-raise connection/transport errors directly to match test expectations
       raise
     rescue MCPClient::Errors::ServerError => e
@@ -262,15 +255,13 @@ module MCPClient
         ensure_connected
 
         # Follow nextCursor across pages so the full prompt list is returned.
-        prompts = request_paginated_list('prompts/list', 'prompts')
-
-        @mutex.synchronize do
-          @prompts = prompts.map do |prompt_data|
-            MCPClient::Prompt.from_json(prompt_data, server: self)
-          end
+        generation = @mutex.synchronize { list_generation(:prompts) }
+        prompts = request_paginated_list('prompts/list', 'prompts').map do |prompt_data|
+          MCPClient::Prompt.from_json(prompt_data, server: self)
         end
-
-        @mutex.synchronize { @prompts }
+        # A list invalidated while in flight is returned but not cached.
+        @mutex.synchronize { @prompts = prompts if list_generation(:prompts) == generation }
+        prompts
       rescue MCPClient::Errors::ConnectionError, MCPClient::Errors::TransportError, MCPClient::Errors::ServerError
         raise
       rescue StandardError => e
@@ -313,6 +304,7 @@ module MCPClient
 
         params = {}
         params['cursor'] = cursor if cursor
+        generation = @mutex.synchronize { list_generation(:resources) }
         result = require_complete_result!(rpc_request('resources/list', params), 'resources/list')
 
         resources = (result['resources'] || []).map do |resource_data|
@@ -321,8 +313,9 @@ module MCPClient
 
         resources_result = { 'resources' => resources, 'nextCursor' => result['nextCursor'] }
 
+        # A list invalidated while in flight is returned but not cached.
         @mutex.synchronize do
-          @resources_result = resources_result unless cursor
+          @resources_result = resources_result if !cursor && list_generation(:resources) == generation
         end
 
         resources_result
@@ -585,11 +578,13 @@ module MCPClient
       end
 
       # Follow nextCursor across pages so the full tool list is returned even
-      # when the server paginates.
+      # when the server paginates. A list invalidated while in flight is
+      # returned but not cached.
+      generation = @mutex.synchronize { tools_generation }
       tools = request_paginated_list('tools/list', 'tools')
 
-      @mutex.synchronize { @tools_data = tools }
-      @mutex.synchronize { @tools_data.dup }
+      @mutex.synchronize { @tools_data = tools if tools_generation == generation }
+      tools.dup
     end
   end
 end

@@ -438,6 +438,8 @@ RSpec.describe 'MCP 2026-07-28 Streamable HTTP modern mode — verification' do
           body = JSON.parse(request.body)
           mutex.synchronize { requests << body }
           next json_response(body['id'], discover_result) if body['method'] == 'server/discover'
+          # A modern call reads tools/list first (to derive its headers).
+          next json_response(body['id'], { 'tools' => [] }) if body['method'] == 'tools/list'
 
           name = body.dig('params', 'name')
           first = mutex.synchronize do
@@ -1414,13 +1416,54 @@ RSpec.describe 'MCP 2026-07-28 Streamable HTTP — a response stream that really
       end
 
       it 'surfaces the loss after exactly one re-issue when the socket ends mid-stream twice' do
+        # Only the call breaks: a modern call_tool reads tools/list first (to
+        # derive its Mcp-Param-* headers), and a list that broke would raise
+        # before the call this example is about ever went out.
         start_server do |message|
-          message['method'] == 'server/discover' ? jsonrpc(message, discovery) : MidStreamCloseServer::CLOSE_MID_STREAM
+          case message['method']
+          when 'server/discover' then jsonrpc(message, discovery)
+          when 'tools/call' then MidStreamCloseServer::CLOSE_MID_STREAM
+          else jsonrpc(message, { 'tools' => [] })
+          end
         end
 
         expect { transport(klass).call_tool('t', {}) }
           .to raise_error(MCPClient::Errors::ResponseStreamClosedError)
         expect(@fixture.received.count { |r| r['method'] == 'tools/call' }).to eq(2)
+      end
+
+      # Round 4: the tools/list a modern call reads first is an exchange of
+      # its own. Its one re-issue is its own, and so is the call's.
+      it 'gives the prerequisite list and the call one re-issue each on a real socket' do
+        broken = Hash.new(0)
+        start_server do |message|
+          case message['method']
+          when 'server/discover' then jsonrpc(message, discovery)
+          when 'tools/list'
+            broken['tools/list'] += 1
+            broken['tools/list'] == 1 ? MidStreamCloseServer::CLOSE_MID_STREAM : jsonrpc(message, { 'tools' => [] })
+          when 'tools/call'
+            broken['tools/call'] += 1
+            broken['tools/call'] == 1 ? MidStreamCloseServer::CLOSE_MID_STREAM : jsonrpc(message, { 'content' => [] })
+          end
+        end
+
+        expect(transport(klass).call_tool('t', {})).to eq({ 'content' => [] })
+        expect(methods_received).to eq(%w[server/discover tools/list tools/list tools/call tools/call])
+      end
+
+      it 'surfaces a prerequisite list lost twice on a real socket without sending the call' do
+        start_server do |message|
+          case message['method']
+          when 'server/discover' then jsonrpc(message, discovery)
+          when 'tools/list' then MidStreamCloseServer::CLOSE_MID_STREAM
+          else jsonrpc(message, { 'content' => [] })
+          end
+        end
+
+        expect { transport(klass).call_tool('t', {}) }
+          .to raise_error(MCPClient::Errors::ResponseStreamClosedError)
+        expect(methods_received).to eq(%w[server/discover tools/list tools/list])
       end
 
       it 'attempts exactly one request when the connection was never established' do
@@ -1456,7 +1499,13 @@ RSpec.describe 'MCP 2026-07-28 Streamable HTTP — a response stream that really
         # socket go idle, so only an overall deadline can end the call.
         it 'bounds an ordinary request with its own timeout while the server keeps the stream alive' do
           start_server do |message|
-            message['method'] == 'server/discover' ? jsonrpc(message, discovery) : MidStreamCloseServer::DRIP_FOREVER
+            case message['method']
+            when 'server/discover' then jsonrpc(message, discovery)
+            # The tools/list a modern call reads first is answered at once:
+            # it is the call itself that must be bounded.
+            when 'tools/list' then jsonrpc(message, { 'tools' => [] })
+            else MidStreamCloseServer::DRIP_FOREVER
+            end
           end
           server = transport(klass, read_timeout: 30)
           server.connect
@@ -1516,8 +1565,11 @@ RSpec.describe 'MCP 2026-07-28 Streamable HTTP — a response stream that really
         # late in the budget, or head bytes forever — outlives it.
         it 'ends a request whose stream falls silent late in its budget, not a timeout later' do
           start_server do |message|
-            if message['method'] == 'server/discover'
-              jsonrpc(message, discovery)
+            case message['method']
+            when 'server/discover' then jsonrpc(message, discovery)
+            # A modern call reads tools/list first to derive its headers;
+            # the stall this example is about belongs to the call's own stream.
+            when 'tools/list' then jsonrpc(message, { 'tools' => [] })
             else
               [MidStreamCloseServer::DELAY, 0.6,
                [MidStreamCloseServer::EVENT_THEN_STALL,
@@ -1539,10 +1591,12 @@ RSpec.describe 'MCP 2026-07-28 Streamable HTTP — a response stream that really
 
         it 'ends a request whose head never finishes, which no socket timeout would' do
           start_server do |message|
-            if message['method'] == 'server/discover'
-              jsonrpc(message, discovery)
-            else
-              [MidStreamCloseServer::HEADER_DRIP, 0.02]
+            case message['method']
+            when 'server/discover' then jsonrpc(message, discovery)
+            # A modern call reads tools/list first to derive its headers;
+            # the stall this example is about belongs to the call's own stream.
+            when 'tools/list' then jsonrpc(message, { 'tools' => [] })
+            else [MidStreamCloseServer::HEADER_DRIP, 0.02]
             end
           end
           server = transport(klass, read_timeout: 30)
@@ -1559,8 +1613,11 @@ RSpec.describe 'MCP 2026-07-28 Streamable HTTP — a response stream that really
 
         it 'refuses an answer that arrives after the deadline instead of settling on it' do
           start_server do |message|
-            if message['method'] == 'server/discover'
-              jsonrpc(message, discovery)
+            case message['method']
+            when 'server/discover' then jsonrpc(message, discovery)
+            # A modern call reads tools/list first to derive its headers;
+            # the stall this example is about belongs to the call's own stream.
+            when 'tools/list' then jsonrpc(message, { 'tools' => [] })
             else
               [MidStreamCloseServer::HEADER_DRIP_THEN, 1.4, 0.02,
                [MidStreamCloseServer::DELIVER_THEN_STALL, jsonrpc(message, { 'content' => [] })]]
@@ -1587,10 +1644,12 @@ RSpec.describe 'MCP 2026-07-28 Streamable HTTP — a response stream that really
         # request instead of a replacement request running it again.
         it 'keeps a delivered result when the stream stalls after the final SSE event until the timeout' do
           start_server do |message|
-            if message['method'] == 'server/discover'
-              jsonrpc(message, discovery)
-            else
-              [MidStreamCloseServer::DELIVER_THEN_STALL, jsonrpc(message, { 'content' => [] })]
+            case message['method']
+            when 'server/discover' then jsonrpc(message, discovery)
+            # A modern call reads tools/list first (to derive its headers);
+            # the stall this example is about belongs to the call's own stream.
+            when 'tools/list' then jsonrpc(message, { 'tools' => [] })
+            else [MidStreamCloseServer::DELIVER_THEN_STALL, jsonrpc(message, { 'content' => [] })]
             end
           end
           server = transport(klass, read_timeout: 0.3)
@@ -1658,8 +1717,10 @@ RSpec.describe 'MCP 2026-07-28 Streamable HTTP — a response stream that really
     it 'delivers a request-scoped notification before the modern response stream ends' do
       seen = Queue.new
       start_server do |message|
-        if message['method'] == 'server/discover'
-          jsonrpc(message, discovery)
+        case message['method']
+        when 'server/discover' then jsonrpc(message, discovery)
+        # The tools/list a modern call reads first carries no notification.
+        when 'tools/list' then jsonrpc(message, { 'tools' => [] })
         else
           waiter = -> { settled_within?(3) { !seen.empty? } }
           [MidStreamCloseServer::EVENT_THEN_WAIT,
@@ -1676,6 +1737,59 @@ RSpec.describe 'MCP 2026-07-28 Streamable HTTP — a response stream that really
       end
       # Dispatched exactly once: not again when the completed body is parsed.
       expect(seen.size).to eq(1)
+    end
+
+    # A listener that fails while the stream is still open must not cancel
+    # the request it was interleaved with (closing the stream is the
+    # cancellation signal): the body is read to its end, the response the
+    # server then sends is received, and the listener's failure is what the
+    # caller gets — once, with no re-issue.
+    it 'holds a live listener failure until the response stream ends' do
+      seen = Queue.new
+      progress = lambda do |n|
+        { 'jsonrpc' => '2.0', 'method' => 'notifications/progress',
+          'params' => { 'progressToken' => 'p', 'progress' => n } }
+      end
+      start_server do |message|
+        case message['method']
+        when 'server/discover' then jsonrpc(message, discovery)
+        when 'tools/list' then jsonrpc(message, { 'tools' => [] })
+        else
+          # Two events, each on its own chunk: a reader that let the first
+          # listener failure abort it never gets to the second.
+          waiter = -> { settled_within?(3) { seen.size == 2 } }
+          [MidStreamCloseServer::EVENT_THEN_WAIT, [progress.call(1), progress.call(2)],
+           waiter, jsonrpc(message, { 'content' => [] })]
+        end
+      end
+      server = transport(MCPClient::ServerHTTP, read_timeout: 5)
+      failures = 0
+      server.on_notification do |method, _params|
+        seen << method
+        failures += 1
+        raise "listener failed #{failures}"
+      end
+
+      error = nil
+      result = nil
+      Timeout.timeout(15) do
+        result = server.rpc_request('tools/call', { 'name' => 't', 'arguments' => {} })
+      rescue MCPClient::Errors::ToolCallError => e
+        error = e
+      end
+
+      expect(result).to be_nil
+      # The FIRST failure is the one held; the reader carried on past it, so
+      # the second event was dispatched too and the server's waiter saw both
+      # before it sent the response.
+      expect(error&.message).to include('listener failed 1')
+      expect(error.message).not_to include('listener failed 2')
+      expect(seen.size).to eq(2)
+      expect(error.cause).to be_a(RuntimeError)
+      expect(error.cause).to be_a(MCPClient::HttpTransportBase::RequestRecovery::NestedExchange)
+      # The stream was read to its end: the server got to send the response
+      # (its waiter saw the listeners run), and the call was sent exactly once.
+      expect(methods_received.count('tools/call')).to eq(1)
     end
   end
 
@@ -1768,10 +1882,12 @@ RSpec.describe 'MCP 2026-07-28 Streamable HTTP — a response stream that really
       it 'delivers a notification exactly once when the socket dies after the final SSE event' do
         seen = Queue.new
         start_server do |message|
-          if message['method'] == 'server/discover'
-            jsonrpc(message, discovery)
-          else
-            [MidStreamCloseServer::DELIVER_THEN_CLOSE, [progress, jsonrpc(message, { 'content' => [] })]]
+          case message['method']
+          when 'server/discover' then jsonrpc(message, discovery)
+          # The call's own prerequisite list on this branch: answered plainly,
+          # so the only notification on the wire rides the call's stream.
+          when 'tools/list' then jsonrpc(message, { 'tools' => [] })
+          else [MidStreamCloseServer::DELIVER_THEN_CLOSE, [progress, jsonrpc(message, { 'content' => [] })]]
           end
         end
         server = transport(klass, read_timeout: 5)
@@ -1785,10 +1901,12 @@ RSpec.describe 'MCP 2026-07-28 Streamable HTTP — a response stream that really
       it 'delivers a notification exactly once when the stream stalls after the final SSE event' do
         seen = Queue.new
         start_server do |message|
-          if message['method'] == 'server/discover'
-            jsonrpc(message, discovery)
-          else
-            [MidStreamCloseServer::DELIVER_THEN_STALL, [progress, jsonrpc(message, { 'content' => [] })]]
+          case message['method']
+          when 'server/discover' then jsonrpc(message, discovery)
+          # The call's own prerequisite list on this branch: answered plainly,
+          # so the only notification on the wire rides the call's stream.
+          when 'tools/list' then jsonrpc(message, { 'tools' => [] })
+          else [MidStreamCloseServer::DELIVER_THEN_STALL, [progress, jsonrpc(message, { 'content' => [] })]]
           end
         end
         server = transport(klass, read_timeout: 0.3)
@@ -1806,8 +1924,10 @@ RSpec.describe 'MCP 2026-07-28 Streamable HTTP — a response stream that really
     it 'delivers a request-scoped notification before the modern response stream ends' do
       seen = Queue.new
       start_server do |message|
-        if message['method'] == 'server/discover'
-          jsonrpc(message, discovery)
+        case message['method']
+        when 'server/discover' then jsonrpc(message, discovery)
+        # The call's own prerequisite list on this branch, answered plainly.
+        when 'tools/list' then jsonrpc(message, { 'tools' => [] })
         else
           waiter = -> { settled_within?(3) { !seen.empty? } }
           [MidStreamCloseServer::EVENT_THEN_WAIT,

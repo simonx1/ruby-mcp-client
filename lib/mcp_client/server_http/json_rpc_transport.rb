@@ -12,7 +12,7 @@ module MCPClient
 
       # Parse an HTTP JSON-RPC response
       # @param response [Faraday::Response] the HTTP response
-      # @param _request [Hash, nil] the originating JSON-RPC request (unused)
+      # @param request [Hash, nil] the originating JSON-RPC request
       # @return [Hash] the parsed result
       # @raise [MCPClient::Errors::TransportError] if parsing fails
       # @raise [MCPClient::Errors::ServerError] if the response contains an error
@@ -22,6 +22,14 @@ module MCPClient
       # taken as it is rather than parsed a second time. An event-stream body
       # is never decoded by that middleware, so it is still the raw text.
       def parse_response(response, request = nil)
+        # Host code a stream listener reached raised while the body was still
+        # arriving: that is this exchange's failure (already marked as a
+        # nested exchange's, so no recovery acts on it), raised in place of
+        # the response it was interleaved with — as it is when the completed
+        # body is parsed.
+        failure = stream_listener_error(response)
+        raise failure if failure
+
         body = response.body
         headers = response.respond_to?(:headers) ? response.headers || {} : {}
         content_type = headers['content-type'] || headers['Content-Type'] || ''
@@ -57,15 +65,14 @@ module MCPClient
 
       # Act on one event as it arrives: requests and notifications are
       # routed now, responses wait for the completed body. A failing
-      # callback is logged rather than allowed to abort the read of the
-      # response it was interleaved with.
+      # callback is not allowed to abort the read of the response it was
+      # interleaved with: the capture middleware holds it and parse_response
+      # raises it once the body is in.
       # @param event [String] one complete, LF-normalized SSE event
       # @return [void]
       def dispatch_live_sse_event(event)
         message = sse_event_message(event)
         dispatch_sse_message(message) if message && message['method']
-      rescue StandardError => e
-        @logger.error("Error handling a message on the response stream: #{e.message}")
       end
 
       # Pick the JSON-RPC response to the request out of an SSE-framed body,
@@ -165,7 +172,19 @@ module MCPClient
       # @param message [Hash] a JSON-RPC request or notification
       # @return [void]
       def dispatch_sse_message(message)
+        # Host code reached from here -- a notification listener -- may issue a
+        # request of its own while the response that carried this message is
+        # still being parsed. That request is an exchange of its own, and the
+        # call still waiting for this response must keep both its recorded
+        # definition and its own failures (HttpTransportBase::RequestRecovery#dispatching_to_host).
+        dispatching_to_host { dispatch_sse_message_now(message) }
+      end
+
+      # @param message [Hash] a JSON-RPC request or notification
+      # @return [void]
+      def dispatch_sse_message_now(message)
         unless message.key?('id')
+          invalidate_cache_for_notification(message['method'])
           @notification_callback&.call(message['method'], message['params'])
           return
         end
