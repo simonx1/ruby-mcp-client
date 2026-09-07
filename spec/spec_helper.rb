@@ -50,6 +50,20 @@ RSpec.configure do |config|
     Faraday::ConnectionPool.instance_variable_set(:@connections, {}) if defined?(Faraday::ConnectionPool)
   end
 
+  # A transport thread that outlives its example keeps making requests, and
+  # WebMock's request registry is process-global: a leaked events thread
+  # re-opening its GET stream lands in whichever example is running next and
+  # fails assertions like "this server never opened a GET". An example that
+  # forgets to clean up its server should fail that example, not a later one.
+  config.after(:each) do
+    Thread.list.each do |thread|
+      next if thread == Thread.current
+      next unless thread.name.to_s.start_with?('MCP-')
+
+      thread.kill
+    end
+  end
+
   # Disable WebMock for integration tests
   config.before(:each, integration: true) do
     WebMock.allow_net_connect!
