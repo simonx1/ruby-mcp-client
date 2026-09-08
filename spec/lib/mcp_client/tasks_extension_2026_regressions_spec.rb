@@ -5054,10 +5054,17 @@ RSpec.describe 'MCP 2026-07-28 tasks extension — round 42' do
       })
       negotiated
       creating
+      # Two client threads write this record while the example reads it, so
+      # the appends and the reads take a lock. Without one an append can be
+      # lost against a concurrent read, and the example fails counting a
+      # request that really did go out.
+      sent_lock = Mutex.new
       sent = []
+      record = ->(entry) { sent_lock.synchronize { sent << entry } }
+      snapshot = -> { sent_lock.synchronize { sent.dup } }
       updated = false
       allow(stdio).to receive(:rpc_request) do |method, params, **_kw|
-        sent << [method, params]
+        record.call([method, params])
         case method
         when 'tasks/get'
           if updated
@@ -5078,13 +5085,13 @@ RSpec.describe 'MCP 2026-07-28 tasks extension — round 42' do
       # The first wait is inside the handler with k1 reserved; the second
       # polls the same input_required task and finds nothing left to answer.
       second = Thread.new { client.wait_for_task(task) }
-      wait_for { sent.count { |method, _| method == 'tasks/get' } >= 2 }
+      wait_for { snapshot.call.count { |method, _| method == 'tasks/get' } >= 2 }
       release << true
 
       expect(first.value).to be_completed
       expect(second.value).to be_completed
       expect(handled).to eq(1)
-      updates = sent.select { |pair| pair.first == 'tasks/update' }
+      updates = snapshot.call.select { |pair| pair.first == 'tasks/update' }
       expect(updates.size).to eq(1)
       expect(updates.dig(0, 1, :inputResponses) || updates.dig(0, 1, 'inputResponses')).to have_key('k1')
     end
