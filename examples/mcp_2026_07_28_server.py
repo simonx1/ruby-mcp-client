@@ -44,11 +44,15 @@ This is a teaching server, not a production one: state lives in memory, and
 the "authorization" it does is a string comparison. It binds to localhost.
 """
 
+import base64
+import binascii
 import json
 import threading
 import time
 import uuid
 from datetime import datetime, timezone
+
+from urllib.parse import urlparse
 
 from flask import Flask, Response, request
 
@@ -213,13 +217,18 @@ def request_meta(params):
 def check_protocol_version(params):
     """Return an error tuple when the request does not declare a version we speak."""
     declared = request_meta(params).get(META_VERSION)
+    if declared == PROTOCOL_VERSION:
+        return None
+
+    # The data is mandated: without `supported` and `requested` a client cannot
+    # tell a real modern rejection from an intermediary emitting a bare -32022,
+    # and has nothing to retry with.
+    data = {"supported": [PROTOCOL_VERSION], "requested": declared}
     if declared is None:
         # A request with no version is a legacy client; this server has no
         # legacy mode, so say so in the terms the revision defines.
-        return (UNSUPPORTED_VERSION, f"this server speaks {PROTOCOL_VERSION} only")
-    if declared != PROTOCOL_VERSION:
-        return (UNSUPPORTED_VERSION, f"unsupported protocol version: {declared}")
-    return None
+        return (UNSUPPORTED_VERSION, f"this server speaks {PROTOCOL_VERSION} only", data)
+    return (UNSUPPORTED_VERSION, f"unsupported protocol version: {declared}", data)
 
 
 # ---------------------------------------------------------------------------
@@ -344,7 +353,11 @@ def echo_tool(request_id, arguments):
 
 def tenant_report_tool(request_id, arguments):
     """The tenant arrives as a header, not in the arguments."""
+    # Decoded, not raw: a value a header cannot carry arrives Base64-wrapped,
+    # and the tool wants the value the caller actually sent.
     header_tenant = request.headers.get("Mcp-Param-Tenant")
+    if header_tenant:
+        header_tenant = decode_header_value(header_tenant)
     if not header_tenant:
         # What a server says when the header it needs did not arrive. The
         # client refreshes tools/list once and retries.
@@ -381,10 +394,28 @@ def create_ticket_tool(request_id, arguments, params):
     state = (params or {}).get("requestState")
 
     if responses and state:
+        # requestState is opaque to the client but not unchecked here: it is
+        # this server's own handle on the round it started. A state it never
+        # issued is a forged continuation, not a resumption.
         with rounds_lock:
-            summary = pending_rounds.pop(state, {}).get("summary", arguments.get("summary", ""))
-        reporter = (responses.get("reporter") or {}).get("content", {})
-        name = reporter.get("name", "unknown") if isinstance(reporter, dict) else "unknown"
+            round_record = pending_rounds.pop(state, None)
+        if round_record is None:
+            return error(request_id, -32602, "unknown requestState")
+
+        reporter = responses.get("reporter") or {}
+        # The host's answer carries an action. "accept" is the only one that
+        # means go ahead; a decline or a cancel must not open a ticket.
+        action = reporter.get("action")
+        if action != "accept":
+            return result(
+                request_id,
+                {"content": [{"type": "text", "text": f"no ticket opened ({action or 'no answer'})"}],
+                 "isError": False},
+            )
+
+        content = reporter.get("content")
+        name = content.get("name", "unknown") if isinstance(content, dict) else "unknown"
+        summary = round_record.get("summary", arguments.get("summary", ""))
         ticket_id = f"TICKET-{uuid.uuid4().hex[:6].upper()}"
         return result(
             request_id,
@@ -395,6 +426,15 @@ def create_ticket_tool(request_id, arguments, params):
                 "isError": False,
             },
         )
+
+    # Only ask for something the client said it can answer. A server that asks
+    # a client with no elicitation capability has nowhere to go, so it says so
+    # in the terms the revision defines instead of stalling the call.
+    caps = request_meta(params).get(META_CLIENT_CAPS) or {}
+    if "elicitation" not in caps:
+        return error(request_id, MISSING_CAPABILITY,
+                     "create_ticket needs to ask the host for the reporter",
+                     {"requiredCapabilities": {"elicitation": {"form": {}}}})
 
     state = uuid.uuid4().hex
     with rounds_lock:
@@ -546,10 +586,12 @@ def listen_stream(request_id, params):
     acknowledged = {}
     unsupported = {}
     for key, value in wanted.items():
-        if key in ("toolsListChanged", "resourcesListChanged", "promptsListChanged"):
-            acknowledged[key] = value
-        else:
+        if key not in ("toolsListChanged", "resourcesListChanged", "promptsListChanged"):
             unsupported[key] = value
+        elif value:
+            acknowledged[key] = value
+        # A flag the client sent as false is not a subscription: it is neither
+        # acknowledged nor unsupported, and nothing is delivered for it.
 
     yield sse(
         {
@@ -565,7 +607,7 @@ def listen_stream(request_id, params):
 
     for index in range(3):
         time.sleep(0.6)
-        if "toolsListChanged" in acknowledged:
+        if acknowledged.get("toolsListChanged"):
             yield sse(
                 {
                     "jsonrpc": "2.0",
@@ -587,6 +629,94 @@ def listen_stream(request_id, params):
 # HTTP
 # ---------------------------------------------------------------------------
 
+# ---------------------------------------------------------------------------
+# Security boundary
+#
+# A local MCP server is reachable from any page the user's browser loads, so
+# the transport spec makes two checks mandatory rather than optional. Both are
+# here because this file is what someone copies when writing their own server.
+# ---------------------------------------------------------------------------
+
+# Only a loopback page may talk to a loopback server. A request with no Origin
+# is not from a browser (curl, a native host) and is allowed.
+ALLOWED_ORIGIN_HOSTS = {"localhost", "127.0.0.1", "[::1]", "::1"}
+
+
+def origin_allowed(origin):
+    if not origin:
+        return True
+    try:
+        parsed = urlparse(origin)
+    except ValueError:
+        return False
+    return parsed.hostname in ALLOWED_ORIGIN_HOSTS or parsed.netloc.split(":")[0] in ALLOWED_ORIGIN_HOSTS
+
+
+BASE64_START = "=?base64?"
+BASE64_END = "?="
+
+
+def decode_header_value(value):
+    """Undo the Base64 sentinel a client uses for values a header cannot carry."""
+    if value.startswith(BASE64_START) and value.endswith(BASE64_END):
+        encoded = value[len(BASE64_START):-len(BASE64_END)]
+        try:
+            return base64.b64decode(encoded, validate=True).decode("utf-8")
+        except (binascii.Error, UnicodeDecodeError):
+            return value
+    return value
+
+
+def header_annotated_properties(schema, prefix=()):
+    """Every (path, header name) an inputSchema annotates with x-mcp-header."""
+    found = []
+    for name, prop in (schema.get("properties") or {}).items():
+        if not isinstance(prop, dict):
+            continue
+        header = prop.get("x-mcp-header")
+        if isinstance(header, str):
+            found.append((prefix + (name,), header))
+        if prop.get("type") == "object":
+            found.extend(header_annotated_properties(prop, prefix + (name,)))
+    return found
+
+
+def argument_at(arguments, path):
+    value = arguments
+    for step in path:
+        if not isinstance(value, dict) or step not in value:
+            return None
+        value = value[step]
+    return value
+
+
+def param_header_problem(params):
+    """The mirrored headers must agree with the arguments they were derived from.
+
+    An intermediary routes on the header while the server executes the body, so
+    a server that trusts one without checking the other lets the two disagree.
+    The revision answers a disagreement with -32020.
+    """
+    name = (params or {}).get("name")
+    tool = next((t for t in TOOLS if t["name"] == name), None)
+    if not tool:
+        return None
+
+    arguments = (params or {}).get("arguments") or {}
+    for path, header in header_annotated_properties(tool.get("inputSchema") or {}):
+        sent = request.headers.get(f"Mcp-Param-{header}")
+        expected = argument_at(arguments, path)
+        if expected is None:
+            if sent is not None:
+                return f"Mcp-Param-{header} was sent for an argument that is absent"
+            continue
+        if sent is None:
+            return f"Mcp-Param-{header} is required for this tool"
+        if decode_header_value(sent) != (expected if isinstance(expected, str) else str(expected)):
+            return f"Mcp-Param-{header} does not match the {'.'.join(path)} argument"
+    return None
+
+
 HANDLERS = {
     "server/discover": handle_discover,
     "tools/list": handle_tools_list,
@@ -601,6 +731,11 @@ HANDLERS = {
 
 @app.route("/mcp", methods=["POST"])
 def handle_post():
+    # The Origin check comes before anything is parsed: a page the user merely
+    # visited must not reach a server bound to their loopback interface.
+    if not origin_allowed(request.headers.get("Origin")):
+        return Response("origin not allowed", status=403)
+
     body = request.get_json(silent=True) or {}
     request_id = body.get("id")
     method = body.get("method")
@@ -612,8 +747,15 @@ def handle_post():
 
     version_problem = check_protocol_version(params)
     if version_problem:
-        code, message = version_problem
-        return json_response(error(request_id, code, message))
+        code, message, data = version_problem
+        # A rejection the client can act on: it names what this server speaks,
+        # and travels with the 4xx a protocol-level refusal owes.
+        return json_response(error(request_id, code, message, data), status=400)
+
+    if method == "tools/call":
+        problem = param_header_problem(params)
+        if problem:
+            return json_response(error(request_id, HEADER_MISMATCH, problem), status=400)
 
     if method == "subscriptions/listen":
         return Response(
@@ -624,12 +766,15 @@ def handle_post():
 
     handler = HANDLERS.get(method)
     if not handler:
-        return json_response(error(request_id, -32601, f"method not found: {method}"))
+        # Streamable HTTP backward compatibility: an unknown method answered
+        # with 404 and a JSON-RPC -32601 is how a client tells a modern server
+        # from a legacy endpoint that never heard of the method.
+        return json_response(error(request_id, -32601, f"method not found: {method}"), status=404)
     return json_response(handler(request_id, params))
 
 
-def json_response(payload):
-    return Response(json.dumps(payload), mimetype="application/json")
+def json_response(payload, status=200):
+    return Response(json.dumps(payload), mimetype="application/json", status=status)
 
 
 @app.route("/mcp", methods=["GET"])
