@@ -357,7 +357,8 @@ def tenant_report_tool(request_id, arguments):
     # and the tool wants the value the caller actually sent.
     header_tenant = request.headers.get("Mcp-Param-Tenant")
     if header_tenant:
-        header_tenant = decode_header_value(header_tenant)
+        decoded = decode_header_value(header_tenant)
+        header_tenant = None if decoded is MALFORMED_SENTINEL else decoded
     if not header_tenant:
         # What a server says when the header it needs did not arrive. The
         # client refreshes tools/list once and retries.
@@ -430,8 +431,13 @@ def create_ticket_tool(request_id, arguments, params):
     # Only ask for something the client said it can answer. A server that asks
     # a client with no elicitation capability has nowhere to go, so it says so
     # in the terms the revision defines instead of stalling the call.
+    # A client may declare only elicitation.url, which cannot answer the form
+    # request this tool sends. An empty elicitation object is the older,
+    # mode-less declaration and is taken as form-capable.
     caps = request_meta(params).get(META_CLIENT_CAPS) or {}
-    if "elicitation" not in caps:
+    elicitation = caps.get("elicitation")
+    form_capable = isinstance(elicitation, dict) and (not elicitation or "form" in elicitation)
+    if not form_capable:
         return error(request_id, MISSING_CAPABILITY,
                      "create_ticket needs to ask the host for the reporter",
                      {"requiredCapabilities": {"elicitation": {"form": {}}}})
@@ -656,14 +662,21 @@ BASE64_START = "=?base64?"
 BASE64_END = "?="
 
 
+# A sentinel-shaped value that does not decode is not a plain value: a client
+# must itself encode any literal that looks like the sentinel, precisely so the
+# two cannot be confused. Returning it unchanged would let "=?base64?!!!!?=" in
+# the header match the same literal in the body.
+MALFORMED_SENTINEL = object()
+
+
 def decode_header_value(value):
     """Undo the Base64 sentinel a client uses for values a header cannot carry."""
     if value.startswith(BASE64_START) and value.endswith(BASE64_END):
         encoded = value[len(BASE64_START):-len(BASE64_END)]
         try:
             return base64.b64decode(encoded, validate=True).decode("utf-8")
-        except (binascii.Error, UnicodeDecodeError):
-            return value
+        except (binascii.Error, UnicodeDecodeError, ValueError):
+            return MALFORMED_SENTINEL
     return value
 
 
@@ -690,6 +703,62 @@ def argument_at(arguments, path):
     return value
 
 
+# Which request field mirrors into Mcp-Name, per the Streamable HTTP standard
+# request headers (the tasks extension adds the taskId routes).
+NAME_HEADER_SOURCES = {
+    "tools/call": "name",
+    "prompts/get": "name",
+    "resources/read": "uri",
+    "tasks/get": "taskId",
+    "tasks/update": "taskId",
+    "tasks/cancel": "taskId",
+    "tasks/result": "taskId",
+}
+
+
+def standard_header_problem(method, params):
+    """The standard mirrors must agree with the body, on every request.
+
+    An intermediary routes on Mcp-Method, Mcp-Name and MCP-Protocol-Version
+    without parsing the body. If the server executes a body that disagrees
+    with them, the routing decision and the work done part company — the same
+    disagreement the mirrored parameter headers are checked for, and the same
+    -32020 answer.
+    """
+    sent_method = request.headers.get("Mcp-Method")
+    if sent_method is None:
+        return "Mcp-Method is required"
+    if sent_method != method:
+        return f"Mcp-Method {sent_method!r} does not match the request method {method!r}"
+
+    sent_version = request.headers.get("MCP-Protocol-Version")
+    declared = request_meta(params).get(META_VERSION)
+    if sent_version is None:
+        return "MCP-Protocol-Version is required"
+    if declared is not None and sent_version != declared:
+        return "MCP-Protocol-Version does not match the version in _meta"
+
+    key = NAME_HEADER_SOURCES.get(method)
+    sent_name = request.headers.get("Mcp-Name")
+    if key is None:
+        if sent_name is not None:
+            return f"Mcp-Name was sent for {method}, which has no name to mirror"
+        return None
+
+    expected = (params or {}).get(key)
+    if expected is None:
+        return "Mcp-Name was sent for an absent parameter" if sent_name is not None else None
+    if sent_name is None:
+        return f"Mcp-Name is required for {method}"
+
+    decoded = decode_header_value(sent_name)
+    if decoded is MALFORMED_SENTINEL:
+        return "Mcp-Name is not a valid encoded value"
+    if decoded != (expected if isinstance(expected, str) else str(expected)):
+        return f"Mcp-Name does not match the {key} parameter"
+    return None
+
+
 def param_header_problem(params):
     """The mirrored headers must agree with the arguments they were derived from.
 
@@ -712,7 +781,10 @@ def param_header_problem(params):
             continue
         if sent is None:
             return f"Mcp-Param-{header} is required for this tool"
-        if decode_header_value(sent) != (expected if isinstance(expected, str) else str(expected)):
+        decoded = decode_header_value(sent)
+        if decoded is MALFORMED_SENTINEL:
+            return f"Mcp-Param-{header} is not a valid encoded value"
+        if decoded != (expected if isinstance(expected, str) else str(expected)):
             return f"Mcp-Param-{header} does not match the {'.'.join(path)} argument"
     return None
 
@@ -752,10 +824,13 @@ def handle_post():
         # and travels with the 4xx a protocol-level refusal owes.
         return json_response(error(request_id, code, message, data), status=400)
 
-    if method == "tools/call":
+    # The standard mirrors are checked on every request; the parameter mirrors
+    # only tools/call carries.
+    problem = standard_header_problem(method, params)
+    if problem is None and method == "tools/call":
         problem = param_header_problem(params)
-        if problem:
-            return json_response(error(request_id, HEADER_MISMATCH, problem), status=400)
+    if problem:
+        return json_response(error(request_id, HEADER_MISMATCH, problem), status=400)
 
     if method == "subscriptions/listen":
         return Response(
