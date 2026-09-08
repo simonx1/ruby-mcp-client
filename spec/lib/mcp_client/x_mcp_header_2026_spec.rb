@@ -337,6 +337,47 @@ RSpec.describe 'MCP 2026-07-28 x-mcp-header custom headers' do
       expect(headers.keys).not_to include('Mcp-Param-Cached')
     end
 
+    # On a modern session the Mcp-Param-* namespace belongs to the client: it
+    # is derived from the call's own arguments, so a header the host configured
+    # once at construction must not survive into a call whose argument is
+    # absent — the server would read another call's tenant as this one's.
+    it 'drops a host-configured Mcp-Param header the arguments do not supply' do
+      configured = MCPClient::ServerStreamableHTTP.new(
+        base_url: base_url, endpoint: endpoint, retries: 0, logger: logger,
+        headers: { 'Mcp-Param-Tenant' => 'alice' }
+      )
+      requests = stub_server(tools: [nested_tool])
+
+      configured.list_tools
+      configured.call_tool('nested', { 'db' => { 'tenant' => nil } })
+      configured.call_tool('nested', { 'db' => { 'tenant' => 'acme' } })
+
+      calls = requests.select { |r| r[:body]['method'] == 'tools/call' }
+      expect(calls[0][:headers].keys.grep(/\AMcp-Param-/)).to be_empty
+      expect(calls[1][:headers]['Mcp-Param-Tenant']).to eq('acme')
+    ensure
+      configured&.cleanup
+    end
+
+    # HTTP field names are case-insensitive, so the namespace is claimed on the
+    # lower-cased name: a differently spelled configured header is the same
+    # header and goes the same way.
+    it 'drops a configured Mcp-Param header whatever case the host spelled it in' do
+      configured = MCPClient::ServerStreamableHTTP.new(
+        base_url: base_url, endpoint: endpoint, retries: 0, logger: logger,
+        headers: { 'mcp-param-tenant' => 'alice' }
+      )
+      requests = stub_server(tools: [nested_tool])
+
+      configured.list_tools
+      configured.call_tool('nested', { 'db' => { 'tenant' => nil } })
+
+      call = requests.find { |r| r[:body]['method'] == 'tools/call' }
+      expect(call[:headers].keys.grep(/\AMcp-Param-/i)).to be_empty
+    ensure
+      configured&.cleanup
+    end
+
     it 'Base64-encodes a value that is not header-safe' do
       requests = stub_server(tools: [sql_tool])
 

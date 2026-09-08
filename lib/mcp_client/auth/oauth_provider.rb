@@ -25,8 +25,15 @@ module MCPClient
       # One lock per storage backend and resource for this resource's
       # authorization state — the pending-flow records and the token slot they
       # end in (see {#with_authorization_state_lock}); storage backends are
-      # weak keys.
-      AUTHORIZATION_STATE_LOCKS = ObjectSpace::WeakMap.new
+      # weak keys, so a storage the host drops takes its locks with it.
+      #
+      # WeakKeyMap, not WeakMap: WeakMap holds its VALUES weakly too, and the
+      # value here is the table of per-resource monitors, which nothing else
+      # references. A collection between two acquisitions dropped that table,
+      # the next caller built a fresh monitor, and two providers sharing one
+      # storage were inside the critical section at the same time — which is
+      # exactly what the section exists to prevent.
+      AUTHORIZATION_STATE_LOCKS = ObjectSpace::WeakKeyMap.new
       AUTHORIZATION_STATE_LOCKS_GUARD = Mutex.new
       private_constant :AUTHORIZATION_STATE_LOCKS, :AUTHORIZATION_STATE_LOCKS_GUARD
 
