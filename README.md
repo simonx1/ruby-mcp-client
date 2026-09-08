@@ -51,7 +51,7 @@ revision retires.
 - **Subscriptions**: `subscriptions/listen` notification streams (2026-07-28)
 - **Caching**: `ttlMs` / `cacheScope` freshness hints on lists, reads and discovery (2026-07-28)
 - **Audio**: Audio content type support
-- **Progress & Cancellation**: `progressToken` plumbing with per-call callbacks; automatic `notifications/cancelled` for abandoned requests
+- **Progress & Cancellation**: `progressToken` plumbing with per-call callbacks; automatic `notifications/cancelled` for abandoned requests (on a modern Streamable HTTP session closing the response stream is itself the cancellation, so no notification is sent)
 - **Metadata**: `icons`, `title` and `_meta` parsed on tools, prompts and resources
 - **OAuth 2.1**: PKCE (S256 required), RFC 8414/9728 discovery, RFC 9207 issuer validation, Client ID Metadata Documents, dynamic registration *(deprecated)*, scope step-up challenges
 

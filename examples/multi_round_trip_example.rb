@@ -63,17 +63,25 @@ begin
 
   ok = asked.size == 1 && text.to_s.include?('Ada Lovelace') && text.to_s.include?('Printer is on fire')
 
-  puts "\nWithout a handler the same call cannot be completed:"
+  # A client with no elicitation handler declares no elicitation capability,
+  # and a well-behaved server checks that before it asks: it refuses the call
+  # with -32021 rather than starting a round trip nobody can finish. A server
+  # that asked anyway would give this client an InputRequiredError instead,
+  # carrying the requests it could not honour and the opaque request state.
+  puts "\nA client that declares no elicitation capability is refused up front:"
   bare = MCPClient::Client.new(
     mcp_server_configs: [MCPClient.streamable_http_config(base_url: server_url)],
     logger: logger
   )
   begin
     bare.call_tool('create_ticket', { 'summary' => 'Second ticket' })
-    puts '  ❌ expected InputRequiredError'
+    puts '  ❌ expected the server to refuse'
     ok = false
+  rescue MCPClient::Errors::MissingRequiredClientCapabilityError => e
+    puts "  ✅ MissingRequiredClientCapabilityError: #{e.message[0, 70]}"
   rescue MCPClient::Errors::InputRequiredError => e
-    puts "  ✅ InputRequiredError: #{e.message[0, 70]}"
+    # Also correct, for a server that asks without checking first.
+    puts "  ✅ InputRequiredError: #{e.message[0, 60]}"
     puts "     input_requests: #{e.input_requests.keys.inspect}, request_state present: #{!e.request_state.nil?}"
   ensure
     bare.cleanup
