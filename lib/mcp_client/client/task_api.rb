@@ -337,17 +337,6 @@ module MCPClient
 
       private
 
-      # Enforce the tasks.<operation> capability gate for a server (MCP
-      # lifecycle: "Only use capabilities that were successfully negotiated").
-      # When the negotiated capability set is not yet known, first trigger the
-      # handshake with a cheap standard request (ping) and then re-apply the
-      # gate against the freshly negotiated set, so a previously uninitialized
-      # server that negotiates no tasks capability never receives the
-      # prohibited request.
-      # @param srv [MCPClient::ServerBase] the selected server
-      # @param operation [String] the tasks sub-capability ('list' or 'cancel')
-      # @return [void]
-      # @raise [MCPClient::Errors::CapabilityError] if the negotiated set lacks the capability
       # Make the server's protocol era known (a cheap request triggers the
       # handshake or the server/discover probe); failures are left to the
       # request that follows.

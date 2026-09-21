@@ -371,7 +371,7 @@ module MCPClient
       # target declares no matching dynamic anchor is the plain reference it
       # resolves to (`:plain`). One that does re-binds to the declaration in
       # the OUTERMOST resource of the dynamic scope — the resources the
-      # evaluation entered on its way here, which {SchemaValidator.enter_scope}
+      # evaluation entered on its way here, which {SchemaValidator.entered_scope?}
       # records as they are entered (`:bound`, with the target). What the
       # document holds elsewhere decides nothing: a resource the instance
       # never entered is not in the scope, so a duplicate anchor there is

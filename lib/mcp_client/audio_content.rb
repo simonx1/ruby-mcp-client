@@ -26,7 +26,7 @@ module MCPClient
     end
 
     # Create an AudioContent instance from JSON data
-    # @param data [Hash] JSON data from MCP server
+    # @param json_data [Hash] JSON data from MCP server
     # @return [MCPClient::AudioContent] audio content instance
     def self.from_json(json_data)
       new(

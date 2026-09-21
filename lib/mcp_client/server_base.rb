@@ -13,8 +13,6 @@ module MCPClient
     #   @return [Numeric, nil] the configured per-request timeout in seconds, when the transport has one
     attr_reader :read_timeout
 
-    # Initialize the server with a name
-    # @param name [String, nil] server name
     # Server-declared instructions from the initialize result, if any
     # @return [String, nil]
     attr_reader :instructions

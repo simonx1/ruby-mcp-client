@@ -562,10 +562,6 @@ module MCPClient
       end
     end
 
-    # Send an HTTP request to the server
-    # @param request [Hash] the JSON-RPC request
-    # @return [Faraday::Response] the HTTP response
-    # @raise [MCPClient::Errors::ConnectionError] if connection fails
     # What an answered POST means: the session it was sent under may have
     # expired, its body may have been cut short, it may carry an error, or it
     # settles the request.
@@ -591,6 +587,13 @@ module MCPClient
       response
     end
 
+    # Send an HTTP request to the server
+    # @param request [Hash] the JSON-RPC request
+    # @param timeout [Numeric, nil] per-request timeout override
+    # @param deadline [Float, nil] monotonic instant the exchange must finish by
+    # @param extra_headers [Hash] headers for this request only
+    # @return [Faraday::Response] the HTTP response
+    # @raise [MCPClient::Errors::ConnectionError] if connection fails
     def send_http_request(request, timeout: nil, deadline: nil, extra_headers: {})
       conn = http_connection
       # The session id this request goes out with: a later 404 is attributed
@@ -827,7 +830,7 @@ module MCPClient
 
     # Apply headers to the HTTP request (can be overridden by subclasses)
     # @param req [Faraday::Request] HTTP request
-    # @param _request [Hash] JSON-RPC request
+    # @param request [Hash] JSON-RPC request
     def apply_request_headers(req, request)
       # The freshness probe models its request on the last method sent.
       @probe_method = request['method'] if request.is_a?(Hash) && request['method'].is_a?(String)

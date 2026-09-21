@@ -118,7 +118,7 @@ module MCPClient
       # The threads are neither killed nor waited for. A kill would interrupt
       # a reader wherever it happened to be — losing whatever it was
       # delivering, or dropping it while it holds the subscription's own lock
-      # to take a new listen id, which is exactly what a later {#close} or
+      # to take a new listen id, which is exactly what a later {MCPClient::Subscription#close} or
       # {#listen} would then wait on. Waiting is no better: this runs under
       # the transport lock a reader needs for its next id, so a join here
       # would stall every later call for its whole timeout. Once its
@@ -581,13 +581,6 @@ module MCPClient
         e
       end
 
-      # Consume the complete SSE events in the buffer: notifications are
-      # routed (acknowledgment, tagged notifications, server-side
-      # cancellation), a response to the listen request ends the subscription,
-      # and comment lines are ignored (keep-alives).
-      # @param buffer [String] mutable stream buffer
-      # @param subscription [MCPClient::Subscription]
-      # @return [Symbol, nil] :closed once the subscription ended
       # One chunk of a listen stream as it arrives: appended, framed on the
       # first chunk, parsed for complete events, and measured. The cap is on
       # the event — {#consume_listen_events} refuses one over it before it is
@@ -609,6 +602,14 @@ module MCPClient
         state[:finished]
       end
 
+      # Consume the complete SSE events in the buffer: notifications are
+      # routed (acknowledgment, tagged notifications, server-side
+      # cancellation), a response to the listen request ends the subscription,
+      # and comment lines are ignored (keep-alives).
+      # @param buffer [String] mutable stream buffer
+      # @param subscription [MCPClient::Subscription]
+      # @param state [Hash] the stream's parsing state
+      # @return [Symbol, nil] :closed once the subscription ended
       def consume_listen_events(buffer, subscription, state = { scanned: 0 })
         finished = nil
         strip_listen_bom(buffer, state)

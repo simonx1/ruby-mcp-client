@@ -2,7 +2,7 @@
 
 require 'socket'
 require 'uri'
-require 'cgi'
+require 'cgi/escape'
 require_relative 'peer_text'
 require_relative 'oauth_provider'
 

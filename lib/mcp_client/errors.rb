@@ -418,7 +418,7 @@ module MCPClient
     # and opaque request state so a host can drive the round trip itself.
     class InputRequiredError < ServerError
       # The request the round trip was driving, when the error was raised by
-      # the round-trip resolver: what {JsonRpcCommon#resume_input_required}
+      # the round-trip resolver: what {MCPClient::JsonRpcCommon::InputWaits#resume_input_required}
       # re-issues, with the requestState echoed and no inputResponses.
       # @return [String, nil] the JSON-RPC method
       attr_accessor :request_method

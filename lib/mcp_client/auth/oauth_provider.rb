@@ -669,10 +669,9 @@ module MCPClient
       # can be validated, so a present `iss` is rejected (fail closed).
       # @param iss [String, nil] the response's iss parameter
       # @param expected [String, nil] the issuer recorded when the flow started
-      # @param server_metadata [ServerMetadata, nil] the authorization server metadata
+      # @param supported [Boolean] whether the request's authorization server advertises iss
       # @return [void]
       # @raise [MCPClient::Errors::ConnectionError]
-      # @param supported [Boolean] whether the request's authorization server advertises iss
       def validate_authorization_response_issuer!(iss, expected, supported)
         unless expected.is_a?(String)
           raise MCPClient::Errors::ConnectionError,
@@ -1186,10 +1185,9 @@ module MCPClient
       # Fetch the first Authorization Server Metadata document that resolves.
       # The oauth-authorization-server and openid-configuration forms are
       # genuine alternatives, so any failing candidate is skipped to try the next.
-      # @param urls [Array<String>] candidate URLs
-      # @return [ServerMetadata, nil]
       # @param urls [Array<String>] well-known candidates
       # @param issuer [String] the issuer identifier the candidates were built from
+      # @return [ServerMetadata, nil]
       def fetch_first_server_metadata(urls, issuer)
         rejected = nil
         urls.each do |url|

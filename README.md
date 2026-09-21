@@ -85,6 +85,13 @@ client = MCPClient.connect(['http://server1/mcp', 'http://server2/mcp'])
 # Force specific transport
 client = MCPClient.connect('http://custom.com/api', transport: :streamable_http)
 
+# Protocol era and extensions (see "MCP 2026-07-28 Features" below)
+client = MCPClient.connect('http://api.example.com/mcp',
+  protocol: :modern,                                  # :auto (default), :modern or :legacy
+  discover_timeout: 5,                                # bound on the server/discover probe
+  extensions: ['io.modelcontextprotocol/tasks']       # extensions the client declares
+)
+
 # Use the client
 tools = client.list_tools
 result = client.call_tool('example_tool', { param: 'value' })
@@ -367,7 +374,9 @@ probe with `discover_timeout:` on `stdio_config`, `http_config` and
 `MCPClient.connect` for those same three transports. The deprecated HTTP+SSE
 transport has no era of its own: `MCPClient::ServerSSE` takes neither option,
 so `MCPClient.connect` drops both for an `/sse` URL rather than passing them
-on ([Deprecated features](#deprecated-features)).
+on ([Deprecated features](#deprecated-features)) — except `protocol: :modern`,
+which an explicit `transport: :sse` refuses with `ArgumentError` rather than
+silently connecting legacy.
 `ping` maps to `server/discover` and `log_level=` to the per-request log
 level on modern servers.
 
@@ -869,8 +878,8 @@ On MCP 2026-07-28 the client must declare the extension for the server to be
 allowed to answer with a task at all:
 
 ```ruby
-client = MCPClient.create_client(mcp_server_configs: [...],
-                                 extensions: ['io.modelcontextprotocol/tasks'])
+client = MCPClient::Client.new(mcp_server_configs: [...],
+                               extensions: ['io.modelcontextprotocol/tasks'])
 
 tool = client.find_tool('long_job')
 tool.supports_task?   # execution.taskSupport is optional/required?
@@ -1161,7 +1170,7 @@ See `examples/` for complete implementations:
 
 ## Running the Examples
 
-The `examples/run_all_examples.sh` harness runs every example that can run on the current machine — self-contained stdio servers, the Python/Flask/FastMCP echo and elicitation servers, `npx`-based MCP servers, and (optionally) the paid LLM integrations. It starts and tears down each server automatically and prints a `PASS`/`FAIL`/`SKIP` summary. `tasks_example.rb` is always skipped (it needs a task-capable remote server); `oauth_browser_auth.rb` is interactive and only runs when you opt in with `RUN_OAUTH=1`.
+The `examples/run_all_examples.sh` harness runs every example that can run on the current machine — self-contained stdio servers, the Python/Flask/FastMCP echo and elicitation servers, `npx`-based MCP servers, and (optionally) the paid LLM integrations. It starts and tears down each server automatically and prints a `PASS`/`FAIL`/`SKIP` summary. `tasks_example.rb` runs against the local `echo_server_streamable.py`; `oauth_browser_auth.rb` is interactive and only runs when you opt in with `RUN_OAUTH=1`.
 
 ### Prerequisites
 
@@ -1408,7 +1417,8 @@ end
 
 ## Session Management
 
-Both HTTP and Streamable HTTP transports automatically handle session-based servers:
+On a legacy session (a server speaking MCP 2025-11-25 or earlier), both HTTP
+and Streamable HTTP transports automatically handle session-based servers:
 
 - **Session capture**: Extracts `Mcp-Session-Id` from initialize response
 - **Session persistence**: Includes session header in subsequent requests
@@ -1418,6 +1428,12 @@ Both HTTP and Streamable HTTP transports automatically handle session-based serv
   server can replay missed messages — honoring the server's `retry:` directive
 
 No configuration required - works automatically.
+
+A modern session (MCP 2026-07-28) has none of this: no session id, no DELETE,
+no GET stream and no resumption. A response stream that breaks loses the
+in-flight request, and the client re-issues it once as a new request — see
+[Treating the Server as Untrusted](#treating-the-server-as-untrusted) for what
+that means for `tools/call`.
 
 ## Server Compatibility
 
@@ -1460,6 +1476,8 @@ default behaviour — but it is worth knowing what the client will refuse:
 | Server-initiated requests | Replies are bounded by a concurrency budget rather than spawning unbounded threads |
 | Schema `pattern` values | Matched under a whole-operation time budget; a timeout fails validation rather than silently passing |
 | Log messages (`notifications/message`) | Control characters escaped and length-capped, so a server cannot forge log lines |
+| Broken response streams (MCP 2026-07-28) | The lost request is re-issued **once** as a new request, `tools/call` included: the revision says clients MUST re-issue and makes the closed stream the server's cancellation signal. A server that had already finished the tool before the stream broke runs it a second time. A `-32020` HeaderMismatch rejection is likewise retried once, after a `tools/list` refresh. Legacy sessions keep the 2.1.0 rule: non-idempotent requests are never re-sent |
+| `cacheScope: "private"` results | Bound to the `Authorization` header the request went out with (SHA-256 of its bytes) and never served under another. A credential carried elsewhere — a cookie, an `X-Api-Key` header, client TLS — is not part of that context |
 
 **Known limit:** the OAuth check is textual. A peer can still advertise a public
 hostname whose DNS record points inside your network; catching that needs

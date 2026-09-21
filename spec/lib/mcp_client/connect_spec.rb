@@ -268,6 +268,13 @@ RSpec.describe 'MCPClient.connect' do
         MCPClient.connect('http://example.com/api', transport: :sse)
       end
 
+      it 'refuses :sse combined with protocol: :modern' do
+        expect(MCPClient::Client).not_to receive(:new)
+
+        expect { MCPClient.connect('http://example.com/api', transport: :sse, protocol: :modern) }
+          .to raise_error(ArgumentError, /protocol: :modern/)
+      end
+
       it 'accepts string transport option' do
         expect(MCPClient::Client).to receive(:new).with(
           hash_including(mcp_server_configs: [hash_including(type: 'http')])

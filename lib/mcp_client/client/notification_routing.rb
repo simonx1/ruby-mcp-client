@@ -10,11 +10,6 @@ module MCPClient
     module NotificationRouting
       private
 
-      # Process incoming JSON-RPC notifications with default handlers
-      # @param server [MCPClient::ServerBase] the server that emitted the notification
-      # @param method [String] JSON-RPC notification method
-      # @param params [Hash] parameters for the notification
-      # @return [void]
       # Wire this client's own notification processing and the host's listeners
       # onto the transport.
       #

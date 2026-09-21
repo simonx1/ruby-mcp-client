@@ -98,16 +98,16 @@ module MCPClient
       # handlers (each inputRequests key is answered once), and give up when
       # the task's TTL backstop or the caller's timeout elapses.
       #
-      # Input requests are answered here (and by {Client#call_tool}) and
+      # Input requests are answered here (and by {MCPClient::Client#call_tool}) and
       # nowhere else: a notifications/tasks that carries inputRequests is
       # delivered to the notification listeners as it arrived, and a host
       # that follows a task through notifications hands it to this method
-      # (or answers with {Client#update_task}) when it wants them answered.
+      # (or answers with {#update_task}) when it wants them answered.
       #
       # Giving up ends the wait and nothing else: the task keeps running,
       # since only the host knows whether its result is still wanted. The
-      # handle stays usable — wait again, read it with {Client#get_task}, or
-      # end the task with {Client#cancel_task} (tasks/cancel; a task is never
+      # handle stays usable — wait again, read it with {TaskApi#get_task}, or
+      # end the task with {TaskApi#cancel_task} (tasks/cancel; a task is never
       # cancelled with notifications/cancelled).
       # @param task [String, MCPClient::Task] the task or its id
       # @param server [Integer, String, Symbol, MCPClient::ServerBase, nil] server selector
@@ -236,7 +236,6 @@ module MCPClient
       # still usable, else a fresh tasks/get; a seed that claims a terminal
       # or input_required status without its payload is confirmed by
       # tasks/get, and a terminal DetailedTask must carry its payload.
-      # @param current [MCPClient::Task, nil]
       # @param wait [Hash] task_id, srv, deadline
       # @return [MCPClient::Task]
       # @raise [MCPClient::Errors::TaskError] once the deadline has passed
@@ -745,7 +744,7 @@ module MCPClient
 
       # The definition a handle carries, if the caller named the task with a
       # handle at all: the one its creating call went out under. Every handle
-      # of that task keeps it — a refreshed one (see {Client#get_task}) and
+      # of that task keeps it — a refreshed one (see {TaskApi#get_task}) and
       # the one a wait hands back name the same task, and so the same tool —
       # while a bare task id identifies no request and no tool.
       # @param task [Object] what the caller named the task with
