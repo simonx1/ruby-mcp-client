@@ -35,7 +35,8 @@ configuration change or a re-authorization.
 
 - **Ruby 3.3 or newer is required.** The floor moved from 3.2 to 3.3 after
   2.1.0 shipped, so this is the release that carries it for anyone upgrading
-  from 2.1.0.
+  from 2.1.0. Development uses Ruby 4.0.7 (`.ruby-version`), and CI runs the
+  suite on it alongside the 3.3 floor.
 - **Every HTTP and stdio connection now begins with a `server/discover`
   probe.** A legacy server answers it with an error and the client falls back
   to `initialize`, which costs one extra round trip on first connect. Skip the
