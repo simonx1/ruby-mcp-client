@@ -1504,7 +1504,7 @@ than the peer's:
 - Runtime dependencies: `faraday` (~> 2.0) with `faraday-follow_redirects` and
   `faraday-retry`, plus `base64` — all pulled in automatically by the gem
 
-Development uses Ruby 4.0.6 (see `.ruby-version`). CI runs the suite on 4.0.6
+Development uses Ruby 4.0.7 (see `.ruby-version`). CI runs the suite on 4.0.7
 plus the supported floor, 3.3.
 
 ## License
