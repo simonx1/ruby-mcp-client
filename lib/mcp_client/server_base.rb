@@ -29,6 +29,8 @@ module MCPClient
       @client_info = info.transform_keys(&:to_s)
     end
 
+    # Initialize the server with a name
+    # @param name [String, nil] server name
     def initialize(name: nil)
       @name = name
     end

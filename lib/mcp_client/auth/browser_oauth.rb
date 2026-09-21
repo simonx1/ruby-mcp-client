@@ -3,6 +3,11 @@
 require 'socket'
 require 'uri'
 require 'cgi/escape'
+# CGI.unescape on Ruby 3.x is the pure-Ruby one from cgi/util, and it reads a
+# class variable only cgi/util initializes; cgi/escape alone raises NameError
+# on several 3.x patch levels. Ruby 4.0 removed cgi/util (requiring it warns)
+# and cgi/escape carries a complete unescape.
+require 'cgi/util' if RUBY_VERSION < '4'
 require_relative 'peer_text'
 require_relative 'oauth_provider'
 

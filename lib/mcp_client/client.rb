@@ -897,6 +897,10 @@ module MCPClient
       @progress_mutex.synchronize { @progress_callbacks.delete(token) }
     end
 
+    # Handle logging message notification from server (MCP 2025-06-18)
+    # @param server_id [String] server identifier for log prefix
+    # @param params [Hash] log message params (level, logger, data)
+    # @return [void]
     def handle_log_message(server_id, params)
       MCPClient::Deprecations.warn(:logging, @logger)
       level = params['level'] || 'info'
