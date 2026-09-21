@@ -416,6 +416,8 @@ module MCPClient
       end
     end
 
+    # @param kind [Symbol]
+    # @return [Object, nil] the identity of the entry currently holding the kind
     def cache_entry_token(kind)
       # A placeholder (an invalidation, a cleanup) identifies nothing.
       cache_entries_mutex.synchronize do

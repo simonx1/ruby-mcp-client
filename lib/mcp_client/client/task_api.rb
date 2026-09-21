@@ -350,9 +350,20 @@ module MCPClient
         srv.ping
       end
 
+      # Enforce the tasks.<operation> capability gate for a server (MCP
+      # lifecycle: "Only use capabilities that were successfully negotiated").
+      # When the negotiated capability set is not yet known, first trigger the
+      # handshake with a cheap standard request (ping) and then re-apply the
+      # gate against the freshly negotiated set, so a previously uninitialized
+      # server that negotiates no tasks capability never receives the
+      # prohibited request.
+      # @param srv [MCPClient::ServerBase] the selected server
+      # @param operation [String] the tasks sub-capability ('list' or 'cancel')
       # @param strict [Boolean] surface an initialization failure instead of
       #   leaving it to the request (for operations that never send one on a
       #   server whose era is unknown)
+      # @return [void]
+      # @raise [MCPClient::Errors::CapabilityError] if the negotiated set lacks the capability
       def ensure_task_capability!(srv, operation, strict: false)
         if !capabilities_known?(srv) && srv.respond_to?(:ping)
           begin

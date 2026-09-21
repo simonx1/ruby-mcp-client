@@ -40,13 +40,18 @@ configuration change or a re-authorization.
   probe.** A legacy server answers it with an error and the client falls back
   to `initialize`, which costs one extra round trip on first connect. Skip the
   probe with `protocol: :legacy`, or bound it with `discover_timeout:`. On
-  HTTP and Streamable HTTP only an *answered* rejection (a JSON-RPC error, a
-  4xx) triggers the fallback: a probe that times out, meets a 5xx or loses
-  its connection is reported as the error it is, because such a failure says
-  nothing about which revision the server speaks, so `discover_timeout:`
-  bounds how long that failure takes rather than the fallback. Stdio does
-  fall back on a probe timeout. A legacy HTTP server that hangs on unknown
-  methods therefore needs `protocol: :legacy`. The deprecated HTTP+SSE
+  HTTP and Streamable HTTP only an *answered* rejection (a JSON-RPC error, or
+  a 4xx other than an authorization failure) triggers the fallback: a probe
+  that times out, meets a 5xx or loses its connection is reported as the
+  error it is, because such a failure says nothing about which revision the
+  server speaks, and a 401 or 403 is raised as the `ConnectionError` it would
+  be on `initialize` too. `discover_timeout:` therefore
+  bounds how long that failure takes rather than the fallback. That is the
+  transport's own negotiation: `MCPClient.connect` auto-detection still
+  treats a failed Streamable HTTP attempt as a reason to try the HTTP+SSE and
+  plain HTTP transports next, unless `protocol: :modern` rules them out.
+  Stdio does fall back on a probe timeout. A legacy HTTP server that hangs
+  on unknown methods therefore needs `protocol: :legacy`. The deprecated HTTP+SSE
   transport never probes; combining it with `protocol: :modern` raises
   `ArgumentError`.
 - **Tool definitions with an invalid `x-mcp-header` annotation are excluded
@@ -64,9 +69,11 @@ configuration change or a re-authorization.
   be localhost or HTTPS. A host that configured a plain-HTTP callback on a
   non-loopback address has to change it.
 - **Stored OAuth credentials and tokens are bound to the authorization server
-  that issued them.** Records persisted by an earlier version carry no issuer:
-  a token is bound to the server it is first read under, and a dynamic client
-  registration whose authorization server cannot be established is retired and
+  that issued them.** Records persisted by an earlier version carry no issuer.
+  When the authorization server's metadata is already cached, such a token is
+  bound to that server the first time it is read; when discovery runs fresh,
+  the unbound token is retired instead, and a dynamic client registration
+  whose authorization server cannot be established is retired and
   re-registered. Some users will have to authorize again once. Credentials a
   host pre-registered are kept, but **they are refused until they name their
   authorization server**: a pre-registered `ClientInfo` with no `issuer:`
@@ -103,7 +110,8 @@ enforces what the revision requires of a client (#245).
   (auto-detection already routed `protocol: :modern` to Streamable HTTP).
 - **`require 'cgi'` warned on Ruby 4.0**, where the `cgi` library moved to a
   gem; only the escape helpers are used, so `browser_oauth` requires
-  `cgi/escape`.
+  `cgi/escape`, plus `cgi/util` on Ruby 3.x, where `CGI.unescape` needs it and
+  the gem had been relying on Faraday loading it first.
 - **`sanitize_peer_log_text` held raw NUL and control bytes** in its regex
   source, which made `file` call the file binary and BSD `grep` return
   nothing for it. Same character class, written as escapes.
