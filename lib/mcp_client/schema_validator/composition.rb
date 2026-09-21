@@ -15,8 +15,8 @@ module MCPClient
     # full verdict.
     #
     # Every standard assertion whose verdict this validator can reach is
-    # evaluated ({SchemaValidator.validate_object},
-    # {SchemaValidator.validate_array}, {SchemaValidator.validate_number},
+    # evaluated ({Instances#validate_object},
+    # {Instances#validate_array}, {Scalars#validate_number},
     # and the unevaluated keywords from the annotations {Evaluation}
     # collects), so what is left here is only what genuinely cannot be
     # decided: a dynamic reference whose target the dynamic scope could

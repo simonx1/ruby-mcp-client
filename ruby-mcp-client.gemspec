@@ -14,7 +14,7 @@ Gem::Specification.new do |spec|
   spec.homepage      = 'https://github.com/simonx1/ruby-mcp-client'
   spec.license       = 'MIT'
 
-  spec.files         = Dir.glob('lib/**/*.rb') + ['README.md', 'LICENSE']
+  spec.files         = Dir.glob('lib/**/*.rb') + ['README.md', 'OAUTH.md', 'LICENSE']
   spec.required_ruby_version = '>= 3.3.0'
   spec.require_paths = ['lib']
   # base64 is required by the OAuth/PKCE and content helpers. It became a

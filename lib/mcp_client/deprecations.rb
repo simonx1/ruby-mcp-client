@@ -411,7 +411,7 @@ module MCPClient
       # @return [String] the detail with control characters (and the Unicode
       #   line and paragraph separators) escaped and its length bounded
       def sanitize(detail)
-        escaped = detail.to_s.gsub(/[[:cntrl:]\u0085\u2028\u2029]/) { |c| format('\\u%04X', c.ord) }
+        escaped = detail.to_s.gsub(/[[:cntrl:]\u2028\u2029]/) { |c| format('\\u%04X', c.ord) }
         escaped.length <= MAX_DETAIL_LENGTH ? escaped : "#{escaped[0, MAX_DETAIL_LENGTH]}..."
       end
     end

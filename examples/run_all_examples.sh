@@ -289,6 +289,7 @@ else
   skip_example "echo_server_streamable_client.rb" "echo_server_streamable.py (:8931) not ready"
   skip_example "test_mcp_protocol_features.rb"    "echo_server_streamable.py (:8931) not ready"
   skip_example "test_ping_pong.rb"                "echo_server_streamable.py (:8931) not ready"
+  skip_example "tasks_example.rb"                 "echo_server_streamable.py (:8931) not ready"
 fi
 stop_server
 

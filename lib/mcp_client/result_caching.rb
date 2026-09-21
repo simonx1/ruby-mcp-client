@@ -390,8 +390,6 @@ module MCPClient
       transport_thread_local_keys.each { |key| Thread.current[key] = nil }
     end
 
-    # @param kind [Symbol]
-    # @return [Object, nil] the identity of the entry currently holding the kind
     # Whether the entry a client-level slice came from is still fresh by its
     # own hint — a lock-safe re-check (no probe, no host callable) for the
     # moment a snapshot is handed out. No entry means nothing bounds it.
@@ -846,21 +844,6 @@ module MCPClient
       Digest::SHA256.hexdigest(header.to_s)
     end
 
-    # Forget the entries cached under `cacheScope: "private"`: they "MUST NOT
-    # be shared across authorization contexts" (a new access token is one).
-    # @return [void]
-    def invalidate_private_cache
-      now = monotonic_now
-      cache_entries_mutex.synchronize do
-        cache_entries.each_key do |key|
-          next unless cache_entries[key].cache_scope == 'private'
-
-          cache_entries[key] = MCPClient::CachedResult.stale(now: now, like: cache_entries[key])
-        end
-        bump_cache_epoch
-      end
-    end
-
     # Forget cached resources/read results: one URI, or all of them.
     # @param uri [String, nil]
     # @return [void]
@@ -979,12 +962,6 @@ module MCPClient
       end
     end
 
-    # Keep caches in step with the server's change notifications: a list
-    # change drops that list (and, for resources, every cached read), a
-    # resource update drops that resource's read.
-    # @param method [String] a notification method
-    # @param params [Hash, nil] notification params
-    # @return [void]
     # A host layered above the transport (MCPClient::Client) keeps caches of
     # its own, and they must be gone before a subscription listener runs —
     # the listener is delivered right after this returns, while the host's
@@ -997,6 +974,12 @@ module MCPClient
       @cache_invalidation_callback = block
     end
 
+    # Keep caches in step with the server's change notifications: a list
+    # change drops that list (and, for resources, every cached read), a
+    # resource update drops that resource's read.
+    # @param method [String] a notification method
+    # @param params [Hash, nil] notification params
+    # @return [void]
     def invalidate_cache_for_notification(method, params = nil)
       kinds = LIST_CHANGE_NOTIFICATIONS[method]
       if kinds

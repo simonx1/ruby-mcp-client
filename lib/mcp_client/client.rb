@@ -837,10 +837,6 @@ module MCPClient
       mark.is_a?(Array) && mark[0].equal?(server) && mark[1] == method
     end
 
-    # Handle logging message notification from server (MCP 2025-06-18)
-    # @param server_id [String] server identifier for log prefix
-    # @param params [Hash] log message params (level, logger, data)
-    # @return [void]
     # Route a notifications/progress message to the callback registered for
     # its progressToken; unknown or stale tokens are debug-logged and dropped
     # (MCP: "Senders and receivers SHOULD track active progress tokens").
@@ -936,7 +932,7 @@ module MCPClient
     # @param text [String] the peer-supplied text
     # @return [String] sanitized, length-bounded text
     def sanitize_peer_log_text(text)
-      escaped = text.gsub(/[ -]/) { |c| format('\\x%02X', c.ord) }
+      escaped = text.gsub(/[\x00-\x1F\x7F]/) { |c| format('\\x%02X', c.ord) }
       return escaped if escaped.length <= MAX_PEER_LOG_MESSAGE_LENGTH
 
       "#{escaped[0, MAX_PEER_LOG_MESSAGE_LENGTH]}... (truncated from #{escaped.length} chars)"

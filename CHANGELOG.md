@@ -1,6 +1,6 @@
 # Changelog
 
-## 3.0.0 — MCP 2026-07-28 (2026-09-08)
+## 3.0.0 — MCP 2026-07-28 (2026-09-21)
 
 Full support for the MCP 2026-07-28 protocol revision. The revision makes the
 protocol stateless: there is no `initialize` handshake, no session and no
@@ -39,7 +39,16 @@ configuration change or a re-authorization.
 - **Every HTTP and stdio connection now begins with a `server/discover`
   probe.** A legacy server answers it with an error and the client falls back
   to `initialize`, which costs one extra round trip on first connect. Skip the
-  probe with `protocol: :legacy`, or bound it with `discover_timeout:`.
+  probe with `protocol: :legacy`, or bound it with `discover_timeout:`. On
+  HTTP and Streamable HTTP only an *answered* rejection (a JSON-RPC error, a
+  4xx) triggers the fallback: a probe that times out, meets a 5xx or loses
+  its connection is reported as the error it is, because such a failure says
+  nothing about which revision the server speaks, so `discover_timeout:`
+  bounds how long that failure takes rather than the fallback. Stdio does
+  fall back on a probe timeout. A legacy HTTP server that hangs on unknown
+  methods therefore needs `protocol: :legacy`. The deprecated HTTP+SSE
+  transport never probes; combining it with `protocol: :modern` raises
+  `ArgumentError`.
 - **Tool definitions with an invalid `x-mcp-header` annotation are excluded
   from `list_tools` with a warning** rather than being offered and failing at
   call time.
@@ -59,8 +68,20 @@ configuration change or a re-authorization.
   a token is bound to the server it is first read under, and a dynamic client
   registration whose authorization server cannot be established is retired and
   re-registered. Some users will have to authorize again once. Credentials a
-  host pre-registered are kept, but they are only used for the authorization
-  server they name — pass `issuer:` with them.
+  host pre-registered are kept, but **they are refused until they name their
+  authorization server**: a pre-registered `ClientInfo` with no `issuer:`
+  fails the connection with `ConnectionError` rather than being sent to
+  whichever server the resource advertises. A 2.1.0 host with static
+  credentials must pass `issuer:` (or store them under
+  `provider.client_registration_key(issuer)`) before it can authorize again.
+- **On a modern session a request whose response stream breaks is re-issued
+  once, `tools/call` included.** MCP 2026-07-28 has no stream resumption:
+  the revision says a broken response stream loses the in-flight request and
+  the client MUST re-issue it, and it makes the closed stream the server's
+  cancellation signal. A server that had already run the tool to completion
+  before the stream broke runs it twice. The 2.1.0 rule that non-idempotent
+  requests are never re-sent still holds for legacy sessions and for every
+  other recovery path (session expiry, transport retries).
 - **Roots, Sampling, Logging, the HTTP+SSE transport and OAuth Dynamic Client
   Registration now log a deprecation notice** once per feature per process on
   first use. They keep working; silence the notices with
@@ -71,10 +92,28 @@ configuration change or a re-authorization.
 `examples/mcp_2026_07_28_server.py` is a Flask server that speaks the new
 revision, with three clients against it: `mcp_2026_07_28_features.rb`,
 `subscriptions_listen_example.rb` and `multi_round_trip_example.rb`. All
-examples are run by `examples/run_all_examples.sh`.
+examples are run by `examples/run_all_examples.sh`. The reference server
+enforces what the revision requires of a client (#245).
 
 ### Fixed during release review
 
+- **`MCPClient.connect(url, transport: :sse, protocol: :modern)` raised
+  nothing and connected legacy.** The HTTP+SSE transport cannot speak a
+  2026-07-28 server, so the explicit combination now raises `ArgumentError`
+  (auto-detection already routed `protocol: :modern` to Streamable HTTP).
+- **`require 'cgi'` warned on Ruby 4.0**, where the `cgi` library moved to a
+  gem; only the escape helpers are used, so `browser_oauth` requires
+  `cgi/escape`.
+- **`sanitize_peer_log_text` held raw NUL and control bytes** in its regex
+  source, which made `file` call the file binary and BSD `grep` return
+  nothing for it. Same character class, written as escapes.
+- **An unused `invalidate_private_cache`** was removed: private entries are
+  bound to the credentials they arrived under and never served to another
+  context, so there is nothing to invalidate by hand.
+- **YARD builds without warnings** (thirty stale `@param` tags and links),
+  `OAUTH.md` ships in the gem so the README's link to it resolves, and the
+  examples harness reports `tasks_example.rb` as skipped rather than dropping
+  it from the summary when its server does not come up.
 - **Two overlapping `-32020` retries could each be sent under the other's tool
   definition.** A `tools/call` rejected with `-32020` refreshes `tools/list`
   and retries under the definition that refresh brought; the pin carrying it

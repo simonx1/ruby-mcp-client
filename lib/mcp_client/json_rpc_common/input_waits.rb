@@ -18,16 +18,6 @@ module MCPClient
       InputRequiredWait = Struct.new(:rpc_method, :round_trip, :delay, :request_state, :result, :elapsed,
                                      keyword_init: true)
 
-      # Register the host's control over an out-of-band wait (MCP 2026-07-28
-      # client/elicitation "URL Mode": "Clients SHOULD provide manual controls
-      # that let the user retry or cancel the original request"). The block is
-      # called with an {InputRequiredWait} before each paced retry of a
-      # continuation that asked for nothing; it returns `:retry` to retry at
-      # once, `:cancel` to stop with an {MCPClient::Errors::InputRequiredError}
-      # the host can hand to {#resume_input_required} later, or anything else
-      # to wait the pace and retry.
-      # @param block [Proc] callback that receives an InputRequiredWait
-      # @return [void]
       # An InputRequiredResult is defined only for tools/call, resources/read
       # and prompts/get (MCP 2026-07-28 basic/patterns/mrtr "Supported
       # Requests"). server/discover is not one of them, so an input_required
@@ -50,6 +40,17 @@ module MCPClient
               "only valid for #{MRTR_METHODS.join(', ')}"
       end
 
+      # Register the host's control over an out-of-band wait (MCP 2026-07-28
+      # client/elicitation "URL Mode": "Clients SHOULD provide manual controls
+      # that let the user retry or cancel the original request"). The block is
+      # called with an {InputRequiredWait} before each paced retry of a
+      # continuation that asked for nothing; it returns `:retry` to retry at
+      # once, `:cancel` to stop with an {MCPClient::Errors::InputRequiredError}
+      # the host can hand to {#resume_input_required} later, or anything else
+      # to wait the pace and retry.
+      # @yieldparam wait [InputRequiredWait] the wait about to be paced
+      # @yieldreturn [Symbol, Object] :retry, :cancel, or anything else to wait
+      # @return [void]
       def on_input_required_wait(&block)
         @input_required_wait_callback = block
       end

@@ -74,6 +74,12 @@ module MCPClient
   # - sampling_handler [Proc] Handler for sampling requests. Deprecated since MCP
   #   2026-07-28 (SEP-2577); earliest removal is the first revision released on or
   #   after 2027-07-28. Integrate directly with the LLM provider API instead.
+  # - protocol [Symbol] :auto (default), :modern or :legacy — which protocol era
+  #   to speak (stdio, HTTP and Streamable HTTP; :modern with transport: :sse
+  #   raises ArgumentError, the HTTP+SSE transport being legacy-only)
+  # - discover_timeout [Numeric] bound on the server/discover probe in seconds
+  # - extensions [Array<String>] MCP extensions the client declares, e.g.
+  #   'io.modelcontextprotocol/tasks'
   # @yield [Faraday::Connection] Optional block for Faraday customization
   # @return [MCPClient::Client] Connected client ready to use
   # @raise [MCPClient::Errors::ConnectionError] if connection fails
@@ -354,7 +360,14 @@ module MCPClient
     end
 
     # Extract SSE transport specific options
+    # @raise [ArgumentError] when protocol: :modern is combined with the SSE
+    #   transport, which cannot speak a 2026-07-28 server
     def extract_sse_options(options)
+      if modern_only?(options)
+        raise ArgumentError, 'transport: :sse cannot honour protocol: :modern: the HTTP+SSE transport is ' \
+                             'legacy-only (SEP-2596). Use transport: :streamable_http for a 2026-07-28 server.'
+      end
+
       extract_common_options(options).merge({
         headers: options[:headers] || {},
         ping: options[:ping]
@@ -492,6 +505,8 @@ module MCPClient
   # @param retry_backoff [Integer] backoff delay in seconds (default: 1)
   # @param name [String, nil] optional name for this server
   # @param logger [Logger, nil] optional logger for server operations
+  # @param protocol [Symbol] :auto (default), :modern or :legacy — which protocol era to speak
+  # @param discover_timeout [Numeric, nil] bound on the server/discover probe in seconds
   # @yieldparam faraday [Faraday::Connection] the configured connection instance for additional customization
   #   (e.g., SSL settings, custom middleware). The block is called after default configuration is applied.
   # @return [Hash] server configuration
@@ -526,6 +541,8 @@ module MCPClient
   # @param max_decompressed_body_bytes [Integer] ceiling on how far a gzip-encoded
   #   response may expand before it is rejected, guarding against a small highly
   #   compressed body exhausting memory (default: 64 MiB)
+  # @param protocol [Symbol] :auto (default), :modern or :legacy — which protocol era to speak
+  # @param discover_timeout [Numeric, nil] bound on the server/discover probe in seconds
   # @yieldparam faraday [Faraday::Connection] the configured connection instance for additional customization
   #   (e.g., SSL settings, custom middleware). The block is called after default configuration is applied.
   # @return [Hash] server configuration

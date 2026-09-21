@@ -96,7 +96,7 @@ The harness starts the paired Python server, then runs the Ruby client against i
 |---------|-------|
 | `json_input_mcp_servers_example.rb` | Loads servers from JSON (Playwright + filesystem); needs `npx` |
 | `streamable_http_example.rb` | Zapier remote MCP; needs `ZAPIER_MCP_TOKEN` (else skipped) |
-| `tasks_example.rb` | Task-augmented tools; needs a task-capable remote HTTP MCP server (always skipped by the harness) |
+| `tasks_example.rb` | Task-augmented tools; the harness runs it against `echo_server_streamable.py` (`:8931`), point it elsewhere with `MCP_SERVER_URL` |
 | `oauth_example.rb` | OAuth 2.1 API walkthrough; connects to Zapier for real when `ZAPIER_MCP_TOKEN` is set |
 | `oauth_browser_auth.rb` | Interactive browser OAuth 2.1; runs only with `RUN_OAUTH=1` + `MCP_SERVER_URL` |
 
