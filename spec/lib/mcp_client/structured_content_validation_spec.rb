@@ -75,12 +75,18 @@ RSpec.describe MCPClient::SchemaValidator do
     end
 
     it 'reports an error instead of accepting the value when pattern matching times out' do
-      # Real timeout, no stubbing: an ambiguous alternation over a long input
-      # exceeds a tight budget, and the value must NOT be accepted just
-      # because the constraint could not be evaluated.
-      stub_const('MCPClient::SchemaValidator::PATTERN_MATCH_TIMEOUT', 0.001)
-      stub_const('MCPClient::SchemaValidator::MIN_PATTERN_MATCH_TIMEOUT', 0.0005)
-      schema = { 'type' => 'string', 'pattern' => '^(a|b|ab)*$' }
+      # Real timeout, no stubbing: a match that cannot finish exhausts the
+      # budget, and the value must NOT be accepted just because the
+      # constraint could not be evaluated.
+      #
+      # The lookahead is what keeps the match exponential: since Ruby 3.2 the
+      # regexp engine memoizes a plain ambiguous alternation like (a|b|ab)*
+      # into a linear scan (a few ms over this input), but it cannot memoize
+      # a lookaround. The budget is thousands of times what the schema
+      # preflight costs, so it is the match that exhausts it, not the
+      # preflight — a 1ms budget left that to the CI runner's mood.
+      stub_const('MCPClient::SchemaValidator::PATTERN_MATCH_TIMEOUT', 0.1)
+      schema = { 'type' => 'string', 'pattern' => '^(?=(a|b|ab)*$).*$' }
 
       expect(described_class.validate("#{'ab' * 20_000}c", schema))
         .to contain_exactly(a_string_matching(/pattern.*budget/i))
