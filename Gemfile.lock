@@ -31,7 +31,7 @@ GEM
       bigdecimal
       rexml
     diff-lcs (1.6.2)
-    erb (6.0.4)
+    erb (6.0.7)
     ethon (0.17.0)
       ffi (>= 1.15.0)
     event_stream_parser (1.0.0)
@@ -92,11 +92,11 @@ GEM
     public_suffix (7.0.5)
     racc (1.8.1)
     rainbow (3.1.1)
-    rbs (4.0.3)
+    rbs (4.2.0)
       logger
       prism (>= 1.6.0)
       tsort
-    rdoc (8.0.0)
+    rdoc (8.1.0)
       erb
       prism (>= 1.6.0)
       rbs (>= 4.0.0)
