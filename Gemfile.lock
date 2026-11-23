@@ -1,9 +1,9 @@
 GIT
   remote: https://github.com/openai/openai-ruby.git
-  revision: 385fef85fc3b56aa695b041b7574b912b5e200ea
+  revision: bd2c998069b73f046c8016dcc344c06dcd686aad
   branch: main
   specs:
-    openai (0.115.1)
+    openai (1.1.0)
       connection_pool (>= 2.2.3, != 3.0.2, != 3.0.1, != 3.0.0)
       logger
 
@@ -26,7 +26,7 @@ GEM
     bigdecimal (4.1.3)
     byebug (13.0.0)
       reline (>= 0.6.0)
-    connection_pool (2.5.5)
+    connection_pool (3.0.3)
     crack (1.0.1)
       bigdecimal
       rexml
