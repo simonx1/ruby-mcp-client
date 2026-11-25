@@ -1096,6 +1096,18 @@ and typed error class instead of degrading to a bare `ServerError`.
       "command": "npx",
       "args": ["-y", "@modelcontextprotocol/server-filesystem", "/home"]
     },
+    "guarded_filesystem": {
+      "type": "stdio",
+      "command": "armorer-guard",
+      "args": [
+        "mcp-proxy",
+        "--",
+        "npx",
+        "-y",
+        "@modelcontextprotocol/server-filesystem",
+        "/home"
+      ]
+    },
     "api": {
       "type": "streamable_http",
       "url": "https://api.example.com/mcp",
@@ -1104,6 +1116,11 @@ and typed error class instead of degrading to a bare `ServerError`.
   }
 }
 ```
+
+The `guarded_filesystem` example wraps a local stdio server with
+[Armorer Guard](https://github.com/ArmorerLabs/Armorer-Guard), which inspects
+MCP tool-call arguments locally for prompt injection, credential leakage,
+exfiltration risk, and dangerous actions before forwarding safe calls.
 
 ## AI Integration Examples
 
