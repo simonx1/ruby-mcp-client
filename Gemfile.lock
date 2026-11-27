@@ -35,7 +35,7 @@ GEM
     ethon (0.17.0)
       ffi (>= 1.15.0)
     event_stream_parser (1.0.0)
-    faraday (2.15.0)
+    faraday (2.15.1)
       faraday-net_http (>= 2.0, < 3.6)
       json
       logger
